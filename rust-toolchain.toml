@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned to a concrete version (not "stable") so CI and dev get the
+# exact same rustc/clippy. `dtolnay/rust-toolchain@stable` in CI
+# respects this file and installs this version instead of the
+# rolling stable. Bump deliberately when picking up newer lints.
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

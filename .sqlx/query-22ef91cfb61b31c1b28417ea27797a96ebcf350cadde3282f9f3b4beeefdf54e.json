@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO worker_shares_entity (address, \"clientName\", shares, \"rejectedShares\")\n           SELECT address,\n                  \"clientName\",\n                  SUM(shares)::double precision,\n                  SUM(\"rejectedJobNotFoundDiff1\"\n                      + \"rejectedDuplicateShareDiff1\"\n                      + \"rejectedLowDifficultyShareDiff1\")::double precision\n           FROM client_statistics_entity\n           GROUP BY address, \"clientName\"\n           ON CONFLICT (address, \"clientName\") DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "22ef91cfb61b31c1b28417ea27797a96ebcf350cadde3282f9f3b4beeefdf54e"
+}

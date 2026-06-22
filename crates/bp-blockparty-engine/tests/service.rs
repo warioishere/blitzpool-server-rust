@@ -1,0 +1,632 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+#![allow(clippy::print_stderr)]
+#![allow(clippy::needless_return)]
+
+//! Integration tests for `bp_blockparty_engine::BlockpartyService`
+//! against the local docker-PG (`blitzpool-rust-pg` on :15433).
+//!
+//! Coverage:
+//! - createGroup + DRAFT initial status (+ cache hit)
+//! - addMember auto-flips DRAFT → CONFIRMING (+ cache sync)
+//! - markMemberConfirmed promotes CONFIRMING → READY and the
+//!   load-bearing routing-cache invariant: routable + pending-fee
+//!   guards both flip in lockstep with the DB
+//! - onShareAccepted promotes READY → ACTIVE (and ONLY from READY)
+//! - dissolve cooldown gates ACTIVE within the 7-day silence window
+//! - onBlockFound is idempotent on duplicate (groupId, blockHash)
+//! - name collision rejects second create
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use bp_blockparty_engine::{
+    BlockpartyHooks, BlockpartyService, BlockpartyServiceConfig, BlockpartyServiceError,
+    CoinbaseReservation,
+};
+use bp_common::{AddressId, Sats};
+use bp_group_mgmt_engine::AddressCache as PplnsAddressCache;
+use sqlx::{postgres::PgPoolOptions, PgPool};
+
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+
+async fn connect_or_skip() -> Option<PgPool> {
+    let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        PgPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect(&url),
+    )
+    .await
+    {
+        Ok(Ok(p)) => Some(p),
+        Ok(Err(e)) => {
+            eprintln!("PG connect failed for {url}: {e} — skipping");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("PG connect timed out — skipping");
+            return None;
+        }
+    }
+}
+
+// ── Test hooks: every address binds to the same canned email. ──
+struct AllVerified;
+
+#[async_trait]
+impl BlockpartyHooks for AllVerified {
+    async fn verified_email_for(&self, _address: &AddressId) -> Option<String> {
+        Some("test@example.test".to_owned())
+    }
+}
+
+fn addr(s: &str) -> AddressId {
+    AddressId::new(s).expect("test address")
+}
+
+/// Records every `ensure_capacity_for_members` call so a test can assert the
+/// `→ Ready` transition sizes the coinbase reservation to the exact roster.
+struct RecordingReservation {
+    calls: Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+#[async_trait]
+impl CoinbaseReservation for RecordingReservation {
+    async fn ensure_capacity_for_members(&self, member_count: usize) {
+        self.calls.lock().expect("poisoned").push(member_count);
+    }
+}
+
+fn config() -> BlockpartyServiceConfig {
+    BlockpartyServiceConfig {
+        fee_address: Some(addr("bc1qfeexxxx")),
+        fee_percent: 2.0,
+        min_payout_sats: Sats(5_000),
+    }
+}
+
+fn svc(pool: &PgPool) -> BlockpartyService<AllVerified> {
+    BlockpartyService::new(
+        pool.clone(),
+        Arc::new(AllVerified),
+        PplnsAddressCache::new(),
+        config(),
+    )
+}
+
+/// Best-effort row cleanup. We use unique-per-test addresses + names so
+/// concurrent runs don't collide, and the FK CASCADE on group dissolve
+/// would take care of children — but tests don't always reach dissolve.
+async fn cleanup(pool: &PgPool, name: &str, admin_addr: &str) {
+    let _ = sqlx::query(r#"DELETE FROM blockparty_group WHERE name = $1"#)
+        .bind(name)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query(r#"DELETE FROM blockparty_member WHERE address = $1"#)
+        .bind(admin_addr)
+        .execute(pool)
+        .await;
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn create_group_seeds_draft_and_routing_cache() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-create-1";
+    let admin = "bc1qadmincreate1";
+    cleanup(&pool, name, admin).await;
+
+    let svc = svc(&pool);
+    let res = svc
+        .create_group(name, admin, "admin@test.example", 10_000)
+        .await
+        .expect("create_group");
+
+    assert_eq!(res.group.status, "draft");
+    assert_eq!(res.admin_member.role, "admin");
+    assert!(res.admin_member.confirmed_at.is_some());
+    assert!(res.admin_token.starts_with("GRP-"));
+
+    let admin_addr = addr(admin);
+    // Cache: routable=None (Draft), pending-fee=Some (Draft is pending).
+    assert!(svc.routable_group_id_for_admin(&admin_addr).await.is_none());
+    assert!(svc.pending_party_fee_route(&admin_addr).await.is_some());
+
+    cleanup(&pool, name, admin).await;
+}
+
+#[tokio::test]
+async fn add_member_flips_to_confirming_and_inserts_member_cache() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-add-2";
+    let admin = "bc1qadminadd2";
+    let bob = "bc1qbobadd2xx";
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(bob)
+        .execute(&pool)
+        .await;
+
+    let svc = svc(&pool);
+    let create = svc
+        .create_group(name, admin, "admin@test.example", 5_000)
+        .await
+        .expect("create");
+    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
+        .await
+        .expect("add_member");
+
+    // DB row: CONFIRMING.
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert_eq!(g.status, "confirming");
+
+    // Admin cache: pending-fee=Some, routable=None.
+    let admin_addr = addr(admin);
+    assert!(svc.pending_party_fee_route(&admin_addr).await.is_some());
+    assert!(svc.routable_group_id_for_admin(&admin_addr).await.is_none());
+    // Member cache: bob mapped.
+    assert_eq!(svc.member_group_id(&addr(bob)).await, Some(create.group.id));
+
+    cleanup(&pool, name, admin).await;
+}
+
+#[tokio::test]
+async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-confirm-3";
+    let admin = "bc1qadminconf3";
+    let bob = "bc1qbobconfirm";
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(bob)
+        .execute(&pool)
+        .await;
+
+    let svc = svc(&pool);
+    let create = svc
+        .create_group(name, admin, "admin@test.example", 5_000)
+        .await
+        .expect("create");
+    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
+        .await
+        .expect("add_member");
+
+    // Pre-confirm: pending-fee guard active.
+    let admin_addr = addr(admin);
+    assert!(svc.pending_party_fee_route(&admin_addr).await.is_some());
+
+    // Confirm bob. Status should flip to READY because all members
+    // (admin auto-confirmed at creation, bob now) have confirmedAt.
+    let r = svc
+        .mark_member_confirmed(create.group.id, &addr(bob))
+        .await
+        .expect("mark_confirmed");
+    assert!(r.member_token.is_some(), "first confirm mints token");
+
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert_eq!(g.status, "ready");
+
+    // Cache sync — the load-bearing invariant.
+    assert!(
+        svc.pending_party_fee_route(&admin_addr).await.is_none(),
+        "READY cancels pending-fee guard"
+    );
+    assert_eq!(
+        svc.routable_group_id_for_admin(&admin_addr).await,
+        Some(create.group.id),
+        "READY enables routing"
+    );
+
+    cleanup(&pool, name, admin).await;
+}
+
+#[tokio::test]
+async fn on_share_accepted_promotes_ready_to_active_only() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-share-4";
+    let admin = "bc1qadminshare4";
+    let bob = "bc1qbobshare4x";
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(bob)
+        .execute(&pool)
+        .await;
+
+    let svc = svc(&pool);
+    let create = svc
+        .create_group(name, admin, "admin@test.example", 5_000)
+        .await
+        .expect("create");
+    let admin_addr = addr(admin);
+
+    // Pre-confirm: share in DRAFT should NOT promote (defensive).
+    svc.on_share_accepted(&admin_addr)
+        .await
+        .expect("share-noop");
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert_eq!(g.status, "draft", "no promotion from draft");
+
+    // Add + confirm bob → READY.
+    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
+        .await
+        .expect("add");
+    svc.mark_member_confirmed(create.group.id, &addr(bob))
+        .await
+        .expect("confirm");
+
+    // First share → READY → ACTIVE.
+    svc.on_share_accepted(&admin_addr).await.expect("share");
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert_eq!(g.status, "active");
+    assert!(g.last_share_at.is_some());
+    // ACTIVE remains routable.
+    assert_eq!(
+        svc.routable_group_id_for_admin(&admin_addr).await,
+        Some(create.group.id)
+    );
+
+    cleanup(&pool, name, admin).await;
+}
+
+#[tokio::test]
+async fn dissolve_blocked_during_active_cooldown() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-dissolve-5";
+    let admin = "bc1qadmindiss5";
+    let bob = "bc1qbobdiss5xx";
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(bob)
+        .execute(&pool)
+        .await;
+
+    let svc = svc(&pool);
+    let create = svc
+        .create_group(name, admin, "admin@test.example", 5_000)
+        .await
+        .expect("create");
+    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
+        .await
+        .expect("add");
+    svc.mark_member_confirmed(create.group.id, &addr(bob))
+        .await
+        .expect("confirm");
+    svc.on_share_accepted(&addr(admin)).await.expect("share");
+    // ACTIVE, last_share_at = now. Dissolve must be rejected.
+    let err = svc
+        .dissolve_group(create.group.id, Some(&create.admin_token))
+        .await
+        .expect_err("must be rejected");
+    assert!(matches!(err, BlockpartyServiceError::DissolveCooldown));
+
+    // Spoof last_share_at to >7d ago — dissolve must succeed.
+    let long_ago = bp_blockparty::DISSOLVE_COOLDOWN_MS + 1_000;
+    let cutoff = chrono::Utc::now().timestamp_millis() - long_ago;
+    sqlx::query(r#"UPDATE blockparty_group SET "lastShareAt" = $2 WHERE id = $1"#)
+        .bind(create.group.id)
+        .bind(cutoff)
+        .execute(&pool)
+        .await
+        .expect("spoof");
+    svc.dissolve_group(create.group.id, Some(&create.admin_token))
+        .await
+        .expect("dissolve");
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert_eq!(g.status, "dissolved");
+    // Cache: dissolved drops both maps.
+    assert!(svc
+        .routable_group_id_for_admin(&addr(admin))
+        .await
+        .is_none());
+    assert!(svc.member_group_id(&addr(admin)).await.is_none());
+
+    cleanup(&pool, name, admin).await;
+}
+
+#[tokio::test]
+async fn on_block_found_is_idempotent_on_duplicate_hash() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-blockfound-6";
+    let admin = "bc1qadminbf6xx";
+    cleanup(&pool, name, admin).await;
+
+    let svc = svc(&pool);
+    let create = svc
+        .create_group(name, admin, "admin@test.example", 10_000)
+        .await
+        .expect("create");
+    let splits = vec![bp_db::BlockpartySplitSnapshot {
+        address: admin.to_owned(),
+        percent_bp: 10_000,
+        sats: 312_500_000,
+        trimmed: false,
+    }];
+    let hash = "0000000000000000abcdef1234567890abcdef1234567890abcdef1234567890";
+
+    let r1 = svc
+        .on_block_found(
+            create.group.id,
+            900_000,
+            hash,
+            Sats(312_500_000),
+            Sats(0),
+            &splits,
+            Some(1_700_000_000_000),
+        )
+        .await
+        .expect("first insert");
+    assert!(r1.is_some());
+
+    let r2 = svc
+        .on_block_found(
+            create.group.id,
+            900_000,
+            hash,
+            Sats(312_500_000),
+            Sats(0),
+            &splits,
+            Some(1_700_000_000_000),
+        )
+        .await
+        .expect("replay must not error");
+    assert!(r2.is_none(), "replay returns None — ON CONFLICT DO NOTHING");
+
+    // History should still hold exactly one row.
+    let history = svc.get_history(create.group.id).await.unwrap();
+    assert_eq!(history.len(), 1);
+
+    cleanup(&pool, name, admin).await;
+}
+
+#[tokio::test]
+async fn name_collision_rejects_second_create() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-nameclash-7";
+    let admin_a = "bc1qadminclasha";
+    let admin_b = "bc1qadminclashb";
+    cleanup(&pool, name, admin_a).await;
+    cleanup(&pool, name, admin_b).await;
+
+    let svc = svc(&pool);
+    svc.create_group(name, admin_a, "a@test.example", 10_000)
+        .await
+        .expect("first");
+    let err = svc
+        .create_group(name, admin_b, "b@test.example", 10_000)
+        .await
+        .expect_err("second must fail");
+    assert!(matches!(err, BlockpartyServiceError::NameTaken));
+
+    cleanup(&pool, name, admin_a).await;
+    cleanup(&pool, name, admin_b).await;
+}
+
+#[tokio::test]
+async fn ready_transition_sizes_coinbase_reservation_to_roster() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-reservation-9";
+    let admin = "bc1qadminresv9";
+    let bob = "bc1qbobresv9";
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(bob)
+        .execute(&pool)
+        .await;
+
+    // Service with a recording reservation hook.
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+    let svc = BlockpartyService::new(
+        pool.clone(),
+        Arc::new(AllVerified),
+        PplnsAddressCache::new(),
+        config(),
+    )
+    .with_coinbase_reservation(Some(Arc::new(RecordingReservation {
+        calls: calls.clone(),
+    })));
+
+    let create = svc
+        .create_group(name, admin, "admin@test.example", 5_000)
+        .await
+        .expect("create");
+    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
+        .await
+        .expect("add_member");
+
+    // Still CONFIRMING (bob unconfirmed) → the reservation hook must NOT have
+    // fired yet (only fires at → Ready).
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "reservation hook must not fire before the party is Ready"
+    );
+
+    // Confirm bob → all members confirmed → READY → hook fires with the exact
+    // roster (admin auto-confirmed at create + bob = 2 members).
+    svc.mark_member_confirmed(create.group.id, &addr(bob))
+        .await
+        .expect("mark_confirmed");
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert_eq!(g.status, "ready");
+
+    let recorded = calls.lock().unwrap().clone();
+    assert!(
+        !recorded.is_empty(),
+        "→ Ready must size the coinbase reservation"
+    );
+    assert!(
+        recorded.iter().all(|&n| n == 2),
+        "reservation must be sized to the exact 2-member roster; recorded {recorded:?}"
+    );
+
+    cleanup(&pool, name, admin).await;
+}
+
+#[tokio::test]
+async fn update_splits_confirms_admin_and_resets_non_admin() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-splits-10";
+    let admin = "bc1qadminsplits10";
+    let bob = "bc1qbobsplits10";
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(bob)
+        .execute(&pool)
+        .await;
+
+    let svc = svc(&pool);
+    let create = svc
+        .create_group(name, admin, "admin@test.example", 5_000)
+        .await
+        .expect("create");
+    svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
+        .await
+        .expect("add_member");
+
+    // Confirm bob → READY (admin is confirmed at creation).
+    svc.mark_member_confirmed(create.group.id, &addr(bob))
+        .await
+        .expect("mark_confirmed");
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert_eq!(
+        g.status, "ready",
+        "precondition: group READY before splits edit"
+    );
+
+    // Edit splits: swap percentages.
+    svc.update_splits(
+        create.group.id,
+        &[(addr(admin), 6_000), (addr(bob), 4_000)],
+        Some(&create.admin_token),
+    )
+    .await
+    .expect("update_splits");
+
+    // Verify member rows directly.
+    let members = bp_db::list_blockparty_members_for_group(&pool, create.group.id)
+        .await
+        .expect("list members");
+    let admin_row = members
+        .iter()
+        .find(|m| m.address.as_str() == admin)
+        .unwrap();
+    let bob_row = members.iter().find(|m| m.address.as_str() == bob).unwrap();
+
+    assert!(
+        admin_row.confirmed_at.is_some(),
+        "admin must be confirmed after splits edit (authoring = consent)"
+    );
+    assert!(
+        bob_row.confirmed_at.is_none(),
+        "non-admin must lose confirmedAt after splits edit"
+    );
+
+    // Group must be CONFIRMING until bob re-confirms.
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert_eq!(
+        g.status, "confirming",
+        "splits edit resets group to CONFIRMING"
+    );
+
+    // Re-confirm bob → READY again.
+    svc.mark_member_confirmed(create.group.id, &addr(bob))
+        .await
+        .expect("re-confirm bob");
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert_eq!(
+        g.status, "ready",
+        "group re-enters READY once all members re-confirm"
+    );
+
+    cleanup(&pool, name, admin).await;
+}
+
+#[tokio::test]
+async fn update_rental_hint_sets_cleans_and_clears() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-rental-hint-1";
+    let admin = "bc1qadminrentalhint1";
+    cleanup(&pool, name, admin).await;
+
+    let svc = svc(&pool);
+    let create = svc
+        .create_group(name, admin, "admin@test.example", 10_000)
+        .await
+        .expect("create_group");
+    let gid = create.group.id;
+    let tok = &create.admin_token;
+
+    // Set a plain hint.
+    let stored = svc
+        .update_rental_hint(gid, Some("MRR"), Some(tok))
+        .await
+        .expect("set hint");
+    assert_eq!(stored.as_deref(), Some("MRR"));
+
+    // Overwrite with a value that needs truncation to 64 chars.
+    let long = "x".repeat(80);
+    let stored = svc
+        .update_rental_hint(gid, Some(&long), Some(tok))
+        .await
+        .expect("truncate hint");
+    assert_eq!(stored.as_deref().map(str::len), Some(64));
+
+    // Whitespace-only hint is stored as None.
+    let stored = svc
+        .update_rental_hint(gid, Some("  "), Some(tok))
+        .await
+        .expect("clear hint");
+    assert!(
+        stored.is_none(),
+        "whitespace-only hint must be stored as null"
+    );
+
+    // Explicit None also clears.
+    let _ = svc
+        .update_rental_hint(gid, Some("MRR"), Some(tok))
+        .await
+        .expect("re-set");
+    let stored = svc
+        .update_rental_hint(gid, None, Some(tok))
+        .await
+        .expect("explicit None");
+    assert!(stored.is_none());
+
+    // Wrong token is rejected.
+    let err = svc
+        .update_rental_hint(gid, Some("MRR"), Some("wrong"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BlockpartyServiceError::InvalidToken | BlockpartyServiceError::MissingToken
+        ),
+        "wrong token must be rejected"
+    );
+
+    cleanup(&pool, name, admin).await;
+}

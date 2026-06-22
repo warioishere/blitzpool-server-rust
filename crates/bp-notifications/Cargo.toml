@@ -1,0 +1,42 @@
+[package]
+name = "bp-notifications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bp-common = { workspace = true }
+bp-db = { workspace = true }
+bp-pplns-engine = { workspace = true }
+bp-group-solo-engine = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+
+# SMTP transport for the email-notification adapter.
+lettre = { workspace = true }
+
+# JWT signing for FCM (RS256) + VAPID (ES256).
+jsonwebtoken = { workspace = true }
+
+# Base64-url encoding for VAPID `k=` header.
+base64 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

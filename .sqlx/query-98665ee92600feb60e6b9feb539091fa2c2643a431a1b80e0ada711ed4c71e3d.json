@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pplns_balance (address, \"balanceSats\", \"totalPaidSats\", \"updatedAt\")\n           SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::bigint[], $4::bigint[])\n           ON CONFLICT (address) DO UPDATE\n           SET \"balanceSats\"  = EXCLUDED.\"balanceSats\",\n               \"totalPaidSats\" = EXCLUDED.\"totalPaidSats\",\n               \"updatedAt\"     = EXCLUDED.\"updatedAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "98665ee92600feb60e6b9feb539091fa2c2643a431a1b80e0ada711ed4c71e3d"
+}

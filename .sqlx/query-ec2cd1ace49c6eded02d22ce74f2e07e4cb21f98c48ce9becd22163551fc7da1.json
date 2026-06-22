@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO network_difficulty_tracker_entity\n           (id, \"currentDifficulty\", \"previousDifficulty\",\n            \"lastCheckedAt\", \"lastChangedAt\", \"createdAt\", \"updatedAt\")\n           VALUES (1, $1, NULL, $2, $2, $2, $2)\n           ON CONFLICT (id) DO UPDATE SET\n             \"previousDifficulty\" = CASE\n                 WHEN network_difficulty_tracker_entity.\"currentDifficulty\" <> EXCLUDED.\"currentDifficulty\"\n                 THEN network_difficulty_tracker_entity.\"currentDifficulty\"\n                 ELSE network_difficulty_tracker_entity.\"previousDifficulty\"\n             END,\n             \"currentDifficulty\" = EXCLUDED.\"currentDifficulty\",\n             \"lastCheckedAt\" = EXCLUDED.\"lastCheckedAt\",\n             \"lastChangedAt\" = CASE\n                 WHEN network_difficulty_tracker_entity.\"currentDifficulty\" <> EXCLUDED.\"currentDifficulty\"\n                 THEN EXCLUDED.\"lastCheckedAt\"\n                 ELSE network_difficulty_tracker_entity.\"lastChangedAt\"\n             END,\n             \"updatedAt\" = EXCLUDED.\"updatedAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Float8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ec2cd1ace49c6eded02d22ce74f2e07e4cb21f98c48ce9becd22163551fc7da1"
+}

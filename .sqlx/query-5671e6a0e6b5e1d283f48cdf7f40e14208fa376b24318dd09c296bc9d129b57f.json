@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO client_statistics_entity\n             (address, \"clientName\", \"sessionId\", \"time\", shares,\n              \"acceptedCount\", \"rejectedCount\",\n              \"rejectedJobNotFoundCount\",      \"rejectedJobNotFoundDiff1\",\n              \"rejectedDuplicateShareCount\",   \"rejectedDuplicateShareDiff1\",\n              \"rejectedLowDifficultyShareCount\",\"rejectedLowDifficultyShareDiff1\",\n              \"updatedAt\")\n           SELECT\n             u.addr, u.cname, u.sid, u.t, u.sh,\n             u.ac,  u.rc,\n             u.rjc, u.rjd,\n             u.rdc, u.rdd,\n             u.rlc, u.rld,\n             (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint\n           FROM UNNEST(\n             $1::varchar[], $2::varchar[], $3::varchar[], $4::bigint[], $5::real[],\n             $6::int[], $7::int[],\n             $8::int[], $9::real[],\n             $10::int[], $11::real[],\n             $12::int[], $13::real[]\n           ) AS u(addr, cname, sid, t, sh, ac, rc, rjc, rjd, rdc, rdd, rlc, rld)\n           ON CONFLICT (address, \"clientName\", \"sessionId\", \"time\") DO UPDATE\n           SET shares                              = client_statistics_entity.shares                              + EXCLUDED.shares,\n               \"acceptedCount\"                     = client_statistics_entity.\"acceptedCount\"                     + EXCLUDED.\"acceptedCount\",\n               \"rejectedCount\"                     = client_statistics_entity.\"rejectedCount\"                     + EXCLUDED.\"rejectedCount\",\n               \"rejectedJobNotFoundCount\"          = client_statistics_entity.\"rejectedJobNotFoundCount\"          + EXCLUDED.\"rejectedJobNotFoundCount\",\n               \"rejectedJobNotFoundDiff1\"          = client_statistics_entity.\"rejectedJobNotFoundDiff1\"          + EXCLUDED.\"rejectedJobNotFoundDiff1\",\n               \"rejectedDuplicateShareCount\"       = client_statistics_entity.\"rejectedDuplicateShareCount\"       + EXCLUDED.\"rejectedDuplicateShareCount\",\n               \"rejectedDuplicateShareDiff1\"       = client_statistics_entity.\"rejectedDuplicateShareDiff1\"       + EXCLUDED.\"rejectedDuplicateShareDiff1\",\n               \"rejectedLowDifficultyShareCount\"   = client_statistics_entity.\"rejectedLowDifficultyShareCount\"   + EXCLUDED.\"rejectedLowDifficultyShareCount\",\n               \"rejectedLowDifficultyShareDiff1\"   = client_statistics_entity.\"rejectedLowDifficultyShareDiff1\"   + EXCLUDED.\"rejectedLowDifficultyShareDiff1\",\n               \"updatedAt\"                         = EXCLUDED.\"updatedAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "VarcharArray",
+        "VarcharArray",
+        "VarcharArray",
+        "Int8Array",
+        "Float4Array",
+        "Int4Array",
+        "Int4Array",
+        "Int4Array",
+        "Float4Array",
+        "Int4Array",
+        "Float4Array",
+        "Int4Array",
+        "Float4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5671e6a0e6b5e1d283f48cdf7f40e14208fa376b24318dd09c296bc9d129b57f"
+}

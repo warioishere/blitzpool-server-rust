@@ -1,0 +1,83 @@
+[package]
+name = "bp-stratum-v2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal crates — pool-side state machine consumes them.
+bp-common = { workspace = true }
+bp-share = { workspace = true }
+bp-mining-job = { workspace = true }
+bp-template-distribution = { workspace = true }
+bp-job-declaration = { workspace = true }
+bp-stats = { workspace = true }
+bp-mining-mode = { workspace = true }
+bp-pplns = { workspace = true }
+bp-group-solo = { workspace = true }
+# Job-lifecycle math (retire-not-clear, classify, age_entries) is shared
+# with bp-stratum-v1 — extracted as a pure-math leaf 2026-05-16. See
+# `bp_jobs_lifecycle::LifecycleConfig` for the constants the SV2 path
+# would otherwise hardcode as `SV2_STALE_GRACE_MS` etc.
+bp-jobs-lifecycle = { workspace = true }
+# Classic vardiff (sliding-window shares-per-minute) is shared with
+# bp-stratum-v1 — extracted as a pure-math leaf 2026-05-16. Standard +
+# Extended channels use it directly via `bp_vardiff::VarDiffEngine`;
+# the JDC-specific share-count vardiff lives in `mining::vardiff`.
+bp-vardiff = { workspace = true }
+# Protocol-agnostic accepted-share hook surface — same role as in
+# bp-stratum-v1: engines impl `SharedAcceptedShareSink` once and our
+# adapter wraps `bp_stratum_v2::hooks::AcceptedShareSink` into it.
+bp-share-hook = { workspace = true }
+
+# Generic SV2 protocol plumbing — runtime-deps per 2026-05-16 strategy.
+# stratum-core gives us binary/codec/framing/noise/mining/parsers/
+# job_declaration/template_distribution sub-modules. stratum-apps gives
+# us the Noise-wrapped tokio TcpStream wrapper + task manager + key utils
+# (feature = "pool" pulls network + config + core + with_buffer_pool).
+stratum-core = { workspace = true }
+stratum-apps = { workspace = true }
+
+# rust-bitcoin for header/script/transaction types in share validation +
+# block reconstruction. Shared crate with bp-mining-job.
+bitcoin = { workspace = true }
+
+# SipHash-2-4 for SHORT_TX_ID hashing (matches TS sv2-siphash.ts).
+siphasher = { workspace = true }
+
+# Async runtime + utilities.
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+# Inline-storage Vec replacement for the per-share extranonce buffer
+# (≤16 bytes covers the typical Extended-channel extranonce size,
+# avoiding a heap allocation per share).
+smallvec = { workspace = true }
+# CSPRNG byte-fill for JDP token-suffix generation (12 random bytes
+# per token). One-shot getrandom calls; no convenience layer needed.
+getrandom = { workspace = true }
+
+# Observability + errors.
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+bp-test-support = { workspace = true }
+bp-regtest-harness = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }
+hex = { workspace = true }
+proptest = { workspace = true }
+smallvec = { workspace = true }
+bp-share = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "submit"
+harness = false

@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"time\" AS \"time!\",\n            reason AS \"reason!\",\n            count AS \"count!\",\n            shares AS \"shares!\"\n           FROM client_rejected_statistics_entity\n           WHERE \"deletedAt\" IS NULL AND address = $1 AND \"time\" >= $2\n           ORDER BY \"time\" ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deleted_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "id!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "time!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "reason!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "count!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 8,
+        "name": "shares!",
+        "type_info": "Float4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "89d797fe90e58a9e68eb0cf265ffd767fe2cc658af905f986d7b17d240c588bb"
+}

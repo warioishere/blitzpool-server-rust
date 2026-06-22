@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM client_difficulty_statistics_entity WHERE address = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0dd0e0ec12d1da5047fd281d9c51389c7cdb62352303e3cc8690c88a0f8b81ef"
+}

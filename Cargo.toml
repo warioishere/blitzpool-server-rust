@@ -1,0 +1,268 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bp-common",
+    "crates/bp-config",
+    "crates/bp-db",
+    "crates/bp-bitcoin",
+    "crates/bp-template-distribution",
+    "crates/bp-job-declaration",
+    "crates/bp-share",
+    "crates/bp-mining-job",
+    "crates/bp-vardiff",
+    "crates/bp-jobs-lifecycle",
+    "crates/bp-inflight-cache",
+    "crates/bp-cron-utils",
+    "crates/bp-coinbase-snapshot",
+    "crates/bp-pplns",
+    "crates/bp-pplns-engine",
+    "crates/bp-group-solo",
+    "crates/bp-group-solo-engine",
+    "crates/bp-group-mgmt",
+    "crates/bp-group-mgmt-engine",
+    "crates/bp-blockparty",
+    "crates/bp-blockparty-engine",
+    "crates/bp-stats",
+    "crates/bp-share-stats-sink",
+    "crates/bp-session-persistence",
+    "crates/bp-share-hook",
+    "crates/bp-share-stream",
+    "crates/bp-mining-mode",
+    "crates/bp-notifications",
+    "crates/bp-stratum-v1",
+    "crates/bp-stratum-v2",
+    "crates/bp-protocol-detect",
+    "crates/bp-api",
+    "crates/bp-metrics",
+    "crates/bp-geoip",
+    "crates/bp-regtest-harness",
+    "crates/bp-test-support",
+    "bin/blitzpool",
+]
+
+[workspace.package]
+# Tracks TS-pool semver so /api/info/version returns the same v<semver>
+# the UI compares against.
+version = "2.2.1"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Blitzpool contributors"]
+publish = false
+license = "AGPL-3.0-or-later"
+
+# Central dependency declarations. Crates pull only what they actually need via
+# `dep.workspace = true`. Keeps versions consistent across the workspace.
+[workspace.dependencies]
+# Process-wide allocator (Linux only). Replaces glibc malloc to bound
+# RSS under the pool's small-alloc / free pattern (per-connection
+# Stratum buffers + sqlx / redis query results across 600+ concurrent
+# clients). The TS port hit unbounded RSS growth on glibc and only
+# stabilised under jemalloc; we adopt the same allocator preemptively
+# so we don't re-discover the same fragmentation problem in production.
+tikv-jemallocator = "0.6"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Observability + errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+thiserror = "1"
+anyhow = "1"
+
+# Serialization / wire
+serde = { version = "1", features = ["derive"] }
+# `raw_value` is used by bp-bitcoin/bp-api (serde_json::value::RawValue).
+# Declared explicitly here rather than relying on cross-crate feature
+# unification, so `-p <crate> --tests` subset builds also see it.
+serde_json = { version = "1", features = ["raw_value"] }
+simd-json = { version = "0.17", default-features = false, features = ["serde_impl", "swar-number-parsing"] }
+bytes = "1"
+hex = "0.4"
+faster-hex = { version = "0.10", default-features = false, features = ["std"] }
+smallvec = { version = "1", features = ["union", "const_generics"] }
+parking_lot = "0.12"
+
+# Database
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio-rustls",
+    "macros",
+    "migrate",
+    "uuid",
+    "json",
+] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Cache / outbound HTTP
+redis = { version = "0.27", default-features = false, features = ["tokio-rustls-comp", "aio", "connection-manager", "script", "streams"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# HTTP server
+axum = "0.7"
+
+# Typed config file (bp-config / bin/blitzpool).
+toml = "0.8"
+
+# CLI argument parsing for the binary.
+clap = { version = "4", features = ["derive"] }
+
+# Metrics — `metrics` facade + Prometheus exporter (text-format /metrics
+# endpoint with histogram-bucket support). Used by `bp-metrics`.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Bitcoin
+bitcoin = "0.32"
+secp256k1 = "0.29"
+# Base58Check round-trip for SV2 authority-key conversion in
+# `bin/blitzpool/src/stratum_v2.rs` (config holds the key as hex;
+# stratum-apps's `Secp256k1SecretKey::FromStr` only parses base58check).
+bs58 = { version = "0.5", features = ["check"] }
+
+# Hashing + big integer arithmetic (pure math, no Bitcoin-crate dep needed)
+sha2 = { version = "0.10", features = ["asm"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+
+# CSPRNG byte fill — used for admin/invitation token generation in
+# bp-group-mgmt. Tiny wrapper around the OS RNG; no convenience layer,
+# which is fine for one-shot calls.
+getrandom = "0.2"
+
+# Constant-time equality check for hashed-token verification. Same crate
+# the rust-crypto ecosystem standardises on.
+subtle = "2.6"
+
+# Dev / testing
+proptest = "1"
+
+# Bitcoin Core IPC bridge (Cap'n-Proto over UNIX socket → SV2 TDP/JDP).
+# git-Dep mit Commit-Pin (RUNTIME-Dep, MIT/Apache — konform mit unserer
+# non-commercial Lizenz-Linie, kein Source-Copy). Cargo cached den Checkout
+# in ~/.cargo/git, der lokale sv2-apps-Clone ist NICHT Build-Voraussetzung.
+# Pinnt bitcoin-core v31.0 + capnproto/libcapnp-dev als system deps. Beim
+# Hochziehen auf neuen sv2-apps-Stand: rev tauschen + `cargo update -p
+# bitcoin_core_sv2`.
+bitcoin_core_sv2 = { git = "https://github.com/stratum-mining/sv2-apps.git", rev = "4c0a65680c91f308fa37e855c4e30c4458434f71" }
+# stratum-core liefert `parsers_sv2::TemplateDistribution` und die Subprotokoll-
+# Strukturen, die wir zum Bauen von SubmitSolution/CoinbaseOutputConstraints
+# brauchen. bitcoin_core_sv2 re-exportiert das (noch) nicht.
+# `branch = "main"` matcht die transitive Spec aus bitcoin_core_sv2 1:1, damit
+# Cargo nur ein stratum-core in den Graph zieht. Cargo.lock pinnt die Commit-SHA.
+stratum-core = { git = "https://github.com/stratum-mining/stratum", branch = "main" }
+# stratum-apps liefert die App-Layer-Helfer für SV2 (Noise-wrapped tokio
+# TcpStream via `network_helpers::accept_noise_connection`, key_utils,
+# task_manager, custom_mutex). Feature `pool` zieht network + config + core
+# + with_buffer_pool. Selber rev wie bitcoin_core_sv2 damit Cargo nur einen
+# stratum-core-Graph baut. Runtime-Dep, kein Source-Copy.
+stratum-apps = { git = "https://github.com/stratum-mining/sv2-apps.git", rev = "4c0a65680c91f308fa37e855c4e30c4458434f71", features = ["pool"] }
+# SipHash-2-4 als pure-math-Lib für SHORT_TX_ID-Hashing
+# (TS portiert eigene Impl in sv2-siphash.ts; in Rust nehmen wir
+# `siphasher` — die aktuell gepflegte Standard-Crate, MIT/Apache).
+# `siphash` (singular) ist seit Jahren stagnant bei 0.0.5.
+siphasher = "1"
+# async-channel: vom obigen Crate genutzte channel-Lib für die TDP-IO-Boundary.
+# Wir matchen die exakte Version damit Sender/Receiver kompatibel sind.
+async-channel = "1.5"
+
+# Date/time math (cron next-3am-UTC, abandoned-balance day calculation).
+# `clock` feature pulls in `Utc::now()`; we deliberately skip `serde` since
+# we keep epoch-ms `u64` on the wire and only render DateTime for cron
+# arithmetic.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# IANA-TZ-aware datetime math for the per-group scheduled-reset cron
+# (each group picks its own admin-local timezone for the calendar
+# boundary fires). `chrono-tz` ships the TZ database compiled in, no
+# OS dependency. Default features OK — pulls in just `chrono`.
+chrono-tz = "0.10"
+
+# SMTP transport for the email-notification adapter. `rustls-tls` keeps
+# us off OpenSSL (the rest of the workspace uses rustls everywhere);
+# `tokio1-rustls-tls` gives us the async `tokio1` runtime adapter.
+# `builder` enables the `Message::builder()` typed-header API.
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "tokio1-rustls-tls",
+    "builder",
+    "hostname",
+] }
+
+# JWT signing for FCM (RS256 with the service-account RSA key) and for
+# VAPID (ES256 with the pool's P-256 private key). One crate, both algos.
+jsonwebtoken = "9"
+
+# Base64 + base64url encoding for VAPID `k=` header + general use.
+base64 = "0.22"
+
+# Test fixtures + scratch dirs
+tempfile = "3"
+
+# Internal crates — declared centrally so consumers do
+#   bp-common = { workspace = true }
+# without repeating the path.
+bp-common = { path = "crates/bp-common" }
+bp-config = { path = "crates/bp-config" }
+bp-db = { path = "crates/bp-db" }
+bp-bitcoin = { path = "crates/bp-bitcoin" }
+bp-template-distribution = { path = "crates/bp-template-distribution" }
+bp-job-declaration = { path = "crates/bp-job-declaration" }
+bp-share = { path = "crates/bp-share" }
+bp-mining-job = { path = "crates/bp-mining-job" }
+bp-vardiff = { path = "crates/bp-vardiff" }
+bp-jobs-lifecycle = { path = "crates/bp-jobs-lifecycle" }
+bp-inflight-cache = { path = "crates/bp-inflight-cache" }
+bp-cron-utils = { path = "crates/bp-cron-utils" }
+bp-coinbase-snapshot = { path = "crates/bp-coinbase-snapshot" }
+bp-pplns = { path = "crates/bp-pplns" }
+bp-pplns-engine = { path = "crates/bp-pplns-engine" }
+bp-group-solo = { path = "crates/bp-group-solo" }
+bp-group-solo-engine = { path = "crates/bp-group-solo-engine" }
+bp-group-mgmt = { path = "crates/bp-group-mgmt" }
+bp-group-mgmt-engine = { path = "crates/bp-group-mgmt-engine" }
+bp-blockparty = { path = "crates/bp-blockparty" }
+bp-blockparty-engine = { path = "crates/bp-blockparty-engine" }
+bp-stats = { path = "crates/bp-stats" }
+bp-share-stats-sink = { path = "crates/bp-share-stats-sink" }
+bp-session-persistence = { path = "crates/bp-session-persistence" }
+bp-share-hook = { path = "crates/bp-share-hook" }
+bp-share-stream = { path = "crates/bp-share-stream" }
+bp-mining-mode = { path = "crates/bp-mining-mode" }
+bp-notifications = { path = "crates/bp-notifications" }
+bp-stratum-v1 = { path = "crates/bp-stratum-v1" }
+bp-stratum-v2 = { path = "crates/bp-stratum-v2" }
+bp-protocol-detect = { path = "crates/bp-protocol-detect" }
+bp-api = { path = "crates/bp-api" }
+bp-metrics = { path = "crates/bp-metrics" }
+bp-geoip = { path = "crates/bp-geoip" }
+bp-regtest-harness = { path = "crates/bp-regtest-harness" }
+bp-test-support = { path = "crates/bp-test-support" }
+
+# Workspace-wide lints. Each crate opts in with `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+todo = "warn"
+unimplemented = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug = true

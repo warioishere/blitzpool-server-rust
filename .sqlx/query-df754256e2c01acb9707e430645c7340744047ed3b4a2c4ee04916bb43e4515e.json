@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pplns_group_balance\n               (address, \"groupId\", \"pendingSats\", \"totalPaidSats\", \"updatedAt\", \"lastAcceptedShareAt\")\n           VALUES ($1, $2, $3, 0, $4, $4)\n           ON CONFLICT (address, \"groupId\") DO UPDATE\n           SET \"pendingSats\" = pplns_group_balance.\"pendingSats\" + EXCLUDED.\"pendingSats\",\n               \"lastAcceptedShareAt\" = EXCLUDED.\"lastAcceptedShareAt\",\n               \"updatedAt\" = EXCLUDED.\"updatedAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Uuid",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "df754256e2c01acb9707e430645c7340744047ed3b4a2c4ee04916bb43e4515e"
+}

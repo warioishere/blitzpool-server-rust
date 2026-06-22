@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE blockparty_member\n           SET \"confirmedAt\" = NULL, \"memberTokenHash\" = NULL, \"updatedAt\" = $3\n           WHERE \"groupId\" = $1 AND address = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "95655db150f30a6bdc34f8cac7c1ae572f48a0357171b083dfb9677e82fa6b2b"
+}

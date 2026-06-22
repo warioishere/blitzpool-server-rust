@@ -1,0 +1,118 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"time\" AS \"time!\",\n            shares AS \"shares!\",\n            \"acceptedCount\" AS \"accepted_count!\",\n            \"rejectedCount\" AS \"rejected_count!\",\n            \"rejectedJobNotFoundCount\" AS \"rejected_job_not_found_count!\",\n            \"rejectedJobNotFoundDiff1\" AS \"rejected_job_not_found_diff1!\",\n            \"rejectedDuplicateShareCount\" AS \"rejected_duplicate_share_count!\",\n            \"rejectedDuplicateShareDiff1\" AS \"rejected_duplicate_share_diff1!\",\n            \"rejectedLowDifficultyShareCount\" AS \"rejected_low_difficulty_share_count!\",\n            \"rejectedLowDifficultyShareDiff1\" AS \"rejected_low_difficulty_share_diff1!\"\n           FROM client_statistics_entity\n           WHERE \"deletedAt\" IS NULL AND \"time\" >= $1\n           ORDER BY \"time\" ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deleted_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "id!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "client_name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "session_id!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "time!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "shares!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 9,
+        "name": "accepted_count!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "rejected_count!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
+        "name": "rejected_job_not_found_count!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 12,
+        "name": "rejected_job_not_found_diff1!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 13,
+        "name": "rejected_duplicate_share_count!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 14,
+        "name": "rejected_duplicate_share_diff1!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 15,
+        "name": "rejected_low_difficulty_share_count!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 16,
+        "name": "rejected_low_difficulty_share_diff1!",
+        "type_info": "Float4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "2bea673d852a4ea4d5d7536347460d4243f4711127edd25343f399d0e8208903"
+}

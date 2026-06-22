@@ -1,0 +1,97 @@
+[package]
+name = "bp-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal — engine + service surfaces consumed by API endpoints.
+bp-common = { workspace = true }
+bp-db = { workspace = true }
+bp-pplns-engine = { workspace = true }
+bp-group-solo-engine = { workspace = true }
+bp-group-mgmt = { workspace = true }
+bp-group-mgmt-engine = { workspace = true }
+bp-blockparty = { workspace = true }
+bp-blockparty-engine = { workspace = true }
+bp-template-distribution = { workspace = true }
+bp-bitcoin = { workspace = true }
+bp-geoip = { workspace = true }
+bp-metrics = { workspace = true }
+bp-config = { workspace = true }
+
+# Async runtime + HTTP server.
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Per-route rate-limiting for the @Throttle-decorated TS endpoints
+# (email register, invitation create + batch + open + accept/decline,
+# join-request create). Keyed by client IP via SmartIpKeyExtractor
+# (X-Forwarded-For → X-Real-IP → Forwarded → peer-addr). `governor` is
+# already a transitive dep of `tower_governor` — pinning it here makes
+# `NoOpMiddleware` nameable in the rate_limit helper module.
+tower_governor = { version = "0.5", default-features = false, features = ["axum"] }
+governor = "0.8"
+
+# Postgres pool + UUIDs in JSON DTOs.
+sqlx = { workspace = true }
+uuid = { workspace = true }
+
+# Serialization + bytes helpers.
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+
+# UTC slot-label formatting for chart endpoints (time_range util).
+chrono = { workspace = true }
+# IANA-TZ database for the group-reset preset's next-fire calculation
+# in /api/groups/:id (nextResetAt field).
+chrono-tz = { workspace = true }
+
+# In-process singleton for the downstream-report TTL-store (TS keeps it
+# on a NestJS singleton service; we mirror that with `once_cell`).
+once_cell = "1"
+
+# Per-endpoint response cache. moka gives us an async cache with
+# per-entry TTL + LRU eviction; values are stored as `Bytes`
+# (pre-serialized JSON) so cache hits skip both the DB hop and the
+# DTO re-serialisation.
+moka = { version = "0.12", features = ["future", "sync"] }
+bytes = "1"
+
+# bp-share for the external-share POST endpoint's difficulty
+# calculation (sha256d of the 80-byte header + Target-to-difficulty).
+bp-share = { workspace = true }
+# bp-mining-job for per-address coinbase + block assembly inside the
+# /api/client/:address/block-template handler. bitcoin crate gives us
+# Block / Transaction serialisation for the blockHex preview.
+bp-mining-job = { workspace = true }
+bitcoin = { workspace = true }
+# Chart-visibility cutoff helper shared with the writer-side
+# accumulator — keeps `/api/info/chart/mode/:mode` consistent with the
+# slot bookkeeping that drives the writes.
+bp-stats = { workspace = true }
+
+# CSPRNG + base64url for email-verification token generation
+# (`pplns_email_verification.token` is base64url-encoded 32 random
+# bytes, matching the TS `crypto.randomBytes(32).toString('base64url')`
+# shape).
+getrandom = { workspace = true }
+base64 = { workspace = true }
+async-trait = { workspace = true }
+redis = { workspace = true }
+
+# Observability + errors.
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

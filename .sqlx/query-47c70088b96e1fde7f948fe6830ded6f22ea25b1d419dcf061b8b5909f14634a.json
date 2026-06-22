@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pplns_group_join_request\n           SET status = 'expired'\n           WHERE status = 'pending' AND \"createdAt\" < $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "47c70088b96e1fde7f948fe6830ded6f22ea25b1d419dcf061b8b5909f14634a"
+}

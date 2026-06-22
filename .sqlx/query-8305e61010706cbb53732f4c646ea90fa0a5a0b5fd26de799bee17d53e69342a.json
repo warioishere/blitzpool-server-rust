@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM pplns_group_block_history WHERE \"groupId\" = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8305e61010706cbb53732f4c646ea90fa0a5a0b5fd26de799bee17d53e69342a"
+}

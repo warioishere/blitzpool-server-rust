@@ -1,0 +1,112 @@
+[package]
+name = "blitzpool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Typed config — single source of truth for runtime values.
+bp-config = { workspace = true }
+
+# Serde for the Redis-persisted pending-found-block store (pending_blocks.rs).
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Foundation handles spawned by `boot.rs`.
+bp-db = { workspace = true }
+bp-bitcoin = { workspace = true }
+bp-geoip = { workspace = true }
+bp-metrics = { workspace = true }
+bp-template-distribution = { workspace = true }
+
+# Engine spawning + share-sink composition (`engines.rs`).
+bp-common = { workspace = true }
+bp-share-hook = { workspace = true }
+# Accepted-share Redis-stream transport (core producer / satellite consumer).
+bp-share-stream = { workspace = true }
+bp-mining-mode = { workspace = true }
+bp-pplns = { workspace = true }
+hex = { workspace = true }
+bp-pplns-engine = { workspace = true }
+# Durable coinbase-budget persistence (autoscaler).
+bp-coinbase-snapshot = { workspace = true }
+bp-group-solo-engine = { workspace = true }
+bp-blockparty-engine = { workspace = true }
+bp-share-stats-sink = { workspace = true }
+bp-session-persistence = { workspace = true }
+
+# Production hook impls (`hooks.rs`) — invitation + verification
+# emails, FCM/Web-Push outbound, GroupService Redis cleanup.
+bp-api = { workspace = true }
+bp-group-mgmt-engine = { workspace = true }
+bp-notifications = { workspace = true }
+# Phase 7.5: `SystemClock` for invitation / join-request expiry crons.
+bp-cron-utils = { workspace = true }
+# Phase 7.5: `PgPool` type for the `kill_dead_clients` cron loop —
+# we own the loop here, the other 3 crons hide sqlx behind their
+# spawn helpers.
+sqlx = { workspace = true }
+chrono = { workspace = true }
+
+# BlockSubmissionSink wiring (`block_sink.rs`) — Stratum-server
+# protocol crate + the MiningJob coinbase-assembly helper + the
+# JobClassification enum used in the per-test ShareAccept builder.
+bp-stratum-v1 = { workspace = true }
+bp-stratum-v2 = { workspace = true }
+bp-share = { workspace = true }
+bp-protocol-detect = { workspace = true }
+bp-mining-job = { workspace = true }
+bp-jobs-lifecycle = { workspace = true }
+# `bitcoin::Network` for the test fixture.
+bitcoin = { workspace = true }
+
+# SV2 noise / authority-key construction (`stratum_v2.rs`) — base58
+# round-trip helpers (stratum-apps's FromStr parses base58check) +
+# bs58 to convert from the hex form we accept in
+# `[sv2].authority_privkey_hex`.
+stratum-apps = { workspace = true }
+bs58 = { workspace = true }
+
+# HTTP listener for the bp-api router (`api_server.rs`).
+axum = { workspace = true }
+
+# Trait-object impls of async sinks (`async_trait`).
+async-trait = { workspace = true }
+
+# Group-Solo's `GroupModeGate` returns `Option<Uuid>` so we need uuid
+# at the wiring layer too.
+uuid = { workspace = true }
+
+# Async runtime — multi-thread per design-prinzip 1.
+tokio = { workspace = true }
+# CancellationToken used by the SV1 accept-loop in `stratum_v1.rs` to
+# propagate shutdown across all per-port listener tasks.
+tokio-util = { workspace = true }
+
+# Direct Redis client — engines consume `redis::aio::ConnectionManager`,
+# which is built here at boot and threaded into every consumer.
+redis = { workspace = true }
+
+# Structured logging. `env-filter` + `fmt` give us RUST_LOG-style
+# configuration with line-oriented stdout output by default.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# CLI argument parsing. Derived from a small struct so we can grow
+# the flag set in Phase 7.1+ without touching the parser shape.
+clap = { workspace = true, features = ["env"] }
+
+# Boot-time error envelope. thiserror-based so the failed-handle
+# variant carries through to the operator-friendly stderr hint.
+thiserror = { workspace = true }
+
+# Process-wide allocator (Linux only). Wired into `main.rs` via
+# `#[global_allocator]`. See workspace Cargo.toml for rationale.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { workspace = true }

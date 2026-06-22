@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            \"time\" AS \"time!\",\n            accepted AS \"accepted!\",\n            rejected AS \"rejected!\"\n           FROM pool_share_statistics_entity\n           WHERE \"deletedAt\" IS NULL AND \"time\" >= $1\n           ORDER BY \"time\" ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deleted_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "id!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "time!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "accepted!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 6,
+        "name": "rejected!",
+        "type_info": "Float4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "86dea9a9fe29151d13a579976a1c65eab4abc39997c922e097bc73cd4902ed70"
+}

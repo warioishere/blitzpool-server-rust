@@ -1,0 +1,22 @@
+[package]
+name = "bp-stats"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bp-common = { workspace = true }
+# parking_lot::Mutex over std::sync::Mutex for the per-share accumulator
+# locks: ~2× faster uncontended, no poisoning overhead.
+parking_lot = { workspace = true }
+# RejectedReason derives serde so the rejected share crosses the
+# Core→Satellite stream (see bp-share-stream).
+serde = { workspace = true }
+
+[dev-dependencies]

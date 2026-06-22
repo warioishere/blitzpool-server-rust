@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n             COALESCE(SUM(CASE WHEN \"balanceSats\" > 0\n                               THEN \"balanceSats\" END), 0)::bigint\n               AS \"credit!\",\n             COALESCE(SUM(CASE WHEN \"balanceSats\" < 0\n                               THEN -\"balanceSats\" END), 0)::bigint\n               AS \"debit!\",\n             COUNT(*) FILTER (WHERE \"balanceSats\" > 0)::bigint\n               AS \"credit_rows!\",\n             COUNT(*) FILTER (WHERE \"balanceSats\" < 0)::bigint\n               AS \"debit_rows!\",\n             COALESCE(SUM(CASE WHEN \"balanceSats\" > 0\n                                AND \"lastAcceptedShareAt\" IS NOT NULL\n                                AND \"lastAcceptedShareAt\" < $1\n                               THEN \"balanceSats\" END), 0)::bigint\n               AS \"abandoned_credit!\",\n             COALESCE(SUM(CASE WHEN \"balanceSats\" < 0\n                                AND \"lastAcceptedShareAt\" IS NOT NULL\n                                AND \"lastAcceptedShareAt\" < $1\n                               THEN -\"balanceSats\" END), 0)::bigint\n               AS \"abandoned_debit!\",\n             COALESCE(SUM(\"totalPaidSats\"), 0)::bigint\n               AS \"lifetime_paid!\"\n           FROM pplns_balance",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "credit!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "debit!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "credit_rows!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "debit_rows!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "abandoned_credit!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "abandoned_debit!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "lifetime_paid!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "9dd6bdd205a4cb58cc949497471abd2596829994e0f7c14d68d09e9251f708b2"
+}

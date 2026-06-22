@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pplns_group\n           SET \"dissolvedAt\" = $1, active = false, \"updatedAt\" = $1\n           WHERE id = $2 AND \"dissolvedAt\" IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fb84cfcce0ddfe3623c03b72c6af29f7c5a85f0fc97cd37549b46228d9d90b51"
+}

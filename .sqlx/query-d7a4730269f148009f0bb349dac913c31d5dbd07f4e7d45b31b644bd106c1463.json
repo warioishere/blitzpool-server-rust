@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO client_rejected_statistics_entity\n             (address, \"time\", reason, count, shares, \"updatedAt\")\n           SELECT\n             u.a, u.t, u.r, u.c, u.s,\n             (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint\n           FROM UNNEST($1::varchar[], $2::bigint[], $3::varchar[], $4::real[], $5::real[])\n             AS u(a, t, r, c, s)\n           ON CONFLICT (address, \"time\", reason) DO UPDATE\n           SET count      = client_rejected_statistics_entity.count  + EXCLUDED.count,\n               shares     = client_rejected_statistics_entity.shares + EXCLUDED.shares,\n               \"updatedAt\" = EXCLUDED.\"updatedAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "VarcharArray",
+        "Int8Array",
+        "VarcharArray",
+        "Float4Array",
+        "Float4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d7a4730269f148009f0bb349dac913c31d5dbd07f4e7d45b31b644bd106c1463"
+}

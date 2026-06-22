@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pplns_email_verification\n             (token, address, email, \"createdAt\", \"expiresAt\")\n           VALUES ($1, $2, $3, $4, $5)\n           RETURNING\n            token AS \"token!\",\n            address AS \"address!: AddressId\",\n            email AS \"email!\",\n            \"createdAt\" AS \"created_at!\",\n            \"expiresAt\" AS \"expires_at!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "token!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "email!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "expires_at!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "aaef9c1229819649a40a7d63c0cdf6ee8a74de6ae1c5d222446b35631de193f2"
+}

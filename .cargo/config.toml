@@ -1,0 +1,16 @@
+# Workspace-wide cargo config.
+#
+# `cargo test-strict` runs the full workspace test suite serially.
+# Required for deterministic results because several integration test
+# binaries share state in the local docker-PG / docker-Redis instances
+# (bp-pplns-engine::tests::*, bp-db::tests::pplns_bulk_writes). Without
+# serialization, ~25-40 tests sporadically don't get run across the
+# parallel binaries (race-condition observed: workspace total swings
+# between 903 and 941). When run serially the total is stable at 941.
+#
+# The alias keeps the standard `cargo test` (parallel) usable for fast
+# unit-test iteration during dev. For pre-commit / CI verification use
+# `cargo test-strict`.
+
+[alias]
+test-strict = "test --workspace --no-fail-fast -- --test-threads=1"

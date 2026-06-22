@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"groupId\" AS \"group_id!\",\n            \"pendingSats\" AS \"pending_sats!: Sats\",\n            \"totalPaidSats\" AS \"total_paid_sats!: Sats\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"lastAcceptedShareAt\" AS \"last_accepted_share_at?\"\n           FROM pplns_group_balance\n           WHERE \"groupId\" = $1 AND \"pendingSats\" > 0",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "group_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "pending_sats!: Sats",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "total_paid_sats!: Sats",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "last_accepted_share_at?",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "3f894995f46961b376667261b1f9902b18326a255b474453ffc7a098d51105b9"
+}

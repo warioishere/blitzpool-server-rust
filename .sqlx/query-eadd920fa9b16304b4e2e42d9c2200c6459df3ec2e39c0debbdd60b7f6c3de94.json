@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO worker_shares_entity (address, \"clientName\", shares, \"rejectedShares\")\n           SELECT * FROM UNNEST($1::varchar[], $2::varchar[], $3::double precision[], $4::double precision[])\n           ON CONFLICT (address, \"clientName\") DO UPDATE\n           SET shares          = worker_shares_entity.shares          + EXCLUDED.shares,\n               \"rejectedShares\" = worker_shares_entity.\"rejectedShares\" + EXCLUDED.\"rejectedShares\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "VarcharArray",
+        "VarcharArray",
+        "Float8Array",
+        "Float8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "eadd920fa9b16304b4e2e42d9c2200c6459df3ec2e39c0debbdd60b7f6c3de94"
+}

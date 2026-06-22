@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pplns_group_invitation\n           SET status = 'expired'\n           WHERE status = 'pending' AND \"expiresAt\" < $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "70ec96ead66b1133617ba8b815cf64d4fccbf8481fc0d77e134836c678e628c3"
+}

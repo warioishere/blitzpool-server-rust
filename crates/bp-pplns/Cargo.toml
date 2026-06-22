@@ -1,0 +1,32 @@
+[package]
+name = "bp-pplns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bp-common = { workspace = true }
+bitcoin = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+bp-test-support = { workspace = true }
+proptest = { workspace = true }
+# Phase-7.8-follow-up regtest harness: bp-regtest-harness boots
+# bitcoin-node v31 + IPC, bp-mining-job turns PPLNS payouts into
+# coinbase bytes, bp-template-distribution attaches TDP + submits
+# solutions, bp-share supplies the Target/sha256d helpers, bitcoin
+# decodes scripts.
+bp-regtest-harness = { workspace = true }
+bp-mining-job = { workspace = true }
+bp-template-distribution = { workspace = true }
+bp-share = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# Mempool-fill RPC params for the autoscaler coupling regtest.
+serde_json = { workspace = true }

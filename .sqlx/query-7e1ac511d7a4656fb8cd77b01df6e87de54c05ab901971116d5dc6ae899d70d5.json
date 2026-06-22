@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            id AS \"id!\",\n            \"groupId\" AS \"group_id!\",\n            address AS \"address!: AddressId\",\n            email AS \"email!\",\n            \"percentBp\" AS \"percent_bp!\",\n            role AS \"role!\",\n            \"confirmedAt\" AS \"confirmed_at?\",\n            \"memberTokenHash\" AS \"member_token_hash?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\"\n           FROM blockparty_member WHERE \"groupId\" = $1 ORDER BY id ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "group_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "email!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "percent_bp!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "role!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "confirmed_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "member_token_hash?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "7e1ac511d7a4656fb8cd77b01df6e87de54c05ab901971116d5dc6ae899d70d5"
+}

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE blockparty_group\n           SET \"rentalProviderHint\" = $2, \"updatedAt\" = $3\n           WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a30459d88fb5b15f1d5d1389e4167bf777d0a12f6c5194aea9f8c14f126afda9"
+}

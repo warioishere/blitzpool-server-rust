@@ -1,0 +1,15 @@
+[package]
+name = "bp-group-solo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bp-common = { workspace = true }
+bp-pplns = { workspace = true }

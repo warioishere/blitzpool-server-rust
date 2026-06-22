@@ -1,0 +1,30 @@
+[package]
+name = "bp-session-persistence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bp-common = { workspace = true }
+bp-db = { workspace = true }
+# Protocol-agnostic per-share + session hook surface — see
+# bp-share-hook crate docs. Same trait used for SV1 + SV2 servers.
+bp-share-hook = { workspace = true }
+bp-share = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+sqlx = { workspace = true }
+
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+sqlx = { workspace = true }

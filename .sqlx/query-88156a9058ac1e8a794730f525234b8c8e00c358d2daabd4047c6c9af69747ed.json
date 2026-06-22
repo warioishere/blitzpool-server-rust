@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pplns_group\n           SET \"creatorAddress\" = $1,\n               \"adminTokenHash\" = $2,\n               \"updatedAt\"      = $3\n           WHERE id = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "88156a9058ac1e8a794730f525234b8c8e00c358d2daabd4047c6c9af69747ed"
+}

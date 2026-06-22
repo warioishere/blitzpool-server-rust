@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE blockparty_group\n           SET \"lastShareAt\" = $2, status = $3, \"updatedAt\" = $4\n           WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "21a0d739a546a82c2bc6575a95c786a76d332f40742daac08bca7e5036ded9e2"
+}

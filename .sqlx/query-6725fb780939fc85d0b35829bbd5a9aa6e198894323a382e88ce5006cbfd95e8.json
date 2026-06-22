@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pplns_group_block_history\n             (\"groupId\", \"blockHeight\", address, \"paidSats\", percent,\n              \"sharesInRound\", \"totalSharesInRound\", \"rowType\", \"createdAt\")\n           SELECT * FROM UNNEST(\n             $1::uuid[], $2::int[], $3::text[], $4::bigint[], $5::real[],\n             $6::bigint[], $7::bigint[], $8::text[], $9::bigint[]\n           )\n           ON CONFLICT (\"groupId\", \"blockHeight\", address) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Int4Array",
+        "TextArray",
+        "Int8Array",
+        "Float4Array",
+        "Int8Array",
+        "Int8Array",
+        "TextArray",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6725fb780939fc85d0b35829bbd5a9aa6e198894323a382e88ce5006cbfd95e8"
+}

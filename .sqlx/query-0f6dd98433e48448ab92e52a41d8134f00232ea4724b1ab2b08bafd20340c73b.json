@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            id AS \"id!\",\n            \"groupId\" AS \"group_id!\",\n            \"blockHeight\" AS \"block_height!\",\n            \"blockHash\" AS \"block_hash!\",\n            \"foundAt\" AS \"found_at!\",\n            \"coinbaseValueSats\" AS \"coinbase_value_sats!: Sats\",\n            \"poolFeeSats\" AS \"pool_fee_sats!: Sats\",\n            splits AS \"splits!: Json<Vec<BlockpartySplitSnapshot>>\",\n            \"createdAt\" AS \"created_at!\"\n           FROM blockparty_block_history\n           WHERE \"groupId\" = $1\n           ORDER BY \"blockHeight\" DESC, id DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "group_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "block_height!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "block_hash!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "found_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "coinbase_value_sats!: Sats",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "pool_fee_sats!: Sats",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "splits!: Json<Vec<BlockpartySplitSnapshot>>",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0f6dd98433e48448ab92e52a41d8134f00232ea4724b1ab2b08bafd20340c73b"
+}

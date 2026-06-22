@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM pplns_group_balance WHERE \"groupId\" = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "22413f4a625fc4dd34a13a1af30dbd3f0abe9c34f57f7f8a477e59b58266c21f"
+}

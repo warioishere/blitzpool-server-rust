@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name?\",\n            \"slotTime\" AS \"slot_time!\",\n            \"maxDifficulty\" AS \"max_difficulty!\"\n           FROM client_difficulty_statistics_entity WHERE id = $1 LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deleted_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "id!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "client_name?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "slot_time!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "max_difficulty!",
+        "type_info": "Float4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "a88952a407746add40865d3d946b3ab99b25e788b9b3b6c8184a6eadd82d36fd"
+}

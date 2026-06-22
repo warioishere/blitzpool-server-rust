@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO client_difficulty_statistics_entity\n               (address, \"clientName\", \"slotTime\", \"maxDifficulty\", \"createdAt\", \"updatedAt\")\n           VALUES ($1, $2, $3, $4, $5, $5)\n           ON CONFLICT (address, \"clientName\", \"slotTime\") DO UPDATE SET\n               \"maxDifficulty\" = GREATEST(\n                   EXCLUDED.\"maxDifficulty\",\n                   client_difficulty_statistics_entity.\"maxDifficulty\"\n               ),\n               \"updatedAt\" = EXCLUDED.\"updatedAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Float4",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "040ae522d567fe1f574b011a125ee7e57c0886303da401d3735f7790614d6b94"
+}

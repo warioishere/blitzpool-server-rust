@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pplns_address_email\n             (address, email, \"verifiedAt\", \"createdAt\", \"updatedAt\")\n           VALUES ($1, $2, $3, $3, $3)\n           ON CONFLICT (address) DO UPDATE SET\n             email = EXCLUDED.email,\n             \"verifiedAt\" = EXCLUDED.\"verifiedAt\",\n             \"updatedAt\" = EXCLUDED.\"updatedAt\"\n           RETURNING\n            address AS \"address!: AddressId\",\n            email AS \"email!\",\n            \"verifiedAt\" AS \"verified_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "email!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "verified_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "3db4970ce1880d0e2c7273e3c4efb4d7adcb0c9834b35208ab70a31b8720ce36"
+}

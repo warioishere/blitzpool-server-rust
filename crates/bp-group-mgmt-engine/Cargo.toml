@@ -1,0 +1,43 @@
+[package]
+name = "bp-group-mgmt-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal — pure domain types + validators + tokens.
+bp-common = { workspace = true }
+bp-group-mgmt = { workspace = true }
+# Data layer — group-mgmt write primitives.
+bp-db = { workspace = true }
+# Clock trait + SystemClock for the 2 expiry crons (analog usage to
+# bp-pplns-engine / bp-group-solo-engine sweep tasks).
+bp-cron-utils = { workspace = true }
+
+# Async runtime + utilities.
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Postgres pool / Executor trait (for TX wrapping in internal_remove +
+# create_open_invite). We don't write inline `sqlx::query!` here — those
+# all live in `bp-db`.
+sqlx = { workspace = true }
+# UUIDs for group rows + join-request rows.
+uuid = { workspace = true }
+
+# IANA-TZ validation for round-reset config. `chrono-tz` ships the TZ
+# database compiled in so we don't depend on the OS having tzdata.
+chrono-tz = { workspace = true }
+
+# Observability + errors.
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

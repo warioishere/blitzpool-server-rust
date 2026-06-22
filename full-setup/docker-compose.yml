@@ -1,0 +1,319 @@
+# blitzpool-rust full stack - single compose file, network selected
+# via docker-compose profiles.
+#
+# Layout:
+#   postgres + redis  always-on (shared across networks)
+#   bitcoin-<net> + blitzpool-<net>  enabled by profile
+#
+# Bring up exactly one network at a time:
+#
+#   docker compose --profile regtest  up -d
+#   docker compose --profile testnet4 up -d
+#   docker compose --profile mainnet  up -d
+#
+# Switch networks by stopping the current profile and starting another:
+#
+#   docker compose --profile regtest down
+#   docker compose --profile mainnet up -d
+#
+# The shared postgres holds one DB per network so switching does NOT
+# wipe the other network's state. Default DB name = `blitzpool` for
+# new installs; set PG_DATABASE=public_pool in .env when attaching to
+# an existing TS-pool DB.
+
+services:
+  # -- always-on backing services -----------------------------------
+  postgres:
+    container_name: blitzpool-postgres
+    image: postgres:18-alpine
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - blitzpool
+    healthcheck:
+      test: ["CMD-SHELL", "cd / && pg_isready -U ${PG_USER:-postgres} -d ${PG_DATABASE:-public_pool}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Tuning copied from the TS-pool production compose. Reasonable
+    # defaults for a single-host pool; tune `shared_buffers` / `work_mem`
+    # downward on a smaller box.
+    command: >
+      postgres
+      -c max_connections=120
+      -c shared_buffers=2GB
+      -c effective_cache_size=4GB
+      -c work_mem=32MB
+      -c maintenance_work_mem=256MB
+      -c wal_buffers=16MB
+      -c max_wal_size=2GB
+      -c min_wal_size=1GB
+      -c checkpoint_completion_target=0.9
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c autovacuum_vacuum_scale_factor=0.05
+      -c autovacuum_analyze_scale_factor=0.02
+      -c autovacuum_vacuum_cost_delay=2ms
+      -c idle_in_transaction_session_timeout=30000
+      -c log_min_duration_statement=2000
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c statement_timeout=30000
+    environment:
+      POSTGRES_DB: ${PG_DATABASE:-public_pool}
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-postgres}
+    volumes:
+      # Mount at /var/lib/postgresql (not /var/lib/postgresql/18/docker)
+      # so the postgres:18-alpine image's default PGDATA layout
+      # (/var/lib/postgresql/18/docker/) lives entirely inside the
+      # mount. This matches the structure the TS pool ships its
+      # production PG data in (data/.../pg/18/docker/), enabling a
+      # 1:1 cp -a copy without flattening.
+      - "./data/postgres:/var/lib/postgresql"
+      # Auto-apply the TS-pool schema on first init. postgres:18-alpine
+      # runs anything in /docker-entrypoint-initdb.d/ once when the
+      # data dir is empty.
+      - "../db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro"
+
+  redis:
+    container_name: blitzpool-redis
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - blitzpool
+    healthcheck:
+      # docker 29.5 regression: CMD-form healthchecks fail with "cwd
+      # outside container mount namespace root" when the docker
+      # client's CWD doesn't exist in the container. Wrap in shell
+      # with explicit `cd /` to sidestep it.
+      test: ["CMD-SHELL", "cd / && valkey-cli ${REDIS_PASSWORD:+-a \"$$REDIS_PASSWORD\"} ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: >
+      valkey-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory ${REDIS_MAX_MEMORY:-4096mb}
+      --maxmemory-policy volatile-lru
+      --io-threads 2
+      --io-threads-do-reads yes
+      ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    volumes:
+      - "./data/redis:/data"
+
+  # -- mainnet profile ----------------------------------------------
+  bitcoin-mainnet:
+    profiles: ["mainnet"]
+    container_name: blitzpool-bitcoin-mainnet
+    build:
+      context: ./docker/bitcoin/mainnet
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - blitzpool
+    # Service-alias `bitcoin` lets blitzpool.toml use a single
+    # `url = "http://bitcoin"` across networks.
+    hostname: bitcoin
+    ports:
+      - "127.0.0.1:8332:8332/tcp"
+      - "0.0.0.0:8333:8333/tcp"
+      - "127.0.0.1:28332:28332/tcp"
+    volumes:
+      - "./data/bitcoin-mainnet:/app/data"
+      - "./docker/bitcoin/mainnet/bitcoin.conf:/app/data/bitcoin.conf:ro"
+      - "ipc:/ipc"
+
+  blitzpool-mainnet:
+    profiles: ["mainnet"]
+    container_name: blitzpool-mainnet
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 4096M
+    networks:
+      - blitzpool
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      bitcoin-mainnet:
+        condition: service_started
+    ports:
+      - "0.0.0.0:3333:3333/tcp"
+      - "0.0.0.0:3339:3339/tcp"
+      - "0.0.0.0:3340:3340/tcp"
+      - "0.0.0.0:3349:3349/tcp"
+      - "0.0.0.0:3335:3335/tcp"
+      - "0.0.0.0:3337:3337/tcp"
+      - "0.0.0.0:3334:3334/tcp"
+      - "127.0.0.1:9000:9000/tcp"
+    volumes:
+      - "../.local/blitzpool.toml:/app/blitzpool.toml:ro"
+      - "./data/blitzpool-logs:/app/logs"
+      - "../.local:/app/keys:ro"
+      - "ipc:/ipc"
+    environment:
+      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_stratum_v1=debug,bp_stratum_v2=debug,bp_template_distribution=debug}
+      - RUST_BACKTRACE=1
+
+  # -- testnet4 profile ---------------------------------------------
+  bitcoin-testnet4:
+    profiles: ["testnet4"]
+    container_name: blitzpool-bitcoin-testnet4
+    build:
+      context: ./docker/bitcoin/testnet4
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - blitzpool
+    hostname: bitcoin
+    ports:
+      - "127.0.0.1:48332:48332/tcp"
+      - "0.0.0.0:48333:48333/tcp"
+      - "127.0.0.1:38332:28332/tcp"
+    volumes:
+      - "./data/bitcoin-testnet4:/app/data"
+      - "./docker/bitcoin/testnet4/bitcoin.conf:/app/data/bitcoin.conf:ro"
+      - "ipc:/ipc"
+
+  blitzpool-testnet4:
+    profiles: ["testnet4"]
+    container_name: blitzpool-testnet4
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - blitzpool
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      bitcoin-testnet4:
+        condition: service_started
+    ports:
+      - "0.0.0.0:3333:3333/tcp"
+      - "0.0.0.0:3339:3339/tcp"
+      - "0.0.0.0:3340:3340/tcp"
+      - "0.0.0.0:3349:3349/tcp"
+      - "0.0.0.0:3335:3335/tcp"
+      - "0.0.0.0:3337:3337/tcp"
+      - "0.0.0.0:3334:3334/tcp"
+      - "127.0.0.1:9000:9000/tcp"
+    volumes:
+      - "../.local/blitzpool-testnet4.toml:/app/blitzpool.toml:ro"
+      - "./data/blitzpool-logs:/app/logs"
+      - "../.local:/app/keys:ro"
+      - "ipc:/ipc"
+    environment:
+      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_stratum_v1=debug,bp_stratum_v2=debug,bp_template_distribution=debug}
+      - RUST_BACKTRACE=1
+
+  # -- regtest profile ----------------------------------------------
+  bitcoin-regtest:
+    profiles: ["regtest"]
+    container_name: blitzpool-bitcoin-regtest
+    build:
+      context: ./docker/bitcoin/regtest
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - blitzpool
+    hostname: bitcoin
+    ports:
+      - "127.0.0.1:28443:18443/tcp"
+    volumes:
+      - "./data/bitcoin-regtest:/app/data"
+      - "./docker/bitcoin/regtest/bitcoin.conf:/app/data/bitcoin.conf:ro"
+      - "ipc:/ipc"
+
+  blitzpool-regtest:
+    profiles: ["regtest"]
+    container_name: blitzpool-regtest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks:
+      - blitzpool
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      bitcoin-regtest:
+        condition: service_started
+    ports:
+      - "0.0.0.0:3333:3333/tcp"
+      - "0.0.0.0:3339:3339/tcp"
+      - "0.0.0.0:3340:3340/tcp"
+      - "0.0.0.0:3349:3349/tcp"
+      - "0.0.0.0:3335:3335/tcp"
+      - "0.0.0.0:3337:3337/tcp"
+      - "0.0.0.0:3334:3334/tcp"
+    volumes:
+      - "../.local/blitzpool-regtest.toml:/app/blitzpool.toml:ro"
+      - "./data/blitzpool-logs:/app/logs"
+      - "../.local:/app/keys:ro"
+      - "ipc:/ipc"
+    environment:
+      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_stratum_v1=debug,bp_stratum_v2=debug,bp_template_distribution=debug}
+      - RUST_BACKTRACE=1
+
+networks:
+  blitzpool:
+    name: blitzpool
+
+volumes:
+  ipc:
+    # Only one bitcoin-<network> service can hold the socket at a
+    # time. `down` clears the volume; `up` repopulates it via the
+    # new bitcoin container.
+    name: blitzpool-ipc

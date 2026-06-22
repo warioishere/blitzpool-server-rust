@@ -1,0 +1,29 @@
+# Cargo build artifacts — re-created inside the chef/builder stages.
+target/
+**/target/
+
+# Repo-internal state that's irrelevant to (and slows down) the build.
+.git/
+.github/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Local config + secrets.
+.local/
+.env
+.env.local
+
+# Docker-compose runtime state. The data/ dirs hold postgres /
+# bitcoind / redis files owned by container UIDs (70 / 1000 / 999),
+# which docker buildkit can't read from the host. Without this
+# exclusion `docker compose build` fails with EACCES on these dirs.
+full-setup/data/
+full-setup/logs/
+full-setup/keys/
+full-setup/blitzpool.toml
+full-setup/blitzpool-regtest.toml
+full-setup/blitzpool-testnet4.toml
+full-setup/.env

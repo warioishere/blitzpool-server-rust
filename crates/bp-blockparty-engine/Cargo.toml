@@ -1,0 +1,48 @@
+[package]
+name = "bp-blockparty-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal — pure domain types + token primitives.
+bp-common = { workspace = true }
+bp-blockparty = { workspace = true }
+# Reuse: token gen/hash + base64url helpers + Error model shape.
+bp-group-mgmt = { workspace = true }
+# Reuse: AddressCache pattern (mode-collision check via PplnsGroup).
+bp-group-mgmt-engine = { workspace = true }
+# Data layer.
+bp-db = { workspace = true }
+
+# Async runtime + trait sugar.
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Postgres pool / TX wrapping.
+sqlx = { workspace = true }
+uuid = { workspace = true }
+
+# Observability + errors.
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+bp-test-support = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+# E2E regtest deps — boot bitcoin-core 31, attach TDP, assemble + submit
+# a Blockparty coinbase, assert tip advances + history idempotency.
+bp-regtest-harness = { workspace = true }
+bp-template-distribution = { workspace = true }
+bp-mining-job = { workspace = true }
+bp-share = { workspace = true }
+bitcoin = { workspace = true }
+hex = { workspace = true }

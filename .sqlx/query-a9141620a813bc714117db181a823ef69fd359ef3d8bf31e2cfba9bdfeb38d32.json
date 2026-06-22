@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO blocks_entity\n             (height, \"minerAddress\", worker, \"sessionId\", \"blockData\")\n           VALUES ($1, $2, $3, $4, $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a9141620a813bc714117db181a823ef69fd359ef3d8bf31e2cfba9bdfeb38d32"
+}

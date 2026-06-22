@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"balanceSats\" AS \"balance_sats!: Sats\",\n            \"totalPaidSats\" AS \"total_paid_sats!: Sats\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"lastAcceptedShareAt\" AS \"last_accepted_share_at?\"\n           FROM pplns_balance WHERE address = ANY($1::text[])",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "balance_sats!: Sats",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "total_paid_sats!: Sats",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "last_accepted_share_at?",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "3a69f94b039ef76b8907814420797b9104f72308af470dbdb6019277cf5dc660"
+}

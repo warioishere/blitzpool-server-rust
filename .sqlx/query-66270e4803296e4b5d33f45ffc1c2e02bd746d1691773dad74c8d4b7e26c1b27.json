@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            \"currentDifficulty\" AS \"current_difficulty!\",\n            \"previousDifficulty\" AS \"previous_difficulty?\",\n            \"lastCheckedAt\" AS \"last_checked_at!\",\n            \"lastChangedAt\" AS \"last_changed_at?\"\n           FROM network_difficulty_tracker_entity WHERE id = 1 LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deleted_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "id!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "current_difficulty!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 5,
+        "name": "previous_difficulty?",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 6,
+        "name": "last_checked_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "last_changed_at?",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "66270e4803296e4b5d33f45ffc1c2e02bd746d1691773dad74c8d4b7e26c1b27"
+}

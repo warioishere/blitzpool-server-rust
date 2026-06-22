@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM blockparty_member WHERE \"groupId\" = $1 AND address = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4f9e38c954fcda8eb6b9e4aea7b5fc105184f497f7e48518c30ca1363fd47152"
+}

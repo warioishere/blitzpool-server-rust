@@ -1,0 +1,122 @@
+# Core/Satellite split deployment — four blitzpool processes from one image
+# + one shared config, differing only by the BLITZPOOL_ROLES env var.
+#
+#   blitzpool-core      roles=front          always-on: Stratum + producer + block submit + JDP
+#   blitzpool-api       roles=api            read-only HTTP API (charts/admin) — restart freely
+#   blitzpool-payout    roles=payout,stats   accounting ledger + stream consumers + maintenance crons
+#   blitzpool-notify    roles=notify         dispatcher + listeners + notification crons + notify fan-out
+#
+# Goal: deploy an accounting/API/notification fix by recreating only that one
+# container — the core stays up, so miners never reconnect. The notify split
+# means a notification change never restarts payout (PPLNS). See
+# SPLIT-DEPLOYMENT.md.
+#
+# Run the infra (postgres/redis/bitcoin) from the main compose first, then:
+#   docker compose -f docker-compose.split.yml up -d
+# (this file joins the external `blitzpool` network the main compose creates.)
+
+networks:
+  blitzpool:
+    external: true
+    name: blitzpool
+
+volumes:
+  # The bitcoin-core IPC socket — only the front (core) needs it (TDP is
+  # front-only). Created by the main compose's bitcoin service.
+  ipc:
+    external: true
+    name: blitzpool-ipc
+
+x-blitzpool-common: &blitzpool-common
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: blitzpool:latest
+  restart: unless-stopped
+  stop_grace_period: 30s
+  networks:
+    - blitzpool
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "3"
+  environment: &blitzpool-env
+    - RUST_LOG=${RUST_LOG:-info,blitzpool=debug}
+    - RUST_BACKTRACE=1
+
+services:
+  # ── Always-on front: holds the miner connections. Never restart for a
+  #    back-office fix. Only this process needs the bitcoin IPC socket. ──
+  blitzpool-core:
+    <<: *blitzpool-common
+    container_name: blitzpool-core
+    environment:
+      - BLITZPOOL_ROLES=front
+      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_stratum_v1=debug,bp_stratum_v2=debug,bp_template_distribution=debug}
+      - RUST_BACKTRACE=1
+    ports:
+      - "0.0.0.0:3333:3333/tcp"   # solo
+      - "0.0.0.0:3339:3339/tcp"   # solo high-diff
+      - "0.0.0.0:3340:3340/tcp"   # pplns
+      - "0.0.0.0:3349:3349/tcp"   # pplns high-diff
+      - "0.0.0.0:3335:3335/tcp"   # sv2
+      - "0.0.0.0:3337:3337/tcp"   # jdp
+    volumes:
+      - "../.local/blitzpool.toml:/app/blitzpool.toml:ro"
+      - "./data/blitzpool-logs:/app/logs"
+      - "../.local:/app/keys:ro"
+      - "ipc:/ipc"
+
+  # ── Read-only API: charts/admin stay up while payout restarts. No IPC,
+  #    no stream consumers, no crons. Safe to recreate any time. ──
+  blitzpool-api:
+    <<: *blitzpool-common
+    container_name: blitzpool-api
+    environment:
+      - BLITZPOOL_ROLES=api
+      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_api=debug}
+      - RUST_BACKTRACE=1
+    ports:
+      - "0.0.0.0:3334:3334/tcp"        # HTTP API
+      - "127.0.0.1:9000:9000/tcp"      # metrics
+    volumes:
+      - "../.local/blitzpool.toml:/app/blitzpool.toml:ro"
+      - "./data/blitzpool-logs:/app/logs"
+      - "../.local:/app/keys:ro"
+
+  # ── Accounting: PPLNS + Group-Solo + Blockparty ledger (block-found ledger
+  #    apply), confirmation watcher, maintenance crons, + statistics. Recreate
+  #    for an accounting/payout fix — miners + API + notifications unaffected.
+  #    Holds NO dispatcher: notifications are the `notify` process below.
+  blitzpool-payout:
+    <<: *blitzpool-common
+    container_name: blitzpool-payout
+    environment:
+      - BLITZPOOL_ROLES=payout,stats
+      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_pplns_engine=debug,bp_group_solo_engine=debug}
+      - RUST_BACKTRACE=1
+    # No published ports — internal accounting only (reads/writes PG + Redis).
+    volumes:
+      - "../.local/blitzpool.toml:/app/blitzpool.toml:ro"
+      - "./data/blitzpool-logs:/app/logs"
+      - "../.local:/app/keys:ro"
+
+  # ── Notifications: the dispatcher (FCM / Web-Push / Telegram / ntfy), the
+  #    Telegram + ntfy command listeners, the push/digest crons (network- +
+  #    best-difficulty, hourly stats), and the notify-only fan-out of the
+  #    block-found + device-status streams. Recreate for a notification-feature
+  #    fix — payout (PPLNS), miners, and API all stay up. Reads-only on the
+  #    engines (like api), so it's safe to restart any time. ──
+  blitzpool-notify:
+    <<: *blitzpool-common
+    container_name: blitzpool-notify
+    environment:
+      - BLITZPOOL_ROLES=notify
+      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_notifications=debug}
+      - RUST_BACKTRACE=1
+    # No published ports — talks to PG + Redis + outbound push/Telegram/ntfy.
+    volumes:
+      - "../.local/blitzpool.toml:/app/blitzpool.toml:ro"
+      - "./data/blitzpool-logs:/app/logs"
+      - "../.local:/app/keys:ro"

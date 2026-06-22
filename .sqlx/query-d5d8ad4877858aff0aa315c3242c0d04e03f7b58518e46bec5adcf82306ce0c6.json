@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM rpc_block_entity\n           WHERE \"blockHeight\" < (SELECT MAX(\"blockHeight\") FROM rpc_block_entity)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "d5d8ad4877858aff0aa315c3242c0d04e03f7b58518e46bec5adcf82306ce0c6"
+}

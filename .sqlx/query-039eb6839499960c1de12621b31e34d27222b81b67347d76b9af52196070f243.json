@@ -1,0 +1,118 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\"\n           FROM pplns_group\n           WHERE name = $1 AND \"dissolvedAt\" IS NULL\n           LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "creator_address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "admin_token_hash!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "active!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "dissolved_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "round_reset_interval_days?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "round_reset_hour_local?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "round_reset_timezone?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "last_round_reset_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 12,
+        "name": "finder_bonus_sats?: Sats",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "round_reset_preset?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 14,
+        "name": "is_public!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 15,
+        "name": "reset_round_on_block!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 16,
+        "name": "max_members?",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "039eb6839499960c1de12621b31e34d27222b81b67347d76b9af52196070f243"
+}

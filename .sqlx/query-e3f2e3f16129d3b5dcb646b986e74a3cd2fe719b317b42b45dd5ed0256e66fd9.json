@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pplns_group_invitation\n           SET status = $1,\n               \"respondedAt\" = COALESCE($2, \"respondedAt\")\n           WHERE token = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e3f2e3f16129d3b5dcb646b986e74a3cd2fe719b317b42b45dd5ed0256e66fd9"
+}

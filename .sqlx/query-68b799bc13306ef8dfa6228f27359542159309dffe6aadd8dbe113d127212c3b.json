@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            id AS \"id!\",\n            mode AS \"mode!: MiningMode\",\n            \"time\" AS \"time!\",\n            diff AS \"diff!\"\n           FROM pool_mode_hashrate\n           WHERE mode = $1 AND \"time\" >= $2\n           ORDER BY \"time\" ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "mode!: MiningMode",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "time!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "diff!",
+        "type_info": "Float4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "68b799bc13306ef8dfa6228f27359542159309dffe6aadd8dbe113d127212c3b"
+}

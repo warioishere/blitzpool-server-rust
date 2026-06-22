@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            id AS \"id!\",\n            \"groupId\" AS \"group_id!\",\n            address AS \"address!: AddressId\",\n            email AS \"email!\",\n            message AS \"message?\",\n            status AS \"status!\",\n            \"createdAt\" AS \"created_at!\",\n            \"decidedAt\" AS \"decided_at?\",\n            \"decidedByAdminTokenHash\" AS \"decided_by_admin_token_hash?\"\n           FROM pplns_group_join_request\n           WHERE address = $1 AND status = 'pending'\n           ORDER BY \"createdAt\" DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "group_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "email!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "message?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "status!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "decided_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "decided_by_admin_token_hash?",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "ebc8bef86bb845f81bd96fdb4b74e68bad9c8e2c0ce5933ff9b57a2228213c95"
+}

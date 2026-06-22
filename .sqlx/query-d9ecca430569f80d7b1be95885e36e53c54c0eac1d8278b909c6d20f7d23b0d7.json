@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE client_entity\n           SET \"deletedAt\" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,\n               \"updatedAt\" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint\n           WHERE \"updatedAt\" < $1 AND \"deletedAt\" IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d9ecca430569f80d7b1be95885e36e53c54c0eac1d8278b909c6d20f7d23b0d7"
+}

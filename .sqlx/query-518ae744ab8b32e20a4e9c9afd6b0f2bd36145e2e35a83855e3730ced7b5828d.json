@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address::text AS \"address!\", COALESCE(SUM(shares), 0)::float8 AS \"total!\"\n                           FROM client_rejected_statistics_entity\n                           WHERE address = ANY($1) AND \"deletedAt\" IS NULL\n                           GROUP BY address",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "total!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "518ae744ab8b32e20a4e9c9afd6b0f2bd36145e2e35a83855e3730ced7b5828d"
+}

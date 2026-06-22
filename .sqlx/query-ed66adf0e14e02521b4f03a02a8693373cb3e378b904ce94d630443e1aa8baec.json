@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            token AS \"token!\",\n            \"groupId\" AS \"group_id!\",\n            address AS \"address?: AddressId\",\n            email AS \"email?\",\n            status AS \"status!\",\n            \"createdAt\" AS \"created_at!\",\n            \"expiresAt\" AS \"expires_at!\",\n            \"respondedAt\" AS \"responded_at?\",\n            \"inviteType\" AS \"invite_type!\",\n            \"approvalRequired\" AS \"approval_required!\"\n           FROM pplns_group_invitation\n           WHERE \"groupId\" = $1\n             AND address = $2\n             AND status = 'pending'\n             AND \"inviteType\" = 'directed'\n           LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "token!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "group_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "address?: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "email?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "status!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "expires_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "responded_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "invite_type!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "approval_required!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "ed66adf0e14e02521b4f03a02a8693373cb3e378b904ce94d630443e1aa8baec"
+}

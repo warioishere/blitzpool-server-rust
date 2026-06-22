@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ntfy_subscriptions_entity\n           SET language = $2, \"updatedAt\" = $3\n           WHERE address = $1 AND \"deletedAt\" IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3de1cdaab9e10c3cc16f7978798bf779cdaaa883049bfeb2e699d09dafac9c4c"
+}

@@ -1,0 +1,141 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pplns_group\n           SET\n             \"roundResetPreset\"       = CASE WHEN $2  THEN (CASE WHEN $3  THEN NULL::varchar  ELSE $4::varchar  END) ELSE \"roundResetPreset\"       END,\n             \"roundResetIntervalDays\" = CASE WHEN $5  THEN (CASE WHEN $6  THEN NULL::int      ELSE $7::int      END) ELSE \"roundResetIntervalDays\" END,\n             \"roundResetTimezone\"     = CASE WHEN $8  THEN (CASE WHEN $9  THEN NULL::varchar  ELSE $10::varchar END) ELSE \"roundResetTimezone\"     END,\n             \"roundResetHourLocal\"    = CASE WHEN $11 THEN (CASE WHEN $12 THEN NULL::int      ELSE $13::int     END) ELSE \"roundResetHourLocal\"    END,\n             \"finderBonusSats\"        = CASE WHEN $14 THEN (CASE WHEN $15 THEN NULL::bigint   ELSE $16::bigint  END) ELSE \"finderBonusSats\"        END,\n             \"isPublic\"               = CASE WHEN $17 THEN $18 ELSE \"isPublic\" END,\n             \"resetRoundOnBlock\"      = CASE WHEN $19 THEN $20 ELSE \"resetRoundOnBlock\" END,\n             \"maxMembers\"             = CASE WHEN $21 THEN (CASE WHEN $22 THEN NULL::int ELSE $23::int END) ELSE \"maxMembers\" END,\n             \"updatedAt\"              = $24\n           WHERE id = $1\n           RETURNING\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "creator_address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "admin_token_hash!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "active!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "dissolved_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "round_reset_interval_days?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "round_reset_hour_local?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "round_reset_timezone?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "last_round_reset_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 12,
+        "name": "finder_bonus_sats?: Sats",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "round_reset_preset?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 14,
+        "name": "is_public!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 15,
+        "name": "reset_round_on_block!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 16,
+        "name": "max_members?",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bool",
+        "Bool",
+        "Varchar",
+        "Bool",
+        "Bool",
+        "Int4",
+        "Bool",
+        "Bool",
+        "Varchar",
+        "Bool",
+        "Bool",
+        "Int4",
+        "Bool",
+        "Bool",
+        "Int8",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "db12b9417bc4c65d90695398691f851f48e8944c09595a1baf29411b5c4a2520"
+}

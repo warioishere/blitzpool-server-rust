@@ -1,0 +1,82 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"telegramChatId\" AS \"telegram_chat_id!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"isDefault\" AS \"is_default!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\"\n           FROM telegram_subscriptions_entity\n           WHERE address = $1 AND \"deletedAt\" IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deleted_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "id!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "telegram_chat_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "best_diff_notifications_enabled!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 7,
+        "name": "is_default!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "device_notifications_enabled!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "hourly_stats_enabled!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "hourly_workers_enabled!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c1ceba6216a7c5d2c6ea85f086cea8c2d044d507d1038870094094465e36a2de"
+}

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pplns_group_join_request\n           SET status = $1,\n               \"decidedAt\" = $2,\n               \"decidedByAdminTokenHash\" = $3\n           WHERE id = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Int8",
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "235db87fde6b88009c32656e7b8e1aa927e136d875d109292cb9d3e74a775284"
+}

@@ -1,0 +1,354 @@
+# Blitzpool — Rust port configuration template
+#
+# Copy this file to `.local/blitzpool.toml` (or anywhere outside the
+# repo) and fill in the values for your deployment. `.local/` is
+# gitignored, so secrets stay out of version control.
+#
+# Run with:    cargo run -p blitzpool -- --config .local/blitzpool.toml
+#
+# Field semantics + defaults are documented in
+# `crates/bp-config/src/lib.rs`. Unknown keys cause a hard load error
+# — typos surface immediately instead of silently falling back to a
+# default.
+
+network = "mainnet"               # mainnet | testnet | regtest
+pool_identifier = "blitzpool"
+
+# Public UI base URL — required when SMTP is configured (used to
+# assemble invitation + email-verification links). No trailing slash.
+# pool_base_url = "https://blitzpool.example.com"
+
+# Operator mailbox for capacity-alert + fail-safe ops mails. Without
+# this the alert pipeline disables itself.
+# pool_admin_email = "admin@example.com"
+
+# `true` when the `/api` HTTP server is fronted by a TLS-terminating
+# proxy. Toggles HSTS + secure-cookie hints in responses.
+api_secure = false
+
+# ───────────────────────────────────────────────────────────────
+# Bitcoin Core
+# ───────────────────────────────────────────────────────────────
+
+[bitcoin_rpc]
+url = "http://127.0.0.1"
+user = "bitcoin"
+password = "REPLACE-ME"
+port = 8332
+timeout_ms = 10000
+
+# Optional ZeroMQ feed for raw-block notifications. The Rust port
+# primarily uses TDP for templates; ZMQ stays here for operators
+# still wiring a ZMQ source during cut-over.
+# [bitcoin_zmq]
+# host = "tcp://127.0.0.1:28332"
+
+# ───────────────────────────────────────────────────────────────
+# Template-Distribution-Protocol (TDP) — bitcoin-core IPC socket
+# ───────────────────────────────────────────────────────────────
+# The Rust port uses TDP-direkt instead of `getblocktemplate` RPC
+# (memory `project-tdp-direct-architecture`). Configure the IPC
+# socket on the bitcoin-core side and point this at it.
+
+[tdp]
+socket_path = "/var/run/bitcoind/bp-tdp.sock"
+# fee_threshold_sats = 1000000
+# min_interval_secs = 1
+# broadcast_capacity = 16
+
+# ───────────────────────────────────────────────────────────────
+# Postgres
+# ───────────────────────────────────────────────────────────────
+
+[database]
+driver = "postgres"
+host = "127.0.0.1"
+port = 5432
+user = "postgres"
+password = "REPLACE-ME"
+database = "public_pool"
+ssl = false
+pool_size = 10
+max_query_time_ms = 30000
+acquire_timeout_ms = 60000
+idle_timeout_ms = 10000
+run_migrations = true
+
+# ───────────────────────────────────────────────────────────────
+# Redis
+# ───────────────────────────────────────────────────────────────
+
+[redis]
+host = "127.0.0.1"
+port = 6379
+# password = "REPLACE-ME"
+db = 0
+ttl_secs = 600
+
+# ───────────────────────────────────────────────────────────────
+# HTTP API (axum)
+# ───────────────────────────────────────────────────────────────
+
+[api]
+port = 3334
+
+# Per-endpoint response-cache TTLs (seconds). Defaults shown.
+# Set any value to 0 to disable caching for that endpoint family.
+[api.cache]
+site_info_secs              = 300   # /api/info
+pool_info_secs              = 600   # /api/pool
+core_info_secs              = 60    # /api/info/core
+peer_info_secs              = 60    # /api/info/peers
+chart_secs                  = 60    # /api/info/chart
+shares_secs                 = 60    # /api/info/shares
+workers_secs                = 60    # /api/info/workers
+accepted_secs               = 60    # /api/info/accepted
+rejected_secs               = 60    # /api/info/rejected
+client_block_template_secs  = 60    # /api/client/:address/block-template
+client_info_secs            = 60    # /api/client/:address
+client_chart_secs           = 60    # /api/client/:address/chart
+client_worker_shares_secs   = 60    # /api/client/:address/worker-shares
+client_workers_secs         = 60    # /api/client/:address/workers
+client_accepted_secs        = 60    # /api/client/:address/accepted
+client_rejected_secs        = 60    # /api/client/:address/rejected
+client_diff_scores_secs     = 60    # /api/client/:address/diff-scores
+client_worker_group_secs    = 60    # /api/client/:address/:worker
+client_worker_session_secs  = 60    # /api/client/:address/:worker/:session
+
+# PPLNS endpoints
+pplns_root_secs             = 60    # /api/pplns
+pplns_mode_secs             = 60    # /api/pplns/mode/:address
+pplns_status_secs           = 60    # /api/pplns/status
+pplns_fees_secs             = 60    # /api/pplns/fees
+pplns_distribution_secs     = 60    # /api/pplns/distribution
+pplns_chart_secs            = 60    # /api/pplns/chart
+pplns_ledger_secs           = 30    # /api/pplns/ledger (sensitive — short TTL)
+pplns_address_secs          = 60    # /api/pplns/:address
+pplns_address_history_secs  = 60    # /api/pplns/:address/history
+
+# Group endpoints
+group_list_secs             = 60    # /api/pplns/groups
+group_public_list_secs      = 60    # /api/pplns/groups/public
+group_by_address_secs       = 60    # /api/pplns/groups/by-address/:address
+group_detail_secs           = 60    # /api/pplns/groups/:id
+group_public_detail_secs    = 60    # /api/pplns/groups/public/:id
+group_hashrate_secs         = 60    # /api/pplns/groups/:id/hashrate
+group_chart_secs            = 60    # /api/pplns/groups/:id/chart
+group_accepted_secs         = 60    # /api/pplns/groups/:id/accepted
+group_rejected_secs         = 60    # /api/pplns/groups/:id/rejected
+group_distribution_secs     = 60    # /api/pplns/groups/:id/distribution
+group_best_difficulty_secs  = 60    # /api/pplns/groups/:id/best-difficulty
+group_history_secs          = 60    # /api/pplns/groups/:id/history
+group_invitations_secs      = 30    # /api/pplns/groups/:id/invitations(/open/active)
+group_join_requests_secs    = 30    # /api/pplns/groups/:id/join-requests + by-address
+
+max_entries                 = 10000 # LRU capacity (all endpoints combined)
+
+# ───────────────────────────────────────────────────────────────
+# Stratum V1 (solo + high-diff ports)
+# ───────────────────────────────────────────────────────────────
+
+[stratum]
+solo_port = 3333
+solo_start_difficulty = 5000
+solo_high_diff_port = 3339
+high_diff_start_difficulty = 1000000
+job_retention_ms = 300000
+target_shares_per_minute = 15
+high_diff_target_shares_per_minute = 10
+difficulty_check_interval_ms = 240000
+
+# ───────────────────────────────────────────────────────────────
+# Stratum V2 + JDP
+# ───────────────────────────────────────────────────────────────
+
+[sv2]
+# 32-byte secp256k1 private key in hex. Pool identity for the Noise
+# NX handshake — miners pin the public key. Absent ⇒ random per
+# startup (staging only).
+# authority_privkey_hex = "REPLACE-ME-32-byte-hex"
+# ed25519_authority_seed_hex = "REPLACE-ME-32-byte-hex"
+# cert_signed_part = 42
+jdp_enabled = false
+# jdp_port = 3335
+
+# ───────────────────────────────────────────────────────────────
+# Protocol-level debug logging — all flags default `false` because
+# the traces are noisy under production load. Flip to `true` in
+# staging / regtest when diagnosing miner rejection rates or a Noise
+# handshake. NOTE: these gate *which* diagnostics are emitted; the
+# log LEVEL is still controlled by the RUST_LOG env var (a flag at
+# `true` only surfaces if its target is at `debug`, e.g.
+# RUST_LOG=info,bp_stratum_v2=debug). `submit_latency` logs at INFO.
+#   stratum_wire_logs  → SV1/SV2 protocol frame RX/TX dumps
+#   stratum_share_logs → per-share diff + accepted traces
+#                        (SV1 🎯/✅, SV2 🎯/📤 SubmitSharesExtended)
+#   noise_debug        → SV2 Noise handshake byte dumps
+#   submit_latency     → pool-internal submit→ack latency, SV1 + SV2 (INFO)
+# ───────────────────────────────────────────────────────────────
+
+[debug]
+stratum_wire_logs = false
+stratum_share_logs = false
+noise_debug = false
+submit_latency = false
+
+# ───────────────────────────────────────────────────────────────
+# PPLNS mode (optional — leave the whole [pplns] table out to disable)
+# ───────────────────────────────────────────────────────────────
+
+# [pplns]
+# port = 3340
+# high_diff_port = 3349
+# start_difficulty = 5000
+# target_shares_per_minute = 12
+# fee_address = "bc1qYOUR-PPLNS-FEE-ADDRESS"
+# fee_percent = 1.5
+# coinbase_weight_budget = 35000
+# min_difficulty = 500
+# warmup_shares = 5
+# min_payout_sats = 5000
+# Shares per count-bucket for the sliding window (default 10000). The window
+# is stored as per-address buckets of this many shares instead of one entry
+# per share; bigger = less Redis memory + coarser trim, smaller = more memory
+# + finer. MUST match the TS pool's PPLNS_BUCKET_SHARES (they share Redis).
+# bucket_shares = 10000
+# Daily 03:00 UTC abandoned-pair sweep on pplns_balance.
+# dust_sweep_enabled = true
+# abandoned_balance_days = 90
+
+# Coinbase-budget autoscaler (optional). Leave the sub-table out and the
+# budget stays fixed at coinbase_weight_budget above. Add it and the budget
+# self-adjusts at runtime — no restart — as your payout count grows.
+#   floor   = coinbase_weight_budget (above)
+#   ceiling = max_weight_budget (below, REQUIRED)
+# It steps multiplicatively with hysteresis + debounce + cooldown so it
+# never flaps. The persisted live value (Redis) survives restarts.
+# [pplns.coinbase_autoscale]
+# max_weight_budget = 200000   # hard ceiling in WU (required)
+# enabled = true               # default true
+# up_threshold = 0.85          # step up at ≥85% of the trim threshold
+# down_threshold = 0.50        # step down at ≤50% (rare)
+# step_factor = 1.15           # ×1.15 up / ÷1.15 down
+# up_debounce = 3              # consecutive high samples before stepping up
+# down_debounce = 10           # consecutive low samples before stepping down
+# cooldown_secs = 300          # min seconds between two changes
+# sample_interval_secs = 30    # how often utilization is evaluated
+
+# ───────────────────────────────────────────────────────────────
+# Fee overview
+#
+#   Solo:              [solo]        dev_fee_address / dev_fee_percent
+#   PPLNS:             [pplns]       fee_address / fee_percent
+#   Group-Solo:        [group_fees]  address / percent  (falls back to [pplns])
+#   Blockparty:        [group_fees]  address / percent  (same lane as Group-Solo)
+#
+# All fee percentages are in percent of block reward (1.5 = 1.5 %).
+# Solo dev-fee is optional; all others are required when the mode is enabled.
+# ───────────────────────────────────────────────────────────────
+
+# ───────────────────────────────────────────────────────────────
+# Solo (dev-fee + coinbase weight reservation)
+# ───────────────────────────────────────────────────────────────
+
+[solo]
+# dev_fee_address = "bc1qYOUR-SOLO-FEE-ADDRESS"
+# dev_fee_percent = 1.5
+# Coinbase weight reservation (WU) for Solo blocks. Solo pays 1–2 outputs, so
+# this stays tiny — bitcoin-core then packs the rest of the block with fee txs
+# instead of reserving PPLNS-sized space. Default 4000 (core min-clamps to 2000).
+# coinbase_weight_budget = 4000
+
+# ───────────────────────────────────────────────────────────────
+# Shared Group-Solo + Blockparty fee lane (independent from PPLNS).
+# Both fields optional — fall back to `[pplns].fee_address` /
+# `[pplns].fee_percent` so existing PPLNS-only deployments keep
+# working without a config change. New operators should set both.
+# ───────────────────────────────────────────────────────────────
+
+# [group_fees]
+# address = "bc1qYOUR-GROUP-FEE-ADDRESS"
+# percent = 1.5
+# Coinbase weight reservation (WU) for the Group-Solo template stream (a small
+# fixed reservation against the same bitcoind, separate from the autoscaled
+# PPLNS default). Size it to your largest group: ~172 WU/member (Taproot) + one
+# fee output. Default 10000 (~50 members). This value is wired into both the TDP
+# reservation AND the engine's distribution trimmer, so blocks stay valid:
+# members beyond the budget are rolled into the pool fee. Under-sizing costs
+# fairness (trimmed members get 0 sats), not validity.
+# coinbase_weight_budget = 10000
+# Daily 03:00 UTC dormant-row sweep on pplns_group_balance.
+# dust_sweep_enabled = true
+# dormant_balance_days = 30
+
+# ───────────────────────────────────────────────────────────────
+# Blockparty mode (optional — leave the whole [blockparty] table out
+# to disable). Fee address/percent come from [group_fees] above
+# (shared with Group-Solo), NOT from this block.
+# ───────────────────────────────────────────────────────────────
+
+# [blockparty]
+# min_payout_sats = 5000
+# Coinbase weight reservation (WU) for the Blockparty template stream (small
+# fixed reservation, separate from the autoscaled PPLNS default). ~172 WU/member
+# (Taproot) + one fee output. Default 8000 (~40 members). VALIDITY-CRITICAL — a
+# party past this reservation produces a coinbase bitcoin-core will reject.
+# coinbase_weight_budget = 8000
+
+# ───────────────────────────────────────────────────────────────
+# Outbound notifications — each sub-table optional
+# ───────────────────────────────────────────────────────────────
+
+[notifications]
+
+# [notifications.telegram]
+# bot_token = "REPLACE-ME"
+# diff_notifications = true
+
+# [notifications.ntfy]
+# server_url = "https://ntfy.example.com"
+# # access_token = "REPLACE-ME"
+# # topic_prefix = "blitzpool-"
+# diff_notifications = false
+
+# [notifications.web_push]
+# vapid_public_key = "REPLACE-ME"
+# vapid_private_key = "REPLACE-ME"
+# vapid_subject = "mailto:admin@example.com"
+
+# [notifications.fcm]
+# service_account_path = ".local/firebase-service-account.json"
+
+# ───────────────────────────────────────────────────────────────
+# SMTP (transactional email — invitations + verification)
+# ───────────────────────────────────────────────────────────────
+
+# [smtp]
+# host = "mail.example.com"
+# port = 587
+# secure = false                    # true ⇒ implicit TLS on 465
+# user = "noreply@example.com"
+# pass = "REPLACE-ME"
+# from = "Blitz Pool <noreply@example.com>"
+
+# ───────────────────────────────────────────────────────────────
+# Capacity alert + background aggregation
+# ───────────────────────────────────────────────────────────────
+
+[capacity_alert]
+enabled = true
+threshold = 0.8
+urgent_threshold = 0.95
+
+[aggregation]
+enabled = true
+pool_stats_interval_ms = 600000
+chart_data_interval_ms = 300000
+
+# Prometheus /metrics exporter. Default off — flip `enabled = true`
+# to bind the listener (default 0.0.0.0:9000). Recorder call-sites
+# across SV1/SV2/engines/crons are not yet wired; enabling here today
+# exposes an empty /metrics body but verifies the listener can bind.
+[metrics]
+enabled = false
+# bind = "0.0.0.0:9000"

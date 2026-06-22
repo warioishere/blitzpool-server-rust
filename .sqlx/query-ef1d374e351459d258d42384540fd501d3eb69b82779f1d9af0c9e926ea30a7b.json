@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pplns_group_balance\n             (address, \"groupId\", \"pendingSats\", \"totalPaidSats\", \"updatedAt\", \"lastAcceptedShareAt\")\n           SELECT * FROM UNNEST(\n             $1::text[], $2::uuid[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[]\n           )\n           ON CONFLICT (address, \"groupId\") DO UPDATE\n           SET \"pendingSats\"          = EXCLUDED.\"pendingSats\",\n               \"totalPaidSats\"        = EXCLUDED.\"totalPaidSats\",\n               \"updatedAt\"            = EXCLUDED.\"updatedAt\",\n               \"lastAcceptedShareAt\"  = COALESCE(EXCLUDED.\"lastAcceptedShareAt\",\n                                                 pplns_group_balance.\"lastAcceptedShareAt\")",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "UuidArray",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ef1d374e351459d258d42384540fd501d3eb69b82779f1d9af0c9e926ea30a7b"
+}

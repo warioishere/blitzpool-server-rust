@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pool_mode_hashrate (mode, \"time\", diff)\n           SELECT * FROM UNNEST($1::varchar[], $2::bigint[], $3::real[])\n           ON CONFLICT (mode, \"time\") DO UPDATE\n           SET diff = pool_mode_hashrate.diff + EXCLUDED.diff",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "VarcharArray",
+        "Int8Array",
+        "Float4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d5f173004736078252dddcd174df5c37b2ab9067473fbaa54463db6fc7943944"
+}

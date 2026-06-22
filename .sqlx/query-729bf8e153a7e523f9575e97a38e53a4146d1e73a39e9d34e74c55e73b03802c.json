@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO best_difficulty_tracker_entity\n             (address, \"bestDifficulty\", \"lastCheckedAt\", \"createdAt\", \"updatedAt\")\n           SELECT a, d, $3, $3, $3\n           FROM unnest($1::text[], $2::float8[]) AS u(a, d)\n           ON CONFLICT (address) DO UPDATE SET\n             \"bestDifficulty\" = EXCLUDED.\"bestDifficulty\",\n             \"lastCheckedAt\" = EXCLUDED.\"lastCheckedAt\",\n             \"updatedAt\" = EXCLUDED.\"updatedAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Float8Array",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "729bf8e153a7e523f9575e97a38e53a4146d1e73a39e9d34e74c55e73b03802c"
+}

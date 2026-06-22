@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM pplns_group_member WHERE \"groupId\" = $1 AND address = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e048b4cc71dd4dec0682a475c99bdfe87460fc53c13f59a7475602d5dbbf0714"
+}

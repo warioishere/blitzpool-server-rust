@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            address AS \"address!: AddressId\",\n            \"bestDifficulty\" AS \"best_difficulty!\",\n            \"lastCheckedAt\" AS \"last_checked_at!\"\n           FROM best_difficulty_tracker_entity WHERE address = ANY($1)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deleted_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "best_difficulty!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 5,
+        "name": "last_checked_at!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "253f9744bc31791823d8e3a6a3f292fa3594c76e837cafa10fde70acf5bce96b"
+}

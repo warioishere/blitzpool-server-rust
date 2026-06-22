@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pool_rejected_statistics_entity (\"time\", reason, count, \"updatedAt\")\n           SELECT u.t, u.r, u.c, (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint\n           FROM UNNEST($1::bigint[], $2::varchar[], $3::real[]) AS u(t, r, c)\n           ON CONFLICT (\"time\", reason) DO UPDATE\n           SET count      = pool_rejected_statistics_entity.count + EXCLUDED.count,\n               \"updatedAt\" = EXCLUDED.\"updatedAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        "VarcharArray",
+        "Float4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "53e7ad6ff249fb19fb767e90adf9ed4c8074340bd5c51188b2052604527bba8b"
+}

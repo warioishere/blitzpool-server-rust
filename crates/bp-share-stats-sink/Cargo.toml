@@ -1,0 +1,36 @@
+[package]
+name = "bp-share-stats-sink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal — accumulators + DB primitives + share-side traits
+bp-common = { workspace = true }
+bp-stats = { workspace = true }
+bp-db = { workspace = true }
+# Protocol-agnostic per-share hook surface — see bp-share-hook crate
+# docs. Same trait used for SV1 + SV2 servers.
+bp-share-hook = { workspace = true }
+bp-share = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Direct PG access (no trait abstraction — analog to bp-pplns-engine)
+sqlx = { workspace = true }
+
+# Observability + errors
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+sqlx = { workspace = true }

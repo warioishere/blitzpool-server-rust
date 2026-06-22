@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            shares AS \"shares!\",\n            \"rejectedShares\" AS \"rejected_shares!\"\n           FROM worker_shares_entity\n           WHERE address = $1 AND \"clientName\" = $2 LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "client_name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "shares!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 3,
+        "name": "rejected_shares!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "053d4c1343b5730bee2094b937e509d3f96e30175291168b4efcd5076c72e836"
+}

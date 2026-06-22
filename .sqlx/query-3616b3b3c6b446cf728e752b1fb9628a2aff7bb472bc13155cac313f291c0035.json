@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE push_subscription_entity\n           SET \"deletedAt\" = $3, \"updatedAt\" = $3\n           WHERE address = $1\n             AND \"subscriptionType\" = $2\n             AND \"deletedAt\" IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3616b3b3c6b446cf728e752b1fb9628a2aff7bb472bc13155cac313f291c0035"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE push_subscription_entity\n           SET \"lastNotificationAt\" = $2, \"updatedAt\" = $2\n           WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5f68cf65de95d050405f1de67bc91f432c1fff89d7340b1a972f4b4c03c21a4f"
+}

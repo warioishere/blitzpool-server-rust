@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "bp-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# Shared helpers for the regtest / integration test suites. Pure
+# test-support — only ever a `dev-dependency` of other crates. Houses the
+# previously copy-pasted helpers (poll_for_height, brute_force_nonce,
+# wait_for_paired_template, the redis/PG connect-or-skip gates, …) so a
+# change lands in one place instead of ~15 test files.
+[dependencies]
+bitcoin = { workspace = true }
+bp-share = { workspace = true }
+bp-mining-job = { workspace = true }
+bp-template-distribution = { workspace = true }
+bp-regtest-harness = { workspace = true }
+redis = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }

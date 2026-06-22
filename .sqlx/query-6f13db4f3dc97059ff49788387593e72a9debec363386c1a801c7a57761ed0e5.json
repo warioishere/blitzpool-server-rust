@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE blockparty_member\n           SET \"percentBp\" = $3, \"updatedAt\" = $4\n           WHERE \"groupId\" = $1 AND address = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6f13db4f3dc97059ff49788387593e72a9debec363386c1a801c7a57761ed0e5"
+}

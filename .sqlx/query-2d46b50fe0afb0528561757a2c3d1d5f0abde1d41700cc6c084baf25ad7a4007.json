@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pplns_group_invitation\n           SET status = 'revoked', \"respondedAt\" = $1\n           WHERE \"groupId\" = $2 AND status = 'pending' AND \"inviteType\" = 'open'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2d46b50fe0afb0528561757a2c3d1d5f0abde1d41700cc6c084baf25ad7a4007"
+}

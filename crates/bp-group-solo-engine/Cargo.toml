@@ -1,0 +1,67 @@
+[package]
+name = "bp-group-solo-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal — pure math + domain types + shared utilities
+bp-common = { workspace = true }
+bp-pplns = { workspace = true }
+bp-group-solo = { workspace = true }
+bp-db = { workspace = true }
+# Shared snapshot persistence + ledger row-type primitives (also used
+# by bp-pplns-engine — one source of truth for the wire formats).
+bp-coinbase-snapshot = { workspace = true }
+# Protocol-agnostic per-share hook surface — see bp-share-hook crate
+# docs. Same trait used for SV1 + SV2 servers.
+bp-share-hook = { workspace = true }
+bp-inflight-cache = { workspace = true }
+bp-cron-utils = { workspace = true }
+uuid = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# I/O — direct clients (no trait abstraction)
+redis = { workspace = true }
+sqlx = { workspace = true }
+
+# Date/time — cron + abandoned-cutoff math
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+
+# Observability + errors
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# Snapshot serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+bp-test-support = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+redis = { workspace = true }
+sqlx = { workspace = true }
+bp-common = { workspace = true }
+bp-pplns = { workspace = true }
+bp-group-solo = { workspace = true }
+bp-db = { workspace = true }
+uuid = { workspace = true }
+# T1 equivalence: drive the same engine sink via the Core→Satellite stream.
+bp-share-stream = { workspace = true }
+# E2E regtest deps for the group-solo distribution → coinbase →
+# bitcoin-core acceptance pipeline test.
+bp-regtest-harness = { workspace = true }
+bp-template-distribution = { workspace = true }
+bp-mining-job = { workspace = true }
+bp-share = { workspace = true }
+bitcoin = { workspace = true }

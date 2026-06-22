@@ -1,0 +1,29 @@
+[package]
+name = "bp-share-hook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+# MiningMode (Solo / Pplns / GroupSolo / Blockparty) stamped onto each
+# accepted share by the producer, so sinks read the share's resolved mode
+# instead of re-querying a mode-gate per share.
+bp-common = { workspace = true }
+# Owned share records derive Serialize/Deserialize so they can be the wire
+# unit on the Core→Satellite share stream (bp-share-stream).
+serde = { workspace = true }
+# Canonical RejectedReason enum (3-variant: JobNotFound / DuplicateShare /
+# LowDifficulty) shared with the bp-stats accumulators. SV1 and SV2
+# adapters map their protocol-specific 4-variant enums into this stable
+# 3-variant form before invoking SharedRejectedShareSink.
+bp-stats = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

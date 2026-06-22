@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO client_entity\n             (address, \"clientName\", \"sessionId\", \"userAgent\", \"startTime\", \"firstSeen\",\n              \"currentDifficulty\", \"createdAt\", \"updatedAt\")\n           VALUES ($1, $2, $3, $4, $5, $5, $6,\n                   (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,\n                   (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)\n           ON CONFLICT (address, \"clientName\", \"sessionId\") DO UPDATE\n           SET \"userAgent\"         = EXCLUDED.\"userAgent\",\n               \"startTime\"         = EXCLUDED.\"startTime\",\n               \"currentDifficulty\" = EXCLUDED.\"currentDifficulty\",\n               \"updatedAt\"         = EXCLUDED.\"updatedAt\",\n               \"deletedAt\"         = NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Float4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d86f420a200af692f16b5ce3659352cc59ab0f8b0886adea676e750f4466f6a1"
+}

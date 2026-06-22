@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pplns_group_member\n           SET role = $1\n           WHERE \"groupId\" = $2 AND address = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "860bd93f901c631bd32a70f3a16e1ae8081d39c637317e19ad20d4da1868ae5d"
+}

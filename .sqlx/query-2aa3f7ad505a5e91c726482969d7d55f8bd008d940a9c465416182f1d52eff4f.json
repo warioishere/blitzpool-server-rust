@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            \"userAgent\" AS user_agent,\n            \"time\" AS \"time!\",\n            \"externalPoolName\" AS external_pool_name,\n            difficulty AS \"difficulty!\"\n           FROM (\n             SELECT DISTINCT ON (address)\n                address,\n                \"userAgent\",\n                \"time\",\n                \"externalPoolName\",\n                difficulty\n             FROM external_shares_entity\n             WHERE \"deletedAt\" IS NULL\n             ORDER BY address, difficulty DESC\n           ) t\n           ORDER BY difficulty DESC\n           LIMIT 10",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_agent",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "time!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "external_pool_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "difficulty!",
+        "type_info": "Float4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "2aa3f7ad505a5e91c726482969d7d55f8bd008d940a9c465416182f1d52eff4f"
+}

@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            language AS \"language!\",\n            \"bestDiffNotificationsEnabled\" AS \"best_diff_notifications_enabled!\",\n            \"deviceNotificationsEnabled\" AS \"device_notifications_enabled!\",\n            \"hourlyStatsEnabled\" AS \"hourly_stats_enabled!\",\n            \"hourlyWorkersEnabled\" AS \"hourly_workers_enabled!\"\n           FROM ntfy_subscriptions_entity WHERE id = $1 LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deleted_at?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "id!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "language!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "best_diff_notifications_enabled!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 7,
+        "name": "device_notifications_enabled!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "hourly_stats_enabled!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "hourly_workers_enabled!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3299379c2c758413291669a970e148d75b49f013732254ab7ab345636d331f50"
+}

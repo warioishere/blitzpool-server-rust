@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT \"slotTime\" AS \"slot_time: i64\",\n                          MAX(\"maxDifficulty\") AS \"max_diff: f32\"\n                   FROM client_difficulty_statistics_entity\n                   WHERE address = $1\n                     AND \"slotTime\" BETWEEN $2 AND $3\n                   GROUP BY \"slotTime\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "slot_time: i64",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "max_diff: f32",
+        "type_info": "Float4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "3d7f7914bb859d57c8dd23af3f1162b0097872e2f0f76ba265688ae8a395a48f"
+}

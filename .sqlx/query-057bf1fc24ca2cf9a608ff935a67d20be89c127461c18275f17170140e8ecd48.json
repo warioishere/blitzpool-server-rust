@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pplns_payout_history\n             (\"blockHeight\", address, \"paidSats\", percent, \"rowType\", \"createdAt\")\n           SELECT * FROM UNNEST(\n             $1::int[], $2::text[], $3::bigint[], $4::real[], $5::text[], $6::bigint[]\n           )\n           ON CONFLICT (\"blockHeight\", address) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4Array",
+        "TextArray",
+        "Int8Array",
+        "Float4Array",
+        "TextArray",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "057bf1fc24ca2cf9a608ff935a67d20be89c127461c18275f17170140e8ecd48"
+}

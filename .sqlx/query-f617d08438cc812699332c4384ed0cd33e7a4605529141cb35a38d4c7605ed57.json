@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM push_subscription_entity\n           WHERE (\"lastNotificationAt\" IS NULL AND \"createdAt\" < $1)\n              OR \"lastNotificationAt\" < $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f617d08438cc812699332c4384ed0cd33e7a4605529141cb35a38d4c7605ed57"
+}

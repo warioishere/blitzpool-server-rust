@@ -1,0 +1,47 @@
+[package]
+name = "bp-stratum-v1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+bitcoin = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+faster-hex = { workspace = true }
+getrandom = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+bp-common = { workspace = true }
+bp-mining-job = { workspace = true }
+bp-share = { workspace = true }
+bp-template-distribution = { workspace = true }
+bp-vardiff = { workspace = true }
+# Job-lifecycle math (retire-not-clear, classify, age_entries) is shared
+# with bp-stratum-v2 — extracted as a pure-math leaf 2026-05-16.
+bp-jobs-lifecycle = { workspace = true }
+# Protocol-agnostic accepted-share hook surface. SV1's per-protocol
+# `AcceptedShareSink` here is layered above the shared trait so engines
+# can implement `SharedAcceptedShareSink` once for both SV1 + SV2.
+bp-share-hook = { workspace = true }
+
+[dev-dependencies]
+bp-test-support = { workspace = true }
+bp-regtest-harness = { workspace = true }
+tokio = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "parse"
+harness = false

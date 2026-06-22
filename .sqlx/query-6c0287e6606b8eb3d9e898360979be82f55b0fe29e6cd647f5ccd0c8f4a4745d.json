@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE address_settings_entity\n           SET \"bestDifficulty\" = 0,\n               \"bestDifficultyUserAgent\" = NULL,\n               \"updatedAt\" = $2\n           WHERE address = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6c0287e6606b8eb3d9e898360979be82f55b0fe29e6cd647f5ccd0c8f4a4745d"
+}
