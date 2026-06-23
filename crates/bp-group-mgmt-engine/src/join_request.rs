@@ -165,7 +165,13 @@ impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
             .map(|m| {
                 let cap = bp_group_mgmt::constants::MAX_JOIN_REQUEST_MESSAGE_LEN;
                 if m.len() > cap {
-                    m[..cap].to_string()
+                    // Back off to a UTF-8 char boundary so a multibyte char
+                    // straddling the cap can't panic the slice.
+                    let mut end = cap;
+                    while !m.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    m[..end].to_string()
                 } else {
                     m.to_string()
                 }

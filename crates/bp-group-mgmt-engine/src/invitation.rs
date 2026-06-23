@@ -642,17 +642,31 @@ impl<H: GroupServiceHooks, M: EmailHooks> InvitationService<H, M> {
     }
 }
 
-/// Mask the local part of an email for public surfacing: first char +
-/// asterisks (e.g. `foo@bar.com` → `f***@bar.com`).
+/// Mask an email for public surfacing: first char of the local part plus
+/// first char of the domain, TLD kept (e.g. `foo@bar.com` → `f***@b***.com`).
+/// Obscuring the domain head keeps a custom/vanity domain from pinpointing
+/// identity. Malformed / TLD-less inputs collapse to `***` forms.
 fn mask_email(email: &str) -> String {
-    match email.split_once('@') {
-        Some((local, domain)) if !local.is_empty() => {
-            let first = local.chars().next().unwrap_or('?');
-            format!("{first}***@{domain}")
-        }
-        Some((_, domain)) => format!("***@{domain}"),
-        None => "***".into(),
+    if email.is_empty() {
+        return String::new();
     }
+    let Some(at_idx) = email.find('@') else {
+        return "***".to_owned();
+    };
+    if at_idx == 0 || at_idx == email.len() - 1 {
+        return "***".to_owned();
+    }
+    let local_head = email[..at_idx].chars().next().unwrap_or('?');
+    let domain = &email[at_idx + 1..];
+    let Some(dot_idx) = domain.find('.') else {
+        return format!("{local_head}***@***");
+    };
+    if dot_idx == 0 {
+        return format!("{local_head}***@***");
+    }
+    let domain_head = domain.chars().next().unwrap_or('?');
+    let tld_and_below = &domain[dot_idx..];
+    format!("{local_head}***@{domain_head}***{tld_and_below}")
 }
 
 /// Logged-only no-op for callers that want a non-async helper to
@@ -680,10 +694,12 @@ mod tests {
     }
 
     #[test]
-    fn mask_email_keeps_first_char_only() {
-        assert_eq!(mask_email("foo@bar.com"), "f***@bar.com");
-        assert_eq!(mask_email("a@x.io"), "a***@x.io");
-        assert_eq!(mask_email("@y.io"), "***@y.io");
+    fn mask_email_obscures_local_and_domain_head() {
+        assert_eq!(mask_email("foo@bar.com"), "f***@b***.com");
+        assert_eq!(mask_email("a@x.io"), "a***@x***.io");
+        assert_eq!(mask_email("alice@gmail.com"), "a***@g***.com");
+        assert_eq!(mask_email("user@localhost"), "u***@***");
+        assert_eq!(mask_email("@y.io"), "***");
         assert_eq!(mask_email("garbage"), "***");
     }
 }

@@ -1162,10 +1162,17 @@ struct PublicGroupDetail {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RecentBlock {
+    id: i32,
+    group_id: Uuid,
     block_height: i32,
-    created_at: i64,
+    /// ISO-8601.
+    created_at: String,
     address: String,
     paid_sats: i64,
+    percent: f64,
+    shares_in_round: i64,
+    total_shares_in_round: i64,
+    row_type: String,
 }
 
 async fn public_one<H, M>(
@@ -1192,15 +1199,21 @@ where
                 let members = svc.list_members(id).await?;
                 let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
                 let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
-                let history = bp_db::find_recent_group_block_history(&s.pool, id, 10).await?;
+                let history = bp_db::find_recent_group_block_history(&s.pool, id, 20).await?;
                 Ok(PublicGroupDetail {
                     recent_blocks: history
                         .into_iter()
                         .map(|h| RecentBlock {
+                            id: h.id,
+                            group_id: h.group_id,
                             block_height: h.block_height,
-                            created_at: h.created_at,
+                            created_at: crate::time_range::format_slot_label(h.created_at),
                             address: h.address.as_str().to_string(),
                             paid_sats: h.paid_sats.to_i64(),
+                            percent: h.percent as f64,
+                            shares_in_round: h.shares_in_round,
+                            total_shares_in_round: h.total_shares_in_round,
+                            row_type: h.row_type,
                         })
                         .collect(),
                     summary: GroupSummary::from(group),
@@ -1281,10 +1294,11 @@ where
             for m in members {
                 let balance = bp_db::find_group_balance(&s.pool, &m.address, id).await?;
                 let email = bp_db::find_address_email(&s.pool, &m.address).await?;
+                // Admin sees a masked email (enough to tell "verified email
+                // present" from "none"); non-admins get no email field.
                 let email_out = match (is_admin, email.as_ref()) {
-                    (true, Some(b)) => Some(b.email.clone()),
-                    (false, Some(b)) => Some(crate::utils::mask_email(&b.email)),
-                    (_, None) => None,
+                    (true, Some(b)) => Some(crate::utils::mask_email(&b.email)),
+                    _ => None,
                 };
                 let hashrate = per_addr_hashrate
                     .get(m.address.as_str())
@@ -1437,30 +1451,11 @@ where
                     .ok_or(ApiError::Unavailable("group-solo-engine not wired"))?;
                 let stats = engine.reader().round_stats(id).await?;
                 let total_shares: f64 = stats.per_address.values().sum();
-
-                // Per-address rejected-difficulty sum sourced from
-                // `client_rejected_statistics_entity.shares` (the diff-1 sum at
-                // the moment of rejection). One SQL with `address = ANY` is
-                // cheaper than N lookups for sizeable groups.
-                let addresses: Vec<String> = stats.per_address.keys().cloned().collect();
-                let mut rejected_by_addr: std::collections::HashMap<String, f64> =
-                    std::collections::HashMap::new();
-                if !addresses.is_empty() {
-                    let rows = sqlx::query!(
-                        r#"SELECT address::text AS "address!", COALESCE(SUM(shares), 0)::float8 AS "total!"
-                           FROM client_rejected_statistics_entity
-                           WHERE address = ANY($1) AND "deletedAt" IS NULL
-                           GROUP BY address"#,
-                        &addresses as &[String]
-                    )
-                    .fetch_all(&s.pool)
-                    .await
-                    .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
-                    for r in rows {
-                        rejected_by_addr.insert(r.address, r.total);
-                    }
-                }
-                let total_rejected: f64 = rejected_by_addr.values().sum();
+                // Rejected shares are round-scoped — read from the same round
+                // store as the accepted shares so both describe the current
+                // round, not an all-time total.
+                let total_rejected: f64 = stats.total_rejected;
+                let rejected_by_addr = stats.rejected_per_address;
 
                 let mut entries: Vec<DistributionEntry> = stats
                     .per_address
@@ -1560,11 +1555,14 @@ struct HistoryQuery {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HistoryEntry {
+    id: i32,
+    group_id: Uuid,
     block_height: i32,
     /// ISO-8601 timestamp the history row was written.
     created_at: String,
     address: String,
     paid_sats: i64,
+    percent: f64,
     shares_in_round: i64,
     total_shares_in_round: i64,
     row_type: String,
@@ -1589,10 +1587,13 @@ where
             Ok(rows
                 .into_iter()
                 .map(|h| HistoryEntry {
+                    id: h.id,
+                    group_id: h.group_id,
                     block_height: h.block_height,
                     created_at: crate::time_range::format_slot_label(h.created_at),
                     address: h.address.as_str().to_string(),
                     paid_sats: h.paid_sats.to_i64(),
+                    percent: h.percent as f64,
                     shares_in_round: h.shares_in_round,
                     total_shares_in_round: h.total_shares_in_round,
                     row_type: h.row_type,

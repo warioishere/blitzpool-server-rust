@@ -131,6 +131,7 @@ pub struct RoundStats {
     pub total_shares: f64,
     pub total_rejected: f64,
     pub per_address: HashMap<String, f64>,
+    pub rejected_per_address: HashMap<String, f64>,
 }
 
 // ── Store ──────────────────────────────────────────────────────────
@@ -367,6 +368,7 @@ impl GroupRoundStore {
             total_shares,
             total_rejected,
             per_address: by_address,
+            rejected_per_address: rejected_map,
         })
     }
 
@@ -464,6 +466,7 @@ mod tests {
             total_shares: per.values().sum(),
             total_rejected: 0.0,
             per_address: per,
+            rejected_per_address: HashMap::new(),
         };
         assert!((stats.total_shares - 100.0).abs() < 1e-9);
         assert_eq!(stats.per_address.len(), 2);

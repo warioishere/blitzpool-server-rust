@@ -329,7 +329,7 @@ async fn list_pending_for_address_masks_email_and_filters_expired() {
         .expect("list");
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].group_id, g.group.id);
-    assert_eq!(list[0].masked_email, "l***@example.com");
+    assert_eq!(list[0].masked_email, "l***@e***.com");
     cleanup_group(&pool, g.group.id).await;
     delete_email_for(&pool, &invitee).await;
 }
