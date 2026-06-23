@@ -99,6 +99,29 @@ impl MemberPublicView {
     }
 }
 
+/// Member shape embedded in the public invitation view: roster + splits
+/// only, no contact details. The invitee sees who is in and at what
+/// percentage before accepting.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InviteMemberView {
+    address: String,
+    percent_bp: i32,
+    role: String,
+    confirmed: bool,
+}
+
+impl InviteMemberView {
+    fn from_row(r: &BlockpartyMemberRow) -> Self {
+        Self {
+            address: r.address.as_str().to_owned(),
+            percent_bp: r.percent_bp,
+            role: r.role.clone(),
+            confirmed: r.confirmed_at.is_some(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InvitationAdminView {
@@ -779,7 +802,8 @@ where
 
 #[derive(Serialize)]
 struct TransitionResponse {
-    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
 }
 
 async fn transition_confirming<H, M>(
@@ -796,10 +820,11 @@ where
         .transition_to_confirming(id, admin_token(&headers).as_deref())
         .await?;
     // Re-read so a recomputeStatus that auto-promoted CONFIRMING → READY
-    // surfaces in the response.
-    let group = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
+    // surfaces in the response. A group that vanished in the race window
+    // yields an omitted status rather than a 404.
+    let group = svc.get_group(id).await?;
     Ok(Json(TransitionResponse {
-        status: group.status,
+        status: group.map(|g| g.status),
     }))
 }
 
@@ -851,7 +876,7 @@ struct InvitationView {
     email: String,
     status: String,
     expires_at: i64,
-    members: Vec<MemberPublicView>,
+    members: Vec<InviteMemberView>,
     pool_fee_percent: f64,
 }
 
@@ -882,10 +907,7 @@ where
         email: invitation.email,
         status: effective_status,
         expires_at: invitation.expires_at,
-        members: members
-            .iter()
-            .map(MemberPublicView::from_row_masked)
-            .collect(),
+        members: members.iter().map(InviteMemberView::from_row).collect(),
         pool_fee_percent: svc.pool_fee_percent(),
     }))
 }
