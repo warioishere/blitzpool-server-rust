@@ -91,7 +91,7 @@ async fn pplns_status_returns_503_when_engine_unwired() {
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["error"]["code"], "upstream-unavailable");
+    assert_eq!(json["code"], "upstream-unavailable");
 }
 
 #[tokio::test]
@@ -179,7 +179,7 @@ async fn client_by_address_invalid_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["error"]["code"], "invalid-address");
+    assert_eq!(json["code"], "invalid-address");
 }
 
 #[tokio::test]
@@ -412,7 +412,7 @@ async fn push_register_missing_fields_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["error"]["code"], "missing-fields-address-endpoint");
+    assert_eq!(json["code"], "missing-fields-address-endpoint");
 }
 
 #[tokio::test]

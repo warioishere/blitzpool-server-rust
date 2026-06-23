@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Uniform JSON error envelope for every endpoint.
+//! Uniform JSON error body for every endpoint.
 //!
-//! Response shape: `{"error": {"code": "string", "message": "human"}}`
-//! plus an HTTP status code. The UI maps `code` to localised text,
-//! so the error code strings are kept stable for UI localisation.
+//! Response shape: `{"code": "string", "message": "human"}` plus an HTTP
+//! status code. The UI maps `code` to localised text, so the error code
+//! strings are kept stable for UI localisation.
 
 use axum::{
     http::StatusCode,
@@ -106,12 +106,6 @@ impl ApiError {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ErrorEnvelope<'a> {
-    error: ErrorBody<'a>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ErrorBody<'a> {
     code: &'a str,
     message: String,
@@ -120,14 +114,12 @@ struct ErrorBody<'a> {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
-        let body = ErrorEnvelope {
-            error: ErrorBody {
-                code: self.code(),
-                message: self.to_string(),
-            },
+        let body = ErrorBody {
+            code: self.code(),
+            message: self.to_string(),
         };
         if status.is_server_error() {
-            tracing::warn!(target: "bp_api", code = %body.error.code, error = %self,
+            tracing::warn!(target: "bp_api", code = %body.code, error = %self,
                 "endpoint returned server error");
         }
         (status, Json(body)).into_response()
