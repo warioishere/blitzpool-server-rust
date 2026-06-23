@@ -203,7 +203,7 @@ async fn main() -> ExitCode {
     // payout Satellite consumes them. A single process holding both `front`
     // and `payout` would produce shares no one consumes — fail fast rather
     // than silently drop the money path. Run the front (core) and the payout
-    // back (satellite) as separate processes (see docker-compose.split.yml).
+    // back (satellite) as separate processes (see full-setup/SPLIT-DEPLOYMENT.md).
     if cfg.has_role(Role::Front) && cfg.has_role(Role::Payout) {
         tracing::error!(
             "invalid roles: a single process cannot run both `front` and `payout` \

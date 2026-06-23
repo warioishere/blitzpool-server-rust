@@ -1,25 +1,64 @@
 # blitzpool-rust full stack - single compose file, network selected
 # via docker-compose profiles.
 #
-# Layout:
-#   postgres + redis  always-on (shared across networks)
-#   bitcoin-<net> + blitzpool-<net>  enabled by profile
+# Infra (postgres + redis always-on; bitcoin-<net> per profile) plus the
+# pool itself, which runs as FOUR processes from one image + one shared
+# config, differing only by BLITZPOOL_ROLES:
+#
+#   blitzpool-core      roles=front          Stratum + producer + block submit + JDP (holds the miners)
+#   blitzpool-api       roles=api            read-only HTTP API (charts/admin)
+#   blitzpool-payout    roles=payout,stats   accounting ledger + stream consumers + maintenance crons
+#   blitzpool-notify    roles=notify         dispatcher + listeners + notification crons
+#
+# There is no single-process "monolith": the front (core) and the back
+# (payout/api/notify) must run as separate processes, so a back-office fix
+# redeploys by recreating one container without dropping miners. See
+# SPLIT-DEPLOYMENT.md.
 #
 # Bring up exactly one network at a time:
 #
-#   docker compose --profile regtest  up -d
-#   docker compose --profile testnet4 up -d
-#   docker compose --profile mainnet  up -d
+#   docker compose --profile mainnet  up -d --build
+#   docker compose --profile regtest  up -d --build
 #
-# Switch networks by stopping the current profile and starting another:
+# mainnet uses ../.local/blitzpool.toml by default. For testnet4 / regtest,
+# point BLITZPOOL_CONFIG at the matching config (mounted to /app/blitzpool.toml):
 #
-#   docker compose --profile regtest down
-#   docker compose --profile mainnet up -d
+#   BLITZPOOL_CONFIG=blitzpool-testnet4.toml docker compose --profile testnet4 up -d
+#   BLITZPOOL_CONFIG=blitzpool-regtest.toml  docker compose --profile regtest  up -d
+#
+# Deploy a back-office fix with near-zero downtime (build, then swap one):
+#
+#   docker compose build blitzpool-payout
+#   docker compose up -d --no-deps blitzpool-payout
 #
 # The shared postgres holds one DB per network so switching does NOT
 # wipe the other network's state. Default DB name = `blitzpool` for
 # new installs; set PG_DATABASE=public_pool in .env when attaching to
 # an existing TS-pool DB.
+
+# Shared base for the four pool processes — they differ only by
+# BLITZPOOL_ROLES, ports, and RUST_LOG. Enabled in every network profile;
+# the mounted config (BLITZPOOL_CONFIG) selects the network.
+x-blitzpool-app: &blitzpool-app
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: blitzpool:latest
+  restart: unless-stopped
+  stop_grace_period: 30s
+  profiles: ["mainnet", "testnet4", "regtest"]
+  networks:
+    - blitzpool
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "3"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
 
 services:
   # -- always-on backing services -----------------------------------
@@ -114,7 +153,7 @@ services:
     volumes:
       - "./data/redis:/data"
 
-  # -- mainnet profile ----------------------------------------------
+  # -- bitcoin node, one per network (profile-gated) ----------------
   bitcoin-mainnet:
     profiles: ["mainnet"]
     container_name: blitzpool-bitcoin-mainnet
@@ -141,51 +180,6 @@ services:
       - "./docker/bitcoin/mainnet/bitcoin.conf:/app/data/bitcoin.conf:ro"
       - "ipc:/ipc"
 
-  blitzpool-mainnet:
-    profiles: ["mainnet"]
-    container_name: blitzpool-mainnet
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    stop_grace_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "3"
-    deploy:
-      resources:
-        limits:
-          memory: 4096M
-    networks:
-      - blitzpool
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      bitcoin-mainnet:
-        condition: service_started
-    ports:
-      - "0.0.0.0:3333:3333/tcp"
-      - "0.0.0.0:3339:3339/tcp"
-      - "0.0.0.0:3340:3340/tcp"
-      - "0.0.0.0:3349:3349/tcp"
-      - "0.0.0.0:3335:3335/tcp"
-      - "0.0.0.0:3337:3337/tcp"
-      - "0.0.0.0:3334:3334/tcp"
-      - "127.0.0.1:9000:9000/tcp"
-    volumes:
-      - "../.local/blitzpool.toml:/app/blitzpool.toml:ro"
-      - "./data/blitzpool-logs:/app/logs"
-      - "../.local:/app/keys:ro"
-      - "ipc:/ipc"
-    environment:
-      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_stratum_v1=debug,bp_stratum_v2=debug,bp_template_distribution=debug}
-      - RUST_BACKTRACE=1
-
-  # -- testnet4 profile ---------------------------------------------
   bitcoin-testnet4:
     profiles: ["testnet4"]
     container_name: blitzpool-bitcoin-testnet4
@@ -210,47 +204,6 @@ services:
       - "./docker/bitcoin/testnet4/bitcoin.conf:/app/data/bitcoin.conf:ro"
       - "ipc:/ipc"
 
-  blitzpool-testnet4:
-    profiles: ["testnet4"]
-    container_name: blitzpool-testnet4
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    stop_grace_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "3"
-    networks:
-      - blitzpool
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      bitcoin-testnet4:
-        condition: service_started
-    ports:
-      - "0.0.0.0:3333:3333/tcp"
-      - "0.0.0.0:3339:3339/tcp"
-      - "0.0.0.0:3340:3340/tcp"
-      - "0.0.0.0:3349:3349/tcp"
-      - "0.0.0.0:3335:3335/tcp"
-      - "0.0.0.0:3337:3337/tcp"
-      - "0.0.0.0:3334:3334/tcp"
-      - "127.0.0.1:9000:9000/tcp"
-    volumes:
-      - "../.local/blitzpool-testnet4.toml:/app/blitzpool.toml:ro"
-      - "./data/blitzpool-logs:/app/logs"
-      - "../.local:/app/keys:ro"
-      - "ipc:/ipc"
-    environment:
-      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_stratum_v1=debug,bp_stratum_v2=debug,bp_template_distribution=debug}
-      - RUST_BACKTRACE=1
-
-  # -- regtest profile ----------------------------------------------
   bitcoin-regtest:
     profiles: ["regtest"]
     container_name: blitzpool-bitcoin-regtest
@@ -273,39 +226,80 @@ services:
       - "./docker/bitcoin/regtest/bitcoin.conf:/app/data/bitcoin.conf:ro"
       - "ipc:/ipc"
 
-  blitzpool-regtest:
-    profiles: ["regtest"]
-    container_name: blitzpool-regtest
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    stop_grace_period: 30s
-    networks:
-      - blitzpool
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      bitcoin-regtest:
-        condition: service_started
+  # -- pool processes: core / api / payout / notify -----------------
+  # Always-on front: holds the miner connections. Only this process needs
+  # the bitcoin IPC socket (TDP is front-only). Recreate only to ship a
+  # share-path / coinbase-math fix (miners reconnect).
+  blitzpool-core:
+    <<: *blitzpool-app
+    container_name: blitzpool-core
+    environment:
+      - BLITZPOOL_ROLES=front
+      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_stratum_v1=debug,bp_stratum_v2=debug,bp_template_distribution=debug}
+      - RUST_BACKTRACE=1
     ports:
-      - "0.0.0.0:3333:3333/tcp"
-      - "0.0.0.0:3339:3339/tcp"
-      - "0.0.0.0:3340:3340/tcp"
-      - "0.0.0.0:3349:3349/tcp"
-      - "0.0.0.0:3335:3335/tcp"
-      - "0.0.0.0:3337:3337/tcp"
-      - "0.0.0.0:3334:3334/tcp"
+      - "0.0.0.0:3333:3333/tcp"   # solo
+      - "0.0.0.0:3339:3339/tcp"   # solo high-diff
+      - "0.0.0.0:3340:3340/tcp"   # pplns
+      - "0.0.0.0:3349:3349/tcp"   # pplns high-diff
+      - "0.0.0.0:3335:3335/tcp"   # sv2
+      - "0.0.0.0:3337:3337/tcp"   # jdp
     volumes:
-      - "../.local/blitzpool-regtest.toml:/app/blitzpool.toml:ro"
+      - "../.local/${BLITZPOOL_CONFIG:-blitzpool.toml}:/app/blitzpool.toml:ro"
       - "./data/blitzpool-logs:/app/logs"
       - "../.local:/app/keys:ro"
       - "ipc:/ipc"
+
+  # Read-only API: charts/admin stay up while payout restarts. No IPC, no
+  # stream consumers, no crons. Safe to recreate any time.
+  blitzpool-api:
+    <<: *blitzpool-app
+    container_name: blitzpool-api
     environment:
-      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_stratum_v1=debug,bp_stratum_v2=debug,bp_template_distribution=debug}
+      - BLITZPOOL_ROLES=api
+      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_api=debug}
       - RUST_BACKTRACE=1
+    ports:
+      - "0.0.0.0:3334:3334/tcp"        # HTTP API
+      - "127.0.0.1:9000:9000/tcp"      # metrics
+    volumes:
+      - "../.local/${BLITZPOOL_CONFIG:-blitzpool.toml}:/app/blitzpool.toml:ro"
+      - "./data/blitzpool-logs:/app/logs"
+      - "../.local:/app/keys:ro"
+
+  # Accounting: PPLNS + Group-Solo + Blockparty ledger (block-found ledger
+  # apply), confirmation watcher, maintenance crons, statistics. Holds NO
+  # dispatcher: notifications are the `notify` process below. Recreate for an
+  # accounting/payout fix — miners + API + notifications unaffected.
+  blitzpool-payout:
+    <<: *blitzpool-app
+    container_name: blitzpool-payout
+    environment:
+      - BLITZPOOL_ROLES=payout,stats
+      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_pplns_engine=debug,bp_group_solo_engine=debug}
+      - RUST_BACKTRACE=1
+    # No published ports — internal accounting only (reads/writes PG + Redis).
+    volumes:
+      - "../.local/${BLITZPOOL_CONFIG:-blitzpool.toml}:/app/blitzpool.toml:ro"
+      - "./data/blitzpool-logs:/app/logs"
+      - "../.local:/app/keys:ro"
+
+  # Notifications: dispatcher (FCM / Web-Push / Telegram / ntfy), command
+  # listeners, push/digest crons, and the notify-only fan-out of the
+  # block-found + device-status streams. Recreate for a notification fix —
+  # payout (PPLNS), miners, and API all stay up.
+  blitzpool-notify:
+    <<: *blitzpool-app
+    container_name: blitzpool-notify
+    environment:
+      - BLITZPOOL_ROLES=notify
+      - RUST_LOG=${RUST_LOG:-info,blitzpool=debug,bp_notifications=debug}
+      - RUST_BACKTRACE=1
+    # No published ports — talks to PG + Redis + outbound push/Telegram/ntfy.
+    volumes:
+      - "../.local/${BLITZPOOL_CONFIG:-blitzpool.toml}:/app/blitzpool.toml:ro"
+      - "./data/blitzpool-logs:/app/logs"
+      - "../.local:/app/keys:ro"
 
 networks:
   blitzpool:
