@@ -528,23 +528,31 @@ where
     let bytes = state
         .cache
         .get_or_fetch::<AddressSummary, _, ApiError>(key, TtlKind::PplnsAddress, async move {
-            let status = require_pplns(&s)?
-                .reader()
-                .address_status(&address)
-                .await?
-                .ok_or(ApiError::NotFound)?;
-            let label = if status.balance_sats > 0 {
+            // A dormant / not-yet-credited address (no balance row and no
+            // window shares) is a valid zero state, not a 404 — return zeros
+            // so the dashboard renders the address.
+            let status = require_pplns(&s)?.reader().address_status(&address).await?;
+            let (balance_sats, total_paid_sats, window_shares, window_percent) = match &status {
+                Some(st) => (
+                    st.balance_sats,
+                    st.total_paid_sats,
+                    st.current_window_shares,
+                    st.current_window_percent,
+                ),
+                None => (0, 0, 0.0, 0.0),
+            };
+            let label = if balance_sats > 0 {
                 "credit"
-            } else if status.balance_sats < 0 {
+            } else if balance_sats < 0 {
                 "debit"
             } else {
                 "zero"
             };
             Ok(AddressSummary {
-                balance_sats: status.balance_sats,
-                total_paid_sats: status.total_paid_sats,
-                current_window_shares: status.current_window_shares,
-                current_window_percent: status.current_window_percent,
+                balance_sats,
+                total_paid_sats,
+                current_window_shares: window_shares,
+                current_window_percent: window_percent,
                 balance_label: label,
             })
         })
