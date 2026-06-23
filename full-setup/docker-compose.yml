@@ -13,7 +13,7 @@
 # There is no single-process "monolith": the front (core) and the back
 # (payout/api/notify) must run as separate processes, so a back-office fix
 # redeploys by recreating one container without dropping miners. See
-# SPLIT-DEPLOYMENT.md.
+# DEPLOYMENT.md.
 #
 # Bring up exactly one network at a time:
 #

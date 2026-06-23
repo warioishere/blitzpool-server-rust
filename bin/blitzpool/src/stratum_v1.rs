@@ -537,7 +537,6 @@ mod tests {
             pool_base_url: None,
             pool_admin_email: None,
             api_secure: false,
-            mode: bp_config::DeploymentMode::Satellite,
             roles: Vec::new(),
             bitcoin_rpc: BitcoinRpcConfig {
                 url: "http://127.0.0.1".into(),

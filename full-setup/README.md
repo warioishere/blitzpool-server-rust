@@ -6,7 +6,7 @@ pool itself runs as **four processes** from one image + one shared config,
 differing only by `BLITZPOOL_ROLES` — `core` (front), `api`, `payout,stats`,
 `notify`. There is no single-process "monolith": the front and the back must
 run separately so a back-office fix redeploys without dropping miners (see
-`SPLIT-DEPLOYMENT.md`).
+`DEPLOYMENT.md`).
 
 | Profile  | Stratum host ports (on `core`) | API (on `api`) | bitcoin host RPC port |
 |----------|--------------------------------|----------------|------------------------|
@@ -63,8 +63,8 @@ cd full-setup/
 #    regtest  → ../.local/blitzpool-regtest.toml
 #
 # A regtest example with sane defaults already lives at the path above.
-# Copy + adapt for testnet4 / mainnet as needed. Keep `mode`/`roles` OUT of
-# the toml — BLITZPOOL_ROLES in the compose file decides each process's role.
+# Copy + adapt for testnet4 / mainnet as needed. Keep `roles` OUT of the
+# toml — BLITZPOOL_ROLES in the compose file decides each process's role.
 
 # 3. Bring up exactly one network (starts infra + the four pool processes).
 #    mainnet uses ../.local/blitzpool.toml by default:
@@ -93,7 +93,7 @@ BLITZPOOL_CONFIG=blitzpool-testnet4.toml docker compose --profile testnet4 up -d
 ## Operating
 
 The pool is four processes — recreate only the one your change touches, and
-the others (and the miners) stay up. See `SPLIT-DEPLOYMENT.md` for the full
+the others (and the miners) stay up. See `DEPLOYMENT.md` for the full
 build-then-swap matrix.
 
 ```bash

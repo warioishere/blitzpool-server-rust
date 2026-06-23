@@ -56,21 +56,12 @@ pub struct AppConfig {
     #[serde(default)]
     pub api_secure: bool,
 
-    /// Deployment topology shorthand for the role set (overridden by an
-    /// explicit `roles` list). `core` is the always-on front — Stratum
-    /// listeners + share validation + block submit, producing accepted shares
-    /// onto the Redis stream (no accounting engines / API). `satellite`
-    /// (default) is the restartable back — it consumes that stream to run
-    /// accounting + API + crons (no Stratum). Split so the Satellite can
-    /// restart without dropping miner connections.
-    #[serde(default)]
-    pub mode: DeploymentMode,
-
-    /// Fine-grained role override. When non-empty it is authoritative and
-    /// `mode` is ignored for topology; when empty (the default) the role set
-    /// is derived from `mode`. Use it to split the back-office into
-    /// per-feature processes, e.g. `roles = ["api"]`, `roles = ["payout"]`,
-    /// `roles = ["stats"]` (or `["payout", "stats"]` to keep them together).
+    /// The roles this process runs — the single source of deployment topology.
+    /// Required: set it here or, more commonly, via `--roles` /
+    /// `BLITZPOOL_ROLES`, otherwise the binary exits at boot. The front is
+    /// `["front"]` (Stratum + producer + block submit); the back is
+    /// `["api", "payout", "stats", "notify"]`, which can be split into
+    /// per-feature processes (e.g. `["api"]`, `["payout", "stats"]`, `["notify"]`).
     #[serde(default)]
     pub roles: Vec<Role>,
 
@@ -162,48 +153,9 @@ pub enum Network {
     Regtest,
 }
 
-/// Deployment topology — see [`AppConfig::mode`].
-#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum DeploymentMode {
-    /// Always-on front: Stratum + validation + block submit + share
-    /// producer. No accounting engines / API.
-    Core,
-    /// Restartable back: stream consumer + accounting + API + crons. No
-    /// Stratum.
-    #[default]
-    Satellite,
-}
-
-impl DeploymentMode {
-    /// Does this process hold miner connections — Stratum listeners +
-    /// the share producer? (`core`.)
-    pub fn is_front(self) -> bool {
-        matches!(self, Self::Core)
-    }
-
-    /// Does this process run the accounting engines, API, crons, and the
-    /// stream consumer? (`satellite`.)
-    pub fn is_back(self) -> bool {
-        matches!(self, Self::Satellite)
-    }
-
-    /// Expand the shorthand mode into its fine-grained [`Role`] set. The
-    /// `satellite` back-office is `api` + `payout` + `stats` + `notify`;
-    /// splitting it into separate processes is done by setting `roles`
-    /// directly (see [`AppConfig::effective_roles`]).
-    pub fn roles(self) -> Vec<Role> {
-        match self {
-            Self::Core => vec![Role::Front],
-            Self::Satellite => vec![Role::Api, Role::Payout, Role::Stats, Role::Notify],
-        }
-    }
-}
-
-/// Fine-grained deployment role. A process runs one or more roles; which
-/// roles it runs is what actually gates each subsystem at boot. `mode` is a
-/// shorthand that expands to a role set, and an explicit `roles` list
-/// overrides it — that's how the back-office splits into per-feature
+/// Fine-grained deployment role. A process runs one or more roles; the set it
+/// runs (`roles` in config, or `--roles` / `BLITZPOOL_ROLES`) is what gates
+/// each subsystem at boot — and how the back-office splits into per-feature
 /// processes (e.g. `roles = ["api"]` / `["payout"]` / `["stats"]`).
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -1100,15 +1052,11 @@ pub enum ConfigError {
 }
 
 impl AppConfig {
-    /// The effective set of roles this process runs: the explicit `roles`
-    /// list when given, otherwise the expansion of `mode`. This is what the
-    /// binary gates every subsystem on at boot.
+    /// The roles this process runs — what the binary gates every subsystem on
+    /// at boot. Empty means none were configured; the binary treats that as a
+    /// fatal misconfiguration (see the boot-time roles check in `main`).
     pub fn effective_roles(&self) -> Vec<Role> {
-        if self.roles.is_empty() {
-            self.mode.roles()
-        } else {
-            self.roles.clone()
-        }
+        self.roles.clone()
     }
 
     /// Whether this process runs the given role.
@@ -1152,40 +1100,10 @@ mod tests {
         let cfg = AppConfig::from_toml_str(bytes).expect("blitzpool.example.toml parses");
         assert_eq!(cfg.network, Network::Mainnet);
         assert_eq!(cfg.pool_identifier, "blitzpool");
-        // `mode` is optional → an example without it defaults to satellite.
-        assert_eq!(cfg.mode, DeploymentMode::Satellite);
-    }
-
-    #[test]
-    fn deployment_mode_default_and_predicates() {
-        assert_eq!(DeploymentMode::default(), DeploymentMode::Satellite);
-        assert!(DeploymentMode::Core.is_front() && !DeploymentMode::Core.is_back());
-        assert!(!DeploymentMode::Satellite.is_front() && DeploymentMode::Satellite.is_back());
-    }
-
-    #[test]
-    fn deployment_mode_parses_lowercase() {
-        #[derive(Deserialize)]
-        struct W {
-            mode: DeploymentMode,
-        }
-        let c: W = toml::from_str(r#"mode = "core""#).expect("parses core");
-        assert_eq!(c.mode, DeploymentMode::Core);
-        let s: W = toml::from_str(r#"mode = "satellite""#).expect("parses satellite");
-        assert_eq!(s.mode, DeploymentMode::Satellite);
-    }
-
-    #[test]
-    fn mode_expands_to_roles() {
-        assert_eq!(DeploymentMode::Core.roles(), vec![Role::Front]);
-        assert_eq!(
-            DeploymentMode::Satellite.roles(),
-            vec![Role::Api, Role::Payout, Role::Stats, Role::Notify]
-        );
     }
 
     /// Minimal valid config body (top-level keys + required tables) for the
-    /// role-resolution tests; `mode` / `roles` are prepended per-case.
+    /// role-resolution tests; a `roles` line is prepended per-case.
     const MINIMAL_CFG: &str = r#"
         network = "mainnet"
         pool_identifier = "blitzpool"
@@ -1224,17 +1142,16 @@ mod tests {
     "#;
 
     #[test]
-    fn roles_parse_and_override_mode() {
-        // No `roles` → derived from `mode` (default satellite: the back, no front).
-        let sat: AppConfig = toml::from_str(MINIMAL_CFG).expect("parse");
-        assert_eq!(sat.effective_roles(), DeploymentMode::Satellite.roles());
-        assert!(!sat.has_role(Role::Front) && sat.has_role(Role::Stats));
+    fn roles_select_topology() {
+        // No `roles` → empty. The config still parses; the binary rejects an
+        // empty role set at boot (see the roles check in `main`).
+        let none: AppConfig = toml::from_str(MINIMAL_CFG).expect("parse");
+        assert!(none.effective_roles().is_empty());
+        assert!(!none.has_role(Role::Front) && !none.has_role(Role::Stats));
 
-        // Explicit `roles` → authoritative, `mode` ignored for topology.
-        let api_only: AppConfig = toml::from_str(&format!(
-            "mode = \"satellite\"\nroles = [\"api\"]\n{MINIMAL_CFG}"
-        ))
-        .expect("parse roles");
+        // Explicit `roles` are the topology.
+        let api_only: AppConfig =
+            toml::from_str(&format!("roles = [\"api\"]\n{MINIMAL_CFG}")).expect("parse roles");
         assert_eq!(api_only.effective_roles(), vec![Role::Api]);
         assert!(api_only.has_role(Role::Api));
         assert!(!api_only.has_role(Role::Payout) && !api_only.has_role(Role::Stats));
@@ -1256,11 +1173,16 @@ mod tests {
         assert_eq!(notify_only.effective_roles(), vec![Role::Notify]);
         assert!(notify_only.has_role(Role::Notify));
         assert!(!notify_only.has_role(Role::Payout) && !notify_only.has_role(Role::Front));
+    }
 
-        // The default satellite back includes notify so a non-split back keeps
-        // sending notifications unchanged.
-        let default_back: AppConfig = toml::from_str(MINIMAL_CFG).expect("parse");
-        assert!(default_back.has_role(Role::Notify));
+    #[test]
+    fn stray_mode_field_is_rejected() {
+        // `mode` was removed — roles are the only topology input. A leftover
+        // `mode = "..."` must surface as a load error (deny_unknown_fields)
+        // rather than be silently ignored.
+        let parsed =
+            AppConfig::from_toml_str(&format!("roles = [\"front\"]\nmode = \"core\"\n{MINIMAL_CFG}"));
+        assert!(parsed.is_err(), "a stray `mode` field must be rejected");
     }
 
     fn valid_autoscale() -> CoinbaseAutoscaleConfig {

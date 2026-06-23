@@ -1,4 +1,4 @@
-# Split deployment runbook (core / api / payout / notify)
+# Deployment runbook (core / api / payout / notify)
 
 Run blitzpool as **four processes** from one image + one shared config so a
 back-office fix can be deployed by recreating a single container — the
@@ -14,14 +14,15 @@ notification change.
 | `blitzpool-notify` | `notify` | dispatcher (FCM/Web-Push/Telegram/ntfy), command listeners, notification crons (network-/best-difficulty, hourly stats), notify-only fan-out of block-found + device-status | payout + API + miners unaffected; recreate freely for a notification change |
 
 All four share `../.local/blitzpool.toml`. The topology comes from
-`BLITZPOOL_ROLES` (env), which overrides `mode`/`roles` in the file — so you
+`BLITZPOOL_ROLES` (env), which overrides any `roles` in the file — so you
 keep editing one config.
 
 > **`payout` and `notify` must both run.** Splitting notifications out means the
 > `payout,stats` process holds **no dispatcher** — it logs a loud `WARN` at boot
 > if it can't see a notify role, and notifications simply won't fire until a
-> `notify` process is up. (The `satellite` *mode* bundles notify by default;
-> only an explicit `BLITZPOOL_ROLES` split separates them.)
+> `notify` process is up. (A back that carries the `notify` role holds the
+> dispatcher itself; splitting `notify` into its own process is what separates
+> them.)
 
 ## How it stays consistent
 
@@ -167,14 +168,14 @@ docker logs --tail 20 blitzpool-payout 2>&1 | grep -E "engines ready|consumer: l
 * **API block-template endpoint**: `/info/block-template` needs TDP, which is
   front-only, so it returns 503 on the `api` process. Everything else
   (balances, charts, stats, admin) needs no TDP and works fully.
-* **One shared config**: keep `mode`/`roles` *out* of `blitzpool.toml` (or
-  leave `mode` at its default) — `BLITZPOOL_ROLES` in the compose file is what
-  decides each process's topology.
+* **One shared config**: keep `roles` *out* of `blitzpool.toml` —
+  `BLITZPOOL_ROLES` in the compose file is what decides each process's
+  topology.
 * **Notify must be running**: with an explicit `BLITZPOOL_ROLES` split, the
   `payout,stats` process holds no dispatcher — notifications only fire if a
   `notify` process is up. The payout process logs a loud `WARN` at boot when it
-  runs accounting without notify. (The `satellite` *mode* bundles notify
-  automatically; the warning is only about explicit role splits.)
+  runs accounting without notify. (A back that carries the `notify` role holds
+  the dispatcher itself; the warning is only about splitting it out.)
 * **`payout` and `stats` not yet split from each other**: they run in one
   process for now (the statistics flush loop must be single-writer). To split
   them later set `BLITZPOOL_ROLES=payout` and `BLITZPOOL_ROLES=stats` on two

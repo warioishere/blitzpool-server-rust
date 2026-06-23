@@ -199,11 +199,35 @@ async fn main() -> ExitCode {
     }
     log_startup_summary(&cfg);
 
+    if cli.check_config {
+        tracing::info!("--check-config given; exiting after successful parse");
+        return ExitCode::SUCCESS;
+    }
+
+    // Boot-time role validation — after the config-parse check, since roles
+    // commonly arrive via BLITZPOOL_ROLES at deploy time rather than the
+    // config file (so `--check-config` validates parsing without requiring them).
+    //
+    // Roles are the only topology input — a process with no role can't do
+    // anything useful. Require one (config `roles` or BLITZPOOL_ROLES) and fail
+    // fast with a pointed message rather than booting an inert process.
+    if cfg.effective_roles().is_empty() {
+        tracing::error!(
+            "no roles configured: set BLITZPOOL_ROLES (e.g. =front) or a `roles` \
+             list in the config"
+        );
+        eprintln!(
+            "blitzpool: no roles configured — set BLITZPOOL_ROLES (front / api / \
+             payout,stats / notify) or a `roles` list in the config"
+        );
+        return ExitCode::from(2);
+    }
+
     // The front always produces shares onto the Redis stream and a separate
     // payout Satellite consumes them. A single process holding both `front`
     // and `payout` would produce shares no one consumes — fail fast rather
     // than silently drop the money path. Run the front (core) and the payout
-    // back (satellite) as separate processes (see full-setup/SPLIT-DEPLOYMENT.md).
+    // back (satellite) as separate processes (see full-setup/DEPLOYMENT.md).
     if cfg.has_role(Role::Front) && cfg.has_role(Role::Payout) {
         tracing::error!(
             "invalid roles: a single process cannot run both `front` and `payout` \
@@ -215,11 +239,6 @@ async fn main() -> ExitCode {
              process; run them as separate core + satellite processes"
         );
         return ExitCode::from(2);
-    }
-
-    if cli.check_config {
-        tracing::info!("--check-config given; exiting after successful parse");
-        return ExitCode::SUCCESS;
     }
 
     let boot_opts = boot::BootOptions {
