@@ -207,13 +207,11 @@ pub(crate) fn build_per_port_servers(
         .with_blockparty(engines.blockparty.clone())
         .with_pool(foundation.db.pool().clone())
         .with_redis(foundation.redis.clone());
-    // A split front (front role, no in-process payout) routes block-found
-    // events to the stream — the payout Satellite applies the ledger and the
-    // notify Satellite fans out the push. A monolith applies in-process. Gated
-    // on the ROLE, not `cfg.mode`: `BLITZPOOL_ROLES=front` leaves `cfg.mode` at
-    // its Monolith default, so a mode check would never wire the producer
-    // (mirrors `produces_streams` in main.rs).
-    if cfg.has_role(Role::Front) && !cfg.has_role(Role::Payout) {
+    // The front routes block-found events to the stream — the payout Satellite
+    // applies the ledger and the notify Satellite fans out the push. A front
+    // always produces (front + payout can't share a process; see the boot
+    // guard in main.rs), so this gates on the front role alone.
+    if cfg.has_role(Role::Front) {
         sink = sink.with_block_found_producer(StreamProducer::new(
             foundation.redis.clone(),
             BLOCK_FOUND_STREAM_KEY,
@@ -222,10 +220,11 @@ pub(crate) fn build_per_port_servers(
     let block_sink: Arc<dyn Sv2BlockSink> = sink.into_sv2_arc();
 
     // Phase 7.7: device-status sink. Forwards ChannelOpened / ChannelClosed.
-    // With an in-process dispatcher (monolith) it fires directly; on a split
-    // front (Core, no dispatcher) it publishes to the `device:status` stream so
-    // the Satellite fans it out — never a silent drop. (Stratum only spawns on
-    // the front, so `None` here means "split front", not "notifications off".)
+    // With an in-process dispatcher (a front co-located with the `notify` role)
+    // it fires directly; without one the front publishes to the `device:status`
+    // stream so the Satellite fans it out — never a silent drop. (Stratum only
+    // spawns on the front, so `None` here means "no co-located dispatcher", not
+    // "notifications off".)
     let device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink> = match dispatcher {
         Some(d) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
             d,
@@ -321,7 +320,7 @@ fn build_port_hooks(
     mode_gate: Arc<BlitzpoolModeGate>,
     device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink>,
 ) -> MiningServerHooks {
-    // Front-only path (Stratum spawns only on monolith / core), where
+    // Front-only path (Stratum spawns only on the front), where
     // `engines::spawn` always builds these composites.
     let accepted: Arc<dyn Sv2AcceptedSink> = Arc::new(Sv2AcceptedShareAdapter::new(
         engines
@@ -377,7 +376,6 @@ mod tests {
             pool_base_url: None,
             pool_admin_email: None,
             api_secure: false,
-            mode: bp_config::DeploymentMode::Monolith,
             roles: Vec::new(),
             bitcoin_rpc: BitcoinRpcConfig {
                 url: "http://127.0.0.1".into(),

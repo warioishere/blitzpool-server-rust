@@ -48,7 +48,9 @@ LOCAL="$ROOT/../.local"
 [ -f "$LOCAL/blitzpool-regtest.toml" ] || \
     echo "[!] $LOCAL/blitzpool-regtest.toml missing (needed for --profile regtest)"
 
-echo "[✓] layout ready. Bring a profile up with:"
-echo "    docker compose --profile regtest  up -d --build"
+echo "[✓] layout ready. Bring a profile up (starts infra + core/api/payout/notify)."
+echo "  mainnet uses blitzpool.toml by default:"
 echo "    docker compose --profile mainnet  up -d --build"
-echo "    docker compose --profile testnet4 up -d --build"
+echo "  testnet4 / regtest pick their config via BLITZPOOL_CONFIG:"
+echo "    BLITZPOOL_CONFIG=blitzpool-testnet4.toml docker compose --profile testnet4 up -d --build"
+echo "    BLITZPOOL_CONFIG=blitzpool-regtest.toml  docker compose --profile regtest  up -d --build"

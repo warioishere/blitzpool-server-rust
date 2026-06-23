@@ -121,8 +121,7 @@ pub(crate) async fn boot(
     // front-only concern. Any process that doesn't run the `front` role
     // (api / payout / stats) holds no Stratum listeners and never builds
     // jobs, so it skips the TDP spawn entirely (and doesn't need the
-    // bitcoin-core IPC socket). Gated on the role, NOT `cfg.mode`: a
-    // role-overridden process (BLITZPOOL_ROLES) keeps `mode` at its default.
+    // bitcoin-core IPC socket).
     let (tdp, alt_tdp) = if opts.skip_tdp || !cfg.has_role(Role::Front) {
         if opts.skip_tdp {
             warn!(

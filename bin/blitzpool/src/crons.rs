@@ -369,8 +369,8 @@ impl CronHandles {
 ///
 /// `run_maintenance` (the `payout`/accounting role) gates the DB-upkeep + group
 /// lifecycle + capacity-alert crons; `run_notifications` (the `notify` role)
-/// gates the push/digest crons. A process running both (monolith / co-located)
-/// spawns everything; a split process spawns only its group.
+/// gates the push/digest crons. A process running both (e.g. the default
+/// satellite back) spawns everything; a split process spawns only its group.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn(
     foundation: &FoundationHandles,

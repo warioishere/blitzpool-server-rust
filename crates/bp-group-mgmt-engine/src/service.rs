@@ -71,7 +71,8 @@ pub struct GroupService<H: GroupServiceHooks> {
     /// Optional cross-process cache-invalidation notifier. Attached after
     /// construction (same `OnceLock` rationale as `blockparty_reader`). When
     /// set, every membership mutation publishes a `"group"` invalidation so a
-    /// separate Stratum Front rebuilds its routing cache. Unset = monolith.
+    /// separate Stratum Front rebuilds its routing cache. Unset where no
+    /// cross-process notification is needed (e.g. tests).
     change_notifier: Arc<std::sync::OnceLock<Arc<dyn crate::hooks::MembershipChangeNotifier>>>,
 }
 

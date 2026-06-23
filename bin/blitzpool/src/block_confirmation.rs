@@ -65,8 +65,8 @@ impl BlockConfirmationHandle {
 /// cheap / `Arc`-backed). Reconciles whichever engines are present (PPLNS
 /// and/or Group-Solo).
 ///
-/// `tdp` is optional: with a TDP feed (monolith / core-side template source)
-/// the `SetNewPrevHash` broadcast wakes the watcher promptly on a new tip. The
+/// `tdp` is optional: with a TDP feed (the front's template source) the
+/// `SetNewPrevHash` broadcast wakes the watcher promptly on a new tip. The
 /// Satellite has none, so it passes `None` and relies solely on the fallback
 /// timer + `getblockheader` RPC — correct, just coarser-grained.
 pub(crate) fn spawn(

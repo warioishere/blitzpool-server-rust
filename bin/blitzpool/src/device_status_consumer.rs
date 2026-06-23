@@ -7,7 +7,7 @@
 //! front therefore publishes each event to the `device:status` stream (see
 //! [`crate::device_status::ProducingDeviceStatusSink`]); this task drains that
 //! stream and calls [`NotificationDispatcher::notify_device_status`] — the same
-//! fan-out the monolith runs in-process.
+//! fan-out a dispatcher-holding process runs in-process.
 //!
 //! Notify-only (no ledger), so at-least-once delivery is harmless: a redelivery
 //! after a crash-before-`XACK` just re-sends one online/offline push, which is

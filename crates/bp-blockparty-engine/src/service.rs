@@ -126,7 +126,8 @@ pub struct BlockpartyService<H: BlockpartyHooks> {
     reservation: Option<Arc<dyn CoinbaseReservation>>,
     /// Optional cross-process cache-invalidation notifier (set-once). When set,
     /// every public mutation publishes a `"blockparty"` invalidation so a
-    /// separate Stratum Front rebuilds its routing cache. Unset = monolith.
+    /// separate Stratum Front rebuilds its routing cache. Unset where no
+    /// cross-process notification is needed (e.g. tests).
     change_notifier:
         Arc<std::sync::OnceLock<Arc<dyn bp_group_mgmt_engine::MembershipChangeNotifier>>>,
 }

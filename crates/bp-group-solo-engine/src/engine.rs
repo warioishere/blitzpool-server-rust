@@ -380,12 +380,12 @@ impl GroupSoloEngine {
     }
 
     /// Apply a Group-Solo found block, reading the distribution snapshot from
-    /// Redis (per-(group, finder) key). The monolith path: the apply runs
-    /// in-process right after the template build, so the snapshot is fresh.
-    /// On the Core/Satellite split prefer [`Self::on_block_found_with_snapshot`]
-    /// — the Redis key races with template-rebuild overwrites by the time the
-    /// async apply runs. Per-group re-entrancy guard; idempotent across
-    /// restarts via the `(groupId, blockHeight, address)` UNIQUE constraint.
+    /// Redis (per-(group, finder) key). This is the fallback path: prefer
+    /// [`Self::on_block_found_with_snapshot`] with the event-carried snapshot
+    /// the front froze at block-found — the Redis key races with
+    /// template-rebuild overwrites by the time the async apply runs. Per-group
+    /// re-entrancy guard; idempotent across restarts via the
+    /// `(groupId, blockHeight, address)` UNIQUE constraint.
     pub async fn on_block_found(
         &self,
         group_id: Uuid,
@@ -428,7 +428,7 @@ impl GroupSoloEngine {
     }
 
     /// Shared re-entrancy guard around the apply. `snapshot == None` reads it
-    /// from Redis (monolith / fallback); `Some` uses the event-carried one.
+    /// from Redis (fallback); `Some` uses the event-carried one.
     async fn guarded_block_found(
         &self,
         group_id: Uuid,
@@ -474,10 +474,10 @@ impl GroupSoloEngine {
     ) -> Result<ApplyDistributionResult, EngineError> {
         let group_key = group_id.to_string();
 
-        // 1. Snapshot source: the event-carried one (split — frozen by the
-        //    Core at block-found, race-free) when present, else read the
-        //    per-(group, finder) Redis key (monolith / fallback). A missing
-        //    Redis snapshot is the operator's job — surface a typed error.
+        // 1. Snapshot source: the event-carried one (frozen by the front at
+        //    block-found, race-free) when present, else read the per-(group,
+        //    finder) Redis key (fallback). A missing Redis snapshot is the
+        //    operator's job — surface a typed error.
         let snapshot = match snapshot {
             Some(s) => s,
             None => {

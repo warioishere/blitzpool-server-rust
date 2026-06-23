@@ -88,7 +88,7 @@ The pool can run as a **monolith** or be split into role-gated processes that co
 - `stats` — share-stats aggregation
 - `notify` — Telegram / ntfy / push / email fan-out
 
-Roles are selected with `--roles` / `BLITZPOOL_ROLES` (independent of payout mode). Block-found and accepted/rejected shares flow Core→Satellite over Redis streams with exactly-once semantics; routing-cache invalidation is broadcast cross-process. See [`full-setup/SPLIT-DEPLOYMENT.md`](full-setup/SPLIT-DEPLOYMENT.md).
+Roles are selected with `--roles` / `BLITZPOOL_ROLES` (independent of payout mode). Block-found and accepted/rejected shares flow Core→Satellite over Redis streams with exactly-once semantics; routing-cache invalidation is broadcast cross-process. See [`full-setup/DEPLOYMENT.md`](full-setup/DEPLOYMENT.md).
 
 ### 5. Confirmation-gated, orphan-safe payouts
 

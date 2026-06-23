@@ -5,8 +5,8 @@
 //! In `satellite` mode the Core publishes each rejected share (group_id
 //! already stamped from the mode gate) onto the rejected stream. This task
 //! drains it and runs the **same** [`SharedRejectedShareSink`] impls the
-//! monolith runs in-process — the Group-Solo + stats reject counters. The
-//! share is fully Core-stamped, so the sinks need no mode gate.
+//! engines expose — the Group-Solo + stats reject counters. The share is
+//! fully Core-stamped, so the sinks need no mode gate.
 //!
 //! Reject counters are pool-fairness/observability stats, not money; the
 //! transport is at-least-once and the counters tolerate the rare double-

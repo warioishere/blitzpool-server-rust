@@ -5,7 +5,7 @@ The one empirical step the automated tests don't cover: run the split as
 miner, and confirm (a) bitcoin-core accepts it and (b) the satellite applies
 the ledger — including across a `payout` restart. Proves the *deployment*
 (the validity logic is already proven by `regtest_split_e2e.rs` + the
-monolith regtest tests).
+in-process regtest tests).
 
 Uses the server-local `docker-compose-regtest-pg-split.yml` (core / api /
 payout, `blitzpool-regtest.toml`). Commands assume the test server's

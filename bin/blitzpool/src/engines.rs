@@ -92,11 +92,12 @@ pub(crate) struct EngineHandles {
     pub(crate) stats: ShareStatsEngineHandle,
     pub(crate) session_persistence: SessionPersistenceEngineHandle,
     pub(crate) mode_gate: Arc<BlitzpoolModeGate>,
-    /// In-process Stratum fan-out sinks — built only on the front (the
-    /// monolith + core), where Stratum feeds them. `None` on the satellite:
-    /// it has no Stratum listeners; its stream consumer builds its own sink
-    /// set from these engines (see `build_accepted_sinks`), so building a
-    /// composite here too would just be a dead duplicate.
+    /// The front's producing Stratum fan-out sinks — built only on the front,
+    /// where Stratum feeds them; they stamp each share and publish it onto the
+    /// Redis stream. `None` on the satellite: it has no Stratum listeners; its
+    /// stream consumer builds its own sink set from these engines (see
+    /// `build_accepted_sinks`), so building one here too would be a dead
+    /// duplicate.
     pub(crate) accepted_sink: Option<Arc<CompositeAcceptedShareSink>>,
     pub(crate) rejected_sink: Option<Arc<dyn SharedRejectedShareSink>>,
     pub(crate) session_persistence_hook: SessionPersistenceHook,
@@ -140,20 +141,19 @@ async fn fetch_core_epoch(redis: &redis::aio::ConnectionManager) -> Result<u64, 
     Ok(epoch)
 }
 
-/// Spawn all four engines + build the composite share sinks.
+/// Spawn all four engines + build the front's producing share sinks.
 ///
-/// Mode-aware (see [`DeploymentMode`]):
+/// Role-aware (see [`Role`]):
 ///
-/// - **Core** runs the accounting engines *read-only* (`spawn_core`, no
-///   ledger-mutating crons) — they exist only so the `PayoutResolver` can
-///   build coinbase distributions. The accepted-share fan-out is reduced
-///   to a single [`ProducingSink`] that publishes each (already
-///   share_id-/mode-stamped) share onto the Redis stream for the Satellite
-///   to consume. The rejected fan-out is empty for now (the rejected
-///   stream lands in a later slice).
-/// - **Monolith** + **Satellite** spawn the full engines and the full
-///   in-process composite; the Satellite's composite is driven by the
-///   stream consumer (wired in a later slice) instead of by Stratum.
+/// - A **front** (`front` role) runs the accounting engines *read-only*
+///   (`spawn_core`, no ledger-mutating crons) — they exist only so the
+///   `PayoutResolver` can build coinbase distributions. Its accepted- and
+///   rejected-share fan-outs are each a single [`ProducingSink`] that
+///   publishes every (already share_id-/mode-stamped) share onto the Redis
+///   stream for the Satellite to consume.
+/// - The **back** (`payout` / `stats`) spawns the full engines; its share
+///   sinks are driven by the stream consumer off `build_accepted_sinks` /
+///   `build_rejected_sinks`, so no in-process composite is built here.
 pub(crate) async fn spawn(
     cfg: &AppConfig,
     handles: &FoundationHandles,
@@ -169,33 +169,17 @@ pub(crate) async fn spawn(
     let stats = spawn_stats(cfg, handles).await?;
     let session_persistence = spawn_session_persistence(handles).await?;
 
-    // Only the front builds the in-process Stratum fan-out composites; a
-    // pure back / api process has no Stratum and consumes (or doesn't touch)
-    // the share stream instead, so it skips them (and the `core:epoch` INCR).
-    // A read-only front (core, no in-process accounting) produces to the
-    // stream; a full front (monolith) fans out in-process.
+    // Only the front builds the Stratum fan-out sinks, and it always produces
+    // to the Redis streams (the Satellite consumes them). A pure back / api
+    // process has no Stratum and consumes (or doesn't touch) the streams
+    // instead, so it skips them (and the `core:epoch` INCR).
     let (accepted_sink, rejected_sink) = if cfg.has_role(Role::Front) {
         let core_epoch = fetch_core_epoch(&handles.redis).await?;
-        let accepted = if read_only {
-            build_producing_composite(mode_gate.clone(), handles.redis.clone(), core_epoch)
-        } else {
-            build_accepted_composite(
-                pplns.as_ref(),
-                &group_solo,
-                &stats,
-                &session_persistence,
-                mode_gate.clone(),
-                handles.redis.clone(),
-                core_epoch,
-            )
-        };
-        let rejected = if read_only {
-            // Stamp the group_id (gate) then publish to the rejected stream;
-            // the back runs the reject counters off it.
-            build_producing_rejected_composite(mode_gate.clone(), handles.redis.clone())
-        } else {
-            build_rejected_composite(&group_solo, &stats, mode_gate.clone())
-        };
+        let accepted =
+            build_producing_composite(mode_gate.clone(), handles.redis.clone(), core_epoch);
+        // Stamp the group_id (gate) then publish to the rejected stream; the
+        // back runs the reject counters off it.
+        let rejected = build_producing_rejected_composite(mode_gate.clone(), handles.redis.clone());
         (Some(accepted), Some(rejected))
     } else {
         (None, None)
@@ -610,9 +594,8 @@ impl SharedRejectedShareSink for CompositeRejectedShareSink {
 
 /// The accepted-share sinks split by durability class — the two consumer
 /// groups the Satellite stream consumer runs (see
-/// [`crate::satellite_consumer`]). The in-process composite flattens them
-/// back into one fan-out (`money` then `aux`), so the monolith order is
-/// unchanged.
+/// [`crate::satellite_consumer`]): order-sensitive `money` first, then
+/// order-insensitive `aux`.
 pub(crate) struct AcceptedSinkSet {
     /// Money: PPLNS + Group-Solo Redis-window mutations. Order-sensitive
     /// (window order = consume order) and exactly-once via the `share_id`
@@ -625,8 +608,8 @@ pub(crate) struct AcceptedSinkSet {
 }
 
 /// Build the per-engine accepted-share sinks, split by durability class.
-/// Shared by the in-process composite (monolith) and the Satellite
-/// consumer so the two paths drive the exact same sink impls.
+/// Driven by the Satellite stream consumer (the front produces to the stream
+/// rather than fanning out in-process).
 pub(crate) fn build_accepted_sinks(
     pplns: Option<&PplnsEngine>,
     group_solo: &GroupSoloEngine,
@@ -655,25 +638,6 @@ pub(crate) fn build_accepted_sinks(
     AcceptedSinkSet { money, aux }
 }
 
-fn build_accepted_composite(
-    pplns: Option<&PplnsEngine>,
-    group_solo: &GroupSoloEngine,
-    stats: &ShareStatsEngineHandle,
-    session_persistence: &SessionPersistenceEngineHandle,
-    gate: Arc<BlitzpoolModeGate>,
-    redis: redis::aio::ConnectionManager,
-    core_epoch: u64,
-) -> Arc<CompositeAcceptedShareSink> {
-    let AcceptedSinkSet { money, aux } =
-        build_accepted_sinks(pplns, group_solo, stats, session_persistence, redis);
-    let sinks: Vec<Arc<dyn SharedAcceptedShareSink>> = money.into_iter().chain(aux).collect();
-    Arc::new(CompositeAcceptedShareSink {
-        sinks: Mutex::new(sinks),
-        sequencer: ShareSequencer::new(core_epoch),
-        gate,
-    })
-}
-
 /// Core-mode accepted fan-out: the composite keeps its single
 /// share_id-/mode-stamping fan-out point but routes to exactly one sink —
 /// the [`ProducingSink`] that publishes each share onto the Redis stream.
@@ -695,9 +659,8 @@ fn build_producing_composite(
 }
 
 /// The per-engine rejected-share sinks (Group-Solo reject counter + stats
-/// reject counter). Shared by the in-process composite (monolith) and the
-/// Satellite's rejected consumer, so both drive the same sink impls. They
-/// read the (Core-stamped) `group_id` off the share — no gate.
+/// reject counter). Driven by the Satellite's rejected consumer. They read
+/// the (Core-stamped) `group_id` off the share — no gate.
 pub(crate) fn build_rejected_sinks(
     group_solo: &GroupSoloEngine,
     stats: &ShareStatsEngineHandle,
@@ -706,17 +669,6 @@ pub(crate) fn build_rejected_sinks(
         Arc::new(GroupSoloRejectedShareSink::new(group_solo.clone())),
         Arc::new(ShareStatsRejectedSink::new(stats.accumulators())),
     ]
-}
-
-fn build_rejected_composite(
-    group_solo: &GroupSoloEngine,
-    stats: &ShareStatsEngineHandle,
-    gate: Arc<BlitzpoolModeGate>,
-) -> Arc<dyn SharedRejectedShareSink> {
-    Arc::new(CompositeRejectedShareSink {
-        sinks: build_rejected_sinks(group_solo, stats),
-        gate,
-    })
 }
 
 /// Core-mode rejected fan-out: stamp the `group_id` (gate) at the single

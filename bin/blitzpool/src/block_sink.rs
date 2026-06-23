@@ -66,11 +66,11 @@ use crate::pending_group_solo_blocks::{put_pending_group_solo_block, PendingGrou
 /// Accounting inputs for a found block, bundled so the block-found fan-out
 /// (per-mode engine ledger + notifications) runs from one value.
 ///
-/// Today it's built and consumed in-process. Under the Core/Satellite split
-/// this becomes the Core→Satellite block-found event (hence `serde`): the
-/// Core keeps `submit_solution` + the `blocks_entity` record and emits this;
-/// the Satellite consumes it and does the ledger accounting. Bundling the
-/// inputs here is the seam that makes that move mechanical.
+/// This is the Core→Satellite block-found event (hence `serde`): the front
+/// keeps `submit_solution` + the `blocks_entity` record and emits this onto
+/// the stream; the payout Satellite consumes it and does the ledger
+/// accounting (the front also applies it in-process as a publish-failure
+/// fallback).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BlockFoundEvent {
     /// Miner-authorized payout address.
@@ -136,9 +136,10 @@ pub(crate) struct TdpBlockSubmissionSink {
     /// same apply runs on the Core (in-process) or on a Satellite consuming
     /// the block-found event off a stream.
     applier: BlockFoundApplier,
-    /// `core` mode: publish each block-found event to the stream instead of
-    /// applying in-process (the Satellite consumes + applies). `None` in
-    /// monolith — apply runs in-process via [`Self::applier`].
+    /// The front publishes each block-found event to the stream (the payout
+    /// Satellite consumes + applies); on a publish failure it applies
+    /// in-process via [`Self::applier`] as a fallback. `None` only on a sink
+    /// with no front role wired (e.g. in tests).
     block_found_producer: Option<StreamProducer<BlockFoundEvent>>,
 }
 
@@ -313,15 +314,14 @@ impl TdpBlockSubmissionSink {
         }
     }
 
-    /// Core-side block-found entry (SV1 + SV2 call this after submit).
+    /// Front-side block-found entry (SV1 + SV2 call this after submit).
     ///
-    /// Does the parts that must run where the Core state lives: resolves the
+    /// Does the parts that must run where the front state lives: resolves the
     /// payout mode from the gate, derives the height (chain tip + 1), and
     /// writes the durable `blocks_entity` record. It then builds the
-    /// self-contained [`BlockFoundEvent`] and hands it to the
-    /// [`BlockFoundApplier`]. Today that apply runs in-process; under the
-    /// Core/Satellite split the Core publishes the event instead and the
-    /// Satellite runs the apply (wired in a later slice).
+    /// self-contained [`BlockFoundEvent`] and publishes it onto the stream for
+    /// the payout Satellite to apply (falling back to an in-process
+    /// [`BlockFoundApplier`] apply if the publish fails).
     #[allow(clippy::too_many_arguments)]
     async fn emit_block_found(
         &self,
@@ -433,11 +433,10 @@ impl TdpBlockSubmissionSink {
             groupsolo_snapshot,
         };
 
-        // core mode publishes to the stream (the Satellite applies);
-        // monolith applies in-process. On a publish failure we fall back to
-        // in-process apply so a Redis blip never silently drops the ledger
-        // write — the apply is PG-idempotent, so a later redelivery is a
-        // no-op.
+        // The front publishes to the stream (the payout Satellite applies). On
+        // a publish failure we fall back to in-process apply so a Redis blip
+        // never silently drops the ledger write — the apply is PG-idempotent,
+        // so a later redelivery is a no-op.
         match self.block_found_producer.as_ref() {
             Some(producer) => match producer.publish(&event).await {
                 Ok(id) => info!(
@@ -464,7 +463,7 @@ impl TdpBlockSubmissionSink {
 impl BlockFoundApplier {
     /// Build an applier from the back-office engines + dispatcher + Redis —
     /// the Satellite's block-found stream consumer uses this to run the same
-    /// apply the monolith runs in-process.
+    /// apply the front runs in-process on a publish-failure fallback.
     pub(crate) fn new(
         pplns: Option<PplnsEngine>,
         group_solo: Option<GroupSoloEngine>,
@@ -926,7 +925,7 @@ impl BlockFoundApplier {
 
     /// Fire the block-found notification fan-out (dispatcher only — no ledger,
     /// no RPC, no engines). It's the tail of [`Self::apply_block_found`] (so the
-    /// monolith + the in-process front path notify as before), and the entry
+    /// front's publish-failure fallback notifies as before), and the entry
     /// point for the **notify-only** Satellite consumer (`notify` role), which
     /// holds the dispatcher but no engines. A no-op when no dispatcher is wired
     /// (e.g. the `payout` process, which does ledger-only).
