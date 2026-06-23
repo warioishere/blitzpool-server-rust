@@ -199,6 +199,24 @@ async fn main() -> ExitCode {
     }
     log_startup_summary(&cfg);
 
+    // The front always produces shares onto the Redis stream and a separate
+    // payout Satellite consumes them. A single process holding both `front`
+    // and `payout` would produce shares no one consumes — fail fast rather
+    // than silently drop the money path. Run the front (core) and the payout
+    // back (satellite) as separate processes (see docker-compose.split.yml).
+    if cfg.has_role(Role::Front) && cfg.has_role(Role::Payout) {
+        tracing::error!(
+            "invalid roles: a single process cannot run both `front` and `payout` \
+             — run the front (core) and the payout back (satellite) as separate \
+             processes"
+        );
+        eprintln!(
+            "blitzpool: invalid roles — `front` and `payout` cannot share a \
+             process; run them as separate core + satellite processes"
+        );
+        return ExitCode::from(2);
+    }
+
     if cli.check_config {
         tracing::info!("--check-config given; exiting after successful parse");
         return ExitCode::SUCCESS;
@@ -270,13 +288,13 @@ async fn main() -> ExitCode {
     let is_api = cfg.has_role(Role::Api);
     let is_accounting = cfg.has_role(Role::Payout) || cfg.has_role(Role::Stats);
     let is_notify = cfg.has_role(Role::Notify);
-    // A back-accounting process with no in-process producer consumes the
-    // engine streams; a front without in-process accounting produces to them.
+    // A back-accounting process consumes the engine streams; the front
+    // produces to them.
     let consumes_streams = is_accounting && !is_front;
     let produces_streams = is_front && !cfg.has_role(Role::Payout);
     // A notify process that isn't also the front consumes the notify streams
-    // (block-found notify + device-status). The monolith is the front, so it
-    // fires those in-process instead and never consumes them.
+    // (block-found notify + device-status). A front never carries the notify
+    // role, so it produces those events for the notify process to consume.
     let consumes_notify_streams = is_notify && !is_front;
     // Loud, not silent: an accounting process without the notify role means the
     // notifications live in a separate `notify` process — warn so an operator
@@ -317,10 +335,9 @@ async fn main() -> ExitCode {
     // into no-ops rather than building pointless event payloads.
     //
     // Notify-only: the dispatcher's drivers (best-diff/hourly/network crons,
-    // the block-found notify consumer, the device-status consumer, and — on the
-    // monolith front — the in-process Stratum sinks) all live where `notify`
-    // runs. Off the notify role it is `None`, so a split front produces the
-    // block-found + device-status events to streams instead, for the notify
+    // the block-found notify consumer, and the device-status consumer) all live
+    // where `notify` runs. Off the notify role it is `None`, so a front produces
+    // the block-found + device-status events to streams instead, for the notify
     // process to fan out.
     let dispatcher = if is_notify {
         dispatcher::build(&handles, &production_hooks, &listeners)
@@ -372,8 +389,8 @@ async fn main() -> ExitCode {
     // writer — attach the notifier so every group/blockparty mutation publishes
     // an invalidation onto the `cache:invalidate` stream. The Front consumes it
     // (spawned below) and rebuilds, so an API-created group/party routes without
-    // a Front restart. (Monolith: api+front in one process — it publishes and
-    // self-consumes; the rebuild is idempotent.)
+    // a Front restart. (A process holding both `api` and `front` publishes
+    // and self-consumes; the rebuild is idempotent.)
     if is_api {
         let notifier = Arc::new(crate::cache_sync::StreamCacheNotifier::new(
             handles.redis.clone(),
@@ -507,7 +524,7 @@ async fn main() -> ExitCode {
 
     // Satellite: drain the accepted-share stream the Core produces into the
     // real engine sinks (two consumer groups by durability class). Only the
-    // pure back consumes — the monolith fans out in-process via the composite.
+    // back (accounting, no front role) consumes the stream.
     let satellite_consumer = if consumes_streams {
         let mut sinks = engines::build_accepted_sinks(
             engines.pplns.as_ref(),
@@ -517,8 +534,7 @@ async fn main() -> ExitCode {
             handles.redis.clone(),
         );
         // Blockparty auto-promote runs off the share-accept too — on the
-        // satellite it joins the order-insensitive (aux) consumer group, same
-        // as the monolith appends it to the in-process composite above.
+        // satellite it joins the order-insensitive (aux) consumer group.
         if let Some(bp) = blockparty.as_ref() {
             sinks.aux.push(Arc::new(
                 crate::blockparty_service::BlockpartyAcceptedShareSink::new(bp.service.clone()),
@@ -588,10 +604,9 @@ async fn main() -> ExitCode {
     };
 
     // Notify: drain the device-status stream (miner online/offline events the
-    // split front publishes) and fan them out via the dispatcher. Only when a
+    // front publishes) and fan them out via the dispatcher. Only when a
     // dispatcher exists — with no transport configured there's nothing to send
-    // and the stream just trims at MAXLEN. The monolith fires device-status
-    // in-process, so it never produces to this stream.
+    // and the stream just trims at MAXLEN.
     let device_status_consumer = if consumes_notify_streams {
         match dispatcher.clone() {
             Some(d) => {
@@ -607,7 +622,7 @@ async fn main() -> ExitCode {
     // Core: watch the Core→Satellite streams' consumer lag (the always-on
     // side notices the restartable Satellite falling behind / going down).
     // Budget = 10% of the default stream cap, so it fires well before MAXLEN
-    // trims. Monolith fans out in-process (no streams) → no monitor.
+    // trims. Only the producing front runs it.
     let stream_monitor = if produces_streams {
         Some(crate::stream_monitor::spawn(
             handles.redis.clone(),
@@ -671,12 +686,8 @@ async fn main() -> ExitCode {
         (true, false) => tracing::info!(
             "stream summary: producing (this core XADDs accepted/rejected/block-found/device-status)"
         ),
-        // Neither produces nor consumes: either a monolith (front + accounting
-        // in one process → in-process fan-out, no streams) or a read-only api
-        // process (serves from Postgres, never touches the streams).
-        (false, false) if is_front => tracing::info!(
-            "stream summary: in-process fan-out (monolith — no Core/Satellite streams)"
-        ),
+        // Neither produces nor consumes: a read-only api process (serves from
+        // Postgres, never touches the streams).
         (false, false) => tracing::info!(
             "stream summary: no stream role (read-only process — serves from Postgres)"
         ),

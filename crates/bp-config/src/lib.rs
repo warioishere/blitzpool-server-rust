@@ -56,13 +56,13 @@ pub struct AppConfig {
     #[serde(default)]
     pub api_secure: bool,
 
-    /// Deployment topology. `monolith` (default) runs everything in one
-    /// process. `core` is the always-on front — Stratum listeners + share
-    /// validation + block submit, producing accepted shares onto the Redis
-    /// stream (no accounting engines / API). `satellite` is the restartable
-    /// back — it consumes that stream to run accounting + API + crons (no
-    /// Stratum). Split so the Satellite can restart without dropping miner
-    /// connections.
+    /// Deployment topology shorthand for the role set (overridden by an
+    /// explicit `roles` list). `core` is the always-on front — Stratum
+    /// listeners + share validation + block submit, producing accepted shares
+    /// onto the Redis stream (no accounting engines / API). `satellite`
+    /// (default) is the restartable back — it consumes that stream to run
+    /// accounting + API + crons (no Stratum). Split so the Satellite can
+    /// restart without dropping miner connections.
     #[serde(default)]
     pub mode: DeploymentMode,
 
@@ -166,43 +166,34 @@ pub enum Network {
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DeploymentMode {
-    /// Everything in one process — today's behaviour.
-    #[default]
-    Monolith,
     /// Always-on front: Stratum + validation + block submit + share
     /// producer. No accounting engines / API.
     Core,
     /// Restartable back: stream consumer + accounting + API + crons. No
     /// Stratum.
+    #[default]
     Satellite,
 }
 
 impl DeploymentMode {
     /// Does this process hold miner connections — Stratum listeners +
-    /// the share producer? (`monolith` + `core`.)
+    /// the share producer? (`core`.)
     pub fn is_front(self) -> bool {
-        matches!(self, Self::Monolith | Self::Core)
+        matches!(self, Self::Core)
     }
 
     /// Does this process run the accounting engines, API, crons, and the
-    /// stream consumer? (`monolith` + `satellite`.)
+    /// stream consumer? (`satellite`.)
     pub fn is_back(self) -> bool {
-        matches!(self, Self::Monolith | Self::Satellite)
+        matches!(self, Self::Satellite)
     }
 
     /// Expand the shorthand mode into its fine-grained [`Role`] set. The
-    /// back-office of `monolith` / `satellite` is `api` + `payout` + `stats`;
+    /// `satellite` back-office is `api` + `payout` + `stats` + `notify`;
     /// splitting it into separate processes is done by setting `roles`
     /// directly (see [`AppConfig::effective_roles`]).
     pub fn roles(self) -> Vec<Role> {
         match self {
-            Self::Monolith => vec![
-                Role::Front,
-                Role::Api,
-                Role::Payout,
-                Role::Stats,
-                Role::Notify,
-            ],
             Self::Core => vec![Role::Front],
             Self::Satellite => vec![Role::Api, Role::Payout, Role::Stats, Role::Notify],
         }
@@ -1161,14 +1152,13 @@ mod tests {
         let cfg = AppConfig::from_toml_str(bytes).expect("blitzpool.example.toml parses");
         assert_eq!(cfg.network, Network::Mainnet);
         assert_eq!(cfg.pool_identifier, "blitzpool");
-        // `mode` is optional → an example without it defaults to monolith.
-        assert_eq!(cfg.mode, DeploymentMode::Monolith);
+        // `mode` is optional → an example without it defaults to satellite.
+        assert_eq!(cfg.mode, DeploymentMode::Satellite);
     }
 
     #[test]
     fn deployment_mode_default_and_predicates() {
-        assert_eq!(DeploymentMode::default(), DeploymentMode::Monolith);
-        assert!(DeploymentMode::Monolith.is_front() && DeploymentMode::Monolith.is_back());
+        assert_eq!(DeploymentMode::default(), DeploymentMode::Satellite);
         assert!(DeploymentMode::Core.is_front() && !DeploymentMode::Core.is_back());
         assert!(!DeploymentMode::Satellite.is_front() && DeploymentMode::Satellite.is_back());
     }
@@ -1191,16 +1181,6 @@ mod tests {
         assert_eq!(
             DeploymentMode::Satellite.roles(),
             vec![Role::Api, Role::Payout, Role::Stats, Role::Notify]
-        );
-        assert_eq!(
-            DeploymentMode::Monolith.roles(),
-            vec![
-                Role::Front,
-                Role::Api,
-                Role::Payout,
-                Role::Stats,
-                Role::Notify
-            ]
         );
     }
 
@@ -1245,10 +1225,10 @@ mod tests {
 
     #[test]
     fn roles_parse_and_override_mode() {
-        // No `roles` → derived from `mode`.
+        // No `roles` → derived from `mode` (default satellite: the back, no front).
         let sat: AppConfig = toml::from_str(MINIMAL_CFG).expect("parse");
-        assert_eq!(sat.effective_roles(), DeploymentMode::Monolith.roles());
-        assert!(sat.has_role(Role::Front) && sat.has_role(Role::Stats));
+        assert_eq!(sat.effective_roles(), DeploymentMode::Satellite.roles());
+        assert!(!sat.has_role(Role::Front) && sat.has_role(Role::Stats));
 
         // Explicit `roles` → authoritative, `mode` ignored for topology.
         let api_only: AppConfig = toml::from_str(&format!(
@@ -1277,10 +1257,10 @@ mod tests {
         assert!(notify_only.has_role(Role::Notify));
         assert!(!notify_only.has_role(Role::Payout) && !notify_only.has_role(Role::Front));
 
-        // Monolith / satellite both include notify so non-split deploys keep
+        // The default satellite back includes notify so a non-split back keeps
         // sending notifications unchanged.
-        let mono: AppConfig = toml::from_str(MINIMAL_CFG).expect("parse");
-        assert!(mono.has_role(Role::Notify));
+        let default_back: AppConfig = toml::from_str(MINIMAL_CFG).expect("parse");
+        assert!(default_back.has_role(Role::Notify));
     }
 
     fn valid_autoscale() -> CoinbaseAutoscaleConfig {
