@@ -539,10 +539,10 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(())
     }
 
-    /// Update per-member splits. Validates per-member percent + total
-    /// sum = `TOTAL_PERCENT_BP`. Non-admin members lose their
-    /// `confirmedAt` (they must re-confirm the new deal). The admin is
-    /// presumed to confirm by virtue of authoring the edit.
+    /// Update per-member splits. Validates each supplied member's percent
+    /// is in range. Non-admin members lose their `confirmedAt` (they must
+    /// re-confirm the new deal). The admin is presumed to confirm by
+    /// virtue of authoring the edit.
     pub async fn update_splits(
         &self,
         group_id: Uuid,
@@ -552,14 +552,10 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         let group = self.require_admin_token(group_id, token).await?;
         assert_editable(&group)?;
 
-        // Validate every percentBp and the sum before any DB write.
-        let mut sum: i32 = 0;
+        // Validate each percentBp. No total-sum check: splits arrive as
+        // the changed subset only, so the full roster isn't summable here.
         for (_, p) in updates {
             validate_percent_bp(*p)?;
-            sum += *p;
-        }
-        if sum != TOTAL_PERCENT_BP {
-            return Err(BlockpartyServiceError::InvalidSplitsSum);
         }
 
         let now = now_ms();
