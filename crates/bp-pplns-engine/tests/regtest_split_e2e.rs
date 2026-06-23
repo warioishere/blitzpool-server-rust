@@ -5,7 +5,7 @@
 //! T4 — Core/Satellite split, gold-standard end-to-end against a real
 //! regtest `bitcoin-node`.
 //!
-//! The other regtest block-submit tests record shares in-process (monolith)
+//! The other regtest block-submit tests record shares directly in-process
 //! and prove a coinbase built from the engine's distribution is accepted by
 //! bitcoin-core. This one proves the **split** path does the same:
 //!

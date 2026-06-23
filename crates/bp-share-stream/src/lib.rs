@@ -6,7 +6,7 @@
 //! [`bp_share_hook::SharedAcceptedShareOwned`] record) onto one Redis
 //! stream; the Satellite consumes it through a **consumer group** and
 //! reconstructs the owned record, then borrows a view back to drive the
-//! exact same engine sinks the monolith uses.
+//! per-engine accounting sinks (the same sink impls regardless of transport).
 //!
 //! # Delivery + exactly-once
 //!
@@ -348,10 +348,10 @@ impl AcceptedShareConsumer {
     /// `XACK`. Returns the number processed (`0` on timeout).
     ///
     /// The dispatch drives the *same* [`SharedAcceptedShareSink`] impls the
-    /// in-process composite uses — the monolith and the stream path share
-    /// one sink entrypoint (the equivalence seam). Acking *after* dispatch
-    /// is safe across a crash because the money sinks dedup on `share_id`:
-    /// a redelivered, already-applied share is a no-op.
+    /// engines expose — one sink entrypoint regardless of transport (the
+    /// equivalence seam). Acking *after* dispatch is safe across a crash
+    /// because the money sinks dedup on `share_id`: a redelivered,
+    /// already-applied share is a no-op.
     pub async fn drain_new(
         &self,
         sinks: &[Arc<dyn SharedAcceptedShareSink>],

@@ -67,7 +67,8 @@ pub trait BlockpartyMembershipReader: Send + Sync {
 /// `kind` names the cache (`"group"` / `"blockparty"`). Best-effort: the
 /// implementation must swallow its own failures — a missed invalidation is
 /// caught by the Front's periodic backstop rebuild, never a hard error on the
-/// mutation path. Left unset (monolith / single-process) it's simply not called.
+/// mutation path. Left unset (no cross-process listener, e.g. tests) it's
+/// simply not called.
 #[async_trait]
 pub trait MembershipChangeNotifier: Send + Sync {
     async fn membership_changed(&self, kind: &str);

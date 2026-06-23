@@ -12,8 +12,8 @@
 //!   and no bitcoin RPC.
 //! - `Notify` (the `notify` role) runs [`BlockFoundApplier::notify_block_found`]
 //!   — the dispatcher fan-out only. Split out so a notification change redeploys
-//!   `notify` without restarting `payout`. The monolith fires both in-process
-//!   and consumes neither group.
+//!   `notify` without restarting `payout`. A back holding both roles consumes
+//!   both groups; the front produces the event and consumes neither.
 //!
 //! Block-found is rare + both sides are idempotent (the ledger via PG `UNIQUE`
 //! constraints + the PPLNS pending store keyed by block hash; the notify via a

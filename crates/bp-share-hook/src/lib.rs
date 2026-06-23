@@ -214,11 +214,10 @@ pub trait SharedAcceptedShareSink: Send + Sync {
 /// form is what a producer materializes ([`SharedAcceptedShare::to_owned_record`])
 /// and what a consumer reconstructs and borrows a view back from
 /// ([`Self::as_view`]) to drive the **exact same** [`SharedAcceptedShareSink`]
-/// code. Today every share is in-process (borrowed path only); once the share
-/// path and the accounting sinks can live in separate processes
-/// (Core/Satellite), the owned record is the unit that crosses the queue.
-/// Keeping one sink entrypoint for both paths is what makes a monolith-vs-split
-/// equivalence test possible.
+/// code. The front's producer materializes this owned record and `XADD`s it;
+/// the Satellite reconstructs it and borrows a view to drive the accounting
+/// sinks. One sink entrypoint for both sides is the producer/consumer
+/// equivalence seam.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SharedAcceptedShareOwned {
     pub address: String,

@@ -7,8 +7,8 @@
 //! online/offline trait. The bin builds one of two concrete impls:
 //!
 //! - [`DispatcherDeviceStatusSink`] — forwards directly to the in-process
-//!   `NotificationDispatcher`. Used by the monolith (and any process that
-//!   holds the dispatcher).
+//!   `NotificationDispatcher`. Used by any process that holds the dispatcher
+//!   (e.g. a front co-located with the `notify` role).
 //! - [`ProducingDeviceStatusSink`] — `XADD`s the event to the Core→Satellite
 //!   `device:status` stream. Used by a split **front** (Core), which has no
 //!   dispatcher; the Satellite drains the stream and fans the event out. This

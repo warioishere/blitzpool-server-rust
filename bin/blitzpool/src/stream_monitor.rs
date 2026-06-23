@@ -7,9 +7,9 @@
 //! producing, the stream grows, and each consumer group's `lag` (entries
 //! added but not yet delivered to that group) climbs. When the lag crosses
 //! a budget we warn — an operator's cue to act before the stream's `MAXLEN`
-//! trims oldest entries (a fairness delle). Runs only in `core` mode; the
-//! monolith has no streams and the satellite can't reliably self-monitor
-//! when it's the thing falling behind.
+//! trims oldest entries (a fairness delle). Runs only on the producing front;
+//! the satellite can't reliably self-monitor when it's the thing falling
+//! behind.
 
 use std::time::Duration;
 

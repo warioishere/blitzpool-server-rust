@@ -220,10 +220,11 @@ pub(crate) fn build_per_port_servers(
     let block_sink: Arc<dyn Sv2BlockSink> = sink.into_sv2_arc();
 
     // Phase 7.7: device-status sink. Forwards ChannelOpened / ChannelClosed.
-    // With an in-process dispatcher (monolith) it fires directly; on a split
-    // front (Core, no dispatcher) it publishes to the `device:status` stream so
-    // the Satellite fans it out — never a silent drop. (Stratum only spawns on
-    // the front, so `None` here means "split front", not "notifications off".)
+    // With an in-process dispatcher (a front co-located with the `notify` role)
+    // it fires directly; without one the front publishes to the `device:status`
+    // stream so the Satellite fans it out — never a silent drop. (Stratum only
+    // spawns on the front, so `None` here means "no co-located dispatcher", not
+    // "notifications off".)
     let device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink> = match dispatcher {
         Some(d) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
             d,
@@ -319,7 +320,7 @@ fn build_port_hooks(
     mode_gate: Arc<BlitzpoolModeGate>,
     device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink>,
 ) -> MiningServerHooks {
-    // Front-only path (Stratum spawns only on monolith / core), where
+    // Front-only path (Stratum spawns only on the front), where
     // `engines::spawn` always builds these composites.
     let accepted: Arc<dyn Sv2AcceptedSink> = Arc::new(Sv2AcceptedShareAdapter::new(
         engines

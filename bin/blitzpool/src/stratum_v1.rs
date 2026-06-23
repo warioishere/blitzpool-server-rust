@@ -152,11 +152,11 @@ pub(crate) fn build_per_port_servers(
 
     let lookup: Arc<dyn GroupLookup> = group_service.service.clone();
     // Phase 7.7: device-status sink forwards Authorized/Disconnect events. With
-    // an in-process dispatcher (monolith) it fires directly; on a split front
-    // (Core, no dispatcher) it publishes to the `device:status` stream so the
-    // Satellite can fan it out. The Core always reaches one of these two — never
-    // a silent drop. (Stratum only spawns on the front, so `None` here means
-    // "split front", not "notifications off".)
+    // an in-process dispatcher (a front co-located with the `notify` role) it
+    // fires directly; without one the front publishes to the `device:status`
+    // stream so the Satellite can fan it out — never a silent drop. (Stratum
+    // only spawns on the front, so `None` here means "no co-located dispatcher",
+    // not "notifications off".)
     let device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink> = match dispatcher.clone() {
         Some(d) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
             d,
@@ -311,8 +311,8 @@ fn build_port_hooks(
     mode_gate: Arc<BlitzpoolModeGate>,
     device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink>,
 ) -> ServerHooks {
-    // Front-only path: `build_per_port_servers` runs only when Stratum
-    // spawns (monolith / core), where `engines::spawn` always builds these.
+    // Front-only path: `build_per_port_servers` runs only when Stratum spawns
+    // (the front), where `engines::spawn` always builds these.
     let accepted = Sv1AcceptedShareAdapter::new(
         engines
             .accepted_sink
