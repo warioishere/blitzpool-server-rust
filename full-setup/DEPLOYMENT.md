@@ -60,13 +60,13 @@ docker logs blitzpool-notify 2>&1 | grep -E "consumer: live|bound: process live"
 
 ## Deploying a fix (build-then-swap, minimal downtime)
 
-> The examples use `$COMPOSE` for the compose file so they work regardless of
-> its name. The repo's default `docker-compose.yml` needs no `-f`; a
-> differently-named server file does. Set it once per shell:
+> The examples use `$COMPOSE` for the compose file. The repo + prod both use
+> `docker-compose.yml` (needs no `-f`), so `$COMPOSE` stays empty; set it only
+> if you point at a non-default file. Set it once per shell:
 >
 > ```bash
-> COMPOSE=""                                    # repo default docker-compose.yml
-> # COMPOSE="-f docker-compose-mainnet-pg.yml"  # server file, if named differently
+> COMPOSE=""                          # docker-compose.yml (repo + prod default)
+> # COMPOSE="-f other-file.yml"       # only if you use a non-default compose file
 > ```
 
 A deploy is **two separate steps** — and that's what gives you near-zero
