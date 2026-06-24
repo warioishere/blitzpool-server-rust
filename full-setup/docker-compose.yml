@@ -32,9 +32,9 @@
 #   docker compose up -d --no-deps blitzpool-payout
 #
 # The shared postgres holds one DB per network so switching does NOT
-# wipe the other network's state. Default DB name = `blitzpool` for
-# new installs; set PG_DATABASE=public_pool in .env when attaching to
-# an existing TS-pool DB.
+# wipe the other network's state. DB name = `blitzpool`. The cutover
+# (cutover-to-rust.sh) renames the migrated TS DB `public_pool` →
+# `blitzpool`, so no PG_DATABASE override is needed post-cutover.
 
 # Shared base for the four pool processes — they differ only by
 # BLITZPOOL_ROLES, ports, and RUST_LOG. Enabled in every network profile;
@@ -75,7 +75,7 @@ services:
     networks:
       - blitzpool
     healthcheck:
-      test: ["CMD-SHELL", "cd / && pg_isready -U ${PG_USER:-postgres} -d ${PG_DATABASE:-public_pool}"]
+      test: ["CMD-SHELL", "cd / && pg_isready -U ${PG_USER:-postgres} -d ${PG_DATABASE:-blitzpool}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -104,7 +104,7 @@ services:
       -c pg_stat_statements.track=all
       -c statement_timeout=30000
     environment:
-      POSTGRES_DB: ${PG_DATABASE:-public_pool}
+      POSTGRES_DB: ${PG_DATABASE:-blitzpool}
       POSTGRES_USER: ${PG_USER:-postgres}
       POSTGRES_PASSWORD: ${PG_PASSWORD:-postgres}
     volumes:
