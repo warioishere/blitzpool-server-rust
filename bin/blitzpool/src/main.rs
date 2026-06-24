@@ -165,9 +165,9 @@ struct Cli {
     skip_tdp: bool,
 
     /// Override the config's deployment roles (comma-separated:
-    /// `front,api,payout,stats,notify`). When set, takes precedence over `mode` /
-    /// `roles` in the config — so every container can mount the same config
-    /// and differ only by `--roles` or the `BLITZPOOL_ROLES` env var.
+    /// `front,api,payout,stats,notify`). When set, takes precedence over the
+    /// `roles` list in the config — so every container can mount the same
+    /// config and differ only by `--roles` or the `BLITZPOOL_ROLES` env var.
     #[arg(long, env = "BLITZPOOL_ROLES", value_delimiter = ',')]
     roles: Vec<Role>,
 }
