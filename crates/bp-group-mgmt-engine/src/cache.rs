@@ -53,22 +53,41 @@ impl AddressCache {
     /// atomically. Single SELECT-per-rebuild is deliberate because
     /// membership changes are rare.
     pub async fn rebuild(&self, pool: &PgPool) -> Result<(), GroupServiceError> {
-        let members = bp_db::find_all_pplns_group_members(pool).await?;
-        let groups = bp_db::list_active_pplns_groups(pool).await?;
-        let active_by_id: HashMap<Uuid, bool> = groups.iter().map(|g| (g.id, g.active)).collect();
+        // Lenient reads (raw address strings, no `AddressId` decode): one
+        // malformed legacy address must NOT fail the whole boot-time rebuild
+        // and crash the pool. We parse + skip invalid ones below instead.
+        let members = bp_db::find_all_pplns_group_member_addresses(pool).await?;
+        let active_by_id: HashMap<Uuid, bool> = bp_db::list_active_pplns_group_flags(pool)
+            .await?
+            .into_iter()
+            .collect();
 
         let mut next = HashMap::with_capacity(members.len());
-        for m in members {
-            if let Some(&active) = active_by_id.get(&m.group_id) {
-                next.insert(
-                    m.address,
-                    GroupCacheEntry {
-                        group_id: m.group_id,
-                        active,
-                    },
-                );
-            }
+        let mut skipped = 0usize;
+        for (group_id, address) in members {
             // Members of dissolved groups are silently dropped.
+            let Some(&active) = active_by_id.get(&group_id) else {
+                continue;
+            };
+            match AddressId::new(address) {
+                Ok(addr) => {
+                    next.insert(addr, GroupCacheEntry { group_id, active });
+                }
+                Err(err) => {
+                    skipped += 1;
+                    tracing::warn!(
+                        %group_id, %err,
+                        "group-cache: skipping member with invalid address (legacy/corrupt \
+                         data); it won't route to its group until the row is fixed"
+                    );
+                }
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                "group-cache: rebuilt, some members skipped (invalid address)"
+            );
         }
         let mut guard = self.inner.write().await;
         *guard = next;

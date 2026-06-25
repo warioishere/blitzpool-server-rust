@@ -654,6 +654,61 @@ async fn address_cache_reflects_membership_changes() {
     cleanup_group(&pool, g.group.id).await;
 }
 
+/// A single corrupt/legacy member address (here: an embedded space, the
+/// exact shape that crashed boot during the prod cutover) must NOT fail
+/// the whole rebuild — the bad row is skipped, every good member still
+/// routes to its group.
+#[tokio::test]
+async fn address_cache_rebuild_skips_invalid_address_member() {
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let creator = format!("bc1qok{}", Uuid::new_v4().simple());
+    let good_addr = AddressId::new(creator.to_lowercase()).unwrap();
+    let g = svc
+        .create_group(&format!("ok-{}", Uuid::new_v4()), &creator)
+        .await
+        .expect("g");
+
+    // Raw-insert a member whose address contains a space — bypasses the
+    // `AddressId` guard the service normally enforces, simulating the
+    // migrated legacy rows that previously crashed the boot-time rebuild.
+    let bad = format!("12CWLwaD4WmZ PKRF{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO pplns_group_member (\"groupId\", address, role) VALUES ($1, $2, 'member')",
+    )
+    .bind(g.group.id)
+    .bind(&bad)
+    .execute(&pool)
+    .await
+    .expect("raw insert bad member");
+
+    // Rebuild must succeed despite the corrupt row...
+    svc.rebuild_cache()
+        .await
+        .expect("rebuild tolerates an invalid member address");
+
+    // ...and the good member is still routed to its group.
+    let entry = svc
+        .get_group_for_address(&good_addr)
+        .await
+        .expect("good member cached");
+    assert_eq!(entry.group_id, g.group.id);
+
+    // Sanity: the bad row really is in the DB, so rebuild had to skip it.
+    let cnt: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pplns_group_member WHERE \"groupId\" = $1")
+            .bind(g.group.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(cnt, 2, "group should hold the good + the bad member rows");
+
+    cleanup_group(&pool, g.group.id).await;
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

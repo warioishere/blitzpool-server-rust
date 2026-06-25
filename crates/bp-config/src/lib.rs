@@ -1180,8 +1180,9 @@ mod tests {
         // `mode` was removed — roles are the only topology input. A leftover
         // `mode = "..."` must surface as a load error (deny_unknown_fields)
         // rather than be silently ignored.
-        let parsed =
-            AppConfig::from_toml_str(&format!("roles = [\"front\"]\nmode = \"core\"\n{MINIMAL_CFG}"));
+        let parsed = AppConfig::from_toml_str(&format!(
+            "roles = [\"front\"]\nmode = \"core\"\n{MINIMAL_CFG}"
+        ));
         assert!(parsed.is_err(), "a stray `mode` field must be rejected");
     }
 

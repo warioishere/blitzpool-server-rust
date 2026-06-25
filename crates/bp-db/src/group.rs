@@ -1288,6 +1288,38 @@ pub async fn find_all_pplns_group_members(
     .map_err(DbError::from)
 }
 
+/// Lenient member list for the boot-time routing-cache rebuild: returns raw
+/// address STRINGS (not `AddressId`), so one malformed legacy address can't
+/// fail the whole decode and crash boot. The caller parses each + skips the
+/// invalid ones. Pairs with [`list_active_pplns_group_flags`].
+pub async fn find_all_pplns_group_member_addresses(
+    pool: &PgPool,
+) -> Result<Vec<(uuid::Uuid, String)>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT "groupId" AS "group_id!", address AS "address!"
+           FROM pplns_group_member"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.group_id, r.address)).collect())
+}
+
+/// Lenient `(group_id, active)` flags for non-dissolved groups — selects no
+/// address column, so a bad `creatorAddress` can't fail the boot-time cache
+/// rebuild. Mirrors [`list_active_pplns_groups`]'s `WHERE`.
+pub async fn list_active_pplns_group_flags(
+    pool: &PgPool,
+) -> Result<Vec<(uuid::Uuid, bool)>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT id AS "id!", active AS "active!"
+           FROM pplns_group
+           WHERE "dissolvedAt" IS NULL"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.id, r.active)).collect())
+}
+
 // ── Invitations ─────────────────────────────────────────────────────
 
 /// INSERT a fresh invitation row. `inviteType` is `"directed"` for
