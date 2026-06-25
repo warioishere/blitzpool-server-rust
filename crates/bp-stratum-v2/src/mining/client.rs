@@ -508,6 +508,12 @@ pub struct MiningSessionState<C: Clock> {
     // Clock + per-port config
     pub clock: C,
     pub min_difficulty: Difficulty,
+    /// Operator-configured start difficulty for the port (already raised
+    /// to `min_difficulty` if set lower). Channel-open uses this as the
+    /// floor for the initial assigned difficulty so a miner that
+    /// under-reports `nominal_hash_rate` is never pinned to a trivial
+    /// target. Vardiff retargets from there.
+    pub initial_difficulty: Difficulty,
     pub target_shares_per_minute: f64,
     /// JDC-vardiff check cadence (ms). 0 disables JDC vardiff entirely
     /// (defensive — JDC `check()` already no-ops on `interval_ms == 0`).
@@ -574,6 +580,11 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             jdc_vardiff: JdcVardiff::new(),
             clock,
             min_difficulty: port.min_difficulty,
+            initial_difficulty: Difficulty(
+                port.initial_difficulty
+                    .as_f64()
+                    .max(port.min_difficulty.as_f64()),
+            ),
             target_shares_per_minute: port.target_shares_per_minute,
             vardiff_interval_ms: port.vardiff_interval_ms,
             share_logs: false,
@@ -911,10 +922,15 @@ pub fn handle_open_extended_mining_channel<C: Clock>(
 /// caller's existing min/ceiling guards to handle.
 fn floor_assigned_difficulty(diff: Difficulty) -> Difficulty {
     let v = diff.as_f64();
-    if !v.is_finite() || v <= 0.0 {
+    if !v.is_finite() || v < 1.0 {
+        // Non-finite, or an intentionally sub-1 difficulty (a tiny
+        // configured min/initial, e.g. on regtest): leave it untouched.
+        // Flooring would zero it; forcing it up to 1.0 would override the
+        // operator's configured difficulty. The integer floor below only
+        // applies once there is a whole share's worth to round.
         return diff;
     }
-    Difficulty(v.floor().max(1.0))
+    Difficulty(v.floor())
 }
 
 /// Captured context the kind-specific closure needs.
@@ -977,24 +993,33 @@ fn resolve_open_context<C: Clock>(
         worker_part.to_string()
     };
 
-    // Difficulty math. nominal_hash_rate=0 → use min_difficulty
-    // (cpuminer-style clients may report 0 H/s).
-    let assigned_difficulty = if nominal_hash_rate <= 0.0 {
-        state.min_difficulty
+    // Initial difficulty. SV2 miners advertise `nominal_hash_rate`; derive
+    // from it when present, but never start below the operator-configured
+    // initial difficulty. Some firmware under-reports (or reports 0) its
+    // rate — without the floor that pins the channel to a trivial target
+    // that wastes share bandwidth (and, on strict firmware, can stall)
+    // until vardiff catches up. `nominal_hash_rate <= 0` starts at the
+    // configured initial difficulty; an honest higher rate starts above it.
+    let derived = if nominal_hash_rate > 0.0 {
+        hash_rate_to_difficulty(nominal_hash_rate as f64, state.target_shares_per_minute)
     } else {
-        let raw = hash_rate_to_difficulty(nominal_hash_rate as f64, state.target_shares_per_minute);
-        // Clamp against miner's declared max_target.
-        let clamped = clamp_difficulty_to_max_target(raw, &Target::from_le_bytes(max_target_bytes));
-        // Floor at per-port min_difficulty.
-        if clamped < state.min_difficulty {
-            state.min_difficulty
-        } else if clamped.as_f64() > MAX_REASONABLE_DIFFICULTY {
-            return Err(err(ERR_MAX_TARGET_OUT_OF_RANGE));
-        } else {
-            // Whole-integer floor so decimal-truncating miners (SV1 via
-            // translator) don't undershoot a fractional target.
-            floor_assigned_difficulty(clamped)
-        }
+        state.initial_difficulty
+    };
+    let floored = Difficulty(
+        derived
+            .as_f64()
+            .max(state.initial_difficulty.as_f64())
+            .max(state.min_difficulty.as_f64()),
+    );
+    // Clamp against the miner's declared max_target (raises the floor to
+    // the miner's minimum acceptable difficulty if it declared one).
+    let clamped = clamp_difficulty_to_max_target(floored, &Target::from_le_bytes(max_target_bytes));
+    let assigned_difficulty = if clamped.as_f64() > MAX_REASONABLE_DIFFICULTY {
+        return Err(err(ERR_MAX_TARGET_OUT_OF_RANGE));
+    } else {
+        // Whole-integer floor so decimal-truncating miners (SV1 via
+        // translator) don't undershoot a fractional target.
+        floor_assigned_difficulty(clamped)
     };
 
     // Address-lock first time → store. The caller's ChannelOpened
@@ -2548,6 +2573,45 @@ mod tests {
         assert!(s.address.is_some());
     }
 
+    /// A miner that under-reports (tiny) or omits (0) `nominal_hash_rate`
+    /// must start at the configured initial difficulty (1024 in the test
+    /// port), never a trivial 1 / min — an honest higher rate starts above.
+    #[test]
+    fn open_standard_floors_initial_difficulty_at_configured_start() {
+        // Tiny nominal (1000 H/s → sub-1 derived) → floored to initial 1024.
+        let mut s = fresh_session();
+        handle_setup_connection(&mut s, &good_setup());
+        let _ = handle_open_standard_mining_channel(
+            &mut s,
+            &open_std(7, &format!("{REGTEST_ADDR}.w")),
+            vec![0x01, 0x02, 0x03, 0x04],
+        );
+        assert_eq!(
+            s.channels[&1].session_difficulty.as_f64(),
+            1024.0,
+            "tiny nominal must floor to the configured initial difficulty"
+        );
+
+        // nominal_hash_rate = 0 → also the configured initial difficulty.
+        let mut s0 = fresh_session();
+        handle_setup_connection(&mut s0, &good_setup());
+        let mut zero = open_std(8, &format!("{REGTEST_ADDR}.w"));
+        zero.nominal_hash_rate = 0.0;
+        let _ = handle_open_standard_mining_channel(&mut s0, &zero, vec![0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(s0.channels[&1].session_difficulty.as_f64(), 1024.0);
+
+        // An honest high nominal (~5 PH/s) starts ABOVE the floor.
+        let mut sh = fresh_session();
+        handle_setup_connection(&mut sh, &good_setup());
+        let mut big = open_std(9, &format!("{REGTEST_ADDR}.w"));
+        big.nominal_hash_rate = 5.0e15;
+        let _ = handle_open_standard_mining_channel(&mut sh, &big, vec![0x01, 0x02, 0x03, 0x04]);
+        assert!(
+            sh.channels[&1].session_difficulty.as_f64() > 1024.0,
+            "an honest high nominal must start above the configured floor"
+        );
+    }
+
     #[test]
     fn open_standard_rejects_invalid_address() {
         let mut s = fresh_session();
@@ -2688,8 +2752,9 @@ mod tests {
             floor_assigned_difficulty(Difficulty(1024.0)).as_f64(),
             1024.0
         );
-        // Sub-1 diffs are bounded up to 1.0 — never floor to 0.
-        assert_eq!(floor_assigned_difficulty(Difficulty(0.7)).as_f64(), 1.0);
+        // Sub-1 diffs pass through unchanged — neither floored to 0 nor
+        // forced up to 1.0 (an intentionally low configured difficulty).
+        assert_eq!(floor_assigned_difficulty(Difficulty(0.7)).as_f64(), 0.7);
         // Non-positive / non-finite pass through for the caller's guards.
         assert_eq!(floor_assigned_difficulty(Difficulty(0.0)).as_f64(), 0.0);
         assert!(floor_assigned_difficulty(Difficulty(f64::NAN))
