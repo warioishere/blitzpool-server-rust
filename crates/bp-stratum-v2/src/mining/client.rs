@@ -1038,6 +1038,20 @@ fn resolve_open_context<C: Clock>(
 
 // ── Handler: SubmitSharesStandard ───────────────────────────────────
 
+/// Vardiff grace: the difficulty a submitted share is validated against
+/// is the LOWER of the job's frozen send-time difficulty and the
+/// channel's current target. Validating against the frozen per-job diff
+/// alone graces a vardiff RAISE (a lagging miner's old-diff shares still
+/// meet the lower frozen value), but a vardiff LOWER leaves the job
+/// frozen ABOVE the miner's new (lower) target — its legitimate shares
+/// would be rejected difficulty-too-low. Taking the minimum graces both
+/// directions, so no share in flight across a difficulty change is lost.
+/// The share is still CREDITED at its actual achieved difficulty, so
+/// PPLNS weighting and block-candidacy are unaffected.
+fn graced_validation_difficulty(job_frozen: Difficulty, session: Difficulty) -> Difficulty {
+    Difficulty(job_frozen.as_f64().min(session.as_f64()))
+}
+
 /// Handle `SubmitSharesStandard`. Resolves the channel + per-job
 /// context (stored merkle root + difficulty + template snapshot) and
 /// delegates to [`validate_submit_standard`]. Emits
@@ -1100,20 +1114,21 @@ pub fn handle_submit_shares_standard<C: Clock>(
         coinbase_tx_value_remaining: entry.template_snapshot.coinbase_tx_value_remaining,
     };
 
-    let validation = validate_submit_standard(
-        channel,
-        submission,
-        entry.difficulty,
-        &entry.merkle_root,
-        &job_ctx,
-    );
+    let graced = graced_validation_difficulty(entry.difficulty, channel.session_difficulty);
+    let validation =
+        validate_submit_standard(channel, submission, graced, &entry.merkle_root, &job_ctx);
+    // Feed classic vardiff with EVERY accepted share (same as the Extended
+    // path) so its submission cache fills and `suggested_difficulty` tracks
+    // the real rate. The previous `is_current = effective == session` gate
+    // went false after every vardiff change (Standard jobs are frozen at
+    // their send-time difficulty, which diverges from the live session
+    // target the moment vardiff moves), starving the sample cache — vardiff
+    // then fell into its under-sampled fallback and drifted the difficulty
+    // toward the floor. Extended never hit this because it always fed `true`.
     if let ShareValidation::Accepted(ref accept) = validation {
-        let is_current = (accept.effective_difficulty.as_f64() - state.session_difficulty.as_f64())
-            .abs()
-            < f64::EPSILON;
         state
             .vardiff
-            .update_hash_rate(accept.effective_difficulty.as_f64(), is_current);
+            .update_hash_rate(accept.effective_difficulty.as_f64(), true);
     }
     let channel = state
         .channels
@@ -1166,7 +1181,7 @@ pub fn handle_submit_shares_extended<C: Clock>(
     // SV2 §5.3.14: per-job difficulty stored on ExtendedJob at send
     // time. Read it out by value (it's `Copy`) so the channel borrow is
     // released before computing the target memo below.
-    let Some(job_difficulty) = channel
+    let Some(frozen_difficulty) = channel
         .extended_jobs
         .get(&submission.job_id)
         .map(|j| j.difficulty)
@@ -1174,6 +1189,10 @@ pub fn handle_submit_shares_extended<C: Clock>(
         let reject = ShareReject::from(RejectReason::InvalidJobId);
         return submit_error_with_event(submission.channel_id, submission.sequence_number, reject);
     };
+    // Vardiff grace (see `graced_validation_difficulty`): accept shares in
+    // flight across a difficulty change in EITHER direction.
+    let job_difficulty =
+        graced_validation_difficulty(frozen_difficulty, channel.session_difficulty);
     // Compute the target memo first, while no field of `channel` is
     // borrowed (`target_for` takes `&mut self`); it returns a `Copy`
     // `Target`, so the borrow ends here. Afterwards we hand the validator
@@ -2762,6 +2781,30 @@ mod tests {
             .is_nan());
     }
 
+    /// Vardiff grace: validate against the LOWER of the job's frozen diff
+    /// and the current session target, so neither a raise nor a lower
+    /// rejects in-flight shares.
+    #[test]
+    fn graced_validation_difficulty_takes_the_lower() {
+        // Raise (job frozen low, session raised) → grace at the frozen low,
+        // so a miner still on the old target is accepted.
+        assert_eq!(
+            graced_validation_difficulty(Difficulty(1024.0), Difficulty(1536.0)).as_f64(),
+            1024.0
+        );
+        // Lower (job frozen high, session lowered) → grace at the new low,
+        // so the miner's lowered-target shares are accepted.
+        assert_eq!(
+            graced_validation_difficulty(Difficulty(1536.0), Difficulty(512.0)).as_f64(),
+            512.0
+        );
+        // Stable → unchanged.
+        assert_eq!(
+            graced_validation_difficulty(Difficulty(1024.0), Difficulty(1024.0)).as_f64(),
+            1024.0
+        );
+    }
+
     // ── SubmitSharesStandard ───────────────────────────────────────
 
     fn snapshot() -> StandardTemplateSnapshot {
@@ -3034,6 +3077,56 @@ mod tests {
             _ => panic!("expected SubmitSharesError"),
         }
         assert!(matches!(out.events[0], SessionEvent::ShareRejected { .. }));
+    }
+
+    /// Regression: an accepted Standard share whose frozen job difficulty
+    /// differs from the live session difficulty MUST still feed the
+    /// vardiff submission cache. Standard jobs are frozen at send-time
+    /// difficulty, so the moment vardiff moves the session target, every
+    /// in-flight job's difficulty diverges from it. If accepted shares on
+    /// those jobs are withheld from the cache, it starves below the sample
+    /// threshold, `suggested_difficulty` falls into its under-sampled
+    /// fallback (`client_difficulty / target_shares_per_minute`), and the
+    /// difficulty ratchets toward the floor on every check. Feeding every
+    /// accepted share keeps the rate estimate honest.
+    #[test]
+    fn submit_standard_feeds_vardiff_even_when_job_diff_differs_from_session() {
+        let mut s = fresh_session();
+        handle_setup_connection(&mut s, &good_setup());
+        let _ = handle_open_standard_mining_channel(
+            &mut s,
+            &open_std(1, &format!("{}.w", REGTEST_ADDR)),
+            vec![0; 4],
+        );
+        let channel_id = s.primary_channel.unwrap();
+        // Simulate a vardiff move: session target is high (1024) while the
+        // in-flight job is frozen at an easy target the share can meet.
+        let easy = Difficulty(1.0 / 4_294_967_296.0);
+        s.session_difficulty = Difficulty(1024.0);
+        {
+            let ch = s.channels.get_mut(&channel_id).unwrap();
+            ch.session_difficulty = Difficulty(1024.0);
+            ch.standard_jobs
+                .record_send_for_test(7, easy, [0xDD; 32], snapshot(), 0);
+        }
+        assert_eq!(s.vardiff.cache_len(), 0, "cache empty before any share");
+        let sub = SubmitSharesStandardInput {
+            channel_id,
+            sequence_number: 1,
+            job_id: 7,
+            nonce: 0x1234_5678,
+            version: 0x2000_0000,
+            ntime: 0x6500_0001,
+        };
+        let out = handle_submit_shares_standard(&mut s, &sub, 0);
+        assert!(matches!(out.events[0], SessionEvent::ShareAccepted { .. }));
+        assert_eq!(
+            s.vardiff.cache_len(),
+            1,
+            "accepted Standard share must feed the vardiff submission cache \
+             even when its frozen job difficulty differs from the session \
+             target — otherwise vardiff starves and drifts to the floor"
+        );
     }
 
     // ── SubmitSharesExtended ───────────────────────────────────────
