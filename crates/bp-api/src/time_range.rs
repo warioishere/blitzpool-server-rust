@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Shared `?range=` parsing + slot-bucket math for chart/timeseries
-//! endpoints. Same range strings, same default bucket sizes.
+//! endpoints. The slot size is a fixed 10 minutes for every range — the
+//! stats are stored at that resolution and surfaced natively, so a
+//! longer range just returns more points (never coarser buckets).
 //!
 //! ## Range presets
 //!
-//! | range | window | slot size | typical bucket count |
-//! |-------|--------|-----------|----------------------|
-//! | `1d`  | 24h    | 10 min    | 144                  |
-//! | `3d`  | 72h    | 30 min    | 144                  |
-//! | `7d`  | 168h   | 1 hour    | 168                  |
-//! | `1m`  | 30 days| 6 hours   | 120                  |
+//! | range | window  | slot size | point count |
+//! |-------|---------|-----------|-------------|
+//! | `1d`  | 24h     | 10 min    | 144         |
+//! | `3d`  | 72h     | 10 min    | 432         |
+//! | `7d`  | 168h    | 10 min    | 1008        |
+//! | `1m`  | 30 days | 10 min    | 4320        |
 //!
 //! Endpoints that don't take `range` (e.g. `/api/info/shares`) just
 //! compute their own millis directly.
@@ -54,15 +56,15 @@ impl Range {
         }
     }
 
+    /// Slot granularity is a fixed 10 minutes for every range — the
+    /// stats are persisted in 10-min slots and the chart / accepted /
+    /// worker endpoints surface them at that native resolution (longer
+    /// ranges simply return more points). Coarser per-range bucketing
+    /// would both drop resolution and, on the hashrate charts, inflate
+    /// the value (the `* 2^32 / 600s` conversion assumes a 10-min slot).
     pub fn slot_size_ms(self) -> i64 {
         const MIN: i64 = 60 * 1000;
-        const HOUR: i64 = 60 * MIN;
-        match self {
-            Self::Day => 10 * MIN,
-            Self::ThreeDays => 30 * MIN,
-            Self::SevenDays => HOUR,
-            Self::Month => 6 * HOUR,
-        }
+        10 * MIN
     }
 
     /// Short string for cache keys / log lines (`1d`, `3d`, `7d`,
@@ -278,6 +280,19 @@ mod tests {
         assert_eq!(Range::parse(Some("7d")).unwrap(), Range::SevenDays);
         assert_eq!(Range::parse(Some("1m")).unwrap(), Range::Month);
         assert_eq!(Range::parse(Some("30d")).unwrap(), Range::Month);
+    }
+
+    /// Every range must surface native 10-min slots — no coarser
+    /// per-range bucketing (keeps chart resolution + correct hashrate).
+    #[test]
+    fn slot_size_is_always_ten_minutes() {
+        for r in [Range::Day, Range::ThreeDays, Range::SevenDays, Range::Month] {
+            assert_eq!(
+                r.slot_size_ms(),
+                10 * 60 * 1000,
+                "{r:?} must use 10-min slots"
+            );
+        }
         assert!(Range::parse(Some("forever")).is_err());
     }
 
