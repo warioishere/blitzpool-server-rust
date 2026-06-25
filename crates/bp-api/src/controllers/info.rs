@@ -1238,8 +1238,11 @@ where
                 let accepted_30d = month_rows.iter().map(|r| r.accepted as f64).sum::<f64>();
                 let rejected_30d = month_rows.iter().map(|r| r.rejected as f64).sum::<f64>();
 
-                // Slice since the most-recent confirmed block; fall back to the
-                // start of the 1d window when no blocks have ever been found.
+                // Slice since the most-recent confirmed block; fall back to 0
+                // (epoch → all-time total) when no block has ever been found.
+                // Matches TS `sinceBlock = latestBlock?.createdAt ?? 0`: a pool
+                // that hasn't found a block shows its cumulative share total,
+                // not just the last day.
                 let last_block_at: Option<i64> = sqlx::query_scalar(
                     r#"SELECT MAX("createdAt") FROM blocks_entity WHERE "deletedAt" IS NULL"#,
                 )
@@ -1247,7 +1250,7 @@ where
                 .await
                 .ok()
                 .flatten();
-                let since_block = last_block_at.unwrap_or(now - DAY);
+                let since_block = last_block_at.unwrap_or(0);
                 let block_rows =
                     bp_db::find_pool_share_statistics_since(&s.pool, since_block).await?;
                 let accepted_since_block =
