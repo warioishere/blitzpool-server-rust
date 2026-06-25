@@ -1638,6 +1638,34 @@ fn standard_member_root_and_coinbase(
 /// The handler emits no `SessionEvent` — broadcasts are pool-driven
 /// and don't need a hook layer fan-out. Caller can derive any
 /// observability it wants from the outbound frame stream.
+/// Content signature of a job: everything the miner
+/// hashes over — version, prev_hash, n_bits, plus the merkle root
+/// (Standard) or merkle path + coinbase prefix/suffix (Extended).
+/// Deliberately EXCLUDES `min_ntime`/timestamp so a refresh that only
+/// bumps the clock is recognised as byte-identical work. Used to suppress
+/// re-issuing identical work under a fresh `job_id`, which freezes strict
+/// firmware (BraiinsOS resets its pipeline on every `NewMiningJob`).
+fn job_content_signature(
+    version: u32,
+    prev_hash: &[u8; 32],
+    n_bits: u32,
+    merkle_root: Option<&[u8; 32]>,
+    merkle_path: &[[u8; 32]],
+    coinbase_prefix: &[u8],
+    coinbase_suffix: &[u8],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    version.hash(&mut h);
+    prev_hash.hash(&mut h);
+    n_bits.hash(&mut h);
+    merkle_root.hash(&mut h);
+    merkle_path.hash(&mut h);
+    coinbase_prefix.hash(&mut h);
+    coinbase_suffix.hash(&mut h);
+    h.finish()
+}
+
 pub fn apply_template_broadcast<C: Clock>(
     state: &mut MiningSessionState<C>,
     broadcast: &TemplateBroadcast,
@@ -1709,7 +1737,7 @@ pub fn apply_template_broadcast<C: Clock>(
         let job_id = channel.next_job_id;
         channel.next_job_id = channel.next_job_id.wrapping_add(1);
 
-        // SV2 future-job protocol (TS parity): on a block change the job is
+        // SV2 future-job protocol: on a block change the job is
         // a FUTURE job — sent with an empty `min_ntime` and activated by a
         // `SetNewPrevHash` emitted AFTER it (below). On a same-block refresh
         // the job is active immediately (`Some(header_timestamp)`, no
@@ -1746,6 +1774,24 @@ pub fn apply_template_broadcast<C: Clock>(
                     &channel.extranonce_prefix,
                     &template.merkle_path,
                 );
+
+                // Suppress a same-block refresh that is
+                // byte-identical to the last job sent — re-issuing it under a
+                // fresh job_id freezes strict firmware (BraiinsOS). A block
+                // change (is_new_block) is always sent.
+                let sig = job_content_signature(
+                    template.version,
+                    &template.prev_hash,
+                    template.n_bits,
+                    Some(&merkle_root),
+                    &[],
+                    &[],
+                    &[],
+                );
+                if !is_new_block && channel.last_sent_job_signature == Some(sig) {
+                    continue;
+                }
+                channel.last_sent_job_signature = Some(sig);
 
                 // Snapshot the template context at send-time. SV2
                 // §5.3.14 strict: in-flight shares for this job hash
@@ -1823,6 +1869,23 @@ pub fn apply_template_broadcast<C: Clock>(
                 let tx_suffix = mining_job.coinbase_suffix().to_vec();
                 let merkle_path = template.merkle_path.clone();
 
+                // Suppress a same-block refresh that is byte-identical to the
+                // last job sent — re-issuing it under a fresh job_id freezes
+                // strict firmware (BraiinsOS). A block change is always sent.
+                let sig = job_content_signature(
+                    template.version,
+                    &template.prev_hash,
+                    template.n_bits,
+                    None,
+                    &merkle_path,
+                    &tx_prefix,
+                    &tx_suffix,
+                );
+                if !is_new_block && channel.last_sent_job_signature == Some(sig) {
+                    continue;
+                }
+                channel.last_sent_job_signature = Some(sig);
+
                 let ext_job = ExtendedJob {
                     coinbase_prefix: tx_prefix.clone(),
                     coinbase_suffix: tx_suffix.clone(),
@@ -1855,7 +1918,7 @@ pub fn apply_template_broadcast<C: Clock>(
 
         // Activate the future job (sent above) on a block change. Emitted
         // AFTER the job per SV2 §7.4 so the miner already holds the job the
-        // `job_id` refers to (TS parity).
+        // `job_id` refers to.
         if is_new_block {
             outcome.push_frame(OutboundFrame::SetNewPrevHash {
                 channel_id,
@@ -1969,7 +2032,7 @@ pub fn apply_template_broadcast<C: Clock>(
                         let cs = job.coinbase_suffix.clone();
                         ch.extended_jobs.insert(jid, job);
                         // Future job first (empty `min_ntime`), then the
-                        // activating SetNewPrevHash — TS parity / SV2 §7.4.
+                        // activating SetNewPrevHash — SV2 §7.4.
                         outcome.push_frame(OutboundFrame::NewExtendedMiningJob {
                             channel_id: new_id,
                             job_id: jid,
@@ -2035,7 +2098,7 @@ pub fn apply_template_broadcast<C: Clock>(
         }
 
         // Future job first (empty `min_ntime` on a block change), then the
-        // activating SetNewPrevHash — TS parity / SV2 §7.4. A same-block
+        // activating SetNewPrevHash — SV2 §7.4. A same-block
         // refresh sends an active job (`Some`) with no SetNewPrevHash.
         outcome.push_frame(OutboundFrame::NewExtendedMiningJob {
             channel_id: gid,
@@ -3586,7 +3649,7 @@ mod tests {
             2,
             "expect NewMiningJob (future job) + SetNewPrevHash"
         );
-        // SV2 future-job order (TS parity): the job comes FIRST with an empty
+        // SV2 future-job order: the job comes FIRST with an empty
         // `min_ntime`, then SetNewPrevHash activates it.
         let stored = match &out.outbound[0] {
             OutboundFrame::NewMiningJob {
@@ -3653,7 +3716,7 @@ mod tests {
             None,
         );
         assert_eq!(out.outbound.len(), 2);
-        // SV2 future-job order (TS parity): future job first, then activation.
+        // SV2 future-job order: future job first, then activation.
         assert!(matches!(
             out.outbound[1],
             OutboundFrame::SetNewPrevHash { channel_id, .. } if channel_id == gid
@@ -4090,11 +4153,15 @@ mod tests {
             1_000,
             None,
         );
-        // Now Refresh: existing entry stays Active (not retired).
+        // Now Refresh with DIFFERENT work (varied coinbase → different merkle
+        // root) so it is not suppressed as a byte-identical re-issue: existing
+        // entry stays Active (not retired).
+        let mut mj2 = synthetic_mining_job_inputs();
+        mj2.coinbase_prefix = vec![0x01, 0xC9];
         let out = apply_template_broadcast(
             &mut s,
             &broadcast(TemplateChange::Refresh, [0xAB; 32]),
-            &mj,
+            &mj2,
             2_000,
             None,
         );
@@ -4104,7 +4171,7 @@ mod tests {
             "only NewMiningJob, no SetNewPrevHash"
         );
         // Same-block refresh: an ACTIVE job (`Some(min_ntime)`), NOT a future
-        // job — the inverse of the block-change case (TS parity).
+        // job — the inverse of the block-change case.
         match &out.outbound[0] {
             OutboundFrame::NewMiningJob { min_ntime, .. } => assert!(
                 min_ntime.is_some(),
@@ -4119,6 +4186,74 @@ mod tests {
             ch.standard_jobs.classify(1, 2_000),
             Some(bp_jobs_lifecycle::JobClassification::Active),
             "Refresh must not retire existing entries"
+        );
+    }
+
+    /// A same-block refresh that is byte-identical to the last job sent is
+    /// NOT re-issued (strict firmware resets its pipeline on every job). A
+    /// refresh with changed work, and any block change, ARE sent.
+    #[test]
+    fn template_broadcast_refresh_suppresses_byte_identical_reissue() {
+        let mut s = session_with_standard_channel();
+        let mj = synthetic_mining_job_inputs();
+        // Seed the channel's last-job signature via a block change.
+        let seed = apply_template_broadcast(
+            &mut s,
+            &broadcast(TemplateChange::NewBlock, [0xAB; 32]),
+            &mj,
+            1_000,
+            None,
+        );
+        assert!(seed
+            .outbound
+            .iter()
+            .any(|f| matches!(f, OutboundFrame::NewMiningJob { .. })));
+
+        // Byte-identical refresh → nothing on the wire.
+        let dup = apply_template_broadcast(
+            &mut s,
+            &broadcast(TemplateChange::Refresh, [0xAB; 32]),
+            &mj,
+            2_000,
+            None,
+        );
+        assert!(
+            dup.outbound.is_empty(),
+            "byte-identical refresh must not re-issue a job"
+        );
+
+        // Refresh with changed work → a fresh NewMiningJob.
+        let mut mj2 = synthetic_mining_job_inputs();
+        mj2.coinbase_prefix = vec![0x01, 0xC9];
+        let changed = apply_template_broadcast(
+            &mut s,
+            &broadcast(TemplateChange::Refresh, [0xAB; 32]),
+            &mj2,
+            3_000,
+            None,
+        );
+        assert!(
+            changed
+                .outbound
+                .iter()
+                .any(|f| matches!(f, OutboundFrame::NewMiningJob { .. })),
+            "a refresh with changed work must be sent"
+        );
+
+        // A block change re-issues even if the work matches the last job.
+        let block = apply_template_broadcast(
+            &mut s,
+            &broadcast(TemplateChange::NewBlock, [0xCD; 32]),
+            &mj2,
+            4_000,
+            None,
+        );
+        assert!(
+            block
+                .outbound
+                .iter()
+                .any(|f| matches!(f, OutboundFrame::NewMiningJob { .. })),
+            "a block change must always be sent"
         );
     }
 
@@ -4207,7 +4342,7 @@ mod tests {
             2_000,
             None,
         );
-        // Future-job order (TS parity): NewMiningJob is frame [0], the
+        // Future-job order: NewMiningJob is frame [0], the
         // activating SetNewPrevHash is frame [1].
         let job1 = match out1.outbound[0] {
             OutboundFrame::NewMiningJob { job_id, .. } => job_id,

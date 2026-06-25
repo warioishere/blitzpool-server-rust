@@ -113,6 +113,16 @@ pub struct ChannelState {
     /// Per-channel submission dedup set. Cleared on block change.
     pub submission_cache: SubmissionCache,
 
+    /// Content signature of the last job sent on this channel — version,
+    /// prev_hash, n_bits and the merkle root (Standard) or coinbase
+    /// prefix/suffix + merkle path (Extended). A same-block *refresh*
+    /// whose signature matches is byte-identical work and is NOT re-issued
+    /// under a fresh `job_id`: strict firmware (BraiinsOS) resets its
+    /// hashing pipeline on every `NewMiningJob`, so re-announcing identical
+    /// work freezes its effective hashrate / best-difficulty. A real block
+    /// change (`SetNewPrevHash`) is always sent. `None` until the first job.
+    pub last_sent_job_signature: Option<u64>,
+
     /// JD-Client flag (set when the connection's IP also has an
     /// active JDP-server connection). Gates pool job broadcast.
     pub is_jdc: bool,
@@ -163,6 +173,7 @@ impl ChannelState {
             accepted_share_difficulty_sum: 0.0,
             next_job_id: 1,
             submission_cache: SubmissionCache::Standard(HashSet::new()),
+            last_sent_job_signature: None,
             is_jdc: false,
             first_share_logged: false,
             last_submission_difficulty: None,
@@ -194,6 +205,7 @@ impl ChannelState {
             accepted_share_difficulty_sum: 0.0,
             next_job_id: 1,
             submission_cache: SubmissionCache::Extended(HashSet::new()),
+            last_sent_job_signature: None,
             is_jdc: false,
             first_share_logged: false,
             last_submission_difficulty: None,

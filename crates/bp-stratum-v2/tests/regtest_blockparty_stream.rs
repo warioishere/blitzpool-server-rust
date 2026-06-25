@@ -262,7 +262,7 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
                     job = Some((j.channel_id, j.job_id, j.version));
                 }
                 // A future job carries an empty min_ntime; the activating
-                // SetNewPrevHash supplies it (SV2 §7.4 / TS parity).
+                // SetNewPrevHash supplies it.
                 AnyMessage::Mining(Mining::SetNewPrevHash(p)) => {
                     ntime = Some(p.min_ntime);
                 }
@@ -309,7 +309,7 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
                         let nt = j.min_ntime.clone().into_inner().unwrap_or(nt);
                         latest_job = (j.channel_id, j.job_id, j.version, nt);
                     }
-                    // Future-job activation supplies the ntime (TS parity).
+                    // Future-job activation supplies the ntime.
                     AnyMessage::Mining(Mining::SetNewPrevHash(p)) => {
                         let (cid, jid, ver, _) = latest_job;
                         latest_job = (cid, jid, ver, p.min_ntime);

@@ -266,7 +266,7 @@ async fn sv2_solo_connection_routes_to_solo_stream_and_block_accepted() {
                     job = Some((j.channel_id, j.job_id, j.version));
                 }
                 // A future job carries an empty min_ntime; the activating
-                // SetNewPrevHash supplies it (SV2 §7.4 / TS parity).
+                // SetNewPrevHash supplies it.
                 AnyMessage::Mining(Mining::SetNewPrevHash(p)) => {
                     ntime = Some(p.min_ntime);
                 }
@@ -320,7 +320,7 @@ async fn sv2_solo_connection_routes_to_solo_stream_and_block_accepted() {
                         latest_job = (j.channel_id, j.job_id, j.version, nt);
                     }
                     // Future-job activation supplies the ntime for the
-                    // just-received job (SV2 §7.4 / TS parity).
+                    // just-received job.
                     AnyMessage::Mining(Mining::SetNewPrevHash(p)) => {
                         let (cid, jid, ver, _) = latest_job;
                         latest_job = (cid, jid, ver, p.min_ntime);
