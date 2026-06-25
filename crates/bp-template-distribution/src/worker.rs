@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 
 use async_channel::{Receiver as AcReceiver, Sender as AcSender};
-use bitcoin_core_sv2::template_distribution_protocol::BitcoinCoreSv2TDP;
+use bitcoin_core_sv2::unix_capnp::v31x::template_distribution_protocol::BitcoinCoreSv2TDP;
 use stratum_core::{
     parsers_sv2::TemplateDistribution,
     template_distribution_sv2::{

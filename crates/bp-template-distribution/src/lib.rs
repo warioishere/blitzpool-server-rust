@@ -4,7 +4,7 @@
 //!
 //! This crate is an in-process bridge between bitcoin-core's SV2 IPC
 //! endpoint and the rest of the Blitzpool runtime. It owns a single
-//! [`bitcoin_core_sv2::template_distribution_protocol::BitcoinCoreSv2TDP`]
+//! [`bitcoin_core_sv2::unix_capnp::v31x::template_distribution_protocol::BitcoinCoreSv2TDP`]
 //! instance on a dedicated OS thread (the underlying type is `!Send`
 //! because `capnp-rpc` is not `Send`) and exposes a `Send + Clone`
 //! [`TdpHandle`] to the multi-threaded pool runtime.

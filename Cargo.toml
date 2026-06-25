@@ -149,7 +149,12 @@ proptest = "1"
 # Pinnt bitcoin-core v31.0 + capnproto/libcapnp-dev als system deps. Beim
 # Hochziehen auf neuen sv2-apps-Stand: rev tauschen + `cargo update -p
 # bitcoin_core_sv2`.
-bitcoin_core_sv2 = { git = "https://github.com/stratum-mining/sv2-apps.git", rev = "4c0a65680c91f308fa37e855c4e30c4458434f71" }
+#
+# FORK-PIN: warioishere/sv2-apps @ branch v0.4.0-blitzpool = upstream main
+# 27985c63 (unreleased 0.4.0 multi-version refactor) + EIN Patch-Commit, der
+# den min_interval-Sleep im v31x-TDP-Monitor durch skip-statt-sleep ersetzt
+# (sv2-apps#541). Rückweg auf Upstream + Revert-Recipe: siehe UPSTREAM_DEPS.md.
+bitcoin_core_sv2 = { git = "https://github.com/warioishere/sv2-apps.git", rev = "8f7043b65c4d3f2bc85aa1ee6a4edb8ef0c14af5" }
 # stratum-core liefert `parsers_sv2::TemplateDistribution` und die Subprotokoll-
 # Strukturen, die wir zum Bauen von SubmitSolution/CoinbaseOutputConstraints
 # brauchen. bitcoin_core_sv2 re-exportiert das (noch) nicht.
@@ -161,7 +166,7 @@ stratum-core = { git = "https://github.com/stratum-mining/stratum", branch = "ma
 # task_manager, custom_mutex). Feature `pool` zieht network + config + core
 # + with_buffer_pool. Selber rev wie bitcoin_core_sv2 damit Cargo nur einen
 # stratum-core-Graph baut. Runtime-Dep, kein Source-Copy.
-stratum-apps = { git = "https://github.com/stratum-mining/sv2-apps.git", rev = "4c0a65680c91f308fa37e855c4e30c4458434f71", features = ["pool"] }
+stratum-apps = { git = "https://github.com/warioishere/sv2-apps.git", rev = "8f7043b65c4d3f2bc85aa1ee6a4edb8ef0c14af5", features = ["pool"] }
 # SipHash-2-4 als pure-math-Lib für SHORT_TX_ID-Hashing
 # (TS portiert eigene Impl in sv2-siphash.ts; in Rust nehmen wir
 # `siphasher` — die aktuell gepflegte Standard-Crate, MIT/Apache).

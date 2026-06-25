@@ -5,7 +5,9 @@
 > ops uses this as the bump-checklist (which crates need attention,
 > which are pinned, what could break on update).
 
-**Last touched:** 2026-05-16 — initial doc covering Phase 5 dependencies.
+**Last touched:** 2026-06-25 — bumped `bitcoin_core_sv2`/`stratum-apps` to a
+fork of the unreleased 0.4.0 multi-version refactor carrying the #541 fix
+(see §2 "FORK pin" for the revert recipe).
 
 ---
 
@@ -102,8 +104,8 @@ crate uses `<dep> = { workspace = true }` so the version is centralised.
 | Crate | Source | Pin type | Current pin |
 |---|---|---|---|
 | `stratum-core` | `github.com/stratum-mining/stratum` | `branch = "main"` | floating |
-| `stratum-apps` | `github.com/stratum-mining/sv2-apps.git` | `rev = "..."` | `4c0a65680c91f308fa37e855c4e30c4458434f71` |
-| `bitcoin_core_sv2` | `github.com/stratum-mining/sv2-apps.git` | `rev = "..."` | `4c0a65680c91f308fa37e855c4e30c4458434f71` |
+| `stratum-apps` | `github.com/warioishere/sv2-apps.git` **(FORK)** | `rev = "..."` | `8f7043b65c4d3f2bc85aa1ee6a4edb8ef0c14af5` |
+| `bitcoin_core_sv2` | `github.com/warioishere/sv2-apps.git` **(FORK)** | `rev = "..."` | `8f7043b65c4d3f2bc85aa1ee6a4edb8ef0c14af5` |
 
 **Why the asymmetry**: `stratum-core` is on a branch because
 `bitcoin_core_sv2` (rev-pinned at the sv2-apps commit above)
@@ -113,6 +115,49 @@ spec exactly — Cargo de-duplicates into one `stratum-core` build
 instead of two slightly different ones. Cargo.lock pins the actual
 commit-SHA so builds remain reproducible until we run
 `cargo update -p stratum-core`.
+
+### ⚠️ FORK pin — why, and how to revert to upstream
+
+`bitcoin_core_sv2` + `stratum-apps` are pinned to **our fork**
+`github.com/warioishere/sv2-apps.git`, branch `v0.4.0-blitzpool`, rev
+`8f7043b6`. The fork = **upstream `main` commit `27985c63`** (the
+*unreleased* `bitcoin_core_sv2` 0.4.0 multi-version refactor — `common`
++ `unix_capnp::{v30x,v31x}`) **plus exactly ONE patch commit**: it
+replaces the `min_interval` sleep in the v31x TDP monitor with
+skip-instead-of-sleep so a chain-tip change during the fee-update window
+isn't delayed (upstream bug **sv2-apps#541**, still open).
+
+`git log 27985c63..8f7043b6` is **only our one commit** — divergence is
+minimal by design.
+
+**Why fork instead of waiting:** the multi-version refactor is only on
+upstream `main` (no release tag yet — the `v0.4.0` git tag is the OLD
+0.2.0 state), and #541 is unfixed. We took the architecture now (on our
+schedule, pre-cutover) rather than mid-production, and carry the #541 fix
+ourselves.
+
+**We consume the `v31x` backend** (prod runs Bitcoin Core v31):
+`bitcoin_core_sv2::unix_capnp::v31x::{template_distribution_protocol,
+job_declaration_protocol}` for the `BitcoinCoreSv2TDP`/`JDP` types, and
+`bitcoin_core_sv2::common::job_declaration_protocol::io` for the message
+types. `stratum-core` stays `branch = "main"` (the refactor still pulls
+stratum-core from git main, not crates.io).
+
+**Revert to upstream (do this when upstream tags a release that contains
+the multi-version refactor AND a #541 fix):**
+1. Flip both pins in the root `Cargo.toml` from
+   `git = ".../warioishere/sv2-apps.git", rev = "8f7043b6"` back to the
+   official source (the new `git = ".../stratum-mining/sv2-apps.git",
+   rev = "<release>"` or crates.io version).
+2. `cargo update -p bitcoin_core_sv2 -p stratum-apps -p stratum-core`.
+3. `cargo check --workspace` + `cargo test-strict` (regtests exercise the
+   v31x backend against a real Core v31). Our `monitors.rs` skip-patch is
+   superseded by upstream's fix, so nothing else to migrate.
+4. Delete the `v0.4.0-blitzpool` fork branch; drop this section.
+
+If upstream main gets fixes we need *before* a release: rebase the fork
+branch onto the newer main, re-apply our one patch (`git rebase`), push,
+re-pin to the new rev. Related: [[project-min-interval-chaintip-issue]].
 
 #### When to bump `stratum-core` (branch=main)
 
@@ -247,6 +292,7 @@ Run this checklist on any rev/branch bump in section A:
 | 2026-05-16 | `stratum-apps` | (introduced) → `4c0a65680c91...` | Phase 5 Teil 3 — needed `network_helpers::accept_noise_connection`, `task_manager`, `key_utils` for bp-stratum-v2's I/O layer. Rev chosen to match `bitcoin_core_sv2` (same sv2-apps commit). | initial bp-stratum-v2 commit |
 | 2026-05-16 | `siphasher` | (introduced) → `"1"` | SipHash-2-4 for SV2 SHORT_TX_ID hashing (ext 0x0002 etc.). Originally specced as `siphash` crate but that's been stagnant since 0.0.5 (2017); `siphasher` is the maintained successor. | initial bp-stratum-v2 commit |
 | 2026-06-09 | _(checked, not bumped)_ | sv2-apps `4c0a6568` (91 behind `98c6434b`), stratum-core `7af1b737` (22 behind `127e6546`) | Upstream review only. `bitcoin-core-sv2/` changes cosmetic, **no `.capnp` schema change** (v31 compat intact). Only relevant breaking change: `stratum` `dd7898d5` channels_sv2 ref-getters → accessor APIs (would need wrapper adaptation on bump). Rest = tproxy/jdc/per-upstream-user_identity (unused). #541 + #516 still unmerged. Stayed pinned per "drift only adds risk". | — |
+| 2026-06-25 | `bitcoin_core_sv2` + `stratum-apps` | `4c0a6568` (0.2.0) → **FORK** `8f7043b6` (0.4.0) | Took the #516 multi-version refactor (`unix_capnp::v30x/v31x` + `common`) early, on our schedule, rather than mid-production. Refactor is unreleased (upstream `main` `27985c63`, no tag); fork = that commit + ONE patch carrying the #541 min_interval skip-instead-of-sleep fix (still unfixed upstream). Adaptation was tiny: wrapper imports → `unix_capnp::v31x` + `common::job_declaration_protocol::io`, one `error_code.to_string()`. `cargo test-strict` GREEN (1695 passed); v31x TDP+JDP regtests pass against real Core v31. stratum-core stays branch=main. Revert recipe: §2 "FORK pin". | feature branch `bump-bitcoin-core-sv2-0.4.0` |
 
 ---
 

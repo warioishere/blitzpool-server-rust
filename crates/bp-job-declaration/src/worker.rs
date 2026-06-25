@@ -19,10 +19,10 @@
 use std::path::PathBuf;
 
 use async_channel::Sender as AcSender;
-use bitcoin_core_sv2::job_declaration_protocol::{
-    io::{JdRequest, JdResponse as UpstreamJdResponse},
-    BitcoinCoreSv2JDP,
+use bitcoin_core_sv2::common::job_declaration_protocol::io::{
+    JdRequest, JdResponse as UpstreamJdResponse,
 };
+use bitcoin_core_sv2::unix_capnp::v31x::job_declaration_protocol::BitcoinCoreSv2JDP;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};

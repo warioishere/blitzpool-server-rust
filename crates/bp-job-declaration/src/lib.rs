@@ -4,7 +4,7 @@
 //!
 //! This crate bridges between the pool's runtime and bitcoin-core's SV2
 //! IPC endpoint for JDP. It owns a single
-//! [`bitcoin_core_sv2::job_declaration_protocol::BitcoinCoreSv2JDP`]
+//! [`bitcoin_core_sv2::unix_capnp::v31x::job_declaration_protocol::BitcoinCoreSv2JDP`]
 //! instance on a dedicated OS thread (the underlying type is `!Send`) and
 //! exposes a `Send + Clone` [`JdpHandle`] to the multi-threaded pool.
 //!

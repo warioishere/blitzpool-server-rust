@@ -17,7 +17,7 @@
 //!   `bitcoin = "0.32"`.
 
 use bitcoin::{BlockHash, CompactTarget, Txid, Wtxid};
-use bitcoin_core_sv2::job_declaration_protocol::io::{
+use bitcoin_core_sv2::common::job_declaration_protocol::io::{
     JdResponse as UpstreamJdResponse, ValidationContext as UpstreamValidationContext,
 };
 
@@ -129,7 +129,7 @@ impl From<UpstreamJdResponse> for DeclareMiningJobResult {
                 error_code,
                 validation_context,
             } => Self::Error {
-                error_code,
+                error_code: error_code.to_string(),
                 validation_context: validation_context.into(),
             },
             UpstreamJdResponse::MissingTransactions {
