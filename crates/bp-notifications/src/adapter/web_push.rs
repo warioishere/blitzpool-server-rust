@@ -64,6 +64,13 @@ struct VapidKey {
 }
 
 impl WebPushAdapter {
+    /// `true` when a valid VAPID key is loaded; `false` means every send
+    /// goes via unauthenticated plain POST (no key configured, or the
+    /// configured key failed its boot-time sign check).
+    pub fn vapid_enabled(&self) -> bool {
+        self.vapid.is_some()
+    }
+
     /// `vapid = None` keeps the adapter alive but disables JWT
     /// signing — every send goes via plain POST.
     pub fn new(vapid: Option<VapidConfig>) -> AdapterResult<Self> {
@@ -74,16 +81,13 @@ impl WebPushAdapter {
 
         let vapid = match vapid {
             None => None,
-            Some(cfg) => {
-                let der = raw_b64url_to_sec1_der(&cfg.private_key_b64url)
-                    .map_err(|e| AdapterError::Config(format!("VAPID EC key: {e}")))?;
-                let encoding_key = EncodingKey::from_ec_der(&der);
-                Some(VapidKey {
-                    encoding_key,
-                    public_key_b64url: cfg.public_key_b64url,
-                    subject: cfg.subject,
-                })
-            }
+            Some(cfg) => match build_vapid_key(cfg) {
+                Ok(key) => Some(key),
+                Err(e) => {
+                    warn!(target: "bp_notifications::web_push", error = %e, "VAPID disabled — sending via plain POST");
+                    None
+                }
+            },
         };
         Ok(Self { client, vapid })
     }
@@ -101,8 +105,8 @@ impl WebPushAdapter {
         if let Some(vapid) = &self.vapid {
             match self.try_vapid(endpoint, vapid, &body).await {
                 Ok(outcome) => return Ok(outcome),
-                Err(AdapterError::Auth(msg)) | Err(AdapterError::Server(msg)) => {
-                    warn!(target: "bp_notifications::web_push", endpoint, error = %msg, "VAPID failed, falling back to plain POST");
+                Err(e) if vapid_failure_falls_back(&e) => {
+                    warn!(target: "bp_notifications::web_push", endpoint, error = %e, "VAPID failed, falling back to plain POST");
                 }
                 Err(other) => return Err(other),
             }
@@ -142,6 +146,18 @@ impl WebPushAdapter {
             .map_err(|e| AdapterError::Transport(format!("VAPID POST: {e}")))?;
         classify_response(response, true).await
     }
+}
+
+/// VAPID errors that should degrade to an unauthenticated plain POST
+/// (UnifiedPush / ntfy accept it) rather than abort the send: a rejected
+/// or unsupported JWT (`Auth` / `Server`) or a local minting failure
+/// (`Encoding` — e.g. a bad key or endpoint). A `Transport` failure is a
+/// genuine network error, surfaced so the caller can retry later.
+fn vapid_failure_falls_back(e: &AdapterError) -> bool {
+    matches!(
+        e,
+        AdapterError::Auth(_) | AdapterError::Server(_) | AdapterError::Encoding(_)
+    )
 }
 
 async fn classify_response(
@@ -211,34 +227,79 @@ fn mint_vapid_jwt(vapid: &VapidKey, audience: &str) -> AdapterResult<String> {
         .map_err(|e| AdapterError::Encoding(format!("JWT encode: {e}")))
 }
 
-/// Convert a raw base64url-encoded P-256 private key scalar (32 bytes)
-/// to SEC1 DER so `EncodingKey::from_ec_der` can consume it.
-///
-/// SEC1 layout (RFC 5915):
-///   SEQUENCE { version=1, privateKey=<32 bytes>, [0] P-256 OID }
-fn raw_b64url_to_sec1_der(b64url: &str) -> Result<Vec<u8>, String> {
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(b64url)
-        .map_err(|e| format!("base64url decode: {e}"))?;
-    if raw.len() != 32 {
+/// Build a usable [`VapidKey`] from raw base64url config, or fail with a
+/// reason string. Encodes the key as PKCS#8 (what `jsonwebtoken` / ring
+/// require — a bare SEC1 key is rejected at sign time) and proves it can
+/// actually sign before returning, so a bad key degrades to plain POST
+/// instead of silently failing every live send.
+fn build_vapid_key(cfg: VapidConfig) -> Result<VapidKey, String> {
+    let der = raw_vapid_to_pkcs8_der(&cfg.private_key_b64url, &cfg.public_key_b64url)?;
+    let key = VapidKey {
+        encoding_key: EncodingKey::from_ec_der(&der),
+        public_key_b64url: cfg.public_key_b64url,
+        subject: cfg.subject,
+    };
+    mint_vapid_jwt(&key, "https://validation.invalid").map_err(|e| format!("test-sign: {e}"))?;
+    Ok(key)
+}
+
+/// Encode a raw base64url P-256 VAPID key pair (32-byte private scalar +
+/// 65-byte uncompressed public point, the `web-push`-tool format) as a
+/// PKCS#8 v1 `PrivateKeyInfo` DER, which is what `jsonwebtoken` hands to
+/// ring's `EcdsaKeyPair::from_pkcs8`. ring requires the public key to be
+/// embedded (it verifies it against the private scalar), so both halves
+/// are encoded. All lengths are fixed for P-256, so the framing is a
+/// constant prefix / mid / suffix around the two key blobs.
+fn raw_vapid_to_pkcs8_der(priv_b64url: &str, pub_b64url: &str) -> Result<Vec<u8>, String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let priv_raw = URL_SAFE_NO_PAD
+        .decode(priv_b64url)
+        .map_err(|e| format!("private base64url: {e}"))?;
+    if priv_raw.len() != 32 {
         return Err(format!(
             "expected 32-byte P-256 scalar, got {} bytes",
-            raw.len()
+            priv_raw.len()
         ));
     }
-    // Fixed DER prefix for SEC1 P-256: SEQUENCE(49) { version INTEGER 1,
-    // privateKey OCTET STRING(32 bytes), [0] EXPLICIT OID P-256 }
-    let mut der = Vec::with_capacity(51);
+    let pub_raw = URL_SAFE_NO_PAD
+        .decode(pub_b64url)
+        .map_err(|e| format!("public base64url: {e}"))?;
+    if pub_raw.len() != 65 || pub_raw[0] != 0x04 {
+        return Err(format!(
+            "expected 65-byte uncompressed P-256 point (0x04…), got {} bytes",
+            pub_raw.len()
+        ));
+    }
+    // PKCS#8 PrivateKeyInfo for P-256:
+    //   SEQUENCE(135) {
+    //     INTEGER 0,
+    //     SEQUENCE { OID ecPublicKey, OID prime256v1 },
+    //     OCTET STRING(109) {            -- wraps the SEC1 ECPrivateKey
+    //       SEQUENCE(107) {
+    //         INTEGER 1,
+    //         OCTET STRING(32) <priv>,
+    //         [1] EXPLICIT { BIT STRING(66) 00 <65-byte pub> }
+    //       }
+    //     }
+    //   }
+    let mut der = Vec::with_capacity(138);
     der.extend_from_slice(&[
-        0x30, 0x31, // SEQUENCE, 49 bytes
+        0x30, 0x81, 0x87, // SEQUENCE, 135 bytes
+        0x02, 0x01, 0x00, // INTEGER version = 0
+        0x30, 0x13, // SEQUENCE (AlgorithmIdentifier), 19 bytes
+        0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // OID ecPublicKey
+        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, // OID prime256v1
+        0x04, 0x6d, // OCTET STRING, 109 bytes
+        0x30, 0x6b, // SEQUENCE (ECPrivateKey), 107 bytes
         0x02, 0x01, 0x01, // INTEGER version = 1
         0x04, 0x20, // OCTET STRING, 32 bytes
     ]);
-    der.extend_from_slice(&raw);
+    der.extend_from_slice(&priv_raw);
     der.extend_from_slice(&[
-        0xa0, 0x0a, // [0] EXPLICIT, 10 bytes
-        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, // OID 1.2.840.10045.3.1.7
+        0xa1, 0x44, // [1] EXPLICIT, 68 bytes
+        0x03, 0x42, 0x00, // BIT STRING, 66 bytes (0 unused bits)
     ]);
+    der.extend_from_slice(&pub_raw);
     Ok(der)
 }
 
@@ -261,5 +322,67 @@ mod tests {
     #[test]
     fn audience_rejects_garbage() {
         assert!(audience_from_endpoint("not-a-url").is_err());
+    }
+
+    #[test]
+    fn vapid_encoding_and_http_errors_fall_back_but_transport_does_not() {
+        assert!(vapid_failure_falls_back(&AdapterError::Encoding(
+            "JWT encode: InvalidEcdsaKey".into()
+        )));
+        assert!(vapid_failure_falls_back(&AdapterError::Auth("401".into())));
+        assert!(vapid_failure_falls_back(&AdapterError::Server(
+            "500".into()
+        )));
+        assert!(!vapid_failure_falls_back(&AdapterError::Transport(
+            "connection reset".into()
+        )));
+    }
+
+    #[test]
+    fn invalid_vapid_key_disables_vapid_instead_of_erroring() {
+        // All-zero private scalar with an otherwise well-formed 65-byte
+        // public point: the lengths pass framing, but the private key
+        // doesn't match the public key, so ring rejects it at the
+        // boot-time test-sign — exactly the failure that must degrade to
+        // plain POST rather than abort the build.
+        let zero = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32]);
+        let cfg = VapidConfig {
+            private_key_b64url: zero,
+            public_key_b64url:
+                "BDXeBZOE3xWM9wbC7TkLThHb6ffEXshqlKkaxWNYDO-vz_0h5ni1SuqeB3pu_lrXUBBVzWbsedFyxDp1RxP7LgQ"
+                    .to_string(),
+            subject: "mailto:test@example.com".to_string(),
+        };
+        let adapter = WebPushAdapter::new(Some(cfg)).expect("adapter still builds");
+        assert!(
+            !adapter.vapid_enabled(),
+            "an unsignable VAPID key must disable VAPID so sends use plain POST"
+        );
+    }
+
+    #[test]
+    fn no_vapid_config_runs_plain_post() {
+        let adapter = WebPushAdapter::new(None).expect("adapter builds");
+        assert!(!adapter.vapid_enabled());
+    }
+
+    #[test]
+    fn valid_webpush_vapid_key_can_sign() {
+        // A real P-256 pair in `web-push`-tool format (raw 32-byte
+        // base64url private scalar + 65-byte uncompressed public point).
+        // Guards the SEC1-DER construction: if it regresses, a valid
+        // operator key silently degrades to plain POST.
+        let cfg = VapidConfig {
+            private_key_b64url: "D3nWYHTrLXSWv94_WqRmfahAFMablsFixufvCNjc_Bc".to_string(),
+            public_key_b64url:
+                "BDXeBZOE3xWM9wbC7TkLThHb6ffEXshqlKkaxWNYDO-vz_0h5ni1SuqeB3pu_lrXUBBVzWbsedFyxDp1RxP7LgQ"
+                    .to_string(),
+            subject: "mailto:test@example.com".to_string(),
+        };
+        let adapter = WebPushAdapter::new(Some(cfg)).expect("adapter builds");
+        assert!(
+            adapter.vapid_enabled(),
+            "a valid web-push VAPID key must be usable for signing"
+        );
     }
 }
