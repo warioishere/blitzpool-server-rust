@@ -504,7 +504,7 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
             Sv2NewMiningJob {
                 channel_id,
                 job_id,
-                min_ntime: stratum_core::binary_sv2::Sv2Option::new(Some(min_ntime)),
+                min_ntime: stratum_core::binary_sv2::Sv2Option::new(min_ntime),
                 version,
                 merkle_root: merkle_root.into(),
             }
@@ -523,7 +523,7 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
             Sv2NewExtMiningJob {
                 channel_id,
                 job_id,
-                min_ntime: stratum_core::binary_sv2::Sv2Option::new(Some(min_ntime)),
+                min_ntime: stratum_core::binary_sv2::Sv2Option::new(min_ntime),
                 version,
                 version_rolling_allowed,
                 merkle_path: seq_from_merkle_path(merkle_path),
@@ -976,7 +976,7 @@ mod tests {
             job_id: 7,
             version: 0x2000_0000,
             merkle_root: [0x12; 32],
-            min_ntime: 0x6500_0001,
+            min_ntime: Some(0x6500_0001),
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
@@ -1001,7 +1001,7 @@ mod tests {
             merkle_path: vec![[0x11; 32], [0x22; 32]],
             coinbase_tx_prefix: vec![0xAA; 8],
             coinbase_tx_suffix: vec![0xBB; 8],
-            min_ntime: 0x6500_0001,
+            min_ntime: Some(0x6500_0001),
         };
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {

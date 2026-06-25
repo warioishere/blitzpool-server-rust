@@ -250,19 +250,32 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
     .await;
 
     // Capture the first NewMiningJob (built from the Blockparty template post-swap).
-    let mut job: Option<(u32, u32, u32, u32)> = None;
+    let mut job: Option<(u32, u32, u32)> = None;
+    let mut ntime: Option<u32> = None;
     let _ = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
-            if let AnyMessage::Mining(Mining::NewMiningJob(j)) = read_any_message(&mut reader).await
-            {
-                let ntime = j.min_ntime.clone().into_inner().unwrap_or(0);
-                job = Some((j.channel_id, j.job_id, j.version, ntime));
+            match read_any_message(&mut reader).await {
+                AnyMessage::Mining(Mining::NewMiningJob(j)) => {
+                    if let Some(t) = j.min_ntime.clone().into_inner() {
+                        ntime = Some(t);
+                    }
+                    job = Some((j.channel_id, j.job_id, j.version));
+                }
+                // A future job carries an empty min_ntime; the activating
+                // SetNewPrevHash supplies it (SV2 §7.4 / TS parity).
+                AnyMessage::Mining(Mining::SetNewPrevHash(p)) => {
+                    ntime = Some(p.min_ntime);
+                }
+                _ => {}
+            }
+            if job.is_some() && ntime.is_some() {
                 return;
             }
         }
     })
     .await;
-    let (channel_id, job_id, version, ntime) = job.expect("NewMiningJob within 8s");
+    let (channel_id, job_id, version) = job.expect("NewMiningJob within 8s");
+    let ntime = ntime.expect("min_ntime via job or SetNewPrevHash");
 
     eprintln!("[sv2-blockparty] captured job: channel_id={channel_id} job_id={job_id} version={version:#x} ntime={ntime}");
     let before = node.current_height().await.expect("height");
@@ -295,6 +308,11 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
                     AnyMessage::Mining(Mining::NewMiningJob(j)) => {
                         let nt = j.min_ntime.clone().into_inner().unwrap_or(nt);
                         latest_job = (j.channel_id, j.job_id, j.version, nt);
+                    }
+                    // Future-job activation supplies the ntime (TS parity).
+                    AnyMessage::Mining(Mining::SetNewPrevHash(p)) => {
+                        let (cid, jid, ver, _) = latest_job;
+                        latest_job = (cid, jid, ver, p.min_ntime);
                     }
                     _ => {}
                 }

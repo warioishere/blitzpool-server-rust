@@ -296,11 +296,12 @@ pub enum OutboundFrame {
         channel_id: u32,
         extranonce_prefix: Vec<u8>,
     },
-    /// SV2 §5.3.4 `SetNewPrevHash` — sent per-channel before the
-    /// matching `NewMiningJob` / `NewExtendedMiningJob` on a block
-    /// change. `job_id` MUST match the immediately-following job frame
-    /// on the same channel; miners use the pair to derive the 80-byte
-    /// header.
+    /// SV2 §5.3.4 `SetNewPrevHash` — sent per-channel on a block change
+    /// to ACTIVATE a future job, AFTER the matching `NewMiningJob` /
+    /// `NewExtendedMiningJob` (which carried an empty `min_ntime`).
+    /// `job_id` MUST match the immediately-preceding future-job frame on
+    /// the same channel; miners pair the two to derive the 80-byte
+    /// header and adopt this `min_ntime` as the job's activation time.
     SetNewPrevHash {
         channel_id: u32,
         job_id: u32,
@@ -314,17 +315,24 @@ pub enum OutboundFrame {
     /// coinbase before computing the merkle root, so the miner just
     /// hashes the 80-byte header with their chosen `nonce` / `ntime` /
     /// version-mask.
+    ///
+    /// `min_ntime`: `None` marks a FUTURE job (block change) — the job
+    /// is sent first and activated by the immediately-following
+    /// `SetNewPrevHash`, which supplies the ntime. `Some(ts)` marks an
+    /// active job for the current prev-hash (same-block fee refresh),
+    /// sent alone with no `SetNewPrevHash`.
     NewMiningJob {
         channel_id: u32,
         job_id: u32,
         version: u32,
         merkle_root: [u8; 32],
-        min_ntime: u32,
+        min_ntime: Option<u32>,
     },
     /// SV2 §5.3.8 `NewExtendedMiningJob` — Extended channels only.
     /// Carries the pre/suffix split of the coinbase so the miner can
     /// roll their portion of the extranonce, plus the merkle path for
-    /// recomputing the root.
+    /// recomputing the root. `min_ntime` follows the same future-job
+    /// (`None`) vs active-job (`Some`) convention as `NewMiningJob`.
     NewExtendedMiningJob {
         channel_id: u32,
         job_id: u32,
@@ -333,7 +341,7 @@ pub enum OutboundFrame {
         merkle_path: Vec<[u8; 32]>,
         coinbase_tx_prefix: Vec<u8>,
         coinbase_tx_suffix: Vec<u8>,
-        min_ntime: u32,
+        min_ntime: Option<u32>,
     },
     SubmitSharesSuccess {
         channel_id: u32,
@@ -1701,15 +1709,17 @@ pub fn apply_template_broadcast<C: Clock>(
         let job_id = channel.next_job_id;
         channel.next_job_id = channel.next_job_id.wrapping_add(1);
 
-        if is_new_block {
-            outcome.push_frame(OutboundFrame::SetNewPrevHash {
-                channel_id,
-                job_id,
-                prev_hash: template.prev_hash,
-                min_ntime: template.header_timestamp,
-                n_bits: template.n_bits,
-            });
-        }
+        // SV2 future-job protocol (TS parity): on a block change the job is
+        // a FUTURE job — sent with an empty `min_ntime` and activated by a
+        // `SetNewPrevHash` emitted AFTER it (below). On a same-block refresh
+        // the job is active immediately (`Some(header_timestamp)`, no
+        // SetNewPrevHash). Strict miners (BraiinsOS) reject a job that
+        // carries `min_ntime` while a SetNewPrevHash also references it.
+        let wire_min_ntime = if is_new_block {
+            None
+        } else {
+            Some(template.header_timestamp)
+        };
 
         match channel.kind {
             ChannelKind::Standard => {
@@ -1764,7 +1774,7 @@ pub fn apply_template_broadcast<C: Clock>(
                     job_id,
                     version: template.version,
                     merkle_root,
-                    min_ntime: template.header_timestamp,
+                    min_ntime: wire_min_ntime,
                 });
             }
             ChannelKind::Extended => {
@@ -1838,9 +1848,22 @@ pub fn apply_template_broadcast<C: Clock>(
                     merkle_path,
                     coinbase_tx_prefix: tx_prefix,
                     coinbase_tx_suffix: tx_suffix,
-                    min_ntime: template.header_timestamp,
+                    min_ntime: wire_min_ntime,
                 });
             }
+        }
+
+        // Activate the future job (sent above) on a block change. Emitted
+        // AFTER the job per SV2 §7.4 so the miner already holds the job the
+        // `job_id` refers to (TS parity).
+        if is_new_block {
+            outcome.push_frame(OutboundFrame::SetNewPrevHash {
+                channel_id,
+                job_id,
+                prev_hash: template.prev_hash,
+                min_ntime: template.header_timestamp,
+                n_bits: template.n_bits,
+            });
         }
     }
 
@@ -1945,13 +1968,8 @@ pub fn apply_template_broadcast<C: Clock>(
                         let cp = job.coinbase_prefix.clone();
                         let cs = job.coinbase_suffix.clone();
                         ch.extended_jobs.insert(jid, job);
-                        outcome.push_frame(OutboundFrame::SetNewPrevHash {
-                            channel_id: new_id,
-                            job_id: jid,
-                            prev_hash: pv,
-                            min_ntime: nt,
-                            n_bits: nb,
-                        });
+                        // Future job first (empty `min_ntime`), then the
+                        // activating SetNewPrevHash — TS parity / SV2 §7.4.
                         outcome.push_frame(OutboundFrame::NewExtendedMiningJob {
                             channel_id: new_id,
                             job_id: jid,
@@ -1960,7 +1978,14 @@ pub fn apply_template_broadcast<C: Clock>(
                             merkle_path: mp,
                             coinbase_tx_prefix: cp,
                             coinbase_tx_suffix: cs,
+                            min_ntime: None,
+                        });
+                        outcome.push_frame(OutboundFrame::SetNewPrevHash {
+                            channel_id: new_id,
+                            job_id: jid,
+                            prev_hash: pv,
                             min_ntime: nt,
+                            n_bits: nb,
                         });
                     }
                 }
@@ -2009,6 +2034,23 @@ pub fn apply_template_broadcast<C: Clock>(
             g.set_current_job(group_template);
         }
 
+        // Future job first (empty `min_ntime` on a block change), then the
+        // activating SetNewPrevHash — TS parity / SV2 §7.4. A same-block
+        // refresh sends an active job (`Some`) with no SetNewPrevHash.
+        outcome.push_frame(OutboundFrame::NewExtendedMiningJob {
+            channel_id: gid,
+            job_id: group_job_id,
+            version: template.version,
+            version_rolling_allowed: version_rolling,
+            merkle_path,
+            coinbase_tx_prefix: tx_prefix,
+            coinbase_tx_suffix: tx_suffix,
+            min_ntime: if is_new_block {
+                None
+            } else {
+                Some(template.header_timestamp)
+            },
+        });
         if is_new_block {
             outcome.push_frame(OutboundFrame::SetNewPrevHash {
                 channel_id: gid,
@@ -2018,16 +2060,6 @@ pub fn apply_template_broadcast<C: Clock>(
                 n_bits: template.n_bits,
             });
         }
-        outcome.push_frame(OutboundFrame::NewExtendedMiningJob {
-            channel_id: gid,
-            job_id: group_job_id,
-            version: template.version,
-            version_rolling_allowed: version_rolling,
-            merkle_path,
-            coinbase_tx_prefix: tx_prefix,
-            coinbase_tx_suffix: tx_suffix,
-            min_ntime: template.header_timestamp,
-        });
     }
 
     outcome
@@ -3552,9 +3584,27 @@ mod tests {
         assert_eq!(
             out.outbound.len(),
             2,
-            "expect SetNewPrevHash + NewMiningJob"
+            "expect NewMiningJob (future job) + SetNewPrevHash"
         );
-        match &out.outbound[0] {
+        // SV2 future-job order (TS parity): the job comes FIRST with an empty
+        // `min_ntime`, then SetNewPrevHash activates it.
+        let stored = match &out.outbound[0] {
+            OutboundFrame::NewMiningJob {
+                channel_id,
+                job_id,
+                version,
+                merkle_root,
+                min_ntime,
+            } => {
+                assert_eq!(*channel_id, cid);
+                assert_eq!(*job_id, 1);
+                assert_eq!(*version, 0x2000_0000);
+                assert_eq!(*min_ntime, None, "block-change job must be a future job");
+                *merkle_root
+            }
+            other => panic!("expected NewMiningJob, got {other:?}"),
+        };
+        match &out.outbound[1] {
             OutboundFrame::SetNewPrevHash {
                 channel_id,
                 job_id,
@@ -3570,22 +3620,6 @@ mod tests {
             }
             other => panic!("expected SetNewPrevHash, got {other:?}"),
         }
-        let stored = match &out.outbound[1] {
-            OutboundFrame::NewMiningJob {
-                channel_id,
-                job_id,
-                version,
-                merkle_root,
-                min_ntime,
-            } => {
-                assert_eq!(*channel_id, cid);
-                assert_eq!(*job_id, 1);
-                assert_eq!(*version, 0x2000_0000);
-                assert_eq!(*min_ntime, 0x6500_0001);
-                *merkle_root
-            }
-            other => panic!("expected NewMiningJob, got {other:?}"),
-        };
         let ch = s.channels.get(&cid).unwrap();
         let (diff, root) = ch.standard_jobs.lookup(1).expect("entry must exist");
         assert_eq!(root, stored, "stored merkle root must match emitted frame");
@@ -3619,11 +3653,12 @@ mod tests {
             None,
         );
         assert_eq!(out.outbound.len(), 2);
+        // SV2 future-job order (TS parity): future job first, then activation.
         assert!(matches!(
-            out.outbound[0],
+            out.outbound[1],
             OutboundFrame::SetNewPrevHash { channel_id, .. } if channel_id == gid
         ));
-        match &out.outbound[1] {
+        match &out.outbound[0] {
             OutboundFrame::NewExtendedMiningJob {
                 channel_id,
                 job_id,
@@ -3657,7 +3692,7 @@ mod tests {
                      (the miner appends it at coinbase-reconstruction time)"
                 );
                 assert!(!coinbase_tx_suffix.is_empty());
-                assert_eq!(*min_ntime, 0x6500_0001);
+                assert_eq!(*min_ntime, None, "block-change job must be a future job");
             }
             other => panic!("expected NewExtendedMiningJob, got {other:?}"),
         }
@@ -4068,10 +4103,15 @@ mod tests {
             1,
             "only NewMiningJob, no SetNewPrevHash"
         );
-        assert!(matches!(
-            out.outbound[0],
-            OutboundFrame::NewMiningJob { .. }
-        ));
+        // Same-block refresh: an ACTIVE job (`Some(min_ntime)`), NOT a future
+        // job — the inverse of the block-change case (TS parity).
+        match &out.outbound[0] {
+            OutboundFrame::NewMiningJob { min_ntime, .. } => assert!(
+                min_ntime.is_some(),
+                "a same-block refresh job must be active (Some(min_ntime))"
+            ),
+            other => panic!("expected NewMiningJob, got {other:?}"),
+        }
         let ch = s.channels.get(&cid).unwrap();
         // The job_id=1 entry from NewBlock is still Active (not retired
         // by Refresh).
@@ -4167,11 +4207,13 @@ mod tests {
             2_000,
             None,
         );
-        let job1 = match out1.outbound[1] {
+        // Future-job order (TS parity): NewMiningJob is frame [0], the
+        // activating SetNewPrevHash is frame [1].
+        let job1 = match out1.outbound[0] {
             OutboundFrame::NewMiningJob { job_id, .. } => job_id,
             _ => unreachable!(),
         };
-        let job2 = match out2.outbound[1] {
+        let job2 = match out2.outbound[0] {
             OutboundFrame::NewMiningJob { job_id, .. } => job_id,
             _ => unreachable!(),
         };
