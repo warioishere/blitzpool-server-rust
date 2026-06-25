@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT captured_at, count(*) AS \"key_count!\"\n           FROM redis_state_backup\n           GROUP BY captured_at\n           ORDER BY captured_at DESC\n           LIMIT $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "captured_at",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "key_count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "80e67051fadbbeef83ee470121474f1d1c5be0adc1362e236787a1b5c2ded3e2"
+}

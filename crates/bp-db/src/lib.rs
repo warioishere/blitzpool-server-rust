@@ -45,9 +45,15 @@ mod notification;
 mod pool;
 mod pool_stats;
 mod pplns;
+mod redis_backup;
 mod stats_writes;
 
 pub use pool::{Db, DbConfig, DbError};
+
+pub use redis_backup::{
+    fetch_redis_backup, insert_redis_backup, latest_redis_backup_captured_at,
+    list_redis_backup_snapshots, prune_redis_backups_before, RedisBackupRow, RedisBackupSnapshot,
+};
 
 pub use address::{
     find_address_settings, find_best_difficulty_tracker,

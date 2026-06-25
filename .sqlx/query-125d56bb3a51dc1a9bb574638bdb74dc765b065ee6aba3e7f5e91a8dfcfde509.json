@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT scope, redis_key, dump\n           FROM redis_state_backup WHERE captured_at = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "redis_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "dump",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "125d56bb3a51dc1a9bb574638bdb74dc765b065ee6aba3e7f5e91a8dfcfde509"
+}

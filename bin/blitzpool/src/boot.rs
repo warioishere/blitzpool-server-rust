@@ -173,7 +173,7 @@ pub(crate) async fn boot(
 
 // ─── Postgres ─────────────────────────────────────────────────────
 
-async fn spawn_pg(cfg: &DatabaseConfig) -> Result<Db, BootError> {
+pub(crate) async fn spawn_pg(cfg: &DatabaseConfig) -> Result<Db, BootError> {
     let url = build_pg_url(cfg);
     let pool_cfg = DbConfig {
         max_connections: cfg.pool_size,

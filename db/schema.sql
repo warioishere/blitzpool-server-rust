@@ -1576,6 +1576,35 @@ CREATE INDEX "IDX_blockparty_block_history_height" ON public.blockparty_block_hi
 
 
 --
+-- Rust-only: periodic best-effort backup of the live PPLNS + Group-Solo Redis
+-- state for manual reconstruction (see crates/bp-db/migrations/0003).
+--
+
+CREATE TABLE public.redis_state_backup (
+    id bigint NOT NULL,
+    captured_at bigint NOT NULL,
+    scope text NOT NULL,
+    redis_key text NOT NULL,
+    dump bytea NOT NULL
+);
+
+CREATE SEQUENCE public.redis_state_backup_id_seq
+    AS bigint
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+ALTER SEQUENCE public.redis_state_backup_id_seq OWNED BY public.redis_state_backup.id;
+ALTER TABLE ONLY public.redis_state_backup ALTER COLUMN id SET DEFAULT nextval('public.redis_state_backup_id_seq'::regclass);
+
+ALTER TABLE ONLY public.redis_state_backup
+    ADD CONSTRAINT redis_state_backup_pkey PRIMARY KEY (id);
+
+CREATE INDEX redis_state_backup_captured_at_idx ON public.redis_state_backup USING btree (captured_at DESC);
+
+
+--
 -- PostgreSQL database dump complete
 --
 

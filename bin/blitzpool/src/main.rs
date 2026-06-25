@@ -60,6 +60,7 @@ mod payout_resolver;
 mod pending_blocks;
 mod pending_group_solo_blocks;
 mod pending_store;
+mod redis_backup;
 mod rejected_consumer;
 mod runtime_diag;
 mod satellite_consumer;
@@ -170,6 +171,33 @@ struct Cli {
     /// config and differ only by `--roles` or the `BLITZPOOL_ROLES` env var.
     #[arg(long, env = "BLITZPOOL_ROLES", value_delimiter = ',')]
     roles: Vec<Role>,
+
+    /// List the available `redis_state_backup` snapshots (newest first) and
+    /// exit. Connects PG only — use to pick a `--restore-at` before a restore.
+    #[arg(long)]
+    list_redis_backups: bool,
+
+    /// MANUALLY restore the PPLNS + Group-Solo Redis state from a backup
+    /// snapshot, then exit. Default is a dry-run (prints the plan); pass
+    /// `--restore-force` to actually write. Picks the newest snapshot unless
+    /// `--restore-at` is given. Never runs automatically.
+    #[arg(long)]
+    restore_redis_state: bool,
+
+    /// `captured_at` (epoch ms) of the snapshot to restore. Defaults to the
+    /// newest. See `--list-redis-backups`.
+    #[arg(long)]
+    restore_at: Option<i64>,
+
+    /// Which scope to restore: `all` (default), `pplns`, or `groupsolo`.
+    #[arg(long, default_value = "all")]
+    restore_scope: String,
+
+    /// Actually perform the restore (`RESTORE ... REPLACE`). Without this the
+    /// `--restore-redis-state` run is a dry-run. Overwrites the snapshot's keys
+    /// in the live Redis — keys not in the snapshot are left untouched.
+    #[arg(long)]
+    restore_force: bool,
 }
 
 #[tokio::main]
@@ -202,6 +230,62 @@ async fn main() -> ExitCode {
     if cli.check_config {
         tracing::info!("--check-config given; exiting after successful parse");
         return ExitCode::SUCCESS;
+    }
+
+    // Operator one-shot tools for the Redis-state backup: list / restore, then
+    // exit. No roles required and no full boot (TDP / bitcoin) — just PG (+
+    // Redis for the restore) — so they work during recovery when the rest of
+    // the stack is down. Restore never runs automatically.
+    if cli.list_redis_backups || cli.restore_redis_state {
+        let db = match boot::spawn_pg(&cfg.database).await {
+            Ok(db) => db,
+            Err(err) => {
+                tracing::error!(%err, "redis-state tool: postgres connect failed");
+                eprintln!("blitzpool: postgres connect failed: {err}");
+                return ExitCode::from(2);
+            }
+        };
+        if cli.list_redis_backups {
+            return match redis_backup::list_snapshots(db.pool()).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("blitzpool: {err}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+        let scope = match redis_backup::ScopeFilter::parse(&cli.restore_scope) {
+            Some(scope) => scope,
+            None => {
+                eprintln!(
+                    "blitzpool: invalid --restore-scope '{}' (expected all|pplns|groupsolo)",
+                    cli.restore_scope
+                );
+                return ExitCode::from(2);
+            }
+        };
+        let mut redis = match boot::spawn_redis(&cfg.redis).await {
+            Ok(redis) => redis,
+            Err(err) => {
+                eprintln!("blitzpool: redis connect failed: {err}");
+                return ExitCode::from(2);
+            }
+        };
+        return match redis_backup::run_restore(
+            db.pool(),
+            &mut redis,
+            cli.restore_at,
+            scope,
+            cli.restore_force,
+        )
+        .await
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("blitzpool: restore failed: {err}");
+                ExitCode::from(1)
+            }
+        };
     }
 
     // Boot-time role validation — after the config-parse check, since roles
@@ -536,6 +620,24 @@ async fn main() -> ExitCode {
             engines.pplns.clone(),
             Some(engines.group_solo.clone()),
             depth,
+        ))
+    } else {
+        None
+    };
+
+    // Periodic best-effort backup of the live PPLNS + Group-Solo Redis state
+    // (the per-address share weights) to Postgres, so an operator can MANUALLY
+    // reconstruct it after a Redis wipe / corruption. Runs on the payout
+    // process (single owner of the money window) with its own Redis connection
+    // so the SCAN/DUMP burst never touches the share hot-path. Restore is never
+    // automatic — see `--restore-redis-state`.
+    let _redis_state_backup = if cfg.has_role(Role::Payout) {
+        let backup_redis = dedicated_redis(&cfg.redis, &handles.redis, "redis-state-backup").await;
+        Some(crate::redis_backup::spawn_backup_task(
+            backup_redis,
+            handles.db.pool().clone(),
+            crate::redis_backup::DEFAULT_INTERVAL,
+            crate::redis_backup::DEFAULT_RETENTION,
         ))
     } else {
         None
