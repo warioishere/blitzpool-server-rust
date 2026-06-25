@@ -24,8 +24,11 @@ use crate::format::{
     format_device_time, format_number_suffix, DeviceStatusArgs, DeviceStatusText, Language,
 };
 
-const PUSH_TYPE_UNIFIED: &str = "UNIFIED_PUSH";
-const PUSH_TYPE_FCM: &str = "FCM";
+// Canonical stored `subscriptionType` values (lowercase, as written by
+// the `/api/push/*` register endpoints). Comparisons below are
+// case-insensitive so any historical casing still routes.
+const PUSH_TYPE_UNIFIED: &str = "unified_push";
+const PUSH_TYPE_FCM: &str = "fcm";
 
 /// Engine-side description of a worker connect / disconnect event. The
 /// dispatcher converts this to per-language text and routes to whichever
@@ -180,8 +183,8 @@ impl NotificationDispatcher {
     }
 
     /// Worker on `address` connected or disconnected. Routes to
-    /// Telegram + FCM (ntfy intentionally skipped — the topic model
-    /// doesn't carry per-user device subscriptions cleanly).
+    /// Telegram + FCM + UnifiedPush (ntfy intentionally skipped — the
+    /// topic model doesn't carry per-user device subscriptions cleanly).
     pub async fn notify_device_status(&self, event: &DeviceStatusEvent) {
         let (telegram_subs, _ntfy_sub, push_subs) = self.load_subs(&event.address).await;
 
@@ -203,12 +206,14 @@ impl NotificationDispatcher {
                 )) as TaskFuture);
             }
         }
-        // FCM device-status goes through the same push-subscription
-        // table as the other types; UnifiedPush is intentionally NOT
-        // notified for device-status events.
+        // FCM + UnifiedPush device-status both go through the
+        // push-subscription table, filtered by `subscription_type`.
         let fcm_dev: Vec<_> = push_subs
             .iter()
-            .filter(|s| s.subscription_type == PUSH_TYPE_FCM && s.device_notifications_enabled)
+            .filter(|s| {
+                s.subscription_type.eq_ignore_ascii_case(PUSH_TYPE_FCM)
+                    && s.device_notifications_enabled
+            })
             .cloned()
             .collect();
         if !fcm_dev.is_empty() {
@@ -219,6 +224,24 @@ impl NotificationDispatcher {
                     event.clone(),
                     fcm_dev,
                     self.config.timezone,
+                )) as TaskFuture);
+            }
+        }
+        let unified_dev: Vec<_> = push_subs
+            .iter()
+            .filter(|s| {
+                s.subscription_type.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED)
+                    && s.device_notifications_enabled
+            })
+            .cloned()
+            .collect();
+        if !unified_dev.is_empty() {
+            if let Some(adapter) = &self.web_push {
+                tasks.push(Box::pin(send_web_push_device_status(
+                    Arc::clone(adapter),
+                    self.pool.clone(),
+                    event.clone(),
+                    unified_dev,
                 )) as TaskFuture);
             }
         }
@@ -482,18 +505,7 @@ async fn send_fcm_device_status(
         .user_agent
         .clone()
         .unwrap_or_else(|| "Unknown".to_string());
-    // FCM uses a timezone-free UTC string.
-    let time_str = event.timestamp.format("%m/%d/%y, %-I:%M %p").to_string();
-    let title = if event.is_online {
-        if event.is_returning {
-            "Device Back Online"
-        } else {
-            "Device Online"
-        }
-    } else {
-        "Device Offline"
-    };
-    let body = format!("{agent} ({worker}) at {time_str}");
+    let (title, body) = device_status_title_body(&event);
 
     let payload = PushPayload {
         kind: PushKind::DeviceStatus,
@@ -542,6 +554,67 @@ async fn send_fcm_device_status(
     join_all(tasks).await;
 }
 
+/// Shared device-status title + body for the push transports (FCM +
+/// UnifiedPush). Uses a UTC en-US short timestamp; the title encodes
+/// online / back-online / offline. Both transports parse the same
+/// `title|body|` shape, so this keeps them in lock-step.
+fn device_status_title_body(event: &DeviceStatusEvent) -> (&'static str, String) {
+    let worker = event.worker_name.as_deref().unwrap_or("Unknown");
+    let agent = event.user_agent.as_deref().unwrap_or("Unknown");
+    let time_str = event.timestamp.format("%m/%d/%y, %-I:%M %p").to_string();
+    let title = if event.is_online {
+        if event.is_returning {
+            "Device Back Online"
+        } else {
+            "Device Online"
+        }
+    } else {
+        "Device Offline"
+    };
+    (title, format!("{agent} ({worker}) at {time_str}"))
+}
+
+async fn send_web_push_device_status(
+    adapter: Arc<WebPushAdapter>,
+    pool: PgPool,
+    event: DeviceStatusEvent,
+    subs: Vec<PushSubscriptionRow>,
+) {
+    let (title, body) = device_status_title_body(&event);
+    // Empty trailing tag → the wire body is `title|body|`, the shape
+    // UnifiedPush device-status clients already parse.
+    let payload = PushPayload {
+        kind: PushKind::DeviceStatus,
+        title: title.to_string(),
+        body,
+        tag: String::new(),
+        extras: Vec::new(),
+    };
+    let tasks = subs.into_iter().map(|sub| {
+        let adapter = Arc::clone(&adapter);
+        let pool = pool.clone();
+        let payload = payload.clone();
+        let address = event.address.clone();
+        async move {
+            match adapter.send(&sub.endpoint, &payload).await {
+                Ok(outcome) if outcome.invalid_endpoint => {
+                    soft_delete_push(&pool, &address, &sub.endpoint).await;
+                }
+                Ok(_) => {
+                    bump_last_notification(&pool, sub.id).await;
+                }
+                Err(AdapterError::InvalidRecipient(_)) => {
+                    soft_delete_push(&pool, &address, &sub.endpoint).await;
+                }
+                Err(e) => {
+                    warn!(target: "bp_notifications::dispatcher", error = %e, "unified push device-status");
+                }
+            }
+        }
+    });
+    join_all(tasks).await;
+}
+
 async fn fan_push(
     handles: PushHandles,
     pool: PgPool,
@@ -555,48 +628,45 @@ async fn fan_push(
         let address = address.clone();
         let handles = handles.clone();
         async move {
-            match sub.subscription_type.as_str() {
-                PUSH_TYPE_UNIFIED => {
-                    let Some(adapter) = handles.web_push else {
-                        return;
-                    };
-                    match adapter.send(&sub.endpoint, &payload).await {
-                        Ok(outcome) if outcome.invalid_endpoint => {
-                            soft_delete_push(&pool, &address, &sub.endpoint).await;
-                        }
-                        Ok(_) => {
-                            bump_last_notification(&pool, sub.id).await;
-                        }
-                        Err(AdapterError::InvalidRecipient(_)) => {
-                            soft_delete_push(&pool, &address, &sub.endpoint).await;
-                        }
-                        Err(e) => {
-                            warn!(target: "bp_notifications::dispatcher", error = %e, "unified push");
-                        }
+            let kind = sub.subscription_type.as_str();
+            if kind.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED) {
+                let Some(adapter) = handles.web_push else {
+                    return;
+                };
+                match adapter.send(&sub.endpoint, &payload).await {
+                    Ok(outcome) if outcome.invalid_endpoint => {
+                        soft_delete_push(&pool, &address, &sub.endpoint).await;
+                    }
+                    Ok(_) => {
+                        bump_last_notification(&pool, sub.id).await;
+                    }
+                    Err(AdapterError::InvalidRecipient(_)) => {
+                        soft_delete_push(&pool, &address, &sub.endpoint).await;
+                    }
+                    Err(e) => {
+                        warn!(target: "bp_notifications::dispatcher", error = %e, "unified push");
                     }
                 }
-                PUSH_TYPE_FCM => {
-                    let Some(adapter) = handles.fcm else {
-                        return;
-                    };
-                    match adapter.send(&sub.endpoint, address.as_str(), &payload).await {
-                        Ok(outcome) if outcome.invalid_token => {
-                            soft_delete_push(&pool, &address, &sub.endpoint).await;
-                        }
-                        Ok(_) => {
-                            bump_last_notification(&pool, sub.id).await;
-                        }
-                        Err(AdapterError::InvalidRecipient(_)) => {
-                            soft_delete_push(&pool, &address, &sub.endpoint).await;
-                        }
-                        Err(e) => {
-                            warn!(target: "bp_notifications::dispatcher", error = %e, "fcm push");
-                        }
+            } else if kind.eq_ignore_ascii_case(PUSH_TYPE_FCM) {
+                let Some(adapter) = handles.fcm else {
+                    return;
+                };
+                match adapter.send(&sub.endpoint, address.as_str(), &payload).await {
+                    Ok(outcome) if outcome.invalid_token => {
+                        soft_delete_push(&pool, &address, &sub.endpoint).await;
+                    }
+                    Ok(_) => {
+                        bump_last_notification(&pool, sub.id).await;
+                    }
+                    Err(AdapterError::InvalidRecipient(_)) => {
+                        soft_delete_push(&pool, &address, &sub.endpoint).await;
+                    }
+                    Err(e) => {
+                        warn!(target: "bp_notifications::dispatcher", error = %e, "fcm push");
                     }
                 }
-                other => {
-                    debug!(target: "bp_notifications::dispatcher", kind = other, "unknown push subscription_type — ignored");
-                }
+            } else {
+                debug!(target: "bp_notifications::dispatcher", kind, "unknown push subscription_type — ignored");
             }
         }
     });
@@ -708,5 +778,69 @@ mod tests {
     fn extract_difficulty_returns_unknown_if_no_bracketed_match() {
         assert_eq!(extract_difficulty_tag("no parens here"), "Unknown");
         assert_eq!(extract_difficulty_tag("(not a difficulty)"), "Unknown");
+    }
+
+    /// The stored `subscriptionType` is lowercase (`unified_push` / `fcm`),
+    /// so the routing constants MUST be lowercase and the comparison
+    /// case-insensitive. A regression here silently drops every push.
+    #[test]
+    fn push_type_constants_lowercase_and_match_case_insensitively() {
+        assert_eq!(PUSH_TYPE_UNIFIED, "unified_push");
+        assert_eq!(PUSH_TYPE_FCM, "fcm");
+        for v in ["unified_push", "UNIFIED_PUSH", "Unified_Push"] {
+            assert!(
+                v.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED),
+                "{v} should match unified"
+            );
+        }
+        for v in ["fcm", "FCM", "Fcm"] {
+            assert!(
+                v.eq_ignore_ascii_case(PUSH_TYPE_FCM),
+                "{v} should match fcm"
+            );
+        }
+        assert!(!"ntfy".eq_ignore_ascii_case(PUSH_TYPE_UNIFIED));
+    }
+
+    fn device_event(is_online: bool, is_returning: bool) -> DeviceStatusEvent {
+        DeviceStatusEvent {
+            address: AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
+                .expect("valid addr"),
+            worker_name: Some("rig1".to_string()),
+            user_agent: Some("bitaxe".to_string()),
+            is_online,
+            is_returning,
+            timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+        }
+    }
+
+    #[test]
+    fn device_status_title_body_picks_title_and_formats_body() {
+        assert_eq!(
+            device_status_title_body(&device_event(true, false)).0,
+            "Device Online"
+        );
+        assert_eq!(
+            device_status_title_body(&device_event(true, true)).0,
+            "Device Back Online"
+        );
+        assert_eq!(
+            device_status_title_body(&device_event(false, false)).0,
+            "Device Offline"
+        );
+        let (_, body) = device_status_title_body(&device_event(true, false));
+        assert!(body.starts_with("bitaxe (rig1) at "), "body was: {body}");
+    }
+
+    #[test]
+    fn device_status_unknown_worker_and_agent_default() {
+        let mut ev = device_event(true, false);
+        ev.worker_name = None;
+        ev.user_agent = None;
+        let (_, body) = device_status_title_body(&ev);
+        assert!(
+            body.starts_with("Unknown (Unknown) at "),
+            "body was: {body}"
+        );
     }
 }

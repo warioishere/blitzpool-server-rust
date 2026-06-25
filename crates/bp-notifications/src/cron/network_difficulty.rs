@@ -196,61 +196,58 @@ async fn fan_out_change(
             .into_iter()
             .filter(|s| s.network_diff_notifications_enabled)
         {
-            match sub.subscription_type.as_str() {
-                "FCM" => {
-                    let Some(adapter) = fcm else { continue };
-                    match adapter
-                        .send(&sub.endpoint, address.as_str(), &payload)
-                        .await
-                    {
-                        Ok(outcome) if outcome.invalid_token => {
-                            let _ = bp_db::delete_push_subscription_by_endpoint(
-                                pool,
-                                &address,
-                                &sub.endpoint,
-                            )
-                            .await;
-                        }
-                        Ok(_) => {
-                            let _ = bp_db::update_push_subscription_last_notification(
-                                pool,
-                                sub.id,
-                                Utc::now().timestamp_millis(),
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            warn!(target: "bp_notifications::cron::network_difficulty", error = %e, "FCM send");
-                        }
+            let kind = sub.subscription_type.as_str();
+            if kind.eq_ignore_ascii_case("fcm") {
+                let Some(adapter) = fcm else { continue };
+                match adapter
+                    .send(&sub.endpoint, address.as_str(), &payload)
+                    .await
+                {
+                    Ok(outcome) if outcome.invalid_token => {
+                        let _ = bp_db::delete_push_subscription_by_endpoint(
+                            pool,
+                            &address,
+                            &sub.endpoint,
+                        )
+                        .await;
+                    }
+                    Ok(_) => {
+                        let _ = bp_db::update_push_subscription_last_notification(
+                            pool,
+                            sub.id,
+                            Utc::now().timestamp_millis(),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        warn!(target: "bp_notifications::cron::network_difficulty", error = %e, "FCM send");
                     }
                 }
-                "UNIFIED_PUSH" => {
-                    let Some(adapter) = web_push else { continue };
-                    match adapter.send(&sub.endpoint, &payload).await {
-                        Ok(outcome) if outcome.invalid_endpoint => {
-                            let _ = bp_db::delete_push_subscription_by_endpoint(
-                                pool,
-                                &address,
-                                &sub.endpoint,
-                            )
-                            .await;
-                        }
-                        Ok(_) => {
-                            let _ = bp_db::update_push_subscription_last_notification(
-                                pool,
-                                sub.id,
-                                Utc::now().timestamp_millis(),
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            warn!(target: "bp_notifications::cron::network_difficulty", error = %e, "UnifiedPush send");
-                        }
+            } else if kind.eq_ignore_ascii_case("unified_push") {
+                let Some(adapter) = web_push else { continue };
+                match adapter.send(&sub.endpoint, &payload).await {
+                    Ok(outcome) if outcome.invalid_endpoint => {
+                        let _ = bp_db::delete_push_subscription_by_endpoint(
+                            pool,
+                            &address,
+                            &sub.endpoint,
+                        )
+                        .await;
+                    }
+                    Ok(_) => {
+                        let _ = bp_db::update_push_subscription_last_notification(
+                            pool,
+                            sub.id,
+                            Utc::now().timestamp_millis(),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        warn!(target: "bp_notifications::cron::network_difficulty", error = %e, "UnifiedPush send");
                     }
                 }
-                other => {
-                    warn!(target: "bp_notifications::cron::network_difficulty", kind = other, "unknown subscription_type — skipped");
-                }
+            } else {
+                warn!(target: "bp_notifications::cron::network_difficulty", kind, "unknown subscription_type — skipped");
             }
         }
     }

@@ -276,9 +276,11 @@ pub struct PushSubscriptionRow {
     pub device_notifications_enabled: bool,
     #[sqlx(rename = "blockNotificationsEnabled")]
     pub block_notifications_enabled: bool,
-    /// `"UNIFIED_PUSH"` or `"FCM"` (raw string kept — it's a stable
-    /// 2-value enum but introducing a typed enum at this layer is
-    /// over-engineering until a caller actually branches on it).
+    /// `"unified_push"` or `"fcm"` (lowercase, as written by the
+    /// `/api/push/*` register endpoints). Raw string kept — it's a
+    /// stable 2-value enum but introducing a typed enum at this layer is
+    /// over-engineering until a caller actually branches on it.
+    /// Consumers compare case-insensitively to tolerate legacy casing.
     #[sqlx(rename = "subscriptionType")]
     pub subscription_type: String,
     #[sqlx(rename = "networkDiffNotificationsEnabled")]
