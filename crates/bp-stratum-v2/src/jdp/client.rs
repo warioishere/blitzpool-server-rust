@@ -628,7 +628,21 @@ pub fn parse_user_identifier_as_address(user_identifier: &str) -> Option<Address
     if trimmed.is_empty() {
         return None;
     }
-    let normalised = normalize_btc_address(trimmed);
+    // Stratum `address.worker` convention (single-dot split; the worker
+    // name keeps any further dots). Strip the worker suffix so only the
+    // payout address is validated and carried downstream — otherwise the
+    // trailing `.worker` makes `address_to_script` reject the address at
+    // coinbase-output encode time, collapsing the pool payout to an empty
+    // output set (`coinbase_tx_outputs = 0x00`). Same split as the
+    // mining channel-open parse (`address.worker_name`, first dot).
+    let address_part = match trimmed.find('.') {
+        Some(idx) => &trimmed[..idx],
+        None => trimmed,
+    };
+    if address_part.is_empty() {
+        return None;
+    }
+    let normalised = normalize_btc_address(address_part);
     AddressId::new(normalised).ok()
 }
 
@@ -1351,6 +1365,20 @@ mod tests {
         // Spaces, control chars, oversize → InvalidAddress.
         let out = parse_user_identifier_as_address(&"x".repeat(200));
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn parse_user_identifier_strips_worker_suffix() {
+        // `address.worker` must yield only the address — the trailing
+        // `.worker` would otherwise reach `address_to_script` and collapse
+        // the JDP coinbase outputs to an empty set.
+        let out = parse_user_identifier_as_address(&format!("{ADDR}.gitgab"));
+        assert_eq!(out.map(|a| a.as_str().to_string()), Some(ADDR.to_string()));
+        // Worker name keeps further dots; only the first split matters.
+        let out2 = parse_user_identifier_as_address(&format!("{ADDR}.rig.1"));
+        assert_eq!(out2.map(|a| a.as_str().to_string()), Some(ADDR.to_string()));
+        // A leading dot (empty address) is rejected.
+        assert!(parse_user_identifier_as_address(".worker").is_none());
     }
 
     // ── RequestPayoutOutputs ───────────────────────────────────────
