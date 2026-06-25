@@ -188,6 +188,14 @@ struct Inner {
     // StreamKind — a connection switches onto one when its OpenChannel address
     // resolves to that mode. Each fed by its own translator off its TDP handle.
     alt_streams: HashMap<StreamKind, AltStream>,
+    // POOL-WIDE extranonce-prefix allocator, shared across every connection.
+    // It MUST be global, not per-connection: Standard channels can't roll
+    // their own extranonce, so two same-address Standard miners handed the
+    // same prefix would mine byte-identical work (identical shares + a
+    // shared best-difficulty). A per-connection allocator restarts at the
+    // same base prefix on each connection, guaranteeing that collision; a
+    // single shared allocator hands out a globally-unique prefix per channel.
+    extranonce_allocator: Arc<Mutex<ExtranonceAllocator>>,
     cancel: CancellationToken,
     translator_join: Mutex<Option<JoinHandle<()>>>,
     alt_translator_joins: Mutex<Vec<JoinHandle<()>>>,
@@ -278,6 +286,7 @@ impl StratumV2MiningServer {
                 template_tx,
                 current_template,
                 alt_streams: alt_map,
+                extranonce_allocator: Arc::new(Mutex::new(ExtranonceAllocator::new_default())),
                 cancel,
                 translator_join: Mutex::new(Some(translator_join)),
                 alt_translator_joins: Mutex::new(alt_joins),
@@ -344,6 +353,7 @@ impl StratumV2MiningServer {
             })
             .collect();
         let cancel = self.inner.cancel.clone();
+        let extranonce_allocator = self.inner.extranonce_allocator.clone();
         let session_id = self.alloc_session_id();
 
         tokio::spawn(async move {
@@ -357,6 +367,7 @@ impl StratumV2MiningServer {
                 template_rx,
                 initial_template,
                 alt_streams,
+                extranonce_allocator,
                 socket,
                 cancel,
             )
@@ -510,6 +521,7 @@ async fn run_mining_connection(
     mut template_rx: broadcast::Receiver<TemplateBroadcast>,
     initial_template: Option<ActiveSV2Template>,
     mut alt_streams: HashMap<StreamKind, AltStreamHandle>,
+    extranonce_allocator: Arc<Mutex<ExtranonceAllocator>>,
     socket: TcpStream,
     cancel: CancellationToken,
 ) -> std::io::Result<()> {
@@ -540,11 +552,12 @@ async fn run_mining_connection(
     // `alt_streams` holds one receiver+snapshot per fixed-reservation stream;
     // at OpenChannel the connection `remove`s the entry for its resolved mode
     // (if any) and swaps `template_rx`/`current_template` onto it.
-    // Per-connection extranonce-prefix allocator. Channels open on
-    // this connection draw their unique prefix here; closed channels
-    // release back to the pool so a long-lived connection with
-    // churning channels doesn't exhaust the namespace.
-    let mut extranonce_allocator = ExtranonceAllocator::new_default();
+    // Extranonce-prefix allocation uses the POOL-WIDE shared allocator
+    // (`extranonce_allocator`, passed in) — NOT a per-connection one.
+    // Standard channels can't roll their own extranonce, so two
+    // same-address Standard miners must never receive the same prefix;
+    // only a global allocator guarantees that. Locked briefly per
+    // channel open/close in `dispatch_inbound_frame` (never per-share).
 
     let mut vardiff_tick = tokio::time::interval(Duration::from_millis(state.vardiff_interval_ms));
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -658,13 +671,15 @@ async fn run_mining_connection(
                 }
                 let is_submit =
                     matches!(inbound, InboundMiningFrame::SubmitSharesExtended(_));
-                let outcome = dispatch_inbound_frame(
-                    &mut state,
-                    inbound,
-                    &mut extranonce_allocator,
-                    &bridge,
-                    now_ms(),
-                );
+                // Lock the pool-wide allocator only for the dispatch (it's
+                // synchronous — no await held). Open/Close are the only frames
+                // that touch it; the common submit path is a no-op on it.
+                let outcome = {
+                    let mut alloc = extranonce_allocator
+                        .lock()
+                        .expect("extranonce allocator mutex poisoned");
+                    dispatch_inbound_frame(&mut state, inbound, &mut alloc, &bridge, now_ms())
+                };
                 let write_start = std::time::Instant::now();
                 if let Err(err) = write_outbound_frames(
                     &mut writer,
@@ -942,6 +957,15 @@ async fn run_mining_connection(
 
 // ── Dispatch + Outbound write helpers ───────────────────────────────
 
+/// Globally-unique key for the pool-wide extranonce allocator. The wire
+/// `channel_id` is only unique within a connection (every connection's
+/// first channel is id 1), so it is combined with the per-connection
+/// random `session_id` into one u64 — otherwise two connections' "channel
+/// 1" would collide in the shared allocator and be handed the same prefix.
+fn channel_alloc_key(session_id: u32, channel_id: u32) -> u64 {
+    ((session_id as u64) << 32) | (channel_id as u64)
+}
+
 /// Translate an [`InboundMiningFrame`] into a call to the matching
 /// `handle_*` function. Returns the resulting [`HandlerOutcome`]
 /// (sync handlers — currently no async hooks needed at dispatch time).
@@ -980,16 +1004,16 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock>(
         InboundMiningFrame::SetupConnection(input) => handle_setup_connection(state, &input),
         InboundMiningFrame::RequestExtensions(input) => handle_request_extensions(state, &input),
         InboundMiningFrame::OpenStandardMiningChannel(input, _placeholder_prefix) => {
-            let next_id = state.next_channel_id;
+            let key = channel_alloc_key(state.session_id, state.next_channel_id);
             let prefix = extranonce_allocator
-                .allocate(next_id)
+                .allocate(key)
                 .unwrap_or_else(|_| Vec::new());
             handle_open_standard_mining_channel(state, &input, prefix)
         }
         InboundMiningFrame::OpenExtendedMiningChannel(input, _placeholder_prefix) => {
-            let next_id = state.next_channel_id;
+            let key = channel_alloc_key(state.session_id, state.next_channel_id);
             let prefix = extranonce_allocator
-                .allocate(next_id)
+                .allocate(key)
                 .unwrap_or_else(|_| Vec::new());
             handle_open_extended_mining_channel(state, &input, prefix)
         }
@@ -1002,7 +1026,7 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock>(
             // allocation is a harmless no-op.
             for ev in &outcome.events {
                 if let SessionEvent::ChannelClosed { channel_id, .. } = ev {
-                    extranonce_allocator.release(*channel_id);
+                    extranonce_allocator.release(channel_alloc_key(state.session_id, *channel_id));
                 }
             }
             outcome
@@ -1410,6 +1434,31 @@ mod tests {
     use bp_template_distribution::{NewTemplate, SetNewPrevHash};
     use bp_vardiff::TestClock;
     use std::sync::Arc;
+
+    /// The pool-wide extranonce allocator must hand DISTINCT prefixes to the
+    /// same wire `channel_id` (1) opened on two different connections —
+    /// otherwise same-address Standard miners mine byte-identical work. The
+    /// per-connection allocator this replaced gave both the same prefix.
+    #[test]
+    fn shared_allocator_distinct_prefix_per_session_same_channel_id() {
+        let mut alloc = ExtranonceAllocator::new_default();
+        let p_a = alloc.allocate(channel_alloc_key(0xAAAA_AAAA, 1)).unwrap();
+        let p_b = alloc.allocate(channel_alloc_key(0xBBBB_BBBB, 1)).unwrap();
+        assert_ne!(
+            p_a, p_b,
+            "channel_id=1 on two sessions must get distinct prefixes"
+        );
+        // Same (session, channel) re-allocation is idempotent.
+        assert_eq!(
+            p_a,
+            alloc.allocate(channel_alloc_key(0xAAAA_AAAA, 1)).unwrap()
+        );
+        // Release frees it for reuse.
+        alloc.release(channel_alloc_key(0xAAAA_AAAA, 1));
+        assert!(alloc
+            .get_prefix(channel_alloc_key(0xAAAA_AAAA, 1))
+            .is_none());
+    }
 
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 

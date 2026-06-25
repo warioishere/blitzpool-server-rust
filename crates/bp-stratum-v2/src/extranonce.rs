@@ -36,7 +36,7 @@ pub struct ExtranonceAllocator {
     worker_offset: u32,
     max_prefix: u32,
     next_prefix: u32,
-    allocated: HashMap<u32, u32>, // channel_id → prefix
+    allocated: HashMap<u64, u32>, // globally-unique channel key → prefix
     used: HashSet<u32>,
 }
 
@@ -94,11 +94,14 @@ impl ExtranonceAllocator {
         self.allocated.len()
     }
 
-    /// Allocate (or re-return) the prefix for `channel_id`. Big-endian
+    /// Allocate (or re-return) the prefix for `channel_key` — a
+    /// GLOBALLY-unique key (the allocator is shared pool-wide, so the
+    /// per-connection wire `channel_id` is not unique on its own; the
+    /// caller combines it with the session id). Big-endian
     /// `prefix_size`-byte buffer. Returns `Err(Exhausted)` only when
     /// every prefix in the worker partition is in use.
-    pub fn allocate(&mut self, channel_id: u32) -> Result<Vec<u8>, ExtranonceError> {
-        if let Some(&existing) = self.allocated.get(&channel_id) {
+    pub fn allocate(&mut self, channel_key: u64) -> Result<Vec<u8>, ExtranonceError> {
+        if let Some(&existing) = self.allocated.get(&channel_key) {
             return Ok(prefix_to_be_bytes(existing, self.prefix_size));
         }
 
@@ -108,7 +111,7 @@ impl ExtranonceAllocator {
         loop {
             let global = self.worker_offset.wrapping_add(local);
             if !self.used.contains(&global) {
-                self.allocated.insert(channel_id, global);
+                self.allocated.insert(channel_key, global);
                 self.used.insert(global);
                 self.next_prefix = if local >= self.max_prefix {
                     1
@@ -129,18 +132,18 @@ impl ExtranonceAllocator {
         }
     }
 
-    /// Drop the channel's allocation. Idempotent for unknown channels.
-    pub fn release(&mut self, channel_id: u32) {
-        if let Some(prefix) = self.allocated.remove(&channel_id) {
+    /// Drop the channel's allocation. Idempotent for unknown keys.
+    pub fn release(&mut self, channel_key: u64) {
+        if let Some(prefix) = self.allocated.remove(&channel_key) {
             self.used.remove(&prefix);
         }
     }
 
-    /// Look up the prefix for a channel without allocating. Returns
+    /// Look up the prefix for a channel key without allocating. Returns
     /// `None` if unknown.
-    pub fn get_prefix(&self, channel_id: u32) -> Option<Vec<u8>> {
+    pub fn get_prefix(&self, channel_key: u64) -> Option<Vec<u8>> {
         self.allocated
-            .get(&channel_id)
+            .get(&channel_key)
             .map(|&p| prefix_to_be_bytes(p, self.prefix_size))
     }
 }

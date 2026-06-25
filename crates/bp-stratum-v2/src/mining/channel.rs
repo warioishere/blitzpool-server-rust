@@ -293,6 +293,15 @@ pub struct ExtendedDedupKey {
     pub extranonce: ExtranonceBytes,
 }
 
+/// Upper bound on the per-channel submission dedup set. The set is only
+/// cleared on a block change; between blocks a fast miner accumulates
+/// entries indefinitely (more so now that byte-identical refreshes are
+/// suppressed and a channel keeps one `job_id` for the whole block). An
+/// unbounded set both leaks memory and, after a firmware nonce-range
+/// replay, starts flagging legitimate resubmissions as duplicates. Cap
+/// the window: when it fills, drop the oldest generation wholesale.
+const MAX_SUBMISSION_CACHE: usize = 10_000;
+
 impl SubmissionCache {
     /// Try to record a Standard-channel submission. Returns `true` if
     /// it was newly inserted (= not a duplicate), `false` if the key
@@ -301,7 +310,12 @@ impl SubmissionCache {
     /// channel kind anyway.
     pub fn insert_standard(&mut self, key: StandardDedupKey) -> bool {
         match self {
-            SubmissionCache::Standard(set) => set.insert(key),
+            SubmissionCache::Standard(set) => {
+                if set.len() >= MAX_SUBMISSION_CACHE {
+                    set.clear();
+                }
+                set.insert(key)
+            }
             SubmissionCache::Extended(_) => {
                 debug_assert!(false, "insert_standard on Extended cache");
                 false
@@ -314,7 +328,12 @@ impl SubmissionCache {
     /// [`Self::insert_standard`] for the kind-mismatch behaviour.
     pub fn insert_extended(&mut self, key: ExtendedDedupKey) -> bool {
         match self {
-            SubmissionCache::Extended(set) => set.insert(key),
+            SubmissionCache::Extended(set) => {
+                if set.len() >= MAX_SUBMISSION_CACHE {
+                    set.clear();
+                }
+                set.insert(key)
+            }
             SubmissionCache::Standard(_) => {
                 debug_assert!(false, "insert_extended on Standard cache");
                 false
