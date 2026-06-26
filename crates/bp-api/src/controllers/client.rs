@@ -137,7 +137,13 @@ where
             for r in rows {
                 let k = bucket_key(r.time, range.slot_size_ms());
                 if let Some(v) = buckets.get_mut(&k) {
-                    *v += r.accepted_count as f64;
+                    // Diff-1-weighted accepted shares (sum of share difficulty),
+                    // NOT the raw share count: this tracks actual work, so the
+                    // chart stays flat when vardiff trades share size for share
+                    // rate at constant hashrate. The raw count (`accepted_count`)
+                    // would drift up as per-share difficulty drops. (The rejected
+                    // endpoint intentionally still reports raw full-share counts.)
+                    *v += r.shares as f64;
                 }
             }
             Ok(SlotDataResponse {

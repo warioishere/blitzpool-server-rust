@@ -1974,7 +1974,10 @@ where
                 let rows =
                     bp_db::find_client_statistics_since_for_address(&s.pool, a, since).await?;
                 for r in rows.iter().filter(|r| r.time < cutoff) {
-                    *buckets.entry(r.time).or_insert(0.0) += r.accepted_count as f64;
+                    // Diff-1-weighted accepted shares (sum of share difficulty),
+                    // matching the per-client `/accepted` endpoint — tracks work,
+                    // not raw share count, so it stays flat at constant hashrate.
+                    *buckets.entry(r.time).or_insert(0.0) += r.shares as f64;
                 }
             }
             let boundaries: Vec<i64> = chart_slot_boundaries(since, range.slot_size_ms())
