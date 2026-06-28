@@ -993,7 +993,7 @@ fn channel_alloc_key(session_id: u32, channel_id: u32) -> u64 {
 ///   `None`) plus the issued payout set to the handler; the
 ///   cross-check + payout validation happen inside the handler, and
 ///   the payout set is single-use-consumed here on success.
-pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock>(
+pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
     state: &mut MiningSessionState<C>,
     inbound: InboundMiningFrame,
     extranonce_allocator: &mut ExtranonceAllocator,
@@ -1374,7 +1374,11 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                         session_id_hex,
                         user_agent.as_deref(),
                         &accept,
-                        state.vardiff.hash_rate(),
+                        state
+                            .vardiff
+                            .get(&channel_id)
+                            .map(|v| v.hash_rate())
+                            .unwrap_or(0.0),
                     )
                     .await;
                 if accept.is_block_candidate {

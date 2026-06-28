@@ -452,12 +452,14 @@ impl HandlerOutcome {
 /// All per-connection mutable state for the mining sub-protocol. Owned
 /// `&mut` by the connection task that drives the Noise-wrapped socket.
 ///
-/// Multi-channel: connections can host any number of channels
-/// (typically 1; multi-hashboard setups open one per board). All
-/// channels share `session_difficulty` as the vardiff base (each
-/// channel may clamp further against its own `declared_max_target`).
-/// All channels share `address` — the first channel opened locks the
-/// address; subsequent channels must match.
+/// Multi-channel: connections can host any number of channels (typically
+/// 1; multi-hashboard setups and aggregating proxies open several). SV2
+/// difficulty is per channel: each channel carries its own classic vardiff
+/// engine (see `vardiff`) and retargets from its own share rate, clamped
+/// against its own `declared_max_target` — independent channels on one
+/// connection never pool their share rate. All channels share `address` —
+/// the first channel opened locks the address; subsequent channels must
+/// match.
 pub struct MiningSessionState<C: Clock> {
     // Identity
     pub session_id: u32,
@@ -483,7 +485,8 @@ pub struct MiningSessionState<C: Clock> {
     // TLV resolver (e.g. ext 0x0002 Worker-ID).
     pub negotiated_extensions: HashSet<u16>,
 
-    // Session-wide difficulty (vardiff base)
+    // Connection default/initial difficulty; also the JDC vardiff base.
+    // Classic per-channel vardiff lives in `vardiff` (keyed by channel id).
     pub session_difficulty: Difficulty,
 
     // Channels
@@ -502,7 +505,12 @@ pub struct MiningSessionState<C: Clock> {
     pub groups: GroupChannelRegistry,
 
     // Vardiff state
-    pub vardiff: VarDiffEngine<C>,
+    /// Classic vardiff, one engine per channel id. SV2 difficulty is per
+    /// channel, so each channel tracks its own share rate independently;
+    /// several channels on one connection (multi-board, aggregating proxy)
+    /// don't combine into one inflated rate. Standard + Extended channels;
+    /// JDC channels retarget via `jdc_vardiff` instead.
+    pub vardiff: HashMap<u32, VarDiffEngine<C>>,
     pub jdc_vardiff: JdcVardiff,
 
     // Clock + per-port config
@@ -545,11 +553,6 @@ pub struct PortConfig {
 
 impl<C: Clock + Clone> MiningSessionState<C> {
     pub fn new(clock: C, session_id: u32, port: PortConfig) -> Self {
-        let vardiff = VarDiffEngine::new(
-            clock.clone(),
-            port.target_shares_per_minute,
-            port.min_difficulty.as_f64(),
-        );
         Self {
             session_id,
             network: port.network,
@@ -576,7 +579,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             primary_channel: None,
             next_channel_id: 1,
             groups: GroupChannelRegistry::new(),
-            vardiff,
+            vardiff: HashMap::new(),
             jdc_vardiff: JdcVardiff::new(),
             clock,
             min_difficulty: port.min_difficulty,
@@ -589,6 +592,17 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             vardiff_interval_ms: port.vardiff_interval_ms,
             share_logs: false,
         }
+    }
+
+    /// A fresh classic vardiff engine for a newly opened channel, seeded
+    /// from the connection's configured target shares/min and difficulty
+    /// floor.
+    fn new_channel_vardiff(&self) -> VarDiffEngine<C> {
+        VarDiffEngine::new(
+            self.clock.clone(),
+            self.target_shares_per_minute,
+            self.min_difficulty.as_f64(),
+        )
     }
 }
 
@@ -736,7 +750,7 @@ pub fn handle_request_extensions<C: Clock>(
 /// 4. Allocate `channel_id` (per-connection monotonic counter).
 /// 5. Insert `ChannelState` (Standard kind, `extranonce_size = 0`).
 /// 6. Emit `OpenStandardMiningChannelSuccess` + `ChannelOpened` event.
-pub fn handle_open_standard_mining_channel<C: Clock>(
+pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
     state: &mut MiningSessionState<C>,
     input: &OpenStandardMiningChannelInput,
     extranonce_prefix: Vec<u8>,
@@ -762,6 +776,8 @@ pub fn handle_open_standard_mining_channel<C: Clock>(
         input.max_target,
     );
     state.channels.insert(channel_id, channel);
+    let engine = state.new_channel_vardiff();
+    state.vardiff.insert(channel_id, engine);
     if state.primary_channel.is_none() {
         state.primary_channel = Some(channel_id);
     }
@@ -835,7 +851,7 @@ fn assign_channel_to_group<C: Clock>(
 ///   advertised sizes larger than that).
 /// - `extranonce_size = 0` in Standard is replaced by the clamped
 ///   rollable size for Extended.
-pub fn handle_open_extended_mining_channel<C: Clock>(
+pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
     state: &mut MiningSessionState<C>,
     input: &OpenExtendedMiningChannelInput,
     extranonce_prefix: Vec<u8>,
@@ -866,6 +882,8 @@ pub fn handle_open_extended_mining_channel<C: Clock>(
         input.max_target,
     );
     state.channels.insert(channel_id, channel);
+    let engine = state.new_channel_vardiff();
+    state.vardiff.insert(channel_id, engine);
     if state.primary_channel.is_none() {
         state.primary_channel = Some(channel_id);
     }
@@ -1126,9 +1144,9 @@ pub fn handle_submit_shares_standard<C: Clock>(
     // then fell into its under-sampled fallback and drifted the difficulty
     // toward the floor. Extended never hit this because it always fed `true`.
     if let ShareValidation::Accepted(ref accept) = validation {
-        state
-            .vardiff
-            .update_hash_rate(accept.effective_difficulty.as_f64(), true);
+        if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
+            engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
+        }
     }
     let channel = state
         .channels
@@ -1227,9 +1245,9 @@ pub fn handle_submit_shares_extended<C: Clock>(
     // Drop the channel borrow first because state.vardiff is a sibling
     // field; re-borrow the channel below for finalize.
     if let ShareValidation::Accepted(ref accept) = validation {
-        state
-            .vardiff
-            .update_hash_rate(accept.effective_difficulty.as_f64(), true);
+        if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
+            engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
+        }
     }
     let channel = state
         .channels
@@ -1372,6 +1390,7 @@ pub fn handle_close_channel<C: Clock>(
         let mut events = Vec::with_capacity(members.len());
         for member_id in members {
             if state.channels.remove(&member_id).is_some() {
+                state.vardiff.remove(&member_id);
                 events.push(SessionEvent::ChannelClosed {
                     channel_id: member_id,
                     reason: input.reason_code.clone(),
@@ -1398,6 +1417,7 @@ pub fn handle_close_channel<C: Clock>(
         return HandlerOutcome::default();
     }
     state.channels.remove(&input.channel_id);
+    state.vardiff.remove(&input.channel_id);
     // Drop the channel from its group (no-op if un-grouped). The group
     // itself persists for the connection's lifetime even when empty —
     // harmless, and a re-opened same-size channel re-joins it.
@@ -1416,20 +1436,17 @@ pub fn handle_close_channel<C: Clock>(
 
 // ── apply_vardiff_check ─────────────────────────────────────────────
 
-/// Periodic vardiff tick. Reads
-/// [`bp_vardiff::VarDiffEngine::suggested_difficulty`] against the
-/// current `session_difficulty`; if a retarget is recommended:
-///
-/// 1. Update `state.session_difficulty`.
-/// 2. For each channel: clamp the new diff against the channel's
-///    `declared_max_target` and emit `SetTarget` if it changed.
-/// 3. Emit `DifficultyChanged` event.
+/// Periodic vardiff tick. For each non-JDC channel, reads that channel's
+/// own [`bp_vardiff::VarDiffEngine::suggested_difficulty`] against the
+/// channel's current difficulty; if a retarget is recommended it clamps
+/// against the channel's `declared_max_target`, updates the channel's
+/// difficulty, and emits `SetTarget` + `DifficultyChanged`. Each channel
+/// retargets independently from its own share rate — SV2 difficulty is per
+/// channel, so several channels on one connection never pool their rate.
 ///
 /// JDC channels (`is_jdc=true`) are skipped here — they retarget via
-/// [`crate::mining::vardiff::JdcVardiff::check`] which lives on a
-/// different cadence (share-count-based instead of sample-window
-/// based). Wiring the JDC path into this function is deferred to a
-/// follow-up.
+/// [`crate::mining::vardiff::JdcVardiff::check`] on a different cadence
+/// (share-count-based instead of sample-window based).
 pub fn apply_vardiff_check<C: Clock>(state: &mut MiningSessionState<C>) -> HandlerOutcome {
     // SV2 vardiff has two algorithms — see `mining/vardiff.rs` for the
     // why. If the primary channel is a Job-Declaration-Client, use
@@ -1444,40 +1461,40 @@ pub fn apply_vardiff_check<C: Clock>(state: &mut MiningSessionState<C>) -> Handl
         return apply_jdc_vardiff_check(state);
     }
 
-    let Some(target_diff) = state
-        .vardiff
-        .suggested_difficulty(state.session_difficulty.as_f64())
-    else {
-        return HandlerOutcome::default();
-    };
-    let target_diff = Difficulty(target_diff);
-    if (target_diff.as_f64() - state.session_difficulty.as_f64()).abs() < f64::EPSILON {
-        return HandlerOutcome::default();
-    }
-    let old = state.session_difficulty;
-    state.session_difficulty = target_diff;
-
+    // Disjoint &mut borrows of the two sibling fields so each channel can
+    // read+update its own vardiff engine and difficulty in one pass.
     let mut outcome = HandlerOutcome::default();
-    for channel in state.channels.values_mut() {
+    let MiningSessionState {
+        channels, vardiff, ..
+    } = state;
+    for channel in channels.values_mut() {
         if channel.is_jdc {
             continue;
         }
+        let Some(engine) = vardiff.get_mut(&channel.channel_id) else {
+            continue;
+        };
+        let Some(suggested) = engine.suggested_difficulty(channel.session_difficulty.as_f64())
+        else {
+            continue;
+        };
         let clamped = clamp_difficulty_to_max_target(
-            target_diff,
+            Difficulty(suggested),
             &Target::from_le_bytes(channel.declared_max_target),
         );
         if (clamped.as_f64() - channel.session_difficulty.as_f64()).abs() >= f64::EPSILON {
+            let old = channel.session_difficulty;
             channel.session_difficulty = clamped;
             outcome.push_frame(OutboundFrame::SetTarget {
                 channel_id: channel.channel_id,
                 maximum_target: difficulty_to_target(clamped).to_le_bytes(),
             });
+            outcome.push_event(SessionEvent::DifficultyChanged {
+                old,
+                new: clamped,
+            });
         }
     }
-    outcome.push_event(SessionEvent::DifficultyChanged {
-        old,
-        new: target_diff,
-    });
     outcome
 }
 
@@ -3109,7 +3126,11 @@ mod tests {
             ch.standard_jobs
                 .record_send_for_test(7, easy, [0xDD; 32], snapshot(), 0);
         }
-        assert_eq!(s.vardiff.cache_len(), 0, "cache empty before any share");
+        assert_eq!(
+            s.vardiff[&channel_id].cache_len(),
+            0,
+            "cache empty before any share"
+        );
         let sub = SubmitSharesStandardInput {
             channel_id,
             sequence_number: 1,
@@ -3121,7 +3142,7 @@ mod tests {
         let out = handle_submit_shares_standard(&mut s, &sub, 0);
         assert!(matches!(out.events[0], SessionEvent::ShareAccepted { .. }));
         assert_eq!(
-            s.vardiff.cache_len(),
+            s.vardiff[&channel_id].cache_len(),
             1,
             "accepted Standard share must feed the vardiff submission cache \
              even when its frozen job difficulty differs from the session \
@@ -3404,10 +3425,9 @@ mod tests {
         assert!(out.events.is_empty());
     }
 
-    /// Vardiff retarget under load: after the submission cache fills
-    /// with shares faster than the target rate, apply_vardiff_check
-    /// must ratchet `session_difficulty` upward and emit a `SetTarget`
-    /// for every open channel.
+    /// Vardiff retarget under load: after a channel's submission cache
+    /// fills with shares faster than the target rate, apply_vardiff_check
+    /// must ratchet THAT channel's difficulty upward and emit a `SetTarget`.
     #[test]
     fn apply_vardiff_check_retargets_up_when_share_rate_exceeds_target() {
         // Clock starts at 0; advance by `tick_ms` between every fed
@@ -3420,7 +3440,8 @@ mod tests {
             &open_std(1, &format!("{}.w", REGTEST_ADDR)),
             vec![0; 4],
         );
-        let initial = s.session_difficulty.as_f64();
+        let channel_id = s.primary_channel.unwrap();
+        let initial = s.channels[&channel_id].session_difficulty.as_f64();
 
         // Feed 10 shares of diff=1024 over 10 seconds — share rate of
         // 1/s ≫ target (target_shares_per_minute=6 → 1 share / 10 s).
@@ -3430,12 +3451,15 @@ mod tests {
         let tick_ms = 1_000_u64;
         for _ in 0..10 {
             clock.advance_ms(tick_ms);
-            s.vardiff.update_hash_rate(initial, true);
+            s.vardiff
+                .get_mut(&channel_id)
+                .unwrap()
+                .update_hash_rate(initial, true);
         }
         clock.advance_ms(tick_ms);
 
         let out = apply_vardiff_check(&mut s);
-        let new_diff = s.session_difficulty.as_f64();
+        let new_diff = s.channels[&channel_id].session_difficulty.as_f64();
         assert!(
             new_diff > initial,
             "vardiff failed to ratchet up: initial={initial}, new={new_diff}"
@@ -3468,6 +3492,69 @@ mod tests {
                     | OutboundFrame::NewMiningJob { .. }
             )),
             "vardiff retarget must emit SetTarget only — no job / SetNewPrevHash frame"
+        );
+    }
+
+    /// SV2 difficulty is per channel: a fast channel and an idle channel on
+    /// the SAME connection retarget INDEPENDENTLY. The fast channel ratchets
+    /// up from its own share rate while the idle channel does not follow it.
+    /// A single per-connection vardiff engine would push the fast channel's
+    /// rate onto both — this guards against that.
+    #[test]
+    fn vardiff_retargets_each_channel_independently() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = MiningSessionState::new(clock.clone(), 1, port_cfg());
+        handle_setup_connection(&mut s, &good_setup());
+        // Two channels on one connection (same locked address).
+        let _ = handle_open_standard_mining_channel(
+            &mut s,
+            &open_std(1, &format!("{}.w", REGTEST_ADDR)),
+            vec![0; 4],
+        );
+        let _ = handle_open_standard_mining_channel(
+            &mut s,
+            &open_std(2, &format!("{}.w", REGTEST_ADDR)),
+            vec![0; 4],
+        );
+        let fast = 1u32;
+        let idle = 2u32;
+        let initial = s.channels[&fast].session_difficulty.as_f64();
+
+        // Drive ONLY the fast channel well above the target rate.
+        let tick_ms = 1_000_u64;
+        for _ in 0..10 {
+            clock.advance_ms(tick_ms);
+            s.vardiff
+                .get_mut(&fast)
+                .unwrap()
+                .update_hash_rate(initial, true);
+        }
+        clock.advance_ms(tick_ms);
+
+        let out = apply_vardiff_check(&mut s);
+        let fast_new = s.channels[&fast].session_difficulty.as_f64();
+        let idle_new = s.channels[&idle].session_difficulty.as_f64();
+
+        assert!(
+            fast_new > initial,
+            "fast channel must ratchet up from its own rate: {initial} -> {fast_new}"
+        );
+        assert!(
+            idle_new < fast_new,
+            "idle channel must NOT follow the fast channel's retarget \
+             (independent per-channel vardiff): idle={idle_new}, fast={fast_new}"
+        );
+        let targets: Vec<u32> = out
+            .outbound
+            .iter()
+            .filter_map(|f| match f {
+                OutboundFrame::SetTarget { channel_id, .. } => Some(*channel_id),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            targets.contains(&fast),
+            "fast channel must get a SetTarget"
         );
     }
 
