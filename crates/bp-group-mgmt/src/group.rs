@@ -170,6 +170,84 @@ impl RoundResetPreset {
     }
 }
 
+// ─── Payout mode ────────────────────────────────────────────────────────────
+
+/// Per-group payout mode. Stored as a varchar in `pplns_group.payoutMode`.
+///
+/// **Immutable**: chosen once at group creation and never changed (no live
+/// state migration between modes). Modelled on [`RoundResetPreset`].
+///
+/// - `Prop` (default) — classic Group-Solo: shares accumulate in a single
+///   per-group round and pay out PROP per round; the round is wiped on
+///   block-found (when `resetRoundOnBlock`) or on a calendar/manual reset.
+/// - `Window` — a continuously-sliding time window (like PPLNS, but
+///   time-based): the payout distribution is "the last N days of shares",
+///   trimming itself over time. No round reset; the window length is the
+///   group's reset-cadence config reinterpreted as a window duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PayoutMode {
+    #[default]
+    Prop,
+    Window,
+}
+
+impl PayoutMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prop => "prop",
+            Self::Window => "window",
+        }
+    }
+
+    /// Parse the stored varchar. Returns `None` for an unrecognized value so
+    /// the caller can decide the fallback (callers default to `Prop`, the
+    /// safe legacy behavior).
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "prop" => Self::Prop,
+            "window" => Self::Window,
+            _ => return None,
+        })
+    }
+
+    /// Lenient parse used on the read side: an unknown / absent value resolves
+    /// to `Prop` (legacy default) rather than erroring.
+    pub fn parse_or_default(s: &str) -> Self {
+        Self::parse(s).unwrap_or_default()
+    }
+}
+
+/// Default sliding-window length in days when a `Window`-mode group has no
+/// reset-cadence config to reinterpret.
+pub const DEFAULT_WINDOW_DAYS: u32 = 1;
+
+/// Interpret the round-reset cadence config as a sliding-window length in
+/// **days** (only meaningful for [`PayoutMode::Window`]).
+///
+/// The window reuses the existing reset config rather than adding a new
+/// field: `daily` → 1, `weekly` → 7, `monthly` → 30, `custom` → the
+/// configured `interval_days`. A missing / zero config falls back to
+/// [`DEFAULT_WINDOW_DAYS`]. Changing this later only trims more/less of the
+/// window — it never migrates state — so it stays editable in the PATCH path.
+pub fn window_days(preset: Option<RoundResetPreset>, interval_days: Option<u32>) -> u32 {
+    match preset {
+        Some(RoundResetPreset::Daily) => 1,
+        Some(RoundResetPreset::Weekly) => 7,
+        Some(RoundResetPreset::Monthly) => 30,
+        Some(RoundResetPreset::Custom) => interval_days
+            .filter(|d| *d > 0)
+            .unwrap_or(DEFAULT_WINDOW_DAYS),
+        None => interval_days
+            .filter(|d| *d > 0)
+            .unwrap_or(DEFAULT_WINDOW_DAYS),
+    }
+}
+
+/// Sliding-window length in **milliseconds** — [`window_days`] × one day.
+pub fn window_duration_ms(preset: Option<RoundResetPreset>, interval_days: Option<u32>) -> i64 {
+    window_days(preset, interval_days) as i64 * MS_PER_DAY
+}
+
 /// Validated round-reset configuration ready to persist on the group row.
 /// `None` for `preset` means "scheduled resets disabled".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -488,5 +566,64 @@ mod tests {
         let mut cfg = ok_cfg();
         cfg.finder_bonus_sats = Sats(0);
         assert!(validate_round_reset(&cfg, Sats(10_000_000)).is_ok());
+    }
+
+    // ── Payout mode ──────────────────────────────────────────────────
+
+    #[test]
+    fn payout_mode_default_is_prop() {
+        assert_eq!(PayoutMode::default(), PayoutMode::Prop);
+    }
+
+    #[test]
+    fn payout_mode_roundtrips_through_str() {
+        for m in [PayoutMode::Prop, PayoutMode::Window] {
+            assert_eq!(PayoutMode::parse(m.as_str()), Some(m));
+        }
+    }
+
+    #[test]
+    fn payout_mode_parse_rejects_unknown() {
+        assert_eq!(PayoutMode::parse("bogus"), None);
+        // Lenient variant falls back to Prop instead of erroring.
+        assert_eq!(PayoutMode::parse_or_default("bogus"), PayoutMode::Prop);
+        assert_eq!(PayoutMode::parse_or_default("window"), PayoutMode::Window);
+    }
+
+    // ── Window length reinterpretation ───────────────────────────────
+
+    #[test]
+    fn window_days_maps_presets() {
+        assert_eq!(window_days(Some(RoundResetPreset::Daily), None), 1);
+        assert_eq!(window_days(Some(RoundResetPreset::Weekly), None), 7);
+        assert_eq!(window_days(Some(RoundResetPreset::Monthly), None), 30);
+        assert_eq!(window_days(Some(RoundResetPreset::Custom), Some(5)), 5);
+    }
+
+    #[test]
+    fn window_days_defaults_when_unset_or_zero() {
+        assert_eq!(window_days(None, None), DEFAULT_WINDOW_DAYS);
+        // Custom with a missing / zero interval falls back to the default.
+        assert_eq!(
+            window_days(Some(RoundResetPreset::Custom), None),
+            DEFAULT_WINDOW_DAYS
+        );
+        assert_eq!(
+            window_days(Some(RoundResetPreset::Custom), Some(0)),
+            DEFAULT_WINDOW_DAYS
+        );
+    }
+
+    #[test]
+    fn window_duration_ms_is_days_times_one_day() {
+        assert_eq!(
+            window_duration_ms(Some(RoundResetPreset::Weekly), None),
+            7 * MS_PER_DAY
+        );
+        assert_eq!(
+            window_duration_ms(Some(RoundResetPreset::Custom), Some(3)),
+            3 * MS_PER_DAY
+        );
+        assert_eq!(window_duration_ms(None, None), MS_PER_DAY);
     }
 }

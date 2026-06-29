@@ -821,6 +821,7 @@ fn reset_row(
         is_public: false,
         reset_round_on_block: false,
         max_members: None,
+        payout_mode: "prop".to_string(),
     }
 }
 
@@ -1018,4 +1019,63 @@ async fn seed_group_with_daily_reset(pool: &PgPool, group_id: Uuid) {
     .execute(pool)
     .await
     .expect("seed group with daily reset");
+}
+
+// ── Window mode — engine record path trims aged-out buckets ─────────
+//
+// Drives the real `GroupSoloEngine::record_share` entry point for a
+// window-mode group: a 30h-old share and a fresh share, with a 1-day window.
+// The watermark guard lets the fresh share's bucket-boundary crossing fire the
+// trim, and the mode-aware round-stats read (which trims with real wall-clock)
+// confirms the old share has aged out while the fresh one remains. Uses
+// now-relative timestamps so the record-path and read-path trims agree.
+#[tokio::test]
+async fn window_mode_record_path_trims_aged_buckets() {
+    let h = match spawn_or_skip(12, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    // Flip the seeded group to window mode. The mode is immutable in prod (no
+    // edit path), but the engine resolves it fresh on the first record, so this
+    // test-only UPDATE before any share takes effect. No preset → 1-day window.
+    sqlx::query(r#"UPDATE pplns_group SET "payoutMode" = 'window' WHERE id = $1"#)
+        .bind(h.group_id)
+        .execute(&h.pool)
+        .await
+        .expect("set window mode");
+
+    let bkt = 3_600_000_i64; // 1h, matches WINDOW_BUCKET_MS
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let t_old = now - 30 * bkt; // 30h ago → outside the 24h window
+    let t_new = now;
+
+    h.engine
+        .record_share(None, h.group_id, "bc1qold", 40.0, t_old)
+        .await
+        .expect("record old share");
+    h.engine
+        .record_share(None, h.group_id, "bc1qnew", 60.0, t_new)
+        .await
+        .expect("record fresh share");
+
+    // round_stats is window-aware + trims with real wall-clock now.
+    let stats = h
+        .engine
+        .reader()
+        .round_stats(h.group_id)
+        .await
+        .expect("round stats");
+    assert!(
+        !stats.per_address.contains_key("bc1qold"),
+        "30h-old share aged out of the 1-day window"
+    );
+    assert!(
+        (stats.per_address.get("bc1qnew").copied().unwrap_or(0.0) - 60.0).abs() < 1e-9,
+        "fresh share retained in the window"
+    );
+
+    drop_harness(h).await;
 }

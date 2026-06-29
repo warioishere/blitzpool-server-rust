@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\"\n           FROM pplns_group WHERE id = $1 LIMIT 1",
+  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\",\n            \"payoutMode\" AS \"payout_mode!\"\n           FROM pplns_group WHERE id = $1 LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -87,6 +87,11 @@
         "ordinal": 16,
         "name": "max_members?",
         "type_info": "Int4"
+      },
+      {
+        "ordinal": 17,
+        "name": "payout_mode!",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -111,8 +116,9 @@
       true,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "14ad9a56111769bcba6227cd8cb1cb9a2af9421504e2e596254a4ed604883cbe"
+  "hash": "432e6280fad93b3948046e00181ef4f7aaaf9171fdeebca6597d7cc725c98a01"
 }

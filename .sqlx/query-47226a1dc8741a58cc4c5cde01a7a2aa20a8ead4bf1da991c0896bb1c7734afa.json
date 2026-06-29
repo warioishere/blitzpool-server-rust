@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO pplns_group\n             (id, name, \"creatorAddress\", \"adminTokenHash\", active,\n              \"createdAt\", \"updatedAt\", \"isPublic\")\n           VALUES ($1, $2, $3, $4, $5, $6, $6, $7)\n           RETURNING\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\"",
+  "query": "INSERT INTO pplns_group\n             (id, name, \"creatorAddress\", \"adminTokenHash\", active,\n              \"createdAt\", \"updatedAt\", \"isPublic\", \"payoutMode\")\n           VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8)\n           RETURNING\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\",\n            \"payoutMode\" AS \"payout_mode!\"",
   "describe": {
     "columns": [
       {
@@ -87,6 +87,11 @@
         "ordinal": 16,
         "name": "max_members?",
         "type_info": "Int4"
+      },
+      {
+        "ordinal": 17,
+        "name": "payout_mode!",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -97,7 +102,8 @@
         "Varchar",
         "Bool",
         "Int8",
-        "Bool"
+        "Bool",
+        "Varchar"
       ]
     },
     "nullable": [
@@ -117,8 +123,9 @@
       true,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "d4b2157067726080b8f4f37f6a92278c5aeae2062cf2212448afc342739a6424"
+  "hash": "47226a1dc8741a58cc4c5cde01a7a2aa20a8ead4bf1da991c0896bb1c7734afa"
 }

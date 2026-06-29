@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bp_common::{AddressId, InvalidAddressError, Sats};
 use bp_cron_utils::SystemClock;
@@ -34,6 +34,7 @@ use bp_db::{
     find_all_pplns_group_balances_for_group, find_group, DbError, PplnsGroupBalanceRow,
     PplnsGroupRow,
 };
+use bp_group_mgmt::group::{window_duration_ms, PayoutMode, RoundResetPreset};
 use bp_pplns::CoinbaseDistributionEntry;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
@@ -53,7 +54,7 @@ use crate::ledger::{
 };
 use crate::reset::{spawn_per_group_task, GroupResetRunner, ResetError, ResetSchedule};
 use crate::round::snapshot::{delete_all_for_group, ParsedSnapshot, StoredSnapshot};
-use crate::round::{GroupRoundStore, RoundError};
+use crate::round::{GroupRoundStore, RoundError, WINDOW_BUCKET_MS};
 use crate::sweep::{spawn_daily_task, GroupDustSweepRunner, SweepError, SweepStats};
 
 #[derive(Debug, Error)]
@@ -116,6 +117,66 @@ struct Inner {
     /// because the hot path awaits PG + Redis inside the critical
     /// section.
     block_found_in_progress: TokioMutex<HashSet<Uuid>>,
+    /// Hot-path cache of each group's payout mode + window length, so
+    /// `record_share` doesn't hit Postgres per accepted share. The mode is
+    /// immutable (set at creation); the window length is editable, so the
+    /// entry carries a short TTL ([`MODE_CACHE_TTL`]) and is re-read on expiry.
+    mode_cache: StdMutex<HashMap<Uuid, CachedGroupMode>>,
+    /// Per-group highest time-bucket for which a windowed `record_share`
+    /// already triggered a trim. The window only sheds whole buckets at hour
+    /// boundaries, so trimming on every share would spend a Redis round-trip
+    /// that is a no-op ~99% of the time. We trim only when a share opens a
+    /// *new* bucket (≈ once/hour/group); the payout read path still trims with
+    /// real wall-clock, so this only bounds Redis between reads, never affects
+    /// correctness. (An out-of-order older share never lowers the watermark.)
+    window_trim_watermark: StdMutex<HashMap<Uuid, i64>>,
+}
+
+/// Cached payout mode + window length for one group. `window_ms` is 0 for
+/// [`PayoutMode::Prop`] (unused there).
+#[derive(Clone, Copy)]
+struct CachedGroupMode {
+    mode: PayoutMode,
+    window_ms: i64,
+    expires_at: Instant,
+}
+
+/// TTL for [`Inner::mode_cache`]. Short enough that a window-length edit takes
+/// effect within a minute (and the mode never changes), cheap enough that the
+/// hot share path almost always hits the cache.
+const MODE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Decide whether a windowed share in `bucket_id` should trigger a trim, given
+/// the highest bucket already trimmed (`watermark`, `None` if never). Trim on
+/// the first share of a group (cold start catches up any aging) and whenever a
+/// share opens a strictly-newer bucket; skip same-bucket and out-of-order older
+/// shares. Pure so the boundary logic is unit-testable without Redis.
+fn should_trim_on_bucket(watermark: Option<i64>, bucket_id: i64) -> bool {
+    match watermark {
+        Some(last) => bucket_id > last,
+        None => true,
+    }
+}
+
+/// Derive `(PayoutMode, window_ms)` from a group row. `window_ms` reinterprets
+/// the reset-cadence config as a sliding-window length (see
+/// [`bp_group_mgmt::group::window_duration_ms`]); it is 0 for PROP groups.
+pub(crate) fn group_mode_from_row(g: &PplnsGroupRow) -> (PayoutMode, i64) {
+    let mode = PayoutMode::parse_or_default(&g.payout_mode);
+    let window_ms = match mode {
+        PayoutMode::Prop => 0,
+        PayoutMode::Window => {
+            let preset = g
+                .round_reset_preset
+                .as_deref()
+                .and_then(RoundResetPreset::parse);
+            let interval = g
+                .round_reset_interval_days
+                .and_then(|d| u32::try_from(d).ok());
+            window_duration_ms(preset, interval)
+        }
+    };
+    (mode, window_ms)
 }
 
 /// A running per-group round-reset cron + its dedicated cancel channel.
@@ -221,6 +282,8 @@ impl GroupSoloEngine {
                 cancel_tx,
                 reset_tasks: StdMutex::new(reset_tasks),
                 block_found_in_progress: TokioMutex::new(HashSet::new()),
+                mode_cache: StdMutex::new(HashMap::new()),
+                window_trim_watermark: StdMutex::new(HashMap::new()),
             }),
         })
     }
@@ -243,6 +306,13 @@ impl GroupSoloEngine {
         // Don't re-arm for dissolved / inactive groups.
         if group.dissolved_at.is_some() || !group.active {
             info!(group_id = %group.id, "round-reset cron unscheduled (group dissolved/inactive)");
+            return;
+        }
+        // Window-mode groups never calendar-reset (the window self-trims); the
+        // reset config is reinterpreted as the window length, so leave the cron
+        // unscheduled regardless of preset.
+        if PayoutMode::parse_or_default(&group.payout_mode) == PayoutMode::Window {
+            info!(group_id = %group.id, "round-reset cron unscheduled (window payout mode)");
             return;
         }
         let interval = group
@@ -278,6 +348,64 @@ impl GroupSoloEngine {
         }
     }
 
+    /// Resolve a group's `(PayoutMode, window_ms)`, caching the result for the
+    /// hot share path. A cache miss reads the `pplns_group` row once; a DB
+    /// error falls back to PROP **without** caching (so a transient failure
+    /// doesn't pin a group to the wrong mode). The mode is immutable, so a
+    /// cached entry is only ever refreshed to pick up a window-length edit.
+    async fn resolve_group_mode(&self, group_id: Uuid) -> (PayoutMode, i64) {
+        {
+            let cache = self.inner.mode_cache.lock().expect("mode_cache poisoned");
+            if let Some(c) = cache.get(&group_id) {
+                if c.expires_at > Instant::now() {
+                    return (c.mode, c.window_ms);
+                }
+            }
+        }
+        let (mode, window_ms) = match find_group(&self.inner.pool, group_id).await {
+            Ok(Some(g)) => group_mode_from_row(&g),
+            Ok(None) => (PayoutMode::Prop, 0),
+            Err(e) => {
+                warn!(%group_id, error = %e,
+                    "group payout-mode lookup failed — defaulting to PROP (not cached)");
+                return (PayoutMode::Prop, 0);
+            }
+        };
+        self.inner
+            .mode_cache
+            .lock()
+            .expect("mode_cache poisoned")
+            .insert(
+                group_id,
+                CachedGroupMode {
+                    mode,
+                    window_ms,
+                    expires_at: Instant::now() + MODE_CACHE_TTL,
+                },
+            );
+        (mode, window_ms)
+    }
+
+    /// Record-path trim gate for a windowed share: returns `true` (and bumps
+    /// the watermark) only when `timestamp_ms` falls in a strictly-newer
+    /// hour-bucket than the last one we trimmed for this group — see
+    /// [`should_trim_on_bucket`]. A short `StdMutex`-guarded map lookup, far
+    /// cheaper than the Redis round-trip it gates.
+    fn advance_trim_watermark(&self, group_id: Uuid, timestamp_ms: i64) -> bool {
+        let bucket_id = timestamp_ms.div_euclid(WINDOW_BUCKET_MS);
+        let mut marks = self
+            .inner
+            .window_trim_watermark
+            .lock()
+            .expect("window_trim_watermark poisoned");
+        if should_trim_on_bucket(marks.get(&group_id).copied(), bucket_id) {
+            marks.insert(group_id, bucket_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Hot path: an accepted Group-Solo share. Caller has resolved
     /// `group_id` (via the mode-gate adapter in `hooks.rs`).
     pub async fn record_share(
@@ -289,11 +417,37 @@ impl GroupSoloEngine {
         timestamp_ms: i64,
     ) -> Result<(), EngineError> {
         let group_key = group_id.to_string();
-        let applied = self
-            .inner
-            .round
-            .record_share(share_id, &group_key, address, difficulty, timestamp_ms)
-            .await?;
+        // PROP appends to the single round aggregate; Window appends into the
+        // share's time bucket and self-trims (using the share's own accept
+        // time as "now" so an idle group still bounds its window).
+        let (mode, window_ms) = self.resolve_group_mode(group_id).await;
+        let applied = match mode {
+            PayoutMode::Prop => {
+                self.inner
+                    .round
+                    .record_share(share_id, &group_key, address, difficulty, timestamp_ms)
+                    .await?
+            }
+            PayoutMode::Window => {
+                let applied = self
+                    .inner
+                    .round
+                    .record_share_windowed(share_id, &group_key, address, difficulty, timestamp_ms)
+                    .await?;
+                // Trim only when this share opens a new hour-bucket — the window
+                // sheds whole buckets at hour boundaries, so per-share trimming
+                // would be a no-op Redis round-trip ~99% of the time. The payout
+                // read path trims with real wall-clock regardless, so this only
+                // bounds Redis between reads.
+                if applied && self.advance_trim_watermark(group_id, timestamp_ms) {
+                    self.inner
+                        .round
+                        .trim_window(&group_key, timestamp_ms, window_ms)
+                        .await?;
+                }
+                applied
+            }
+        };
         if !applied {
             // Deduped redelivery: the round already counts this share, so
             // the best-share check + cache-invalidate would be redundant.
@@ -515,14 +669,35 @@ impl GroupSoloEngine {
             });
         }
 
-        // 2. Read current round state for sharesInRound / totalSharesInRound
-        //    fields on audit rows (Group-Solo-specific). Done BEFORE
-        //    the round reset wipes it.
-        let round_by_addr = self.inner.round.read_by_address(&group_key).await?;
+        // 2. Resolve the group's payout mode + reset gate from a single row
+        //    read (reused for the mode-aware round read AND the reset decision
+        //    below). A failed read defaults to PROP + no reset (safe: never
+        //    silently wipe accumulated shares, never window-trim blind).
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let (mode, window_ms, reset_on_block) = match find_group(&self.inner.pool, group_id).await {
+            Ok(Some(g)) => {
+                let (mode, window_ms) = group_mode_from_row(&g);
+                (mode, window_ms, g.reset_round_on_block)
+            }
+            Ok(None) => (PayoutMode::Prop, 0, false),
+            Err(e) => {
+                warn!(%group_id, error = %e,
+                    "group row read failed in on_block_found — defaulting to PROP / no reset");
+                (PayoutMode::Prop, 0, false)
+            }
+        };
+
+        // Read current round state for sharesInRound / totalSharesInRound
+        // fields on audit rows (Group-Solo-specific). Done BEFORE any reset
+        // wipes it. In Window mode this trims + reads the sliding window.
+        let round_by_addr = self
+            .inner
+            .round
+            .read_payout_shares(&group_key, mode, now_ms, window_ms)
+            .await?;
         let total_shares_in_round: f64 = round_by_addr.values().sum();
         let total_shares_i64 = total_shares_in_round.round() as i64;
 
-        let now_ms = chrono::Utc::now().timestamp_millis();
         let (audit_rows, balance_writes) = self
             .build_writes_from_snapshot(group_id, &snapshot, &round_by_addr, total_shares_i64)
             .await?;
@@ -538,22 +713,17 @@ impl GroupSoloEngine {
         )
         .await?;
 
-        // 4. Reset the round ONLY when the group opted into per-block reset
-        //    (`resetRoundOnBlock`). Default false: shares accumulate across
-        //    blocks until a calendar preset or manual reset fires. Variant A
-        //    preserves `last-accepted-share-at` for inactivity tracking. A
-        //    failed flag read defaults to NO reset (the safe default — never
-        //    silently wipe accumulated shares).
-        let reset_on_block = match find_group(&self.inner.pool, group_id).await {
-            Ok(Some(g)) => g.reset_round_on_block,
-            Ok(None) => false,
-            Err(e) => {
-                warn!(%group_id, error = %e,
-                    "group row read failed before reset gate — defaulting to no per-block reset");
-                false
-            }
-        };
-        if reset_on_block {
+        // 4. Reset the round. Window-mode groups NEVER block-reset — the
+        //    sliding window self-trims by age, so wiping it would drop the
+        //    continuous "last N days" distribution. PROP groups reset only when
+        //    they opted into per-block reset (`resetRoundOnBlock`); default
+        //    false accumulates across blocks until a calendar/manual reset.
+        //    Variant A preserves `last-accepted-share-at` for inactivity
+        //    tracking. (Mode + flag resolved once in step 2.)
+        if mode == PayoutMode::Window {
+            info!(%group_id,
+                "group-solo: window mode — no per-block round reset (window self-trims by age)");
+        } else if reset_on_block {
             if let Err(e) = self.inner.round.reset_for_block_found(&group_key).await {
                 warn!(%group_id, error = %e, "round.reset_for_block_found failed — non-fatal");
             }
@@ -764,11 +934,14 @@ type ResetConfigRow = (Uuid, Option<String>, Option<String>, Option<i32>);
 /// with invalid TZ / preset (logs + continues).
 async fn load_active_schedules(pool: &PgPool) -> Result<Vec<ResetSchedule>, EngineError> {
     let rows: Vec<ResetConfigRow> = sqlx::query_as(
+        // Window-mode groups reinterpret the reset config as a window length
+        // and never calendar-reset — exclude them so no reset cron is armed.
         r#"SELECT id, "roundResetPreset", "roundResetTimezone", "roundResetIntervalDays"
            FROM pplns_group
            WHERE active = true
              AND "dissolvedAt" IS NULL
-             AND "roundResetPreset" IS NOT NULL"#,
+             AND "roundResetPreset" IS NOT NULL
+             AND "payoutMode" <> 'window'"#,
     )
     .fetch_all(pool)
     .await
@@ -816,6 +989,18 @@ mod tests {
         fn _from_reset(e: ResetError) -> EngineError {
             EngineError::from(e)
         }
+    }
+
+    #[test]
+    fn trim_watermark_gates_to_new_buckets_only() {
+        // Cold start (no watermark) always trims — catches up aging on restart.
+        assert!(should_trim_on_bucket(None, 100));
+        // Same bucket → skip (the common per-share case within an hour).
+        assert!(!should_trim_on_bucket(Some(100), 100));
+        // Strictly-newer bucket → trim once for the boundary crossing.
+        assert!(should_trim_on_bucket(Some(100), 101));
+        // Out-of-order older share never lowers the watermark / re-trims.
+        assert!(!should_trim_on_bucket(Some(100), 7));
     }
 
     #[test]

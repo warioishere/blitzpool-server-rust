@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\"\n           FROM pplns_group\n           WHERE \"dissolvedAt\" IS NULL\n           ORDER BY \"createdAt\" ASC",
+  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\",\n            \"payoutMode\" AS \"payout_mode!\"\n           FROM pplns_group\n           WHERE \"dissolvedAt\" IS NULL\n           ORDER BY \"createdAt\" ASC",
   "describe": {
     "columns": [
       {
@@ -87,6 +87,11 @@
         "ordinal": 16,
         "name": "max_members?",
         "type_info": "Int4"
+      },
+      {
+        "ordinal": 17,
+        "name": "payout_mode!",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -109,8 +114,9 @@
       true,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "a63e83700b5c4da066032f39dcec46158d458293aceefc6a886c2a248feb6b84"
+  "hash": "371c7086e409c25c95412648a82d4f2a8152ef0b9c1d0e8276916a11a037d8e6"
 }

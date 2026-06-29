@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bp_common::{AddressId, Sats};
 use bp_db::PatchField;
-use bp_group_mgmt::group::RoundResetPreset;
+use bp_group_mgmt::group::{PayoutMode, RoundResetPreset};
 use bp_group_mgmt_engine::{
     GroupService, GroupServiceError, GroupServiceHooks, UpdateRoundResetSettings,
 };
@@ -135,6 +135,50 @@ async fn create_group_happy_path_returns_token_and_seeds_creator() {
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].role, "creator");
     assert_eq!(members[0].address.as_str(), creator.to_lowercase());
+
+    cleanup_group(&pool, result.group.id).await;
+}
+
+#[tokio::test]
+async fn create_group_defaults_to_prop_mode() {
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let hooks = TestHooks::new(1000, None);
+    let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14);
+    let name = format!("test-mode-default-{}", Uuid::new_v4());
+    let creator = format!("bc1qpropdef{}", Uuid::new_v4().simple());
+    let result = svc.create_group(&name, &creator).await.expect("create");
+    assert_eq!(result.group.payout_mode, "prop", "default is PROP");
+
+    cleanup_group(&pool, result.group.id).await;
+}
+
+#[tokio::test]
+async fn create_group_with_window_mode_persists_window() {
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let hooks = TestHooks::new(1000, None);
+    let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14);
+    let name = format!("test-mode-window-{}", Uuid::new_v4());
+    let creator = format!("bc1qwindow{}", Uuid::new_v4().simple());
+    let result = svc
+        .create_group_with_mode(&name, &creator, PayoutMode::Window)
+        .await
+        .expect("create");
+    assert_eq!(result.group.payout_mode, "window");
+
+    // Persisted: a fresh read-back from the DB also reports window. The mode
+    // has no edit path, so this is the only place it's ever set.
+    let row = svc
+        .get_group(result.group.id)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(row.payout_mode, "window");
 
     cleanup_group(&pool, result.group.id).await;
 }

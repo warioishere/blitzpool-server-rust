@@ -58,6 +58,11 @@ pub struct PplnsGroupRow {
     /// (GroupService::add_member_without_admin) across every join path.
     #[sqlx(rename = "maxMembers")]
     pub max_members: Option<i32>,
+    /// Payout mode — `"prop"` (classic per-round PROP, default) or `"window"`
+    /// (continuously-sliding time window). Chosen at creation and immutable.
+    /// Parsed via `bp_group_mgmt::group::PayoutMode::parse_or_default`.
+    #[sqlx(rename = "payoutMode")]
+    pub payout_mode: String,
 }
 
 pub async fn find_group(pool: &PgPool, id: Uuid) -> Result<Option<PplnsGroupRow>, DbError> {
@@ -80,7 +85,8 @@ pub async fn find_group(pool: &PgPool, id: Uuid) -> Result<Option<PplnsGroupRow>
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
-            "maxMembers" AS "max_members?"
+            "maxMembers" AS "max_members?",
+            "payoutMode" AS "payout_mode!"
            FROM pplns_group WHERE id = $1 LIMIT 1"#,
         id
     )
@@ -756,6 +762,7 @@ pub async fn insert_pplns_group<'e, E>(
     admin_token_hash: &str,
     active: bool,
     is_public: bool,
+    payout_mode: &str,
     now_ms: i64,
 ) -> Result<PplnsGroupRow, DbError>
 where
@@ -765,8 +772,8 @@ where
         PplnsGroupRow,
         r#"INSERT INTO pplns_group
              (id, name, "creatorAddress", "adminTokenHash", active,
-              "createdAt", "updatedAt", "isPublic")
-           VALUES ($1, $2, $3, $4, $5, $6, $6, $7)
+              "createdAt", "updatedAt", "isPublic", "payoutMode")
+           VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8)
            RETURNING
             id AS "id!",
             name AS "name!",
@@ -784,7 +791,8 @@ where
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
-            "maxMembers" AS "max_members?""#,
+            "maxMembers" AS "max_members?",
+            "payoutMode" AS "payout_mode!""#,
         id,
         name,
         creator_address.as_str(),
@@ -792,6 +800,7 @@ where
         active,
         now_ms,
         is_public,
+        payout_mode,
     )
     .fetch_one(executor)
     .await
@@ -825,7 +834,8 @@ pub async fn find_pplns_group_by_name_not_dissolved(
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
-            "maxMembers" AS "max_members?"
+            "maxMembers" AS "max_members?",
+            "payoutMode" AS "payout_mode!"
            FROM pplns_group
            WHERE name = $1 AND "dissolvedAt" IS NULL
            LIMIT 1"#,
@@ -858,7 +868,8 @@ pub async fn list_active_pplns_groups(pool: &PgPool) -> Result<Vec<PplnsGroupRow
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
-            "maxMembers" AS "max_members?"
+            "maxMembers" AS "max_members?",
+            "payoutMode" AS "payout_mode!"
            FROM pplns_group
            WHERE "dissolvedAt" IS NULL
            ORDER BY "createdAt" ASC"#,
@@ -1030,7 +1041,8 @@ pub async fn update_pplns_group_round_reset_config(
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
-            "maxMembers" AS "max_members?""#,
+            "maxMembers" AS "max_members?",
+            "payoutMode" AS "payout_mode!""#,
         group_id,
         preset_write,
         preset_clear,

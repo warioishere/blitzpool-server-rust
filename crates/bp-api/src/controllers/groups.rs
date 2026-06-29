@@ -217,6 +217,10 @@ where
 struct CreateGroupBody {
     name: String,
     creator_address: String,
+    /// Payout mode, chosen once at creation and immutable thereafter:
+    /// `"prop"` (default) or `"window"`. Absent ⇒ `"prop"`.
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -247,7 +251,15 @@ where
     M: EmailHooks + 'static,
 {
     let svc = require_group_service(&state)?;
-    let res = svc.create_group(&body.name, &body.creator_address).await?;
+    // Mode is immutable (no edit path) — validate it up front. Absent ⇒ prop.
+    let mode = match body.mode.as_deref() {
+        None => bp_group_mgmt::group::PayoutMode::Prop,
+        Some(s) => bp_group_mgmt::group::PayoutMode::parse(s)
+            .ok_or(ApiError::BadRequest("mode must be 'prop' or 'window'"))?,
+    };
+    let res = svc
+        .create_group_with_mode(&body.name, &body.creator_address, mode)
+        .await?;
     state.cache.invalidate("GROUP_LIST").await;
     state.cache.invalidate_prefix("GROUP_PUBLIC_LIST").await;
     if let Ok(addr) = AddressId::new(body.creator_address.clone()) {
@@ -936,6 +948,9 @@ struct GroupSummary {
     reset_round_on_block: bool,
     /// Hard member cap; null = no limit. UI shows `current/max` when set.
     max_members: Option<i64>,
+    /// Payout mode — `"prop"` or `"window"`. Immutable; the UI shows it
+    /// read-only in the edit form and offers it only at creation.
+    mode: String,
 }
 
 impl From<bp_db::PplnsGroupRow> for GroupSummary {
@@ -964,6 +979,7 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
             is_public: r.is_public,
             reset_round_on_block: r.reset_round_on_block,
             max_members: r.max_members.map(|v| v as i64),
+            mode: r.payout_mode,
         }
     }
 }
@@ -2178,6 +2194,7 @@ mod tests {
             is_public: false,
             reset_round_on_block: false,
             max_members: None,
+            mode: "prop".into(),
         };
         let r = CreateGroupResponse {
             summary: g,

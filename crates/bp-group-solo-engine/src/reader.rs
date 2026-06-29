@@ -15,7 +15,8 @@
 //! `PplnsGroupBlockHistoryRow` row-struct already exists in bp-db.
 
 use bp_common::AddressId;
-use bp_db::find_group_balance;
+use bp_db::{find_group, find_group_balance};
+use bp_group_mgmt::group::PayoutMode;
 use uuid::Uuid;
 
 use crate::engine::{EngineError, GroupSoloEngine};
@@ -41,13 +42,19 @@ pub struct GroupBalanceView {
 }
 
 impl ReaderView<'_> {
-    /// Snapshot of one group's PROP-round state: per-address share
-    /// contribution + totals + rejected counters.
+    /// Snapshot of one group's round state: per-address share contribution +
+    /// totals + rejected counters. Mode-aware — a `Window`-mode group's
+    /// per-address view is its trimmed sliding window, not the full history.
     pub async fn round_stats(&self, group_id: Uuid) -> Result<RoundStats, EngineError> {
+        let (mode, window_ms) = match find_group(self.engine.pool(), group_id).await? {
+            Some(g) => crate::engine::group_mode_from_row(&g),
+            None => (PayoutMode::Prop, 0),
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let stats = self
             .engine
             .round()
-            .read_round_stats(&group_id.to_string())
+            .read_round_stats_for(&group_id.to_string(), mode, now_ms, window_ms)
             .await?;
         Ok(stats)
     }
