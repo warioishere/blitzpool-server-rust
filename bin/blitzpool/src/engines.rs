@@ -751,6 +751,7 @@ mod tests {
             user_agent: Some("bitaxe/1.0"),
             is_block_candidate: false,
             hash_rate: 12345.6,
+            channel_count: 1,
             ts_ms: 1_700_000_000_000,
             share_id: "",
             mode: MiningMode::Solo,

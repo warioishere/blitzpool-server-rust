@@ -1374,11 +1374,12 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                         session_id_hex,
                         user_agent.as_deref(),
                         &accept,
-                        state
-                            .vardiff
-                            .get(&channel_id)
-                            .map(|v| v.hash_rate())
-                            .unwrap_or(0.0),
+                        // Sum every channel's vardiff hash-rate so the per-session
+                        // client row reports the whole connection's rate. For a 1:1
+                        // miner this is its single channel; for a bundled rig (one
+                        // connection, several channels) it is the rig total.
+                        state.vardiff.values().map(|v| v.hash_rate()).sum::<f64>(),
+                        state.channels.len() as u32,
                     )
                     .await;
                 if accept.is_block_candidate {
@@ -1683,6 +1684,62 @@ mod tests {
         assert_eq!(records[0].worker, "wrk");
         assert_eq!(records[0].session_id_hex, "sess-1");
         assert!(recording.blocks_submitted.lock().unwrap().is_empty());
+    }
+
+    /// Each accepted share carries the connection's open-channel count so the
+    /// persistence layer can mark a bundled rig's difficulty as aggregated. A
+    /// rental proxy bundles several same-rig devices onto ONE connection (N
+    /// channels); a direct miner has 1. The count is the live channel total,
+    /// not a constant.
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepted_share_reports_open_channel_count() {
+        use crate::mining::channel::ChannelState;
+
+        let mk_channel = |cid: u32| {
+            ChannelState::new_standard(cid, vec![0u8; 4], Difficulty(1024.0), [0xffu8; 32])
+        };
+
+        // One channel (direct miner) → count 1.
+        let recording = RecordingHooks::new();
+        let hooks = recording.clone().into_server_hooks();
+        let mut state = fresh_session_with_address();
+        state.channels.insert(1, mk_channel(1));
+        apply_session_events_generic(
+            vec![SessionEvent::ShareAccepted {
+                channel_id: 1,
+                accept: Box::new(accept()),
+            }],
+            "sess-1",
+            &state,
+            &hooks,
+        )
+        .await;
+        assert_eq!(
+            recording.accepted.lock().unwrap()[0].channel_count, 1,
+            "a single-channel connection reports 1"
+        );
+
+        // Three channels bundled on one connection → count 3.
+        let recording = RecordingHooks::new();
+        let hooks = recording.clone().into_server_hooks();
+        let mut state = fresh_session_with_address();
+        for cid in 1..=3u32 {
+            state.channels.insert(cid, mk_channel(cid));
+        }
+        apply_session_events_generic(
+            vec![SessionEvent::ShareAccepted {
+                channel_id: 1,
+                accept: Box::new(accept()),
+            }],
+            "sess-1",
+            &state,
+            &hooks,
+        )
+        .await;
+        assert_eq!(
+            recording.accepted.lock().unwrap()[0].channel_count, 3,
+            "a bundled rig reports its open-channel count"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

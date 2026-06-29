@@ -122,7 +122,12 @@ pub trait AcceptedShareSink: Send + Sync {
     /// client_entity.hashRate by the persistence sink. `user_agent` is
     /// the vendor-derived firmware string (same source as the
     /// register / device-status path), used to stamp the all-time
-    /// best-difficulty row.
+    /// best-difficulty row. `channel_count` is how many mining channels
+    /// the connection holds (`1` for a direct miner, `> 1` when a rental
+    /// proxy bundles several same-rig devices onto one connection) —
+    /// persisted to client_entity.channelCount so the UI can flag the
+    /// session's difficulty as aggregated.
+    #[allow(clippy::too_many_arguments)]
     async fn record_accepted(
         &self,
         address: &str,
@@ -131,6 +136,7 @@ pub trait AcceptedShareSink: Send + Sync {
         user_agent: Option<&str>,
         accept: &ShareAccept,
         hash_rate: f64,
+        channel_count: u32,
     );
 }
 
@@ -258,6 +264,7 @@ impl AcceptedShareSink for NoOpHooks {
         _: Option<&str>,
         _: &ShareAccept,
         _: f64,
+        _: u32,
     ) {
     }
 }
@@ -305,6 +312,7 @@ pub mod test_support {
         pub session_id_hex: String,
         pub effective_difficulty: f64,
         pub is_block_candidate: bool,
+        pub channel_count: u32,
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -405,6 +413,9 @@ pub mod test_support {
                     session_id_hex: session_id_hex.to_string(),
                     effective_difficulty: accept.effective_difficulty.as_f64(),
                     is_block_candidate: accept.is_block_candidate,
+                    // submit_block carries no channel count; the block
+                    // record only asserts the candidate path, not bundling.
+                    channel_count: 1,
                 });
         }
     }
@@ -419,6 +430,7 @@ pub mod test_support {
             _user_agent: Option<&str>,
             accept: &ShareAccept,
             _hash_rate: f64,
+            channel_count: u32,
         ) {
             self.accepted
                 .lock()
@@ -429,6 +441,7 @@ pub mod test_support {
                     session_id_hex: session_id_hex.to_string(),
                     effective_difficulty: accept.effective_difficulty.as_f64(),
                     is_block_candidate: accept.is_block_candidate,
+                    channel_count,
                 });
         }
     }
@@ -544,7 +557,7 @@ mod tests {
         let server_hooks = hooks.clone().into_server_hooks();
         server_hooks
             .accepted_sink
-            .record_accepted("addr1", "wrk", "sess-1", None, &make_accept(), 0.0)
+            .record_accepted("addr1", "wrk", "sess-1", None, &make_accept(), 0.0, 1)
             .await;
         let records = hooks.accepted.lock().unwrap();
         assert_eq!(records.len(), 1);

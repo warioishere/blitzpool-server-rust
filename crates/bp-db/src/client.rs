@@ -38,6 +38,12 @@ pub struct ClientRow {
     pub hash_rate: f64,
     #[sqlx(rename = "currentDifficulty")]
     pub current_difficulty: Option<f32>,
+    /// Number of mining channels on this session's connection. `1` for a
+    /// direct miner; `> 1` when a rental proxy bundles several same-rig
+    /// devices onto one connection — the UI flags the difficulty as
+    /// aggregated in that case.
+    #[sqlx(rename = "channelCount")]
+    pub channel_count: i32,
 }
 
 pub async fn find_client(
@@ -60,7 +66,8 @@ pub async fn find_client(
             "firstSeen" AS "first_seen?",
             "bestDifficulty" AS "best_difficulty!",
             "hashRate" AS "hash_rate!",
-            "currentDifficulty" AS "current_difficulty?"
+            "currentDifficulty" AS "current_difficulty?",
+            "channelCount" AS "channel_count!"
            FROM client_entity
            WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3 LIMIT 1"#,
         address.as_str(),
@@ -92,7 +99,8 @@ pub async fn find_clients_by_address(
             "firstSeen" AS "first_seen?",
             "bestDifficulty" AS "best_difficulty!",
             "hashRate" AS "hash_rate!",
-            "currentDifficulty" AS "current_difficulty?"
+            "currentDifficulty" AS "current_difficulty?",
+            "channelCount" AS "channel_count!"
            FROM client_entity
            WHERE address = $1 AND "deletedAt" IS NULL
            ORDER BY "clientName", "sessionId""#,
@@ -746,6 +754,7 @@ pub async fn touch_client_for_share<'e, E>(
     share_diff: f64,
     current_diff: Option<f64>,
     hash_rate_est: Option<f64>,
+    channel_count: i32,
     now_ms: i64,
 ) -> Result<u64, DbError>
 where
@@ -757,6 +766,7 @@ where
                "currentDifficulty" = COALESCE($7::real, "currentDifficulty"),
                "firstSeen"         = COALESCE("firstSeen", $5),
                "hashRate"          = COALESCE($6, "hashRate"),
+               "channelCount"      = $8,
                "updatedAt"         = $5,
                "deletedAt"         = NULL
            WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3"#,
@@ -767,6 +777,7 @@ where
         now_ms,
         hash_rate_est,
         current_diff.map(|d| d as f32),
+        channel_count,
     )
     .execute(executor)
     .await
@@ -827,6 +838,7 @@ pub async fn bulk_touch_clients_for_share(
     share_diffs: &[f32],
     current_diffs: &[Option<f32>],
     hash_rates: &[Option<f64>],
+    channel_counts: &[i32],
     updated_ats: &[i64],
 ) -> Result<u64, DbError> {
     let result = sqlx::query!(
@@ -835,6 +847,7 @@ pub async fn bulk_touch_clients_for_share(
                "currentDifficulty" = COALESCE(u.current_diff, t."currentDifficulty"),
                "firstSeen"         = COALESCE(t."firstSeen", u.updated_at),
                "hashRate"          = COALESCE(u.hash_rate, t."hashRate"),
+               "channelCount"      = u.channel_count,
                "updatedAt"         = u.updated_at,
                "deletedAt"         = NULL
            FROM (
@@ -845,7 +858,8 @@ pub async fn bulk_touch_clients_for_share(
                    unnest($4::real[])     AS share_diff,
                    unnest($5::real[])     AS current_diff,
                    unnest($6::float8[])   AS hash_rate,
-                   unnest($7::bigint[])   AS updated_at
+                   unnest($7::int[])      AS channel_count,
+                   unnest($8::bigint[])   AS updated_at
            ) AS u
            WHERE t.address      = u.address
              AND t."clientName" = u."clientName"
@@ -856,6 +870,7 @@ pub async fn bulk_touch_clients_for_share(
         share_diffs,
         current_diffs as &[Option<f32>],
         hash_rates as &[Option<f64>],
+        channel_counts,
         updated_ats,
     )
     .execute(pool)

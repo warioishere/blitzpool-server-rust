@@ -110,6 +110,14 @@ pub struct SharedAcceptedShare<'a> {
     /// render the actual hashrate the miner is contributing.
     pub hash_rate: f64,
 
+    /// Number of mining channels open on this session's downstream
+    /// connection. `1` for a direct miner (one device → one channel);
+    /// `> 1` when a rental proxy bundles several same-rig devices onto a
+    /// single connection. Persisted onto `client_entity.channelCount` so
+    /// the UI can render the per-session difficulty as "aggregated"
+    /// instead of one channel's flapping vardiff target.
+    pub channel_count: u32,
+
     /// Core wall-clock time (epoch milliseconds) at which this share was
     /// accepted, stamped **once** at the protocol-agnostic projection
     /// boundary (the SV1/SV2 adapters) via [`now_ms`]. Every downstream
@@ -228,10 +236,21 @@ pub struct SharedAcceptedShareOwned {
     pub user_agent: Option<String>,
     pub is_block_candidate: bool,
     pub hash_rate: f64,
+    /// See [`SharedAcceptedShare::channel_count`]. `serde(default)` keeps
+    /// any already-enqueued record without this field decoding to a
+    /// single-channel (non-aggregated) session.
+    #[serde(default = "one_channel")]
+    pub channel_count: u32,
     pub ts_ms: i64,
     pub share_id: String,
     pub mode: MiningMode,
     pub group_id: Option<String>,
+}
+
+/// Serde default for [`SharedAcceptedShareOwned::channel_count`] — a record
+/// without the field is a pre-bundling single-channel session.
+fn one_channel() -> u32 {
+    1
 }
 
 impl SharedAcceptedShareOwned {
@@ -248,6 +267,7 @@ impl SharedAcceptedShareOwned {
             user_agent: self.user_agent.as_deref(),
             is_block_candidate: self.is_block_candidate,
             hash_rate: self.hash_rate,
+            channel_count: self.channel_count,
             ts_ms: self.ts_ms,
             share_id: &self.share_id,
             mode: self.mode,
@@ -272,6 +292,7 @@ impl SharedAcceptedShare<'_> {
             user_agent: self.user_agent.map(str::to_string),
             is_block_candidate: self.is_block_candidate,
             hash_rate: self.hash_rate,
+            channel_count: self.channel_count,
             ts_ms: self.ts_ms,
             share_id: self.share_id.to_string(),
             mode: self.mode,
@@ -424,6 +445,7 @@ mod tests {
             submission_difficulty: 2048.0,
             is_block_candidate: false,
             hash_rate: 0.0,
+            channel_count: 1,
             ts_ms: 0,
             share_id: "",
             mode: MiningMode::Solo,
@@ -452,6 +474,7 @@ mod tests {
             submission_difficulty: 1e15,
             is_block_candidate: true,
             hash_rate: 0.0,
+            channel_count: 1,
             ts_ms: 0,
             share_id: "",
             mode: MiningMode::Solo,
@@ -471,6 +494,7 @@ mod tests {
             submission_difficulty: 2048.0,
             is_block_candidate: true,
             hash_rate: 1234.5,
+            channel_count: 3,
             ts_ms: 1_700_000_000_123,
             share_id: "ep7:42",
             mode: MiningMode::GroupSolo,
@@ -494,6 +518,7 @@ mod tests {
         assert_eq!(owned.submission_difficulty, 2048.0);
         assert!(owned.is_block_candidate);
         assert_eq!(owned.hash_rate, 1234.5);
+        assert_eq!(owned.channel_count, 3);
         assert_eq!(owned.ts_ms, 1_700_000_000_123);
         assert_eq!(owned.share_id, "ep7:42");
         assert_eq!(owned.mode, MiningMode::GroupSolo);

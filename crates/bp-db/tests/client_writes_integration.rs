@@ -276,6 +276,7 @@ async fn touch_client_for_share_updates_current_difficulty() {
         65_536.0,       // share_diff → bestDifficulty (GREATEST)
         Some(32_768.0), // current_diff → currentDifficulty
         Some(1.0e12),   // hash_rate
+        3,              // channel_count → channelCount (bundled rig)
         1_700_000_100_000,
     )
     .await
@@ -283,7 +284,7 @@ async fn touch_client_for_share_updates_current_difficulty() {
     assert_eq!(n, 1, "touch must update the matching row");
 
     let row = sqlx::query(
-        r#"SELECT "currentDifficulty", "bestDifficulty" FROM client_entity
+        r#"SELECT "currentDifficulty", "bestDifficulty", "channelCount" FROM client_entity
            WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3"#,
     )
     .bind("test_client_addr")
@@ -294,11 +295,13 @@ async fn touch_client_for_share_updates_current_difficulty() {
     .expect("read");
     let cd: Option<f32> = row.get("currentDifficulty");
     let bd: Option<f32> = row.get("bestDifficulty");
+    let cc: i32 = row.get("channelCount");
     assert!(
         cd.is_some() && (cd.unwrap() - 32_768.0).abs() < 0.01,
         "currentDifficulty must reflect the assigned vardiff target, got {cd:?}"
     );
     assert!(bd.is_some() && (bd.unwrap() - 65_536.0).abs() < 0.01);
+    assert_eq!(cc, 3, "channelCount must reflect the bundled channel count");
 
     // A follow-up touch with `None` leaves currentDifficulty unchanged.
     touch_client_for_share(
@@ -309,6 +312,7 @@ async fn touch_client_for_share_updates_current_difficulty() {
         70_000.0,
         None,
         None,
+        1,
         1_700_000_200_000,
     )
     .await
@@ -698,6 +702,7 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
     let share_diffs = vec![65_536.0_f32, 1_024.0_f32];
     let current_diffs = vec![Some(32_768.0_f32), None];
     let hash_rates = vec![Some(1.0e12_f64), None];
+    let channel_counts = vec![3_i32, 1_i32];
     let updated_ats = vec![1_700_000_000_000_i64, 1_700_000_100_000_i64];
 
     let affected = bulk_touch_clients_for_share(
@@ -708,6 +713,7 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
         &share_diffs,
         &current_diffs,
         &hash_rates,
+        &channel_counts,
         &updated_ats,
     )
     .await
@@ -716,7 +722,7 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
 
     // Row 1: Some values were applied.
     let row1 = sqlx::query(
-        r#"SELECT "currentDifficulty", "bestDifficulty", "hashRate", "updatedAt"
+        r#"SELECT "currentDifficulty", "bestDifficulty", "hashRate", "channelCount", "updatedAt"
            FROM client_entity WHERE "sessionId" = $1"#,
     )
     .bind("tBTs1")
@@ -726,6 +732,7 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
     let cd1: Option<f32> = row1.get("currentDifficulty");
     let bd1: Option<f32> = row1.get("bestDifficulty");
     let hr1: Option<f64> = row1.get("hashRate");
+    let cc1: i32 = row1.get("channelCount");
     let ua1: i64 = row1.get("updatedAt");
     assert!(
         cd1.is_some() && (cd1.unwrap() - 32_768.0).abs() < 0.01,
@@ -733,12 +740,13 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
     );
     assert!(bd1.is_some() && (bd1.unwrap() - 65_536.0).abs() < 0.01);
     assert!(hr1.is_some() && (hr1.unwrap() - 1.0e12).abs() < 1.0);
+    assert_eq!(cc1, 3, "row1 channelCount = 3 (bundled rig)");
     assert_eq!(ua1, 1_700_000_000_000);
 
     // Row 2: None values preserved the seeded zero defaults; bestDiff
     // still bumped via GREATEST.
     let row2 = sqlx::query(
-        r#"SELECT "currentDifficulty", "bestDifficulty", "hashRate", "updatedAt"
+        r#"SELECT "currentDifficulty", "bestDifficulty", "hashRate", "channelCount", "updatedAt"
            FROM client_entity WHERE "sessionId" = $1"#,
     )
     .bind("tBTs2")
@@ -748,7 +756,9 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
     let cd2: Option<f32> = row2.get("currentDifficulty");
     let bd2: Option<f32> = row2.get("bestDifficulty");
     let hr2: Option<f64> = row2.get("hashRate");
+    let cc2: i32 = row2.get("channelCount");
     let ua2: i64 = row2.get("updatedAt");
+    assert_eq!(cc2, 1, "row2 channelCount = 1 (single channel)");
     // currentDifficulty seeded was 0/null — COALESCE(NULL, t.col) keeps it as-is.
     assert!(
         cd2.is_none() || cd2.unwrap_or(0.0) == 0.0,

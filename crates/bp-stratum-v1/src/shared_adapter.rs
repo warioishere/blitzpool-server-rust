@@ -54,6 +54,8 @@ impl<S: SharedAcceptedShareSink + ?Sized> AcceptedShareSink for Sv1AcceptedShare
                 submission_difficulty: accept.submission_difficulty,
                 is_block_candidate: accept.is_block_candidate,
                 hash_rate,
+                // SV1 is one device per connection — never bundled.
+                channel_count: 1,
                 ts_ms: bp_share_hook::now_ms(),
                 // Producer-assigned downstream at the single fan-out point;
                 // the per-protocol adapter has no global share sequence and

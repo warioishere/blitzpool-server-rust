@@ -112,6 +112,7 @@ mod tests {
             user_agent: None,
             is_block_candidate: false,
             hash_rate: 0.0,
+            channel_count: 1,
             ts_ms: 0,
             share_id: "",
             mode,

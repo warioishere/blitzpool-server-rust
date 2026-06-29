@@ -152,6 +152,7 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
                 share.submission_difficulty as f32,
                 Some(share.effective_difficulty as f32),
                 hash_rate,
+                share.channel_count as i32,
                 now_ms,
             )
             .await;

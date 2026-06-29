@@ -41,6 +41,7 @@ fn share_seq(group_id: Uuid) -> Vec<SharedAcceptedShareOwned> {
             user_agent: None,
             is_block_candidate: false,
             hash_rate: 0.0,
+            channel_count: 1,
             ts_ms: 1_700_000_000_000 + i as i64,
             share_id: format!("t:{i}"),
             mode: MiningMode::GroupSolo,

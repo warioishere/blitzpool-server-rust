@@ -41,6 +41,7 @@ impl<S: SharedAcceptedShareSink + ?Sized> AcceptedShareSink for Sv2AcceptedShare
         user_agent: Option<&str>,
         accept: &ShareAccept,
         hash_rate: f64,
+        channel_count: u32,
     ) {
         self.inner
             .record_accepted(SharedAcceptedShare {
@@ -52,6 +53,7 @@ impl<S: SharedAcceptedShareSink + ?Sized> AcceptedShareSink for Sv2AcceptedShare
                 submission_difficulty: accept.submission_difficulty.as_f64(),
                 is_block_candidate: accept.is_block_candidate,
                 hash_rate,
+                channel_count,
                 ts_ms: bp_share_hook::now_ms(),
                 // Producer-assigned downstream at the single fan-out point;
                 // the per-protocol adapter has no global share sequence and
@@ -159,7 +161,7 @@ mod tests {
     use bp_jobs_lifecycle::JobClassification;
     use std::sync::Mutex;
 
-    type SharedTuple = (String, String, String, f64, f64, bool, Option<String>);
+    type SharedTuple = (String, String, String, f64, f64, bool, Option<String>, u32);
 
     struct CapturingSink {
         captured: Mutex<Vec<SharedTuple>>,
@@ -176,6 +178,7 @@ mod tests {
                 share.submission_difficulty,
                 share.is_block_candidate,
                 share.user_agent.map(str::to_string),
+                share.channel_count,
             ));
         }
     }
@@ -210,6 +213,7 @@ mod tests {
                 Some("antminer/sv2"),
                 &accept,
                 0.0,
+                4,
             )
             .await;
         let cap = inner.captured.lock().unwrap();
@@ -221,6 +225,7 @@ mod tests {
         assert_eq!(cap[0].4, 8192.0);
         assert!(!cap[0].5);
         assert_eq!(cap[0].6.as_deref(), Some("antminer/sv2"));
+        assert_eq!(cap[0].7, 4, "channel_count forwarded into shared view");
     }
 
     #[tokio::test]
@@ -231,7 +236,7 @@ mod tests {
         let adapter = Sv2AcceptedShareAdapter::new(inner.clone());
         let accept = synthetic_accept(100.0, 1e15, true);
         adapter
-            .record_accepted("a", "w", "s", None, &accept, 0.0)
+            .record_accepted("a", "w", "s", None, &accept, 0.0, 1)
             .await;
         assert!(inner.captured.lock().unwrap()[0].5);
     }
@@ -258,7 +263,7 @@ mod tests {
         let adapter = Sv2AcceptedShareAdapter::new(inner.clone());
         let accept = synthetic_accept(512.0, 8192.0, false);
         adapter
-            .record_accepted("a", "w", "s", None, &accept, 0.0)
+            .record_accepted("a", "w", "s", None, &accept, 0.0, 1)
             .await;
         let after = bp_share_hook::now_ms();
 

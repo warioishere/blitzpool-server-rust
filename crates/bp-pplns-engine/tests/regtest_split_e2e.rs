@@ -63,6 +63,7 @@ fn mk_share(share_id: &str, address: &str, diff: f64) -> SharedAcceptedShareOwne
         user_agent: None,
         is_block_candidate: false,
         hash_rate: 0.0,
+        channel_count: 1,
         ts_ms: 1_700_000_000_000,
         share_id: share_id.to_string(),
         mode: MiningMode::Pplns,

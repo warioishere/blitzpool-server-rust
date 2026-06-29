@@ -142,7 +142,8 @@ CREATE TABLE public.client_entity (
     "firstSeen" bigint,
     "bestDifficulty" real DEFAULT '0'::real NOT NULL,
     "hashRate" double precision DEFAULT '0'::double precision NOT NULL,
-    "currentDifficulty" real
+    "currentDifficulty" real,
+    "channelCount" integer DEFAULT 1 NOT NULL
 );
 
 

@@ -322,6 +322,10 @@ struct WorkerEntry {
     hash_rate: f64,
     #[serde(serialize_with = "crate::time_range::ser_opt_f64_jsnum")]
     current_difficulty: Option<f64>,
+    /// Mining channels on this worker's connection. `> 1` means a rental
+    /// proxy bundled several same-rig devices onto one connection, so the
+    /// UI renders the difficulty as aggregated instead of a single value.
+    channel_count: i32,
     start_time: String,
     last_seen: String,
 }
@@ -358,6 +362,7 @@ where
                         best_difficulty: format!("{:.2}", c.best_difficulty as f64),
                         hash_rate: c.hash_rate,
                         current_difficulty: c.current_difficulty.map(|d| d as f64),
+                        channel_count: c.channel_count,
                         start_time: crate::time_range::format_slot_label(c.start_time),
                         last_seen: crate::time_range::format_slot_label(c.updated_at),
                     })

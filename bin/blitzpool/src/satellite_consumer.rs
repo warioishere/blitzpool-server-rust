@@ -198,6 +198,7 @@ mod tests {
             user_agent: None,
             is_block_candidate: false,
             hash_rate: 1.0,
+            channel_count: 1,
             ts_ms: 1_700_000_000_000,
             share_id: share_id.into(),
             mode: MiningMode::Pplns,

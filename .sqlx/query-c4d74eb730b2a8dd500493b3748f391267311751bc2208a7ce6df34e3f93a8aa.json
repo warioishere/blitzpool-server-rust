@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"userAgent\" AS \"user_agent?\",\n            \"startTime\" AS \"start_time!\",\n            \"firstSeen\" AS \"first_seen?\",\n            \"bestDifficulty\" AS \"best_difficulty!\",\n            \"hashRate\" AS \"hash_rate!\",\n            \"currentDifficulty\" AS \"current_difficulty?\"\n           FROM client_entity\n           WHERE address = $1 AND \"deletedAt\" IS NULL\n           ORDER BY \"clientName\", \"sessionId\"",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"userAgent\" AS \"user_agent?\",\n            \"startTime\" AS \"start_time!\",\n            \"firstSeen\" AS \"first_seen?\",\n            \"bestDifficulty\" AS \"best_difficulty!\",\n            \"hashRate\" AS \"hash_rate!\",\n            \"currentDifficulty\" AS \"current_difficulty?\",\n            \"channelCount\" AS \"channel_count!\"\n           FROM client_entity\n           WHERE address = $1 AND \"deletedAt\" IS NULL\n           ORDER BY \"clientName\", \"sessionId\"",
   "describe": {
     "columns": [
       {
@@ -62,6 +62,11 @@
         "ordinal": 11,
         "name": "current_difficulty?",
         "type_info": "Float4"
+      },
+      {
+        "ordinal": 12,
+        "name": "channel_count!",
+        "type_info": "Int4"
       }
     ],
     "parameters": {
@@ -81,8 +86,9 @@
       true,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "66a3e5678a1248bbac1cca1e2b33198e80686bf58d040769f95c3c4ba03ebff7"
+  "hash": "c4d74eb730b2a8dd500493b3748f391267311751bc2208a7ce6df34e3f93a8aa"
 }
