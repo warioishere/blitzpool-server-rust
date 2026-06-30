@@ -64,13 +64,16 @@ pub const VARDIFF_DIFFICULTY_1: f64 = 4_294_967_296.0;
 /// here rather than imported from `bp-stats`.
 pub const VARDIFF_SLOT_DURATION_MS: u64 = 600_000;
 
-/// Minimum samples before the retarget math is allowed to fire. Below
-/// the threshold, the engine either waits or — past the warmup window —
-/// emits a fallback target derived from `clientDifficulty / target`.
+/// Minimum samples before the full cache-rate retarget math is allowed to
+/// fire. Below the threshold, the engine waits during warmup, then — past the
+/// warmup window — retargets from the measured hashrate (the under-sampled
+/// path in [`VarDiffEngine::suggested_difficulty`]).
 pub const VARDIFF_SAMPLE_THRESHOLD: usize = 5;
 
 /// Initial warmup period during which under-sampled sessions are NOT
-/// retargeted (return `None`). After this, the fallback formula kicks in.
+/// retargeted (return `None`). After this, an under-sampled session retargets
+/// from its measured hashrate (once it has one) instead of waiting for a full
+/// sample window.
 pub const VARDIFF_WARMUP_MS: u64 = 60_000;
 
 /// Default `target_shares_per_minute` fallback for misconfigured ports.
@@ -210,7 +213,6 @@ pub struct VarDiffEngine<C: Clock> {
     clock: C,
 
     // Config
-    target_shares_per_minute: f64,
     target_submission_per_second: f64,
     min_difficulty: f64,
 
@@ -246,7 +248,6 @@ impl<C: Clock> VarDiffEngine<C> {
         let now = clock.now_ms();
         Self {
             clock,
-            target_shares_per_minute: target,
             target_submission_per_second: 60.0 / target,
             min_difficulty,
             submission_cache_start_ms: now,
@@ -344,8 +345,9 @@ impl<C: Clock> VarDiffEngine<C> {
     /// Compute the suggested next session difficulty given the miner's
     /// current diff. Returns:
     ///
-    /// - `None` — no retarget recommended (insufficient samples + still
-    ///   in warmup OR samples present but already inside the 2× clamp).
+    /// - `None` — no retarget recommended (still in warmup, or under-sampled
+    ///   with no measured hashrate yet, or samples present but inside the 2×
+    ///   clamp).
     /// - `Some(diff)` — a freshly-rounded power-of-2 target. Always
     ///   ≥ [`min_difficulty`]; never NaN / Infinity.
     ///
@@ -353,12 +355,25 @@ impl<C: Clock> VarDiffEngine<C> {
     /// at `min_difficulty`).
     pub fn suggested_difficulty(&self, client_difficulty: f64) -> Option<f64> {
         if self.submission_cache.len() < VARDIFF_SAMPLE_THRESHOLD {
-            // Under-sampled: only retarget once the warmup window
-            // has elapsed, in which case use the rough-fallback formula.
+            // Under-sampled: hold during warmup, then retarget from the miner's
+            // MEASURED hashrate. The earlier heuristic divided the *current*
+            // diff by `target_shares_per_minute` on every call — a value
+            // independent of the actual rate — so a miner that stayed
+            // under-sampled (one device per channel after the per-channel
+            // vardiff split sees only its own ~⅓ of the shares) compounded it
+            // down geometrically into a runaway to the floor. The
+            // hashrate-derived target is the same rate→difficulty conversion
+            // the fully-sampled path uses, so it converges to the miner's real
+            // equilibrium in one step and does NOT depend on `client_difficulty`
+            // — repeated calls can't compound. Needs ≥1 measured rate (≥2
+            // shares); until then there is nothing to estimate from, so wait.
             let now = self.clock.now_ms();
-            if now.saturating_sub(self.submission_cache_start_ms) > VARDIFF_WARMUP_MS {
-                return self
-                    .nearest_difficulty_step(client_difficulty / self.target_shares_per_minute);
+            if now.saturating_sub(self.submission_cache_start_ms) > VARDIFF_WARMUP_MS
+                && self.hash_rate > 0.0
+            {
+                let target =
+                    self.hash_rate * self.target_submission_per_second / VARDIFF_DIFFICULTY_1;
+                return self.nearest_difficulty_step(target);
             }
             return None;
         }
@@ -515,12 +530,13 @@ mod tests {
 
     #[test]
     fn invalid_target_shares_per_minute_falls_back_to_default() {
+        // Default 6 shares/min → target_submission_per_second = 60/6 = 10.
         let e1 = VarDiffEngine::new(TestClock::new(0), 0.0, 0.00001);
-        assert_eq!(e1.target_shares_per_minute, 6.0);
+        assert_eq!(e1.target_submission_per_second, 10.0);
         let e2 = VarDiffEngine::new(TestClock::new(0), -5.0, 0.00001);
-        assert_eq!(e2.target_shares_per_minute, 6.0);
+        assert_eq!(e2.target_submission_per_second, 10.0);
         let e3 = VarDiffEngine::new(TestClock::new(0), f64::NAN, 0.00001);
-        assert_eq!(e3.target_shares_per_minute, 6.0);
+        assert_eq!(e3.target_submission_per_second, 10.0);
     }
 
     #[test]
@@ -619,18 +635,49 @@ mod tests {
     }
 
     #[test]
-    fn under_sampled_past_warmup_returns_fallback_step() {
-        let clock = TestClock::new(1_000);
+    fn under_sampled_past_warmup_without_measured_hashrate_waits() {
+        let clock = TestClock::new(0);
         let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        // 1 sample, then jump past warmup.
+        // A single share never establishes a hashrate (the slot baseline needs
+        // a second share to span time), so there is nothing to retarget from
+        // even past warmup — wait rather than guess.
         e.update_hash_rate(1024.0, true);
         clock.advance_ms(VARDIFF_WARMUP_MS + 1_000);
-        // Fallback: nearest_difficulty_step(clientDiff / target) =
-        // step(16384 / 6) ≈ step(2730.67). 2048 < 2730.67 < 3072 (middle)
-        // < 4096. Distance to 2048 = 682, to 3072 = 341, to 4096 = 1365.
-        // → returns 3072.
-        let suggested = e.suggested_difficulty(16384.0).unwrap();
-        assert_eq!(suggested, 3072.0);
+        assert!(e.suggested_difficulty(16384.0).is_none());
+    }
+
+    #[test]
+    fn under_sampled_past_warmup_retargets_from_measured_hashrate_not_current_diff() {
+        // Regression: the old under-sampled fallback was `client_difficulty /
+        // target_shares_per_minute`, applied on EVERY retarget call. A miner
+        // that stayed under-sampled (one device per channel after the
+        // per-channel vardiff split) had its diff divided by the constant each
+        // share → a geometric runaway to the floor. The fix retargets from the
+        // measured hashrate, independent of the current diff, so it converges
+        // in one step and repeated calls cannot compound.
+        let clock = TestClock::new(0);
+        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001); // target/min => tsps = 10
+        // 2 shares at diff 1000, 20s apart → hashrate = 2000 * 2^32 / 20s.
+        // target = hashrate * tsps / 2^32 = (2000/20) * 10 = 1000 → step 1024.
+        e.update_hash_rate(1000.0, true);
+        clock.advance_ms(20_000);
+        e.update_hash_rate(1000.0, true);
+        // Still under-sampled (2 < 5 cache entries); jump past warmup.
+        assert!(e.cache_len() < VARDIFF_SAMPLE_THRESHOLD);
+        clock.advance_ms(VARDIFF_WARMUP_MS);
+
+        let expected = 1024.0;
+        // The result is derived from the measured rate, NOT the current diff:
+        // wildly different `client_difficulty` inputs all yield the SAME target
+        // — so calling it repeatedly (the per-share inline retarget) can never
+        // ratchet the diff down step by step.
+        for client in [16384.0, 1000.0, 1.0, 0.001] {
+            assert_eq!(
+                e.suggested_difficulty(client),
+                Some(expected),
+                "under-sampled retarget must track the hashrate, not client_difficulty={client}"
+            );
+        }
     }
 
     // ── suggested_difficulty: 2× clamp ────────────────────────────────
