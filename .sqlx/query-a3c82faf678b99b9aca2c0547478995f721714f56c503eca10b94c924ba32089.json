@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT \"time\" AS \"time!\", address AS \"address!\", \"clientName\" AS \"client_name!\"\n             FROM client_statistics_entity\n            WHERE \"deletedAt\" IS NULL AND \"time\" >= $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "time!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "address!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "client_name!",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a3c82faf678b99b9aca2c0547478995f721714f56c503eca10b94c924ba32089"
+}

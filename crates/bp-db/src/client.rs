@@ -204,6 +204,38 @@ pub async fn find_client_statistics_since(
     .map_err(DbError::from)
 }
 
+/// Minimal projection for `/api/info/workers`: only the slot time + identity
+/// columns needed to count DISTINCT addresses / (address, worker) per slot.
+/// Selecting three columns instead of the full 17-column stats row cuts the
+/// transferred payload ~4× for the same row set, and there's no `ORDER BY`
+/// (the caller buckets into a map, order is irrelevant) so PG skips a sort.
+#[derive(Clone, Debug, FromRow)]
+pub struct PoolWorkerRow {
+    pub time: i64,
+    pub address: String,
+    #[sqlx(rename = "clientName")]
+    pub client_name: String,
+}
+
+pub async fn find_pool_worker_rows_since<'e, E>(
+    executor: E,
+    since_ms: i64,
+) -> Result<Vec<PoolWorkerRow>, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as!(
+        PoolWorkerRow,
+        r#"SELECT "time" AS "time!", address AS "address!", "clientName" AS "client_name!"
+             FROM client_statistics_entity
+            WHERE "deletedAt" IS NULL AND "time" >= $1"#,
+        since_ms,
+    )
+    .fetch_all(executor)
+    .await
+    .map_err(DbError::from)
+}
+
 /// Same as [`find_client_statistics_since`] but restricted to one
 /// address. Drives `/api/client/:address/chart`, `/api/client/:address/
 /// workers`, `/api/client/:address/accepted`.

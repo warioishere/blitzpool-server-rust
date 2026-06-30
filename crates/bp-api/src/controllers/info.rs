@@ -1048,7 +1048,10 @@ where
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Workers, async move {
             let since = crate::time_range::now_ms() - range.window_ms();
-            let rows = bp_db::find_client_statistics_since(&s.pool, since).await?;
+            // Skinny projection (slot time + address + worker only) — the
+            // distinct counting stays in-process; we just avoid shipping the
+            // full 17-column stats row for every session in the window.
+            let rows = bp_db::find_pool_worker_rows_since(&s.pool, since).await?;
             let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
             let mut addresses_by_slot: BTreeMap<i64, std::collections::HashSet<String>> =
                 BTreeMap::new();
@@ -1059,11 +1062,11 @@ where
                 addresses_by_slot
                     .entry(k)
                     .or_default()
-                    .insert(r.address.as_str().to_string());
+                    .insert(r.address.clone());
                 workers_by_slot
                     .entry(k)
                     .or_default()
-                    .insert((r.address.as_str().to_string(), r.client_name.clone()));
+                    .insert((r.address.clone(), r.client_name.clone()));
             }
             Ok(SlotDataResponse {
                 slot_data: boundaries

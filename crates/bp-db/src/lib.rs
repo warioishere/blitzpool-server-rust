@@ -87,11 +87,11 @@ pub use client::{
     find_client_difficulty_statistics, find_client_recent_first_seen,
     find_client_rejected_statistics, find_client_rejected_statistics_since_for_address,
     find_client_statistics, find_client_statistics_since, find_client_statistics_since_for_address,
-    find_clients_by_address, find_user_agents, find_worker_shares, kill_dead_clients,
-    sum_active_pool_hashrate, sum_hashrate_for_addresses, touch_client_for_share,
+    find_clients_by_address, find_pool_worker_rows_since, find_user_agents, find_worker_shares,
+    kill_dead_clients, sum_active_pool_hashrate, sum_hashrate_for_addresses, touch_client_for_share,
     update_sv2_user_agent_by_address, upsert_address_best_difficulty, upsert_client,
     upsert_client_difficulty_statistic, ClientDifficultyStatisticsRow, ClientRejectedStatisticsRow,
-    ClientRow, ClientStatisticsRow, ClientUpsert, UserAgentAggRow, WorkerSharesRow,
+    ClientRow, ClientStatisticsRow, ClientUpsert, PoolWorkerRow, UserAgentAggRow, WorkerSharesRow,
 };
 pub use email::{
     delete_email_verification_by_token, delete_email_verifications_for_address,
