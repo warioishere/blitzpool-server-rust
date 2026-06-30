@@ -1079,3 +1079,76 @@ async fn window_mode_record_path_trims_aged_buckets() {
 
     drop_harness(h).await;
 }
+
+// ── Window mode — growing the window invalidates the stale mode cache ──
+//
+// Regression for the record-path trim using a STALE cached window length after
+// a window-length GROW. With a 1-day window the engine caches window_ms=1d on
+// the first share. If the operator then grows the window (preset → monthly =
+// 30d), the cached 1d length would make the next share's record-path trim
+// (which DELETES buckets) drop a 25h-old bucket that the 30d window must keep —
+// and the read path can't resurrect a deleted bucket. `invalidate_mode_cache`
+// (called by the API on every settings edit) drops the stale entry so the next
+// share re-reads 30d and keeps the bucket. This test drives that fix path.
+#[tokio::test]
+async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
+    let h = match spawn_or_skip(10, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    // Window mode, no preset → 1-day window (see the trim test above).
+    sqlx::query(r#"UPDATE pplns_group SET "payoutMode" = 'window' WHERE id = $1"#)
+        .bind(h.group_id)
+        .execute(&h.pool)
+        .await
+        .expect("set window mode");
+
+    let bkt = 3_600_000_i64; // 1h, matches WINDOW_BUCKET_MS
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    // 25h ago: outside the 1-day window, well inside a 30-day window.
+    let t_mid = now - 25 * bkt;
+
+    // First share caches window_ms = 1 day. Its own record-path trim uses its
+    // own (older) timestamp as "now", so it does not drop itself.
+    h.engine
+        .record_share(None, h.group_id, "bc1qmid", 40.0, t_mid)
+        .await
+        .expect("record 25h-old share");
+
+    // Operator grows the window: monthly preset ⇒ 30-day window.
+    sqlx::query(r#"UPDATE pplns_group SET "roundResetPreset" = 'monthly' WHERE id = $1"#)
+        .bind(h.group_id)
+        .execute(&h.pool)
+        .await
+        .expect("grow window to monthly");
+    // The API fires this on every settings edit; here we call it directly. With
+    // it, the next share re-reads 30d; WITHOUT it, the stale 1d would over-trim.
+    h.engine.invalidate_mode_cache(h.group_id);
+
+    // Fresh share crosses a bucket boundary → its record-path trim fires. With
+    // the cache invalidated it trims against the 30-day window and keeps bc1qmid.
+    h.engine
+        .record_share(None, h.group_id, "bc1qnew", 60.0, now)
+        .await
+        .expect("record fresh share");
+
+    let stats = h
+        .engine
+        .reader()
+        .round_stats(h.group_id)
+        .await
+        .expect("round stats");
+    assert!(
+        (stats.per_address.get("bc1qmid").copied().unwrap_or(0.0) - 40.0).abs() < 1e-9,
+        "25h-old share kept after window grew to 30 days (stale 1d cache invalidated)"
+    );
+    assert!(
+        (stats.per_address.get("bc1qnew").copied().unwrap_or(0.0) - 60.0).abs() < 1e-9,
+        "fresh share present in the window"
+    );
+
+    drop_harness(h).await;
+}

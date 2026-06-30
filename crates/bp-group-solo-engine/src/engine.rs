@@ -158,6 +158,20 @@ fn should_trim_on_bucket(watermark: Option<i64>, bucket_id: i64) -> bool {
     }
 }
 
+/// `(PayoutMode, window_ms)` to use when the per-share mode lookup hits a DB
+/// error. The mode is immutable, so a cached entry — even an expired one —
+/// still carries the correct mode; reusing it keeps a `Window` group's shares
+/// flowing into the window aggregate during a transient DB blip instead of
+/// silently misrouting them to the PROP keys (where the window read never sees
+/// them). `Prop` is only the cold fallback for a group never resolved. Pure so
+/// the "never misroute on a transient error" rule is unit-testable.
+fn mode_on_lookup_error(cached: Option<CachedGroupMode>) -> (PayoutMode, i64) {
+    match cached {
+        Some(c) => (c.mode, c.window_ms),
+        None => (PayoutMode::Prop, 0),
+    }
+}
+
 /// Derive `(PayoutMode, window_ms)` from a group row. `window_ms` reinterprets
 /// the reset-cadence config as a sliding-window length (see
 /// [`bp_group_mgmt::group::window_duration_ms`]); it is 0 for PROP groups.
@@ -349,26 +363,39 @@ impl GroupSoloEngine {
     }
 
     /// Resolve a group's `(PayoutMode, window_ms)`, caching the result for the
-    /// hot share path. A cache miss reads the `pplns_group` row once; a DB
-    /// error falls back to PROP **without** caching (so a transient failure
-    /// doesn't pin a group to the wrong mode). The mode is immutable, so a
-    /// cached entry is only ever refreshed to pick up a window-length edit.
+    /// hot share path. A cache miss reads the `pplns_group` row once. On a DB
+    /// error we fall back to the last cached entry **even if expired** — the
+    /// mode is immutable so its mode is still correct, and a stale `window_ms`
+    /// only over-/under-trims on the record path (the read path always re-trims
+    /// with a fresh `window_ms`, so payouts are unaffected). Routing a Window
+    /// group's shares to the PROP keys during a DB blip would instead drop them
+    /// from the window aggregate for good, so PROP is only the cold fallback for
+    /// a group we have never resolved. Neither error fallback is cached.
     async fn resolve_group_mode(&self, group_id: Uuid) -> (PayoutMode, i64) {
-        {
+        let cached = {
             let cache = self.inner.mode_cache.lock().expect("mode_cache poisoned");
-            if let Some(c) = cache.get(&group_id) {
-                if c.expires_at > Instant::now() {
-                    return (c.mode, c.window_ms);
-                }
+            cache.get(&group_id).copied()
+        };
+        if let Some(c) = cached {
+            if c.expires_at > Instant::now() {
+                return (c.mode, c.window_ms);
             }
         }
         let (mode, window_ms) = match find_group(&self.inner.pool, group_id).await {
             Ok(Some(g)) => group_mode_from_row(&g),
             Ok(None) => (PayoutMode::Prop, 0),
             Err(e) => {
-                warn!(%group_id, error = %e,
-                    "group payout-mode lookup failed — defaulting to PROP (not cached)");
-                return (PayoutMode::Prop, 0);
+                // Prefer the last-known (immutable) mode over PROP so a transient
+                // DB error can't misroute a Window group's shares into the PROP
+                // aggregate, where they'd be invisible to the window payout.
+                if cached.is_some() {
+                    warn!(%group_id, error = %e,
+                        "group payout-mode lookup failed — reusing last-known mode (not re-cached)");
+                } else {
+                    warn!(%group_id, error = %e,
+                        "group payout-mode lookup failed and no cached mode — defaulting to PROP");
+                }
+                return mode_on_lookup_error(cached);
             }
         };
         self.inner
@@ -384,6 +411,22 @@ impl GroupSoloEngine {
                 },
             );
         (mode, window_ms)
+    }
+
+    /// Drop the cached `(PayoutMode, window_ms)` for a group so the next share
+    /// re-reads it from Postgres. Call this after a settings edit that changes
+    /// the round-reset cadence: the cadence is reinterpreted as the window
+    /// length, so a stale cache would keep the record-path trim using the OLD
+    /// length for up to [`MODE_CACHE_TTL`]. On a window *grow* that stale-small
+    /// length would over-trim and permanently drop a bucket the new (larger)
+    /// window should keep, so we invalidate eagerly. (The mode itself is
+    /// immutable; only the window length can move.)
+    pub fn invalidate_mode_cache(&self, group_id: Uuid) {
+        self.inner
+            .mode_cache
+            .lock()
+            .expect("mode_cache poisoned")
+            .remove(&group_id);
     }
 
     /// Record-path trim gate for a windowed share: returns `true` (and bumps
@@ -1001,6 +1044,30 @@ mod tests {
         assert!(should_trim_on_bucket(Some(100), 101));
         // Out-of-order older share never lowers the watermark / re-trims.
         assert!(!should_trim_on_bucket(Some(100), 7));
+    }
+
+    #[test]
+    fn lookup_error_reuses_cached_mode_never_misroutes_window() {
+        // No cached entry → cold fallback is PROP (legacy default).
+        assert_eq!(mode_on_lookup_error(None), (PayoutMode::Prop, 0));
+        // A cached Window entry (even expired) is reused on a DB error, so the
+        // group's shares keep flowing into the window — NOT the PROP keys.
+        let win = CachedGroupMode {
+            mode: PayoutMode::Window,
+            window_ms: 7 * 24 * 60 * 60 * 1000,
+            expires_at: Instant::now(),
+        };
+        assert_eq!(
+            mode_on_lookup_error(Some(win)),
+            (PayoutMode::Window, 7 * 24 * 60 * 60 * 1000)
+        );
+        // A cached PROP entry resolves to PROP, as expected.
+        let prop = CachedGroupMode {
+            mode: PayoutMode::Prop,
+            window_ms: 0,
+            expires_at: Instant::now(),
+        };
+        assert_eq!(mode_on_lookup_error(Some(prop)), (PayoutMode::Prop, 0));
     }
 
     #[test]

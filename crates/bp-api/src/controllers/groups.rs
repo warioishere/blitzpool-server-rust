@@ -193,6 +193,13 @@ where
         let full = format!("{prefix}{id_str}");
         state.cache.invalidate_prefix(&full).await;
     }
+    // The round-reset cadence doubles as the Window payout length; drop the
+    // engine's per-share mode cache so an edit takes effect immediately instead
+    // of letting the record-path trim run on the stale (possibly smaller)
+    // window length for up to its TTL.
+    if let Some(engine) = state.group_solo.as_ref() {
+        engine.invalidate_mode_cache(id);
+    }
 }
 
 /// Drop the address-keyed group entries for the supplied address.
