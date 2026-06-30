@@ -204,45 +204,6 @@ pub async fn find_client_statistics_since(
     .map_err(DbError::from)
 }
 
-/// Per-slot DISTINCT-address and DISTINCT-(address, worker) counts from
-/// `client_statistics_entity` since `since_ms`, aggregated in SQL. Drives
-/// `/api/info/workers`. The per-session rows are stored slot-end-aligned, so
-/// grouping by the snapped slot key `(time / slot) * slot` returns one row per
-/// 10-min slot whose key matches the chart boundaries the caller fills —
-/// replacing a full per-session row load (hundreds of thousands of rows) with
-/// a handful of pre-counted slots, and doing the DISTINCT counting in PG.
-#[derive(Clone, Debug, FromRow)]
-pub struct PoolWorkerSlotCount {
-    pub slot: i64,
-    pub addresses: i64,
-    pub workers: i64,
-}
-
-pub async fn count_pool_workers_by_slot<'e, E>(
-    executor: E,
-    since_ms: i64,
-    slot_size_ms: i64,
-) -> Result<Vec<PoolWorkerSlotCount>, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    sqlx::query_as!(
-        PoolWorkerSlotCount,
-        r#"SELECT
-              ("time" / $2) * $2 AS "slot!",
-              COUNT(DISTINCT address) AS "addresses!",
-              COUNT(DISTINCT (address, "clientName")) AS "workers!"
-           FROM client_statistics_entity
-           WHERE "deletedAt" IS NULL AND "time" >= $1
-           GROUP BY ("time" / $2) * $2"#,
-        since_ms,
-        slot_size_ms,
-    )
-    .fetch_all(executor)
-    .await
-    .map_err(DbError::from)
-}
-
 /// Same as [`find_client_statistics_since`] but restricted to one
 /// address. Drives `/api/client/:address/chart`, `/api/client/:address/
 /// workers`, `/api/client/:address/accepted`.
