@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE pplns_group\n           SET\n             \"roundResetPreset\"       = CASE WHEN $2  THEN (CASE WHEN $3  THEN NULL::varchar  ELSE $4::varchar  END) ELSE \"roundResetPreset\"       END,\n             \"roundResetIntervalDays\" = CASE WHEN $5  THEN (CASE WHEN $6  THEN NULL::int      ELSE $7::int      END) ELSE \"roundResetIntervalDays\" END,\n             \"roundResetTimezone\"     = CASE WHEN $8  THEN (CASE WHEN $9  THEN NULL::varchar  ELSE $10::varchar END) ELSE \"roundResetTimezone\"     END,\n             \"roundResetHourLocal\"    = CASE WHEN $11 THEN (CASE WHEN $12 THEN NULL::int      ELSE $13::int     END) ELSE \"roundResetHourLocal\"    END,\n             \"finderBonusSats\"        = CASE WHEN $14 THEN (CASE WHEN $15 THEN NULL::bigint   ELSE $16::bigint  END) ELSE \"finderBonusSats\"        END,\n             \"isPublic\"               = CASE WHEN $17 THEN $18 ELSE \"isPublic\" END,\n             \"resetRoundOnBlock\"      = CASE WHEN $19 THEN $20 ELSE \"resetRoundOnBlock\" END,\n             \"maxMembers\"             = CASE WHEN $21 THEN (CASE WHEN $22 THEN NULL::int ELSE $23::int END) ELSE \"maxMembers\" END,\n             \"updatedAt\"              = $24\n           WHERE id = $1\n           RETURNING\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\"",
+  "query": "UPDATE pplns_group\n           SET\n             \"roundResetPreset\"       = CASE WHEN $2  THEN (CASE WHEN $3  THEN NULL::varchar  ELSE $4::varchar  END) ELSE \"roundResetPreset\"       END,\n             \"roundResetIntervalDays\" = CASE WHEN $5  THEN (CASE WHEN $6  THEN NULL::int      ELSE $7::int      END) ELSE \"roundResetIntervalDays\" END,\n             \"roundResetTimezone\"     = CASE WHEN $8  THEN (CASE WHEN $9  THEN NULL::varchar  ELSE $10::varchar END) ELSE \"roundResetTimezone\"     END,\n             \"roundResetHourLocal\"    = CASE WHEN $11 THEN (CASE WHEN $12 THEN NULL::int      ELSE $13::int     END) ELSE \"roundResetHourLocal\"    END,\n             \"finderBonusSats\"        = CASE WHEN $14 THEN (CASE WHEN $15 THEN NULL::bigint   ELSE $16::bigint  END) ELSE \"finderBonusSats\"        END,\n             \"isPublic\"               = CASE WHEN $17 THEN $18 ELSE \"isPublic\" END,\n             \"resetRoundOnBlock\"      = CASE WHEN $19 THEN $20 ELSE \"resetRoundOnBlock\" END,\n             \"maxMembers\"             = CASE WHEN $21 THEN (CASE WHEN $22 THEN NULL::int ELSE $23::int END) ELSE \"maxMembers\" END,\n             \"updatedAt\"              = $24\n           WHERE id = $1\n           RETURNING\n            id AS \"id!\",\n            name AS \"name!\",\n            \"creatorAddress\" AS \"creator_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            active AS \"active!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"roundResetIntervalDays\" AS \"round_reset_interval_days?\",\n            \"roundResetHourLocal\" AS \"round_reset_hour_local?\",\n            \"roundResetTimezone\" AS \"round_reset_timezone?\",\n            \"lastRoundResetAt\" AS \"last_round_reset_at?\",\n            \"finderBonusSats\" AS \"finder_bonus_sats?: Sats\",\n            \"roundResetPreset\" AS \"round_reset_preset?\",\n            \"isPublic\" AS \"is_public!\",\n            \"resetRoundOnBlock\" AS \"reset_round_on_block!\",\n            \"maxMembers\" AS \"max_members?\",\n            \"payoutMode\" AS \"payout_mode!\"",
   "describe": {
     "columns": [
       {
@@ -87,6 +87,11 @@
         "ordinal": 16,
         "name": "max_members?",
         "type_info": "Int4"
+      },
+      {
+        "ordinal": 17,
+        "name": "payout_mode!",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -134,8 +139,9 @@
       true,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "db12b9417bc4c65d90695398691f851f48e8944c09595a1baf29411b5c4a2520"
+  "hash": "7a2814800b266a5d912a99b5b930be46b4cdebfc124900223b16e67cbc247299"
 }

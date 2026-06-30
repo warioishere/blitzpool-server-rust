@@ -11,9 +11,11 @@
 //! kept unique per test so within-DB tests don't interfere either.
 
 use bp_common::{AddressId, Sats};
+use bp_group_mgmt::group::PayoutMode;
 use bp_group_solo_engine::round::{
     key_applied, key_best_share, key_by_address, key_counter, key_last_accepted_share_at,
-    key_rejected_shares, key_total, snapshot, GroupRoundStore,
+    key_rejected_shares, key_total, key_window_buckets, snapshot, GroupRoundStore,
+    WINDOW_BUCKET_MS,
 };
 use bp_pplns::CoinbaseDistributionEntry;
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
@@ -510,4 +512,191 @@ async fn record_share_is_idempotent_per_share_id() {
         (by - 200.0).abs() < 1e-9,
         "by-address must also exclude the dup"
     );
+}
+
+// ── Test 13 — windowed record aggregates into time buckets ──────────
+//
+// `record_share_windowed` aggregates per (time-bucket, address) and keeps the
+// `window:by-address` aggregate + the `wbuckets` index lock-step. Two shares
+// for the same address in the same hour bucket sum; a share in a later bucket
+// registers a second bucket id.
+#[tokio::test]
+async fn windowed_record_aggregates_into_buckets() {
+    let conn = match connect_or_skip(12).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let group = "g_win_record";
+    let bkt = WINDOW_BUCKET_MS;
+    // Two shares for foo in bucket 100, one for bar in bucket 102.
+    store
+        .record_share_windowed(None, group, "bc1qfoo", 30.0, 100 * bkt)
+        .await
+        .expect("ok");
+    store
+        .record_share_windowed(None, group, "bc1qfoo", 20.0, 100 * bkt + 5)
+        .await
+        .expect("ok");
+    store
+        .record_share_windowed(None, group, "bc1qbar", 70.0, 102 * bkt)
+        .await
+        .expect("ok");
+
+    let agg = store.read_window_by_address(group).await.unwrap();
+    assert!((agg["bc1qfoo"] - 50.0).abs() < 1e-9, "foo summed in-bucket");
+    assert!((agg["bc1qbar"] - 70.0).abs() < 1e-9);
+
+    // Two distinct time buckets registered in the index zset.
+    let mut conn = conn;
+    let buckets: Vec<i64> = conn.zrange(key_window_buckets(group), 0, -1).await.unwrap();
+    assert_eq!(buckets, vec![100, 102], "FIFO-ordered bucket ids");
+}
+
+// ── Test 14 — trim_window drops aged-out buckets ────────────────────
+//
+// Buckets older than `window_ms` relative to `now_ms` are dropped, and the
+// `window:by-address` aggregate is decremented by exactly the dropped bucket's
+// per-address contribution (hDel-ing addresses that hit zero).
+#[tokio::test]
+async fn windowed_trim_drops_aged_buckets() {
+    let conn = match connect_or_skip(13).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let group = "g_win_trim";
+    let bkt = WINDOW_BUCKET_MS;
+    // Old share in bucket 0, fresh share in bucket 5.
+    store
+        .record_share_windowed(None, group, "bc1qold", 40.0, 0)
+        .await
+        .unwrap();
+    store
+        .record_share_windowed(None, group, "bc1qfresh", 60.0, 5 * bkt)
+        .await
+        .unwrap();
+    assert_eq!(store.read_window_by_address(group).await.unwrap().len(), 2);
+
+    // now = bucket 5, window = 2 buckets → cutoff bucket 3 → drop bucket 0.
+    store.trim_window(group, 5 * bkt, 2 * bkt).await.unwrap();
+
+    let after = store.read_window_by_address(group).await.unwrap();
+    assert!(!after.contains_key("bc1qold"), "aged-out addr dropped");
+    assert!((after["bc1qfresh"] - 60.0).abs() < 1e-9, "fresh addr kept");
+
+    // The old bucket's hash + index entry are gone; only bucket 5 remains.
+    let mut conn = conn;
+    let buckets: Vec<i64> = conn.zrange(key_window_buckets(group), 0, -1).await.unwrap();
+    assert_eq!(buckets, vec![5]);
+    let old_exists: bool = conn.exists("groupsolo:g_win_trim:wbucket:0").await.unwrap();
+    assert!(!old_exists, "dropped bucket hash deleted");
+}
+
+// ── Test 15 — read_payout_shares(Window) trims on read (idle group) ─
+//
+// The dispatcher trims before reading, so even a group that went idle after
+// recording sees a fenster-current distribution at payout-build time. PROP
+// mode reads the independent per-round aggregate — the branch picks the right
+// keyspace.
+#[tokio::test]
+async fn read_payout_shares_window_trims_on_read() {
+    let conn = match connect_or_skip(14).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let group = "g_win_read";
+    let bkt = WINDOW_BUCKET_MS;
+    // Window shares: stale bucket 0 + fresh bucket 10.
+    store
+        .record_share_windowed(None, group, "bc1qstale", 10.0, 0)
+        .await
+        .unwrap();
+    store
+        .record_share_windowed(None, group, "bc1qfresh", 20.0, 10 * bkt)
+        .await
+        .unwrap();
+    // A PROP-keyspace share for the SAME group, to prove the branch separates them.
+    store
+        .record_share(None, group, "bc1qprop", 99.0, 1)
+        .await
+        .unwrap();
+
+    // Window read at now=bucket 10, window=2 buckets → stale bucket 0 trimmed.
+    let win = store
+        .read_payout_shares(group, PayoutMode::Window, 10 * bkt, 2 * bkt)
+        .await
+        .unwrap();
+    assert!(
+        !win.contains_key("bc1qstale"),
+        "idle-group stale share trimmed on read"
+    );
+    assert!((win["bc1qfresh"] - 20.0).abs() < 1e-9);
+    assert!(
+        !win.contains_key("bc1qprop"),
+        "window read ignores PROP keyspace"
+    );
+
+    // PROP read of the same group returns only the PROP aggregate.
+    let prop = store
+        .read_payout_shares(group, PayoutMode::Prop, 10 * bkt, 2 * bkt)
+        .await
+        .unwrap();
+    assert!((prop["bc1qprop"] - 99.0).abs() < 1e-9);
+    assert!(
+        !prop.contains_key("bc1qfresh"),
+        "PROP read ignores window keyspace"
+    );
+}
+
+// ── Test 16 — windowed record is idempotent per share_id ────────────
+//
+// Same exactly-once contract as the PROP path: a redelivered windowed share
+// (same share_id) is a no-op against the window aggregate.
+#[tokio::test]
+async fn windowed_record_is_idempotent_per_share_id() {
+    let conn = match connect_or_skip(15).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let group = "g_win_idem";
+    let bkt = WINDOW_BUCKET_MS;
+
+    let applied = store
+        .record_share_windowed(Some("ep1:0"), group, "bc1qfoo", 100.0, 7 * bkt)
+        .await
+        .expect("ok");
+    assert!(applied, "first windowed apply must append");
+
+    let replay = store
+        .record_share_windowed(Some("ep1:0"), group, "bc1qfoo", 100.0, 7 * bkt)
+        .await
+        .expect("ok");
+    assert!(
+        !replay,
+        "redelivered windowed share_id must be a deduped no-op"
+    );
+
+    let agg = store.read_window_by_address(group).await.unwrap();
+    assert!(
+        (agg["bc1qfoo"] - 100.0).abs() < 1e-9,
+        "window aggregate counts the share once, not twice"
+    );
+
+    // reset_full (the dissolve / scheduled-wipe path) clears the dynamic
+    // window keyspace too via delete_window_keys.
+    store.reset_full(group).await.unwrap();
+    assert!(
+        store
+            .read_window_by_address(group)
+            .await
+            .unwrap()
+            .is_empty(),
+        "reset_full clears the window aggregate"
+    );
+    let mut conn = conn;
+    let buckets: Vec<i64> = conn.zrange(key_window_buckets(group), 0, -1).await.unwrap();
+    assert!(buckets.is_empty(), "reset_full drops the window index zset");
 }

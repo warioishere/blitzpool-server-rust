@@ -81,6 +81,7 @@ async fn insert_group_returns_row_with_defaults() {
         "hash-a",
         false,
         false,
+        "prop",
         1_700_000_000_000,
     )
     .await
@@ -128,6 +129,7 @@ async fn find_group_by_name_filters_dissolved() {
         "h",
         false,
         false,
+        "prop",
         1,
     )
     .await
@@ -172,6 +174,7 @@ async fn list_active_groups_omits_dissolved() {
         "h1",
         false,
         false,
+        "prop",
         1,
     )
     .await
@@ -184,6 +187,7 @@ async fn list_active_groups_omits_dissolved() {
         "h2",
         false,
         false,
+        "prop",
         1,
     )
     .await
@@ -221,6 +225,7 @@ async fn active_toggle_and_count_members() {
         "h",
         false,
         false,
+        "prop",
         1,
     )
     .await
@@ -276,6 +281,7 @@ async fn transfer_creator_swaps_admin_token_and_creator_address() {
         "old_hash",
         false,
         false,
+        "prop",
         1,
     )
     .await
@@ -322,9 +328,19 @@ async fn round_reset_config_patch_applies_per_field() {
     };
     let gid = Uuid::new_v4();
     let name = format!("rr-{}", gid);
-    insert_pplns_group(&pool, gid, &name, &addr("rr_creator"), "h", false, false, 1)
-        .await
-        .expect("g");
+    insert_pplns_group(
+        &pool,
+        gid,
+        &name,
+        &addr("rr_creator"),
+        "h",
+        false,
+        false,
+        "prop",
+        1,
+    )
+    .await
+    .expect("g");
 
     // First patch — Set everything.
     let p1 = RoundResetConfigPatch {
@@ -390,9 +406,19 @@ async fn dissolve_is_idempotent() {
     };
     let gid = Uuid::new_v4();
     let name = format!("diss-{}", gid);
-    insert_pplns_group(&pool, gid, &name, &addr("d_creator"), "h", true, false, 1)
-        .await
-        .expect("g");
+    insert_pplns_group(
+        &pool,
+        gid,
+        &name,
+        &addr("d_creator"),
+        "h",
+        true,
+        false,
+        "prop",
+        1,
+    )
+    .await
+    .expect("g");
     let n1 = update_pplns_group_dissolved(&pool, gid, 100)
         .await
         .expect("d1");
@@ -422,9 +448,19 @@ async fn insert_member_and_delete_roundtrip() {
     };
     let gid = Uuid::new_v4();
     let name = format!("mem-{}", gid);
-    insert_pplns_group(&pool, gid, &name, &addr("m_creator"), "h", false, false, 1)
-        .await
-        .expect("g");
+    insert_pplns_group(
+        &pool,
+        gid,
+        &name,
+        &addr("m_creator"),
+        "h",
+        false,
+        false,
+        "prop",
+        1,
+    )
+    .await
+    .expect("g");
 
     let m = insert_pplns_group_member(&pool, gid, &addr("m_x"), "member", 5)
         .await
@@ -465,10 +501,10 @@ async fn find_all_members_returns_all_groups() {
     let g2 = Uuid::new_v4();
     let n1 = format!("all1-{}", g1);
     let n2 = format!("all2-{}", g2);
-    insert_pplns_group(&pool, g1, &n1, &addr("a_c1"), "h", false, false, 1)
+    insert_pplns_group(&pool, g1, &n1, &addr("a_c1"), "h", false, false, "prop", 1)
         .await
         .expect("g1");
-    insert_pplns_group(&pool, g2, &n2, &addr("a_c2"), "h", false, false, 1)
+    insert_pplns_group(&pool, g2, &n2, &addr("a_c2"), "h", false, false, "prop", 1)
         .await
         .expect("g2");
     let m_addr = format!("all_m_unique_{}", g1);
@@ -499,7 +535,7 @@ async fn directed_invitation_lifecycle() {
     };
     let gid = Uuid::new_v4();
     let n = format!("inv-{}", gid);
-    insert_pplns_group(&pool, gid, &n, &addr("inv_c"), "h", false, false, 1)
+    insert_pplns_group(&pool, gid, &n, &addr("inv_c"), "h", false, false, "prop", 1)
         .await
         .expect("g");
 
@@ -571,9 +607,19 @@ async fn open_invite_revoke_replaces_atomically() {
     };
     let gid = Uuid::new_v4();
     let n = format!("open-{}", gid);
-    insert_pplns_group(&pool, gid, &n, &addr("open_c"), "h", false, false, 1)
-        .await
-        .expect("g");
+    insert_pplns_group(
+        &pool,
+        gid,
+        &n,
+        &addr("open_c"),
+        "h",
+        false,
+        false,
+        "prop",
+        1,
+    )
+    .await
+    .expect("g");
 
     // Two open invites in succession — second should leave only itself active.
     let t1 = format!("open-1-{}", gid);
@@ -616,7 +662,7 @@ async fn expire_invitations_only_flips_past_due() {
     };
     let gid = Uuid::new_v4();
     let n = format!("exp-i-{}", gid);
-    insert_pplns_group(&pool, gid, &n, &addr("ei_c"), "h", false, false, 1)
+    insert_pplns_group(&pool, gid, &n, &addr("ei_c"), "h", false, false, "prop", 1)
         .await
         .expect("g");
 
@@ -681,7 +727,7 @@ async fn delete_invitation_by_token_removes_row() {
     };
     let gid = Uuid::new_v4();
     let n = format!("delinv-{}", gid);
-    insert_pplns_group(&pool, gid, &n, &addr("del_c"), "h", false, false, 1)
+    insert_pplns_group(&pool, gid, &n, &addr("del_c"), "h", false, false, "prop", 1)
         .await
         .expect("g");
     let token = format!("rm-{}", gid);
@@ -720,7 +766,7 @@ async fn join_request_lifecycle() {
     };
     let gid = Uuid::new_v4();
     let n = format!("jr-{}", gid);
-    insert_pplns_group(&pool, gid, &n, &addr("jr_c"), "h", false, true, 1)
+    insert_pplns_group(&pool, gid, &n, &addr("jr_c"), "h", false, true, "prop", 1)
         .await
         .expect("g");
 
@@ -788,7 +834,7 @@ async fn expire_join_requests_flips_old_pending() {
     };
     let gid = Uuid::new_v4();
     let n = format!("ejr-{}", gid);
-    insert_pplns_group(&pool, gid, &n, &addr("ejr_c"), "h", false, true, 1)
+    insert_pplns_group(&pool, gid, &n, &addr("ejr_c"), "h", false, true, "prop", 1)
         .await
         .expect("g");
     let old =
@@ -842,9 +888,19 @@ async fn update_active_ignores_dissolved_group() {
     };
     let gid = Uuid::new_v4();
     let name = format!("diss-active-{}", gid);
-    insert_pplns_group(&pool, gid, &name, &addr("da_creator"), "h", false, false, 1)
-        .await
-        .expect("g");
+    insert_pplns_group(
+        &pool,
+        gid,
+        &name,
+        &addr("da_creator"),
+        "h",
+        false,
+        false,
+        "prop",
+        1,
+    )
+    .await
+    .expect("g");
     update_pplns_group_dissolved(&pool, gid, 50)
         .await
         .expect("dissolve");

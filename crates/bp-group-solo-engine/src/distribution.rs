@@ -180,8 +180,14 @@ async fn compute_distribution(
         .ok_or(DistributionError::GroupNotFound { group_id })?;
     let finder_bonus_sats = group_row.finder_bonus_sats;
 
-    // 2. Round state from Redis.
-    let round_raw = round.read_by_address(&group_id.to_string()).await?;
+    // 2. Round state from Redis. Mode-aware: a PROP group reads its per-round
+    //    aggregate; a Window group trims to the sliding window first, so the
+    //    built distribution is always fenster-current (even for an idle group).
+    let (mode, window_ms) = crate::engine::group_mode_from_row(&group_row);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let round_raw = round
+        .read_payout_shares(&group_id.to_string(), mode, now_ms, window_ms)
+        .await?;
     let mut address_shares = share_map_from_redis_hash(
         &round_raw,
         "group-solo distribution: skipping invalid address in round state",

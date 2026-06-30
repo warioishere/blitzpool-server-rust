@@ -13,7 +13,7 @@ use bp_common::{AddressId, Sats};
 use bp_db::{PatchField, PplnsGroupMemberRow, PplnsGroupRow, RoundResetConfigPatch};
 use bp_group_mgmt::{
     constants::{MIN_MEMBERS_ACTIVE, MS_PER_DAY},
-    group::{GroupName, MemberRole, RoundResetConfig, RoundResetPreset},
+    group::{GroupName, MemberRole, PayoutMode, RoundResetConfig, RoundResetPreset},
     token::{AdminToken, TokenHash},
 };
 use sqlx::PgPool;
@@ -207,6 +207,21 @@ impl<H: GroupServiceHooks> GroupService<H> {
         name: &str,
         creator_address: &str,
     ) -> Result<GroupCreateResult, GroupServiceError> {
+        // Existing callers default to the classic PROP-per-round mode.
+        self.create_group_with_mode(name, creator_address, PayoutMode::Prop)
+            .await
+    }
+
+    /// Create a fresh group with an explicit [`PayoutMode`]. The mode is chosen
+    /// **once at creation and is immutable** — there is no edit path for it (a
+    /// live PROP↔Window migration is intentionally unsupported). `Prop` is the
+    /// default and what [`Self::create_group`] uses.
+    pub async fn create_group_with_mode(
+        &self,
+        name: &str,
+        creator_address: &str,
+        mode: PayoutMode,
+    ) -> Result<GroupCreateResult, GroupServiceError> {
         let validated_name = GroupName::new(name).map_err(|_| GroupServiceError::InvalidName)?;
         let normalized_address = normalize_address(creator_address)?;
 
@@ -238,6 +253,7 @@ impl<H: GroupServiceHooks> GroupService<H> {
             admin_hash.as_str(),
             /* active = */ false,
             /* is_public = */ false,
+            mode.as_str(),
             now,
         )
         .await?;

@@ -516,7 +516,8 @@ CREATE TABLE public.pplns_group (
     "roundResetPreset" character varying(16),
     "isPublic" boolean DEFAULT false NOT NULL,
     "resetRoundOnBlock" boolean DEFAULT false NOT NULL,
-    "maxMembers" integer
+    "maxMembers" integer,
+    "payoutMode" character varying(16) DEFAULT 'prop'::character varying NOT NULL
 );
 
 
