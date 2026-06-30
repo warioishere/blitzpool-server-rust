@@ -13,7 +13,9 @@
 //!      group was dissolved between the mark and the read — the rest of
 //!      the algorithm picks Solo/PPLNS correctly without surfacing a
 //!      dangling group_id.
-//!    - `Solo` ⇒ return Solo.
+//!    - `Solo` ⇒ if the address is in an *active* group, return group-solo
+//!      (an active membership beats a stale, self-refreshing Solo marker so a
+//!      joined member switches over on its next authorize); otherwise Solo.
 //!    - `None` ⇒ continue.
 //! 2. **Active group wins over residual PPLNS window shares.** Group
 //!    membership is an intentional admin action; PPLNS window shares may
@@ -161,7 +163,19 @@ where
                     return MiningModeResult::blockparty(group_id);
                 }
             }
-            Some(MiningMode::Solo) => return MiningModeResult::solo(),
+            Some(MiningMode::Solo) => {
+                // An active group membership beats a stale Solo marker. A miner
+                // that solo-mined before joining a group keeps a self-refreshing
+                // Solo marker (5-min TTL, re-written on every accepted share),
+                // which would otherwise pin it to solo forever — approving its
+                // join would never take effect. Re-checking the group here lets a
+                // joined member resolve to group-solo on its next authorize
+                // (e.g. after a deploy/reconnect) with no manual intervention.
+                if let Some(group_id) = self.groups.active_group_for(address).await {
+                    return MiningModeResult::group_solo(group_id);
+                }
+                return MiningModeResult::solo();
+            }
             None => {}
         }
 
@@ -308,6 +322,22 @@ mod tests {
         assert_eq!(
             r.get_mode(&addr("bc1qalice")).await,
             MiningModeResult::solo()
+        );
+    }
+
+    #[tokio::test]
+    async fn live_marker_solo_yields_group_solo_when_in_active_group() {
+        // A miner that solo-mined before joining a group keeps a self-refreshing
+        // Solo marker; an active group membership must still win, so an approved
+        // join takes effect on the next authorize without manual intervention.
+        let r = resolver(
+            FakeMarker::new(Map::from([("bc1qalice".into(), MiningMode::Solo)])),
+            FakeGroups(Map::from([("bc1qalice".into(), Some("grp-9".into()))])),
+            FakePplns(Map::new()),
+        );
+        assert_eq!(
+            r.get_mode(&addr("bc1qalice")).await,
+            MiningModeResult::group_solo("grp-9")
         );
     }
 
