@@ -1048,36 +1048,26 @@ where
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Workers, async move {
             let since = crate::time_range::now_ms() - range.window_ms();
-            let rows = bp_db::find_client_statistics_since(&s.pool, since).await?;
-            let boundaries = chart_slot_boundaries(since, range.slot_size_ms());
-            let mut addresses_by_slot: BTreeMap<i64, std::collections::HashSet<String>> =
-                BTreeMap::new();
-            let mut workers_by_slot: BTreeMap<i64, std::collections::HashSet<(String, String)>> =
-                BTreeMap::new();
-            for r in &rows {
-                let k = crate::time_range::bucket_key(r.time, range.slot_size_ms());
-                addresses_by_slot
-                    .entry(k)
-                    .or_default()
-                    .insert(r.address.as_str().to_string());
-                workers_by_slot
-                    .entry(k)
-                    .or_default()
-                    .insert((r.address.as_str().to_string(), r.client_name.clone()));
-            }
+            let slot_size = range.slot_size_ms();
+            // DISTINCT-address + DISTINCT-(address, worker) counts are computed
+            // in SQL (GROUP BY snapped slot) instead of loading every per-session
+            // row and counting in memory — same per-slot result, a few rows
+            // instead of the full window's worth.
+            let by_slot: BTreeMap<i64, (i64, i64)> =
+                bp_db::count_pool_workers_by_slot(&s.pool, since, slot_size)
+                    .await?
+                    .into_iter()
+                    .map(|c| (c.slot, (c.addresses, c.workers)))
+                    .collect();
+            let boundaries = chart_slot_boundaries(since, slot_size);
             Ok(SlotDataResponse {
                 slot_data: boundaries
                     .iter()
                     .map(|&b| {
+                        let (addresses, workers) = by_slot.get(&b).copied().unwrap_or((0, 0));
                         let mut counts = BTreeMap::new();
-                        counts.insert(
-                            "addresses".into(),
-                            addresses_by_slot.get(&b).map(|s| s.len()).unwrap_or(0) as f64,
-                        );
-                        counts.insert(
-                            "workers".into(),
-                            workers_by_slot.get(&b).map(|s| s.len()).unwrap_or(0) as f64,
-                        );
+                        counts.insert("addresses".into(), addresses as f64);
+                        counts.insert("workers".into(), workers as f64);
                         SlotCounts {
                             time: crate::time_range::format_slot_label(b),
                             counts,
