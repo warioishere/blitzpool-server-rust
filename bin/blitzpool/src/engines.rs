@@ -484,6 +484,32 @@ impl BlitzpoolModeGate {
         }
         r.group_id.and_then(|s| Uuid::parse_str(&s).ok())
     }
+
+    /// Snapshot the connected addresses currently gated `Solo` or `GroupSolo`
+    /// — the only modes the cache-sync reconcile flips on a group-membership
+    /// change. Returns `(address, mode)` pairs (a small clone under a brief
+    /// lock); PPLNS/Blockparty addresses are never touched.
+    pub(crate) fn group_transition_candidates(&self) -> Vec<(String, MiningModeResult)> {
+        let guard = self.inner.lock().expect("mode-gate mutex poisoned");
+        guard
+            .iter()
+            .filter(|(_, e)| matches!(e.mode.mode, MiningMode::Solo | MiningMode::GroupSolo))
+            .map(|(a, e)| (a.clone(), e.mode.clone()))
+            .collect()
+    }
+
+    /// Update the cached mode for an **already-connected** address WITHOUT
+    /// bumping its refcount — used by the cache-sync reconcile to flip a live
+    /// miner between Solo and Group-Solo when its group membership changes, so
+    /// its running connection's shares route to the right place on the next
+    /// share with no reconnect. No-op for an address that isn't connected
+    /// (absent from the map) — we never resurrect a disconnected entry.
+    pub(crate) fn override_mode(&self, address: &str, result: MiningModeResult) {
+        let mut guard = self.inner.lock().expect("mode-gate mutex poisoned");
+        if let Some(e) = guard.get_mut(address) {
+            e.mode = result;
+        }
+    }
 }
 
 // ─── Composite share sinks ───────────────────────────────────────
@@ -821,6 +847,35 @@ mod tests {
         assert_eq!(mode_of(&gate, "bc1q"), MiningMode::Pplns);
         gate.clear_mode("bc1q");
         assert_eq!(mode_of(&gate, "bc1q"), MiningMode::Solo);
+    }
+
+    #[test]
+    fn override_mode_flips_connected_solo_to_group_without_touching_refcount() {
+        let gate = BlitzpoolModeGate::new();
+        gate.set_mode("bc1qsolo", MiningModeResult::solo());
+        gate.set_mode("bc1qpplns", MiningModeResult::pplns());
+        let group_id = Uuid::new_v4();
+
+        // Only Solo / GroupSolo entries are transition candidates (PPLNS skipped).
+        let cands = gate.group_transition_candidates();
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].0, "bc1qsolo");
+        assert_eq!(cands[0].1.mode, MiningMode::Solo);
+
+        // The cache-sync reconcile flips a live solo miner to group-solo so its
+        // running connection's shares route to the group from the next share.
+        gate.override_mode("bc1qsolo", MiningModeResult::group_solo(group_id.to_string()));
+        assert_eq!(mode_of(&gate, "bc1qsolo"), MiningMode::GroupSolo);
+        assert_eq!(gate.group_for_address("bc1qsolo"), Some(group_id));
+
+        // Refcount untouched: a single disconnect still drops the entry (an
+        // accidental extra bump would leave it stuck after one disconnect).
+        gate.clear_mode("bc1qsolo");
+        assert_eq!(mode_of(&gate, "bc1qsolo"), MiningMode::Solo);
+
+        // Override on a disconnected (absent) address is a no-op — never resurrects.
+        gate.override_mode("bc1qabsent", MiningModeResult::group_solo(group_id.to_string()));
+        assert_eq!(mode_of(&gate, "bc1qabsent"), MiningMode::Solo);
     }
 
     #[test]

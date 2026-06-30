@@ -30,6 +30,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use bp_common::{AddressId, MiningMode};
+use bp_mining_mode::MiningModeResult;
+
+use crate::engines::BlitzpoolModeGate;
 use crate::group_service::SharedGroupService;
 
 const GROUP: &str = "cache-sync-front";
@@ -92,6 +96,7 @@ pub(crate) fn spawn(
     redis: ConnectionManager,
     group: SharedGroupService,
     blockparty: Option<Arc<dyn BlockpartyApi>>,
+    gate: Arc<BlitzpoolModeGate>,
 ) -> CacheSyncHandle {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
@@ -113,7 +118,7 @@ pub(crate) fn spawn(
                 biased;
                 _ = task_cancel.cancelled() => break,
                 _ = backstop.tick() => {
-                    rebuild_group(&group).await;
+                    rebuild_group(&group, &gate).await;
                     rebuild_blockparty(blockparty.as_ref()).await;
                 }
                 result = consumer.read_new(BATCH, BLOCK_MS) => match result {
@@ -134,7 +139,7 @@ pub(crate) fn spawn(
                         }
                         // Coalesce: one rebuild per kind per batch.
                         if want_group {
-                            rebuild_group(&group).await;
+                            rebuild_group(&group, &gate).await;
                         }
                         if want_blockparty {
                             rebuild_blockparty(blockparty.as_ref()).await;
@@ -155,10 +160,58 @@ pub(crate) fn spawn(
     CacheSyncHandle { task, cancel }
 }
 
-async fn rebuild_group(group: &SharedGroupService) {
+async fn rebuild_group(group: &SharedGroupService, gate: &Arc<BlitzpoolModeGate>) {
     match group.service.rebuild_cache().await {
         Ok(()) => info!("cache-sync: group address cache rebuilt"),
-        Err(err) => warn!(%err, "cache-sync: group cache rebuild failed"),
+        Err(err) => {
+            warn!(%err, "cache-sync: group cache rebuild failed");
+            return;
+        }
+    }
+    reconcile_gate_modes(group, gate).await;
+}
+
+/// After the address cache reflects a membership change, flip the **live** mode
+/// gate for already-connected miners so their running connection's shares route
+/// correctly without a reconnect:
+///
+/// - a `Solo`-gated miner now in an active group → `GroupSolo` (the join case:
+///   a miner that solo-mined before joining keeps a self-refreshing Solo marker,
+///   so its authorize-time resolution stuck on Solo — this is what makes an
+///   approved join take effect from the next share),
+/// - a `GroupSolo`-gated miner no longer in an active group → `Solo` (left /
+///   kicked / dissolved).
+///
+/// Runs on every group invalidation (instant on approve) + the 60s backstop.
+async fn reconcile_gate_modes(group: &SharedGroupService, gate: &Arc<BlitzpoolModeGate>) {
+    let cache = group.service.address_cache();
+    let (mut upgraded, mut downgraded) = (0u32, 0u32);
+    for (address, current) in gate.group_transition_candidates() {
+        let Ok(addr_id) = AddressId::new(address.clone()) else {
+            continue;
+        };
+        let active_group = cache
+            .get(&addr_id)
+            .await
+            .filter(|e| e.active)
+            .map(|e| e.group_id);
+        match (current.mode, active_group) {
+            (MiningMode::Solo, Some(group_id)) => {
+                gate.override_mode(&address, MiningModeResult::group_solo(group_id.to_string()));
+                upgraded += 1;
+            }
+            (MiningMode::GroupSolo, None) => {
+                gate.override_mode(&address, MiningModeResult::solo());
+                downgraded += 1;
+            }
+            _ => {}
+        }
+    }
+    if upgraded > 0 || downgraded > 0 {
+        info!(
+            upgraded,
+            downgraded, "cache-sync: reconciled live mode gate to group membership"
+        );
     }
 }
 

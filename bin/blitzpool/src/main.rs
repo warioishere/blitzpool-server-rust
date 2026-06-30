@@ -788,6 +788,7 @@ async fn main() -> ExitCode {
             cache_conn,
             group_service.clone(),
             blockparty.as_ref().map(|bp| bp.service.clone()),
+            engines.mode_gate.clone(),
         ))
     } else {
         None
