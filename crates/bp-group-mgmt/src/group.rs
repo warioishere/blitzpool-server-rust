@@ -367,9 +367,11 @@ mod tests {
     // ── Active threshold ─────────────────────────────────────────────
 
     #[test]
-    fn active_threshold_is_two() {
+    fn active_threshold_is_one() {
+        // A group mines as soon as it has its creator; only an empty group is
+        // inactive (MIN_MEMBERS_ACTIVE == 1).
         assert!(!is_active(0));
-        assert!(!is_active(1));
+        assert!(is_active(1));
         assert!(is_active(2));
         assert!(is_active(100));
     }

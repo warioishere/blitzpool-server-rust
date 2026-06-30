@@ -130,7 +130,8 @@ async fn create_group_happy_path_returns_token_and_seeds_creator() {
     let result = svc.create_group(&name, &creator).await.expect("create");
     assert!(result.admin_token.starts_with("GRP-"));
     assert_eq!(result.group.name, name);
-    assert!(!result.group.active);
+    // Active from creation: the creator alone meets MIN_MEMBERS_ACTIVE (== 1).
+    assert!(result.group.active);
     let members = svc.list_members(result.group.id).await.expect("members");
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].role, "creator");
@@ -246,7 +247,7 @@ async fn create_group_rejects_address_already_in_group() {
 // ─── addMember ────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn add_member_flips_active_when_threshold_met() {
+async fn group_active_from_creation_and_stays_after_add() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -258,7 +259,8 @@ async fn add_member_flips_active_when_threshold_met() {
         .create_group(&format!("a-{}", Uuid::new_v4()), &creator)
         .await
         .expect("g");
-    assert!(!g.group.active);
+    // Active already with just the creator (MIN_MEMBERS_ACTIVE == 1) …
+    assert!(g.group.active);
     svc.add_member(g.group.id, &new_member, Some(&g.admin_token))
         .await
         .expect("add");
@@ -267,6 +269,7 @@ async fn add_member_flips_active_when_threshold_met() {
         .await
         .expect("get")
         .expect("present");
+    // … and still active after a second member joins.
     assert!(group.active);
     cleanup_group(&pool, g.group.id).await;
 }
@@ -402,7 +405,7 @@ async fn remove_member_inactivity_guard_then_kick_succeeds() {
 }
 
 #[tokio::test]
-async fn remove_member_flips_active_below_threshold() {
+async fn remove_member_keeps_group_active_down_to_creator() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -426,9 +429,9 @@ async fn remove_member_flips_active_below_threshold() {
     svc.remove_member(g.group.id, &member, Some(&g.admin_token))
         .await
         .expect("remove");
-    // After remove: 1 member (below threshold) → inactive.
+    // After remove: 1 member (the creator) still meets the floor → stays active.
     let after = svc.get_group(g.group.id).await.expect("get").expect("row");
-    assert!(!after.active);
+    assert!(after.active);
 
     cleanup_group(&pool, g.group.id).await;
 }
@@ -677,9 +680,9 @@ async fn address_cache_reflects_membership_changes() {
         .await
         .expect("cached");
     assert_eq!(entry.group_id, g.group.id);
-    assert!(!entry.active); // single member
+    assert!(entry.active); // single member (creator) already mines
 
-    // Add a member → active flips
+    // Add a member → still active
     let m = format!("bc1qccm{}", Uuid::new_v4().simple());
     svc.add_member(g.group.id, &m, Some(&g.admin_token))
         .await

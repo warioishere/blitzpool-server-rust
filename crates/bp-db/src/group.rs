@@ -881,7 +881,7 @@ pub async fn list_active_pplns_groups(pool: &PgPool) -> Result<Vec<PplnsGroupRow
 
 /// Count rows in `pplns_group_member` for one group. Drives the
 /// `recomputeActive` path: a group is active once `count >=
-/// MIN_MEMBERS_ACTIVE` (= 2 today).
+/// MIN_MEMBERS_ACTIVE` (= 1 today — active as soon as the creator joins).
 pub async fn count_pplns_group_members_for_group<'e, E>(
     executor: E,
     group_id: Uuid,

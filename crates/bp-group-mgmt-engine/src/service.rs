@@ -13,7 +13,7 @@ use bp_common::{AddressId, Sats};
 use bp_db::{PatchField, PplnsGroupMemberRow, PplnsGroupRow, RoundResetConfigPatch};
 use bp_group_mgmt::{
     constants::{MIN_MEMBERS_ACTIVE, MS_PER_DAY},
-    group::{GroupName, MemberRole, PayoutMode, RoundResetConfig, RoundResetPreset},
+    group::{is_active, GroupName, MemberRole, PayoutMode, RoundResetConfig, RoundResetPreset},
     token::{AdminToken, TokenHash},
 };
 use sqlx::PgPool;
@@ -251,7 +251,10 @@ impl<H: GroupServiceHooks> GroupService<H> {
             validated_name.as_str(),
             &normalized_address,
             admin_hash.as_str(),
-            /* active = */ false,
+            // The creator is added as the sole member just below, so the group
+            // starts active whenever a single member already meets the floor
+            // (MIN_MEMBERS_ACTIVE == 1) — it can mine immediately.
+            /* active = */ is_active(1),
             /* is_public = */ false,
             mode.as_str(),
             now,

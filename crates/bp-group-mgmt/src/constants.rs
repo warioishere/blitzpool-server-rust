@@ -5,8 +5,10 @@
 
 /// Number of members at or above which a group becomes active. The
 /// stratum layer refuses Group-Solo connections for addresses in
-/// inactive groups (under this floor).
-pub const MIN_MEMBERS_ACTIVE: u32 = 2;
+/// inactive groups (under this floor). `1` means a group mines as soon as
+/// it has its creator: the coinbase is then built from that one member's
+/// proportional share + the fee output (+ finder bonus when configured).
+pub const MIN_MEMBERS_ACTIVE: u32 = 1;
 
 /// Default kick-inactivity window. An admin can only remove a member
 /// who hasn't submitted a share in this many days. Overridable per
