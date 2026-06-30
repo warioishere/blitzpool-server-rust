@@ -1315,7 +1315,10 @@ where
 
             let mut entries = Vec::with_capacity(members.len());
             for m in members {
-                let balance = bp_db::find_group_balance(&s.pool, &m.address, id).await?;
+                // Redis-first / PG-fallback — same policy as the kick-inactivity
+                // guard, so an actively-mining member doesn't read "never mined"
+                // before the group's first block-found stamps the durable balance.
+                let last_active = svc.member_last_active(id, &m.address).await;
                 let email = bp_db::find_address_email(&s.pool, &m.address).await?;
                 // Admin sees a masked email (enough to tell "verified email
                 // present" from "none"); non-admins get no email field.
@@ -1332,8 +1335,7 @@ where
                     role: m.role,
                     joined_at: crate::time_range::format_slot_label(m.joined_at),
                     hashrate,
-                    last_accepted_share_at: balance
-                        .and_then(|b| b.last_accepted_share_at)
+                    last_accepted_share_at: last_active
                         .map(crate::time_range::format_slot_label),
                     email: email_out,
                 });

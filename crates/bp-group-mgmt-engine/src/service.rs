@@ -196,6 +196,16 @@ impl<H: GroupServiceHooks> GroupService<H> {
         Ok(bp_db::find_pplns_group_members_for_group(&self.pool, group_id).await?)
     }
 
+    /// Last-active timestamp (epoch-ms) for a member, using the same
+    /// Redis-first / PG-fallback policy as the kick-inactivity guard
+    /// ([`Self::remove_member`]). The live Redis hash is stamped on every
+    /// accepted share, whereas the durable balance is only stamped at
+    /// block-found — so this reports active miners as active before their
+    /// group's first block. `None` if the member has never submitted a share.
+    pub async fn member_last_active(&self, group_id: Uuid, address: &AddressId) -> Option<i64> {
+        self.hooks.last_active_for_member(group_id, address).await
+    }
+
     // ── Lifecycle ─────────────────────────────────────────────────
 
     /// Create a fresh group. Validates the name shape + the creator

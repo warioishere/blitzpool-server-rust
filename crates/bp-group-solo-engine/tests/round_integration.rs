@@ -547,6 +547,25 @@ async fn windowed_record_aggregates_into_buckets() {
     assert!((agg["bc1qfoo"] - 50.0).abs() < 1e-9, "foo summed in-bucket");
     assert!((agg["bc1qbar"] - 70.0).abs() < 1e-9);
 
+    // The windowed record also stamps the live `last-accepted-share-at` hash on
+    // every accepted share (the source the member-list view reads, Redis-first,
+    // so active miners aren't shown "never mined" before the group's first
+    // block-found). It holds each address's MOST RECENT share timestamp.
+    let foo_last = store
+        .read_last_accepted_share_at(group, "bc1qfoo")
+        .await
+        .unwrap();
+    assert_eq!(
+        foo_last,
+        Some(100 * bkt + 5),
+        "foo last-accepted is the later of its two shares"
+    );
+    let bar_last = store
+        .read_last_accepted_share_at(group, "bc1qbar")
+        .await
+        .unwrap();
+    assert_eq!(bar_last, Some(102 * bkt));
+
     // Two distinct time buckets registered in the index zset.
     let mut conn = conn;
     let buckets: Vec<i64> = conn.zrange(key_window_buckets(group), 0, -1).await.unwrap();
