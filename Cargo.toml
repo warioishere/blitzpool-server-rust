@@ -43,7 +43,7 @@ members = [
 [workspace.package]
 # Tracks TS-pool semver so /api/info/version returns the same v<semver>
 # the UI compares against.
-version = "2.2.1"
+version = "2.2.2"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Blitzpool contributors"]
