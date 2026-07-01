@@ -419,6 +419,47 @@ impl GroupRoundStore {
         }
     }
 
+    /// Per-time-bucket, per-address contribution across the live window —
+    /// drives the `/api/pplns/groups/:id/window-timeline` chart. Trims first
+    /// (so the timeline matches the payout window), reads every remaining
+    /// bucket's `addr → diff` hash in a single pipelined round-trip, and
+    /// returns `(bucket_id, map)` oldest→newest (`bucket_id` is hours-since-
+    /// epoch, i.e. `timestamp_ms / WINDOW_BUCKET_MS`). Empty when the window
+    /// has no live buckets.
+    pub async fn read_window_timeline(
+        &self,
+        group_id: &str,
+        now_ms: i64,
+        window_ms: i64,
+    ) -> Result<Vec<(i64, HashMap<String, f64>)>, RoundError> {
+        self.trim_window(group_id, now_ms, window_ms).await?;
+        let mut conn = self.conn.clone();
+        let bucket_ids: Vec<i64> = conn.zrange(key_window_buckets(group_id), 0, -1).await?;
+        if bucket_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One HGETALL per live bucket, pipelined into a single round-trip.
+        let mut pipe = redis::pipe();
+        for bid in &bucket_ids {
+            pipe.hgetall(key_window_bucket(group_id, *bid));
+        }
+        let raw: Vec<HashMap<String, String>> = pipe.query_async(&mut conn).await?;
+        Ok(bucket_ids
+            .into_iter()
+            .zip(raw)
+            .map(|(bid, hash)| {
+                let map = hash
+                    .into_iter()
+                    .filter_map(|(addr, v)| {
+                        let d: f64 = v.parse().ok()?;
+                        (d > 0.0).then_some((addr, d))
+                    })
+                    .collect();
+                (bid, map)
+            })
+            .collect())
+    }
+
     /// Delete all `Window`-mode keys for a group (every live time bucket via
     /// the index zset, plus the index zset + window aggregate). Folded into the
     /// reset paths so a dissolve / scheduled-reset cleans window state too,

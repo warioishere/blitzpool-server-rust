@@ -570,6 +570,18 @@ async fn windowed_record_aggregates_into_buckets() {
     let mut conn = conn;
     let buckets: Vec<i64> = conn.zrange(key_window_buckets(group), 0, -1).await.unwrap();
     assert_eq!(buckets, vec![100, 102], "FIFO-ordered bucket ids");
+
+    // Window-timeline read: per-bucket per-address diffs, oldest→newest (feeds
+    // the sliding-window chart). A 30-bucket window keeps both buckets here.
+    let timeline = store
+        .read_window_timeline(group, 102 * bkt, 30 * bkt)
+        .await
+        .unwrap();
+    assert_eq!(timeline.len(), 2, "two live buckets");
+    assert_eq!(timeline[0].0, 100);
+    assert!((timeline[0].1["bc1qfoo"] - 50.0).abs() < 1e-9);
+    assert_eq!(timeline[1].0, 102);
+    assert!((timeline[1].1["bc1qbar"] - 70.0).abs() < 1e-9);
 }
 
 // ── Test 14 — trim_window drops aged-out buckets ────────────────────

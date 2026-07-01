@@ -18,7 +18,7 @@
 //! response shape rather than gating access) keep the inline
 //! `admin_token(&headers)` plus a per-handler conditional check.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::{
     extract::{Path, Query, State},
@@ -29,7 +29,8 @@ use axum::{
 };
 use bp_common::{AddressId, Sats};
 use bp_db::PatchField;
-use bp_group_mgmt::group::RoundResetPreset;
+use bp_group_mgmt::group::{PayoutMode, RoundResetPreset};
+use bp_group_solo_engine::reader::WindowTimeline;
 use bp_group_mgmt_engine::{
     EmailHooks, GroupService, GroupServiceHooks, OpenInviteTtl, UpdateRoundResetSettings,
 };
@@ -135,6 +136,10 @@ where
         .route(
             "/api/pplns/groups/:id/distribution",
             get(distribution::<H, M>),
+        )
+        .route(
+            "/api/pplns/groups/:id/window-timeline",
+            get(window_timeline::<H, M>),
         )
         .route(
             "/api/pplns/groups/:id/best-difficulty",
@@ -962,13 +967,21 @@ struct GroupSummary {
 
 impl From<bp_db::PplnsGroupRow> for GroupSummary {
     fn from(r: bp_db::PplnsGroupRow) -> Self {
-        let next_reset_at = compute_next_reset_at(
-            r.round_reset_preset.as_deref(),
-            r.round_reset_timezone.as_deref(),
-            r.round_reset_interval_days,
-            r.last_round_reset_at,
-        )
-        .map(crate::time_range::format_slot_label);
+        // Window-mode groups never calendar-reset — the reset preset is the
+        // sliding-window LENGTH, not a wipe. Don't advertise a phantom
+        // `nextResetAt` (it made the UI show a countdown to a reset that never
+        // fires); the UI renders the window length instead.
+        let next_reset_at = if PayoutMode::parse_or_default(&r.payout_mode) == PayoutMode::Window {
+            None
+        } else {
+            compute_next_reset_at(
+                r.round_reset_preset.as_deref(),
+                r.round_reset_timezone.as_deref(),
+                r.round_reset_interval_days,
+                r.last_round_reset_at,
+            )
+            .map(crate::time_range::format_slot_label)
+        };
         Self {
             id: r.id,
             name: r.name,
@@ -1511,6 +1524,106 @@ where
                     total_rejected,
                     per_address: entries,
                 })
+            },
+        )
+        .await?;
+    Ok(JsonBytes(bytes))
+}
+
+// ─── GET /api/pplns/groups/:id/window-timeline ──────────────────
+//
+// Per-day, per-member contribution across the live sliding window. Drives the
+// Window-mode "sliding window" chart (area / bar / heatmap) + the per-member
+// share card. Non-Window groups return an empty timeline (`windowDays: 0`) so
+// the UI simply renders nothing.
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowTimelineResponse {
+    /// Sliding-window length in days; 0 for a non-Window group.
+    window_days: i64,
+    /// Every address that contributed anywhere in the window, biggest total
+    /// first (stable stacking + colour order across the views).
+    addresses: Vec<String>,
+    /// One entry per calendar day that has data, oldest→newest.
+    days: Vec<TimelineDay>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelineDay {
+    /// ISO-8601 day-start (UTC).
+    date: String,
+    /// Diff-weighted contribution per address, index-aligned to `addresses`.
+    values: Vec<f64>,
+}
+
+/// Fold the per-hour-bucket timeline into per-day, per-address sums and shape
+/// the response. Pure (no I/O) so it unit-tests without Redis.
+fn build_window_timeline_response(timeline: WindowTimeline) -> WindowTimelineResponse {
+    // Mirrors `bp_group_solo_engine::round::WINDOW_BUCKET_MS` (1h buckets).
+    const HOUR_MS: i64 = 60 * 60 * 1000;
+    const DAY_MS: i64 = 24 * HOUR_MS;
+
+    let mut per_day: BTreeMap<i64, HashMap<String, f64>> = BTreeMap::new();
+    let mut totals: HashMap<String, f64> = HashMap::new();
+    for (bucket_id, addr_map) in timeline.buckets {
+        let day_start = (bucket_id * HOUR_MS).div_euclid(DAY_MS) * DAY_MS;
+        let day = per_day.entry(day_start).or_default();
+        for (addr, diff) in addr_map {
+            *day.entry(addr.clone()).or_insert(0.0) += diff;
+            *totals.entry(addr).or_insert(0.0) += diff;
+        }
+    }
+
+    let mut addresses: Vec<String> = totals.keys().cloned().collect();
+    addresses.sort_by(|a, b| {
+        totals[b]
+            .partial_cmp(&totals[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b))
+    });
+
+    let days = per_day
+        .into_iter()
+        .map(|(day_start, addr_map)| TimelineDay {
+            date: crate::time_range::format_slot_label(day_start),
+            values: addresses
+                .iter()
+                .map(|a| addr_map.get(a).copied().unwrap_or(0.0))
+                .collect(),
+        })
+        .collect();
+
+    WindowTimelineResponse {
+        window_days: timeline.window_ms / DAY_MS,
+        addresses,
+        days,
+    }
+}
+
+async fn window_timeline<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(id): Path<Uuid>,
+) -> Result<JsonBytes, ApiError>
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    let key = format!("GROUP_WINDOW_TIMELINE_{id}");
+    let s = state.clone();
+    let bytes = state
+        .cache
+        .get_or_fetch::<WindowTimelineResponse, _, ApiError>(
+            key,
+            TtlKind::GroupDistribution,
+            async move {
+                let engine = s
+                    .group_solo
+                    .as_deref()
+                    .ok_or(ApiError::Unavailable("group-solo-engine not wired"))?;
+                let timeline = engine.reader().window_timeline(id).await?;
+                Ok(build_window_timeline_response(timeline))
             },
         )
         .await?;
@@ -2160,6 +2273,53 @@ mod tests {
         assert_eq!(block_subsidy_sats(150, Network::Regtest), 25 * 100_000_000);
         // Past 64 halvings the subsidy is 0 (no underflow/panic).
         assert_eq!(block_subsidy_sats(64 * 210_000, Network::Bitcoin), 0);
+    }
+
+    #[test]
+    fn window_timeline_folds_hours_into_days_and_sorts_by_total() {
+        const HOUR_MS: i64 = 60 * 60 * 1000;
+        const DAY_MS: i64 = 24 * HOUR_MS;
+        let a = "bc1qaaa".to_string();
+        let b = "bc1qbbb".to_string();
+        // Buckets 100 & 101 fall in day 4 (100/24 = 101/24 = 4); bucket 130 in
+        // day 5. B contributes less than A overall.
+        let timeline = WindowTimeline {
+            window_ms: 30 * DAY_MS,
+            buckets: vec![
+                (100, HashMap::from([(a.clone(), 10.0), (b.clone(), 5.0)])),
+                (101, HashMap::from([(a.clone(), 20.0)])),
+                (130, HashMap::from([(a.clone(), 7.0), (b.clone(), 3.0)])),
+            ],
+        };
+        let resp = build_window_timeline_response(timeline);
+
+        assert_eq!(resp.window_days, 30);
+        // A total 37 > B total 8 → A stacked/coloured first.
+        assert_eq!(resp.addresses, vec![a, b]);
+        assert_eq!(resp.days.len(), 2, "two distinct calendar-day buckets");
+        // Same-day hours summed; values index-aligned to [A, B].
+        assert_eq!(resp.days[0].values, vec![30.0, 5.0]);
+        assert_eq!(resp.days[1].values, vec![7.0, 3.0]);
+        // Days are the two day-starts, oldest→newest.
+        assert_eq!(
+            resp.days[0].date,
+            crate::time_range::format_slot_label(4 * DAY_MS)
+        );
+        assert_eq!(
+            resp.days[1].date,
+            crate::time_range::format_slot_label(5 * DAY_MS)
+        );
+    }
+
+    #[test]
+    fn window_timeline_empty_for_non_window_group() {
+        let resp = build_window_timeline_response(WindowTimeline {
+            window_ms: 0,
+            buckets: vec![],
+        });
+        assert_eq!(resp.window_days, 0);
+        assert!(resp.addresses.is_empty());
+        assert!(resp.days.is_empty());
     }
 
     #[test]
