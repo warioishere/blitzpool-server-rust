@@ -1193,7 +1193,7 @@ mod tests {
         };
         let payouts = vec![PayoutEntry {
             address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            percent: 100.0,
+            sats: 5_000_000_000,
         }];
         let mining_job = build_mining_job_from_tdp(
             Network::Regtest,

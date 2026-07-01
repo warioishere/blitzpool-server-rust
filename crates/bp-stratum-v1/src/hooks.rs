@@ -274,10 +274,10 @@ impl DeviceStatusSink for NoOpHooks {
 
 #[async_trait]
 impl PayoutResolver for NoOpHooks {
-    async fn resolve_payouts(&self, miner_address: &str, _reward_sats: u64) -> Vec<PayoutEntry> {
+    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> Vec<PayoutEntry> {
         vec![PayoutEntry {
             address: miner_address.to_string(),
-            percent: 100.0,
+            sats: reward_sats,
         }]
     }
 }
@@ -407,11 +407,11 @@ pub(crate) mod test_support {
         async fn resolve_payouts(
             &self,
             miner_address: &str,
-            _reward_sats: u64,
+            reward_sats: u64,
         ) -> Vec<PayoutEntry> {
             vec![PayoutEntry {
                 address: miner_address.to_string(),
-                percent: 100.0,
+                sats: reward_sats,
             }]
         }
     }

@@ -902,7 +902,7 @@ mod tests {
     fn solo_payouts_fixture(addr: &str) -> Vec<PayoutEntry> {
         vec![PayoutEntry {
             address: addr.to_string(),
-            percent: 100.0,
+            sats: 5_000_000_000,
         }]
     }
 

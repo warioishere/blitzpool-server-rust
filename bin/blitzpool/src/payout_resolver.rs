@@ -122,10 +122,13 @@ impl ProductionPayoutResolver {
                 // `pending_party_fee_route`). Without the guard the
                 // admin would pocket the full block reward before the
                 // members confirm the splits.
-                if let Some(route) = self.blockparty_pending_fee_route(miner_address).await {
+                if let Some(route) = self
+                    .blockparty_pending_fee_route(miner_address, reward_sats)
+                    .await
+                {
                     return route;
                 }
-                solo_payouts(miner_address, &self.solo_fee)
+                solo_payouts(miner_address, &self.solo_fee, reward_sats)
             }
             MiningMode::Pplns => self.pplns_payouts(miner_address, reward_sats).await,
             MiningMode::Blockparty => {
@@ -139,14 +142,14 @@ impl ProductionPayoutResolver {
                         "GroupSolo mode published WITHOUT a group_id; falling back to solo \
                          payouts so the coinbase is at least spendable"
                     );
-                    return solo_payouts(miner_address, &self.solo_fee);
+                    return solo_payouts(miner_address, &self.solo_fee, reward_sats);
                 };
                 let Ok(group_id) = Uuid::parse_str(gid_str) else {
                     warn!(
                         miner_address,
                         gid_str, "GroupSolo group_id failed to parse as UUID; falling back to solo"
                     );
-                    return solo_payouts(miner_address, &self.solo_fee);
+                    return solo_payouts(miner_address, &self.solo_fee, reward_sats);
                 };
                 self.group_solo_payouts(miner_address, reward_sats, group_id)
                     .await
@@ -163,7 +166,7 @@ impl ProductionPayoutResolver {
                 miner_address,
                 "PPLNS mode in gate but `[pplns]` is absent from config; falling back to solo"
             );
-            return solo_payouts(miner_address, &self.solo_fee);
+            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
         };
         match pplns.build_distribution(reward_sats).await {
             Ok(result) => entries_to_payouts(&result.payouts),
@@ -174,7 +177,7 @@ impl ProductionPayoutResolver {
                     reward_sats,
                     "PPLNS distribution build failed; falling back to solo coinbase"
                 );
-                solo_payouts(miner_address, &self.solo_fee)
+                solo_payouts(miner_address, &self.solo_fee, reward_sats)
             }
         }
     }
@@ -183,13 +186,21 @@ impl ProductionPayoutResolver {
     /// when the connecting address is the admin of an unconfirmed
     /// Blockparty (DRAFT or CONFIRMING). Returns `None` otherwise so
     /// the caller falls through to the standard Solo coinbase.
-    async fn blockparty_pending_fee_route(&self, miner_address: &str) -> Option<Vec<PayoutEntry>> {
+    async fn blockparty_pending_fee_route(
+        &self,
+        miner_address: &str,
+        reward_sats: u64,
+    ) -> Option<Vec<PayoutEntry>> {
         let svc = self.blockparty.as_ref()?;
         let addr = AddressId::new(miner_address.to_string()).ok()?;
         let route = svc.pending_party_fee_route(&addr).await?;
+        // Single output at `route.percent` (100% for the pending-fee route) →
+        // exact sats. The coinbase builder's remainder guard tops up any
+        // sub-1-sat floor loss on this sole output.
+        let sats = ((route.percent as f64 / 100.0) * reward_sats as f64).floor() as u64;
         Some(vec![PayoutEntry {
             address: route.fee_address.into_inner(),
-            percent: route.percent as f64,
+            sats,
         }])
     }
 
@@ -204,21 +215,21 @@ impl ProductionPayoutResolver {
                 miner_address,
                 "Blockparty mode in gate but service handle not wired; falling back to solo"
             );
-            return solo_payouts(miner_address, &self.solo_fee);
+            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
         };
         let Some(gid_str) = group_id_str else {
             warn!(
                 miner_address,
                 "Blockparty mode published WITHOUT a group_id; falling back to solo"
             );
-            return solo_payouts(miner_address, &self.solo_fee);
+            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
         };
         let Ok(group_id) = Uuid::parse_str(gid_str) else {
             warn!(
                 miner_address,
                 gid_str, "Blockparty group_id failed to parse as UUID; falling back to solo"
             );
-            return solo_payouts(miner_address, &self.solo_fee);
+            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
         };
         match svc.build_payouts(group_id, Sats(reward_sats as i64)).await {
             Ok(Some(result)) => entries_to_payouts(&result.payouts),
@@ -228,7 +239,7 @@ impl ProductionPayoutResolver {
                     %group_id,
                     "Blockparty group not found; falling back to solo"
                 );
-                solo_payouts(miner_address, &self.solo_fee)
+                solo_payouts(miner_address, &self.solo_fee, reward_sats)
             }
             Err(err) => {
                 warn!(
@@ -237,7 +248,7 @@ impl ProductionPayoutResolver {
                     %group_id,
                     "Blockparty distribution build failed; falling back to solo"
                 );
-                solo_payouts(miner_address, &self.solo_fee)
+                solo_payouts(miner_address, &self.solo_fee, reward_sats)
             }
         }
     }
@@ -259,7 +270,7 @@ impl ProductionPayoutResolver {
                     miner_address,
                     "GroupSolo miner address failed AddressId parse; falling back to solo"
                 );
-                return solo_payouts(miner_address, &self.solo_fee);
+                return solo_payouts(miner_address, &self.solo_fee, reward_sats);
             }
         };
         match self
@@ -276,7 +287,7 @@ impl ProductionPayoutResolver {
                     reward_sats,
                     "Group-Solo distribution build failed; falling back to solo coinbase"
                 );
-                solo_payouts(miner_address, &self.solo_fee)
+                solo_payouts(miner_address, &self.solo_fee, reward_sats)
             }
         }
     }
@@ -318,47 +329,52 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
 // ─── Helpers ──────────────────────────────────────────────────────
 
 /// Translate the engine's `CoinbaseDistributionEntry` shape into the
-/// `bp_mining_job::PayoutEntry` shape consumed by
-/// `build_mining_job_from_tdp`. Drops the absolute sats — the coinbase
-/// is built from percentages, and `build_mining_job`
-/// re-derives floor(percent/100 × reward) per entry (matching the
-/// engine's math).
+/// `bp_mining_job::PayoutEntry` shape consumed by `build_mining_job_from_tdp`.
+/// Carries the EXACT per-output sats the distributor computed (largest-remainder
+/// residuum, fixed finder bonus, solvency cap) — the coinbase builder places
+/// them verbatim, never re-deriving from a percentage.
 fn entries_to_payouts(entries: &[CoinbaseDistributionEntry]) -> Vec<PayoutEntry> {
     entries
         .iter()
         .map(|e| PayoutEntry {
             address: e.address.as_str().to_string(),
-            percent: e.percent,
+            // `Sats` is a signed i64; a coinbase output can only ever be a
+            // non-negative amount. Clamp defensively so a (should-be-impossible)
+            // negative distributor value can't wrap to ~1.8e19 via `as u64` and
+            // blow up the coinbase as bad-cb-amount.
+            sats: e.sats.0.max(0) as u64,
         })
         .collect()
 }
 
 /// Solo-mode coinbase split. Mirrors
 /// [`bp_stratum_v1::client::solo_payouts`]:
-/// 100%-to-miner, or `dev_fee_percent` to dev + remainder to miner.
-fn solo_payouts(miner_address: &str, fee: &SoloFeeConfig) -> Vec<PayoutEntry> {
+/// 100%-to-miner, or `dev_fee_percent` to dev + remainder to miner. Amounts are
+/// exact sats — the dev fee floors, the miner takes the remainder so both
+/// outputs sum to exactly `reward_sats`.
+fn solo_payouts(miner_address: &str, fee: &SoloFeeConfig, reward_sats: u64) -> Vec<PayoutEntry> {
     let dev_addr = fee
         .dev_fee_address
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let percent = fee.dev_fee_percent;
+    let full_to_miner = || {
+        vec![PayoutEntry {
+            address: miner_address.to_string(),
+            sats: reward_sats,
+        }]
+    };
     match (miner_address.is_empty(), dev_addr) {
         (true, _) => vec![],
-        (false, None) => vec![PayoutEntry {
-            address: miner_address.to_string(),
-            percent: 100.0,
-        }],
+        (false, None) => full_to_miner(),
         (false, Some(_dev)) if !(0.0..=100.0).contains(&percent) => {
             // Defensive: out-of-range dev percent → ignore the fee, full to miner.
             warn!(
                 percent,
                 "solo dev_fee_percent out of [0,100]; ignoring fee + paying 100% to miner"
             );
-            vec![PayoutEntry {
-                address: miner_address.to_string(),
-                percent: 100.0,
-            }]
+            full_to_miner()
         }
         (false, Some(_dev)) if percent <= 0.0 => {
             // Dev address configured but a zero (or negative) percent — the
@@ -366,21 +382,19 @@ fn solo_payouts(miner_address: &str, fee: &SoloFeeConfig) -> Vec<PayoutEntry> {
             // since the production default is 0.0. Emitting a dev output at 0 %
             // would put a useless zero-value output in the coinbase; pay the
             // whole reward to the miner instead.
-            vec![PayoutEntry {
-                address: miner_address.to_string(),
-                percent: 100.0,
-            }]
+            full_to_miner()
         }
-        (false, Some(dev)) => vec![
-            PayoutEntry {
-                address: dev.to_string(),
-                percent,
-            },
-            PayoutEntry {
-                address: miner_address.to_string(),
-                percent: 100.0 - percent,
-            },
-        ],
+        (false, Some(dev)) => {
+            let dev = PayoutEntry::from_percent(dev, percent, reward_sats);
+            let miner_sats = reward_sats.saturating_sub(dev.sats);
+            vec![
+                dev,
+                PayoutEntry {
+                    address: miner_address.to_string(),
+                    sats: miner_sats,
+                },
+            ]
+        }
     }
 }
 
@@ -388,9 +402,11 @@ fn solo_payouts(miner_address: &str, fee: &SoloFeeConfig) -> Vec<PayoutEntry> {
 mod tests {
     use super::*;
 
+    const TEST_REWARD: u64 = 5_000_000_000;
+
     #[test]
     fn solo_payouts_empty_address_yields_empty() {
-        let r = solo_payouts("", &SoloFeeConfig::default());
+        let r = solo_payouts("", &SoloFeeConfig::default(), TEST_REWARD);
         assert!(r.is_empty());
     }
 
@@ -402,10 +418,11 @@ mod tests {
                 dev_fee_address: None,
                 dev_fee_percent: 0.0,
             },
+            TEST_REWARD,
         );
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].address, "bc1qabc");
-        assert!((r[0].percent - 100.0).abs() < f64::EPSILON);
+        assert_eq!(r[0].sats, TEST_REWARD);
     }
 
     #[test]
@@ -416,12 +433,15 @@ mod tests {
                 dev_fee_address: Some("bc1qdev".into()),
                 dev_fee_percent: 1.5,
             },
+            TEST_REWARD,
         );
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].address, "bc1qdev");
-        assert!((r[0].percent - 1.5).abs() < f64::EPSILON);
+        assert_eq!(r[0].sats, 75_000_000); // floor(1.5% × 5e9)
         assert_eq!(r[1].address, "bc1qminer");
-        assert!((r[1].percent - 98.5).abs() < f64::EPSILON);
+        assert_eq!(r[1].sats, TEST_REWARD - 75_000_000); // miner takes the remainder
+        // The two outputs sum to exactly the reward.
+        assert_eq!(r[0].sats + r[1].sats, TEST_REWARD);
     }
 
     #[test]
@@ -433,9 +453,11 @@ mod tests {
                 dev_fee_address: Some("   ".into()),
                 dev_fee_percent: 1.5,
             },
+            TEST_REWARD,
         );
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].address, "bc1qminer");
+        assert_eq!(r[0].sats, TEST_REWARD);
     }
 
     #[test]
@@ -446,9 +468,11 @@ mod tests {
                 dev_fee_address: Some("bc1qdev".into()),
                 dev_fee_percent: 150.0,
             },
+            TEST_REWARD,
         );
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].address, "bc1qminer");
+        assert_eq!(r[0].sats, TEST_REWARD);
     }
 
     #[test]
@@ -462,14 +486,15 @@ mod tests {
                 dev_fee_address: Some("bc1qdev".into()),
                 dev_fee_percent: 0.0,
             },
+            TEST_REWARD,
         );
         assert_eq!(r.len(), 1, "no zero-value dev output");
         assert_eq!(r[0].address, "bc1qminer");
-        assert!((r[0].percent - 100.0).abs() < f64::EPSILON);
+        assert_eq!(r[0].sats, TEST_REWARD);
     }
 
     #[test]
-    fn entries_to_payouts_translates_address_id_to_string() {
+    fn entries_to_payouts_carries_exact_sats() {
         use bp_common::Sats;
         let entries = vec![
             CoinbaseDistributionEntry {
@@ -486,8 +511,8 @@ mod tests {
         let payouts = entries_to_payouts(&entries);
         assert_eq!(payouts.len(), 2);
         assert_eq!(payouts[0].address, "bc1qa");
-        assert!((payouts[0].percent - 60.0).abs() < f64::EPSILON);
+        assert_eq!(payouts[0].sats, 60_000_000);
         assert_eq!(payouts[1].address, "bc1qb");
-        assert!((payouts[1].percent - 40.0).abs() < f64::EPSILON);
+        assert_eq!(payouts[1].sats, 40_000_000);
     }
 }

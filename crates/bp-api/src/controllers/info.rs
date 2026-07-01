@@ -615,7 +615,7 @@ fn assemble_block_preview(
         .iter()
         .map(|p| PayoutEntry {
             address: p.address.clone(),
-            percent: p.percent,
+            sats: p.sats,
         })
         .collect();
     let cb_template = CoinbaseTemplate {

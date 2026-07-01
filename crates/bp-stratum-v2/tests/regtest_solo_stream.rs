@@ -53,11 +53,11 @@ impl PayoutResolver for SoloResolver {
     async fn resolve_payouts(
         &self,
         miner_address: &AddressId,
-        _reward_sats: u64,
+        reward_sats: u64,
     ) -> Vec<PayoutEntry> {
         vec![PayoutEntry {
             address: miner_address.as_str().to_string(),
-            percent: 100.0,
+            sats: reward_sats,
         }]
     }
 

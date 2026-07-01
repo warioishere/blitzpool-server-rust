@@ -215,7 +215,7 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
 
         // Convert PayoutEntry (address + percent) → DynamicOutput
         // (address + sats) by applying the percent to reward_sats.
-        let outputs = payouts_to_dynamic_outputs(&payouts, reward_sats);
+        let outputs = payouts_to_dynamic_outputs(&payouts);
         match encode_coinbase_outputs(self.network, &outputs) {
             Ok(bytes) => Some(AllocateTokenContext {
                 miner_address,
@@ -241,16 +241,16 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
     }
 }
 
-/// Translate `PayoutEntry { address, percent }` to
-/// `DynamicOutput { address, sats }` by applying the percent to the
-/// reward estimate. Dust (`< DUST_LIMIT_SATS = 546`) entries are
-/// dropped — the production PPLNS / Group-Solo distributors handle
-/// this upstream but defensive in case a manual / test fixture leaks
-/// a sub-dust entry through.
-fn payouts_to_dynamic_outputs(payouts: &[PayoutEntry], reward_sats: u64) -> Vec<DynamicOutput> {
+/// Translate `PayoutEntry { address, sats }` to `DynamicOutput { address, sats }`
+/// — the exact per-output sats are placed verbatim. Dust
+/// (`< DUST_LIMIT_SATS = 546`) entries are dropped — the production PPLNS /
+/// Group-Solo distributors handle this upstream but defensive in case a manual /
+/// test fixture leaks a sub-dust entry through.
+fn payouts_to_dynamic_outputs(payouts: &[PayoutEntry]) -> Vec<DynamicOutput> {
     let mut out = Vec::with_capacity(payouts.len());
     for entry in payouts {
-        let raw_sats = ((entry.percent / 100.0) * reward_sats as f64).floor() as i64;
+        // Exact sats from the distributor — placed verbatim, never re-derived.
+        let raw_sats = entry.sats as i64;
         if raw_sats < 546 {
             continue;
         }
@@ -522,7 +522,7 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
         // floor-rounding + dropped-sub-dust residual into the largest
         // kept output. An empty result means everything was sub-dust —
         // we can't build a set summing to a positive value.
-        let mut outputs = payouts_to_dynamic_outputs(&payouts, available_payout_value);
+        let mut outputs = payouts_to_dynamic_outputs(&payouts);
         if outputs.is_empty() {
             warn!(
                 request_id,
@@ -592,14 +592,14 @@ mod tests {
         let payouts = vec![
             PayoutEntry {
                 address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".into(),
-                percent: 0.0001, // → 0.0001/100 * 5_000_000_000 = 5_000 sats, dust-borderline
+                sats: 5_000, // > 546 dust limit → survives
             },
             PayoutEntry {
                 address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".into(),
-                percent: 99.9999,
+                sats: 4_999_995_000,
             },
         ];
-        let outs = payouts_to_dynamic_outputs(&payouts, 5_000_000_000);
+        let outs = payouts_to_dynamic_outputs(&payouts);
         // 5_000 sats > 546 dust limit, so first entry survives.
         assert_eq!(outs.len(), 2);
         assert_eq!(outs[0].sats.to_i64(), 5_000);
@@ -609,9 +609,9 @@ mod tests {
     fn payouts_to_dynamic_outputs_drops_truly_sub_dust() {
         let payouts = vec![PayoutEntry {
             address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".into(),
-            percent: 0.000001, // → 0.5 sats, way below dust
+            sats: 500, // below the 546 dust limit → dropped
         }];
-        let outs = payouts_to_dynamic_outputs(&payouts, 5_000_000_000);
+        let outs = payouts_to_dynamic_outputs(&payouts);
         assert!(outs.is_empty());
     }
 
@@ -623,9 +623,9 @@ mod tests {
         // (>62 chars) to verify the defensive filter at this layer.
         let payouts = vec![PayoutEntry {
             address: "x".repeat(70),
-            percent: 100.0,
+            sats: 5_000_000_000,
         }];
-        let outs = payouts_to_dynamic_outputs(&payouts, 5_000_000_000);
+        let outs = payouts_to_dynamic_outputs(&payouts);
         assert!(outs.is_empty());
     }
 

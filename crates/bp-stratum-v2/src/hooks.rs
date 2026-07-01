@@ -70,10 +70,9 @@ use crate::mining::submit::{RejectReason, ShareAccept};
 #[async_trait::async_trait]
 pub trait PayoutResolver: Send + Sync {
     /// Resolve the payout list for a given connection's locked
-    /// address + reward (in sats). Returns the list ordered so
-    /// `floor(percent / 100 × reward)` per entry sums to ≤ reward;
-    /// `bp_mining_job::build_mining_job_from_tdp` redistributes the
-    /// floor remainder to `outs[0]`.
+    /// address + reward (in sats). Each entry carries its exact output
+    /// sats (summing to ≤ reward); `bp_mining_job::build_mining_job_from_tdp`
+    /// places them verbatim and sweeps any shortfall onto `outs[0]`.
     async fn resolve_payouts(
         &self,
         miner_address: &AddressId,
@@ -240,11 +239,11 @@ impl PayoutResolver for NoOpHooks {
     async fn resolve_payouts(
         &self,
         miner_address: &AddressId,
-        _reward_sats: u64,
+        reward_sats: u64,
     ) -> Vec<PayoutEntry> {
         vec![PayoutEntry {
             address: miner_address.as_str().to_string(),
-            percent: 100.0,
+            sats: reward_sats,
         }]
     }
 }
@@ -382,14 +381,14 @@ pub mod test_support {
         async fn resolve_payouts(
             &self,
             miner_address: &AddressId,
-            _reward_sats: u64,
+            reward_sats: u64,
         ) -> Vec<PayoutEntry> {
             if let Some(ref custom) = *self.payouts_override.lock().expect("poisoned") {
                 return custom.clone();
             }
             vec![PayoutEntry {
                 address: miner_address.as_str().to_string(),
-                percent: 100.0,
+                sats: reward_sats,
             }]
         }
     }
@@ -548,7 +547,7 @@ mod tests {
         let hooks = NoOpHooks;
         let payouts = hooks.resolve_payouts(&make_addr(), 5_000_000_000).await;
         assert_eq!(payouts.len(), 1);
-        assert!((payouts[0].percent - 100.0).abs() < f64::EPSILON);
+        assert_eq!(payouts[0].sats, 5_000_000_000);
     }
 
     #[tokio::test]
@@ -625,11 +624,11 @@ mod tests {
         let hooks = RecordingHooks::new().with_payouts(vec![
             PayoutEntry {
                 address: "p1".to_string(),
-                percent: 30.0,
+                sats: 1_500_000_000,
             },
             PayoutEntry {
                 address: "p2".to_string(),
-                percent: 70.0,
+                sats: 3_500_000_000,
             },
         ]);
         let payouts = hooks.resolve_payouts(&make_addr(), 5_000_000_000).await;

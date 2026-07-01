@@ -68,7 +68,7 @@ async fn single_output_coinbase_no_fee_accepted_by_core() {
 
     let payouts = vec![PayoutEntry {
         address: MINER_ADDR.to_string(),
-        percent: 100.0,
+        sats: 5_000_000_000,
     }];
     run_block_acceptance_case(payouts, "v1-solo-nofee").await;
 }
@@ -90,14 +90,8 @@ async fn fee_split_two_output_coinbase_accepted_by_core() {
     let fee_percent = 1.5;
     let fee_addr = deterministic_p2wpkh_regtest([0x42; 32]);
     let payouts = vec![
-        PayoutEntry {
-            address: fee_addr,
-            percent: fee_percent,
-        },
-        PayoutEntry {
-            address: MINER_ADDR.to_string(),
-            percent: 100.0 - fee_percent,
-        },
+        PayoutEntry::from_percent(fee_addr, fee_percent, 5_000_000_000),
+        PayoutEntry::from_percent(MINER_ADDR, 100.0 - fee_percent, 5_000_000_000),
     ];
     run_block_acceptance_case(payouts, "v1-solo-fee").await;
 }
@@ -336,23 +330,23 @@ async fn coinbase_with_all_5_address_types_accepted_by_core() {
     let payouts = vec![
         PayoutEntry {
             address: p2pkh.clone(),
-            percent: 20.0,
+            sats: 1_000_000_000,
         },
         PayoutEntry {
             address: p2sh.clone(),
-            percent: 20.0,
+            sats: 1_000_000_000,
         },
         PayoutEntry {
             address: p2wpkh.clone(),
-            percent: 20.0,
+            sats: 1_000_000_000,
         },
         PayoutEntry {
             address: p2wsh.clone(),
-            percent: 20.0,
+            sats: 1_000_000_000,
         },
         PayoutEntry {
             address: p2tr.clone(),
-            percent: 20.0,
+            sats: 1_000_000_000,
         },
     ];
 

@@ -126,7 +126,7 @@ async fn pending_party_admin_routes_block_to_pool_fee_accepted_by_core() {
 
     let payouts = vec![PayoutEntry {
         address: route.fee_address.into_inner(),
-        percent: route.percent as f64,
+        sats: 5_000_000_000,
     }];
     let coinbase_template = TdpCoinbaseTemplate {
         coinbase_prefix: &template.coinbase_prefix,

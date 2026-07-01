@@ -347,7 +347,7 @@ mod tests {
         };
         let payouts = vec![PayoutEntry {
             address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-            percent: 100.0,
+            sats: 5_000_000_000,
         }];
         build_mining_job_from_tdp(
             Network::Bitcoin,

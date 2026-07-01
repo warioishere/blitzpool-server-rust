@@ -97,7 +97,7 @@ async fn coinbase_from_core31_template_is_bip54_compliant_and_accepted() {
     // ── Build the coinbase the pool way (passthrough of Core's fields) ─
     let payouts = vec![PayoutEntry {
         address: MINER_ADDR.to_string(),
-        percent: 100.0,
+        sats: 5_000_000_000,
     }];
     let coinbase_template = TdpCoinbaseTemplate {
         coinbase_prefix: &template.coinbase_prefix,

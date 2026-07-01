@@ -156,7 +156,7 @@ async fn run_block_submit_case(miner_extranonce_size: u8) {
     };
     let payouts = vec![PayoutEntry {
         address: MINER_ADDR.to_string(),
-        percent: 100.0,
+        sats: 5_000_000_000,
     }];
     let mining_job = build_mining_job_from_tdp(
         Network::Regtest,

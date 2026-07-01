@@ -221,7 +221,7 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
         .iter()
         .map(|p| PayoutEntry {
             address: p.address.as_str().to_string(),
-            percent: p.percent,
+            sats: p.sats.0 as u64,
         })
         .collect();
     let coinbase_template = TdpCoinbaseTemplate {

@@ -21,11 +21,31 @@ const WITNESS_COMMIT_MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
 const COINBASE_NONFINAL_SEQUENCE: u32 = 0xffff_fffe;
 
 /// A miner-payout entry for the coinbase outputs.
+///
+/// Carries the EXACT satoshi amount for the output — the payout distributors
+/// (PPLNS / Group-Solo / Blockparty) already do the precise integer allocation
+/// (largest-remainder residuum, fixed finder bonus, solvency cap), so the
+/// coinbase builder must place those sats verbatim. Deriving amounts from a
+/// float percentage here would re-floor each output and silently drop up to a
+/// sat per output (e.g. a 50 000 000-sat finder bonus rounding to 49 999 999).
 #[derive(Clone, Debug)]
 pub struct PayoutEntry {
     pub address: String,
-    /// Percentage of the block reward, 0.0..100.0.
-    pub percent: f64,
+    /// Exact output amount in satoshis.
+    pub sats: u64,
+}
+
+impl PayoutEntry {
+    /// Percentage-based convenience: floor `percent`% of `reward_sats` to an
+    /// exact output. For the Solo split (dev-fee / 100%-to-miner) and the
+    /// percentage-oriented tests. The PPLNS / Group-Solo / Blockparty
+    /// distributors bypass this — they carry exact per-output sats already.
+    pub fn from_percent(address: impl Into<String>, percent: f64, reward_sats: u64) -> Self {
+        Self {
+            address: address.into(),
+            sats: ((percent / 100.0) * reward_sats as f64).floor() as u64,
+        }
+    }
 }
 
 /// The block-template fields needed for coinbase construction.
@@ -149,8 +169,9 @@ pub enum MiningJobError {
 /// `channel.extranonce_prefix.len() + channel.extranonce_size` so the
 /// scriptsig_len varint matches the wire bytes exactly.
 ///
-/// Floor remainder from `floor(percent/100 * reward)` per output is added
-/// to `outs[0]` so the coinbase consumes exactly `coinbase_value_sats`.
+/// Each `PayoutEntry` carries its exact sats, placed verbatim. Any shortfall
+/// vs `coinbase_value_sats` (normally zero — the distributor sums to the
+/// reward) is swept onto `outs[0]` so the coinbase consumes it exactly.
 ///
 /// The coinbase is built BIP-54-compliant: `nLockTime = block_height - 1`
 /// and a non-final `nSequence` (`0xfffffffe`). The TDP path
@@ -399,14 +420,46 @@ fn build_payout_outputs(
     let mut total_paid: u64 = 0;
 
     for p in payouts {
-        let amount = ((p.percent / 100.0) * reward_sats as f64).floor() as u64;
+        // Place the exact sats the distributor computed. No percent re-derivation
+        // — the distribution already summed to `reward_sats` precisely.
+        let amount = p.sats;
         total_paid = total_paid.saturating_add(amount);
         let script = address::address_to_script(network, &p.address)?.into_bytes();
         outputs.push((amount, script));
     }
 
-    let remainder = reward_sats.saturating_sub(total_paid);
-    outputs[0].0 = outputs[0].0.saturating_add(remainder);
+    // Reconcile to consume EXACTLY `reward_sats` so the coinbase can never be
+    // rejected as bad-cb-amount. The distributors already sum to the reward, so
+    // this is normally a no-op — it's a defensive guard, not the primary path.
+    match total_paid.cmp(&reward_sats) {
+        // Undershoot (an edge-case forfeited residuum): sweep the shortfall onto
+        // the first output so the full reward is claimed.
+        std::cmp::Ordering::Less => {
+            outputs[0].0 = outputs[0].0.saturating_add(reward_sats - total_paid);
+        }
+        // Overshoot must never happen — the PPLNS solvency cap / group-solo /
+        // blockparty allocators bound the sum at the reward. If a distributor bug
+        // ever breaches that, a verbatim over-value coinbase would forfeit a real
+        // found block; trimming the excess off the trailing outputs keeps the
+        // block valid (strictly better than a lost block). `debug_assert` makes
+        // the invariant loud in tests.
+        std::cmp::Ordering::Greater => {
+            debug_assert!(
+                false,
+                "coinbase payout overshoot: total_paid {total_paid} > reward {reward_sats}"
+            );
+            let mut excess = total_paid - reward_sats;
+            for out in outputs.iter_mut().rev() {
+                if excess == 0 {
+                    break;
+                }
+                let cut = out.0.min(excess);
+                out.0 -= cut;
+                excess -= cut;
+            }
+        }
+        std::cmp::Ordering::Equal => {}
+    }
 
     Ok(outputs)
 }
@@ -536,9 +589,11 @@ mod tests {
     }
 
     fn single_payout(addr: &str) -> Vec<PayoutEntry> {
+        // Single output → the builder's remainder guard tops it up to the full
+        // reward regardless of the exact value seeded here.
         vec![PayoutEntry {
             address: addr.to_string(),
-            percent: 100.0,
+            sats: 5_000_000_000,
         }]
     }
 
@@ -695,24 +750,45 @@ mod tests {
     }
 
     #[test]
+    fn build_payout_outputs_places_exact_sats_verbatim() {
+        // Regression: the distributor computes exact per-output sats (fixed
+        // finder bonus, largest-remainder residuum). The coinbase builder must
+        // place them verbatim — NOT re-derive `floor(percent/100 × reward)`,
+        // which silently dropped a sat (a 50 000 000-sat bonus rounding to
+        // 49 999 999). Mirrors a real Group-Solo block-template payout set.
+        let reward = 316_672_616;
+        let payouts = vec![
+            PayoutEntry {
+                address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".into(),
+                sats: 4_750_092,
+            },
+            PayoutEntry {
+                address: "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2".into(),
+                sats: 50_000_000, // finder bonus — must stay EXACT
+            },
+            PayoutEntry {
+                address: "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy".into(),
+                sats: reward - 4_750_092 - 50_000_000,
+            },
+        ];
+        let outs = build_payout_outputs(Network::Bitcoin, &payouts, reward).unwrap();
+        assert_eq!(outs[0].0, 4_750_092);
+        assert_eq!(outs[1].0, 50_000_000, "finder bonus placed verbatim, not floored");
+        assert_eq!(outs[2].0, reward - 4_750_092 - 50_000_000);
+        let total: u64 = outs.iter().map(|(amt, _)| *amt).sum();
+        assert_eq!(total, reward, "coinbase sums to exactly the reward");
+    }
+
+    #[test]
     fn floor_remainder_added_to_first_output() {
         // 5_000_000_000 split 3 ways with floor: each gets 1_666_666_666, total = 4_999_999_998.
         // Remainder of 2 sats goes to outs[0] → 1_666_666_668.
         let template = template_with_height(100);
         let percent = 100.0 / 3.0;
         let payouts = vec![
-            PayoutEntry {
-                address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-                percent,
-            },
-            PayoutEntry {
-                address: "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2".to_string(),
-                percent,
-            },
-            PayoutEntry {
-                address: "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy".to_string(),
-                percent,
-            },
+            PayoutEntry::from_percent("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", percent, 5_000_000_000),
+            PayoutEntry::from_percent("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", percent, 5_000_000_000),
+            PayoutEntry::from_percent("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", percent, 5_000_000_000),
         ];
         let job = build_mining_job(
             Network::Bitcoin,
@@ -996,18 +1072,9 @@ mod tests {
         let (prefix, outputs) = tdp_template_for([0u8; 32]);
         let percent = 100.0 / 3.0;
         let payouts = vec![
-            PayoutEntry {
-                address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-                percent,
-            },
-            PayoutEntry {
-                address: "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2".to_string(),
-                percent,
-            },
-            PayoutEntry {
-                address: "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy".to_string(),
-                percent,
-            },
+            PayoutEntry::from_percent("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", percent, 5_000_000_000),
+            PayoutEntry::from_percent("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", percent, 5_000_000_000),
+            PayoutEntry::from_percent("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", percent, 5_000_000_000),
         ];
         let template = TdpCoinbaseTemplate {
             coinbase_prefix: &prefix,

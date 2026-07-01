@@ -128,7 +128,7 @@ async fn sv2_group_solo_connection_routes_to_group_solo_stream_and_block_accepte
     // 1-output coinbase: full reward to the miner address.
     let payouts = vec![PayoutEntry {
         address: REGTEST_ADDR.to_string(),
-        percent: 100.0,
+        sats: 5_000_000_000,
     }];
     let (recorded, before, after) =
         run_scenario(&node, payouts, GROUP_SOLO_RESERVATION_BYTES).await;
@@ -154,7 +154,7 @@ async fn sv2_group_solo_max_size_multi_output_coinbase_accepted() {
             .expect("mint bech32m member address");
         payouts.push(PayoutEntry {
             address: addr,
-            percent: 100.0 / MEMBERS as f64,
+            sats: 5_000_000_000 / MEMBERS as u64,
         });
     }
     let (recorded, before, after) =

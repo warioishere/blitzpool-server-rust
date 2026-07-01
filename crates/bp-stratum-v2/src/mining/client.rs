@@ -3683,7 +3683,7 @@ mod tests {
     fn payouts() -> Vec<PayoutEntry> {
         vec![PayoutEntry {
             address: REGTEST_ADDR.to_string(),
-            percent: 100.0,
+            sats: 5_000_000_000,
         }]
     }
 

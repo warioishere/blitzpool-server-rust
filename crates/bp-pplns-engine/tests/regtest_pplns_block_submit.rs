@@ -220,7 +220,7 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
         .iter()
         .map(|p| PayoutEntry {
             address: p.address.as_str().to_string(),
-            percent: p.percent,
+            sats: p.sats.0 as u64,
         })
         .collect();
 
@@ -412,7 +412,7 @@ async fn pplns_block_with_real_txs_nonempty_merkle_path_accepted_by_core() {
         .iter()
         .map(|p| PayoutEntry {
             address: p.address.as_str().to_string(),
-            percent: p.percent,
+            sats: p.sats.0 as u64,
         })
         .collect();
 

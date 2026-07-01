@@ -1293,7 +1293,7 @@ mod tests {
 
         let payouts = [PayoutEntry {
             address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            percent: 100.0,
+            sats: 5_000_000_000,
         }];
         let template = CoinbaseTemplate {
             block_height: 42,

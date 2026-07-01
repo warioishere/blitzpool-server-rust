@@ -255,7 +255,7 @@ async fn run_trim_scenario(
         .iter()
         .map(|e| PayoutEntry {
             address: e.address.as_str().to_string(),
-            percent: e.percent,
+            sats: e.sats.0 as u64,
         })
         .collect();
 

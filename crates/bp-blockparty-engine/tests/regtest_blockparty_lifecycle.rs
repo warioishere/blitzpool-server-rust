@@ -154,7 +154,7 @@ async fn blockparty_two_member_block_accepted_by_core_and_history_idempotent() {
         .iter()
         .map(|p| PayoutEntry {
             address: p.address.as_str().to_string(),
-            percent: p.percent,
+            sats: p.sats.0 as u64,
         })
         .collect();
     let coinbase_template = TdpCoinbaseTemplate {

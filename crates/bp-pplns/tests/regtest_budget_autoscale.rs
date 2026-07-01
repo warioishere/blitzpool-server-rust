@@ -129,7 +129,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
         .iter()
         .map(|e| PayoutEntry {
             address: e.address.as_str().to_string(),
-            percent: e.percent,
+            sats: e.sats.0 as u64,
         })
         .collect();
     eprintln!("[autoscale] distribution kept {} outputs", payouts.len());
