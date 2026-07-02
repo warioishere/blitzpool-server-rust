@@ -50,6 +50,21 @@ pub const AGGREGATION_JOB_DURATION_SECONDS: &str = "aggregation_job_duration_sec
 /// flush cron of the stats-sink + the daily 03:00 UTC sweep cron.
 pub const AGGREGATION_JOB_BUCKETS_SECONDS: &[f64] = &[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0];
 
+// ── Core→Satellite stream consumers ─────────────────────────────────
+
+/// Per-group consumer lag — entries added to the stream but not yet
+/// delivered to this consumer group. A rising value means a satellite is
+/// behind or down. Only emitted while Redis can compute it (see
+/// [`STREAM_CONSUMER_LAG_COMPUTABLE`]).
+pub const STREAM_CONSUMER_LAG: &str = "stream_consumer_lag";
+/// Per-group pending (delivered-but-unacked) entries — the PEL size.
+pub const STREAM_CONSUMER_PENDING: &str = "stream_consumer_pending";
+/// `1` when Redis can compute the group's lag, `0` when it can't — which
+/// happens exactly when the stream was trimmed below the group's last-read id
+/// (probable entry loss). The plain lag gauge goes blind in that case, so
+/// alert on `stream_consumer_lag_computable == 0`, not just on high lag.
+pub const STREAM_CONSUMER_LAG_COMPUTABLE: &str = "stream_consumer_lag_computable";
+
 // ── Label names ──────────────────────────────────────────────────────
 
 pub const LABEL_STATUS: &str = "status";
@@ -57,3 +72,5 @@ pub const LABEL_PROTOCOL: &str = "protocol";
 pub const LABEL_METHOD: &str = "method";
 pub const LABEL_ENDPOINT: &str = "endpoint";
 pub const LABEL_JOB_NAME: &str = "job_name";
+pub const LABEL_STREAM: &str = "stream";
+pub const LABEL_GROUP: &str = "group";

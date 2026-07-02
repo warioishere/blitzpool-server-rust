@@ -72,6 +72,29 @@ pub(crate) struct FoundationHandles {
     pub(crate) metrics: Option<MetricsServiceHandle>,
 }
 
+impl FoundationHandles {
+    /// A dedicated Redis [`ConnectionManager`] for a blocking stream consumer.
+    /// A blocking command (`XREAD BLOCK`) must never share a multiplexed
+    /// connection — it head-of-line-blocks every command queued behind it on
+    /// that one connection. Falls back to the shared handle only if a fresh
+    /// connection can't be opened. `who` labels the consumer in the fallback
+    /// warning.
+    pub(crate) async fn dedicated_redis(&self, cfg: &RedisConfig, who: &str) -> ConnectionManager {
+        match spawn_redis(cfg).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    consumer = who,
+                    "dedicated redis connection failed; reusing the shared handle \
+                     (its blocking read may stall this process's redis throughput)"
+                );
+                self.redis.clone()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum BootError {
     #[error("postgres connect failed: {0}")]

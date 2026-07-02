@@ -70,6 +70,28 @@ pub fn set_stratum_clients_connected(protocol: &'static str, count: i64) {
     gauge!(STRATUM_CLIENTS_CONNECTED, LABEL_PROTOCOL => protocol).set(count as f64);
 }
 
+/// Update the Core→Satellite stream-consumer lag gauges for one consumer
+/// group. `lag` is `None` when Redis can't compute it (the stream was trimmed
+/// below the group's read offset — the probable-entry-loss case); the
+/// `_computable` gauge then drops to `0` so alerting catches the blind spot the
+/// plain lag gauge would otherwise mask as "0 / ok". `pending` (PEL size) is
+/// always known and always emitted.
+pub fn set_stream_consumer_lag(stream: &str, group: &str, lag: Option<u64>, pending: u64) {
+    let stream = stream.to_string();
+    let group = group.to_string();
+    gauge!(STREAM_CONSUMER_PENDING, LABEL_STREAM => stream.clone(), LABEL_GROUP => group.clone())
+        .set(pending as f64);
+    gauge!(
+        STREAM_CONSUMER_LAG_COMPUTABLE,
+        LABEL_STREAM => stream.clone(),
+        LABEL_GROUP => group.clone(),
+    )
+    .set(if lag.is_some() { 1.0 } else { 0.0 });
+    if let Some(lag) = lag {
+        gauge!(STREAM_CONSUMER_LAG, LABEL_STREAM => stream, LABEL_GROUP => group).set(lag as f64);
+    }
+}
+
 /// Tick the vardiff-adjustment counter.
 pub fn record_stratum_difficulty_adjustment() {
     counter!(STRATUM_DIFFICULTY_ADJUSTMENTS_TOTAL).increment(1);
@@ -166,6 +188,9 @@ mod tests {
         record_share_submission(ShareStatus::Stale, 2048.0, None);
         set_stratum_clients_connected("sv1", 42);
         set_stratum_clients_connected("sv2", 7);
+        set_stream_consumer_lag("shares:accepted", "money", Some(0), 0);
+        set_stream_consumer_lag("shares:accepted", "money", Some(1234), 5);
+        set_stream_consumer_lag("blocks:found", "notify", None, 2);
         record_stratum_difficulty_adjustment();
         record_stratum_job_sent();
         record_api_request("GET", "/api/pplns/window", 200, Duration::from_millis(15));

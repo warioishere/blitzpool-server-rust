@@ -632,7 +632,7 @@ async fn main() -> ExitCode {
     // so the SCAN/DUMP burst never touches the share hot-path. Restore is never
     // automatic — see `--restore-redis-state`.
     let _redis_state_backup = if cfg.has_role(Role::Payout) {
-        let backup_redis = dedicated_redis(&cfg.redis, &handles.redis, "redis-state-backup").await;
+        let backup_redis = handles.dedicated_redis(&cfg.redis, "redis-state-backup").await;
         Some(crate::redis_backup::spawn_backup_task(
             backup_redis,
             handles.db.pool().clone(),
@@ -663,8 +663,8 @@ async fn main() -> ExitCode {
         }
         // Dedicated connection per consumer group — a blocking XREAD must not
         // share a multiplexed connection (it head-of-line-blocks the rest).
-        let money_redis = dedicated_redis(&cfg.redis, &handles.redis, "satellite-money").await;
-        let stats_redis = dedicated_redis(&cfg.redis, &handles.redis, "satellite-stats").await;
+        let money_redis = handles.dedicated_redis(&cfg.redis, "satellite-money").await;
+        let stats_redis = handles.dedicated_redis(&cfg.redis, "satellite-stats").await;
         Some(satellite_consumer::spawn(money_redis, stats_redis, sinks))
     } else {
         None
@@ -682,7 +682,7 @@ async fn main() -> ExitCode {
             None,
             Some(handles.redis.clone()),
         );
-        let bf_redis = dedicated_redis(&cfg.redis, &handles.redis, "block-found-ledger").await;
+        let bf_redis = handles.dedicated_redis(&cfg.redis, "block-found-ledger").await;
         Some(crate::block_found_consumer::spawn(
             bf_redis,
             applier,
@@ -699,7 +699,7 @@ async fn main() -> ExitCode {
         match dispatcher.clone() {
             Some(d) => {
                 let bf_notify_redis =
-                    dedicated_redis(&cfg.redis, &handles.redis, "block-found-notify").await;
+                    handles.dedicated_redis(&cfg.redis, "block-found-notify").await;
                 let applier =
                     crate::block_sink::BlockFoundApplier::new(None, None, None, Some(d), None);
                 Some(crate::block_found_consumer::spawn(
@@ -718,7 +718,7 @@ async fn main() -> ExitCode {
     // reject counters (the Core stamps the group_id, then publishes).
     let rejected_consumer = if consumes_streams {
         let sinks = engines::build_rejected_sinks(&engines.group_solo, &engines.stats);
-        let rej_redis = dedicated_redis(&cfg.redis, &handles.redis, "rejected").await;
+        let rej_redis = handles.dedicated_redis(&cfg.redis, "rejected").await;
         Some(crate::rejected_consumer::spawn(rej_redis, sinks))
     } else {
         None
@@ -731,7 +731,7 @@ async fn main() -> ExitCode {
     let device_status_consumer = if consumes_notify_streams {
         match dispatcher.clone() {
             Some(d) => {
-                let ds_redis = dedicated_redis(&cfg.redis, &handles.redis, "device-status").await;
+                let ds_redis = handles.dedicated_redis(&cfg.redis, "device-status").await;
                 Some(crate::device_status_consumer::spawn(ds_redis, d))
             }
             None => None,
@@ -783,7 +783,7 @@ async fn main() -> ExitCode {
         // ms share-ack spikes. A blocking command MUST get its own
         // connection. Fall back to the shared handle only if a fresh
         // connection can't be opened.
-        let cache_conn = dedicated_redis(&cfg.redis, &handles.redis, "cache-sync").await;
+        let cache_conn = handles.dedicated_redis(&cfg.redis, "cache-sync").await;
         Some(crate::cache_sync::spawn(
             cache_conn,
             group_service.clone(),
@@ -1132,30 +1132,6 @@ fn log_api_summary(api: Option<&ApiServerHandle>, is_api: bool) {
 }
 
 /// One-line summary after the unified SV1+SV2 listeners are bound. Stratum is
-/// A dedicated Redis [`ConnectionManager`](redis::aio::ConnectionManager) for
-/// a blocking stream consumer. A blocking command (`XREAD BLOCK`) must never
-/// share a multiplexed connection — it head-of-line-blocks every command
-/// queued behind it on that one connection. Falls back to the shared handle
-/// only if a fresh connection can't be opened.
-async fn dedicated_redis(
-    cfg: &bp_config::RedisConfig,
-    shared: &redis::aio::ConnectionManager,
-    who: &str,
-) -> redis::aio::ConnectionManager {
-    match crate::boot::spawn_redis(cfg).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                consumer = who,
-                "dedicated redis connection failed; reusing the shared handle \
-                 (its blocking read may stall this process's redis throughput)"
-            );
-            shared.clone()
-        }
-    }
-}
-
 /// the always-on front (`front` role), so on the api/payout processes it's not
 /// run — say so rather than logging nothing. Empty `ports` on the front means
 /// TDP was skipped (`--skip-tdp`) — stratum spawn is a no-op in that case to

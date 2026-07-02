@@ -24,13 +24,39 @@ use tracing::{debug, info, warn};
 /// a 30s sample is plenty to catch a sustained backlog without polling churn.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Per-group lag (undelivered entries) for one stream at one sample.
+/// Per-group lag (undelivered entries) for one stream at one sample. `lag` is
+/// `None` when Redis can't compute it — which happens exactly when the stream
+/// was trimmed below the group's last-read id (the probable-entry-loss case),
+/// so `None` is treated as alarming, not as `0`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LagReport {
     pub(crate) stream: String,
     pub(crate) group: String,
-    pub(crate) lag: usize,
+    pub(crate) lag: Option<usize>,
     pub(crate) pending: usize,
+}
+
+/// Classification of one lag sample against the budget. Split out as a pure
+/// function so the "is this alarming?" decision is unit-testable without Redis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LagStatus {
+    /// Lag known and within budget.
+    Ok,
+    /// Lag known and over budget — the satellite is behind or down.
+    OverBudget,
+    /// Lag unavailable — the stream was trimmed below the group offset, which
+    /// means entries were almost certainly lost. Alarming precisely because the
+    /// plain lag number would read `0` here.
+    Unknown,
+}
+
+/// Classify a lag sample. `None` → [`LagStatus::Unknown`] (never silently `0`).
+pub(crate) fn classify(lag: Option<usize>, budget: usize) -> LagStatus {
+    match lag {
+        None => LagStatus::Unknown,
+        Some(l) if l > budget => LagStatus::OverBudget,
+        Some(_) => LagStatus::Ok,
+    }
 }
 
 /// Live monitor task + its cancel token.
@@ -67,22 +93,36 @@ pub(crate) fn spawn(
                 _ = task_cancel.cancelled() => break,
                 _ = tick.tick() => {
                     for report in collect_lag(&redis, &keys).await {
-                        if report.lag > lag_budget {
-                            warn!(
+                        // Export before classifying: the gauges must reflect
+                        // every sample, and `lag = None` drops the
+                        // `_computable` gauge to 0 (the alertable blind spot).
+                        bp_metrics::set_stream_consumer_lag(
+                            &report.stream,
+                            &report.group,
+                            report.lag.map(|l| l as u64),
+                            report.pending as u64,
+                        );
+                        match classify(report.lag, lag_budget) {
+                            LagStatus::OverBudget => warn!(
                                 stream = %report.stream,
                                 group = %report.group,
-                                lag = report.lag,
+                                lag = ?report.lag,
                                 pending = report.pending,
                                 lag_budget,
                                 "stream-monitor: consumer lag over budget — Satellite is behind or down"
-                            );
-                        } else {
-                            debug!(
+                            ),
+                            LagStatus::Unknown => warn!(
                                 stream = %report.stream,
                                 group = %report.group,
-                                lag = report.lag,
+                                pending = report.pending,
+                                "stream-monitor: consumer lag UNAVAILABLE — stream likely trimmed below the group offset (probable entry loss); investigate"
+                            ),
+                            LagStatus::Ok => debug!(
+                                stream = %report.stream,
+                                group = %report.group,
+                                lag = ?report.lag,
                                 "stream-monitor: lag ok"
-                            );
+                            ),
                         }
                     }
                 }
@@ -110,10 +150,11 @@ pub(crate) async fn collect_lag(redis: &ConnectionManager, keys: &[&str]) -> Vec
             out.push(LagReport {
                 stream: (*key).to_string(),
                 group: g.name,
-                // `lag` is `None` if Redis can't compute it (e.g. the stream
-                // was XADD-trimmed below the group's last-read id); treat that
-                // as 0 here — the monitor is best-effort observability.
-                lag: g.lag.unwrap_or(0),
+                // `lag` is `None` if Redis can't compute it (the stream was
+                // XADD-trimmed below the group's last-read id). Kept as-is
+                // (NOT coerced to 0) so the monitor can flag it as the
+                // entry-loss signal it is — see [`classify`].
+                lag: g.lag,
                 pending: g.pending,
             });
         }
@@ -179,6 +220,17 @@ mod tests {
         let reports = collect_lag(&conn, &[key]).await;
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].group, "g1");
-        assert_eq!(reports[0].lag, 4, "all 4 entries are undelivered");
+        assert_eq!(reports[0].lag, Some(4), "all 4 entries are undelivered");
+    }
+
+    /// The alarming case is `lag = None` (Redis can't compute lag → stream
+    /// trimmed below the group offset → probable entry loss). It must NOT be
+    /// treated as `0`/ok — the whole point of the ② hardening.
+    #[test]
+    fn classify_treats_none_as_unknown_not_ok() {
+        assert_eq!(classify(None, 100), LagStatus::Unknown);
+        assert_eq!(classify(Some(101), 100), LagStatus::OverBudget);
+        assert_eq!(classify(Some(100), 100), LagStatus::Ok, "at budget is ok");
+        assert_eq!(classify(Some(0), 100), LagStatus::Ok);
     }
 }

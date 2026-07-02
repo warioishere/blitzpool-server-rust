@@ -41,6 +41,6 @@ pub use error::MetricsError;
 pub use recorder::{
     record_aggregation_job, record_api_request, record_pool_block_found, record_pool_stats,
     record_share_submission, record_stratum_difficulty_adjustment, record_stratum_job_sent,
-    set_stratum_clients_connected, AggregationStatus, ShareStatus,
+    set_stratum_clients_connected, set_stream_consumer_lag, AggregationStatus, ShareStatus,
 };
 pub use service::{MetricsService, MetricsServiceHandle};

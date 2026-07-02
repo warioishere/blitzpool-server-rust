@@ -150,6 +150,83 @@ impl AcceptedShareProducer {
     }
 }
 
+/// Off-loop publish buffer. An `XADD` is sub-millisecond at realistic
+/// share rates, so this only fills if Redis publishing stalls. On overflow
+/// we drop (best-effort — the miner already got its accept) rather than
+/// block the stratum read loop. ~32 s of headroom at 250 shares/s.
+const PUBLISH_BUFFER: usize = 8192;
+
+/// Anything that can publish one owned record onto a stream. Lets the shared
+/// [`BufferedPublisher`] drain-loop back both the accepted-share producer and
+/// the generic [`StreamProducer`] without caring which it holds.
+#[async_trait]
+trait ItemPublisher<T>: Send + Sync + 'static {
+    async fn publish_item(&self, item: &T) -> Result<(), StreamError>;
+}
+
+#[async_trait]
+impl ItemPublisher<SharedAcceptedShareOwned> for AcceptedShareProducer {
+    async fn publish_item(&self, item: &SharedAcceptedShareOwned) -> Result<(), StreamError> {
+        self.publish(item).await.map(|_| ())
+    }
+}
+
+#[async_trait]
+impl<T: Serialize + Send + Sync + 'static> ItemPublisher<T> for StreamProducer<T> {
+    async fn publish_item(&self, item: &T) -> Result<(), StreamError> {
+        self.publish(item).await.map(|_| ())
+    }
+}
+
+/// Off-loop publish core shared by the producing sinks: a bounded channel + a
+/// drain task that owns the `XADD` round-trip, so the latency-sensitive stratum
+/// read loop never blocks on Redis (the loop already acked the share in ~40µs).
+/// On buffer overflow it drops best-effort and logs on power-of-two crossings
+/// to surface a sustained stall without flooding.
+struct BufferedPublisher<T> {
+    tx: mpsc::Sender<T>,
+    dropped: Arc<AtomicU64>,
+    what: &'static str,
+}
+
+impl<T: Send + 'static> BufferedPublisher<T> {
+    fn new<P: ItemPublisher<T>>(producer: P, what: &'static str) -> Self {
+        let (tx, mut rx) = mpsc::channel::<T>(PUBLISH_BUFFER);
+        tokio::spawn(async move {
+            while let Some(item) = rx.recv().await {
+                if let Err(e) = producer.publish_item(&item).await {
+                    tracing::warn!(
+                        error = %e,
+                        what,
+                        "share-stream: stream publish failed (accounting deferred)"
+                    );
+                }
+            }
+        });
+        Self {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            what,
+        }
+    }
+
+    /// Non-blocking hand-off to the drain task (a few atomics + a move, no
+    /// network `.await`). Drops best-effort if the buffer is full (publish
+    /// lagging) or the drain task is gone.
+    fn offer(&self, item: T) {
+        if self.tx.try_send(item).is_err() {
+            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    dropped_total = n,
+                    what = self.what,
+                    "share-stream: publish buffer full — dropping (stream publish lagging)"
+                );
+            }
+        }
+    }
+}
+
 /// A [`SharedAcceptedShareSink`] that publishes each accepted share onto the
 /// Redis stream — the Core's fan-out target in `core` mode.
 ///
@@ -158,37 +235,14 @@ impl AcceptedShareProducer {
 /// this one sink instead of the engine sinks. The share it receives is
 /// already stamped, so the published owned record carries everything the
 /// Satellite's sinks need.
-/// Off-loop publish buffer. An `XADD` is sub-millisecond at realistic
-/// share rates, so this only fills if Redis publishing stalls. On overflow
-/// we drop (best-effort — the miner already got its accept) rather than
-/// block the stratum read loop. ~32 s of headroom at 250 shares/s.
-const PUBLISH_BUFFER: usize = 8192;
-
 pub struct ProducingSink {
-    tx: mpsc::Sender<SharedAcceptedShareOwned>,
-    dropped: Arc<AtomicU64>,
+    inner: BufferedPublisher<SharedAcceptedShareOwned>,
 }
 
 impl ProducingSink {
     pub fn new(producer: AcceptedShareProducer) -> Self {
-        let (tx, mut rx) = mpsc::channel::<SharedAcceptedShareOwned>(PUBLISH_BUFFER);
-        // Drain task: the `XADD` round-trip lives HERE, off the stratum read
-        // loop, so a slow / head-of-line-blocked Redis connection can never
-        // add share-ack latency (the loop already acked the share in ~40µs).
-        tokio::spawn(async move {
-            while let Some(owned) = rx.recv().await {
-                if let Err(e) = producer.publish(&owned).await {
-                    tracing::warn!(
-                        error = %e,
-                        share_id = %owned.share_id,
-                        "share-stream: publish failed (share's accounting deferred)"
-                    );
-                }
-            }
-        });
         Self {
-            tx,
-            dropped: Arc::new(AtomicU64::new(0)),
+            inner: BufferedPublisher::new(producer, "accepted"),
         }
     }
 }
@@ -196,22 +250,7 @@ impl ProducingSink {
 #[async_trait]
 impl SharedAcceptedShareSink for ProducingSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        // Non-blocking hand-off to the drain task. The owned conversion is
-        // the same allocation the publish path always made; `try_send` is a
-        // few atomics + a move. No `.await` on a network round-trip here.
-        let owned = share.to_owned_record();
-        if self.tx.try_send(owned).is_err() {
-            // Buffer full (publish lagging) or drain task gone — drop the
-            // share's stream publish + count. Log on power-of-two crossings
-            // to surface a sustained stall without flooding.
-            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            if n.is_power_of_two() {
-                tracing::warn!(
-                    dropped_total = n,
-                    "share-stream: publish buffer full — dropping accepted share (stream publish lagging)"
-                );
-            }
-        }
+        self.inner.offer(share.to_owned_record());
     }
 }
 
@@ -221,28 +260,13 @@ impl SharedAcceptedShareSink for ProducingSink {
 /// first, so the published owned record carries everything the Satellite's
 /// reject sinks need.
 pub struct ProducingRejectedSink {
-    tx: mpsc::Sender<SharedRejectedShareOwned>,
-    dropped: Arc<AtomicU64>,
+    inner: BufferedPublisher<SharedRejectedShareOwned>,
 }
 
 impl ProducingRejectedSink {
     pub fn new(producer: StreamProducer<SharedRejectedShareOwned>) -> Self {
-        let (tx, mut rx) = mpsc::channel::<SharedRejectedShareOwned>(PUBLISH_BUFFER);
-        // Drain task — same off-loop pattern as `ProducingSink`: the XADD
-        // never runs in the stratum read loop.
-        tokio::spawn(async move {
-            while let Some(owned) = rx.recv().await {
-                if let Err(e) = producer.publish(&owned).await {
-                    tracing::warn!(
-                        error = %e,
-                        "rejected-share-stream: publish failed (reject counter deferred)"
-                    );
-                }
-            }
-        });
         Self {
-            tx,
-            dropped: Arc::new(AtomicU64::new(0)),
+            inner: BufferedPublisher::new(producer, "rejected"),
         }
     }
 }
@@ -250,16 +274,7 @@ impl ProducingRejectedSink {
 #[async_trait]
 impl SharedRejectedShareSink for ProducingRejectedSink {
     async fn record_rejected(&self, share: SharedRejectedShare<'_>) {
-        let owned = share.to_owned_record();
-        if self.tx.try_send(owned).is_err() {
-            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            if n.is_power_of_two() {
-                tracing::warn!(
-                    dropped_total = n,
-                    "rejected-share-stream: publish buffer full — dropping rejected share (publish lagging)"
-                );
-            }
-        }
+        self.inner.offer(share.to_owned_record());
     }
 }
 
