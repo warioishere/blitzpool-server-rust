@@ -328,7 +328,7 @@ impl AcceptedShareConsumer {
         let reply: StreamReadReply = conn
             .xread_options(&[&self.stream_key], &[">"], &opts)
             .await?;
-        self.parse(reply)
+        Ok(self.partition(reply).await)
     }
 
     /// Re-read this consumer's pending (delivered-but-unacked) entries from
@@ -343,7 +343,7 @@ impl AcceptedShareConsumer {
         let reply: StreamReadReply = conn
             .xread_options(&[&self.stream_key], &["0"], &opts)
             .await?;
-        self.parse(reply)
+        Ok(self.partition(reply).await)
     }
 
     /// Drain one batch of **new** entries: read up to `count` (blocking up
@@ -407,25 +407,58 @@ impl AcceptedShareConsumer {
         Ok(n)
     }
 
-    fn parse(&self, reply: StreamReadReply) -> Result<Vec<ConsumedShare>, StreamError> {
-        let mut out = Vec::new();
+    fn decode_entry(entry: &redis::streams::StreamId) -> Result<SharedAcceptedShareOwned, StreamError> {
+        let raw = entry
+            .map
+            .get(FIELD)
+            .ok_or_else(|| StreamError::MissingField {
+                id: entry.id.clone(),
+            })?;
+        let json: String = redis::from_redis_value(raw)?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// Split a reply into decodable shares; an undecodable entry (missing `d`
+    /// field / malformed JSON) can never reach a sink, so it's **dead-lettered**
+    /// — logged loudly and `XACK`ed here so one poison entry can't fail its whole
+    /// batch or linger un-acked in the PEL. See
+    /// [`StreamConsumer::partition`](crate::StreamConsumer) for the rationale;
+    /// this mirrors it for the accepted-share fan-out path.
+    async fn partition(&self, reply: StreamReadReply) -> Vec<ConsumedShare> {
+        let mut good = Vec::new();
+        let mut poison = Vec::new();
         for key in reply.keys {
             for entry in key.ids {
-                let raw = entry
-                    .map
-                    .get(FIELD)
-                    .ok_or_else(|| StreamError::MissingField {
-                        id: entry.id.clone(),
-                    })?;
-                let json: String = redis::from_redis_value(raw)?;
-                let share: SharedAcceptedShareOwned = serde_json::from_str(&json)?;
-                out.push(ConsumedShare {
-                    id: entry.id,
-                    share,
-                });
+                match Self::decode_entry(&entry) {
+                    Ok(share) => good.push(ConsumedShare {
+                        id: entry.id,
+                        share,
+                    }),
+                    Err(err) => {
+                        tracing::warn!(
+                            id = %entry.id,
+                            %err,
+                            stream = %self.stream_key,
+                            group = %self.group,
+                            "accepted-consumer: dropping undecodable share (dead-letter)"
+                        );
+                        poison.push(entry.id);
+                    }
+                }
             }
         }
-        Ok(out)
+        if !poison.is_empty() {
+            if let Err(err) = self.ack(&poison).await {
+                tracing::warn!(
+                    %err,
+                    n = poison.len(),
+                    stream = %self.stream_key,
+                    group = %self.group,
+                    "accepted-consumer: dead-letter ack failed (entries stay pending, retried next read)"
+                );
+            }
+        }
+        good
     }
 }
 
@@ -562,7 +595,7 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
         let reply: StreamReadReply = conn
             .xread_options(&[&self.stream_key], &[">"], &opts)
             .await?;
-        self.parse(reply)
+        Ok(self.partition(reply).await)
     }
 
     /// Re-read this consumer's pending (delivered-but-unacked) entries from
@@ -575,7 +608,7 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
         let reply: StreamReadReply = conn
             .xread_options(&[&self.stream_key], &["0"], &opts)
             .await?;
-        self.parse(reply)
+        Ok(self.partition(reply).await)
     }
 
     /// `XACK` the given entry ids. Returns the number acknowledged.
@@ -588,25 +621,61 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
         Ok(n)
     }
 
-    fn parse(&self, reply: StreamReadReply) -> Result<Vec<Consumed<T>>, StreamError> {
-        let mut out = Vec::new();
+    fn decode_entry(entry: &redis::streams::StreamId) -> Result<T, StreamError> {
+        let raw = entry
+            .map
+            .get(FIELD)
+            .ok_or_else(|| StreamError::MissingField {
+                id: entry.id.clone(),
+            })?;
+        let json: String = redis::from_redis_value(raw)?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// Split a reply into decodable entries; entries that can't be
+    /// reconstructed (missing `d` field / malformed JSON) can never reach a
+    /// handler, so they're **dead-lettered** — logged loudly and `XACK`ed here
+    /// so a single poison entry can't fail its whole batch (dropping the good
+    /// entries with it) or linger un-acked in the PEL (which would also mask the
+    /// consumer-lag monitor). A decode failure is deterministic — same bytes +
+    /// same code → same failure — so retrying is futile and dropping with a loud
+    /// log is correct. Genuine version-skew is prevented upstream by
+    /// `#[serde(default)]` on newly-added fields.
+    async fn partition(&self, reply: StreamReadReply) -> Vec<Consumed<T>> {
+        let mut good = Vec::new();
+        let mut poison = Vec::new();
         for key in reply.keys {
             for entry in key.ids {
-                let raw = entry
-                    .map
-                    .get(FIELD)
-                    .ok_or_else(|| StreamError::MissingField {
-                        id: entry.id.clone(),
-                    })?;
-                let json: String = redis::from_redis_value(raw)?;
-                let value: T = serde_json::from_str(&json)?;
-                out.push(Consumed {
-                    id: entry.id,
-                    value,
-                });
+                match Self::decode_entry(&entry) {
+                    Ok(value) => good.push(Consumed {
+                        id: entry.id,
+                        value,
+                    }),
+                    Err(err) => {
+                        tracing::warn!(
+                            id = %entry.id,
+                            %err,
+                            stream = %self.stream_key,
+                            group = %self.group,
+                            "stream-consumer: dropping undecodable entry (dead-letter)"
+                        );
+                        poison.push(entry.id);
+                    }
+                }
             }
         }
-        Ok(out)
+        if !poison.is_empty() {
+            if let Err(err) = self.ack(&poison).await {
+                tracing::warn!(
+                    %err,
+                    n = poison.len(),
+                    stream = %self.stream_key,
+                    group = %self.group,
+                    "stream-consumer: dead-letter ack failed (entries stay pending, retried next read)"
+                );
+            }
+        }
+        good
     }
 }
 
@@ -818,6 +887,65 @@ mod tests {
                 .expect("read_pending")
                 .is_empty(),
             "drain_new must ack the batch"
+        );
+    }
+
+    /// A poison (undecodable) entry between two good shares must not fail the
+    /// batch: the good shares still reach the sinks in order, and the poison
+    /// entry is dead-lettered (acked) rather than dropping the whole batch or
+    /// lingering in the PEL.
+    #[tokio::test]
+    async fn drain_new_dead_letters_poison_share_and_keeps_good() {
+        let Some(conn) = connect_or_skip(5).await else {
+            return;
+        };
+        let key = "bp:test:shares:poison";
+        let producer = AcceptedShareProducer::new(conn.clone(), key);
+        let consumer = AcceptedShareConsumer::new(conn.clone(), key, "money", "c1");
+        consumer.ensure_group().await.expect("ensure_group");
+
+        producer
+            .publish(&sample("ep1:0", MiningMode::Pplns, None))
+            .await
+            .expect("publish good1");
+        // Raw entry whose `d` field isn't a valid share record.
+        let _: String = redis::cmd("XADD")
+            .arg(key)
+            .arg("*")
+            .arg("d")
+            .arg("{ not a share")
+            .query_async(&mut conn.clone())
+            .await
+            .expect("xadd poison");
+        producer
+            .publish(&sample("ep1:1", MiningMode::GroupSolo, Some("g")))
+            .await
+            .expect("publish good2");
+
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sinks: Vec<Arc<dyn SharedAcceptedShareSink>> = vec![Arc::new(RecordingSink {
+            ids: recorded.clone(),
+        })];
+
+        let n = consumer
+            .drain_new(&sinks, 10, 1000)
+            .await
+            .expect("drain_new");
+        assert_eq!(n, 2, "both good shares processed, poison skipped");
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            vec!["ep1:0".to_string(), "ep1:1".to_string()],
+            "sinks see only the good shares, in order"
+        );
+
+        // Good acked by drain_new, poison dead-lettered by the read → PEL empty.
+        assert!(
+            consumer
+                .read_pending(10)
+                .await
+                .expect("read_pending")
+                .is_empty(),
+            "poison entry dead-lettered (acked), not left pending"
         );
     }
 

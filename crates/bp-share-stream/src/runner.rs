@@ -363,7 +363,7 @@ mod tests {
     /// after the group was created.
     #[tokio::test]
     async fn run_from_tail_skips_history() {
-        let Some(conn) = connect_or_skip(8).await else {
+        let Some(conn) = connect_or_skip(3).await else {
             return;
         };
         let key = "bp:test:runner:tail";
@@ -391,6 +391,58 @@ mod tests {
             *seen.lock().await,
             vec![200],
             "the pre-creation entry was skipped"
+        );
+        cancel.cancel();
+        task.await.expect("join");
+    }
+
+    /// A single undecodable (poison) entry between two good ones must NOT drop
+    /// the whole batch: the good entries still process, and the poison entry is
+    /// dead-lettered (acked, gone from the PEL) rather than lingering.
+    #[tokio::test]
+    async fn run_dead_letters_poison_entry_and_keeps_good() {
+        let Some(conn) = connect_or_skip(4).await else {
+            return;
+        };
+        let key = "bp:test:runner:poison";
+        let prod = producer(conn.clone(), key);
+        prod.publish(&Evt { n: 1 }).await.expect("publish good1");
+        // A raw entry whose `d` field isn't valid JSON for `Evt`.
+        let _: String = redis::cmd("XADD")
+            .arg(key)
+            .arg("*")
+            .arg("d")
+            .arg("{ not valid json")
+            .query_async(&mut conn.clone())
+            .await
+            .expect("xadd poison");
+        prod.publish(&Evt { n: 2 }).await.expect("publish good2");
+
+        let seen = Arc::new(AsyncMutex::new(Vec::new()));
+        let consumer: StreamConsumer<Evt> = StreamConsumer::new(conn.clone(), key, "g", "c1");
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(consumer.run(
+            EnsureMode::FromZero,
+            ConsumerLoopConfig::new(16, "test"),
+            cancel.clone(),
+            RecordingHandler { seen: seen.clone() },
+        ));
+
+        assert!(
+            wait_until_len(&seen, 2).await,
+            "both good entries handled despite the poison one between them"
+        );
+        assert_eq!(
+            *seen.lock().await,
+            vec![1, 2],
+            "poison entry skipped, good order preserved"
+        );
+
+        // Good + poison all acked → nothing lingers in the PEL.
+        let checker: StreamConsumer<Evt> = StreamConsumer::new(conn, key, "g", "c1");
+        assert!(
+            checker.read_pending(16).await.expect("read_pending").is_empty(),
+            "poison entry dead-lettered (acked), not left pending"
         );
         cancel.cancel();
         task.await.expect("join");
