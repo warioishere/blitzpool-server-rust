@@ -21,19 +21,16 @@
 //! at-least-once delivery is enough: a crash before `XACK` redelivers and the
 //! reprocess is harmless.
 
-use std::time::Duration;
-
-use bp_share_stream::{StreamConsumer, BLOCK_FOUND_STREAM_KEY};
+use async_trait::async_trait;
+use bp_share_stream::{
+    ConsumerLoopConfig, EnsureMode, StreamConsumer, StreamConsumerHandle, StreamEntryHandler,
+    BLOCK_FOUND_STREAM_KEY,
+};
 use redis::aio::ConnectionManager;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
 
 use crate::block_sink::{BlockFoundApplier, BlockFoundEvent};
 
 const BATCH: usize = 64;
-const BLOCK_MS: usize = 1000;
-const ERROR_BACKOFF: Duration = Duration::from_millis(500);
 const CONSUMER: &str = "c1";
 
 /// What a block-found consumer does with each event, and on which consumer
@@ -58,126 +55,64 @@ impl BlockFoundAction {
         }
     }
 
-    fn label(self) -> &'static str {
+    /// Full log label (loop skeleton logs `label=`), distinct per group so an
+    /// operator can tell the two consumers apart.
+    fn loop_label(self) -> &'static str {
         match self {
-            Self::Ledger => "ledger",
-            Self::Notify => "notify",
+            Self::Ledger => "block-found:ledger",
+            Self::Notify => "block-found:notify",
+        }
+    }
+
+    /// Ledger is idempotent (PG `UNIQUE`) → replay history from `0` safely.
+    /// Notify is NOT → a freshly-created group starts at the tail ($) so a
+    /// first start doesn't re-fire a push for every historical block.
+    fn ensure_mode(self) -> EnsureMode {
+        match self {
+            Self::Ledger => EnsureMode::FromZero,
+            Self::Notify => EnsureMode::FromTail,
         }
     }
 }
 
-/// Live consumer task + its cancel token.
-pub(crate) struct BlockFoundConsumerHandle {
-    task: JoinHandle<()>,
-    cancel: CancellationToken,
+/// Runs each block-found event through the chosen `action` — the `payout`
+/// ledger apply or the `notify` dispatcher fan-out.
+struct BlockFoundHandler {
+    applier: BlockFoundApplier,
+    action: BlockFoundAction,
 }
 
-impl BlockFoundConsumerHandle {
-    pub(crate) async fn shutdown(self) {
-        self.cancel.cancel();
-        if let Err(err) = self.task.await {
-            warn!(%err, "block-found-consumer: task join failed");
+#[async_trait]
+impl StreamEntryHandler<BlockFoundEvent> for BlockFoundHandler {
+    async fn handle(&self, value: BlockFoundEvent) {
+        match self.action {
+            BlockFoundAction::Ledger => self.applier.apply_block_found(&value).await,
+            BlockFoundAction::Notify => self.applier.notify_block_found(&value).await,
         }
     }
 }
 
 /// Spawn the block-found stream consumer. Owns the applier + a Redis handle.
-/// `action` picks the consumer group + what each event does (ledger vs notify).
+/// `action` picks the consumer group, the ensure start-point, and what each
+/// event does (ledger vs notify).
 pub(crate) fn spawn(
     redis: ConnectionManager,
     applier: BlockFoundApplier,
     action: BlockFoundAction,
-) -> BlockFoundConsumerHandle {
-    let cancel = CancellationToken::new();
-    let task_cancel = cancel.clone();
-    let task = tokio::spawn(async move {
-        let consumer: StreamConsumer<BlockFoundEvent> =
-            StreamConsumer::new(redis, BLOCK_FOUND_STREAM_KEY, action.group(), CONSUMER);
-        // Ledger is idempotent (PG UNIQUE) → replay history from id 0 safely.
-        // Notify is NOT → a freshly-created group starts at the tail ($) so a
-        // first start doesn't re-fire a push for every historical block.
-        let ensured = match action {
-            BlockFoundAction::Ledger => consumer.ensure_group().await,
-            BlockFoundAction::Notify => consumer.ensure_group_at_tail().await,
-        };
-        if let Err(err) = ensured {
-            warn!(%err, action = action.label(), "block-found-consumer: ensure_group failed; task not started");
-            return;
-        }
-
-        // Resume: replay the delivered-but-unacked backlog before new events.
-        loop {
-            match consumer.read_pending(BATCH).await {
-                Ok(batch) if batch.is_empty() => break,
-                Ok(batch) => {
-                    apply_and_ack(&consumer, &applier, action, batch, "pending").await;
-                }
-                Err(err) => {
-                    warn!(%err, action = action.label(), "block-found-consumer: read_pending failed; continuing");
-                    break;
-                }
-            }
-        }
-
-        info!(action = action.label(), "block-found-consumer: live");
-        loop {
-            tokio::select! {
-                biased;
-                _ = task_cancel.cancelled() => break,
-                result = consumer.read_new(BATCH, BLOCK_MS) => match result {
-                    Ok(batch) => {
-                        apply_and_ack(&consumer, &applier, action, batch, "new").await;
-                    }
-                    Err(err) => {
-                        warn!(%err, action = action.label(), "block-found-consumer: read_new failed; backing off");
-                        tokio::time::sleep(ERROR_BACKOFF).await;
-                    }
-                },
-            }
-        }
-        info!(action = action.label(), "block-found-consumer: stopped");
-    });
-    BlockFoundConsumerHandle { task, cancel }
-}
-
-/// Run each event through the chosen `action` (ledger apply or notify fan-out),
-/// then `XACK` the batch. Acking after is safe: both sides are idempotent —
-/// the ledger via PG constraints, the notify via a duplicate-push being cosmetic
-/// — so a redelivery (crash before ack) does no harm.
-async fn apply_and_ack(
-    consumer: &StreamConsumer<BlockFoundEvent>,
-    applier: &BlockFoundApplier,
-    action: BlockFoundAction,
-    batch: Vec<bp_share_stream::Consumed<BlockFoundEvent>>,
-    kind: &str,
-) {
-    if batch.is_empty() {
-        return;
-    }
-    let mut ids = Vec::with_capacity(batch.len());
-    for entry in &batch {
-        match action {
-            BlockFoundAction::Ledger => applier.apply_block_found(&entry.value).await,
-            BlockFoundAction::Notify => applier.notify_block_found(&entry.value).await,
-        }
-        ids.push(entry.id.clone());
-    }
-    match consumer.ack(&ids).await {
-        Ok(n) => info!(
-            n,
-            kind,
-            action = action.label(),
-            "block-found-consumer: applied + acked"
-        ),
-        Err(err) => {
-            warn!(%err, kind, action = action.label(), "block-found-consumer: ack failed (will redeliver)")
-        }
-    }
+) -> StreamConsumerHandle {
+    let consumer: StreamConsumer<BlockFoundEvent> =
+        StreamConsumer::new(redis, BLOCK_FOUND_STREAM_KEY, action.group(), CONSUMER);
+    consumer.spawn(
+        action.ensure_mode(),
+        ConsumerLoopConfig::new(BATCH, action.loop_label()),
+        BlockFoundHandler { applier, action },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use bp_common::MiningMode;
     use bp_notifications::command::ChatLanguageMap;

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bp_share_hook::SharedAcceptedShareSink;
-use bp_share_stream::{AcceptedShareConsumer, ACCEPTED_STREAM_KEY};
+use bp_share_stream::{AcceptedShareConsumer, StreamConsumerHandle, ACCEPTED_STREAM_KEY};
 use redis::aio::ConnectionManager;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -55,31 +55,14 @@ const STATS_SESSION_GROUP: &str = "stats-session";
 /// for window ordering; the stats group keeps one for simplicity).
 const CONSUMER: &str = "c1";
 
-/// Live consumer tasks + their shared cancel token. [`Self::shutdown`]
-/// cancels and joins both as part of the graceful shutdown sequence.
-pub(crate) struct SatelliteConsumerHandle {
-    tasks: Vec<JoinHandle<()>>,
-    cancel: CancellationToken,
-}
-
-impl SatelliteConsumerHandle {
-    pub(crate) async fn shutdown(self) {
-        self.cancel.cancel();
-        for task in self.tasks {
-            if let Err(err) = task.await {
-                warn!(%err, "satellite-consumer: task join failed");
-            }
-        }
-    }
-}
-
 /// Spawn one consumer task per durability class against the shared accepted
-/// stream. Owns clones of every handle it needs (all `Arc`-backed).
+/// stream. Owns clones of every handle it needs (all `Arc`-backed). Returns the
+/// shared [`StreamConsumerHandle`] holding both tasks under one cancel token.
 pub(crate) fn spawn(
     money_redis: ConnectionManager,
     stats_redis: ConnectionManager,
     sinks: AcceptedSinkSet,
-) -> SatelliteConsumerHandle {
+) -> StreamConsumerHandle {
     let cancel = CancellationToken::new();
     // Each consumer group gets its OWN connection. A group's blocking
     // `XREAD BLOCK` would otherwise head-of-line-block the other group's
@@ -87,10 +70,7 @@ pub(crate) fn spawn(
     // connection.
     let money = spawn_group(money_redis, MONEY_GROUP, sinks.money, cancel.clone());
     let stats_session = spawn_group(stats_redis, STATS_SESSION_GROUP, sinks.aux, cancel.clone());
-    SatelliteConsumerHandle {
-        tasks: vec![money, stats_session],
-        cancel,
-    }
+    StreamConsumerHandle::new(vec![money, stats_session], cancel, "accepted")
 }
 
 fn spawn_group(

@@ -11,117 +11,56 @@
 //!
 //! Notify-only (no ledger), so at-least-once delivery is harmless: a redelivery
 //! after a crash-before-`XACK` just re-sends one online/offline push, which is
-//! cosmetic. Mirrors [`crate::block_found_consumer`].
+//! cosmetic. Tail-start ($) so a first run doesn't re-fire buffered history. The
+//! loop skeleton lives in [`bp_share_stream::StreamConsumer::run`]; this file
+//! only supplies the per-event dispatcher fan-out.
 
 use std::sync::Arc;
-use std::time::Duration;
 
+use async_trait::async_trait;
 use bp_notifications::dispatcher::NotificationDispatcher;
-use bp_share_stream::{StreamConsumer, DEVICE_STATUS_STREAM_KEY};
+use bp_share_stream::{
+    ConsumerLoopConfig, EnsureMode, StreamConsumer, StreamConsumerHandle, StreamEntryHandler,
+    DEVICE_STATUS_STREAM_KEY,
+};
 use redis::aio::ConnectionManager;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
 
 use crate::device_status::DeviceStatusStreamEvent;
 
 const BATCH: usize = 64;
-const BLOCK_MS: usize = 1000;
-const ERROR_BACKOFF: Duration = Duration::from_millis(500);
 const GROUP: &str = "device-status";
 const CONSUMER: &str = "c1";
 
-/// Live consumer task + its cancel token.
-pub(crate) struct DeviceStatusConsumerHandle {
-    task: JoinHandle<()>,
-    cancel: CancellationToken,
+/// Fans each device-status event out via the dispatcher. Events that don't
+/// reconstruct into a notify payload (`into_event` → `None`) are dropped.
+struct DeviceStatusHandler {
+    dispatcher: Arc<NotificationDispatcher>,
 }
 
-impl DeviceStatusConsumerHandle {
-    pub(crate) async fn shutdown(self) {
-        self.cancel.cancel();
-        if let Err(err) = self.task.await {
-            warn!(%err, "device-status-consumer: task join failed");
+#[async_trait]
+impl StreamEntryHandler<DeviceStatusStreamEvent> for DeviceStatusHandler {
+    async fn handle(&self, value: DeviceStatusStreamEvent) {
+        if let Some(event) = value.into_event() {
+            self.dispatcher.notify_device_status(&event).await;
         }
     }
 }
 
 /// Spawn the device-status stream consumer. Owns the dispatcher + a Redis
-/// handle.
+/// handle. Tail-start ($): a freshly-created group must not replay history (it
+/// would re-fire every buffered online/offline push); existing groups keep
+/// their offset.
 pub(crate) fn spawn(
     redis: ConnectionManager,
     dispatcher: Arc<NotificationDispatcher>,
-) -> DeviceStatusConsumerHandle {
-    let cancel = CancellationToken::new();
-    let task_cancel = cancel.clone();
-    let task = tokio::spawn(async move {
-        let consumer: StreamConsumer<DeviceStatusStreamEvent> =
-            StreamConsumer::new(redis, DEVICE_STATUS_STREAM_KEY, GROUP, CONSUMER);
-        // Tail-start ($): notifications aren't idempotent, so a freshly-created
-        // group must not replay history (it would re-fire every buffered
-        // online/offline event). Existing groups keep their offset.
-        if let Err(err) = consumer.ensure_group_at_tail().await {
-            warn!(%err, "device-status-consumer: ensure_group failed; task not started");
-            return;
-        }
-
-        // Resume: replay the delivered-but-unacked backlog before new events.
-        loop {
-            match consumer.read_pending(BATCH).await {
-                Ok(batch) if batch.is_empty() => break,
-                Ok(batch) => {
-                    fire_and_ack(&consumer, &dispatcher, batch, "pending").await;
-                }
-                Err(err) => {
-                    warn!(%err, "device-status-consumer: read_pending failed; continuing");
-                    break;
-                }
-            }
-        }
-
-        info!("device-status-consumer: live");
-        loop {
-            tokio::select! {
-                biased;
-                _ = task_cancel.cancelled() => break,
-                result = consumer.read_new(BATCH, BLOCK_MS) => match result {
-                    Ok(batch) => {
-                        fire_and_ack(&consumer, &dispatcher, batch, "new").await;
-                    }
-                    Err(err) => {
-                        warn!(%err, "device-status-consumer: read_new failed; backing off");
-                        tokio::time::sleep(ERROR_BACKOFF).await;
-                    }
-                },
-            }
-        }
-        info!("device-status-consumer: stopped");
-    });
-    DeviceStatusConsumerHandle { task, cancel }
-}
-
-/// Fan each event out via the dispatcher, then `XACK` the batch. Acking after
-/// the notify is safe: a redelivery (crash before ack) just re-sends a push.
-async fn fire_and_ack(
-    consumer: &StreamConsumer<DeviceStatusStreamEvent>,
-    dispatcher: &Arc<NotificationDispatcher>,
-    batch: Vec<bp_share_stream::Consumed<DeviceStatusStreamEvent>>,
-    kind: &str,
-) {
-    if batch.is_empty() {
-        return;
-    }
-    let mut ids = Vec::with_capacity(batch.len());
-    for entry in batch {
-        if let Some(event) = entry.value.into_event() {
-            dispatcher.notify_device_status(&event).await;
-        }
-        ids.push(entry.id);
-    }
-    match consumer.ack(&ids).await {
-        Ok(n) => info!(n, kind, "device-status-consumer: fired + acked"),
-        Err(err) => warn!(%err, kind, "device-status-consumer: ack failed (will redeliver)"),
-    }
+) -> StreamConsumerHandle {
+    let consumer: StreamConsumer<DeviceStatusStreamEvent> =
+        StreamConsumer::new(redis, DEVICE_STATUS_STREAM_KEY, GROUP, CONSUMER);
+    consumer.spawn(
+        EnsureMode::FromTail,
+        ConsumerLoopConfig::new(BATCH, "device-status"),
+        DeviceStatusHandler { dispatcher },
+    )
 }
 
 #[cfg(test)]

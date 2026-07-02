@@ -22,6 +22,9 @@
 //! Each entry stores the share as a single JSON field (`d`) — compact
 //! enough at pool share-rates, and human-inspectable via `XRANGE`.
 
+mod runner;
+pub use runner::{ConsumerLoopConfig, EnsureMode, StreamConsumerHandle, StreamEntryHandler};
+
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

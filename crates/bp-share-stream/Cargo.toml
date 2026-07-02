@@ -19,8 +19,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# `sync` for the off-loop publish channel, `rt` for the drain-task spawn.
-tokio = { workspace = true, features = ["sync", "rt"] }
+# `sync` for the off-loop publish channel, `rt` for the drain-task spawn,
+# `macros`+`time` for the shared consume loop (`select!` + error back-off).
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+# `CancellationToken` for the shared consume-loop shutdown signal.
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

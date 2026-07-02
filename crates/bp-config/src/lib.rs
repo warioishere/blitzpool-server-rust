@@ -157,6 +157,23 @@ pub enum Network {
 /// runs (`roles` in config, or `--roles` / `BLITZPOOL_ROLES`) is what gates
 /// each subsystem at boot — and how the back-office splits into per-feature
 /// processes (e.g. `roles = ["api"]` / `["payout"]` / `["stats"]`).
+///
+/// ## Vocabulary (there is no `Satellite` role — it's a derived term)
+///
+/// - **front** / **core**: the [`Role::Front`] process. Holds the Stratum
+///   listeners + share producer + block submit + JDP, and *produces* the
+///   Core→Satellite Redis event streams (accepted / rejected / block-found /
+///   device-status). Always-on.
+/// - **satellite** / **back** / **back-office**: any process that is NOT the
+///   front — it *consumes* those streams instead of holding listeners. Used
+///   interchangeably in the codebase; all mean "a non-front process".
+/// - **accounting**: the [`Role::Payout`] + [`Role::Stats`] subset of the
+///   satellite that drains the engine streams (money + stats), as opposed to
+///   the [`Role::Api`] (read-only) and [`Role::Notify`] (notifications) roles.
+///
+/// The split lets the back-office redeploy/restart without dropping miners: the
+/// front keeps running while a satellite process bounces and resumes from the
+/// stream (at-least-once, dedup on `share_id`).
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
