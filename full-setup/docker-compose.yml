@@ -46,6 +46,13 @@ x-blitzpool-app: &blitzpool-app
   image: blitzpool:latest
   restart: unless-stopped
   stop_grace_period: 30s
+  # Raise the open-file limit: each miner connection is a socket, and the
+  # Docker default soft limit (1024) is hit by the front role's concurrent
+  # connections -> accept() fails with EMFILE ("Too many open files").
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
   profiles: ["mainnet", "testnet4", "regtest"]
   networks:
     - blitzpool
