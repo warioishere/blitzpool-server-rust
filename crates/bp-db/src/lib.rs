@@ -92,6 +92,7 @@ pub use client::{
     update_sv2_user_agent_by_address, upsert_address_best_difficulty, upsert_client,
     upsert_client_difficulty_statistic, ClientDifficultyStatisticsRow, ClientRejectedStatisticsRow,
     ClientRow, ClientStatisticsRow, ClientUpsert, PoolWorkerRow, UserAgentAggRow, WorkerSharesRow,
+    HASHRATE_DECAY_WINDOW_MS,
 };
 pub use email::{
     delete_email_verification_by_token, delete_email_verifications_for_address,

@@ -345,7 +345,20 @@ where
         .cache
         .get_or_fetch::<ClientResponse, _, ApiError>(key, TtlKind::ClientInfo, async move {
             let clients = find_clients_by_address(&s.pool, &addr).await?;
-            let total_hashrate: f64 = clients.iter().map(|c| c.hash_rate).sum();
+            // Weight each session's stored hashrate by how fresh its last share
+            // is: a miner that just went offline fades to zero over the decay
+            // window instead of counting at full until the dead-client sweep.
+            // Keeps the per-worker values and the total consistent.
+            let now = crate::time_range::now_ms();
+            let decayed = |hash_rate: f64, updated_at: i64| -> f64 {
+                hash_rate
+                    * crate::time_range::hashrate_decay_factor(
+                        now,
+                        updated_at,
+                        bp_db::HASHRATE_DECAY_WINDOW_MS,
+                    )
+            };
+            let total_hashrate: f64 = clients.iter().map(|c| decayed(c.hash_rate, c.updated_at)).sum();
             let settings = find_address_settings(&s.pool, &addr).await?;
             let best_difficulty = settings.as_ref().map(|x| x.best_difficulty.floor() as u64);
             let total_shares = settings.map(|x| x.shares).unwrap_or(0.0);
@@ -360,7 +373,7 @@ where
                         session_id: c.session_id,
                         name: c.client_name,
                         best_difficulty: format!("{:.2}", c.best_difficulty as f64),
-                        hash_rate: c.hash_rate,
+                        hash_rate: decayed(c.hash_rate, c.updated_at),
                         current_difficulty: c.current_difficulty.map(|d| d as f64),
                         channel_count: c.channel_count,
                         start_time: crate::time_range::format_slot_label(c.start_time),

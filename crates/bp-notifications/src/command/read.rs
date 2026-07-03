@@ -50,7 +50,8 @@ fn default_http_client() -> Client {
 // ── /poolhashrate ────────────────────────────────────────────────────
 
 pub(super) async fn build_pool_hashrate(pool: &PgPool, lang: Language) -> String {
-    match sum_active_pool_hashrate(pool).await {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    match sum_active_pool_hashrate(pool, now_ms, bp_db::HASHRATE_DECAY_WINDOW_MS).await {
         Ok(total) => format_pool_hashrate(lang, total),
         Err(e) => {
             warn!(target: "bp_notifications::command::read", error = %e, "pool_hashrate");

@@ -161,6 +161,20 @@ pub const DIFFICULTY_1: f64 = 4_294_967_296.0;
 /// 10-minute slot duration in seconds; divisor in hashrate conversion.
 pub const SLOT_SECONDS: f64 = 600.0;
 
+/// Staleness weight for a session's stored hashrate: `1.0` when the last share
+/// is fresh, fading **linearly to 0** as `now_ms - updated_at_ms` reaches
+/// `window_ms`. Mirrors the SQL decay in `bp_db::sum_active_pool_hashrate`, so a
+/// miner that just went offline drops out of the reported total smoothly instead
+/// of counting at its frozen last value until the dead-client sweep. Clamped to
+/// `[0, 1]`; a non-positive window disables decay (weight `1.0`).
+pub fn hashrate_decay_factor(now_ms: i64, updated_at_ms: i64, window_ms: i64) -> f64 {
+    if window_ms <= 0 {
+        return 1.0;
+    }
+    let staleness = (now_ms - updated_at_ms).max(0) as f64;
+    (1.0 - staleness / window_ms as f64).clamp(0.0, 1.0)
+}
+
 /// Current Unix time in milliseconds.
 pub fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -271,6 +285,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hashrate_decay_fades_linearly_over_the_window() {
+        let w = 120_000; // 2 min
+        let now = 1_000_000_000;
+        // Fresh share → full weight.
+        assert_eq!(hashrate_decay_factor(now, now, w), 1.0);
+        // Halfway through the window → half weight.
+        assert!((hashrate_decay_factor(now, now - 60_000, w) - 0.5).abs() < 1e-9);
+        // At/after the window → zero (a departed miner drops out).
+        assert_eq!(hashrate_decay_factor(now, now - w, w), 0.0);
+        assert_eq!(hashrate_decay_factor(now, now - 10 * w, w), 0.0);
+        // Clock skew (updated_at in the future) is clamped to full, not > 1.
+        assert_eq!(hashrate_decay_factor(now, now + 5_000, w), 1.0);
+        // A non-positive window disables decay.
+        assert_eq!(hashrate_decay_factor(now, now - 999_999, 0), 1.0);
+    }
 
     #[test]
     fn parse_range_defaults_to_day() {
