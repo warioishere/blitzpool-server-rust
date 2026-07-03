@@ -42,7 +42,7 @@
 //! wire) is not accepted — the Rust pool sources templates via TDP-IPC, not
 //! the SV2 TDP wire protocol. Architecture choice, not a missing feature.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use bitcoin::Network;
 use bp_common::{AddressId, StreamKind};
@@ -482,8 +482,11 @@ pub struct MiningSessionState<C: Clock> {
 
     // Extensions negotiated via ext 0x0001 (RequestExtensions) —
     // populated by `handle_request_extensions`; read by the submit-side
-    // TLV resolver (e.g. ext 0x0002 Worker-ID).
-    pub negotiated_extensions: HashSet<u16>,
+    // TLV resolver (e.g. ext 0x0002 Worker-ID). A deduped `Vec` (not a
+    // set): the list is tiny (0–2 entries) and the read loop hands it
+    // straight to the frame parser as `&[u16]` on EVERY inbound frame —
+    // a set would force a fresh collect-to-Vec allocation per frame.
+    pub negotiated_extensions: Vec<u16>,
 
     // Connection default/initial difficulty; also the JDC vardiff base.
     // Classic per-channel vardiff lives in `vardiff` (keyed by channel id).
@@ -566,7 +569,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             work_selection: false,
             requires_standard_jobs: false,
             is_tdp_client: false,
-            negotiated_extensions: HashSet::new(),
+            negotiated_extensions: Vec::new(),
             // Start at the configured initial difficulty, raised to the
             // floor if the operator set initial < min. Vardiff retargets
             // from here and is bound by `min_difficulty`.
@@ -710,7 +713,11 @@ pub fn handle_request_extensions<C: Clock>(
     for &ext in &input.requested_extensions {
         if is_mining_extension_supported(ext) {
             supported.push(ext);
-            state.negotiated_extensions.insert(ext);
+            // Dedup on insert — a re-negotiation of an already-active
+            // extension must not grow the list.
+            if !state.negotiated_extensions.contains(&ext) {
+                state.negotiated_extensions.push(ext);
+            }
         } else {
             unsupported.push(ext);
         }
@@ -2429,6 +2436,7 @@ fn encode_varint(n: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use crate::mining::jobs::ExtendedJob;
     use bp_vardiff::TestClock;
     use std::sync::Arc;
@@ -3743,7 +3751,7 @@ mod tests {
 
     fn broadcast(change: TemplateChange, prev: [u8; 32]) -> TemplateBroadcast {
         TemplateBroadcast {
-            template: active_template(1, prev),
+            template: Arc::new(active_template(1, prev)),
             change,
         }
     }

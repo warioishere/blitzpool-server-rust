@@ -33,7 +33,7 @@
 //!   `broadcast::Receiver` returned by `TdpHandle::subscribe()`, drives
 //!   an [`crate::mining::translator::SV2TemplateAssembler`], re-broadcasts
 //!   `TemplateBroadcast` to per-connection tasks. Maintains
-//!   `Arc<Mutex<Option<ActiveSV2Template>>>` snapshot so freshly-accepted
+//!   `Arc<Mutex<Option<Arc<ActiveSV2Template>>>>` snapshot so freshly-accepted
 //!   connections can boot from the current state without waiting for
 //!   the next TDP update.
 //! - Per-connection-task: Noise-XK handshake on accept, then a
@@ -183,7 +183,7 @@ struct Inner {
     // PPLNS stream (PPLNS-autoscaled) — every connection boots here before
     // its payout mode is resolved.
     template_tx: broadcast::Sender<TemplateBroadcast>,
-    current_template: Arc<Mutex<Option<ActiveSV2Template>>>,
+    current_template: Arc<Mutex<Option<Arc<ActiveSV2Template>>>>,
     // Fixed-reservation alt streams (Solo / GroupSolo / Blockparty) keyed by
     // StreamKind — a connection switches onto one when its OpenChannel address
     // resolves to that mode. Each fed by its own translator off its TDP handle.
@@ -206,7 +206,7 @@ struct Inner {
 /// boots from. Mirrors the PPLNS stream's `template_tx` / `current_template`.
 struct AltStream {
     template_tx: broadcast::Sender<TemplateBroadcast>,
-    current_template: Arc<Mutex<Option<ActiveSV2Template>>>,
+    current_template: Arc<Mutex<Option<Arc<ActiveSV2Template>>>>,
 }
 
 /// A single connection's claim on one alt stream — its own broadcast receiver
@@ -215,7 +215,7 @@ struct AltStream {
 /// it swaps onto that stream.
 struct AltStreamHandle {
     rx: broadcast::Receiver<TemplateBroadcast>,
-    initial: Option<ActiveSV2Template>,
+    initial: Option<Arc<ActiveSV2Template>>,
 }
 
 impl StratumV2MiningServer {
@@ -245,7 +245,7 @@ impl StratumV2MiningServer {
     ) -> Self {
         let server_config = Arc::new(server_config);
         let (template_tx, _) = broadcast::channel(TEMPLATE_BROADCAST_CAPACITY);
-        let current_template = Arc::new(Mutex::new(None::<ActiveSV2Template>));
+        let current_template = Arc::new(Mutex::new(None::<Arc<ActiveSV2Template>>));
         let cancel = CancellationToken::new();
 
         let translator_join = tokio::spawn(run_translator(
@@ -260,7 +260,7 @@ impl StratumV2MiningServer {
         let mut alt_joins = Vec::with_capacity(alt_streams.len());
         for (kind, alt_updates_rx, alt_initial_snapshot) in alt_streams {
             let (alt_tx, _) = broadcast::channel(TEMPLATE_BROADCAST_CAPACITY);
-            let alt_current = Arc::new(Mutex::new(None::<ActiveSV2Template>));
+            let alt_current = Arc::new(Mutex::new(None::<Arc<ActiveSV2Template>>));
             alt_joins.push(tokio::spawn(run_translator(
                 alt_updates_rx,
                 alt_initial_snapshot,
@@ -300,7 +300,7 @@ impl StratumV2MiningServer {
 
     /// Snapshot of the latest assembled template. `None` until the
     /// translator pairs its first `NewTemplate` + `SetNewPrevHash`.
-    pub fn current_template(&self) -> Option<ActiveSV2Template> {
+    pub fn current_template(&self) -> Option<Arc<ActiveSV2Template>> {
         self.inner
             .current_template
             .lock()
@@ -442,7 +442,7 @@ async fn run_translator(
     mut updates_rx: broadcast::Receiver<TemplateUpdate>,
     initial_snapshot: bp_template_distribution::TemplateSnapshot,
     template_tx: broadcast::Sender<TemplateBroadcast>,
-    current_template: Arc<Mutex<Option<ActiveSV2Template>>>,
+    current_template: Arc<Mutex<Option<Arc<ActiveSV2Template>>>>,
     cancel: CancellationToken,
 ) {
     let mut assembler = SV2TemplateAssembler::new();
@@ -455,6 +455,9 @@ async fn run_translator(
         &mut assembler,
         initial_snapshot,
     ) {
+        // Wrap once; the snapshot store and every broadcast subscriber
+        // then share this allocation via Arc refcounting.
+        let active = Arc::new(active);
         {
             let mut guard = current_template
                 .lock()
@@ -487,6 +490,7 @@ async fn run_translator(
                 };
                 if let Some(change) = assembler.apply(&update) {
                     if let Some(active) = assembler.current().cloned() {
+                        let active = Arc::new(active);
                         {
                             let mut guard = current_template
                                 .lock()
@@ -519,7 +523,7 @@ async fn run_mining_connection(
     hooks: MiningServerHooks,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     mut template_rx: broadcast::Receiver<TemplateBroadcast>,
-    initial_template: Option<ActiveSV2Template>,
+    initial_template: Option<Arc<ActiveSV2Template>>,
     mut alt_streams: HashMap<StreamKind, AltStreamHandle>,
     extranonce_allocator: Arc<Mutex<ExtranonceAllocator>>,
     socket: TcpStream,
@@ -597,13 +601,12 @@ async fn run_mining_connection(
                         continue;
                     }
                 };
-                let negotiated: Vec<u16> = state.negotiated_extensions.iter().copied().collect();
                 let payload_len = sv2_frame.payload().len();
                 let header_msg_type = header.msg_type();
                 let (any_message, tlvs) = match parse_message_frame_with_tlvs(
                     header,
                     sv2_frame.payload(),
-                    &negotiated,
+                    &state.negotiated_extensions,
                 ) {
                     Ok(parsed) => parsed,
                     Err(err) => {
@@ -671,15 +674,17 @@ async fn run_mining_connection(
                 }
                 let is_submit =
                     matches!(inbound, InboundMiningFrame::SubmitSharesExtended(_));
-                // Lock the pool-wide allocator only for the dispatch (it's
-                // synchronous — no await held). Open/Close are the only frames
-                // that touch it; the common submit path is a no-op on it.
-                let outcome = {
-                    let mut alloc = extranonce_allocator
-                        .lock()
-                        .expect("extranonce allocator mutex poisoned");
-                    dispatch_inbound_frame(&mut state, inbound, &mut alloc, &bridge, now_ms())
-                };
+                // The pool-wide extranonce allocator is locked INSIDE the
+                // Open/Close dispatch arms only — the hot submit path never
+                // touches it, so share validation across connections does
+                // not serialize on one global mutex.
+                let outcome = dispatch_inbound_frame(
+                    &mut state,
+                    inbound,
+                    &extranonce_allocator,
+                    &bridge,
+                    now_ms(),
+                );
                 let write_start = std::time::Instant::now();
                 if let Err(err) = write_outbound_frames(
                     &mut writer,
@@ -974,8 +979,11 @@ fn channel_alloc_key(session_id: u32, channel_id: u32) -> u64 {
 ///
 /// - **OpenStandard/Extended-MiningChannel**: allocates a fresh
 ///   extranonce-prefix via [`ExtranonceAllocator`] using
-///   `state.next_channel_id` (the about-to-be-allocated id). On
-///   handler error the prefix is leaked until connection close —
+///   `state.next_channel_id` (the about-to-be-allocated id). The
+///   pool-wide allocator mutex is locked ONLY inside the Open/Close
+///   arms — never across the submit arms — so per-share validation on
+///   one connection can't serialize behind channel churn on another.
+///   On handler error the prefix is leaked until connection close —
 ///   acceptable since channel-open errors are rare.
 /// - **CloseChannel**: releases the extranonce-prefix of every channel the
 ///   handler actually closed — one for a normal close, ALL members for a
@@ -996,7 +1004,7 @@ fn channel_alloc_key(session_id: u32, channel_id: u32) -> u64 {
 pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
     state: &mut MiningSessionState<C>,
     inbound: InboundMiningFrame,
-    extranonce_allocator: &mut ExtranonceAllocator,
+    extranonce_allocator: &Mutex<ExtranonceAllocator>,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
     now_ms: u64,
 ) -> HandlerOutcome {
@@ -1006,6 +1014,8 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
         InboundMiningFrame::OpenStandardMiningChannel(input, _placeholder_prefix) => {
             let key = channel_alloc_key(state.session_id, state.next_channel_id);
             let prefix = extranonce_allocator
+                .lock()
+                .expect("extranonce allocator mutex poisoned")
                 .allocate(key)
                 .unwrap_or_else(|_| Vec::new());
             handle_open_standard_mining_channel(state, &input, prefix)
@@ -1013,6 +1023,8 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
         InboundMiningFrame::OpenExtendedMiningChannel(input, _placeholder_prefix) => {
             let key = channel_alloc_key(state.session_id, state.next_channel_id);
             let prefix = extranonce_allocator
+                .lock()
+                .expect("extranonce allocator mutex poisoned")
                 .allocate(key)
                 .unwrap_or_else(|_| Vec::new());
             handle_open_extended_mining_channel(state, &input, prefix)
@@ -1024,11 +1036,15 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
             // actually removed — one for a normal close, all members for a
             // group-channel close (spec §5.3.9). Releasing an id with no
             // allocation is a harmless no-op.
+            let mut alloc = extranonce_allocator
+                .lock()
+                .expect("extranonce allocator mutex poisoned");
             for ev in &outcome.events {
                 if let SessionEvent::ChannelClosed { channel_id, .. } = ev {
-                    extranonce_allocator.release(channel_alloc_key(state.session_id, *channel_id));
+                    alloc.release(channel_alloc_key(state.session_id, *channel_id));
                 }
             }
+            drop(alloc);
             outcome
         }
         InboundMiningFrame::SubmitSharesStandard(input) => {
@@ -1903,7 +1919,7 @@ mod tests {
     #[test]
     fn dispatch_setup_connection_emits_success() {
         let mut s = fresh_test_session();
-        let mut alloc = ExtranonceAllocator::new_default();
+        let alloc = Mutex::new(ExtranonceAllocator::new_default());
         let bridge = fresh_bridge();
         let inbound = InboundMiningFrame::SetupConnection(SetupConnectionInput {
             protocol: PROTOCOL_MINING,
@@ -1915,7 +1931,7 @@ mod tests {
             hardware_version: "rev1".to_string(),
             device_id: "dev-1".to_string(),
         });
-        let outcome = dispatch_inbound_frame(&mut s, inbound, &mut alloc, &bridge, 0);
+        let outcome = dispatch_inbound_frame(&mut s, inbound, &alloc, &bridge, 0);
         assert!(matches!(
             outcome.outbound[0],
             crate::mining::client::OutboundFrame::SetupConnectionSuccess { .. }
@@ -1932,7 +1948,7 @@ mod tests {
     #[test]
     fn dispatch_submit_standard_unknown_channel_emits_invalid_channel_id() {
         let mut s = fresh_test_session();
-        let mut alloc = ExtranonceAllocator::new_default();
+        let alloc = Mutex::new(ExtranonceAllocator::new_default());
         let bridge = fresh_bridge();
         let inbound = InboundMiningFrame::SubmitSharesStandard(SubmitSharesStandardInput {
             channel_id: 99,
@@ -1942,7 +1958,7 @@ mod tests {
             ntime: 0,
             version: 0,
         });
-        let outcome = dispatch_inbound_frame(&mut s, inbound, &mut alloc, &bridge, 0);
+        let outcome = dispatch_inbound_frame(&mut s, inbound, &alloc, &bridge, 0);
         match &outcome.outbound[0] {
             crate::mining::client::OutboundFrame::SubmitSharesError { error_code, .. } => {
                 assert_eq!(error_code, "invalid-channel-id");
@@ -1958,7 +1974,7 @@ mod tests {
     #[test]
     fn dispatch_close_channel_releases_extranonce_prefix() {
         let mut s = fresh_test_session();
-        let mut alloc = ExtranonceAllocator::new_default();
+        let alloc = Mutex::new(ExtranonceAllocator::new_default());
         let bridge = fresh_bridge();
         let setup = InboundMiningFrame::SetupConnection(SetupConnectionInput {
             protocol: PROTOCOL_MINING,
@@ -1970,7 +1986,7 @@ mod tests {
             hardware_version: "r".to_string(),
             device_id: "d".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, setup, &mut alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
         let open = InboundMiningFrame::OpenStandardMiningChannel(
             crate::mining::client::OpenStandardMiningChannelInput {
                 request_id: 1,
@@ -1980,18 +1996,18 @@ mod tests {
             },
             Vec::new(),
         );
-        let _ = dispatch_inbound_frame(&mut s, open, &mut alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
         let cid = s.primary_channel.expect("channel opened");
-        let before = alloc.allocated_count();
+        let before = alloc.lock().unwrap().allocated_count();
         assert_eq!(before, 1, "one prefix allocated for the open channel");
 
         let inbound = InboundMiningFrame::CloseChannel(crate::mining::client::CloseChannelInput {
             channel_id: cid,
             reason_code: "user-quit".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, inbound, &mut alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, inbound, &alloc, &bridge, 0);
         assert_eq!(
-            alloc.allocated_count(),
+            alloc.lock().unwrap().allocated_count(),
             before - 1,
             "close releases the channel's prefix"
         );
@@ -2004,7 +2020,7 @@ mod tests {
     #[test]
     fn dispatch_group_close_releases_all_member_prefixes() {
         let mut s = fresh_test_session();
-        let mut alloc = ExtranonceAllocator::new_default();
+        let alloc = Mutex::new(ExtranonceAllocator::new_default());
         let bridge = fresh_bridge();
         // non-RSJ setup → Extended channels are grouped.
         let setup = InboundMiningFrame::SetupConnection(SetupConnectionInput {
@@ -2017,7 +2033,7 @@ mod tests {
             hardware_version: "r".to_string(),
             device_id: "d".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, setup, &mut alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
         for req in 1..=2u32 {
             let open = InboundMiningFrame::OpenExtendedMiningChannel(
                 crate::mining::client::OpenExtendedMiningChannelInput {
@@ -2029,9 +2045,9 @@ mod tests {
                 },
                 Vec::new(),
             );
-            let _ = dispatch_inbound_frame(&mut s, open, &mut alloc, &bridge, 0);
+            let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
         }
-        assert_eq!(alloc.allocated_count(), 2, "two member prefixes allocated");
+        assert_eq!(alloc.lock().unwrap().allocated_count(), 2, "two member prefixes allocated");
         let gid = s
             .groups
             .group_for_channel(s.primary_channel.unwrap())
@@ -2041,9 +2057,9 @@ mod tests {
             channel_id: gid,
             reason_code: "bye".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, inbound, &mut alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, inbound, &alloc, &bridge, 0);
         assert_eq!(
-            alloc.allocated_count(),
+            alloc.lock().unwrap().allocated_count(),
             0,
             "group close must release every member's prefix"
         );
@@ -2062,7 +2078,7 @@ mod tests {
         use bp_common::{AddressId, Sats};
 
         let mut s = fresh_test_session();
-        let mut alloc = ExtranonceAllocator::new_default();
+        let alloc = Mutex::new(ExtranonceAllocator::new_default());
         let bridge = fresh_bridge();
         let setup = InboundMiningFrame::SetupConnection(SetupConnectionInput {
             protocol: PROTOCOL_MINING,
@@ -2074,7 +2090,7 @@ mod tests {
             hardware_version: "r".to_string(),
             device_id: "d".to_string(),
         });
-        let _ = dispatch_inbound_frame(&mut s, setup, &mut alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
         let open = InboundMiningFrame::OpenExtendedMiningChannel(
             crate::mining::client::OpenExtendedMiningChannelInput {
                 request_id: 1,
@@ -2085,7 +2101,7 @@ mod tests {
             },
             Vec::new(),
         );
-        let _ = dispatch_inbound_frame(&mut s, open, &mut alloc, &bridge, 0);
+        let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
         let cid = s.primary_channel.expect("extended channel opened");
 
         // Pool commits a single payout output to the channel's miner.
@@ -2130,7 +2146,7 @@ mod tests {
         let out1 = dispatch_inbound_frame(
             &mut s,
             InboundMiningFrame::SetCustomMiningJob(make_input(1)),
-            &mut alloc,
+            &alloc,
             &bridge,
             0,
         );
@@ -2152,7 +2168,7 @@ mod tests {
         let out2 = dispatch_inbound_frame(
             &mut s,
             InboundMiningFrame::SetCustomMiningJob(make_input(2)),
-            &mut alloc,
+            &alloc,
             &bridge,
             0,
         );
@@ -2172,7 +2188,7 @@ mod tests {
     #[test]
     fn dispatch_is_synchronous_to_handlers() {
         let mut s = fresh_test_session();
-        let mut alloc = ExtranonceAllocator::new_default();
+        let alloc = Mutex::new(ExtranonceAllocator::new_default());
         let bridge = fresh_bridge();
         let inbound =
             InboundMiningFrame::UpdateChannel(crate::mining::client::UpdateChannelInput {
@@ -2180,7 +2196,7 @@ mod tests {
                 nominal_hash_rate: 1_000_000.0,
                 maximum_target: [0xFF; 32],
             });
-        let outcome = dispatch_inbound_frame(&mut s, inbound, &mut alloc, &bridge, 0);
+        let outcome = dispatch_inbound_frame(&mut s, inbound, &alloc, &bridge, 0);
         // Unknown channel → UpdateChannelError.
         assert!(matches!(
             outcome.outbound[0],

@@ -37,6 +37,7 @@
 //!   block-submission path consumes those separately.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bp_share::Difficulty;
 use bp_template_distribution::{NewTemplate, SetNewPrevHash, TemplateUpdate};
@@ -117,13 +118,14 @@ pub enum TemplateChange {
 // ── Broadcast payload ────────────────────────────────────────────────
 
 /// Single broadcast event from the translator to per-connection tasks.
-/// Cloned per subscriber by the `tokio::sync::broadcast::Sender` (the
-/// connection-task fan-out is naturally heterogeneous, so a per-task
-/// clone is cheaper than an `Arc` indirection that all callers would
-/// have to unwrap).
+/// The template rides in an `Arc`: the `tokio::sync::broadcast::Sender`
+/// clones the payload once per subscriber, and without the `Arc` every
+/// connection would deep-copy the whole template (coinbase prefix/output
+/// buffers + merkle path, ~1 KB) on every block change — N refcount
+/// bumps instead of N allocations. Field reads deref transparently.
 #[derive(Clone, Debug)]
 pub struct TemplateBroadcast {
-    pub template: ActiveSV2Template,
+    pub template: Arc<ActiveSV2Template>,
     pub change: TemplateChange,
 }
 
