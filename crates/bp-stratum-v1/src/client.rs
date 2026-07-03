@@ -108,10 +108,16 @@ pub struct SessionState<C: Clock> {
 
 impl<C: Clock> SessionState<C> {
     /// Construct a fresh session. `clock` drives the vardiff engine + the
-    /// `session_start_ms` timestamp. `session_id_hex` is the 8-hex string
-    /// that doubles as the extranonce1 in `mining.subscribe` responses
-    /// — pass a freshly-generated one via [`random_session_id_hex`] or a
+    /// `session_start_ms` timestamp. `session_id_hex` is the 8-hex
+    /// session identity (used for the UI / DB / device notifications) —
+    /// pass a freshly-generated one via [`random_session_id_hex`] or a
     /// fixed value for deterministic tests.
+    ///
+    /// `extranonce1` is seeded from `session_id_hex` here as a fallback;
+    /// in production the server overwrites it with a pool-wide
+    /// collision-free prefix from `server::SharedExtranonce` right after
+    /// construction (the two used to be the same value — they are now
+    /// decoupled so two sessions can never mine identical coinbases).
     pub fn new(
         clock: C,
         server_config: &ServerConfig,
@@ -324,8 +330,8 @@ pub fn dispatch<C: Clock>(
 /// Records the opt-in on the session and acks with `{"result":true}`. The flag
 /// gates any later `mining.set_extranonce` push (a session that never
 /// subscribed must not be sent extranonce updates). We do NOT rotate the
-/// extranonce here — extranonce-1 stays the subscribe-time session id until
-/// something explicitly changes it.
+/// extranonce here — extranonce-1 stays the pool-assigned prefix from
+/// subscribe time until something explicitly changes it.
 pub fn handle_extranonce_subscribe<C: Clock>(
     state: &mut SessionState<C>,
     id: RpcId,
@@ -349,12 +355,21 @@ pub fn handle_subscribe<C: Clock>(
 
     // 1. Write subscribe response. We always echo the existing session_id
     // — repeated subscribes from a confused miner re-use the same id.
+    // The subscription id (first field) stays the session id; the
+    // extranonce1 (second field) is the pool-wide collision-free prefix
+    // the server assigned to this connection (see
+    // `server::SharedExtranonce`). The two used to be the same value;
+    // decoupling them is why we send `state.extranonce1` here rather than
+    // `session_id_hex`. On submit the coinbase is reconstructed from the
+    // same `state.extranonce1`, so miner and pool always agree.
     let already_subscribed = state.subscription.is_some();
     state.subscription = Some(request);
+    let subscription_id = state.subscription.as_ref().expect("just set").id.clone();
+    let extranonce1_hex = hex::encode(state.extranonce1);
     out.push_frame(write_subscribe_response(
-        &state.subscription.as_ref().expect("just set").id.clone(),
+        &subscription_id,
         &state.session_id_hex,
-        &state.session_id_hex, // extranonce1 == session_id in hex
+        &extranonce1_hex,
         server_config.extranonce2_size,
     ));
     out.push_event(SessionEvent::Subscribed);
@@ -1018,6 +1033,39 @@ mod tests {
         assert!(s.contains("\"mining.notify\""));
         assert!(s.contains("\"abcd1234\""));
         assert!(s.contains("8]"));
+    }
+
+    #[test]
+    fn subscribe_response_carries_allocated_extranonce1_not_session_id() {
+        // The server assigns a pool-wide collision-free extranonce1 that is
+        // decoupled from the (random) session id. The subscribe response
+        // must carry that allocated prefix as the extranonce1 field while
+        // keeping the session id in the mining.notify subscription tuple.
+        let port = solo_port(16384.0);
+        let mut state = fresh_state(TestClock::new(0), &port); // session id "abcd1234"
+                                                               // Simulate a worker-1 allocated prefix distinct from the session id.
+        state.extranonce1 = [0x01, 0x00, 0x00, 0x2a];
+        let reg = empty_registry();
+        let out = handle_subscribe(
+            &mut state,
+            &server_config(),
+            &port,
+            &reg,
+            None,
+            subscribe_req(Some("cgminer/4.11.1")),
+            0,
+        );
+        let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        // Session id stays as the subscription id (notify tuple)...
+        assert!(
+            s.contains("\"abcd1234\""),
+            "session id must remain the subscription id: {s}"
+        );
+        // ...but the extranonce1 field is the allocated prefix, not the session id.
+        assert!(
+            s.contains("\"0100002a\""),
+            "extranonce1 must be the allocated prefix 0100002a: {s}"
+        );
     }
 
     #[test]

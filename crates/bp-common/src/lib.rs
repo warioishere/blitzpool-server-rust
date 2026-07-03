@@ -18,6 +18,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+pub mod extranonce;
+pub use extranonce::{ExtranonceAllocator, ExtranonceError};
+
 #[cfg(feature = "sqlx")]
 mod sqlx_impls;
 

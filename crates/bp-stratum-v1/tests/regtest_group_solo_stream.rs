@@ -30,7 +30,7 @@ use bp_mining_job::PayoutEntry;
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_stratum_v1::{
     BlockSubmissionSink, PayoutResolver, PortConfig, ServerConfig, ServerHooks, ShareAccept,
-    StratumV1Server,
+    SharedExtranonce, StratumV1Server,
 };
 use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig, TdpHandle};
 use bp_test_support::poll_for_height;
@@ -246,6 +246,7 @@ async fn run_scenario(
             tdp_alt.current_snapshot(),
         )],
         hooks,
+        SharedExtranonce::new(),
     );
 
     // Wait until the Group-Solo stream has paired a template.

@@ -31,9 +31,11 @@
 //! and exit.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bp_common::ExtranonceAllocator;
 use bp_common::StreamKind;
 use bp_template_distribution::TemplateUpdate;
 use futures::StreamExt;
@@ -63,6 +65,110 @@ use crate::jobs::JobRegistry;
 use crate::notify::{ActiveSV1Template, SV1TemplateAssembler, TemplateChange};
 use bp_mining_job::PayoutEntry;
 use bp_vardiff::SystemClock;
+
+/// Pool-wide (across every SV1 port) collision-free extranonce1 allocator
+/// plus its per-connection key counter. Constructed once by the binary
+/// and shared into every [`StratumV1Server`] so two miners — even on
+/// different ports — can never be handed the same extranonce1.
+///
+/// Cheap to clone (both fields are `Arc`). Each connection calls
+/// [`allocate`](Self::allocate) exactly once at accept time; the returned
+/// [`PrefixGuard`] releases the prefix back to the pool when the
+/// connection task ends (any exit path — EOF, cancel, IO error).
+#[derive(Clone)]
+pub struct SharedExtranonce {
+    allocator: Arc<Mutex<ExtranonceAllocator>>,
+    /// Monotonic per-connection key. The allocator only needs the key to
+    /// be unique within this (SV1) instance, so a plain counter suffices
+    /// — SV2's separate instance never shares this map.
+    next_key: Arc<AtomicU64>,
+}
+
+impl SharedExtranonce {
+    /// Build a fresh SV1 allocator on [`bp_common::extranonce::SV1_WORKER_ID`]
+    /// (disjoint from SV2's worker 0). Call once in the binary and clone
+    /// into every port.
+    pub fn new() -> Self {
+        Self {
+            allocator: Arc::new(Mutex::new(ExtranonceAllocator::new_default_on_worker(
+                bp_common::extranonce::SV1_WORKER_ID,
+            ))),
+            next_key: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Allocate a pool-wide-unique 4-byte extranonce1. The returned guard
+    /// releases the prefix on drop, covering every connection-exit path.
+    /// [`PrefixGuard::prefix`] is `None` only when the (16.7M-slot) space
+    /// is exhausted — the caller then keeps the session-id-derived
+    /// extranonce1, i.e. the pre-unification random behaviour.
+    pub fn allocate(&self) -> PrefixGuard {
+        let key = self.next_key.fetch_add(1, Ordering::Relaxed);
+        // Recover a poisoned lock rather than degrading silently: the
+        // allocator is never left half-updated (its ops don't panic
+        // mid-mutation), so a panic elsewhere must NOT permanently force
+        // every future connection onto the non-unique session-id-derived
+        // fallback. A `None` prefix below therefore means genuine
+        // partition exhaustion, which the caller logs.
+        let mut alloc = self
+            .allocator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prefix = alloc
+            .allocate(key)
+            .ok()
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes.as_slice()).ok());
+        drop(alloc);
+        PrefixGuard {
+            key,
+            prefix,
+            allocator: self.allocator.clone(),
+        }
+    }
+
+    /// Number of extranonce1 prefixes currently checked out (one per live
+    /// connection). Exposed for tests + potential metrics.
+    pub fn allocated_count(&self) -> usize {
+        self.allocator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .allocated_count()
+    }
+}
+
+impl Default for SharedExtranonce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RAII claim on one extranonce1 prefix. Dropping it returns the prefix
+/// to the shared allocator (idempotent for the exhausted/`None` case).
+pub struct PrefixGuard {
+    key: u64,
+    prefix: Option<[u8; 4]>,
+    allocator: Arc<Mutex<ExtranonceAllocator>>,
+}
+
+impl PrefixGuard {
+    /// The allocated prefix, or `None` when the partition was exhausted
+    /// (caller falls back to the session-id-derived extranonce1).
+    pub fn prefix(&self) -> Option<[u8; 4]> {
+        self.prefix
+    }
+}
+
+impl Drop for PrefixGuard {
+    fn drop(&mut self) {
+        // Recover a poisoned lock so the prefix is always returned to the
+        // pool — otherwise a single panic elsewhere would leak prefixes
+        // toward exhaustion.
+        self.allocator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .release(self.key);
+    }
+}
 
 /// Broadcast payload from translator → per-connection tasks. The clone
 /// per subscriber is necessary because `apply_new_template` consumes the
@@ -107,6 +213,9 @@ struct Inner {
     // its address resolves to that mode. Each is fed by its own translator off
     // the matching TDP handle.
     alt_streams: HashMap<StreamKind, AltStream>,
+    /// Pool-wide extranonce1 allocator, shared across every SV1 port so
+    /// no two connections are ever handed the same prefix.
+    extranonce: SharedExtranonce,
     cancel: CancellationToken,
     translator_join: Mutex<Option<JoinHandle<()>>>,
     alt_translator_joins: Mutex<Vec<JoinHandle<()>>>,
@@ -155,6 +264,7 @@ impl StratumV1Server {
             bp_template_distribution::TemplateSnapshot,
         )>,
         hooks: ServerHooks,
+        extranonce: SharedExtranonce,
     ) -> Self {
         let server_config = Arc::new(server_config);
         let registry = Arc::new(JobRegistry::from_server_config(&server_config));
@@ -199,6 +309,7 @@ impl StratumV1Server {
                 template_tx,
                 current_template,
                 alt_streams: alt_map,
+                extranonce,
                 cancel,
                 translator_join: Mutex::new(Some(translator_join)),
                 alt_translator_joins: Mutex::new(alt_joins),
@@ -262,6 +373,7 @@ impl StratumV1Server {
             })
             .collect();
         let cancel = self.inner.cancel.clone();
+        let extranonce = self.inner.extranonce.clone();
 
         tokio::spawn(async move {
             let result = run_connection(
@@ -274,6 +386,7 @@ impl StratumV1Server {
                 hooks,
                 socket,
                 cancel,
+                extranonce,
             )
             .await;
             if let Err(err) = result {
@@ -426,6 +539,7 @@ async fn run_connection(
     hooks: ServerHooks,
     socket: TcpStream,
     cancel: CancellationToken,
+    extranonce: SharedExtranonce,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = socket.into_split();
     // Length-capped line framing: a peer that never sends a newline can no
@@ -441,6 +555,23 @@ async fn run_connection(
         &port_config,
         random_session_id_hex(),
     );
+    // Assign a pool-wide collision-free extranonce1 from the shared
+    // allocator, decoupled from the (still-random) session id — the
+    // session id keeps its old identity role for the UI / DB / device
+    // notifications; only the coinbase extranonce becomes unique-by-
+    // construction. The guard releases the prefix when this task ends
+    // (every exit path: EOF, cancel, IO error, disconnect). If the
+    // partition is ever exhausted `prefix()` is None and we keep the
+    // session-id-derived extranonce1, i.e. the pre-unification behaviour.
+    let extranonce_guard = extranonce.allocate();
+    match extranonce_guard.prefix() {
+        Some(prefix) => state.extranonce1 = prefix,
+        None => warn!(
+            session_id = %state.session_id_hex,
+            "sv1: extranonce1 partition exhausted; falling back to the \
+             session-id-derived (non-unique) prefix for this connection"
+        ),
+    }
     let mut current_template = initial_template;
     // `alt_streams` holds one receiver+snapshot per fixed-reservation stream;
     // at `mining.authorize` the connection `remove`s the entry for its resolved
@@ -1370,10 +1501,115 @@ mod tests {
                 ),
             ],
             ServerHooks::no_op(),
+            SharedExtranonce::new(),
         );
         // Shutdown waits for every translator to exit.
         server.shutdown().await;
         // Second call is idempotent (no panic / hang).
         server.shutdown().await;
+    }
+
+    // ── SharedExtranonce ─────────────────────────────────────────────
+
+    #[test]
+    fn shared_extranonce_hands_distinct_worker1_prefixes() {
+        let ex = SharedExtranonce::new();
+        let g1 = ex.allocate();
+        let g2 = ex.allocate();
+        let p1 = g1.prefix().expect("first prefix allocated");
+        let p2 = g2.prefix().expect("second prefix allocated");
+        // Both live in SV1's worker-1 partition (top byte 0x01) — never the
+        // SV2 worker-0 space — and are never equal to each other.
+        assert_eq!(p1[0], 0x01, "SV1 prefix must start 0x01: {p1:?}");
+        assert_eq!(p2[0], 0x01, "SV1 prefix must start 0x01: {p2:?}");
+        assert_ne!(p1, p2, "two connections must never share extranonce1");
+    }
+
+    #[test]
+    fn prefix_guard_releases_prefix_on_drop() {
+        let ex = SharedExtranonce::new();
+        assert_eq!(ex.allocated_count(), 0);
+        let guard = ex.allocate();
+        assert!(guard.prefix().is_some());
+        assert_eq!(ex.allocated_count(), 1, "prefix is checked out while held");
+        drop(guard);
+        assert_eq!(
+            ex.allocated_count(),
+            0,
+            "dropping the guard must return the prefix to the pool"
+        );
+    }
+
+    /// Two SV1 connections on the same server (one shared allocator) must
+    /// receive distinct extranonce1 values in their subscribe responses —
+    /// the whole point of the unification. No bitcoin-core needed: the
+    /// subscribe response is emitted immediately after the handshake.
+    #[tokio::test]
+    async fn two_connections_get_distinct_worker1_extranonce1() {
+        use tokio::net::TcpListener;
+
+        let (_updates_tx, updates_rx) = broadcast::channel(8);
+        let server = StratumV1Server::spawn(
+            server_cfg(),
+            updates_rx,
+            bp_template_distribution::TemplateSnapshot::default(),
+            Vec::new(),
+            ServerHooks::no_op(),
+            SharedExtranonce::new(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Accept two connections, each served by the same server + allocator.
+        let s1 = server.clone();
+        let s2 = server.clone();
+        let pc1 = port_cfg();
+        let pc2 = port_cfg();
+        let accept = tokio::spawn(async move {
+            let (a, _) = listener.accept().await.unwrap();
+            a.set_nodelay(true).ok();
+            s1.accept_connection(a, pc1);
+            let (b, _) = listener.accept().await.unwrap();
+            b.set_nodelay(true).ok();
+            s2.accept_connection(b, pc2);
+        });
+
+        let en1_a = subscribe_and_read_extranonce1(addr).await;
+        let en1_b = subscribe_and_read_extranonce1(addr).await;
+        accept.await.unwrap();
+
+        assert_eq!(en1_a.len(), 8, "extranonce1 is 8 hex chars: {en1_a}");
+        assert!(
+            en1_a.starts_with("01") && en1_b.starts_with("01"),
+            "both extranonce1 must be from worker 1: {en1_a} / {en1_b}"
+        );
+        assert_ne!(
+            en1_a, en1_b,
+            "two connections must never share extranonce1"
+        );
+
+        server.shutdown().await;
+    }
+
+    async fn subscribe_and_read_extranonce1(addr: std::net::SocketAddr) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpStream;
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        sock.set_nodelay(true).ok();
+        let (read, mut write) = sock.into_split();
+        let mut reader = BufReader::new(read);
+        write
+            .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"t/1.0\"]}\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        v["result"][1]
+            .as_str()
+            .expect("extranonce1 in subscribe response")
+            .to_string()
     }
 }

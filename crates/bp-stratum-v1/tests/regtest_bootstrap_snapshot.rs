@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use bitcoin::Network;
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
-use bp_stratum_v1::{ServerConfig, ServerHooks, StratumV1Server};
+use bp_stratum_v1::{ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server};
 use bp_template_distribution::{TdpConfig, TdpHandle};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -112,6 +112,7 @@ async fn sv1_translator_bootstraps_current_template_from_late_snapshot() {
         // No alt streams — this test asserts the default-stream snapshot replay.
         Vec::new(),
         ServerHooks::no_op(),
+        SharedExtranonce::new(),
     );
 
     // ── Assert: current_template populated WITHOUT mining another

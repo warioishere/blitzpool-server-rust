@@ -29,7 +29,8 @@ use std::time::Duration;
 use bitcoin::Network;
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_stratum_v1::{
-    PortConfig, ServerConfig, ServerHooks, StratumV1Server, DEFAULT_POOL_IDENTIFIER,
+    PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server,
+    DEFAULT_POOL_IDENTIFIER,
 };
 use bp_template_distribution::{TdpConfig, TdpHandle};
 use serde_json::Value;
@@ -101,6 +102,7 @@ async fn sv1_server_end_to_end_against_regtest() {
         // No alt streams — this test exercises the default-stream lifecycle only.
         Vec::new(),
         ServerHooks::no_op(),
+        SharedExtranonce::new(),
     );
 
     // Wait until the translator has paired its first template. 5 s is

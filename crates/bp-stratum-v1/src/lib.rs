@@ -72,7 +72,7 @@ pub use notify::{
     build_notify_frame, network_difficulty_from_n_bits, swap_endian_words, ActiveSV1Template,
     SV1TemplateAssembler, TemplateChange,
 };
-pub use server::{StratumV1Server, TemplateBroadcast};
+pub use server::{SharedExtranonce, StratumV1Server, TemplateBroadcast};
 pub use submit::{
     validate_submit, RejectReason, SessionContext, SessionShareCache, ShareAccept, ShareReject,
     ShareValidation,

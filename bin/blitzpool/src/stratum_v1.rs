@@ -53,8 +53,8 @@ use bp_mining_mode::MiningModeResult;
 use bp_share_hook::SharedSessionPersistence;
 use bp_share_stream::{StreamProducer, BLOCK_FOUND_STREAM_KEY};
 use bp_stratum_v1::{
-    PortConfig, ServerConfig, ServerHooks, StratumV1Server, Sv1AcceptedShareAdapter,
-    Sv1RejectedShareAdapter, Sv1SessionPersistenceAdapter,
+    PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server,
+    Sv1AcceptedShareAdapter, Sv1RejectedShareAdapter, Sv1SessionPersistenceAdapter,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -169,6 +169,12 @@ pub(crate) fn build_per_port_servers(
     };
     let mut out: Vec<Sv1PortServer> = Vec::with_capacity(port_configs.len());
 
+    // One pool-wide extranonce1 allocator shared across every SV1 port, so
+    // two miners can never be handed the same prefix — not even on
+    // different ports. Worker 1 keeps SV1's prefixes disjoint from the SV2
+    // server's worker-0 space.
+    let extranonce = SharedExtranonce::new();
+
     for port_config in port_configs {
         let hooks = build_port_hooks(
             port_config.payout_mode,
@@ -203,6 +209,7 @@ pub(crate) fn build_per_port_servers(
             initial_snapshot,
             alt_streams,
             hooks,
+            extranonce.clone(),
         );
         out.push(Sv1PortServer {
             port_config,

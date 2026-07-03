@@ -27,7 +27,7 @@ use bp_mining_job::PayoutEntry;
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_stratum_v1::{
     BlockSubmissionSink, PayoutResolver, PortConfig, ServerConfig, ServerHooks, ShareAccept,
-    StratumV1Server,
+    SharedExtranonce, StratumV1Server,
 };
 use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig, TdpHandle};
 use bp_test_support::poll_for_height;
@@ -169,6 +169,7 @@ async fn sv1_solo_connection_routes_to_solo_stream_and_block_accepted() {
             tdp_solo.current_snapshot(),
         )],
         hooks,
+        SharedExtranonce::new(),
     );
 
     // Wait until the Solo stream has paired a template (that's the one the
@@ -205,7 +206,20 @@ async fn sv1_solo_connection_routes_to_solo_stream_and_block_accepted() {
         .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"solo-miner/1.0\"]}\n")
         .await
         .expect("write subscribe");
-    let _ = read_frame(&mut reader).await;
+    let sub_resp = read_frame(&mut reader).await;
+    // The extranonce1 (result[1]) the pool hands the miner must come from
+    // the pool-wide collision-free allocator's SV1 partition (worker 1 →
+    // top byte 0x01), NOT from the random session id. The block that lands
+    // below is reconstructed from this exact extranonce1, so its acceptance
+    // by bitcoin-core proves the allocated-prefix path yields valid blocks.
+    let en1 = sub_resp["result"][1]
+        .as_str()
+        .expect("extranonce1 in subscribe response");
+    assert_eq!(en1.len(), 8, "extranonce1 is 4 bytes / 8 hex chars: {en1}");
+    assert!(
+        en1.starts_with("01"),
+        "SV1 extranonce1 must be allocated from worker 1 (0x01…), got {en1}"
+    );
 
     // authorize as the Solo address → run_connection resolves Solo + swaps stream.
     write
