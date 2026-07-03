@@ -9,12 +9,17 @@
 //!    (the assembled [`ActiveSV1Template`] each batch of jobs was built
 //!    against).
 //!
-//! 2. **Retire-then-age** lifecycle: a block boundary stamps `retired_at`
-//!    on every current entry without deleting them (so late shares for
-//!    the previous tip can still resolve to a real job, not be reported
-//!    as `JobNotFound`). Aging removes entries whose retirement is past
+//! 2. **Retire-then-age** lifecycle: on every broadcast the stream
+//!    translator runs [`JobRegistry::cleanup_for_tip`], which stamps
+//!    `retired_at` on entries built on a DIFFERENT previous-block hash
+//!    without deleting them (so late shares for the previous tip can
+//!    still resolve to a real job, not be reported as `JobNotFound`).
+//!    Aging then removes entries whose retirement is past
 //!    [`bp_jobs_lifecycle::LifecycleConfig::retention_ms`], subject to
 //!    the [`bp_jobs_lifecycle::LifecycleConfig::min_retained`] floor.
+//!    The retire is prev-hash-conditioned (not a blanket
+//!    `cleanup(true)`) because the registry is shared across the port's
+//!    template streams — see [`JobRegistry::cleanup_for_tip`].
 //!
 //! 3. **Three-way share classification** ([`JobClassification`]
 //!    re-exported from [`bp_jobs_lifecycle`]):
@@ -224,19 +229,23 @@ impl JobRegistry {
         })
     }
 
-    /// Run the ckpool-style lifecycle.
+    /// Run the ckpool-style lifecycle with an UNCONDITIONAL retire.
     ///
     /// - `clear_jobs = true` stamps `retired_at = now_ms` on every entry
     ///   that doesn't already have one (idempotent — already-retired
-    ///   entries keep their original timestamp). This is what
-    ///   [`crate::notify::TemplateChange::NewBlock`] triggers in the
-    ///   server.
+    ///   entries keep their original timestamp).
     /// - `clear_jobs = false` is a periodic age-only tick.
     ///
     /// Both paths then run `age_entries`, which deletes retired entries
     /// past the retention window and (defense-in-depth) non-retired
     /// entries past 2× retention, while always preserving the newest
-    /// [`JobRegistryConfig::min_retained`] entries.
+    /// [`bp_jobs_lifecycle::LifecycleConfig::min_retained`] entries.
+    ///
+    /// Production does NOT call this on block changes — the registry is
+    /// shared by every template stream of a port, and a blanket retire
+    /// races the other streams' fresh jobs. The translator drives
+    /// [`Self::cleanup_for_tip`] instead; this method remains for tests
+    /// and for callers that genuinely mean "retire everything".
     pub fn cleanup(&self, clear_jobs: bool, now_ms: u64) {
         let mut inner = self.inner.lock().expect("job-registry mutex poisoned");
         let cfg = self.config;
@@ -251,6 +260,69 @@ impl JobRegistry {
                 if t.retired_at_ms.is_none() {
                     t.retired_at_ms = Some(now_ms);
                 }
+            }
+        }
+
+        age_entries(
+            &mut inner.jobs,
+            now_ms,
+            &cfg,
+            |j| j.creation_ms,
+            |j| j.retired_at_ms,
+        );
+        age_entries(
+            &mut inner.templates,
+            now_ms,
+            &cfg,
+            |t| t.creation_ms,
+            |t| t.retired_at_ms,
+        );
+    }
+
+    /// Tip-conditioned lifecycle pass — the production wiring, driven by
+    /// each stream's translator on every broadcast it emits.
+    ///
+    /// Retires (idempotently) every entry whose template was built on a
+    /// previous-block hash OTHER than `tip_prev_hash`, plus orphan jobs
+    /// whose template row is already gone, then runs the same aging pass
+    /// as [`Self::cleanup`].
+    ///
+    /// Why prev-hash-conditioned instead of `cleanup(true)`: the registry
+    /// is shared by ALL template streams of a port (PPLNS + Solo +
+    /// Group-Solo + Blockparty), and each stream's translator observes a
+    /// block change at a slightly different instant. A blanket retire
+    /// from whichever stream fires LAST would stamp the fresh jobs the
+    /// earlier streams' connections already registered for the new tip —
+    /// after the grace window every share on them would be rejected as
+    /// stale until the next refresh. Keying the retire on the template's
+    /// `prev_hash` makes the pass idempotent and order-independent
+    /// across streams: new-tip entries are never touched, and refresh
+    /// broadcasts (same tip) retire nothing and only age.
+    pub fn cleanup_for_tip(&self, tip_prev_hash: &[u8; 32], now_ms: u64) {
+        let mut guard = self.inner.lock().expect("job-registry mutex poisoned");
+        let cfg = self.config;
+        let inner = &mut *guard;
+
+        for t in inner.templates.values_mut() {
+            if t.retired_at_ms.is_none() && t.template.prev_hash != *tip_prev_hash {
+                t.retired_at_ms = Some(now_ms);
+            }
+        }
+        // Jobs chase their template's prev_hash. A job whose template row
+        // is already gone (aged out first) is retired too — `classify`
+        // would self-prune it on lookup, but a late share should see a
+        // proper stale classification instead of racing the GC.
+        let templates = &inner.templates;
+        for j in inner.jobs.values_mut() {
+            if j.retired_at_ms.is_some() {
+                continue;
+            }
+            let stale = match templates.get(&j.template_id_hex) {
+                Some(t) => t.template.prev_hash != *tip_prev_hash,
+                None => true,
+            };
+            if stale {
+                j.retired_at_ms = Some(now_ms);
             }
         }
 
@@ -515,6 +587,135 @@ mod tests {
         // it's rejected at 17_000.
         let cls = reg.classify(&jid, 17_000).unwrap().classification;
         assert_eq!(cls, JobClassification::StaleRejected);
+    }
+
+    // ── cleanup_for_tip: prev-hash-conditioned retire ──────────────────
+
+    fn template_with_prev(prev: u8) -> ActiveSV1Template {
+        ActiveSV1Template {
+            prev_hash: [prev; 32],
+            ..dummy_active_template()
+        }
+    }
+
+    /// Entries built on the OLD tip get retired; entries already on the
+    /// new tip are untouched (stay `Active`).
+    #[test]
+    fn cleanup_for_tip_retires_only_entries_from_other_tips() {
+        let reg = JobRegistry::new(cfg());
+        let t_old = reg.add_template(template_with_prev(0xAB), 1_000);
+        let j_old = reg.add_job(dummy_mining_job(), t_old, 1_000);
+        let t_new = reg.add_template(template_with_prev(0xCD), 2_000);
+        let j_new = reg.add_job(dummy_mining_job(), t_new, 2_000);
+
+        reg.cleanup_for_tip(&[0xCD; 32], 10_000);
+
+        assert_eq!(
+            reg.classify(&j_old, 10_000).unwrap().classification,
+            JobClassification::StaleCreditable,
+            "old-tip job must be retired"
+        );
+        assert_eq!(
+            reg.classify(&j_new, 10_000).unwrap().classification,
+            JobClassification::Active,
+            "new-tip job must stay active"
+        );
+    }
+
+    /// A second call with the SAME tip (another stream's translator
+    /// firing later) neither touches new-tip entries nor bumps the
+    /// original `retired_at` of already-retired ones. This pins the
+    /// multi-stream order-independence the method exists for.
+    #[test]
+    fn cleanup_for_tip_is_idempotent_and_order_independent() {
+        let reg = JobRegistry::new(cfg());
+        let t_old = reg.add_template(template_with_prev(0xAB), 1_000);
+        let j_old = reg.add_job(dummy_mining_job(), t_old, 1_000);
+
+        // Stream A observes the new block at t=10_000 …
+        reg.cleanup_for_tip(&[0xCD; 32], 10_000);
+        // … a connection registers a fresh new-tip job right after …
+        let t_new = reg.add_template(template_with_prev(0xCD), 10_100);
+        let j_new = reg.add_job(dummy_mining_job(), t_new, 10_100);
+        // … and stream B's translator fires later with the same tip.
+        reg.cleanup_for_tip(&[0xCD; 32], 12_000);
+
+        // The fresh job survives the late second pass.
+        assert_eq!(
+            reg.classify(&j_new, 12_500).unwrap().classification,
+            JobClassification::Active,
+            "a later same-tip pass must never retire fresh new-tip jobs"
+        );
+        // The old job keeps its ORIGINAL retired_at (10_000): at 17_000
+        // it is past the 5s grace → rejected. Had the second pass bumped
+        // it to 12_000 this would still be creditable.
+        assert_eq!(
+            reg.classify(&j_old, 17_000).unwrap().classification,
+            JobClassification::StaleRejected
+        );
+    }
+
+    /// A refresh broadcast (same tip as every live entry) retires
+    /// nothing — the pass is age-only.
+    #[test]
+    fn cleanup_for_tip_same_tip_is_age_only() {
+        let reg = JobRegistry::new(cfg());
+        let tid = reg.add_template(template_with_prev(0xAB), 1_000);
+        let jid = reg.add_job(dummy_mining_job(), tid, 1_000);
+
+        reg.cleanup_for_tip(&[0xAB; 32], 50_000);
+
+        assert_eq!(
+            reg.classify(&jid, 50_000).unwrap().classification,
+            JobClassification::Active
+        );
+    }
+
+    /// A job whose template row is gone gets retired by the pass (a late
+    /// share then sees a proper stale classification instead of racing
+    /// the orphan self-prune in `classify`).
+    #[test]
+    fn cleanup_for_tip_retires_orphan_jobs() {
+        let reg = JobRegistry::new(cfg());
+        let jid = reg.add_job(dummy_mining_job(), "nonexistent".to_string(), 1_000);
+
+        reg.cleanup_for_tip(&[0xAB; 32], 10_000);
+
+        // classify chases the missing template → None + self-prune; the
+        // retire itself is observable via the entry count staying 1
+        // until classify prunes it.
+        assert_eq!(reg.job_count(), 1);
+        assert!(reg.classify(&jid, 10_000).is_none());
+        assert_eq!(reg.job_count(), 0);
+    }
+
+    /// Entries retired by a tip change age out after retention on a
+    /// LATER pass — the end-to-end memory-bound this wiring exists for.
+    #[test]
+    fn cleanup_for_tip_ages_out_retired_entries_past_retention() {
+        let reg = JobRegistry::new(cfg());
+        let t_old = reg.add_template(template_with_prev(0xAB), 1_000);
+        let j_old = reg.add_job(dummy_mining_job(), t_old, 1_000);
+
+        // Block change at t=10_000 retires the old-tip entries.
+        reg.cleanup_for_tip(&[0xCD; 32], 10_000);
+        // Enough newer entries that the MIN_RETAINED floor doesn't save
+        // the originals.
+        for i in 0..3 {
+            let t = reg.add_template(template_with_prev(0xCD), 20_000 + i);
+            reg.add_job(dummy_mining_job(), t, 20_000 + i);
+        }
+
+        // A later same-tip pass past retention GCs the retired entries.
+        reg.cleanup_for_tip(&[0xCD; 32], 10_000 + cfg().retention_ms + 1);
+
+        assert!(
+            reg.classify(&j_old, 10_000 + cfg().retention_ms + 100)
+                .is_none(),
+            "old-tip job must be GC'd past retention"
+        );
+        assert_eq!(reg.job_count(), 3);
+        assert_eq!(reg.template_count(), 3);
     }
 
     // ── aging: MIN_RETAINED + retention-window + 2x-defense ────────────

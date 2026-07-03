@@ -277,9 +277,13 @@ impl StratumV1Server {
             initial_snapshot,
             template_tx.clone(),
             current_template.clone(),
+            registry.clone(),
             cancel.clone(),
         ));
         // One translator per alt stream, each off its own TDP handle.
+        // They all drive the SAME shared registry's lifecycle — safe
+        // because `cleanup_for_tip` is prev-hash-conditioned and thus
+        // order-independent across streams.
         let mut alt_map = HashMap::with_capacity(alt_streams.len());
         let mut alt_joins = Vec::with_capacity(alt_streams.len());
         for (kind, alt_updates_rx, alt_initial_snapshot) in alt_streams {
@@ -290,6 +294,7 @@ impl StratumV1Server {
                 alt_initial_snapshot,
                 alt_tx.clone(),
                 alt_current.clone(),
+                registry.clone(),
                 cancel.clone(),
             )));
             alt_map.insert(
@@ -443,6 +448,7 @@ async fn run_translator(
     initial_snapshot: bp_template_distribution::TemplateSnapshot,
     template_tx: broadcast::Sender<TemplateBroadcast>,
     current_template: Arc<Mutex<Option<Arc<ActiveSV1Template>>>>,
+    registry: Arc<JobRegistry>,
     cancel: CancellationToken,
 ) {
     let mut assembler = SV1TemplateAssembler::new();
@@ -468,6 +474,9 @@ async fn run_translator(
                 .expect("current_template mutex poisoned");
             *guard = Some(active.clone());
         }
+        // Registry lifecycle (no-op on the empty boot registry; kept for
+        // symmetry with the loop below).
+        registry.cleanup_for_tip(&active.prev_hash, now_ms());
         let _ = template_tx.send(TemplateBroadcast {
             template: active,
             change,
@@ -509,6 +518,16 @@ async fn run_translator(
                                 .expect("current_template mutex poisoned");
                             *guard = Some(active.clone());
                         }
+                        // Registry lifecycle, BEFORE the send so a fast
+                        // subscriber can't register a job that a
+                        // trailing pass would then race. On a block
+                        // change this retires every previous-tip entry
+                        // (their shares classify stale from here on);
+                        // on a refresh (same tip) it only ages retired
+                        // entries out past retention. Without this the
+                        // registry grows without bound — entries were
+                        // never retired OR pruned.
+                        registry.cleanup_for_tip(&active.prev_hash, now_ms());
                         // Broadcast::send errors only when there are no
                         // subscribers — that's fine, freshly-accepted
                         // connections will pick up via the snapshot.
@@ -1175,13 +1194,51 @@ mod tests {
     }
 
     fn dummy_prev_hash(template_id: u64) -> TemplateUpdate {
+        dummy_prev_hash_with(template_id, 0xAB)
+    }
+
+    fn dummy_prev_hash_with(template_id: u64, prev_byte: u8) -> TemplateUpdate {
         TemplateUpdate::SetNewPrevHash(SetNewPrevHash {
             template_id,
-            prev_hash: [0xAB; 32],
+            prev_hash: [prev_byte; 32],
             header_timestamp: 0x65a1_b2c3,
             n_bits: 0x207f_ffff,
             target: [0xff; 32],
         })
+    }
+
+    /// Minimal valid MiningJob for registry entries in translator tests.
+    fn dummy_mining_job() -> bp_mining_job::MiningJob {
+        use bp_mining_job::{
+            build_mining_job_from_tdp, PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
+        };
+        let template = TdpCoinbaseTemplate {
+            coinbase_prefix: &[0x03, 0x40, 0x0d, 0x03],
+            coinbase_tx_version: 2,
+            coinbase_tx_input_sequence: 0xffff_ffff,
+            coinbase_tx_value_remaining: 5_000_000_000,
+            coinbase_tx_outputs: &{
+                let mut v = vec![0u8; 8];
+                v.push(0x26);
+                v.extend_from_slice(&[0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]);
+                v.extend(std::iter::repeat_n(0xCC, 32));
+                v
+            },
+            coinbase_tx_outputs_count: 1,
+            coinbase_tx_locktime: 0,
+        };
+        let payouts = vec![PayoutEntry {
+            address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            sats: 5_000_000_000,
+        }];
+        build_mining_job_from_tdp(
+            Network::Regtest,
+            &payouts,
+            &template,
+            "BP",
+            EXTRANONCE_SLOT_LEN,
+        )
+        .unwrap()
     }
 
     fn fresh_state(port: &PortConfig) -> SessionState<Arc<TestClock>> {
@@ -1202,6 +1259,7 @@ mod tests {
             bp_template_distribution::TemplateSnapshot::default(),
             template_tx,
             current.clone(),
+            Arc::new(JobRegistry::from_server_config(&server_cfg())),
             cancel.clone(),
         ));
 
@@ -1237,6 +1295,7 @@ mod tests {
             bp_template_distribution::TemplateSnapshot::default(),
             template_tx,
             current.clone(),
+            Arc::new(JobRegistry::from_server_config(&server_cfg())),
             cancel.clone(),
         ));
 
@@ -1272,6 +1331,7 @@ mod tests {
             bp_template_distribution::TemplateSnapshot::default(),
             template_tx,
             current,
+            Arc::new(JobRegistry::from_server_config(&server_cfg())),
             cancel.clone(),
         ));
         cancel.cancel();
@@ -1280,6 +1340,74 @@ mod tests {
             .await
             .expect("translator must exit on cancel")
             .unwrap();
+    }
+
+    /// The translator drives the shared registry's lifecycle: a block
+    /// change retires previous-tip entries (→ stale classification), a
+    /// later same-tip pass (another stream's translator) never touches
+    /// fresh new-tip jobs. Guards the memory-bound wiring AND the
+    /// multi-stream order-independence.
+    #[tokio::test]
+    async fn translator_retires_previous_tip_entries_on_new_block() {
+        use crate::jobs::JobClassification;
+
+        let (updates_tx, updates_rx) = broadcast::channel(8);
+        let (template_tx, mut template_rx) = broadcast::channel(8);
+        let current = Arc::new(Mutex::new(None));
+        let registry = Arc::new(JobRegistry::from_server_config(&server_cfg()));
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(run_translator(
+            updates_rx,
+            bp_template_distribution::TemplateSnapshot::default(),
+            template_tx,
+            current,
+            registry.clone(),
+            cancel.clone(),
+        ));
+
+        // Block 1 (prev 0xAB) → a connection registers a job on it.
+        updates_tx.send(dummy_new_template(1, true)).unwrap();
+        updates_tx.send(dummy_prev_hash_with(1, 0xAB)).unwrap();
+        let payload1 =
+            tokio::time::timeout(std::time::Duration::from_millis(200), template_rx.recv())
+                .await
+                .expect("first pair must broadcast")
+                .unwrap();
+        let tid1 = registry.add_template_shared(payload1.template.clone(), now_ms());
+        let jid1 = registry.add_job(dummy_mining_job(), tid1, now_ms());
+        assert_eq!(
+            registry.classify(&jid1, now_ms()).unwrap().classification,
+            JobClassification::Active
+        );
+
+        // Block 2 (prev 0xCD) → the broadcast implies the retire already
+        // ran (cleanup_for_tip fires before the send).
+        updates_tx.send(dummy_new_template(2, true)).unwrap();
+        updates_tx.send(dummy_prev_hash_with(2, 0xCD)).unwrap();
+        let payload2 =
+            tokio::time::timeout(std::time::Duration::from_millis(200), template_rx.recv())
+                .await
+                .expect("second pair must broadcast")
+                .unwrap();
+        assert_eq!(
+            registry.classify(&jid1, now_ms()).unwrap().classification,
+            JobClassification::StaleCreditable,
+            "previous-tip job must be retired by the block-change broadcast"
+        );
+
+        // A fresh job on the new tip survives a LATER same-tip pass (the
+        // race an unconditional retire would lose against alt streams).
+        let tid2 = registry.add_template_shared(payload2.template.clone(), now_ms());
+        let jid2 = registry.add_job(dummy_mining_job(), tid2, now_ms());
+        registry.cleanup_for_tip(&payload2.template.prev_hash, now_ms());
+        assert_eq!(
+            registry.classify(&jid2, now_ms()).unwrap().classification,
+            JobClassification::Active,
+            "a later same-tip pass must not retire fresh new-tip jobs"
+        );
+
+        cancel.cancel();
+        join.await.unwrap();
     }
 
     // ── process_event hook fan-out ────────────────────────────────────
