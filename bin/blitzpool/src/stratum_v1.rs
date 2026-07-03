@@ -102,6 +102,7 @@ pub(crate) fn build_per_port_servers(
     group_service: &SharedGroupService,
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
+    job_cache: Arc<bp_mining_job::MiningJobCache>,
 ) -> Result<Vec<Sv1PortServer>, StratumV1SpawnError> {
     let Some(tdp) = foundation.tdp.as_ref() else {
         warn!("stratum-v1: TDP missing (--skip-tdp); skipping SV1 server construction");
@@ -210,6 +211,7 @@ pub(crate) fn build_per_port_servers(
             alt_streams,
             hooks,
             extranonce.clone(),
+            job_cache.clone(),
         );
         out.push(Sv1PortServer {
             port_config,

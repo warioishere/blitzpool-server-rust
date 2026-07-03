@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use bitcoin::Network;
 use bp_mining_job::{
-    address_to_script, build_mining_job_from_tdp, normalize_btc_address, PayoutEntry,
-    TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
+    address_to_script, normalize_btc_address, MiningJobCache, PayoutEntry, TdpCoinbaseTemplate,
+    EXTRANONCE_SLOT_LEN,
 };
 
 use crate::config::{PortConfig, ServerConfig};
@@ -653,11 +653,13 @@ pub fn handle_submit<C: Clock>(
 ///     notify carries `clean_jobs=false` — ckpool comment: "No forced
 ///     clean_jobs=true on diff change … the right cover for in-flight
 ///     stale-diff shares is the CK-style clamp, not a queue flush."
+#[allow(clippy::too_many_arguments)]
 pub fn apply_vardiff_check<C: Clock>(
     state: &mut SessionState<C>,
     server_config: &ServerConfig,
     port_config: &PortConfig,
     registry: &Arc<JobRegistry>,
+    job_cache: &MiningJobCache,
     current_template: Option<&Arc<ActiveSV1Template>>,
     payouts: &[PayoutEntry],
     now_ms: u64,
@@ -695,6 +697,7 @@ pub fn apply_vardiff_check<C: Clock>(
             server_config,
             port_config,
             registry,
+            job_cache,
             template,
             payouts,
             false,
@@ -721,6 +724,7 @@ pub fn apply_new_template<C: Clock>(
     server_config: &ServerConfig,
     port_config: &PortConfig,
     registry: &Arc<JobRegistry>,
+    job_cache: &MiningJobCache,
     template: &Arc<ActiveSV1Template>,
     payouts: &[PayoutEntry],
     clean_jobs: bool,
@@ -738,6 +742,7 @@ pub fn apply_new_template<C: Clock>(
         server_config,
         port_config,
         registry,
+        job_cache,
         template,
         payouts,
         clean_jobs,
@@ -765,6 +770,7 @@ fn build_and_register_notify<C: Clock>(
     server_config: &ServerConfig,
     _port_config: &PortConfig,
     registry: &Arc<JobRegistry>,
+    job_cache: &MiningJobCache,
     template: &Arc<ActiveSV1Template>,
     payouts: &[PayoutEntry],
     clean_jobs: bool,
@@ -789,19 +795,23 @@ fn build_and_register_notify<C: Clock>(
         coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
         coinbase_tx_locktime: template.coinbase_tx_locktime,
     };
-    let mining_job = build_mining_job_from_tdp(
-        state.network,
-        payouts,
-        &tdp_template,
-        &server_config.pool_identifier,
-        EXTRANONCE_SLOT_LEN,
-    )
-    .ok()?;
+    // Pool-wide memoized build: SV1 always uses the fixed
+    // EXTRANONCE_SLOT_LEN, so every connection with the same payout set
+    // (all of PPLNS) shares literally ONE `MiningJob` per template.
+    let mining_job = job_cache
+        .get_or_build(
+            state.network,
+            payouts,
+            &tdp_template,
+            &server_config.pool_identifier,
+            EXTRANONCE_SLOT_LEN,
+        )
+        .ok()?;
 
     // `template.clone()` is an Arc refcount bump — the registry shares
     // the one template allocation across every connection's registration.
     let template_id_hex = registry.add_template_shared(template.clone(), now_ms);
-    let job_id_hex = registry.add_job(mining_job.clone(), template_id_hex, now_ms);
+    let job_id_hex = registry.add_job_shared(mining_job.clone(), template_id_hex, now_ms);
     Some(build_notify_frame(
         template,
         &mining_job,
@@ -1271,7 +1281,16 @@ mod tests {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
         let reg = empty_registry();
-        let out = apply_vardiff_check(&mut state, &server_config(), &port, &reg, None, &[], 1_000);
+        let out = apply_vardiff_check(
+            &mut state,
+            &server_config(),
+            &port,
+            &reg,
+            &MiningJobCache::new(),
+            None,
+            &[],
+            1_000,
+        );
         assert!(out.outbound_frames.is_empty());
         // last_difficulty_check_ms is still updated.
         assert_eq!(state.last_difficulty_check_ms, 1_000);
@@ -1297,6 +1316,7 @@ mod tests {
             &server_config(),
             &port,
             &reg,
+            &MiningJobCache::new(),
             &template,
             &payouts,
             true,
@@ -1327,6 +1347,7 @@ mod tests {
             &server_config(),
             &port,
             &reg,
+            &MiningJobCache::new(),
             &template,
             &payouts,
             false,
@@ -1353,6 +1374,7 @@ mod tests {
             &server_config(),
             &port,
             &reg,
+            &MiningJobCache::new(),
             &template,
             &payouts,
             true,

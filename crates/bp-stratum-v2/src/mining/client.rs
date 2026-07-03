@@ -43,12 +43,13 @@
 //! the SV2 TDP wire protocol. Architecture choice, not a missing feature.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bitcoin::Network;
 use bp_common::{AddressId, StreamKind};
 use bp_mining_job::{
-    address_to_script, build_mining_job_from_tdp, merkle_root_from_coinbase, normalize_btc_address,
-    MiningJob, MiningJobError, PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
+    address_to_script, merkle_root_from_coinbase, normalize_btc_address, MiningJob, MiningJobCache,
+    MiningJobError, PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
 };
 use bp_share::{
     clamp_difficulty_to_max_target, difficulty_to_target, hash_rate_to_difficulty, sha256d,
@@ -1591,12 +1592,19 @@ pub struct MiningJobInputs {
     pub coinbase_tx_outputs: Vec<u8>,
     pub coinbase_tx_outputs_count: u32,
     pub coinbase_tx_locktime: u32,
+    /// Pool-wide memoization of built jobs, shared across every
+    /// connection. `build` is keyed on ALL of the fields above plus the
+    /// slot size, so channels with the same payout set + slot share one
+    /// `Arc<MiningJob>`; payout sets that differ per finder stay
+    /// distinct by construction.
+    pub job_cache: Arc<MiningJobCache>,
 }
 
 impl MiningJobInputs {
-    /// Build a fresh [`MiningJob`] with `extranonce_slot_size` bytes
-    /// reserved at the tail of the scriptsig.
-    pub fn build(&self, extranonce_slot_size: usize) -> Result<MiningJob, MiningJobError> {
+    /// Build (or fetch the memoized) [`MiningJob`] with
+    /// `extranonce_slot_size` bytes reserved at the tail of the
+    /// scriptsig.
+    pub fn build(&self, extranonce_slot_size: usize) -> Result<Arc<MiningJob>, MiningJobError> {
         let tdp = TdpCoinbaseTemplate {
             coinbase_prefix: &self.coinbase_prefix,
             coinbase_tx_version: self.coinbase_tx_version,
@@ -1606,7 +1614,7 @@ impl MiningJobInputs {
             coinbase_tx_outputs_count: self.coinbase_tx_outputs_count,
             coinbase_tx_locktime: self.coinbase_tx_locktime,
         };
-        build_mining_job_from_tdp(
+        self.job_cache.get_or_build(
             self.network,
             &self.payouts,
             &tdp,
@@ -3726,6 +3734,7 @@ mod tests {
             coinbase_tx_outputs,
             coinbase_tx_outputs_count: 1,
             coinbase_tx_locktime: 0,
+            job_cache: Arc::new(MiningJobCache::new()),
         }
     }
 

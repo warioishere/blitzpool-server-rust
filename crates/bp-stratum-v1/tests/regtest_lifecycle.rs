@@ -103,6 +103,7 @@ async fn sv1_server_end_to_end_against_regtest() {
         Vec::new(),
         ServerHooks::no_op(),
         SharedExtranonce::new(),
+        std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
 
     // Wait until the translator has paired its first template. 5 s is

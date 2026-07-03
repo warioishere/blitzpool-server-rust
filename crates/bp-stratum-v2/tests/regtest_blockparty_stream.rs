@@ -180,6 +180,7 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
         )],
         hooks,
         bridge,
+        std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
     wait_until(Duration::from_secs(8), || {
         server.current_template().is_some()

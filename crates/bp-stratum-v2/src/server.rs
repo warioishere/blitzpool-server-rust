@@ -75,7 +75,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitcoin::Network;
 use bp_common::{AddressId, StreamKind};
-use bp_mining_job::MiningJobError;
+use bp_mining_job::{MiningJobCache, MiningJobError};
 use bp_template_distribution::TemplateUpdate;
 use bp_vardiff::SystemClock;
 use stratum_core::binary_sv2::GetSize;
@@ -196,6 +196,12 @@ struct Inner {
     // same base prefix on each connection, guaranteeing that collision; a
     // single shared allocator hands out a globally-unique prefix per channel.
     extranonce_allocator: Arc<Mutex<ExtranonceAllocator>>,
+    // Pool-wide memoization of built MiningJobs — the binary creates
+    // ONE cache and passes it into every per-port SV2 server (and the
+    // SV1 servers): one PPLNS coinbase build per (template, payout
+    // set, slot size) for the whole pool instead of one per channel
+    // per broadcast.
+    job_cache: Arc<MiningJobCache>,
     cancel: CancellationToken,
     translator_join: Mutex<Option<JoinHandle<()>>>,
     alt_translator_joins: Mutex<Vec<JoinHandle<()>>>,
@@ -242,6 +248,7 @@ impl StratumV2MiningServer {
         )>,
         hooks: MiningServerHooks,
         bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
+        job_cache: Arc<MiningJobCache>,
     ) -> Self {
         let server_config = Arc::new(server_config);
         let (template_tx, _) = broadcast::channel(TEMPLATE_BROADCAST_CAPACITY);
@@ -253,6 +260,7 @@ impl StratumV2MiningServer {
             initial_snapshot,
             template_tx.clone(),
             current_template.clone(),
+            job_cache.clone(),
             cancel.clone(),
         ));
         // One translator per alt stream, each off its own TDP handle.
@@ -266,6 +274,7 @@ impl StratumV2MiningServer {
                 alt_initial_snapshot,
                 alt_tx.clone(),
                 alt_current.clone(),
+                job_cache.clone(),
                 cancel.clone(),
             )));
             alt_map.insert(
@@ -287,6 +296,7 @@ impl StratumV2MiningServer {
                 current_template,
                 alt_streams: alt_map,
                 extranonce_allocator: Arc::new(Mutex::new(ExtranonceAllocator::new_default())),
+                job_cache,
                 cancel,
                 translator_join: Mutex::new(Some(translator_join)),
                 alt_translator_joins: Mutex::new(alt_joins),
@@ -354,6 +364,7 @@ impl StratumV2MiningServer {
             .collect();
         let cancel = self.inner.cancel.clone();
         let extranonce_allocator = self.inner.extranonce_allocator.clone();
+        let job_cache = self.inner.job_cache.clone();
         let session_id = self.alloc_session_id();
 
         tokio::spawn(async move {
@@ -368,6 +379,7 @@ impl StratumV2MiningServer {
                 initial_template,
                 alt_streams,
                 extranonce_allocator,
+                job_cache,
                 socket,
                 cancel,
             )
@@ -443,6 +455,7 @@ async fn run_translator(
     initial_snapshot: bp_template_distribution::TemplateSnapshot,
     template_tx: broadcast::Sender<TemplateBroadcast>,
     current_template: Arc<Mutex<Option<Arc<ActiveSV2Template>>>>,
+    job_cache: Arc<MiningJobCache>,
     cancel: CancellationToken,
 ) {
     let mut assembler = SV2TemplateAssembler::new();
@@ -497,6 +510,12 @@ async fn run_translator(
                                 .expect("current_template mutex poisoned");
                             *guard = Some(active.clone());
                         }
+                        // Job-cache aging heartbeat: prune piggybacks
+                        // on lookups too, but the translator fires even
+                        // when NO channel is open — without this, the
+                        // last window's entries would sit in RAM until
+                        // the next lookup.
+                        job_cache.prune_expired();
                         // Broadcast::send errors only when there are no
                         // subscribers — freshly-accepted connections
                         // pick up via the snapshot.
@@ -526,6 +545,7 @@ async fn run_mining_connection(
     initial_template: Option<Arc<ActiveSV2Template>>,
     mut alt_streams: HashMap<StreamKind, AltStreamHandle>,
     extranonce_allocator: Arc<Mutex<ExtranonceAllocator>>,
+    job_cache: Arc<MiningJobCache>,
     socket: TcpStream,
     cancel: CancellationToken,
 ) -> std::io::Result<()> {
@@ -797,6 +817,7 @@ async fn run_mining_connection(
                         &server_config,
                         &template,
                         &hooks,
+                        &job_cache,
                     )
                     .await
                     {
@@ -901,6 +922,7 @@ async fn run_mining_connection(
                     &server_config,
                     &payload.template,
                     &hooks,
+                    &job_cache,
                 )
                 .await
                 {
@@ -1197,6 +1219,7 @@ async fn resolve_template_mining_job_inputs(
     server_config: &ServerConfig,
     template: &ActiveSV2Template,
     hooks: &MiningServerHooks,
+    job_cache: &Arc<MiningJobCache>,
 ) -> Result<Option<MiningJobInputs>, MiningJobError> {
     let Some(addr) = address else {
         return Ok(None);
@@ -1216,6 +1239,7 @@ async fn resolve_template_mining_job_inputs(
         coinbase_tx_outputs: template.coinbase_tx_outputs.clone(),
         coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
         coinbase_tx_locktime: template.coinbase_tx_locktime,
+        job_cache: job_cache.clone(),
     }))
 }
 
@@ -1527,6 +1551,7 @@ mod tests {
             Vec::new(),
             MiningServerHooks::no_op(),
             bridge,
+            Arc::new(MiningJobCache::new()),
         );
         server.shutdown().await;
         // Second call is a no-op (translator_join already taken).
@@ -1545,6 +1570,7 @@ mod tests {
             Vec::new(),
             MiningServerHooks::no_op(),
             bridge,
+            Arc::new(MiningJobCache::new()),
         );
         let clone = server.clone();
         assert!(clone.current_template().is_none());
@@ -1563,6 +1589,7 @@ mod tests {
             Vec::new(),
             MiningServerHooks::no_op(),
             bridge,
+            Arc::new(MiningJobCache::new()),
         );
         // Random u32 IDs (4 OS-CSPRNG bytes → BE u32) — collision odds
         // across three draws are ~negligible. Test pins distinctness +
@@ -1621,6 +1648,7 @@ mod tests {
             Vec::new(),
             MiningServerHooks::no_op(),
             bridge,
+            Arc::new(MiningJobCache::new()),
         );
         let mut rx = server.subscribe_templates();
         tdp_tx
@@ -1651,6 +1679,7 @@ mod tests {
             Vec::new(),
             MiningServerHooks::no_op(),
             bridge,
+            Arc::new(MiningJobCache::new()),
         );
         assert!(server.current_template().is_none());
         tdp_tx
@@ -1857,9 +1886,15 @@ mod tests {
         let cfg = server_cfg();
         let hooks = MiningServerHooks::no_op();
         let template = active_template_fixture();
-        let out = resolve_template_mining_job_inputs(&None, &cfg, &template, &hooks)
-            .await
-            .unwrap();
+        let out = resolve_template_mining_job_inputs(
+            &None,
+            &cfg,
+            &template,
+            &hooks,
+            &Arc::new(MiningJobCache::new()),
+        )
+        .await
+        .unwrap();
         assert!(out.is_none(), "no address → no MiningJobInputs");
     }
 
@@ -1869,9 +1904,15 @@ mod tests {
         let hooks = MiningServerHooks::no_op();
         let template = active_template_fixture();
         let addr = Some(AddressId::new(ADDR.to_string()).unwrap());
-        let out = resolve_template_mining_job_inputs(&addr, &cfg, &template, &hooks)
-            .await
-            .unwrap();
+        let out = resolve_template_mining_job_inputs(
+            &addr,
+            &cfg,
+            &template,
+            &hooks,
+            &Arc::new(MiningJobCache::new()),
+        )
+        .await
+        .unwrap();
         assert!(out.is_some(), "address locked → MiningJobInputs populated");
         let inputs = out.unwrap();
         assert!(

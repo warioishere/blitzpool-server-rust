@@ -109,6 +109,7 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
         Vec::new(),
         MiningServerHooks::no_op(),
         bridge,
+        std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
 
     // Wait until the translator has paired its first template.

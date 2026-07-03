@@ -28,7 +28,7 @@ const COINBASE_NONFINAL_SEQUENCE: u32 = 0xffff_fffe;
 /// coinbase builder must place those sats verbatim. Deriving amounts from a
 /// float percentage here would re-floor each output and silently drop up to a
 /// sat per output (e.g. a 50 000 000-sat finder bonus rounding to 49 999 999).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PayoutEntry {
     pub address: String,
     /// Exact output amount in satoshis.
@@ -301,26 +301,61 @@ pub fn build_mining_job_from_tdp(
         return Err(MiningJobError::NoPayouts);
     }
 
-    let identifier_bytes = pool_identifier.as_bytes();
-
-    // Try with identifier appended after the TDP prefix; drop it if the
-    // resulting scriptsig would exceed the 100-byte consensus limit.
-    // Mirrors the existing `build_mining_job` "drop on overflow" behavior.
-    let mut script_sig = build_tdp_scriptsig(
+    // Scriptsig FIRST, outputs second — keeps the error precedence
+    // (NoPayouts → ScriptSigTooLong → InvalidAddress) identical to the
+    // pre-split function so callers matching/logging the variant see
+    // the same failure cause for the same inputs.
+    let script_sig = checked_tdp_scriptsig(
         template.coinbase_prefix,
-        identifier_bytes,
+        pool_identifier,
         extranonce_slot_size,
-    );
-    if script_sig.len() > MAX_SCRIPT_SIZE {
-        script_sig = build_tdp_scriptsig(template.coinbase_prefix, &[], extranonce_slot_size);
-    }
-    if script_sig.len() > MAX_SCRIPT_SIZE {
-        return Err(MiningJobError::ScriptSigTooLong(script_sig.len()));
-    }
+    )?;
 
     let payout_outputs =
         build_payout_outputs(network, payouts, template.coinbase_tx_value_remaining)?;
 
+    Ok(assemble_tdp_job(
+        script_sig,
+        &payout_outputs,
+        template,
+        extranonce_slot_size,
+    ))
+}
+
+/// Build the TDP scriptsig (template prefix + pool identifier +
+/// extranonce slot), dropping the identifier if the result would exceed
+/// the 100-byte consensus limit — mirrors `build_mining_job`'s "drop on
+/// overflow" behavior. Split out so [`crate::cache::MiningJobCache`]
+/// runs the same check in the same order as
+/// [`build_mining_job_from_tdp`].
+pub(crate) fn checked_tdp_scriptsig(
+    tdp_prefix: &[u8],
+    pool_identifier: &str,
+    extranonce_slot_size: usize,
+) -> Result<Vec<u8>, MiningJobError> {
+    let mut script_sig =
+        build_tdp_scriptsig(tdp_prefix, pool_identifier.as_bytes(), extranonce_slot_size);
+    if script_sig.len() > MAX_SCRIPT_SIZE {
+        script_sig = build_tdp_scriptsig(tdp_prefix, &[], extranonce_slot_size);
+    }
+    if script_sig.len() > MAX_SCRIPT_SIZE {
+        return Err(MiningJobError::ScriptSigTooLong(script_sig.len()));
+    }
+    Ok(script_sig)
+}
+
+/// Assemble a `MiningJob` from an ALREADY-CHECKED scriptsig and
+/// ALREADY-BUILT payout outputs — the two fallible steps
+/// ([`checked_tdp_scriptsig`], [`build_payout_outputs`]) factored out
+/// so [`crate::cache::MiningJobCache`] can reuse parsed outputs across
+/// builds that differ only in slot size / template coinbase fields.
+/// Serialization itself cannot fail.
+pub(crate) fn assemble_tdp_job(
+    script_sig: Vec<u8>,
+    payout_outputs: &[(u64, Vec<u8>)],
+    template: &TdpCoinbaseTemplate<'_>,
+    extranonce_slot_size: usize,
+) -> MiningJob {
     let total_output_count =
         payout_outputs.len() as u64 + u64::from(template.coinbase_tx_outputs_count);
 
@@ -329,7 +364,7 @@ pub fn build_mining_job_from_tdp(
         &script_sig,
         template.coinbase_tx_input_sequence,
         total_output_count,
-        &payout_outputs,
+        payout_outputs,
         template.coinbase_tx_outputs,
         template.coinbase_tx_locktime,
     );
@@ -345,10 +380,10 @@ pub fn build_mining_job_from_tdp(
     let coinbase_prefix = serialized[..prefix_end].to_vec();
     let coinbase_suffix = serialized[suffix_start..].to_vec();
 
-    Ok(MiningJob {
+    MiningJob {
         coinbase_prefix,
         coinbase_suffix,
-    })
+    }
 }
 
 fn build_tdp_scriptsig(tdp_prefix: &[u8], identifier: &[u8], slot_len: usize) -> Vec<u8> {
@@ -411,7 +446,7 @@ fn build_scriptsig(height_encoded: &[u8], identifier: &[u8], padding: &[u8]) -> 
     s
 }
 
-fn build_payout_outputs(
+pub(crate) fn build_payout_outputs(
     network: Network,
     payouts: &[PayoutEntry],
     reward_sats: u64,

@@ -113,6 +113,7 @@ async fn sv1_translator_bootstraps_current_template_from_late_snapshot() {
         Vec::new(),
         ServerHooks::no_op(),
         SharedExtranonce::new(),
+        std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
 
     // ── Assert: current_template populated WITHOUT mining another

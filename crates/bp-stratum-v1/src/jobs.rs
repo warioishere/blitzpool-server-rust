@@ -178,8 +178,24 @@ impl JobRegistry {
 
     /// Insert a mining job linked to a template, under a freshly-allocated
     /// hex id. Returns the id the SV1 wire layer should put in
-    /// `mining.notify[0]`.
+    /// `mining.notify[0]`. Convenience wrapper that takes ownership and
+    /// wraps in `Arc` — used by tests. The hot broadcast path uses
+    /// [`Self::add_job_shared`] to register the pool-wide memoized job
+    /// without a deep copy.
     pub fn add_job(&self, mining_job: MiningJob, template_id_hex: String, now_ms: u64) -> String {
+        self.add_job_shared(Arc::new(mining_job), template_id_hex, now_ms)
+    }
+
+    /// Insert an already-`Arc`-shared mining job under a freshly-allocated
+    /// hex id. With the pool-wide `MiningJobCache`, every same-payout
+    /// connection registers the SAME job allocation per broadcast — a
+    /// refcount bump each instead of N copies of the coinbase buffers.
+    pub fn add_job_shared(
+        &self,
+        mining_job: Arc<MiningJob>,
+        template_id_hex: String,
+        now_ms: u64,
+    ) -> String {
         let mut inner = self.inner.lock().expect("job-registry mutex poisoned");
         let id = inner.next_job_id;
         inner.next_job_id += 1;
@@ -187,7 +203,7 @@ impl JobRegistry {
         inner.jobs.insert(
             id_hex.clone(),
             JobEntry {
-                mining_job: Arc::new(mining_job),
+                mining_job,
                 template_id_hex,
                 creation_ms: now_ms,
                 retired_at_ms: None,

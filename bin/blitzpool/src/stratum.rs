@@ -140,6 +140,13 @@ pub(crate) async fn spawn(
     let sv1_resolver: Arc<dyn bp_stratum_v1::PayoutResolver> = production_resolver.clone();
     let sv2_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver> = production_resolver;
 
+    // ONE pool-wide MiningJob cache shared across every SV1 AND SV2
+    // port server. All of them ride the same TDP streams, and the
+    // cache key is content-based, so an SV1 PPLNS build and an SV2
+    // Standard-channel build for the same template are literally the
+    // same entry.
+    let job_cache = Arc::new(bp_mining_job::MiningJobCache::new());
+
     let sv1_servers = stratum_v1::build_per_port_servers(
         cfg,
         foundation,
@@ -147,6 +154,7 @@ pub(crate) async fn spawn(
         group_service,
         sv1_resolver,
         dispatcher.clone(),
+        job_cache.clone(),
     )?;
     let noise_config = stratum_v2::build_noise_config(cfg)?;
     let bridge = stratum_v2::build_bridge();
@@ -159,6 +167,7 @@ pub(crate) async fn spawn(
         bridge,
         sv2_resolver,
         dispatcher,
+        job_cache,
     );
 
     // Pair SV1 + SV2 servers by port. Both builders enumerate ports

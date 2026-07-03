@@ -177,6 +177,7 @@ pub(crate) fn build_per_port_servers(
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     payout_resolver: Arc<dyn PayoutResolver>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
+    job_cache: Arc<bp_mining_job::MiningJobCache>,
 ) -> Vec<Sv2PortServer> {
     let Some(tdp) = foundation.tdp.as_ref() else {
         warn!("stratum-v2: TDP missing (--skip-tdp); skipping SV2 server construction");
@@ -270,6 +271,7 @@ pub(crate) fn build_per_port_servers(
             alt_streams,
             hooks,
             bridge.clone(),
+            job_cache.clone(),
         );
         // Same per-port toml block drives both SV1 + SV2. start_difficulty
         // is the first SetTarget; min_difficulty is the vardiff floor (only

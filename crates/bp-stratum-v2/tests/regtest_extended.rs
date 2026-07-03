@@ -100,6 +100,7 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
         Vec::new(),
         MiningServerHooks::no_op(),
         bridge,
+        std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
 
     wait_until(Duration::from_secs(5), || {

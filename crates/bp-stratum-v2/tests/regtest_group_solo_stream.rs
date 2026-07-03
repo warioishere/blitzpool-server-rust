@@ -263,6 +263,7 @@ async fn run_scenario(
         )],
         hooks,
         bridge,
+        std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
     wait_until(Duration::from_secs(8), || {
         server.current_template().is_some()

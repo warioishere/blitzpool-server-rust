@@ -63,7 +63,7 @@ use crate::config::{PortConfig, ServerConfig};
 use crate::hooks::ServerHooks;
 use crate::jobs::JobRegistry;
 use crate::notify::{ActiveSV1Template, SV1TemplateAssembler, TemplateChange};
-use bp_mining_job::PayoutEntry;
+use bp_mining_job::{MiningJobCache, PayoutEntry};
 use bp_vardiff::SystemClock;
 
 /// Pool-wide (across every SV1 port) collision-free extranonce1 allocator
@@ -216,6 +216,11 @@ struct Inner {
     /// Pool-wide extranonce1 allocator, shared across every SV1 port so
     /// no two connections are ever handed the same prefix.
     extranonce: SharedExtranonce,
+    /// Pool-wide memoization of built `MiningJob`s, shared across every
+    /// SV1 port (the ports ride the same TDP streams, so their templates
+    /// — and thus cache keys — are identical). One PPLNS coinbase build
+    /// per template instead of one per connection.
+    job_cache: Arc<MiningJobCache>,
     cancel: CancellationToken,
     translator_join: Mutex<Option<JoinHandle<()>>>,
     alt_translator_joins: Mutex<Vec<JoinHandle<()>>>,
@@ -265,6 +270,7 @@ impl StratumV1Server {
         )>,
         hooks: ServerHooks,
         extranonce: SharedExtranonce,
+        job_cache: Arc<MiningJobCache>,
     ) -> Self {
         let server_config = Arc::new(server_config);
         let registry = Arc::new(JobRegistry::from_server_config(&server_config));
@@ -278,6 +284,7 @@ impl StratumV1Server {
             template_tx.clone(),
             current_template.clone(),
             registry.clone(),
+            job_cache.clone(),
             cancel.clone(),
         ));
         // One translator per alt stream, each off its own TDP handle.
@@ -295,6 +302,7 @@ impl StratumV1Server {
                 alt_tx.clone(),
                 alt_current.clone(),
                 registry.clone(),
+                job_cache.clone(),
                 cancel.clone(),
             )));
             alt_map.insert(
@@ -315,6 +323,7 @@ impl StratumV1Server {
                 current_template,
                 alt_streams: alt_map,
                 extranonce,
+                job_cache,
                 cancel,
                 translator_join: Mutex::new(Some(translator_join)),
                 alt_translator_joins: Mutex::new(alt_joins),
@@ -379,6 +388,7 @@ impl StratumV1Server {
             .collect();
         let cancel = self.inner.cancel.clone();
         let extranonce = self.inner.extranonce.clone();
+        let job_cache = self.inner.job_cache.clone();
 
         tokio::spawn(async move {
             let result = run_connection(
@@ -392,6 +402,7 @@ impl StratumV1Server {
                 socket,
                 cancel,
                 extranonce,
+                job_cache,
             )
             .await;
             if let Err(err) = result {
@@ -449,6 +460,7 @@ async fn run_translator(
     template_tx: broadcast::Sender<TemplateBroadcast>,
     current_template: Arc<Mutex<Option<Arc<ActiveSV1Template>>>>,
     registry: Arc<JobRegistry>,
+    job_cache: Arc<MiningJobCache>,
     cancel: CancellationToken,
 ) {
     let mut assembler = SV1TemplateAssembler::new();
@@ -528,6 +540,12 @@ async fn run_translator(
                         // registry grows without bound — entries were
                         // never retired OR pruned.
                         registry.cleanup_for_tip(&active.prev_hash, now_ms());
+                        // Job-cache aging heartbeat: prune piggybacks
+                        // on lookups too, but the translator fires even
+                        // when NO miner is connected — without this,
+                        // the last window's entries would sit in RAM
+                        // until the next connection's first lookup.
+                        job_cache.prune_expired();
                         // Broadcast::send errors only when there are no
                         // subscribers — that's fine, freshly-accepted
                         // connections will pick up via the snapshot.
@@ -559,6 +577,7 @@ async fn run_connection(
     socket: TcpStream,
     cancel: CancellationToken,
     extranonce: SharedExtranonce,
+    job_cache: Arc<MiningJobCache>,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = socket.into_split();
     // Length-capped line framing: a peer that never sends a newline can no
@@ -746,6 +765,7 @@ async fn run_connection(
                             &server_config,
                             &port_config,
                             &registry,
+                            &job_cache,
                             current_template.as_ref(),
                             &hooks,
                             &mut write_half,
@@ -775,6 +795,7 @@ async fn run_connection(
                                 &server_config,
                                 &port_config,
                                 &registry,
+                                &job_cache,
                                 current_template.as_ref(),
                                 &payouts,
                                 now,
@@ -785,6 +806,7 @@ async fn run_connection(
                                 &server_config,
                                 &port_config,
                                 &registry,
+                                &job_cache,
                                 current_template.as_ref(),
                                 &hooks,
                                 &mut write_half,
@@ -835,6 +857,7 @@ async fn run_connection(
                     &server_config,
                     &port_config,
                     &registry,
+                    &job_cache,
                     &payload.template,
                     &payouts,
                     clean_jobs,
@@ -846,6 +869,7 @@ async fn run_connection(
                     &server_config,
                     &port_config,
                     &registry,
+                    &job_cache,
                     current_template.as_ref(),
                     &hooks,
                     &mut write_half,
@@ -870,6 +894,7 @@ async fn run_connection(
                     &server_config,
                     &port_config,
                     &registry,
+                    &job_cache,
                     current_template.as_ref(),
                     &payouts,
                     now_ms(),
@@ -880,6 +905,7 @@ async fn run_connection(
                     &server_config,
                     &port_config,
                     &registry,
+                    &job_cache,
                     current_template.as_ref(),
                     &hooks,
                     &mut write_half,
@@ -920,6 +946,7 @@ async fn apply_outcome(
     server_config: &Arc<ServerConfig>,
     port_config: &PortConfig,
     registry: &Arc<JobRegistry>,
+    job_cache: &Arc<MiningJobCache>,
     current_template: Option<&Arc<ActiveSV1Template>>,
     hooks: &ServerHooks,
     write_half: &mut tokio::net::tcp::OwnedWriteHalf,
@@ -958,6 +985,7 @@ async fn apply_outcome(
                     server_config,
                     port_config,
                     registry,
+                    job_cache,
                     template,
                     &payouts,
                     true,
@@ -1260,6 +1288,7 @@ mod tests {
             template_tx,
             current.clone(),
             Arc::new(JobRegistry::from_server_config(&server_cfg())),
+            Arc::new(MiningJobCache::new()),
             cancel.clone(),
         ));
 
@@ -1296,6 +1325,7 @@ mod tests {
             template_tx,
             current.clone(),
             Arc::new(JobRegistry::from_server_config(&server_cfg())),
+            Arc::new(MiningJobCache::new()),
             cancel.clone(),
         ));
 
@@ -1332,6 +1362,7 @@ mod tests {
             template_tx,
             current,
             Arc::new(JobRegistry::from_server_config(&server_cfg())),
+            Arc::new(MiningJobCache::new()),
             cancel.clone(),
         ));
         cancel.cancel();
@@ -1362,6 +1393,7 @@ mod tests {
             template_tx,
             current,
             registry.clone(),
+            Arc::new(MiningJobCache::new()),
             cancel.clone(),
         ));
 
@@ -1630,6 +1662,7 @@ mod tests {
             ],
             ServerHooks::no_op(),
             SharedExtranonce::new(),
+            Arc::new(MiningJobCache::new()),
         );
         // Shutdown waits for every translator to exit.
         server.shutdown().await;
@@ -1684,6 +1717,7 @@ mod tests {
             Vec::new(),
             ServerHooks::no_op(),
             SharedExtranonce::new(),
+            Arc::new(MiningJobCache::new()),
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

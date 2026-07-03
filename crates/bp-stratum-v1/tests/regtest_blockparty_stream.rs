@@ -248,6 +248,7 @@ async fn run_scenario(
         )],
         hooks,
         SharedExtranonce::new(),
+        std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
 
     // Wait until the Blockparty stream has paired a template.

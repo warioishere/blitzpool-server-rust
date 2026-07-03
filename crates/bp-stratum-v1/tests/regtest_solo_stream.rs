@@ -170,6 +170,7 @@ async fn sv1_solo_connection_routes_to_solo_stream_and_block_accepted() {
         )],
         hooks,
         SharedExtranonce::new(),
+        std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
 
     // Wait until the Solo stream has paired a template (that's the one the

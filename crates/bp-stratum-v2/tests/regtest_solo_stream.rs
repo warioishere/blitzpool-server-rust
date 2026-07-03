@@ -179,6 +179,7 @@ async fn sv2_solo_connection_routes_to_solo_stream_and_block_accepted() {
         )],
         hooks,
         bridge,
+        std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
     wait_until(Duration::from_secs(8), || {
         server.current_template().is_some()

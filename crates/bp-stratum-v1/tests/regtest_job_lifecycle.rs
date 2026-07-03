@@ -80,6 +80,7 @@ async fn sv1_job_lifecycle_stale_and_pruning_against_regtest() {
         Vec::new(),
         ServerHooks::no_op(),
         SharedExtranonce::new(),
+        std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
     );
 
     wait_until(Duration::from_secs(5), || {
