@@ -27,16 +27,23 @@
 //!
 //! ## Concurrency
 //!
-//! The global mutex guards ONLY the map operations (lookup / insert /
-//! prune) — never a build. Each key owns a slot with its own mutex:
-//! the first caller for a key becomes the leader and builds while
-//! holding just that slot's lock, so callers for OTHER keys build in
-//! parallel exactly as they did pre-cache (Solo / Group-Solo payout
-//! sets are distinct per connection — those must not serialize behind
-//! one pool-wide lock), while same-key callers (PPLNS broadcast storm)
-//! wait on their slot and then share the leader's result instead of
-//! thundering-herd-rebuilding it. A failed build leaves the slot empty
-//! — no negative caching, the next caller retries.
+//! Both levels are instances of one generic [`CoalescingSlotMap`]. Its
+//! mutex guards ONLY map operations (lookup / insert / prune) — never a
+//! build. Each key owns a slot with its own mutex: the first caller for
+//! a key becomes the leader and builds while holding just that slot's
+//! lock, so callers for OTHER keys build in parallel exactly as they
+//! did pre-cache (Solo / Group-Solo payout sets are distinct per
+//! connection — those must not serialize behind one pool-wide lock),
+//! while same-key callers (PPLNS broadcast storm) wait on their slot
+//! and then share the leader's result instead of thundering-herd-
+//! rebuilding it. A failed build leaves the slot empty — no negative
+//! caching, the next caller retries.
+//!
+//! Across the two levels the lock order is job-slot → outputs-map →
+//! outputs-slot: a job-slot leader takes the outputs map lock (released
+//! before it takes the outputs-slot lock) to parse. The two map mutexes
+//! are never held at once, and nothing takes a job-slot while holding an
+//! outputs-slot, so no cycle can form.
 //!
 //! ## Key definition
 //!
@@ -196,37 +203,205 @@ impl OutputsKey {
     }
 }
 
-// ── Slots + entries ─────────────────────────────────────────────────
+// ── Generic coalescing slot map ─────────────────────────────────────
 
 /// Per-key build slot. The slot mutex is the ONLY lock held during a
 /// build: the leader locks it, builds, publishes; same-key followers
-/// block here (not on the global map lock) and read the result.
-#[derive(Default)]
-struct JobSlot {
-    job: Mutex<Option<Arc<MiningJob>>>,
+/// block here (not on the map's global lock) and read the result.
+struct ValueSlot<V> {
+    value: Mutex<Option<Arc<V>>>,
 }
 
-#[derive(Default)]
-struct OutputsSlot {
-    outputs: Mutex<Option<Arc<PayoutOutputs>>>,
+// Manual, not `#[derive(Default)]`: the slot must default to an EMPTY
+// value regardless of whether `V: Default` (MiningJob has no Default).
+impl<V> Default for ValueSlot<V> {
+    fn default() -> Self {
+        Self {
+            value: Mutex::new(None),
+        }
+    }
 }
 
-struct JobEntry {
-    key: JobKey,
-    slot: Arc<JobSlot>,
+struct SlotEntry<K, V> {
+    key: K,
+    slot: Arc<ValueSlot<V>>,
     last_used: Instant,
 }
 
-struct OutputsEntry {
-    key: OutputsKey,
-    slot: Arc<OutputsSlot>,
-    last_used: Instant,
+/// Did [`CoalescingSlotMap::get_or_build`] serve an already-built value,
+/// or run the builder? The caller maps this onto its own hit/built
+/// counters.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotOutcome {
+    Hit,
+    Built,
 }
 
-struct CacheInner {
-    jobs: HashMap<u64, Vec<JobEntry>>,
-    outputs: HashMap<u64, Vec<OutputsEntry>>,
+/// A hash-bucketed map with per-key build coalescing + TTL pruning — the
+/// one place the leader/follower slot invariant lives, shared by both
+/// cache levels.
+///
+/// The map mutex guards ONLY map operations (bucket lookup / install /
+/// prune); the actual build runs under the per-key slot lock so distinct
+/// keys build in parallel while same-key callers coalesce. The owned key
+/// `K` is compared against a borrowed lookup via a caller-supplied
+/// predicate and hashed by the caller — the map stays agnostic to the
+/// key/lookup shapes.
+struct CoalescingSlotMap<K, V> {
+    inner: Mutex<SlotMapInner<K, V>>,
+}
+
+struct SlotMapInner<K, V> {
+    buckets: HashMap<u64, Vec<SlotEntry<K, V>>>,
     last_prune: Instant,
+}
+
+impl<K, V> CoalescingSlotMap<K, V> {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(SlotMapInner {
+                buckets: HashMap::new(),
+                last_prune: Instant::now(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, SlotMapInner<K, V>> {
+        // Recover a poisoned lock: the map is only mutated by single-step
+        // ops, so no cross-op invariant can be left half-applied by a
+        // panic elsewhere.
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Return the value for `hash`/`matches` — from the slot if already
+    /// built (coalescing onto the leader), else build it as the leader
+    /// via `build`, installing a fresh slot keyed by `make_key` on a map
+    /// miss. `now` also drives the rate-limited prune sweep. A failed
+    /// build leaves the slot empty (no negative caching).
+    fn get_or_build<E>(
+        &self,
+        hash: u64,
+        now: Instant,
+        matches: impl Fn(&K) -> bool,
+        make_key: impl FnOnce() -> K,
+        build: impl FnOnce() -> Result<Arc<V>, E>,
+    ) -> Result<(Arc<V>, SlotOutcome), E> {
+        // Map phase (map lock only — no build): find or install the slot.
+        let slot = {
+            let mut inner = self.lock();
+            inner.maybe_prune(now);
+            let existing = inner
+                .buckets
+                .get_mut(&hash)
+                .and_then(|bucket| bucket.iter_mut().find(|e| matches(&e.key)))
+                .map(|entry| {
+                    entry.last_used = now;
+                    entry.slot.clone()
+                });
+            match existing {
+                Some(slot) => slot,
+                None => {
+                    let slot = Arc::new(ValueSlot::default());
+                    inner.buckets.entry(hash).or_default().push(SlotEntry {
+                        key: make_key(),
+                        slot: slot.clone(),
+                        last_used: now,
+                    });
+                    slot
+                }
+            }
+        };
+
+        // Build phase (per-key slot lock only): leader builds, same-key
+        // followers block here while other keys proceed in parallel.
+        let mut guard = slot
+            .value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(value) = guard.as_ref() {
+            return Ok((value.clone(), SlotOutcome::Hit));
+        }
+        let value = build()?;
+        *guard = Some(value.clone());
+        Ok((value, SlotOutcome::Built))
+    }
+
+    /// Refresh the `last_used` of the entry for `hash`/`matches` and
+    /// return `project(&key)` if present — keeps an entry warm (and reads
+    /// a shared field off its key) without building.
+    fn touch<R>(
+        &self,
+        hash: u64,
+        now: Instant,
+        matches: impl Fn(&K) -> bool,
+        project: impl FnOnce(&K) -> R,
+    ) -> Option<R> {
+        let mut inner = self.lock();
+        let entry = inner
+            .buckets
+            .get_mut(&hash)?
+            .iter_mut()
+            .find(|e| matches(&e.key))?;
+        entry.last_used = now;
+        Some(project(&entry.key))
+    }
+
+    fn prune_expired(&self, now: Instant) {
+        self.lock().maybe_prune(now);
+    }
+
+    /// Test hook: force a sweep at `now`, bypassing the rate limit.
+    #[cfg(test)]
+    fn force_prune(&self, now: Instant) {
+        self.lock().prune(now);
+    }
+
+    /// Test hook: number of entries currently stored.
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.lock().buckets.values().map(Vec::len).sum()
+    }
+
+    /// Test hook: `project(&key)` for every stored entry.
+    #[cfg(test)]
+    fn map_keys<R>(&self, project: impl Fn(&K) -> R) -> Vec<R> {
+        self.lock()
+            .buckets
+            .values()
+            .flatten()
+            .map(|e| project(&e.key))
+            .collect()
+    }
+
+    /// Test hook: `last_used` of the sole entry (panics unless exactly
+    /// one exists — the single-payout-set test shape).
+    #[cfg(test)]
+    fn sole_last_used(&self) -> Instant {
+        let inner = self.lock();
+        let mut it = inner.buckets.values().flatten();
+        let first = it.next().expect("one entry");
+        assert!(it.next().is_none(), "expected exactly one entry");
+        first.last_used
+    }
+}
+
+impl<K, V> SlotMapInner<K, V> {
+    fn maybe_prune(&mut self, now: Instant) {
+        if now.duration_since(self.last_prune) < PRUNE_INTERVAL {
+            return;
+        }
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.last_prune = now;
+        self.buckets.retain(|_, bucket| {
+            bucket.retain(|e| now.duration_since(e.last_used) < ENTRY_TTL);
+            !bucket.is_empty()
+        });
+    }
 }
 
 /// Cumulative counters — how often the cache actually built vs served
@@ -243,9 +418,12 @@ pub struct MiningJobCacheStats {
 }
 
 /// Pool-wide `MiningJob` memoization — see the module docs. Cheap to
-/// share via `Arc`; all methods take `&self`.
+/// share via `Arc`; all methods take `&self`. Both levels are
+/// [`CoalescingSlotMap`]s; this type only wires them together (payouts
+/// Arc sharing, error precedence) and tallies stats.
 pub struct MiningJobCache {
-    inner: Mutex<CacheInner>,
+    jobs: CoalescingSlotMap<JobKey, MiningJob>,
+    outputs: CoalescingSlotMap<OutputsKey, PayoutOutputs>,
     job_hits: AtomicU64,
     jobs_built: AtomicU64,
     outputs_built: AtomicU64,
@@ -253,10 +431,9 @@ pub struct MiningJobCache {
 
 impl std::fmt::Debug for MiningJobCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.lock_inner();
         f.debug_struct("MiningJobCache")
-            .field("job_buckets", &inner.jobs.len())
-            .field("output_buckets", &inner.outputs.len())
+            .field("job_buckets", &self.jobs.lock().buckets.len())
+            .field("output_buckets", &self.outputs.lock().buckets.len())
             .field("stats", &self.stats())
             .finish()
     }
@@ -271,11 +448,8 @@ impl Default for MiningJobCache {
 impl MiningJobCache {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(CacheInner {
-                jobs: HashMap::new(),
-                outputs: HashMap::new(),
-                last_prune: Instant::now(),
-            }),
+            jobs: CoalescingSlotMap::new(),
+            outputs: CoalescingSlotMap::new(),
             job_hits: AtomicU64::new(0),
             jobs_built: AtomicU64::new(0),
             outputs_built: AtomicU64::new(0),
@@ -309,113 +483,69 @@ impl MiningJobCache {
         let reward = template.coinbase_tx_value_remaining;
         let now = Instant::now();
 
-        // Map phase (global lock, map ops only — no build): find the
-        // key's slot or install a fresh one. The entry's payouts Arc
-        // rides along so the outputs level can share the allocation.
-        let (slot, payouts_arc) = {
-            let mut inner = self.lock_inner();
-            inner.maybe_prune(now);
+        // Resolve the canonical payouts Arc from the outputs level FIRST.
+        // This also refreshes that entry's `last_used`, so the shared
+        // parsed outputs stay warm alongside this job even on a pure
+        // job-hit (which never reaches the build closure below). Absent
+        // → allocate the payout vec once; the job key and the outputs
+        // entry then share this one allocation.
+        let payouts_arc = self
+            .touch_outputs(network, reward, payouts, now)
+            .unwrap_or_else(|| Arc::new(payouts.to_vec()));
+        let key_payouts = payouts_arc.clone();
 
-            // Job lookup first; the `.map` ends the `jobs` borrow so we
-            // can also touch the outputs level in the same critical
-            // section.
-            let hit = inner
-                .jobs
-                .get_mut(&job_hash)
-                .and_then(|bucket| bucket.iter_mut().find(|e| e.key.as_tuple() == lookup))
-                .map(|entry| {
-                    entry.last_used = now;
-                    (entry.slot.clone(), entry.key.payouts.clone())
-                });
-
-            match hit {
-                Some((slot, payouts_arc)) => {
-                    // Keep the backing outputs entry alive alongside the
-                    // job it serves: a pure job-hit never reaches
-                    // get_or_parse_outputs, so without this a long run of
-                    // hits (stable template — new joiners, vardiff
-                    // re-notifies) would let the shared outputs entry age
-                    // out and force a needless address reparse for the
-                    // next distinct job key of the same payout set.
-                    inner.touch_outputs(network, reward, payouts, now);
-                    (slot, payouts_arc)
-                }
-                None => {
-                    // One payouts allocation per distinct payout set:
-                    // reuse (and refresh) the outputs-level Arc when this
-                    // set is already known (e.g. a new template, same
-                    // window), else allocate once.
-                    let payouts_arc = inner
-                        .touch_outputs(network, reward, payouts, now)
-                        .unwrap_or_else(|| Arc::new(payouts.to_vec()));
-                    let slot = Arc::new(JobSlot::default());
-                    let key = JobKey {
-                        network,
-                        pool_identifier: pool_identifier.to_string(),
-                        extranonce_slot_size,
-                        payouts: payouts_arc.clone(),
-                        coinbase_prefix: template.coinbase_prefix.to_vec(),
-                        coinbase_tx_version: template.coinbase_tx_version,
-                        coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,
-                        coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
-                        coinbase_tx_outputs: template.coinbase_tx_outputs.to_vec(),
-                        coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
-                        coinbase_tx_locktime: template.coinbase_tx_locktime,
-                    };
-                    inner.jobs.entry(job_hash).or_default().push(JobEntry {
-                        key,
-                        slot: slot.clone(),
-                        last_used: now,
-                    });
-                    (slot, payouts_arc)
-                }
-            }
-        };
-
-        // Build phase (per-key slot lock only): first locker with an
-        // empty slot is the leader; same-key followers block on THIS
-        // slot while other keys proceed in parallel.
-        let mut job_guard = slot
-            .job
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(job) = job_guard.as_ref() {
-            self.job_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(job.clone());
-        }
-
-        // Leader. Error precedence mirrors build_mining_job_from_tdp:
-        // ScriptSigTooLong before InvalidAddress.
-        let script_sig = checked_tdp_scriptsig(
-            template.coinbase_prefix,
-            pool_identifier,
-            extranonce_slot_size,
-        )?;
-        let payout_outputs = self.get_or_parse_outputs(
-            network,
-            payouts,
-            template.coinbase_tx_value_remaining,
-            payouts_arc,
+        let (job, outcome) = self.jobs.get_or_build(
+            job_hash,
             now,
+            |k| k.as_tuple() == lookup,
+            move || JobKey {
+                network,
+                pool_identifier: pool_identifier.to_string(),
+                extranonce_slot_size,
+                payouts: key_payouts,
+                coinbase_prefix: template.coinbase_prefix.to_vec(),
+                coinbase_tx_version: template.coinbase_tx_version,
+                coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,
+                coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
+                coinbase_tx_outputs: template.coinbase_tx_outputs.to_vec(),
+                coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
+                coinbase_tx_locktime: template.coinbase_tx_locktime,
+            },
+            // Leader build. Error precedence mirrors
+            // build_mining_job_from_tdp: ScriptSigTooLong before
+            // InvalidAddress.
+            move || -> Result<Arc<MiningJob>, MiningJobError> {
+                let script_sig = checked_tdp_scriptsig(
+                    template.coinbase_prefix,
+                    pool_identifier,
+                    extranonce_slot_size,
+                )?;
+                let payout_outputs =
+                    self.get_or_parse_outputs(network, payouts, reward, payouts_arc, now)?;
+                Ok(Arc::new(assemble_tdp_job(
+                    script_sig,
+                    &payout_outputs,
+                    template,
+                    extranonce_slot_size,
+                )))
+            },
         )?;
-        let job = Arc::new(assemble_tdp_job(
-            script_sig,
-            &payout_outputs,
-            template,
-            extranonce_slot_size,
-        ));
-        self.jobs_built.fetch_add(1, Ordering::Relaxed);
-        *job_guard = Some(job.clone());
+
+        match outcome {
+            SlotOutcome::Hit => {
+                self.job_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            SlotOutcome::Built => {
+                self.jobs_built.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         Ok(job)
-        // On error the slot stays empty: waiting followers see None,
-        // become the new leader, and retry — no negative caching.
     }
 
-    /// Outputs-level lookup with the same slot pattern. Called only by
-    /// a job-slot leader; the job-slot lock is held while this takes
-    /// the global lock and then an outputs-slot lock. Lock order is
-    /// strictly job-slot → global → outputs-slot and the global lock
-    /// is never held while waiting on a slot, so no cycle can form.
+    /// Outputs-level lookup over the shared coalescing map. Called only
+    /// by a job-slot leader — the job-slot lock is held across the
+    /// outputs map lock + outputs-slot lock (lock order job-slot →
+    /// outputs-map → outputs-slot, no cycle; see the module docs).
     fn get_or_parse_outputs(
         &self,
         network: Network,
@@ -426,56 +556,60 @@ impl MiningJobCache {
     ) -> Result<Arc<PayoutOutputs>, MiningJobError> {
         let lookup: OutputsKeyTuple<'_> = (network, reward_sats, payouts);
         let hash = hash_tuple(&lookup);
-
-        let slot = {
-            let mut inner = self.lock_inner();
-            match inner
-                .outputs
-                .get_mut(&hash)
-                .and_then(|bucket| bucket.iter_mut().find(|e| e.key.as_tuple() == lookup))
-            {
-                Some(entry) => {
-                    entry.last_used = now;
-                    entry.slot.clone()
-                }
-                None => {
-                    let slot = Arc::new(OutputsSlot::default());
-                    inner.outputs.entry(hash).or_default().push(OutputsEntry {
-                        key: OutputsKey {
-                            network,
-                            reward_sats,
-                            // Share the job entry's allocation — one
-                            // payouts copy per distinct payout set.
-                            payouts: payouts_arc,
-                        },
-                        slot: slot.clone(),
-                        last_used: now,
-                    });
-                    slot
-                }
-            }
-        };
-
-        let mut guard = slot
-            .outputs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(outputs) = guard.as_ref() {
-            return Ok(outputs.clone());
+        let (outputs, outcome) = self.outputs.get_or_build(
+            hash,
+            now,
+            |k| k.as_tuple() == lookup,
+            // Share the job entry's payouts allocation — one copy per
+            // distinct payout set across both levels.
+            move || OutputsKey {
+                network,
+                reward_sats,
+                payouts: payouts_arc,
+            },
+            || -> Result<Arc<PayoutOutputs>, MiningJobError> {
+                Ok(Arc::new(build_payout_outputs(
+                    network,
+                    payouts,
+                    reward_sats,
+                )?))
+            },
+        )?;
+        if matches!(outcome, SlotOutcome::Built) {
+            self.outputs_built.fetch_add(1, Ordering::Relaxed);
         }
-        let outputs = Arc::new(build_payout_outputs(network, payouts, reward_sats)?);
-        self.outputs_built.fetch_add(1, Ordering::Relaxed);
-        *guard = Some(outputs.clone());
         Ok(outputs)
     }
 
+    /// Refresh the `last_used` of the outputs entry for
+    /// (network, reward, payouts) and return its shared payouts Arc, if
+    /// one exists. Called on every `get_or_build` — including a pure
+    /// job-hit — so the backing outputs entry can never age out from
+    /// under a live job (which would waste the address-parse
+    /// memoization it exists for), and so a new job entry reuses the one
+    /// payouts allocation instead of cloning the vec again.
+    fn touch_outputs(
+        &self,
+        network: Network,
+        reward_sats: u64,
+        payouts: &[PayoutEntry],
+        now: Instant,
+    ) -> Option<Arc<Vec<PayoutEntry>>> {
+        let lookup: OutputsKeyTuple<'_> = (network, reward_sats, payouts);
+        let hash = hash_tuple(&lookup);
+        self.outputs
+            .touch(hash, now, |k| k.as_tuple() == lookup, |k| k.payouts.clone())
+    }
+
     /// Drop entries unused for [`ENTRY_TTL`], rate-limited to one sweep
-    /// per [`PRUNE_INTERVAL`]. Piggybacked on every lookup AND driven by
-    /// the stratum translator tasks on each template update, so memory
-    /// is reclaimed even when no miner is connected (no lookups).
+    /// per [`PRUNE_INTERVAL`] per level. Piggybacked on every lookup AND
+    /// driven by the stratum translator tasks on each template update,
+    /// so memory is reclaimed even when no miner is connected (no
+    /// lookups).
     pub fn prune_expired(&self) {
         let now = Instant::now();
-        self.lock_inner().maybe_prune(now);
+        self.jobs.prune_expired(now);
+        self.outputs.prune_expired(now);
     }
 
     pub fn stats(&self) -> MiningJobCacheStats {
@@ -486,88 +620,25 @@ impl MiningJobCache {
         }
     }
 
-    fn lock_inner(&self) -> MutexGuard<'_, CacheInner> {
-        // Recover a poisoned lock: the maps are only mutated by
-        // single-step HashMap ops, so no cross-op invariant can be left
-        // half-applied by a panic elsewhere.
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Test hook: force a sweep as if the wall clock were `now`,
-    /// bypassing the PRUNE_INTERVAL rate limit.
+    /// Test hook: force a sweep at `now` on both levels, bypassing the
+    /// PRUNE_INTERVAL rate limit.
     #[cfg(test)]
     fn prune_at(&self, now: Instant) {
-        self.lock_inner().prune(now);
+        self.jobs.force_prune(now);
+        self.outputs.force_prune(now);
     }
 
     /// Test hook: (job entries, output entries) currently stored.
     #[cfg(test)]
     fn entry_counts(&self) -> (usize, usize) {
-        let inner = self.lock_inner();
-        (
-            inner.jobs.values().map(Vec::len).sum(),
-            inner.outputs.values().map(Vec::len).sum(),
-        )
+        (self.jobs.entry_count(), self.outputs.entry_count())
     }
 
     /// Test hook: `last_used` of the sole outputs entry (panics unless
     /// exactly one exists — the single-payout-set test shape).
     #[cfg(test)]
     fn sole_outputs_last_used(&self) -> Instant {
-        let inner = self.lock_inner();
-        let mut it = inner.outputs.values().flatten();
-        let first = it.next().expect("one outputs entry");
-        assert!(it.next().is_none(), "expected exactly one outputs entry");
-        first.last_used
-    }
-}
-
-impl CacheInner {
-    /// Refresh the `last_used` of the outputs entry for
-    /// (network, reward, payouts) and return its shared payouts Arc, if
-    /// one exists. Called whenever a job entry for the same payout set
-    /// is used — including a pure job-hit — so the backing outputs
-    /// entry can never age out from under a live job (which would waste
-    /// the address-parse memoization the entry exists for), and so a new
-    /// job entry reuses the one payouts allocation instead of cloning
-    /// the vec again.
-    fn touch_outputs(
-        &mut self,
-        network: Network,
-        reward_sats: u64,
-        payouts: &[PayoutEntry],
-        now: Instant,
-    ) -> Option<Arc<Vec<PayoutEntry>>> {
-        let lookup: OutputsKeyTuple<'_> = (network, reward_sats, payouts);
-        let hash = hash_tuple(&lookup);
-        let entry = self
-            .outputs
-            .get_mut(&hash)?
-            .iter_mut()
-            .find(|e| e.key.as_tuple() == lookup)?;
-        entry.last_used = now;
-        Some(entry.key.payouts.clone())
-    }
-
-    fn maybe_prune(&mut self, now: Instant) {
-        if now.duration_since(self.last_prune) < PRUNE_INTERVAL {
-            return;
-        }
-        self.prune(now);
-    }
-
-    fn prune(&mut self, now: Instant) {
-        self.last_prune = now;
-        self.jobs.retain(|_, bucket| {
-            bucket.retain(|e| now.duration_since(e.last_used) < ENTRY_TTL);
-            !bucket.is_empty()
-        });
-        self.outputs.retain(|_, bucket| {
-            bucket.retain(|e| now.duration_since(e.last_used) < ENTRY_TTL);
-            !bucket.is_empty()
-        });
+        self.outputs.sole_last_used()
     }
 }
 
@@ -1009,24 +1080,17 @@ mod tests {
             .get_or_build(Network::Bitcoin, &payouts, &tmpl_b, "BP", 12)
             .unwrap();
 
-        let inner = cache.lock_inner();
-        let job_arcs: Vec<&Arc<Vec<PayoutEntry>>> = inner
-            .jobs
-            .values()
-            .flatten()
-            .map(|e| &e.key.payouts)
-            .collect();
-        let outputs_arc = inner
-            .outputs
-            .values()
-            .flatten()
-            .map(|e| &e.key.payouts)
-            .next()
-            .expect("one outputs entry");
-        assert_eq!(job_arcs.len(), 2);
-        for arc in job_arcs {
+        let job_arcs = cache.jobs.map_keys(|k| k.payouts.clone());
+        let outputs_arcs = cache.outputs.map_keys(|k| k.payouts.clone());
+        assert_eq!(job_arcs.len(), 2, "one job entry per template");
+        assert_eq!(
+            outputs_arcs.len(),
+            1,
+            "one outputs entry for the payout set"
+        );
+        for arc in &job_arcs {
             assert!(
-                Arc::ptr_eq(arc, outputs_arc),
+                Arc::ptr_eq(arc, &outputs_arcs[0]),
                 "job keys must share the outputs entry's payouts allocation"
             );
         }
