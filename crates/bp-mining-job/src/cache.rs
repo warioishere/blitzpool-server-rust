@@ -49,7 +49,9 @@
 //! Entries are touched on use and lazily pruned after [`ENTRY_TTL`] of
 //! disuse — on lookups AND via [`MiningJobCache::prune_expired`],
 //! which the stratum translator tasks drive on every template update
-//! so memory is reclaimed even when no miner is connected.
+//! so memory is reclaimed even when no miner is connected. A job-hit
+//! also touches its backing outputs entry, so the shared parsed
+//! outputs never age out from under a live job.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -304,6 +306,7 @@ impl MiningJobCache {
             extranonce_slot_size,
         );
         let job_hash = hash_tuple(&lookup);
+        let reward = template.coinbase_tx_value_remaining;
         let now = Instant::now();
 
         // Map phase (global lock, map ops only — no build): find the
@@ -312,28 +315,45 @@ impl MiningJobCache {
         let (slot, payouts_arc) = {
             let mut inner = self.lock_inner();
             inner.maybe_prune(now);
-            match inner
+
+            // Job lookup first; the `.map` ends the `jobs` borrow so we
+            // can also touch the outputs level in the same critical
+            // section.
+            let hit = inner
                 .jobs
                 .get_mut(&job_hash)
                 .and_then(|bucket| bucket.iter_mut().find(|e| e.key.as_tuple() == lookup))
-            {
-                Some(entry) => {
+                .map(|entry| {
                     entry.last_used = now;
                     (entry.slot.clone(), entry.key.payouts.clone())
+                });
+
+            match hit {
+                Some((slot, payouts_arc)) => {
+                    // Keep the backing outputs entry alive alongside the
+                    // job it serves: a pure job-hit never reaches
+                    // get_or_parse_outputs, so without this a long run of
+                    // hits (stable template — new joiners, vardiff
+                    // re-notifies) would let the shared outputs entry age
+                    // out and force a needless address reparse for the
+                    // next distinct job key of the same payout set.
+                    inner.touch_outputs(network, reward, payouts, now);
+                    (slot, payouts_arc)
                 }
                 None => {
                     // One payouts allocation per distinct payout set:
-                    // reuse the outputs-level Arc when this set is
-                    // already known (e.g. a new template, same window).
+                    // reuse (and refresh) the outputs-level Arc when this
+                    // set is already known (e.g. a new template, same
+                    // window), else allocate once.
                     let payouts_arc = inner
-                        .find_outputs_payouts_arc(network, payouts, template)
+                        .touch_outputs(network, reward, payouts, now)
                         .unwrap_or_else(|| Arc::new(payouts.to_vec()));
                     let slot = Arc::new(JobSlot::default());
                     let key = JobKey {
                         network,
                         pool_identifier: pool_identifier.to_string(),
                         extranonce_slot_size,
-                        payouts: payouts_arc,
+                        payouts: payouts_arc.clone(),
                         coinbase_prefix: template.coinbase_prefix.to_vec(),
                         coinbase_tx_version: template.coinbase_tx_version,
                         coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,
@@ -342,7 +362,6 @@ impl MiningJobCache {
                         coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
                         coinbase_tx_locktime: template.coinbase_tx_locktime,
                     };
-                    let payouts_arc = key.payouts.clone();
                     inner.jobs.entry(job_hash).or_default().push(JobEntry {
                         key,
                         slot: slot.clone(),
@@ -492,25 +511,44 @@ impl MiningJobCache {
             inner.outputs.values().map(Vec::len).sum(),
         )
     }
+
+    /// Test hook: `last_used` of the sole outputs entry (panics unless
+    /// exactly one exists — the single-payout-set test shape).
+    #[cfg(test)]
+    fn sole_outputs_last_used(&self) -> Instant {
+        let inner = self.lock_inner();
+        let mut it = inner.outputs.values().flatten();
+        let first = it.next().expect("one outputs entry");
+        assert!(it.next().is_none(), "expected exactly one outputs entry");
+        first.last_used
+    }
 }
 
 impl CacheInner {
-    /// Reuse the payouts Arc of an existing outputs entry for this
-    /// (network, payouts, reward) so a new job entry doesn't clone the
-    /// payout vec again.
-    fn find_outputs_payouts_arc(
+    /// Refresh the `last_used` of the outputs entry for
+    /// (network, reward, payouts) and return its shared payouts Arc, if
+    /// one exists. Called whenever a job entry for the same payout set
+    /// is used — including a pure job-hit — so the backing outputs
+    /// entry can never age out from under a live job (which would waste
+    /// the address-parse memoization the entry exists for), and so a new
+    /// job entry reuses the one payouts allocation instead of cloning
+    /// the vec again.
+    fn touch_outputs(
         &mut self,
         network: Network,
+        reward_sats: u64,
         payouts: &[PayoutEntry],
-        template: &TdpCoinbaseTemplate<'_>,
+        now: Instant,
     ) -> Option<Arc<Vec<PayoutEntry>>> {
-        let lookup: OutputsKeyTuple<'_> = (network, template.coinbase_tx_value_remaining, payouts);
+        let lookup: OutputsKeyTuple<'_> = (network, reward_sats, payouts);
         let hash = hash_tuple(&lookup);
-        self.outputs
-            .get(&hash)?
-            .iter()
-            .find(|e| e.key.as_tuple() == lookup)
-            .map(|e| e.key.payouts.clone())
+        let entry = self
+            .outputs
+            .get_mut(&hash)?
+            .iter_mut()
+            .find(|e| e.key.as_tuple() == lookup)?;
+        entry.last_used = now;
+        Some(entry.key.payouts.clone())
     }
 
     fn maybe_prune(&mut self, now: Instant) {
@@ -917,6 +955,39 @@ mod tests {
             .unwrap();
         assert!(!again.coinbase_prefix().is_empty());
         assert_eq!(cache.stats().jobs_built, 2);
+    }
+
+    #[test]
+    fn job_hit_refreshes_backing_outputs_entry() {
+        // Regression: a pure job-hit never reaches get_or_parse_outputs,
+        // so it must still refresh the backing outputs entry's last_used
+        // — otherwise a long run of hits on a stable template would let
+        // the shared outputs entry age out from under the live job and
+        // force a needless address reparse for the next distinct job key.
+        let (prefix, outputs) = tdp_fixture();
+        let tmpl = template(&prefix, &outputs);
+        let payouts = payouts_two_way();
+        let cache = MiningJobCache::new();
+
+        cache
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+            .unwrap();
+        let built_at = cache.sole_outputs_last_used();
+
+        // Guarantee the monotonic clock advances so the refresh is
+        // observable (Instant has ns resolution on the CI platform).
+        std::thread::sleep(Duration::from_millis(2));
+
+        // Pure job-hit: identical key.
+        cache
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+            .unwrap();
+        assert_eq!(cache.stats().job_hits, 1, "second call must be a job-hit");
+
+        assert!(
+            cache.sole_outputs_last_used() > built_at,
+            "a job-hit must refresh the backing outputs entry's last_used"
+        );
     }
 
     #[test]

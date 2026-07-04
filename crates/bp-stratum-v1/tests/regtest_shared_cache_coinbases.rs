@@ -212,7 +212,9 @@ async fn sv1_shared_cache_keeps_per_finder_coinbases_distinct() {
     let mut miner_b = Miner::connect(addr).await;
     let mut miner_c = Miner::connect(addr).await;
     let (en1_a, notify_a) = miner_a.handshake(10, ADDR_A).await;
-    let (_en1_b, notify_b) = miner_b.handshake(20, ADDR_B).await;
+    let (en1_b, notify_b) = miner_b.handshake(20, ADDR_B).await;
+    // Miner C's own extranonce isn't reassembled below (C is only
+    // checked for coinbase-byte equality against A), so it stays unused.
     let (_en1_c, notify_c) = miner_c.handshake(30, ADDR_A).await;
 
     let (job_a, coinb1_a, coinb2_a) = notify_coinbase_parts(&notify_a);
@@ -224,10 +226,12 @@ async fn sv1_shared_cache_keeps_per_finder_coinbases_distinct() {
     node.shutdown().await.ok();
 
     // ── Distinctness: A and B have different payout sets — each
-    // coinbase must pay ITS OWN finder. ──
+    // coinbase must pay ITS OWN finder. Each is reassembled with its
+    // OWN extranonce1 (en1_a / en1_b) so the test exercises the real
+    // per-connection extranonce, not a shared one. ──
     for (name, notify_addr, en1, coinb1, coinb2) in [
         ("A", ADDR_A, &en1_a, &coinb1_a, &coinb2_a),
-        ("B", ADDR_B, &en1_a, &coinb1_b, &coinb2_b),
+        ("B", ADDR_B, &en1_b, &coinb1_b, &coinb2_b),
     ] {
         let full = assemble_coinbase(coinb1, en1, coinb2);
         let tx = bitcoin::Transaction::consensus_decode(&mut full.as_slice())
