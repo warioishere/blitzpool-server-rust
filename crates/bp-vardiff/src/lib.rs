@@ -220,6 +220,14 @@ pub struct VarDiffEngine<C: Clock> {
     submission_cache_start_ms: u64,
     submission_cache: VecDeque<Submission>,
 
+    // Lifetime accepted difficulty-work (sum of every accepted share's
+    // credited difficulty since engine creation). Divided by the elapsed
+    // time since `submission_cache_start_ms` it yields a stable, long-
+    // window rate estimate for the under-sampled bootstrap retarget —
+    // the one signal an ultra-sparse miner (never 2 shares in a slot)
+    // actually provides. Grows unbounded but only ever read as a ratio.
+    lifetime_difficulty_sum: f64,
+
     // Hashrate state
     hash_rate: f64,
     current_slot: Option<u64>,
@@ -252,6 +260,7 @@ impl<C: Clock> VarDiffEngine<C> {
             min_difficulty,
             submission_cache_start_ms: now,
             submission_cache: VecDeque::with_capacity(VARDIFF_CACHE_SIZE + 1),
+            lifetime_difficulty_sum: 0.0,
             hash_rate: 0.0,
             current_slot: None,
             previous_slot_time_ms: 0,
@@ -286,6 +295,12 @@ impl<C: Clock> VarDiffEngine<C> {
     pub fn update_hash_rate(&mut self, target_difficulty: f64, is_current_diff: bool) {
         let now = self.clock.now_ms();
         let slot = slot_for(now);
+
+        // Lifetime diff-work accumulator: every accepted share counts
+        // (like the slot hashrate accumulator, incl. clamped stale-diff
+        // shares — they are real work). Feeds the under-sampled bootstrap
+        // rate estimate in `suggested_difficulty`.
+        self.lifetime_difficulty_sum += target_difficulty;
 
         if is_current_diff {
             self.update_submission_cache(now, target_difficulty);
@@ -346,8 +361,8 @@ impl<C: Clock> VarDiffEngine<C> {
     /// current diff. Returns:
     ///
     /// - `None` — no retarget recommended (still in warmup, or under-sampled
-    ///   with no measured hashrate yet, or samples present but inside the 2×
-    ///   clamp).
+    ///   with no accepted share at all yet, or samples present but inside the
+    ///   2× clamp).
     /// - `Some(diff)` — a freshly-rounded power-of-2 target. Always
     ///   ≥ [`min_difficulty`]; never NaN / Infinity.
     ///
@@ -356,26 +371,45 @@ impl<C: Clock> VarDiffEngine<C> {
     pub fn suggested_difficulty(&self, client_difficulty: f64) -> Option<f64> {
         if self.submission_cache.len() < VARDIFF_SAMPLE_THRESHOLD {
             // Under-sampled: hold during warmup, then retarget from the miner's
-            // MEASURED hashrate. The earlier heuristic divided the *current*
-            // diff by `target_shares_per_minute` on every call — a value
-            // independent of the actual rate — so a miner that stayed
-            // under-sampled (one device per channel after the per-channel
-            // vardiff split sees only its own ~⅓ of the shares) compounded it
-            // down geometrically into a runaway to the floor. The
-            // hashrate-derived target is the same rate→difficulty conversion
-            // the fully-sampled path uses, so it converges to the miner's real
-            // equilibrium in one step and does NOT depend on `client_difficulty`
-            // — repeated calls can't compound. Needs ≥1 measured rate (≥2
-            // shares); until then there is nothing to estimate from, so wait.
+            // MEASURED rate. The earlier heuristic divided the *current* diff by
+            // `target_shares_per_minute` on every call — a value independent of
+            // the actual rate — so a miner that stayed under-sampled (one device
+            // per channel after the per-channel vardiff split sees only its own
+            // ~⅓ of the shares) compounded it down geometrically into a runaway
+            // to the floor. Both rate sources below feed the SAME
+            // rate→difficulty conversion the fully-sampled path uses, so they
+            // converge to the miner's real equilibrium in one step and do NOT
+            // depend on `client_difficulty` — repeated calls can't compound.
             let now = self.clock.now_ms();
-            if now.saturating_sub(self.submission_cache_start_ms) > VARDIFF_WARMUP_MS
-                && self.hash_rate > 0.0
-            {
-                let target =
-                    self.hash_rate * self.target_submission_per_second / VARDIFF_DIFFICULTY_1;
-                return self.nearest_difficulty_step(target);
+            if now.saturating_sub(self.submission_cache_start_ms) <= VARDIFF_WARMUP_MS {
+                return None;
             }
-            return None;
+            // Prefer the slot-measured hashrate (needs ≥2 shares in one slot);
+            // else bootstrap from lifetime diff-work over elapsed time. The
+            // latter is the only signal an ultra-sparse miner provides — a
+            // 50 kH/s device that takes hours to land one share at a too-high
+            // diff never gets 2-in-a-slot, so without this its diff is never
+            // lowered and it stays stuck (cpuminer-fallback devices land here).
+            // Anchored to cumulative accepted difficulty + the fixed engine-
+            // start time, so it estimates the true rate (incl. the time-to-
+            // first-share, which itself encodes the hashrate) and can't compound.
+            let rate = if self.hash_rate > 0.0 {
+                self.hash_rate
+            } else if self.lifetime_difficulty_sum > 0.0 {
+                let elapsed_s = now.saturating_sub(self.submission_cache_start_ms) as f64 / 1000.0;
+                if elapsed_s <= 0.0 {
+                    return None;
+                }
+                self.lifetime_difficulty_sum * VARDIFF_DIFFICULTY_1 / elapsed_s
+            } else {
+                // No accepted share yet — nothing to estimate from.
+                return None;
+            };
+            let target = rate * self.target_submission_per_second / VARDIFF_DIFFICULTY_1;
+            if !target.is_finite() {
+                return None;
+            }
+            return self.nearest_difficulty_step(target);
         }
 
         let sum: f64 = self.submission_cache.iter().map(|s| s.difficulty).sum();
@@ -635,15 +669,75 @@ mod tests {
     }
 
     #[test]
-    fn under_sampled_past_warmup_without_measured_hashrate_waits() {
+    fn under_sampled_past_warmup_with_no_share_at_all_waits() {
         let clock = TestClock::new(0);
-        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
-        // A single share never establishes a hashrate (the slot baseline needs
-        // a second share to span time), so there is nothing to retarget from
-        // even past warmup — wait rather than guess.
-        e.update_hash_rate(1024.0, true);
+        let e = VarDiffEngine::new(&clock, 6.0, 0.00001);
+        // Zero accepted shares: there is genuinely nothing to estimate a rate
+        // from, so hold even past warmup (an operator-set initial diff a miner
+        // can't clear even once is out of scope — it never submits any signal).
         clock.advance_ms(VARDIFF_WARMUP_MS + 1_000);
         assert!(e.suggested_difficulty(16384.0).is_none());
+    }
+
+    #[test]
+    fn under_sampled_single_share_bootstraps_down_from_lifetime_rate() {
+        // The finding: a miner that lands exactly ONE share never establishes a
+        // slot hashrate (needs 2-in-a-slot), so pre-fix it returned None forever
+        // and its diff was never lowered — an ultra-sparse device (NMMiner/CPU
+        // on the cpuminer 0.1 fallback) stuck too high. The bootstrap estimates
+        // the rate from cumulative accepted difficulty over elapsed time (the
+        // time-to-first-share encodes the hashrate), so it retargets DOWN.
+        let clock = TestClock::new(0);
+        let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001); // tsps = 10
+        e.update_hash_rate(1024.0, true); // one share, diff 1024, at t=0
+                                          // No 2nd share → slot hashrate stays 0 → bootstrap path.
+        assert_eq!(e.hash_rate(), 0.0);
+        clock.advance_ms(80_000); // elapsed 80s (> warmup 60s)
+                                  // target = lifetime_sum * tsps / elapsed_s = 1024 * 10 / 80 = 128.
+        let expected = 128.0;
+        // Client-independent (proves it can't compound on repeated per-share
+        // calls the way the old client_diff/target ratchet did).
+        for client in [16384.0, 1024.0, 1.0, 0.001] {
+            assert_eq!(
+                e.suggested_difficulty(client),
+                Some(expected),
+                "single-share bootstrap must track the lifetime rate, not client={client}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_retarget_converges_and_does_not_runaway_to_floor() {
+        // A steady ultra-sparse miner (one share per 700s, always in a distinct
+        // 10-min slot so the slot hashrate never engages → pure bootstrap path).
+        // Its per-share target must CONVERGE to the rate-derived equilibrium, not
+        // keep shrinking toward the floor call-over-call (the old runaway).
+        let clock = TestClock::new(0);
+        let min_diff = 0.00001;
+        let mut e = VarDiffEngine::new(&clock, 6.0, min_diff); // tsps = 10
+        let mut post_share_targets = Vec::new();
+        for _ in 0..8 {
+            e.update_hash_rate(700.0, true);
+            clock.advance_ms(700_000); // 700s → distinct slot each time
+            assert_eq!(e.hash_rate(), 0.0, "must stay on the bootstrap path");
+            if let Some(t) = e.suggested_difficulty(16384.0) {
+                post_share_targets.push(t);
+            }
+        }
+        // Equilibrium: lifetime_sum/elapsed → 700/700 = 1 diff/s → target = 10.
+        // Every post-share target sits near that, far above the floor, and the
+        // last two are within a small factor (converged, not geometrically
+        // decaying).
+        let last = *post_share_targets.last().unwrap();
+        let prev = post_share_targets[post_share_targets.len() - 2];
+        assert!(
+            last > min_diff * 100.0,
+            "must not sink to the floor: {last}"
+        );
+        assert!(
+            (last / prev).abs() < 2.0 && (prev / last).abs() < 2.0,
+            "successive targets must converge, not compound down: {prev} → {last}"
+        );
     }
 
     #[test]
@@ -657,8 +751,8 @@ mod tests {
         // in one step and repeated calls cannot compound.
         let clock = TestClock::new(0);
         let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001); // target/min => tsps = 10
-        // 2 shares at diff 1000, 20s apart → hashrate = 2000 * 2^32 / 20s.
-        // target = hashrate * tsps / 2^32 = (2000/20) * 10 = 1000 → step 1024.
+                                                              // 2 shares at diff 1000, 20s apart → hashrate = 2000 * 2^32 / 20s.
+                                                              // target = hashrate * tsps / 2^32 = (2000/20) * 10 = 1000 → step 1024.
         e.update_hash_rate(1000.0, true);
         clock.advance_ms(20_000);
         e.update_hash_rate(1000.0, true);
