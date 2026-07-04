@@ -962,6 +962,7 @@ version = "2.2.2"
 dependencies = [
  "async-trait",
  "bp-share-hook",
+ "metrics",
  "redis",
  "serde",
  "serde_json",

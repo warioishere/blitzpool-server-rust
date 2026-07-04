@@ -116,11 +116,13 @@ impl<T: DeserializeOwned + Send + 'static> StreamConsumer<T> {
         }
 
         // Resume: replay the delivered-but-unacked backlog before new entries.
-        // `read_pending` re-reads from `0` each call, so loop until it's empty.
+        // `read_pending_counted` re-reads from `0` each call; loop until the RAW
+        // count is 0 (PEL empty). Keying on the good vec being empty would stop
+        // on an all-poison batch, stranding good entries queued behind it.
         loop {
-            match self.read_pending(config.batch).await {
-                Ok(batch) if batch.is_empty() => break,
-                Ok(batch) => self.drain_batch(&handler, batch, &config, "pending").await,
+            match self.read_pending_counted(config.batch).await {
+                Ok((_, 0)) => break,
+                Ok((batch, _raw)) => self.drain_batch(&handler, batch, &config, "pending").await,
                 Err(err) => {
                     warn!(%err, label = config.label, "stream-consumer: read_pending failed; continuing");
                     break;
@@ -167,7 +169,12 @@ impl<T: DeserializeOwned + Send + 'static> StreamConsumer<T> {
             ids.push(entry.id);
         }
         match self.ack(&ids).await {
-            Ok(n) => info!(n, kind, label = config.label, "stream-consumer: processed + acked"),
+            Ok(n) => info!(
+                n,
+                kind,
+                label = config.label,
+                "stream-consumer: processed + acked"
+            ),
             Err(err) => {
                 warn!(%err, kind, label = config.label, "stream-consumer: ack failed (will redeliver)")
             }
@@ -314,7 +321,11 @@ mod tests {
         // Acked → nothing pending for this consumer.
         let checker: StreamConsumer<Evt> = StreamConsumer::new(conn, key, "g", "c1");
         assert!(
-            checker.read_pending(16).await.expect("read_pending").is_empty(),
+            checker
+                .read_pending(16)
+                .await
+                .expect("read_pending")
+                .is_empty(),
             "driver acked the batch"
         );
 
@@ -386,7 +397,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         prod.publish(&Evt { n: 200 }).await.expect("publish new");
 
-        assert!(wait_until_len(&seen, 1).await, "the post-creation entry handled");
+        assert!(
+            wait_until_len(&seen, 1).await,
+            "the post-creation entry handled"
+        );
         assert_eq!(
             *seen.lock().await,
             vec![200],
@@ -441,7 +455,11 @@ mod tests {
         // Good + poison all acked → nothing lingers in the PEL.
         let checker: StreamConsumer<Evt> = StreamConsumer::new(conn, key, "g", "c1");
         assert!(
-            checker.read_pending(16).await.expect("read_pending").is_empty(),
+            checker
+                .read_pending(16)
+                .await
+                .expect("read_pending")
+                .is_empty(),
             "poison entry dead-lettered (acked), not left pending"
         );
         cancel.cancel();

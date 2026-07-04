@@ -343,7 +343,7 @@ impl AcceptedShareConsumer {
         let reply: StreamReadReply = conn
             .xread_options(&[&self.stream_key], &[">"], &opts)
             .await?;
-        Ok(self.partition(reply).await)
+        Ok(self.partition(reply).await.0)
     }
 
     /// Re-read this consumer's pending (delivered-but-unacked) entries from
@@ -351,6 +351,16 @@ impl AcceptedShareConsumer {
     /// apply crashed before `XACK` is redelivered (and the dedup marker
     /// makes the re-apply a no-op).
     pub async fn read_pending(&self, count: usize) -> Result<Vec<ConsumedShare>, StreamError> {
+        Ok(self.read_pending_counted(count).await?.0)
+    }
+
+    /// Like [`Self::read_pending`] but also returns the total RAW entry count
+    /// (good + dead-lettered), so the resume loop can tell "nothing left in the
+    /// PEL" (stop) from "this batch was all poison" (keep draining).
+    async fn read_pending_counted(
+        &self,
+        count: usize,
+    ) -> Result<(Vec<ConsumedShare>, usize), StreamError> {
         let opts = StreamReadOptions::default()
             .group(&self.group, &self.consumer)
             .count(count);
@@ -383,14 +393,19 @@ impl AcceptedShareConsumer {
 
     /// Drain this consumer's **pending** (delivered-but-unacked) entries —
     /// the restart-resume path. Same dispatch + ack as [`Self::drain_new`].
+    ///
+    /// Returns the total RAW entry count seen (good + dead-lettered), NOT the
+    /// number of good shares. The resume loop drains until this is `0` (PEL
+    /// empty); returning `good.len()` would let an all-poison batch report `0`
+    /// and break the loop with good shares still queued behind the poison.
     pub async fn drain_pending(
         &self,
         sinks: &[Arc<dyn SharedAcceptedShareSink>],
         count: usize,
     ) -> Result<usize, StreamError> {
-        let batch = self.read_pending(count).await?;
+        let (batch, raw) = self.read_pending_counted(count).await?;
         self.dispatch_and_ack(&batch, sinks).await?;
-        Ok(batch.len())
+        Ok(raw)
     }
 
     async fn dispatch_and_ack(
@@ -422,7 +437,9 @@ impl AcceptedShareConsumer {
         Ok(n)
     }
 
-    fn decode_entry(entry: &redis::streams::StreamId) -> Result<SharedAcceptedShareOwned, StreamError> {
+    fn decode_entry(
+        entry: &redis::streams::StreamId,
+    ) -> Result<SharedAcceptedShareOwned, StreamError> {
         let raw = entry
             .map
             .get(FIELD)
@@ -434,12 +451,25 @@ impl AcceptedShareConsumer {
     }
 
     /// Split a reply into decodable shares; an undecodable entry (missing `d`
-    /// field / malformed JSON) can never reach a sink, so it's **dead-lettered**
-    /// — logged loudly and `XACK`ed here so one poison entry can't fail its whole
-    /// batch or linger un-acked in the PEL. See
-    /// [`StreamConsumer::partition`](crate::StreamConsumer) for the rationale;
-    /// this mirrors it for the accepted-share fan-out path.
-    async fn partition(&self, reply: StreamReadReply) -> Vec<ConsumedShare> {
+    /// field / malformed JSON) can never reach a sink, so it's dead-lettered
+    /// (`XACK`ed) so one poison entry can't fail its whole batch or linger
+    /// un-acked in the PEL.
+    ///
+    /// Unlike [`StreamConsumer::partition`](crate::StreamConsumer) (used for
+    /// device-status etc.), THIS is the money path: a dropped accepted share
+    /// underpays a miner and can't be recovered, so the drop is logged at
+    /// `error` + counted (`accepted_share_undecodable_dropped_total`) rather
+    /// than a quiet warning — the loss must be alertable so the operator fixes
+    /// the root cause (a non-additive share-schema skew across a rolling
+    /// Core/Satellite deploy, or a corrupt Redis write; additive changes are
+    /// absorbed by `#[serde(default)]` and never land here).
+    ///
+    /// Returns `(decodable shares, total raw entries seen)`. The raw count —
+    /// NOT `good.len()` — is what the resume loop must key on: an all-poison
+    /// batch acks its entries and returns zero good, and keying the loop on
+    /// good-count would break it there, stranding good shares queued behind
+    /// the poison until the next restart.
+    async fn partition(&self, reply: StreamReadReply) -> (Vec<ConsumedShare>, usize) {
         let mut good = Vec::new();
         let mut poison = Vec::new();
         for key in reply.keys {
@@ -450,18 +480,22 @@ impl AcceptedShareConsumer {
                         share,
                     }),
                     Err(err) => {
-                        tracing::warn!(
+                        tracing::error!(
                             id = %entry.id,
                             %err,
                             stream = %self.stream_key,
                             group = %self.group,
-                            "accepted-consumer: dropping undecodable share (dead-letter)"
+                            "accepted-consumer: LOST an undecodable accepted (money) share — \
+                             miner underpaid for this window; investigate share-schema skew / \
+                             corrupt write"
                         );
+                        metrics::counter!("accepted_share_undecodable_dropped_total").increment(1);
                         poison.push(entry.id);
                     }
                 }
             }
         }
+        let raw = good.len() + poison.len();
         if !poison.is_empty() {
             if let Err(err) = self.ack(&poison).await {
                 tracing::warn!(
@@ -473,7 +507,7 @@ impl AcceptedShareConsumer {
                 );
             }
         }
-        good
+        (good, raw)
     }
 }
 
@@ -610,12 +644,22 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
         let reply: StreamReadReply = conn
             .xread_options(&[&self.stream_key], &[">"], &opts)
             .await?;
-        Ok(self.partition(reply).await)
+        Ok(self.partition(reply).await.0)
     }
 
     /// Re-read this consumer's pending (delivered-but-unacked) entries from
     /// the start (`0`) — the restart-resume path.
     pub async fn read_pending(&self, count: usize) -> Result<Vec<Consumed<T>>, StreamError> {
+        Ok(self.read_pending_counted(count).await?.0)
+    }
+
+    /// Like [`Self::read_pending`] but also returns the total RAW entry count
+    /// (good + dead-lettered) so the resume loop in `run` can distinguish an
+    /// empty PEL (stop) from an all-poison batch (keep draining).
+    pub(crate) async fn read_pending_counted(
+        &self,
+        count: usize,
+    ) -> Result<(Vec<Consumed<T>>, usize), StreamError> {
         let opts = StreamReadOptions::default()
             .group(&self.group, &self.consumer)
             .count(count);
@@ -649,14 +693,22 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
 
     /// Split a reply into decodable entries; entries that can't be
     /// reconstructed (missing `d` field / malformed JSON) can never reach a
-    /// handler, so they're **dead-lettered** — logged loudly and `XACK`ed here
+    /// handler, so they're **dead-lettered** — logged and `XACK`ed here
     /// so a single poison entry can't fail its whole batch (dropping the good
     /// entries with it) or linger un-acked in the PEL (which would also mask the
     /// consumer-lag monitor). A decode failure is deterministic — same bytes +
-    /// same code → same failure — so retrying is futile and dropping with a loud
+    /// same code → same failure — so retrying is futile and dropping with a
     /// log is correct. Genuine version-skew is prevented upstream by
     /// `#[serde(default)]` on newly-added fields.
-    async fn partition(&self, reply: StreamReadReply) -> Vec<Consumed<T>> {
+    ///
+    /// This path carries NON-money streams (device-status, block-found,
+    /// rejected), so a drop is `warn`, not the `error` + counter the accepted-
+    /// share (money) [`AcceptedShareConsumer::partition`] uses.
+    ///
+    /// Returns `(decodable entries, total raw entries seen)` — the raw count is
+    /// what the resume loop keys on so an all-poison batch doesn't halt it with
+    /// good entries still queued behind (see [`Self::read_pending_counted`]).
+    async fn partition(&self, reply: StreamReadReply) -> (Vec<Consumed<T>>, usize) {
         let mut good = Vec::new();
         let mut poison = Vec::new();
         for key in reply.keys {
@@ -679,6 +731,7 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
                 }
             }
         }
+        let raw = good.len() + poison.len();
         if !poison.is_empty() {
             if let Err(err) = self.ack(&poison).await {
                 tracing::warn!(
@@ -690,7 +743,7 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
                 );
             }
         }
-        good
+        (good, raw)
     }
 }
 
@@ -964,6 +1017,87 @@ mod tests {
         );
     }
 
+    /// Regression: the resume loop must drain good pending shares even when an
+    /// all-poison batch sits at the FRONT of the PEL. With `count == 1` the
+    /// first pending entry (poison) is dead-lettered and yields zero good
+    /// shares; the loop must key on the RAW count (keep going) not the good
+    /// count (which would break here and strand the good share behind it).
+    #[tokio::test]
+    async fn resume_loop_drains_good_share_stranded_behind_front_poison() {
+        let Some(conn) = connect_or_skip(2).await else {
+            return;
+        };
+        let key = "bp:test:shares:strand";
+        let group = "money";
+        let consumer_name = "c1";
+        let producer = AcceptedShareProducer::new(conn.clone(), key);
+        let consumer = AcceptedShareConsumer::new(conn.clone(), key, group, consumer_name);
+        consumer.ensure_group().await.expect("ensure_group");
+
+        // Poison FIRST (lowest id → front of the PEL), good share behind it.
+        let _: String = redis::cmd("XADD")
+            .arg(key)
+            .arg("*")
+            .arg("d")
+            .arg("{ not a share")
+            .query_async(&mut conn.clone())
+            .await
+            .expect("xadd poison");
+        producer
+            .publish(&sample("ep1:0", MiningMode::Pplns, None))
+            .await
+            .expect("publish good");
+
+        // Simulate a crash AFTER delivery, BEFORE ack: deliver both to the PEL
+        // via a raw XREADGROUP `>` (marks pending; does NOT run partition, so
+        // the poison is not yet dead-lettered — exactly the post-crash state).
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg(consumer_name)
+            .arg("COUNT")
+            .arg(10)
+            .arg("STREAMS")
+            .arg(key)
+            .arg(">")
+            .query_async(&mut conn.clone())
+            .await
+            .expect("raw deliver to PEL");
+
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sinks: Vec<Arc<dyn SharedAcceptedShareSink>> = vec![Arc::new(RecordingSink {
+            ids: recorded.clone(),
+        })];
+
+        // The production resume loop, with count = 1 to force the all-poison
+        // first batch. Pre-fix: iteration 1 returns 0 good → break → good share
+        // stranded. Post-fix: raw count 1 → keep draining → good share reaches
+        // the sink.
+        loop {
+            let n = consumer
+                .drain_pending(&sinks, 1)
+                .await
+                .expect("drain_pending");
+            if n == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            vec!["ep1:0".to_string()],
+            "good share behind the front poison must not be stranded"
+        );
+        assert!(
+            consumer
+                .read_pending(10)
+                .await
+                .expect("read_pending")
+                .is_empty(),
+            "resume loop must drain the whole PEL (good dispatched, poison dead-lettered)"
+        );
+    }
+
     #[tokio::test]
     async fn producing_sink_publishes_each_accepted_share() {
         // DBs 0–15 only (valkey default `databases 16`); keep ≤ 15.
@@ -1094,7 +1228,9 @@ mod tests {
     /// block / event. Contrasted against the `0`-started group, which does.
     #[tokio::test]
     async fn ensure_group_at_tail_skips_history() {
-        let Some(conn) = connect_or_skip(11).await else {
+        // Own DB (1): `connect_or_skip` FLUSHDBs, so sharing a DB with another
+        // FLUSHDB-ing test makes both flaky when the suite runs in parallel.
+        let Some(conn) = connect_or_skip(1).await else {
             return;
         };
         let key = "bp:test:tail";

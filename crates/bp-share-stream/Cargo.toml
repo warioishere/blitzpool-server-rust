@@ -19,6 +19,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Global metrics facade — counts undecodable accepted (money) shares that
+# are dropped, so the loss is alertable instead of a silent log line.
+metrics = { workspace = true }
 # `sync` for the off-loop publish channel, `rt` for the drain-task spawn,
 # `macros`+`time` for the shared consume loop (`select!` + error back-off).
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
