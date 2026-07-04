@@ -2,8 +2,6 @@
 
 **Blitzpool** is an open-source Bitcoin mining pool with a single distinguishing feature: **every payout — Solo, PPLNS, Group-Solo, Blockparty — is written directly into the coinbase transaction of the block that earned it.** No pool wallet, no custody period, no FPPS-style intermediate. Your sats arrive at your address with the block itself.
 
-Current version: **v2.2.1**
-
 This is the **ground-up Rust rebuild** of the original TypeScript Blitzpool — same non-custodial payout philosophy, re-architected around a multi-stream template pipeline, a self-tuning coinbase budget, and a Core/Satellite split that lets the pool scale horizontally. The protocol behaviour (Stratum V1/V2, coinbase distribution) is feature-equivalent with the TS pool; the internals are not.
 
 License: **GNU AGPL v3 (AGPL-3.0-or-later)**.
@@ -80,7 +78,7 @@ Trimmed sats are **never lost**: in PPLNS they become a signed pending credit; i
 
 ### 4. Core/Satellite split (horizontal scale)
 
-The pool can run as a **monolith** or be split into role-gated processes that communicate over **Redis streams**:
+The pool runs as role-gated processes that communicate over **Redis streams**:
 
 - `front` — Stratum listeners, template streams, job building, block submit
 - `api` — read-only HTTP API
