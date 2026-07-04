@@ -213,8 +213,9 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
             });
         }
 
-        // Convert PayoutEntry (address + percent) → DynamicOutput
-        // (address + sats) by applying the percent to reward_sats.
+        // Convert each PayoutEntry to a DynamicOutput, placing the exact
+        // per-output sats the distributor already computed verbatim — no
+        // percent re-derivation (see `payouts_to_dynamic_outputs`).
         let outputs = payouts_to_dynamic_outputs(&payouts);
         match encode_coinbase_outputs(self.network, &outputs) {
             Ok(bytes) => Some(AllocateTokenContext {
