@@ -111,37 +111,16 @@ pub async fn find_clients_by_address(
     .map_err(DbError::from)
 }
 
-/// Time-decay window (ms) for the live-hashrate sums. `client_entity.hashRate`
-/// is a snapshot frozen at a session's last accepted share, so a departed miner
-/// keeps its last value until the dead-client sweep (minutes later) — summing
-/// raw snapshots over-counts miners that just left, badly when marketplace
-/// proxies churn sessions. Instead each session is weighted by how fresh its
-/// last share is, fading linearly to zero over this window, so a session that
-/// goes quiet drops out of the number smoothly instead of lingering at full.
-pub const HASHRATE_DECAY_WINDOW_MS: i64 = 2 * 60 * 1000;
-
-/// Staleness-decayed sum of `hashRate` across active client rows — powers the
-/// `/api/pool` `totalHashRate` field. Each session is weighted
-/// `max(0, 1 - (now_ms - updatedAt)/window_ms)` so a miner that just went
-/// offline fades out over `window_ms` instead of counting at full until swept.
-pub async fn sum_active_pool_hashrate<'e, E>(
-    executor: E,
-    now_ms: i64,
-    window_ms: i64,
-) -> Result<f64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
+/// Sum of `hashRate` across every non-soft-deleted client row — powers
+/// the `/api/pool` `totalHashRate` field and operator-dashboard
+/// endpoints.
+pub async fn sum_active_pool_hashrate(pool: &PgPool) -> Result<f64, DbError> {
     let row = sqlx::query!(
-        r#"SELECT COALESCE(SUM(
-               "hashRate" * GREATEST(0.0, LEAST(1.0, 1.0 - (($1 - "updatedAt")::float8 / $2::float8)))
-           ), 0.0)::float8 AS "total!"
+        r#"SELECT COALESCE(SUM("hashRate"), 0.0)::float8 AS "total!"
            FROM client_entity
            WHERE "deletedAt" IS NULL"#,
-        now_ms,
-        window_ms as f64,
     )
-    .fetch_one(executor)
+    .fetch_one(pool)
     .await
     .map_err(DbError::from)?;
     Ok(row.total)
@@ -163,27 +142,19 @@ pub struct UserAgentAggRow {
 /// GROUP BY `userAgent` over the **active** rows in `client_entity`
 /// — `deletedAt IS NULL` filter so an idle pool with only soft-deleted
 /// sessions doesn't emit a ghost `{userAgent: null, count: 0}` entry.
-/// Ordered by `count DESC`. `totalHashRate` is staleness-decayed like
-/// [`sum_active_pool_hashrate`] so the per-agent hashrate agrees with the pool
-/// total; `count` stays a raw session count.
-pub async fn find_user_agents(
-    pool: &PgPool,
-    now_ms: i64,
-    window_ms: i64,
-) -> Result<Vec<UserAgentAggRow>, DbError> {
+/// Ordered by `count DESC`.
+pub async fn find_user_agents(pool: &PgPool) -> Result<Vec<UserAgentAggRow>, DbError> {
     sqlx::query_as::<_, UserAgentAggRow>(
         r#"SELECT
             "userAgent",
             COUNT("userAgent") AS count,
             MAX("bestDifficulty") AS "bestDifficulty",
-            SUM("hashRate" * GREATEST(0.0, LEAST(1.0, 1.0 - (($1 - "updatedAt")::float8 / $2::float8)))) AS "totalHashRate"
+            SUM("hashRate") AS "totalHashRate"
            FROM client_entity
            WHERE "deletedAt" IS NULL
            GROUP BY "userAgent"
            ORDER BY COUNT("userAgent") DESC"#,
     )
-    .bind(now_ms)
-    .bind(window_ms)
     .fetch_all(pool)
     .await
     .map_err(DbError::from)

@@ -731,12 +731,7 @@ where
             "POOL_INFO".to_string(),
             TtlKind::PoolInfo,
             async move {
-                let total_hash_rate = bp_db::sum_active_pool_hashrate(
-                    &s.pool,
-                    crate::time_range::now_ms(),
-                    bp_db::HASHRATE_DECAY_WINDOW_MS,
-                )
-                .await?;
+                let total_hash_rate = bp_db::sum_active_pool_hashrate(&s.pool).await?;
                 let total_miners: i64 =
                     sqlx::query_scalar!(r#"SELECT COUNT("userAgent") FROM client_entity"#,)
                         .fetch_one(&s.pool)
@@ -1342,12 +1337,7 @@ where
             TtlKind::SiteInfo,
             async move {
                 let blocks = find_found_blocks(&s.pool).await?;
-                let agents = find_user_agents(
-                    &s.pool,
-                    crate::time_range::now_ms(),
-                    bp_db::HASHRATE_DECAY_WINDOW_MS,
-                )
-                .await?;
+                let agents = find_user_agents(&s.pool).await?;
                 let scores = find_high_scores(&s.pool).await?;
                 Ok(InfoResponse {
                     block_data: blocks
