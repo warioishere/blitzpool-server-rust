@@ -12,12 +12,18 @@ use bp_common::AddressId;
 use bp_db::{
     bulk_set_client_hashrate, bulk_touch_clients_for_share, delete_client_for_session,
     find_addresses_for_ntfy_listener, find_client_recent_first_seen, kill_dead_clients,
-    touch_client_for_share, update_sv2_user_agent_by_address, upsert_address_best_difficulty,
-    upsert_client, upsert_ntfy_subscription, ClientUpsert,
+    reset_all_client_hashrate, touch_client_for_share, update_sv2_user_agent_by_address,
+    upsert_address_best_difficulty, upsert_client, upsert_ntfy_subscription, ClientUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+
+/// Serialises the tests that mutate `hashRate` table-wide against the shared
+/// PG. `reset_all_client_hashrate` zeroes every active row, so it must not
+/// overlap `bulk_set_client_hashrate`'s test (which asserts its own row's
+/// value). No other test touches the column, so this two-test lock suffices.
+static HASHRATE_DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn connect_or_skip() -> Option<PgPool> {
     let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
@@ -777,6 +783,7 @@ async fn bulk_set_client_hashrate_overwrites_and_skips_deleted() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
+    let _guard = HASHRATE_DB_LOCK.lock().await;
 
     const ACTIVE: &str = "tHRact";
     const DELETED: &str = "tHRdel";
@@ -879,6 +886,88 @@ async fn bulk_set_client_hashrate_overwrites_and_skips_deleted() {
     assert_eq!(zeroed, 0.0, "idle session self-zeroes");
 
     for sid in [ACTIVE, DELETED] {
+        sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
+            .bind(sid)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+}
+
+// ── reset_all_client_hashrate ─────────────────────────────────────
+
+#[tokio::test]
+async fn reset_all_client_hashrate_zeroes_active_only() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let _guard = HASHRATE_DB_LOCK.lock().await;
+
+    const ACTIVE_A: &str = "tRHrA";
+    const ACTIVE_B: &str = "tRHrB";
+    const DELETED: &str = "tRHrD";
+    for sid in [ACTIVE_A, ACTIVE_B, DELETED] {
+        let _ = sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
+            .bind(sid)
+            .execute(&pool)
+            .await;
+    }
+
+    for sid in [ACTIVE_A, ACTIVE_B, DELETED] {
+        upsert_client(
+            &pool,
+            &ClientUpsert {
+                address: "test_resethr_addr".to_string(),
+                client_name: "wkr".to_string(),
+                session_id: sid.to_string(),
+                user_agent: None,
+                start_time_ms: 1,
+                current_difficulty: None,
+            },
+        )
+        .await
+        .expect("seed client");
+        sqlx::query(r#"UPDATE client_entity SET "hashRate" = 7.0e12 WHERE "sessionId" = $1"#)
+            .bind(sid)
+            .execute(&pool)
+            .await
+            .expect("seed hashRate");
+    }
+    // Soft-delete one — reset must leave it alone (it's excluded from active
+    // sums anyway) and not count it.
+    sqlx::query(r#"UPDATE client_entity SET "deletedAt" = 1 WHERE "sessionId" = $1"#)
+        .bind(DELETED)
+        .execute(&pool)
+        .await
+        .expect("soft-delete");
+
+    let cleared = reset_all_client_hashrate(&pool).await.expect("reset");
+    assert!(cleared >= 2, "at least our two active non-zero rows are cleared, got {cleared}");
+
+    for sid in [ACTIVE_A, ACTIVE_B] {
+        let hr: f64 =
+            sqlx::query_scalar(r#"SELECT "hashRate" FROM client_entity WHERE "sessionId" = $1"#)
+                .bind(sid)
+                .fetch_one(&pool)
+                .await
+                .expect("read active");
+        assert_eq!(hr, 0.0, "active row zeroed on boot reconcile");
+    }
+    let del_hr: f64 =
+        sqlx::query_scalar(r#"SELECT "hashRate" FROM client_entity WHERE "sessionId" = $1"#)
+            .bind(DELETED)
+            .fetch_one(&pool)
+            .await
+            .expect("read deleted");
+    assert!((del_hr - 7.0e12).abs() < 1.0, "soft-deleted row untouched");
+
+    // Idempotent + the `<> 0` guard: a second call clears nothing.
+    let again = reset_all_client_hashrate(&pool)
+        .await
+        .expect("reset again");
+    assert_eq!(again, 0, "no non-zero active rows left to clear");
+
+    for sid in [ACTIVE_A, ACTIVE_B, DELETED] {
         sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
             .bind(sid)
             .execute(&pool)

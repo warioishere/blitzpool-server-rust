@@ -948,6 +948,30 @@ pub async fn bulk_set_client_hashrate(
     Ok(result.rows_affected())
 }
 
+/// Zero `hashRate` for every active (non-soft-deleted) client row. Run
+/// once at Front startup by the live hashrate sampler, which is the sole
+/// writer of the column: its in-memory window map starts empty after a
+/// restart, so any hashRate left over from the previous process is a ghost
+/// — a session that never reconnects would keep its stale value (and stay
+/// summed into the pool total) until `kill_dead_clients` sweeps the row.
+/// Zeroing on boot removes the ghosts; live sessions repopulate within one
+/// sample window. Only touches rows that are actually non-zero. Returns the
+/// number of rows cleared.
+///
+/// Assumes a single hashRate-writing process (one Front). A future
+/// multi-front deployment would need this scoped per writer.
+pub async fn reset_all_client_hashrate(pool: &PgPool) -> Result<u64, DbError> {
+    let result = sqlx::query!(
+        r#"UPDATE client_entity
+           SET "hashRate" = 0
+           WHERE "deletedAt" IS NULL AND "hashRate" <> 0"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
 /// Atomic compare-and-set on `address_settings_entity.bestDifficulty`.
 /// INSERTs a fresh row if the address has none yet (cold-path on the
 /// very first share); on conflict, only UPDATEs when the candidate

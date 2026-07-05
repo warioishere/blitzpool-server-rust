@@ -114,6 +114,15 @@ impl Default for TouchBuffer {
 }
 
 impl TouchBuffer {
+    /// Lock the map, recovering the guard if a previous holder panicked
+    /// (poisoning). The critical sections here can't panic, but recovering
+    /// instead of `.expect()`-panicking keeps a stray poison from turning
+    /// every subsequent accepted share into a panic — same posture as the
+    /// engine's shutdown path.
+    fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<TouchKey, TouchEntry>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Insert or merge a sample. `share_diff` takes the running max,
     /// the optionals overwrite only when `Some`, `updated_at_ms` takes
     /// the max (out-of-order shares mustn't roll the timestamp back).
@@ -129,7 +138,7 @@ impl TouchBuffer {
         channel_count: i32,
         updated_at_ms: i64,
     ) {
-        let mut guard = self.inner.lock().expect("touch buffer mutex poisoned");
+        let mut guard = self.guard();
         if let Some(e) = guard.get_mut(&key) {
             if share_diff > e.share_diff {
                 e.share_diff = share_diff;
@@ -159,7 +168,7 @@ impl TouchBuffer {
     /// Drain everything currently buffered. Empties the buffer in one
     /// lock-pass. Returns the owned snapshot.
     fn drain(&self) -> HashMap<TouchKey, TouchEntry> {
-        let mut guard = self.inner.lock().expect("touch buffer mutex poisoned");
+        let mut guard = self.guard();
         std::mem::take(&mut *guard)
     }
 
@@ -170,7 +179,7 @@ impl TouchBuffer {
     /// only fills `None` slots. For `share_diff` we still take the
     /// running max (kommutativ).
     fn rebuffer(&self, snap: HashMap<TouchKey, TouchEntry>) {
-        let mut guard = self.inner.lock().expect("touch buffer mutex poisoned");
+        let mut guard = self.guard();
         for (k, v) in snap {
             guard
                 .entry(k)
@@ -192,10 +201,7 @@ impl TouchBuffer {
     /// Snapshot size — used by tests + lib metrics surface.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("touch buffer mutex poisoned")
-            .len()
+        self.guard().len()
     }
 }
 

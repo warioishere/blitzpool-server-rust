@@ -21,14 +21,15 @@
 //!
 //! Unlike the share-touch buffer (which drains its map every flush), this
 //! map is **persistent**: a session that stops submitting stays tracked
-//! and samples to 0, so the moving average fades a stopped miner over two
-//! windows (R → R/2 → 0) before the entry is dropped. That is what makes
-//! the reported hashrate self-zeroing and reconnect-immune without waiting
-//! for `kill_dead_clients` to sweep the row.
+//! and samples to 0, so the moving average fades a stopped miner to 0 over
+//! two empty windows (R → R/2 → 0); the entry is kept one window longer to
+//! re-write the 0 (a retry if the terminal write failed), then dropped.
+//! That is what makes the reported hashrate self-zeroing and
+//! reconnect-immune without waiting for `kill_dead_clients` to sweep the row.
 
 use std::sync::{Arc, Mutex};
 
-use bp_db::bulk_set_client_hashrate;
+use bp_db::{bulk_set_client_hashrate, reset_all_client_hashrate};
 use hashbrown::HashMap;
 use sqlx::PgPool;
 use tokio::sync::oneshot;
@@ -42,10 +43,13 @@ use crate::touch_buffer::{TouchKey, TouchKeyRef};
 /// so bp-session-persistence needn't depend on bp-api.
 const HASH_PER_DIFFICULTY_1: f64 = 4_294_967_296.0;
 
-/// Consecutive zero-share windows after which a session is treated as
-/// fully faded (its last write was the 0) and dropped from the map. Two
-/// windows produce the R → R/2 → 0 fade.
-const MAX_EMPTY_WINDOWS: u32 = 2;
+/// Consecutive zero-share windows after which a faded session is dropped
+/// from the map. The fade itself reaches 0 after two empty windows
+/// (R → R/2 → 0); we keep the session for a third window that re-writes the
+/// 0, so a transient DB failure on the terminal 0-write gets one automatic
+/// retry before the entry is dropped (the entry going stale otherwise would
+/// freeze a dead rig at R/2 until `kill_dead_clients` sweeps it).
+const MAX_EMPTY_WINDOWS: u32 = 3;
 
 /// Per-session sampling state. Persists across windows so a stopped
 /// session can fade rather than freezing at its last value.
@@ -79,6 +83,13 @@ impl Default for HashrateSampler {
 }
 
 impl HashrateSampler {
+    /// Lock the map, recovering the guard on poison rather than panicking
+    /// (see `TouchBuffer::guard` — a stray poison must not turn every
+    /// subsequent share into a panic).
+    fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<TouchKey, SessionSample>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Add a share's credited difficulty to its session's open window.
     /// Non-finite / non-positive values are ignored (defensive — the
     /// accounting sinks already clamp, but this is the hashrate path's
@@ -91,7 +102,7 @@ impl HashrateSampler {
         if !credited_diff.is_finite() || credited_diff <= 0.0 {
             return;
         }
-        let mut guard = self.inner.lock().expect("hashrate sampler mutex poisoned");
+        let mut guard = self.guard();
         if let Some(s) = guard.get_mut(&key) {
             s.diff_accum += credited_diff;
         } else {
@@ -113,7 +124,7 @@ impl HashrateSampler {
     /// One lock-pass; no `.await` while the lock is held.
     fn sample(&self, window_secs: f64) -> Vec<(TouchKey, f64)> {
         let window = window_secs.max(1.0);
-        let mut guard = self.inner.lock().expect("hashrate sampler mutex poisoned");
+        let mut guard = self.guard();
         let mut writes = Vec::with_capacity(guard.len());
         guard.retain(|key, s| {
             let rate = s.diff_accum * HASH_PER_DIFFICULTY_1 / window;
@@ -131,8 +142,9 @@ impl HashrateSampler {
             s.prev_rate = Some(rate);
             s.diff_accum = 0.0;
 
-            // Keep tracking until two empty windows have elapsed — the
-            // second one wrote the 0 above, so it's safe to drop now.
+            // Fade reaches 0 at the second empty window; keep the session
+            // for a third that re-writes the 0 (a free retry if the terminal
+            // write failed), then drop.
             s.empty_windows < MAX_EMPTY_WINDOWS
         });
         writes
@@ -140,10 +152,7 @@ impl HashrateSampler {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("hashrate sampler mutex poisoned")
-            .len()
+        self.guard().len()
     }
 }
 
@@ -161,11 +170,14 @@ async fn sample_and_write(sampler: &HashrateSampler, pool: &PgPool, window_secs:
     let mut client_names = Vec::with_capacity(n);
     let mut session_ids = Vec::with_capacity(n);
     let mut hash_rates = Vec::with_capacity(n);
-    for (k, hr) in &writes {
-        addresses.push(k.address.clone());
-        client_names.push(k.client_name.clone());
-        session_ids.push(k.session_id.clone());
-        hash_rates.push(*hr);
+    // Consume `writes` by value: `sample()` already cloned each key out of
+    // the map, so move those Strings into the columnar vecs instead of
+    // cloning them a second time.
+    for (k, hr) in writes {
+        addresses.push(k.address);
+        client_names.push(k.client_name);
+        session_ids.push(k.session_id);
+        hash_rates.push(hr);
     }
     match bulk_set_client_hashrate(pool, &addresses, &client_names, &session_ids, &hash_rates).await
     {
@@ -182,25 +194,44 @@ async fn sample_and_write(sampler: &HashrateSampler, pool: &PgPool, window_secs:
     }
 }
 
-/// Spawned sample loop. Ticks every `sample_interval`, dividing each
-/// window's accumulated work by the **actual** elapsed time since the
-/// previous tick (so a delayed tick doesn't inflate the estimate).
+/// Spawned sample loop. Ticks every `sample_interval` and divides each
+/// window's accumulated work by the **actual wall-clock** elapsed since the
+/// previous tick — measured with `Instant::now()`, not the tick deadline:
+/// `tokio::Interval::tick()` returns the scheduled grid time, so after a
+/// runtime stall that would understate elapsed and overstate the rate.
+/// Missed ticks are skipped rather than burst-fired.
+///
+/// When `reconcile_on_boot` is set (the Front role — the sole hashRate
+/// writer), it first zeroes any hashRate the previous process left in the
+/// DB: the in-memory map starts empty, so a session that never reconnects
+/// would otherwise keep its stale value (and stay summed into the pool
+/// total) until `kill_dead_clients` sweeps it.
+///
 /// Returns when `shutdown_rx` resolves — no final flush, the values are
 /// ephemeral and recomputed from live shares on the next boot.
 pub(crate) async fn run_sample_loop(
     sampler: Arc<HashrateSampler>,
     pool: PgPool,
     sample_interval: Duration,
+    reconcile_on_boot: bool,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
+    if reconcile_on_boot {
+        match reset_all_client_hashrate(&pool).await {
+            Ok(n) => debug!(cleared = n, "hashrate sampler: zeroed stale hashRate on boot"),
+            Err(e) => warn!(error = %e, "hashrate sampler: boot hashRate reset failed"),
+        }
+    }
     let start = Instant::now() + sample_interval;
     let mut ticker = tokio::time::interval_at(start, sample_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_tick = Instant::now();
     loop {
         tokio::select! {
-            tick = ticker.tick() => {
-                let elapsed = tick.saturating_duration_since(last_tick).as_secs_f64();
-                last_tick = tick;
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                let elapsed = now.saturating_duration_since(last_tick).as_secs_f64();
+                last_tick = now;
                 sample_and_write(&sampler, &pool, elapsed).await;
             }
             _ = &mut shutdown_rx => {
@@ -263,28 +294,33 @@ mod tests {
     }
 
     #[test]
-    fn idle_session_fades_over_two_windows_then_drops() {
+    fn idle_session_fades_then_retries_zero_before_drop() {
         let s = HashrateSampler::default();
         let r1 = rate_for(600.0, 60.0);
 
         s.record(kref(), 600.0);
-        let _ = s.sample(60.0); // window 1: prev = r1
+        let _ = s.sample(60.0); // active window: prev = r1
 
-        // Window 2: no shares → displayed = (r1 + 0)/2, still tracked.
-        let w2 = s.sample(60.0);
+        // Empty window 1 → (r1 + 0)/2, still tracked.
+        let w = s.sample(60.0);
         assert!(
-            (w2[0].1 - r1 / 2.0).abs() < 1.0,
+            (w[0].1 - r1 / 2.0).abs() < 1.0,
             "first idle window halves, got {}",
-            w2[0].1
+            w[0].1
         );
-        assert_eq!(s.len(), 1, "still tracked after one empty window");
+        assert_eq!(s.len(), 1, "tracked after one empty window");
 
-        // Window 3: still no shares → displayed = 0, then dropped.
-        let w3 = s.sample(60.0);
-        assert_eq!(w3[0].1, 0.0, "second idle window zeroes");
-        assert_eq!(s.len(), 0, "dropped after two empty windows");
+        // Empty window 2 → 0, but kept one more window for the retry.
+        let w = s.sample(60.0);
+        assert_eq!(w[0].1, 0.0, "second idle window zeroes");
+        assert_eq!(s.len(), 1, "kept for the terminal-0 retry window");
 
-        // Window 4: nothing left to write.
+        // Empty window 3 → re-writes 0 (the free retry), then drops.
+        let w = s.sample(60.0);
+        assert_eq!(w[0].1, 0.0, "third idle window re-writes 0");
+        assert_eq!(s.len(), 0, "dropped after the retry window");
+
+        // Nothing left to write.
         assert!(
             s.sample(60.0).is_empty(),
             "no writes once the session is gone"

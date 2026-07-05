@@ -96,6 +96,7 @@ impl SessionPersistenceEngine {
             self.hashrate_sampler.clone(),
             self.pool.clone(),
             self.config.hashrate_sample_interval,
+            self.config.reconcile_hashrate_on_boot,
             sampler_rx,
         ));
 

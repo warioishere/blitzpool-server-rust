@@ -23,6 +23,13 @@ pub struct SessionPersistenceConfig {
     /// that vardiff's ~10–15 shares/min keep a window well-populated (30 s
     /// is too few shares → noisy), short enough to stay "live".
     pub hashrate_sample_interval: Duration,
+    /// Whether this process zeroes stale `hashRate` at startup. Only the
+    /// hashRate-writing role (Front) should set this — the sampler map is
+    /// empty on boot, so leftover hashRate from the previous process would
+    /// linger as a ghost until `kill_dead_clients` sweeps it. A non-writing
+    /// role (api/payout/notify) must NOT, or it would wipe the values the
+    /// Front is actively maintaining. Default `false`.
+    pub reconcile_hashrate_on_boot: bool,
 }
 
 impl Default for SessionPersistenceConfig {
@@ -31,6 +38,7 @@ impl Default for SessionPersistenceConfig {
             address_cache_capacity: 50_000,
             touch_flush_interval: Duration::from_secs(30),
             hashrate_sample_interval: Duration::from_secs(60),
+            reconcile_hashrate_on_boot: false,
         }
     }
 }
