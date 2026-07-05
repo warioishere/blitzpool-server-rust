@@ -19,10 +19,11 @@
 //! 30s touch flush clobber the sampler's value every other tick.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use bp_db::bulk_touch_clients_for_share;
 use sqlx::PgPool;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -49,6 +50,10 @@ pub(crate) struct TouchEntry {
 /// Shared buffer. Cloning the `Arc<TouchBuffer>` is the standard pattern
 /// — the sink writes into it on every share, the flusher drains it on
 /// every tick.
+///
+/// Locking is a plain `std::sync::Mutex`: no critical section here spans an
+/// `.await` (record merges into the map; the flusher drains before the DB
+/// round-trip), so an async mutex would be pure overhead on the hot path.
 pub(crate) struct TouchBuffer {
     inner: Mutex<HashMap<TouchKey, TouchEntry>>,
 }
@@ -65,43 +70,49 @@ impl TouchBuffer {
     /// Insert or merge a sample. `share_diff` takes the running max,
     /// the optionals overwrite only when `Some`, `updated_at_ms` takes
     /// the max (out-of-order shares mustn't roll the timestamp back).
-    pub(crate) async fn record(
+    ///
+    /// Takes `&key` and clones it only on a first insert: after a session's
+    /// first share in a flush window, every subsequent share hits the
+    /// `get_mut` fast path with zero allocation.
+    pub(crate) fn record(
         &self,
-        key: TouchKey,
+        key: &TouchKey,
         share_diff: f32,
         current_diff: Option<f32>,
         channel_count: i32,
         updated_at_ms: i64,
     ) {
-        let mut guard = self.inner.lock().await;
-        guard
-            .entry(key)
-            .and_modify(|e| {
-                if share_diff > e.share_diff {
-                    e.share_diff = share_diff;
-                }
-                if current_diff.is_some() {
-                    e.current_diff = current_diff;
-                }
-                // Latest sample wins: a rejoin/leave changes the channel
-                // count, the freshest share reflects the current bundle size.
-                e.channel_count = channel_count;
-                if updated_at_ms > e.updated_at_ms {
-                    e.updated_at_ms = updated_at_ms;
-                }
-            })
-            .or_insert(TouchEntry {
-                share_diff,
-                current_diff,
-                channel_count,
-                updated_at_ms,
-            });
+        let mut guard = self.inner.lock().expect("touch buffer mutex poisoned");
+        if let Some(e) = guard.get_mut(key) {
+            if share_diff > e.share_diff {
+                e.share_diff = share_diff;
+            }
+            if current_diff.is_some() {
+                e.current_diff = current_diff;
+            }
+            // Latest sample wins: a rejoin/leave changes the channel
+            // count, the freshest share reflects the current bundle size.
+            e.channel_count = channel_count;
+            if updated_at_ms > e.updated_at_ms {
+                e.updated_at_ms = updated_at_ms;
+            }
+        } else {
+            guard.insert(
+                key.clone(),
+                TouchEntry {
+                    share_diff,
+                    current_diff,
+                    channel_count,
+                    updated_at_ms,
+                },
+            );
+        }
     }
 
     /// Drain everything currently buffered. Empties the buffer in one
     /// lock-pass. Returns the owned snapshot.
-    async fn drain(&self) -> HashMap<TouchKey, TouchEntry> {
-        let mut guard = self.inner.lock().await;
+    fn drain(&self) -> HashMap<TouchKey, TouchEntry> {
+        let mut guard = self.inner.lock().expect("touch buffer mutex poisoned");
         std::mem::take(&mut *guard)
     }
 
@@ -111,8 +122,8 @@ impl TouchBuffer {
     /// "latest-wins" fields they win unconditionally — the snapshot
     /// only fills `None` slots. For `share_diff` we still take the
     /// running max (kommutativ).
-    async fn rebuffer(&self, snap: HashMap<TouchKey, TouchEntry>) {
-        let mut guard = self.inner.lock().await;
+    fn rebuffer(&self, snap: HashMap<TouchKey, TouchEntry>) {
+        let mut guard = self.inner.lock().expect("touch buffer mutex poisoned");
         for (k, v) in snap {
             guard
                 .entry(k)
@@ -133,8 +144,11 @@ impl TouchBuffer {
 
     /// Snapshot size — used by tests + lib metrics surface.
     #[cfg(test)]
-    pub(crate) async fn len(&self) -> usize {
-        self.inner.lock().await.len()
+    pub(crate) fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("touch buffer mutex poisoned")
+            .len()
     }
 }
 
@@ -142,7 +156,7 @@ impl TouchBuffer {
 /// rebuffers the snapshot if the UPDATE fails. Returns the number of
 /// rows the DB reported affected.
 async fn flush_once(buffer: &TouchBuffer, pool: &PgPool) -> u64 {
-    let snapshot = buffer.drain().await;
+    let snapshot = buffer.drain();
     if snapshot.is_empty() {
         return 0;
     }
@@ -188,7 +202,7 @@ async fn flush_once(buffer: &TouchBuffer, pool: &PgPool) -> u64 {
                 buffered = n,
                 "client touch buffer flush failed; rebuffering for retry"
             );
-            buffer.rebuffer(snapshot).await;
+            buffer.rebuffer(snapshot);
             0
         }
     }
@@ -224,19 +238,19 @@ pub(crate) async fn run_flush_loop(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn record_merges_running_max_and_latest() {
+    #[test]
+    fn record_merges_running_max_and_latest() {
         let buf = TouchBuffer::default();
         let key = TouchKey {
             address: "addr".into(),
             client_name: "wkr".into(),
             session_id: "sess".into(),
         };
-        buf.record(key.clone(), 100.0, Some(8.0), 1, 1000).await;
-        buf.record(key.clone(), 50.0, Some(16.0), 1, 2000).await;
-        buf.record(key.clone(), 200.0, None, 3, 1500).await;
+        buf.record(&key, 100.0, Some(8.0), 1, 1000);
+        buf.record(&key, 50.0, Some(16.0), 1, 2000);
+        buf.record(&key, 200.0, None, 3, 1500);
 
-        let snap = buf.drain().await;
+        let snap = buf.drain();
         assert_eq!(snap.len(), 1);
         let entry = snap.get(&key).unwrap();
         assert_eq!(entry.share_diff, 200.0, "running max");
@@ -248,8 +262,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn rebuffer_merges_with_live_writes() {
+    #[test]
+    fn rebuffer_merges_with_live_writes() {
         let buf = TouchBuffer::default();
         let key = TouchKey {
             address: "addr".into(),
@@ -268,11 +282,11 @@ mod tests {
             },
         );
         // Meanwhile a new share landed.
-        buf.record(key.clone(), 50.0, Some(16.0), 1, 2000).await;
+        buf.record(&key, 50.0, Some(16.0), 1, 2000);
         // DB failed → rebuffer the snapshot.
-        buf.rebuffer(snap).await;
+        buf.rebuffer(snap);
 
-        let merged = buf.drain().await;
+        let merged = buf.drain();
         let entry = merged.get(&key).unwrap();
         assert_eq!(entry.share_diff, 100.0, "max of rebuffered+live");
         assert_eq!(
@@ -283,18 +297,18 @@ mod tests {
         assert_eq!(entry.updated_at_ms, 2000);
     }
 
-    #[tokio::test]
-    async fn drain_empties_buffer() {
+    #[test]
+    fn drain_empties_buffer() {
         let buf = TouchBuffer::default();
         let key = TouchKey {
             address: "a".into(),
             client_name: "c".into(),
             session_id: "s".into(),
         };
-        buf.record(key, 1.0, None, 1, 1).await;
-        assert_eq!(buf.len().await, 1);
-        let snap = buf.drain().await;
+        buf.record(&key, 1.0, None, 1, 1);
+        assert_eq!(buf.len(), 1);
+        let snap = buf.drain();
         assert_eq!(snap.len(), 1);
-        assert_eq!(buf.len().await, 0);
+        assert_eq!(buf.len(), 0);
     }
 }

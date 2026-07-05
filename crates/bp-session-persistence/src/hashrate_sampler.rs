@@ -27,11 +27,11 @@
 //! for `kill_dead_clients` to sweep the row.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bp_db::bulk_set_client_hashrate;
 use sqlx::PgPool;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -61,6 +61,11 @@ struct SessionSample {
 
 /// Shared sampler. The share sink records into it on every accepted
 /// share; the sample loop closes-and-writes it on every tick.
+///
+/// Locking is a plain `std::sync::Mutex`: neither `record` nor `sample`
+/// holds the lock across an `.await` (the DB write happens after `sample`
+/// has returned and released it), so an async mutex would be pure overhead
+/// on the per-share path.
 pub(crate) struct HashrateSampler {
     inner: Mutex<HashMap<TouchKey, SessionSample>>,
 }
@@ -78,19 +83,26 @@ impl HashrateSampler {
     /// Non-finite / non-positive values are ignored (defensive — the
     /// accounting sinks already clamp, but this is the hashrate path's
     /// own guard against a corrupt sample poisoning the estimate).
-    pub(crate) async fn record(&self, key: TouchKey, credited_diff: f64) {
+    ///
+    /// Takes `&key` and clones it only when a session first appears; every
+    /// later share in the window hits the `get_mut` fast path allocation-free.
+    pub(crate) fn record(&self, key: &TouchKey, credited_diff: f64) {
         if !credited_diff.is_finite() || credited_diff <= 0.0 {
             return;
         }
-        let mut guard = self.inner.lock().await;
-        guard
-            .entry(key)
-            .and_modify(|s| s.diff_accum += credited_diff)
-            .or_insert(SessionSample {
-                diff_accum: credited_diff,
-                prev_rate: None,
-                empty_windows: 0,
-            });
+        let mut guard = self.inner.lock().expect("hashrate sampler mutex poisoned");
+        if let Some(s) = guard.get_mut(key) {
+            s.diff_accum += credited_diff;
+        } else {
+            guard.insert(
+                key.clone(),
+                SessionSample {
+                    diff_accum: credited_diff,
+                    prev_rate: None,
+                    empty_windows: 0,
+                },
+            );
+        }
     }
 
     /// Close the current window for every tracked session: compute its
@@ -98,9 +110,9 @@ impl HashrateSampler {
     /// average, advance the window state, and drop sessions that have
     /// fully faded to 0. Returns the `(key, hashrate)` writes to persist.
     /// One lock-pass; no `.await` while the lock is held.
-    async fn sample(&self, window_secs: f64) -> Vec<(TouchKey, f64)> {
+    fn sample(&self, window_secs: f64) -> Vec<(TouchKey, f64)> {
         let window = window_secs.max(1.0);
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.lock().expect("hashrate sampler mutex poisoned");
         let mut writes = Vec::with_capacity(guard.len());
         guard.retain(|key, s| {
             let rate = s.diff_accum * HASH_PER_DIFFICULTY_1 / window;
@@ -126,8 +138,11 @@ impl HashrateSampler {
     }
 
     #[cfg(test)]
-    async fn len(&self) -> usize {
-        self.inner.lock().await.len()
+    fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("hashrate sampler mutex poisoned")
+            .len()
     }
 }
 
@@ -136,7 +151,7 @@ impl HashrateSampler {
 /// window overwrites them — a hashrate estimate is ephemeral, so (unlike
 /// a best-difficulty sample) there's nothing to rebuffer.
 async fn sample_and_write(sampler: &HashrateSampler, pool: &PgPool, window_secs: f64) {
-    let writes = sampler.sample(window_secs).await;
+    let writes = sampler.sample(window_secs);
     if writes.is_empty() {
         return;
     }
@@ -207,13 +222,13 @@ mod tests {
         diff * HASH_PER_DIFFICULTY_1 / window_secs
     }
 
-    #[tokio::test]
-    async fn first_window_shows_own_rate_then_moving_average() {
+    #[test]
+    fn first_window_shows_own_rate_then_moving_average() {
         let s = HashrateSampler::default();
 
         // Window 1: 600 credited diff over 60 s → its own rate (no prev).
-        s.record(key(), 600.0).await;
-        let w1 = s.sample(60.0).await;
+        s.record(&key(), 600.0);
+        let w1 = s.sample(60.0);
         let r1 = rate_for(600.0, 60.0);
         assert_eq!(w1.len(), 1);
         assert!(
@@ -223,8 +238,8 @@ mod tests {
         );
 
         // Window 2: 1200 diff → rate2, displayed = avg(rate1, rate2).
-        s.record(key(), 1200.0).await;
-        let w2 = s.sample(60.0).await;
+        s.record(&key(), 1200.0);
+        let w2 = s.sample(60.0);
         let r2 = rate_for(1200.0, 60.0);
         assert!(
             (w2[0].1 - (r1 + r2) / 2.0).abs() < 1.0,
@@ -233,8 +248,8 @@ mod tests {
         );
 
         // Window 3: 1200 diff again → avg(rate2, rate3) with rate3==rate2.
-        s.record(key(), 1200.0).await;
-        let w3 = s.sample(60.0).await;
+        s.record(&key(), 1200.0);
+        let w3 = s.sample(60.0);
         assert!(
             (w3[0].1 - r2).abs() < 1.0,
             "third window = avg(w2, w3) = r2, got {}",
@@ -242,76 +257,72 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn idle_session_fades_over_two_windows_then_drops() {
+    #[test]
+    fn idle_session_fades_over_two_windows_then_drops() {
         let s = HashrateSampler::default();
         let r1 = rate_for(600.0, 60.0);
 
-        s.record(key(), 600.0).await;
-        let _ = s.sample(60.0).await; // window 1: prev = r1
+        s.record(&key(), 600.0);
+        let _ = s.sample(60.0); // window 1: prev = r1
 
         // Window 2: no shares → displayed = (r1 + 0)/2, still tracked.
-        let w2 = s.sample(60.0).await;
+        let w2 = s.sample(60.0);
         assert!(
             (w2[0].1 - r1 / 2.0).abs() < 1.0,
             "first idle window halves, got {}",
             w2[0].1
         );
-        assert_eq!(s.len().await, 1, "still tracked after one empty window");
+        assert_eq!(s.len(), 1, "still tracked after one empty window");
 
         // Window 3: still no shares → displayed = 0, then dropped.
-        let w3 = s.sample(60.0).await;
+        let w3 = s.sample(60.0);
         assert_eq!(w3[0].1, 0.0, "second idle window zeroes");
-        assert_eq!(s.len().await, 0, "dropped after two empty windows");
+        assert_eq!(s.len(), 0, "dropped after two empty windows");
 
         // Window 4: nothing left to write.
         assert!(
-            s.sample(60.0).await.is_empty(),
+            s.sample(60.0).is_empty(),
             "no writes once the session is gone"
         );
     }
 
-    #[tokio::test]
-    async fn resumed_share_clears_the_empty_counter() {
+    #[test]
+    fn resumed_share_clears_the_empty_counter() {
         let s = HashrateSampler::default();
         let r = rate_for(600.0, 60.0);
 
-        s.record(key(), 600.0).await;
-        let _ = s.sample(60.0).await; // prev = r, empty = 0
-        let _ = s.sample(60.0).await; // idle window 1 → r/2, empty = 1
+        s.record(&key(), 600.0);
+        let _ = s.sample(60.0); // prev = r, empty = 0
+        let _ = s.sample(60.0); // idle window 1 → r/2, empty = 1
 
         // A share lands before the second idle window → counter resets,
         // session survives instead of being dropped.
-        s.record(key(), 600.0).await;
-        let w = s.sample(60.0).await;
+        s.record(&key(), 600.0);
+        let w = s.sample(60.0);
         assert!(
             (w[0].1 - r / 2.0).abs() < 1.0,
             "recovers to avg(0, r) = r/2, got {}",
             w[0].1
         );
-        assert_eq!(s.len().await, 1, "still tracked — the gap didn't drop it");
+        assert_eq!(s.len(), 1, "still tracked — the gap didn't drop it");
     }
 
-    #[tokio::test]
-    async fn ignores_nonpositive_and_nonfinite_diff() {
+    #[test]
+    fn ignores_nonpositive_and_nonfinite_diff() {
         let s = HashrateSampler::default();
-        s.record(key(), 0.0).await;
-        s.record(key(), -5.0).await;
-        s.record(key(), f64::NAN).await;
-        s.record(key(), f64::INFINITY).await;
-        assert_eq!(
-            s.len().await,
-            0,
-            "invalid diffs must not create a tracked session"
-        );
+        s.record(&key(), 0.0);
+        s.record(&key(), -5.0);
+        s.record(&key(), f64::NAN);
+        s.record(&key(), f64::INFINITY);
+        assert_eq!(s.len(), 0, "invalid diffs must not create a tracked session");
     }
 
-    #[tokio::test]
-    async fn window_seconds_scale_the_rate() {
+    #[test]
+    fn window_seconds_scale_the_rate() {
         let s = HashrateSampler::default();
         // Same accumulated diff over half the window → double the rate.
-        s.record(key(), 600.0).await;
-        let w = s.sample(30.0).await;
+        s.record(&key(), 600.0);
+        let w = s.sample(30.0);
         assert!(
             (w[0].1 - rate_for(600.0, 30.0)).abs() < 1.0,
             "rate divides by the actual window length, got {}",

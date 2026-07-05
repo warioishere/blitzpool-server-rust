@@ -145,21 +145,19 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
         // credited at = the difficulty currently assigned to the
         // session, so it keeps `currentDifficulty` fresh as vardiff
         // ratchets (for both SV1 + SV2 — this sink is protocol-blind).
-        self.buffer
-            .record(
-                key.clone(),
-                share.submission_difficulty as f32,
-                Some(share.effective_difficulty as f32),
-                share.channel_count as i32,
-                now_ms,
-            )
-            .await;
+        // The key is built once and borrowed by both sinks — neither
+        // clones it unless it's inserting a brand-new session.
+        self.buffer.record(
+            &key,
+            share.submission_difficulty as f32,
+            Some(share.effective_difficulty as f32),
+            share.channel_count as i32,
+            now_ms,
+        );
         // Live hashrate: accumulate the same credited difficulty into the
         // sampler's current window. It owns `client_entity.hashRate` and
         // writes a self-zeroing moving average — see [`HashrateSampler`].
-        self.sampler
-            .record(key, share.effective_difficulty)
-            .await;
+        self.sampler.record(&key, share.effective_difficulty);
     }
 }
 
