@@ -767,16 +767,18 @@ where
 /// share-accept hook so the row stays alive (kill_dead_clients
 /// otherwise sweeps it after a few minutes of no UPDATE), reflects
 /// the best difficulty the session has ever solved, sets `firstSeen`
-/// on the first share, exposes a recent hashrate estimate, and keeps
-/// `currentDifficulty` in step with the vardiff target the miner is
-/// currently working at.
+/// on the first share, and keeps `currentDifficulty` in step with the
+/// vardiff target the miner is currently working at.
+///
+/// `hashRate` is **not** written here — that column is owned by the live
+/// hashrate sampler (bp-session-persistence), which writes a self-zeroing
+/// 2-min moving average on its own cadence. A per-share touch of the
+/// column would fight the sampler.
 ///
 /// `share_diff` is the share-accepted difficulty (the all-time best
 /// uses GREATEST). `current_diff` is the difficulty currently assigned
 /// to the session (vardiff target) — pass `None` to leave the column
-/// unchanged. `hash_rate_est` is the caller-computed hashrate in H/s
-/// (pass `None` to leave the column unchanged). `now_ms` is wall-clock
-/// epoch-ms.
+/// unchanged. `now_ms` is wall-clock epoch-ms.
 #[allow(clippy::too_many_arguments)]
 pub async fn touch_client_for_share<'e, E>(
     executor: E,
@@ -785,7 +787,6 @@ pub async fn touch_client_for_share<'e, E>(
     session_id: &str,
     share_diff: f64,
     current_diff: Option<f64>,
-    hash_rate_est: Option<f64>,
     channel_count: i32,
     now_ms: i64,
 ) -> Result<u64, DbError>
@@ -795,10 +796,9 @@ where
     let result = sqlx::query!(
         r#"UPDATE client_entity
            SET "bestDifficulty"    = GREATEST("bestDifficulty", $4::real),
-               "currentDifficulty" = COALESCE($7::real, "currentDifficulty"),
+               "currentDifficulty" = COALESCE($6::real, "currentDifficulty"),
                "firstSeen"         = COALESCE("firstSeen", $5),
-               "hashRate"          = COALESCE($6, "hashRate"),
-               "channelCount"      = $8,
+               "channelCount"      = $7,
                "updatedAt"         = $5,
                "deletedAt"         = NULL
            WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3"#,
@@ -807,7 +807,6 @@ where
         session_id,
         share_diff as f32,
         now_ms,
-        hash_rate_est,
         current_diff.map(|d| d as f32),
         channel_count,
     )
@@ -856,11 +855,12 @@ pub async fn find_client_recent_first_seen(
 /// Bulk variant of [`touch_client_for_share`] — collapses N per-session
 /// updates into a single `UPDATE … FROM unnest(...)`. Same column
 /// semantics as the per-row form: `bestDifficulty` takes `GREATEST`,
-/// `currentDifficulty`/`hashRate` `COALESCE` (NULL preserves existing),
-/// `firstSeen` only fills when NULL, `updatedAt` overwrites, `deletedAt`
-/// clears. Caller is responsible for collapsing duplicates per
-/// `(address, clientName, sessionId)` key (a buffered flusher keeps
-/// only the latest sample per key).
+/// `currentDifficulty` `COALESCE`s (NULL preserves existing), `firstSeen`
+/// only fills when NULL, `updatedAt` overwrites, `deletedAt` clears.
+/// `hashRate` is deliberately not touched — it's owned by the live
+/// hashrate sampler ([`bulk_set_client_hashrate`]). Caller is responsible
+/// for collapsing duplicates per `(address, clientName, sessionId)` key
+/// (a buffered flusher keeps only the latest sample per key).
 #[allow(clippy::too_many_arguments)]
 pub async fn bulk_touch_clients_for_share(
     pool: &PgPool,
@@ -869,7 +869,6 @@ pub async fn bulk_touch_clients_for_share(
     session_ids: &[String],
     share_diffs: &[f32],
     current_diffs: &[Option<f32>],
-    hash_rates: &[Option<f64>],
     channel_counts: &[i32],
     updated_ats: &[i64],
 ) -> Result<u64, DbError> {
@@ -878,7 +877,6 @@ pub async fn bulk_touch_clients_for_share(
            SET "bestDifficulty"    = GREATEST(t."bestDifficulty", u.share_diff),
                "currentDifficulty" = COALESCE(u.current_diff, t."currentDifficulty"),
                "firstSeen"         = COALESCE(t."firstSeen", u.updated_at),
-               "hashRate"          = COALESCE(u.hash_rate, t."hashRate"),
                "channelCount"      = u.channel_count,
                "updatedAt"         = u.updated_at,
                "deletedAt"         = NULL
@@ -889,9 +887,8 @@ pub async fn bulk_touch_clients_for_share(
                    unnest($3::text[])     AS "sessionId",
                    unnest($4::real[])     AS share_diff,
                    unnest($5::real[])     AS current_diff,
-                   unnest($6::float8[])   AS hash_rate,
-                   unnest($7::int[])      AS channel_count,
-                   unnest($8::bigint[])   AS updated_at
+                   unnest($6::int[])      AS channel_count,
+                   unnest($7::bigint[])   AS updated_at
            ) AS u
            WHERE t.address      = u.address
              AND t."clientName" = u."clientName"
@@ -901,9 +898,49 @@ pub async fn bulk_touch_clients_for_share(
         session_ids,
         share_diffs,
         current_diffs as &[Option<f32>],
-        hash_rates as &[Option<f64>],
         channel_counts,
         updated_ats,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
+/// Overwrite `hashRate` for N sessions in one `UPDATE … FROM unnest(...)`.
+/// The live hashrate sampler owns this column: it writes a 2-sample
+/// moving average of each session's per-window share rate every ~60s,
+/// including a `0` once a session goes idle (so the reported hashrate
+/// self-zeroes instead of freezing at the last value). Only `hashRate`
+/// is written — `updatedAt` / `deletedAt` are left alone so session
+/// staleness stays owned by the share-touch path + `kill_dead_clients`.
+/// Already-soft-deleted rows are skipped. Caller collapses duplicates
+/// per `(address, clientName, sessionId)`.
+pub async fn bulk_set_client_hashrate(
+    pool: &PgPool,
+    addresses: &[String],
+    client_names: &[String],
+    session_ids: &[String],
+    hash_rates: &[f64],
+) -> Result<u64, DbError> {
+    let result = sqlx::query!(
+        r#"UPDATE client_entity AS t
+           SET "hashRate" = u.hash_rate
+           FROM (
+               SELECT
+                   unnest($1::text[])     AS address,
+                   unnest($2::text[])     AS "clientName",
+                   unnest($3::text[])     AS "sessionId",
+                   unnest($4::float8[])   AS hash_rate
+           ) AS u
+           WHERE t.address      = u.address
+             AND t."clientName" = u."clientName"
+             AND t."sessionId"  = u."sessionId"
+             AND t."deletedAt" IS NULL"#,
+        addresses,
+        client_names,
+        session_ids,
+        hash_rates,
     )
     .execute(pool)
     .await

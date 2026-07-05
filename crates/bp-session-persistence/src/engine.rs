@@ -23,6 +23,7 @@ use tracing::warn;
 use crate::address_settings_cache::InMemoryAddressSettingsCache;
 use crate::config::SessionPersistenceConfig;
 use crate::error::SessionPersistenceError;
+use crate::hashrate_sampler::{run_sample_loop, HashrateSampler};
 use crate::hooks::{
     BestDifficultySink, ClientDifficultyStatisticsSink, ClientRowTouchSink, SessionPersistenceHook,
 };
@@ -33,6 +34,7 @@ pub struct SessionPersistenceEngine {
     cache: Arc<InMemoryAddressSettingsCache>,
     config: SessionPersistenceConfig,
     touch_buffer: Arc<TouchBuffer>,
+    hashrate_sampler: Arc<HashrateSampler>,
 }
 
 impl SessionPersistenceEngine {
@@ -51,6 +53,7 @@ impl SessionPersistenceEngine {
             )),
             config,
             touch_buffer: Arc::new(TouchBuffer::default()),
+            hashrate_sampler: Arc::new(HashrateSampler::default()),
         })
     }
 
@@ -71,24 +74,39 @@ impl SessionPersistenceEngine {
             pool: self.pool,
             cache: self.cache,
             touch_buffer: self.touch_buffer,
+            hashrate_sampler: self.hashrate_sampler,
             shutdown: Arc::new(std::sync::Mutex::new(ShutdownState::default())),
         }
     }
 
     fn spawn_internal(self) -> SessionPersistenceEngineHandle {
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let buffer = self.touch_buffer.clone();
-        let pool = self.pool.clone();
-        let interval = self.config.touch_flush_interval;
-        let join = tokio::spawn(run_flush_loop(buffer, pool, interval, shutdown_rx));
+        // Two background loops: the 30s touch-buffer flush and the 60s
+        // live-hashrate sampler. Each gets its own shutdown channel; the
+        // handle joins both on `shutdown()`.
+        let (touch_tx, touch_rx) = oneshot::channel();
+        let touch_join = tokio::spawn(run_flush_loop(
+            self.touch_buffer.clone(),
+            self.pool.clone(),
+            self.config.touch_flush_interval,
+            touch_rx,
+        ));
+
+        let (sampler_tx, sampler_rx) = oneshot::channel();
+        let sampler_join = tokio::spawn(run_sample_loop(
+            self.hashrate_sampler.clone(),
+            self.pool.clone(),
+            self.config.hashrate_sample_interval,
+            sampler_rx,
+        ));
 
         SessionPersistenceEngineHandle {
             pool: self.pool,
             cache: self.cache,
             touch_buffer: self.touch_buffer,
+            hashrate_sampler: self.hashrate_sampler,
             shutdown: Arc::new(std::sync::Mutex::new(ShutdownState {
-                tx: Some(shutdown_tx),
-                join: Some(join),
+                txs: vec![touch_tx, sampler_tx],
+                joins: vec![touch_join, sampler_join],
             })),
         }
     }
@@ -97,11 +115,12 @@ impl SessionPersistenceEngine {
 /// Shutdown plumbing held behind a `Mutex` so the handle can stay
 /// `Clone` (the SV1 and SV2 servers each clone the handle into their
 /// hook wiring at startup). Only the first `shutdown()` actually
-/// signals + joins; subsequent calls are no-ops.
+/// signals + joins; subsequent calls are no-ops. Holds one entry per
+/// background loop (touch flush + hashrate sampler).
 #[derive(Default)]
 struct ShutdownState {
-    tx: Option<oneshot::Sender<()>>,
-    join: Option<JoinHandle<()>>,
+    txs: Vec<oneshot::Sender<()>>,
+    joins: Vec<JoinHandle<()>>,
 }
 
 /// Shared handle. `bin/blitzpool` clones it into the SV1 / SV2 server
@@ -112,6 +131,7 @@ pub struct SessionPersistenceEngineHandle {
     pool: PgPool,
     cache: Arc<InMemoryAddressSettingsCache>,
     touch_buffer: Arc<TouchBuffer>,
+    hashrate_sampler: Arc<HashrateSampler>,
     shutdown: Arc<std::sync::Mutex<ShutdownState>>,
 }
 
@@ -134,7 +154,7 @@ impl SessionPersistenceEngineHandle {
     /// `touch_flush_interval` (default 30s) by the engine's background
     /// task.
     pub fn client_row_touch_sink(&self) -> ClientRowTouchSink {
-        ClientRowTouchSink::new(self.touch_buffer.clone())
+        ClientRowTouchSink::new(self.touch_buffer.clone(), self.hashrate_sampler.clone())
     }
 
     /// Hook impl that records the per-`(address, worker, hour-slot)` max
@@ -152,19 +172,24 @@ impl SessionPersistenceEngineHandle {
     /// task. Idempotent across handle clones — only the first call
     /// actually signals; subsequent calls are no-ops.
     pub async fn shutdown(&self) {
-        let (tx, join) = {
+        let (txs, joins) = {
             let mut guard = match self.shutdown.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            (guard.tx.take(), guard.join.take())
+            (
+                std::mem::take(&mut guard.txs),
+                std::mem::take(&mut guard.joins),
+            )
         };
-        if let Some(tx) = tx {
+        // Signal all loops first, then await each — so they drain
+        // concurrently rather than serially.
+        for tx in txs {
             let _ = tx.send(());
         }
-        if let Some(join) = join {
+        for join in joins {
             if let Err(e) = join.await {
-                warn!(error = %e, "session-persistence touch flush task panicked");
+                warn!(error = %e, "session-persistence background task panicked");
             }
         }
     }

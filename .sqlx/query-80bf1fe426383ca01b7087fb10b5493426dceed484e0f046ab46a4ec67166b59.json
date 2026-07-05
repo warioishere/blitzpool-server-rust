@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE client_entity\n           SET \"bestDifficulty\"    = GREATEST(\"bestDifficulty\", $4::real),\n               \"currentDifficulty\" = COALESCE($6::real, \"currentDifficulty\"),\n               \"firstSeen\"         = COALESCE(\"firstSeen\", $5),\n               \"channelCount\"      = $7,\n               \"updatedAt\"         = $5,\n               \"deletedAt\"         = NULL\n           WHERE address = $1 AND \"clientName\" = $2 AND \"sessionId\" = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Float4",
+        "Int8",
+        "Float4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "80bf1fe426383ca01b7087fb10b5493426dceed484e0f046ab46a4ec67166b59"
+}

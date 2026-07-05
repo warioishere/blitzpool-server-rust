@@ -81,7 +81,7 @@ pub use blockparty::{
     BlockpartyInvitationRow, BlockpartyMemberRow, BlockpartySplitSnapshot,
 };
 pub use client::{
-    bulk_touch_clients_for_share, delete_client_for_session,
+    bulk_set_client_hashrate, bulk_touch_clients_for_share, delete_client_for_session,
     delete_old_client_difficulty_statistics, delete_old_client_rejected_statistics,
     delete_old_client_statistics, delete_old_clients, delete_old_pool_mode_hashrate, find_client,
     find_client_difficulty_statistics, find_client_recent_first_seen,

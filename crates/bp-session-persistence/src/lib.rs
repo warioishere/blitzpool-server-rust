@@ -27,6 +27,7 @@ pub mod client_row;
 pub mod config;
 pub mod engine;
 pub mod error;
+mod hashrate_sampler;
 pub mod hooks;
 mod touch_buffer;
 

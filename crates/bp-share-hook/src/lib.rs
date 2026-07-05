@@ -104,10 +104,12 @@ pub struct SharedAcceptedShare<'a> {
 
     /// Session-wide hashrate snapshot taken right after the vardiff
     /// engine consumed this share — H/s computed from the per-slot
-    /// share-difficulty sum over the elapsed window. Persisted onto
-    /// `client_entity.hashRate` by the ClientRowTouchSink so
-    /// /api/info totalHashRate + /api/client/:address totalHashrate
-    /// render the actual hashrate the miner is contributing.
+    /// share-difficulty sum over the elapsed window. Carried on the share
+    /// record for downstream observers; note the persisted
+    /// `client_entity.hashRate` is **not** this value — that column is
+    /// owned by the session-persistence hashrate sampler, which computes a
+    /// self-zeroing 2-min moving average from accumulated credited
+    /// difficulty rather than a single per-share snapshot.
     pub hash_rate: f64,
 
     /// Number of mining channels open on this session's downstream

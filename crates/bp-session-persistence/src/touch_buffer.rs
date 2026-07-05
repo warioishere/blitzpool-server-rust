@@ -3,15 +3,20 @@
 //! Buffered share-touch flusher.
 //!
 //! On the share hot path we collect per-session updates (best-diff sample,
-//! current vardiff target, hashrate estimate, `updatedAt`) in a shared
+//! current vardiff target, channel count, `updatedAt`) in a shared
 //! [`TouchBuffer`] and flush them every [`flush_interval`](super::config)
 //! via a single bulk `UPDATE ... FROM unnest(...)` statement, instead of
 //! N synchronous DB hits per second on a busy pool.
 //!
 //! Buffer collapses duplicates per `(address, clientName, sessionId)` —
-//! the latest sample wins for `currentDifficulty`/`hashRate`/`updatedAt`,
+//! the latest sample wins for `currentDifficulty`/`channelCount`/`updatedAt`,
 //! the maximum wins for `bestDifficulty`. On flush failure, the snapshot
 //! is folded back into the live buffer for retry on the next tick.
+//!
+//! `hashRate` is **not** handled here — it's owned by the
+//! [`crate::hashrate_sampler`], which writes a self-zeroing 2-min moving
+//! average on its own cadence. Writing it from both paths would let the
+//! 30s touch flush clobber the sampler's value every other tick.
 
 use std::collections::HashMap;
 
@@ -37,7 +42,6 @@ pub(crate) struct TouchKey {
 pub(crate) struct TouchEntry {
     pub share_diff: f32,
     pub current_diff: Option<f32>,
-    pub hash_rate: Option<f64>,
     pub channel_count: i32,
     pub updated_at_ms: i64,
 }
@@ -66,7 +70,6 @@ impl TouchBuffer {
         key: TouchKey,
         share_diff: f32,
         current_diff: Option<f32>,
-        hash_rate: Option<f64>,
         channel_count: i32,
         updated_at_ms: i64,
     ) {
@@ -80,9 +83,6 @@ impl TouchBuffer {
                 if current_diff.is_some() {
                     e.current_diff = current_diff;
                 }
-                if hash_rate.is_some() {
-                    e.hash_rate = hash_rate;
-                }
                 // Latest sample wins: a rejoin/leave changes the channel
                 // count, the freshest share reflects the current bundle size.
                 e.channel_count = channel_count;
@@ -93,7 +93,6 @@ impl TouchBuffer {
             .or_insert(TouchEntry {
                 share_diff,
                 current_diff,
-                hash_rate,
                 channel_count,
                 updated_at_ms,
             });
@@ -123,9 +122,6 @@ impl TouchBuffer {
                     }
                     if e.current_diff.is_none() {
                         e.current_diff = v.current_diff;
-                    }
-                    if e.hash_rate.is_none() {
-                        e.hash_rate = v.hash_rate;
                     }
                     if v.updated_at_ms > e.updated_at_ms {
                         e.updated_at_ms = v.updated_at_ms;
@@ -157,7 +153,6 @@ async fn flush_once(buffer: &TouchBuffer, pool: &PgPool) -> u64 {
     let mut session_ids = Vec::with_capacity(n);
     let mut share_diffs = Vec::with_capacity(n);
     let mut current_diffs = Vec::with_capacity(n);
-    let mut hash_rates = Vec::with_capacity(n);
     let mut channel_counts = Vec::with_capacity(n);
     let mut updated_ats = Vec::with_capacity(n);
 
@@ -167,7 +162,6 @@ async fn flush_once(buffer: &TouchBuffer, pool: &PgPool) -> u64 {
         session_ids.push(k.session_id.clone());
         share_diffs.push(v.share_diff);
         current_diffs.push(v.current_diff);
-        hash_rates.push(v.hash_rate);
         channel_counts.push(v.channel_count);
         updated_ats.push(v.updated_at_ms);
     }
@@ -179,7 +173,6 @@ async fn flush_once(buffer: &TouchBuffer, pool: &PgPool) -> u64 {
         &session_ids,
         &share_diffs,
         &current_diffs,
-        &hash_rates,
         &channel_counts,
         &updated_ats,
     )
@@ -239,18 +232,15 @@ mod tests {
             client_name: "wkr".into(),
             session_id: "sess".into(),
         };
-        buf.record(key.clone(), 100.0, Some(8.0), Some(1.0e9), 1, 1000)
-            .await;
-        buf.record(key.clone(), 50.0, Some(16.0), None, 1, 2000).await;
-        buf.record(key.clone(), 200.0, None, Some(2.0e9), 3, 1500)
-            .await;
+        buf.record(key.clone(), 100.0, Some(8.0), 1, 1000).await;
+        buf.record(key.clone(), 50.0, Some(16.0), 1, 2000).await;
+        buf.record(key.clone(), 200.0, None, 3, 1500).await;
 
         let snap = buf.drain().await;
         assert_eq!(snap.len(), 1);
         let entry = snap.get(&key).unwrap();
         assert_eq!(entry.share_diff, 200.0, "running max");
         assert_eq!(entry.current_diff, Some(16.0), "latest non-None");
-        assert_eq!(entry.hash_rate, Some(2.0e9), "latest non-None");
         assert_eq!(entry.channel_count, 3, "latest sample wins");
         assert_eq!(
             entry.updated_at_ms, 2000,
@@ -273,14 +263,12 @@ mod tests {
             TouchEntry {
                 share_diff: 100.0,
                 current_diff: Some(8.0),
-                hash_rate: Some(1.0e9),
                 channel_count: 1,
                 updated_at_ms: 1000,
             },
         );
         // Meanwhile a new share landed.
-        buf.record(key.clone(), 50.0, Some(16.0), None, 1, 2000)
-            .await;
+        buf.record(key.clone(), 50.0, Some(16.0), 1, 2000).await;
         // DB failed → rebuffer the snapshot.
         buf.rebuffer(snap).await;
 
@@ -291,11 +279,6 @@ mod tests {
             entry.current_diff,
             Some(16.0),
             "live write keeps its value (rebuffer doesn't clobber non-None with older value)"
-        );
-        assert_eq!(
-            entry.hash_rate,
-            Some(1.0e9),
-            "rebuffer fills None from live"
         );
         assert_eq!(entry.updated_at_ms, 2000);
     }
@@ -308,7 +291,7 @@ mod tests {
             client_name: "c".into(),
             session_id: "s".into(),
         };
-        buf.record(key, 1.0, None, None, 1, 1).await;
+        buf.record(key, 1.0, None, 1, 1).await;
         assert_eq!(buf.len().await, 1);
         let snap = buf.drain().await;
         assert_eq!(snap.len(), 1);

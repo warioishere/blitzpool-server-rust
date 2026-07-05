@@ -10,10 +10,10 @@
 
 use bp_common::AddressId;
 use bp_db::{
-    bulk_touch_clients_for_share, delete_client_for_session, find_addresses_for_ntfy_listener,
-    find_client_recent_first_seen, kill_dead_clients, touch_client_for_share,
-    update_sv2_user_agent_by_address, upsert_address_best_difficulty, upsert_client,
-    upsert_ntfy_subscription, ClientUpsert,
+    bulk_set_client_hashrate, bulk_touch_clients_for_share, delete_client_for_session,
+    find_addresses_for_ntfy_listener, find_client_recent_first_seen, kill_dead_clients,
+    touch_client_for_share, update_sv2_user_agent_by_address, upsert_address_best_difficulty,
+    upsert_client, upsert_ntfy_subscription, ClientUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
@@ -275,7 +275,6 @@ async fn touch_client_for_share_updates_current_difficulty() {
         "sessD003",
         65_536.0,       // share_diff → bestDifficulty (GREATEST)
         Some(32_768.0), // current_diff → currentDifficulty
-        Some(1.0e12),   // hash_rate
         3,              // channel_count → channelCount (bundled rig)
         1_700_000_100_000,
     )
@@ -310,7 +309,6 @@ async fn touch_client_for_share_updates_current_difficulty() {
         "wkr",
         "sessD003",
         70_000.0,
-        None,
         None,
         1,
         1_700_000_200_000,
@@ -695,13 +693,12 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
         .expect("seed client");
     }
 
-    // Bulk touch with mixed Some/None for current_diff and hash_rate.
+    // Bulk touch with mixed Some/None for current_diff.
     let addresses = vec!["test_bulktouch_addr".to_string(); 2];
     let client_names = vec!["wkr".to_string(); 2];
     let session_ids: Vec<String> = SESSIONS.iter().map(|s| s.to_string()).collect();
     let share_diffs = vec![65_536.0_f32, 1_024.0_f32];
     let current_diffs = vec![Some(32_768.0_f32), None];
-    let hash_rates = vec![Some(1.0e12_f64), None];
     let channel_counts = vec![3_i32, 1_i32];
     let updated_ats = vec![1_700_000_000_000_i64, 1_700_000_100_000_i64];
 
@@ -712,7 +709,6 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
         &session_ids,
         &share_diffs,
         &current_diffs,
-        &hash_rates,
         &channel_counts,
         &updated_ats,
     )
@@ -722,7 +718,7 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
 
     // Row 1: Some values were applied.
     let row1 = sqlx::query(
-        r#"SELECT "currentDifficulty", "bestDifficulty", "hashRate", "channelCount", "updatedAt"
+        r#"SELECT "currentDifficulty", "bestDifficulty", "channelCount", "updatedAt"
            FROM client_entity WHERE "sessionId" = $1"#,
     )
     .bind("tBTs1")
@@ -731,7 +727,6 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
     .expect("read1");
     let cd1: Option<f32> = row1.get("currentDifficulty");
     let bd1: Option<f32> = row1.get("bestDifficulty");
-    let hr1: Option<f64> = row1.get("hashRate");
     let cc1: i32 = row1.get("channelCount");
     let ua1: i64 = row1.get("updatedAt");
     assert!(
@@ -739,14 +734,13 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
         "row1 currentDifficulty = Some(32768), got {cd1:?}"
     );
     assert!(bd1.is_some() && (bd1.unwrap() - 65_536.0).abs() < 0.01);
-    assert!(hr1.is_some() && (hr1.unwrap() - 1.0e12).abs() < 1.0);
     assert_eq!(cc1, 3, "row1 channelCount = 3 (bundled rig)");
     assert_eq!(ua1, 1_700_000_000_000);
 
     // Row 2: None values preserved the seeded zero defaults; bestDiff
     // still bumped via GREATEST.
     let row2 = sqlx::query(
-        r#"SELECT "currentDifficulty", "bestDifficulty", "hashRate", "channelCount", "updatedAt"
+        r#"SELECT "currentDifficulty", "bestDifficulty", "channelCount", "updatedAt"
            FROM client_entity WHERE "sessionId" = $1"#,
     )
     .bind("tBTs2")
@@ -755,7 +749,6 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
     .expect("read2");
     let cd2: Option<f32> = row2.get("currentDifficulty");
     let bd2: Option<f32> = row2.get("bestDifficulty");
-    let hr2: Option<f64> = row2.get("hashRate");
     let cc2: i32 = row2.get("channelCount");
     let ua2: i64 = row2.get("updatedAt");
     assert_eq!(cc2, 1, "row2 channelCount = 1 (single channel)");
@@ -765,15 +758,127 @@ async fn bulk_touch_clients_for_share_collapses_updates() {
         "row2 currentDifficulty preserved (None or 0), got {cd2:?}"
     );
     assert!(bd2.is_some() && (bd2.unwrap() - 1_024.0).abs() < 0.01);
-    // hashRate seeded was 0 — COALESCE(NULL, t.col) keeps 0.
-    assert!(
-        hr2.is_none() || hr2.unwrap_or(0.0) == 0.0,
-        "row2 hashRate preserved, got {hr2:?}"
-    );
     assert_eq!(ua2, 1_700_000_100_000);
 
     // Cleanup.
     for sid in SESSIONS {
+        sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
+            .bind(sid)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+}
+
+// ── bulk_set_client_hashrate ──────────────────────────────────────
+
+#[tokio::test]
+async fn bulk_set_client_hashrate_overwrites_and_skips_deleted() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+
+    const ACTIVE: &str = "tHRact";
+    const DELETED: &str = "tHRdel";
+    for sid in [ACTIVE, DELETED] {
+        let _ = sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
+            .bind(sid)
+            .execute(&pool)
+            .await;
+    }
+
+    // Seed two sessions, both with a stale non-zero hashRate.
+    for sid in [ACTIVE, DELETED] {
+        upsert_client(
+            &pool,
+            &ClientUpsert {
+                address: "test_hr_addr".to_string(),
+                client_name: "wkr".to_string(),
+                session_id: sid.to_string(),
+                user_agent: Some("bitaxe/test".to_string()),
+                start_time_ms: 1,
+                current_difficulty: None,
+            },
+        )
+        .await
+        .expect("seed client");
+        sqlx::query(r#"UPDATE client_entity SET "hashRate" = 5.0e11 WHERE "sessionId" = $1"#)
+            .bind(sid)
+            .execute(&pool)
+            .await
+            .expect("seed hashRate");
+    }
+    // Soft-delete one of them — the sampler must not resurrect its value.
+    sqlx::query(
+        r#"UPDATE client_entity SET "deletedAt" = 1 WHERE "sessionId" = $1"#,
+    )
+    .bind(DELETED)
+    .execute(&pool)
+    .await
+    .expect("soft-delete");
+
+    // One live write (a fresh estimate) + one 0 (a faded/idle session).
+    let addresses = vec!["test_hr_addr".to_string(); 2];
+    let client_names = vec!["wkr".to_string(); 2];
+    let session_ids = vec![ACTIVE.to_string(), DELETED.to_string()];
+    let hash_rates = vec![9.0e12_f64, 0.0_f64];
+
+    let affected = bulk_set_client_hashrate(
+        &pool,
+        &addresses,
+        &client_names,
+        &session_ids,
+        &hash_rates,
+    )
+    .await
+    .expect("bulk set hashrate");
+    assert_eq!(affected, 1, "only the non-deleted row must update");
+
+    let active_hr: f64 = sqlx::query_scalar(
+        r#"SELECT "hashRate" FROM client_entity WHERE "sessionId" = $1"#,
+    )
+    .bind(ACTIVE)
+    .fetch_one(&pool)
+    .await
+    .expect("read active");
+    assert!(
+        (active_hr - 9.0e12).abs() < 1.0,
+        "active row overwritten with the new estimate, got {active_hr}"
+    );
+
+    // The soft-deleted row keeps its stale value — the guard skipped it.
+    let deleted_hr: f64 = sqlx::query_scalar(
+        r#"SELECT "hashRate" FROM client_entity WHERE "sessionId" = $1"#,
+    )
+    .bind(DELETED)
+    .fetch_one(&pool)
+    .await
+    .expect("read deleted");
+    assert!(
+        (deleted_hr - 5.0e11).abs() < 1.0,
+        "soft-deleted row untouched (excluded from active SUM anyway), got {deleted_hr}"
+    );
+
+    // A follow-up 0 write self-zeroes the active row.
+    bulk_set_client_hashrate(
+        &pool,
+        &["test_hr_addr".to_string()],
+        &["wkr".to_string()],
+        &[ACTIVE.to_string()],
+        &[0.0],
+    )
+    .await
+    .expect("zero write");
+    let zeroed: f64 = sqlx::query_scalar(
+        r#"SELECT "hashRate" FROM client_entity WHERE "sessionId" = $1"#,
+    )
+    .bind(ACTIVE)
+    .fetch_one(&pool)
+    .await
+    .expect("read zeroed");
+    assert_eq!(zeroed, 0.0, "idle session self-zeroes");
+
+    for sid in [ACTIVE, DELETED] {
         sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
             .bind(sid)
             .execute(&pool)

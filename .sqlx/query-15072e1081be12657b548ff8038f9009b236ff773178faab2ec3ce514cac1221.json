@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE client_entity AS t\n           SET \"bestDifficulty\"    = GREATEST(t.\"bestDifficulty\", u.share_diff),\n               \"currentDifficulty\" = COALESCE(u.current_diff, t.\"currentDifficulty\"),\n               \"firstSeen\"         = COALESCE(t.\"firstSeen\", u.updated_at),\n               \"channelCount\"      = u.channel_count,\n               \"updatedAt\"         = u.updated_at,\n               \"deletedAt\"         = NULL\n           FROM (\n               SELECT\n                   unnest($1::text[])     AS address,\n                   unnest($2::text[])     AS \"clientName\",\n                   unnest($3::text[])     AS \"sessionId\",\n                   unnest($4::real[])     AS share_diff,\n                   unnest($5::real[])     AS current_diff,\n                   unnest($6::int[])      AS channel_count,\n                   unnest($7::bigint[])   AS updated_at\n           ) AS u\n           WHERE t.address      = u.address\n             AND t.\"clientName\" = u.\"clientName\"\n             AND t.\"sessionId\"  = u.\"sessionId\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Float4Array",
+        "Float4Array",
+        "Int4Array",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "15072e1081be12657b548ff8038f9009b236ff773178faab2ec3ce514cac1221"
+}

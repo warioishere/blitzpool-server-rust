@@ -38,6 +38,7 @@ use tracing::warn;
 
 use crate::address_settings_cache::{AddressSettingsCache, CachedAddressSettings};
 use crate::client_row::{deregister_client, register_client};
+use crate::hashrate_sampler::HashrateSampler;
 use crate::touch_buffer::{TouchBuffer, TouchKey};
 
 /// `SharedSessionPersistence` impl that persists the `client_entity`
@@ -91,24 +92,30 @@ impl SharedSessionPersistence for SessionPersistenceHook {
 /// `client_entity` row on every accepted share — `updatedAt` (so
 /// `kill_dead_clients` doesn't sweep), `firstSeen` (COALESCE safety
 /// net in case the register INSERT raced), `bestDifficulty` (GREATEST),
-/// `currentDifficulty` (latest vardiff target), and `hashRate` (latest
-/// non-zero sample). Without this, the `/api/info/workers`, `/api/info`,
-/// and `/api/client/:address` endpoints all return zero for active
-/// sessions.
+/// `currentDifficulty` (latest vardiff target), and `channelCount`.
+/// Without this, the `/api/info/workers`, `/api/info`, and
+/// `/api/client/:address` endpoints all return zero for active sessions.
 ///
 /// Buffered: writes land in a shared [`TouchBuffer`] keyed by
 /// `(address, clientName, sessionId)` and are flushed every 30s by the
 /// engine's background task in one bulk UPDATE statement. At ~250
 /// shares/s on a busy pool this collapses ~250 individual DB UPDATEs/s
 /// to ≈ N_active_sessions per 30 s.
+///
+/// The same share also feeds the [`HashrateSampler`], which owns the
+/// `hashRate` column: it accumulates the share's credited difficulty and
+/// writes a self-zeroing 2-min moving average on its own 60 s cadence.
+/// The touch buffer above deliberately does not write `hashRate` — two
+/// writers on one column would fight.
 #[derive(Clone)]
 pub struct ClientRowTouchSink {
     buffer: Arc<TouchBuffer>,
+    sampler: Arc<HashrateSampler>,
 }
 
 impl ClientRowTouchSink {
-    pub(crate) fn new(buffer: Arc<TouchBuffer>) -> Self {
-        Self { buffer }
+    pub(crate) fn new(buffer: Arc<TouchBuffer>, sampler: Arc<HashrateSampler>) -> Self {
+        Self { buffer, sampler }
     }
 }
 
@@ -129,14 +136,6 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
         } else {
             share.worker
         };
-        // Skip writing hashRate when the vardiff engine hasn't
-        // produced a non-zero sample yet (very first shares of a
-        // session); `None` means COALESCE keeps the existing value.
-        let hash_rate = if share.hash_rate > 0.0 {
-            Some(share.hash_rate)
-        } else {
-            None
-        };
         let key = TouchKey {
             address: share.address.to_string(),
             client_name: worker.to_string(),
@@ -148,13 +147,18 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
         // ratchets (for both SV1 + SV2 — this sink is protocol-blind).
         self.buffer
             .record(
-                key,
+                key.clone(),
                 share.submission_difficulty as f32,
                 Some(share.effective_difficulty as f32),
-                hash_rate,
                 share.channel_count as i32,
                 now_ms,
             )
+            .await;
+        // Live hashrate: accumulate the same credited difficulty into the
+        // sampler's current window. It owns `client_entity.hashRate` and
+        // writes a self-zeroing moving average — see [`HashrateSampler`].
+        self.sampler
+            .record(key, share.effective_difficulty)
             .await;
     }
 }

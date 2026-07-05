@@ -17,6 +17,12 @@ pub struct SessionPersistenceConfig {
     /// Flush interval for the buffered `client_entity` touch updates.
     /// Default 30 s.
     pub touch_flush_interval: Duration,
+    /// Sampling window for the live per-session hashrate. Each tick closes
+    /// a window and writes a 2-sample moving average of the per-window
+    /// share rate to `client_entity.hashRate`. Default 60 s — long enough
+    /// that vardiff's ~10–15 shares/min keep a window well-populated (30 s
+    /// is too few shares → noisy), short enough to stay "live".
+    pub hashrate_sample_interval: Duration,
 }
 
 impl Default for SessionPersistenceConfig {
@@ -24,6 +30,7 @@ impl Default for SessionPersistenceConfig {
         Self {
             address_cache_capacity: 50_000,
             touch_flush_interval: Duration::from_secs(30),
+            hashrate_sample_interval: Duration::from_secs(60),
         }
     }
 }
@@ -38,6 +45,11 @@ impl SessionPersistenceConfig {
         if self.touch_flush_interval.is_zero() {
             return Err(SessionPersistenceError::Config(
                 "touch_flush_interval must be > 0".to_string(),
+            ));
+        }
+        if self.hashrate_sample_interval.is_zero() {
+            return Err(SessionPersistenceError::Config(
+                "hashrate_sample_interval must be > 0".to_string(),
             ));
         }
         Ok(())
@@ -66,6 +78,15 @@ mod tests {
     fn zero_flush_interval_rejected() {
         let cfg = SessionPersistenceConfig {
             touch_flush_interval: Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zero_hashrate_sample_interval_rejected() {
+        let cfg = SessionPersistenceConfig {
+            hashrate_sample_interval: Duration::ZERO,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
