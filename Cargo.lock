@@ -910,6 +910,7 @@ dependencies = [
  "bp-db",
  "bp-share",
  "bp-share-hook",
+ "hashbrown 0.15.5",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",

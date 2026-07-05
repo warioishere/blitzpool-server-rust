@@ -18,10 +18,10 @@
 //! average on its own cadence. Writing it from both paths would let the
 //! 30s touch flush clobber the sampler's value every other tick.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 
 use bp_db::bulk_touch_clients_for_share;
+use hashbrown::{Equivalent, HashMap};
 use sqlx::PgPool;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
@@ -34,6 +34,53 @@ pub(crate) struct TouchKey {
     pub address: String,
     pub client_name: String,
     pub session_id: String,
+}
+
+/// Borrowed view of a [`TouchKey`] for allocation-free map lookups. The
+/// share hot path builds one of these (three `&str`, no heap) and passes
+/// it to both the touch buffer and the hashrate sampler; an owned
+/// `TouchKey` is materialised only when a session is first inserted.
+///
+/// Relies on `hashbrown`'s [`Equivalent`] lookup (std's `Borrow`-based
+/// lookup can't express a borrowed composite key without allocating).
+#[derive(Clone, Copy)]
+pub(crate) struct TouchKeyRef<'a> {
+    pub address: &'a str,
+    pub client_name: &'a str,
+    pub session_id: &'a str,
+}
+
+impl TouchKeyRef<'_> {
+    /// Materialise the owned key — called only on the cold insert path.
+    pub(crate) fn to_key(self) -> TouchKey {
+        TouchKey {
+            address: self.address.to_string(),
+            client_name: self.client_name.to_string(),
+            session_id: self.session_id.to_string(),
+        }
+    }
+}
+
+// `Hash` must feed the hasher the same bytes as `TouchKey`'s derived
+// `Hash` so a `TouchKeyRef` lookup lands on a `TouchKey`-inserted entry:
+// derive(Hash) on the struct hashes address, client_name, session_id in
+// declaration order, and `str`/`String` hash identically — so we hash the
+// same three in the same order. The `hashbrown_lookup_matches_owned_key`
+// test pins this invariant.
+impl std::hash::Hash for TouchKeyRef<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.address.hash(state);
+        self.client_name.hash(state);
+        self.session_id.hash(state);
+    }
+}
+
+impl Equivalent<TouchKey> for TouchKeyRef<'_> {
+    fn equivalent(&self, key: &TouchKey) -> bool {
+        self.address == key.address.as_str()
+            && self.client_name == key.client_name.as_str()
+            && self.session_id == key.session_id.as_str()
+    }
 }
 
 /// One coalesced sample for a `TouchKey`. `share_diff` is the running
@@ -71,19 +118,19 @@ impl TouchBuffer {
     /// the optionals overwrite only when `Some`, `updated_at_ms` takes
     /// the max (out-of-order shares mustn't roll the timestamp back).
     ///
-    /// Takes `&key` and clones it only on a first insert: after a session's
-    /// first share in a flush window, every subsequent share hits the
-    /// `get_mut` fast path with zero allocation.
+    /// Takes a borrowed [`TouchKeyRef`] and allocates an owned key only on
+    /// the first insert: after a session's first share in a flush window,
+    /// every subsequent share is a zero-allocation `get_mut` lookup.
     pub(crate) fn record(
         &self,
-        key: &TouchKey,
+        key: TouchKeyRef<'_>,
         share_diff: f32,
         current_diff: Option<f32>,
         channel_count: i32,
         updated_at_ms: i64,
     ) {
         let mut guard = self.inner.lock().expect("touch buffer mutex poisoned");
-        if let Some(e) = guard.get_mut(key) {
+        if let Some(e) = guard.get_mut(&key) {
             if share_diff > e.share_diff {
                 e.share_diff = share_diff;
             }
@@ -98,7 +145,7 @@ impl TouchBuffer {
             }
         } else {
             guard.insert(
-                key.clone(),
+                key.to_key(),
                 TouchEntry {
                     share_diff,
                     current_diff,
@@ -238,6 +285,15 @@ pub(crate) async fn run_flush_loop(
 mod tests {
     use super::*;
 
+    /// Borrow an owned key as the ref the record path takes.
+    fn kref(k: &TouchKey) -> TouchKeyRef<'_> {
+        TouchKeyRef {
+            address: &k.address,
+            client_name: &k.client_name,
+            session_id: &k.session_id,
+        }
+    }
+
     #[test]
     fn record_merges_running_max_and_latest() {
         let buf = TouchBuffer::default();
@@ -246,9 +302,9 @@ mod tests {
             client_name: "wkr".into(),
             session_id: "sess".into(),
         };
-        buf.record(&key, 100.0, Some(8.0), 1, 1000);
-        buf.record(&key, 50.0, Some(16.0), 1, 2000);
-        buf.record(&key, 200.0, None, 3, 1500);
+        buf.record(kref(&key), 100.0, Some(8.0), 1, 1000);
+        buf.record(kref(&key), 50.0, Some(16.0), 1, 2000);
+        buf.record(kref(&key), 200.0, None, 3, 1500);
 
         let snap = buf.drain();
         assert_eq!(snap.len(), 1);
@@ -282,7 +338,7 @@ mod tests {
             },
         );
         // Meanwhile a new share landed.
-        buf.record(&key, 50.0, Some(16.0), 1, 2000);
+        buf.record(kref(&key), 50.0, Some(16.0), 1, 2000);
         // DB failed → rebuffer the snapshot.
         buf.rebuffer(snap);
 
@@ -305,10 +361,42 @@ mod tests {
             client_name: "c".into(),
             session_id: "s".into(),
         };
-        buf.record(&key, 1.0, None, 1, 1);
+        buf.record(kref(&key), 1.0, None, 1, 1);
         assert_eq!(buf.len(), 1);
         let snap = buf.drain();
         assert_eq!(snap.len(), 1);
         assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn hashbrown_lookup_matches_owned_key() {
+        let buf = TouchBuffer::default();
+        let r = |sid| TouchKeyRef {
+            address: "bc1qxyz",
+            client_name: "rig1",
+            session_id: sid,
+        };
+        // Two shares, same identity: the second must find the entry the
+        // first inserted (borrowed-ref lookup lands on the owned key) and
+        // coalesce, not duplicate.
+        buf.record(r("abc123"), 42.0, Some(8.0), 1, 1000);
+        buf.record(r("abc123"), 99.0, None, 1, 2000);
+        assert_eq!(buf.len(), 1, "same identity must coalesce, not duplicate");
+        // A different session_id must be a distinct entry (no false hit).
+        buf.record(r("zzz999"), 1.0, None, 1, 3000);
+        assert_eq!(buf.len(), 2, "distinct identity is a separate entry");
+
+        // The coalesced entry is retrievable by the equivalent OWNED key —
+        // proves TouchKeyRef and TouchKey hash + compare identically.
+        let snap = buf.drain();
+        let owned = TouchKey {
+            address: "bc1qxyz".into(),
+            client_name: "rig1".into(),
+            session_id: "abc123".into(),
+        };
+        let e = snap
+            .get(&owned)
+            .expect("owned-key lookup finds the ref-inserted entry");
+        assert_eq!(e.share_diff, 99.0, "running max across both records");
     }
 }

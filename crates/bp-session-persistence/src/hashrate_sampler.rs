@@ -26,16 +26,16 @@
 //! the reported hashrate self-zeroing and reconnect-immune without waiting
 //! for `kill_dead_clients` to sweep the row.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bp_db::bulk_set_client_hashrate;
+use hashbrown::HashMap;
 use sqlx::PgPool;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-use crate::touch_buffer::TouchKey;
+use crate::touch_buffer::{TouchKey, TouchKeyRef};
 
 /// Hashes per unit of difficulty-1 work (2^32). `Σdiff × this / seconds`
 /// yields H/s. Matches `bp_api::time_range::DIFFICULTY_1`; duplicated here
@@ -84,18 +84,19 @@ impl HashrateSampler {
     /// accounting sinks already clamp, but this is the hashrate path's
     /// own guard against a corrupt sample poisoning the estimate).
     ///
-    /// Takes `&key` and clones it only when a session first appears; every
-    /// later share in the window hits the `get_mut` fast path allocation-free.
-    pub(crate) fn record(&self, key: &TouchKey, credited_diff: f64) {
+    /// Takes a borrowed [`TouchKeyRef`] and allocates an owned key only
+    /// when a session first appears; every later share in the window is a
+    /// zero-allocation `get_mut` lookup.
+    pub(crate) fn record(&self, key: TouchKeyRef<'_>, credited_diff: f64) {
         if !credited_diff.is_finite() || credited_diff <= 0.0 {
             return;
         }
         let mut guard = self.inner.lock().expect("hashrate sampler mutex poisoned");
-        if let Some(s) = guard.get_mut(key) {
+        if let Some(s) = guard.get_mut(&key) {
             s.diff_accum += credited_diff;
         } else {
             guard.insert(
-                key.clone(),
+                key.to_key(),
                 SessionSample {
                     diff_accum: credited_diff,
                     prev_rate: None,
@@ -168,7 +169,11 @@ async fn sample_and_write(sampler: &HashrateSampler, pool: &PgPool, window_secs:
     }
     match bulk_set_client_hashrate(pool, &addresses, &client_names, &session_ids, &hash_rates).await
     {
-        Ok(rows) => debug!(sampled = n, affected = rows, "hashrate sampler flushed live rates"),
+        Ok(rows) => debug!(
+            sampled = n,
+            affected = rows,
+            "hashrate sampler flushed live rates"
+        ),
         Err(e) => warn!(
             error = %e,
             sampled = n,
@@ -210,11 +215,11 @@ pub(crate) async fn run_sample_loop(
 mod tests {
     use super::*;
 
-    fn key() -> TouchKey {
-        TouchKey {
-            address: "addr".into(),
-            client_name: "wkr".into(),
-            session_id: "sess".into(),
+    fn kref() -> TouchKeyRef<'static> {
+        TouchKeyRef {
+            address: "addr",
+            client_name: "wkr",
+            session_id: "sess",
         }
     }
 
@@ -227,7 +232,7 @@ mod tests {
         let s = HashrateSampler::default();
 
         // Window 1: 600 credited diff over 60 s → its own rate (no prev).
-        s.record(&key(), 600.0);
+        s.record(kref(), 600.0);
         let w1 = s.sample(60.0);
         let r1 = rate_for(600.0, 60.0);
         assert_eq!(w1.len(), 1);
@@ -238,7 +243,7 @@ mod tests {
         );
 
         // Window 2: 1200 diff → rate2, displayed = avg(rate1, rate2).
-        s.record(&key(), 1200.0);
+        s.record(kref(), 1200.0);
         let w2 = s.sample(60.0);
         let r2 = rate_for(1200.0, 60.0);
         assert!(
@@ -248,7 +253,7 @@ mod tests {
         );
 
         // Window 3: 1200 diff again → avg(rate2, rate3) with rate3==rate2.
-        s.record(&key(), 1200.0);
+        s.record(kref(), 1200.0);
         let w3 = s.sample(60.0);
         assert!(
             (w3[0].1 - r2).abs() < 1.0,
@@ -262,7 +267,7 @@ mod tests {
         let s = HashrateSampler::default();
         let r1 = rate_for(600.0, 60.0);
 
-        s.record(&key(), 600.0);
+        s.record(kref(), 600.0);
         let _ = s.sample(60.0); // window 1: prev = r1
 
         // Window 2: no shares → displayed = (r1 + 0)/2, still tracked.
@@ -291,13 +296,13 @@ mod tests {
         let s = HashrateSampler::default();
         let r = rate_for(600.0, 60.0);
 
-        s.record(&key(), 600.0);
+        s.record(kref(), 600.0);
         let _ = s.sample(60.0); // prev = r, empty = 0
         let _ = s.sample(60.0); // idle window 1 → r/2, empty = 1
 
         // A share lands before the second idle window → counter resets,
         // session survives instead of being dropped.
-        s.record(&key(), 600.0);
+        s.record(kref(), 600.0);
         let w = s.sample(60.0);
         assert!(
             (w[0].1 - r / 2.0).abs() < 1.0,
@@ -310,18 +315,22 @@ mod tests {
     #[test]
     fn ignores_nonpositive_and_nonfinite_diff() {
         let s = HashrateSampler::default();
-        s.record(&key(), 0.0);
-        s.record(&key(), -5.0);
-        s.record(&key(), f64::NAN);
-        s.record(&key(), f64::INFINITY);
-        assert_eq!(s.len(), 0, "invalid diffs must not create a tracked session");
+        s.record(kref(), 0.0);
+        s.record(kref(), -5.0);
+        s.record(kref(), f64::NAN);
+        s.record(kref(), f64::INFINITY);
+        assert_eq!(
+            s.len(),
+            0,
+            "invalid diffs must not create a tracked session"
+        );
     }
 
     #[test]
     fn window_seconds_scale_the_rate() {
         let s = HashrateSampler::default();
         // Same accumulated diff over half the window → double the rate.
-        s.record(&key(), 600.0);
+        s.record(kref(), 600.0);
         let w = s.sample(30.0);
         assert!(
             (w[0].1 - rate_for(600.0, 30.0)).abs() < 1.0,

@@ -85,6 +85,8 @@ hex = "0.4"
 faster-hex = { version = "0.10", default-features = false, features = ["std"] }
 smallvec = { version = "1", features = ["union", "const_generics"] }
 parking_lot = "0.12"
+# Zero-alloc composite-key lookups (Equivalent trait) on the share hot path.
+hashbrown = "0.15"
 
 # Database
 sqlx = { version = "0.8", default-features = false, features = [

@@ -21,6 +21,7 @@ bp-share = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 sqlx = { workspace = true }
+hashbrown = { workspace = true }
 
 tracing = { workspace = true }
 thiserror = { workspace = true }

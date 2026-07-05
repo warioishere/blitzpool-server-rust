@@ -39,7 +39,7 @@ use tracing::warn;
 use crate::address_settings_cache::{AddressSettingsCache, CachedAddressSettings};
 use crate::client_row::{deregister_client, register_client};
 use crate::hashrate_sampler::HashrateSampler;
-use crate::touch_buffer::{TouchBuffer, TouchKey};
+use crate::touch_buffer::{TouchBuffer, TouchKeyRef};
 
 /// `SharedSessionPersistence` impl that persists the `client_entity`
 /// row on register + soft-deletes it on deregister. Cheap to clone
@@ -136,19 +136,20 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
         } else {
             share.worker
         };
-        let key = TouchKey {
-            address: share.address.to_string(),
-            client_name: worker.to_string(),
-            session_id: share.session_id.to_string(),
+        // Borrowed key — no heap allocation on the hot path. Both sinks
+        // take it by value (it's `Copy`) and materialise an owned key only
+        // when a session first appears in the current flush/sample window.
+        let key = TouchKeyRef {
+            address: share.address,
+            client_name: worker,
+            session_id: share.session_id,
         };
         // `effective_difficulty` is the vardiff target this share was
         // credited at = the difficulty currently assigned to the
         // session, so it keeps `currentDifficulty` fresh as vardiff
         // ratchets (for both SV1 + SV2 — this sink is protocol-blind).
-        // The key is built once and borrowed by both sinks — neither
-        // clones it unless it's inserting a brand-new session.
         self.buffer.record(
-            &key,
+            key,
             share.submission_difficulty as f32,
             Some(share.effective_difficulty as f32),
             share.channel_count as i32,
@@ -157,7 +158,7 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
         // Live hashrate: accumulate the same credited difficulty into the
         // sampler's current window. It owns `client_entity.hashRate` and
         // writes a self-zeroing moving average — see [`HashrateSampler`].
-        self.sampler.record(&key, share.effective_difficulty);
+        self.sampler.record(key, share.effective_difficulty);
     }
 }
 
