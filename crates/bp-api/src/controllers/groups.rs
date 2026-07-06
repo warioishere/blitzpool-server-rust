@@ -35,6 +35,7 @@ use bp_group_mgmt_engine::{
     EmailHooks, GroupService, GroupServiceHooks, OpenInviteTtl, UpdateRoundResetSettings,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -1184,7 +1185,8 @@ struct RecentBlock {
     block_height: i32,
     /// ISO-8601.
     created_at: String,
-    address: String,
+    /// Masked payout address (never the full address).
+    address_label: String,
     paid_sats: i64,
     percent: f64,
     shares_in_round: i64,
@@ -1227,7 +1229,7 @@ where
                             group_id: h.group_id,
                             block_height: h.block_height,
                             created_at: crate::time_range::format_slot_label(h.created_at),
-                            address: h.address.as_str().to_string(),
+                            address_label: mask_address_tail(h.address.as_str(), 5),
                             paid_sats: h.paid_sats.to_i64(),
                             percent: h.percent as f64,
                             shares_in_round: h.shares_in_round,
@@ -1245,7 +1247,74 @@ where
     Ok(JsonBytes(bytes))
 }
 
+// ─── member pseudonymisation ─────────────────────────────────────
+//
+// The group-detail endpoints are anonymous (a group id alone opens them), so
+// they must never hand out a member's full payout address — the id would then
+// be a scraper key for every member's on-chain address. Instead each member is
+// exposed as an opaque `memberId` (the stable join key the UI uses across the
+// detail endpoints) plus a masked `addressLabel` for display. The full address
+// never leaves the server; the viewer's own row is flagged via `?viewer=`, and
+// the UI already knows its own address (from the route) for the self-link.
+
+/// Opaque, stable per-(group, member) id. Deterministic so every detail
+/// endpoint produces the same id for the same member (the UI joins on it), and
+/// one-way + group-scoped so it reveals neither the address nor cross-group
+/// membership.
+fn member_id(group_id: Uuid, address: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(group_id.as_bytes());
+    h.update([0u8]); // domain-separate the two fields
+    h.update(address.as_bytes());
+    hex::encode(&h.finalize()[..8]) // 64-bit → collision-free within a group
+}
+
+/// Masked address for display: first 4 + "..." + last `tail` chars, mirroring
+/// the UI's `formatBtcAddress` (tail = 5). Returns the input unchanged when
+/// it's too short to shorten.
+fn mask_address_tail(address: &str, tail: usize) -> String {
+    let a = address.trim();
+    let n = a.chars().count();
+    if n <= 4 + tail {
+        return a.to_string();
+    }
+    let first: String = a.chars().take(4).collect();
+    let last: String = a.chars().skip(n - tail).collect();
+    format!("{first}...{last}")
+}
+
+/// Masked labels for a group's members, guaranteed unique within the group.
+/// Base = last-5 (like the UI); if two members would collapse to the same
+/// label, both are widened to last-9, which makes an intra-group visual
+/// collision astronomically unlikely. (The `memberId` join is collision-free
+/// regardless — this only keeps two rows from *looking* identical.)
+fn build_member_labels(addresses: &[String]) -> HashMap<String, String> {
+    let mut base_counts: HashMap<String, usize> = HashMap::new();
+    for a in addresses {
+        *base_counts.entry(mask_address_tail(a, 5)).or_insert(0) += 1;
+    }
+    let mut out = HashMap::with_capacity(addresses.len());
+    for a in addresses {
+        let base = mask_address_tail(a, 5);
+        let label = if base_counts.get(&base).copied().unwrap_or(0) > 1 {
+            mask_address_tail(a, 9)
+        } else {
+            base
+        };
+        out.insert(a.clone(), label);
+    }
+    out
+}
+
 // ─── GET /api/groups/:id ─────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewerQuery {
+    /// The viewer's own address (already in the UI route). Only used to flag
+    /// that member's row `isSelf` — never echoed back for other members.
+    viewer: Option<String>,
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1259,11 +1328,32 @@ struct GroupDetailResponse {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MemberEntry {
-    address: String,
+    /// Opaque stable join key; the full address is never sent.
+    member_id: String,
+    /// Masked address for display (first 4 + last 5, unique within the group).
+    address_label: String,
+    /// Full payout address — included ONLY for an admin-token-authenticated
+    /// caller (the creator managing members). Absent for anonymous / member
+    /// viewers, so a group id can't harvest member addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<String>,
+    /// True only for the row matching `?viewer=` — the UI uses it to link the
+    /// viewer's own row to their address dashboard (it already knows the address
+    /// from the route).
+    is_self: bool,
     role: String,
     /// ISO-8601.
     joined_at: String,
     hashrate: f64,
+    /// All-time best difficulty for the member (folded in so the UI no longer
+    /// fetches per-member client info by full address).
+    best_difficulty: f64,
+    /// Earliest worker start (uptime basis), ISO-8601; None when offline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_time: Option<String>,
+    /// Most recent worker heartbeat, ISO-8601; None when never seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen: Option<String>,
     last_accepted_share_at: Option<String>,
     /// `None` when caller isn't admin OR when the address has no
     /// verified email binding; otherwise masked-or-unmasked depending
@@ -1275,6 +1365,7 @@ struct MemberEntry {
 async fn by_id<H, M>(
     State(state): State<SharedState<H, M>>,
     Path(id): Path<Uuid>,
+    Query(q): Query<ViewerQuery>,
     headers: HeaderMap,
 ) -> Result<JsonBytes, ApiError>
 where
@@ -1294,9 +1385,19 @@ where
             Err(e) => return Err(e.into()),
         },
     };
+    // Viewer's own address (from the UI route) — only ever used to flag their
+    // own row `isSelf`; never echoed back for other members. Keyed into the
+    // cache so the self-flag is per-viewer (anonymous viewers share "none").
+    let viewer = q
+        .viewer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let key = format!(
-        "GROUP_DETAIL_{id}_{}",
-        if is_admin { "admin" } else { "pub" }
+        "GROUP_DETAIL_{id}_{}_{}",
+        if is_admin { "admin" } else { "pub" },
+        viewer.as_deref().unwrap_or("none"),
     );
     let s = state.clone();
     let bytes = state
@@ -1308,9 +1409,13 @@ where
             let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
             let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
             let per_addr_hashrate = per_address_hashrate(&s.pool, &addrs).await?;
+            let addr_strings: Vec<String> =
+                addrs.iter().map(|a| a.as_str().to_string()).collect();
+            let labels = build_member_labels(&addr_strings);
 
             let mut entries = Vec::with_capacity(members.len());
             for m in members {
+                let addr_str = m.address.as_str();
                 // Redis-first / PG-fallback — same policy as the kick-inactivity
                 // guard, so an actively-mining member doesn't read "never mined"
                 // before the group's first block-found stamps the durable balance.
@@ -1322,15 +1427,31 @@ where
                     (true, Some(b)) => Some(crate::utils::mask_email(&b.email)),
                     _ => None,
                 };
-                let hashrate = per_addr_hashrate
-                    .get(m.address.as_str())
-                    .copied()
+                let hashrate = per_addr_hashrate.get(addr_str).copied().unwrap_or(0.0);
+                // Per-member worker stats folded in server-side (best-diff /
+                // uptime / last-seen) so the UI no longer fetches per-member
+                // client info by full address.
+                let clients = bp_db::find_clients_by_address(&s.pool, &m.address).await?;
+                let start_time = clients.iter().map(|c| c.start_time).min();
+                let last_seen = clients.iter().map(|c| c.updated_at).max();
+                let best_difficulty = bp_db::find_address_settings(&s.pool, &m.address)
+                    .await?
+                    .map(|x| x.best_difficulty)
                     .unwrap_or(0.0);
                 entries.push(MemberEntry {
-                    address: m.address.as_str().to_string(),
+                    member_id: member_id(id, addr_str),
+                    address_label: labels
+                        .get(addr_str)
+                        .cloned()
+                        .unwrap_or_else(|| mask_address_tail(addr_str, 5)),
+                    address: is_admin.then(|| addr_str.to_string()),
+                    is_self: viewer.as_deref() == Some(addr_str),
                     role: m.role,
                     joined_at: crate::time_range::format_slot_label(m.joined_at),
                     hashrate,
+                    best_difficulty,
+                    start_time: start_time.map(crate::time_range::format_slot_label),
+                    last_seen: last_seen.map(crate::time_range::format_slot_label),
                     last_accepted_share_at: last_active
                         .map(crate::time_range::format_slot_label),
                     email: email_out,
@@ -1376,7 +1497,12 @@ where
     let member = bp_db::find_group_member_by_address(&state.pool, &addr)
         .await?
         .ok_or(ApiError::NotFound)?;
-    by_id(State(state), Path(member.group_id), headers).await
+    // The looked-up address is the viewer here (a member opening their own
+    // group), so flag its row `isSelf`.
+    let viewer = Query(ViewerQuery {
+        viewer: Some(addr.as_str().to_string()),
+    });
+    by_id(State(state), Path(member.group_id), viewer, headers).await
 }
 
 // ─── GET /api/groups/:id/hashrate ────────────────────────────────
@@ -1392,7 +1518,8 @@ struct HashrateResponse {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MemberHashrate {
-    address: String,
+    member_id: String,
+    address_label: String,
     hashrate: f64,
 }
 
@@ -1415,6 +1542,9 @@ where
             let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
             let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
             let per_addr = per_address_hashrate(&s.pool, &addrs).await?;
+            let addr_strings: Vec<String> =
+                addrs.iter().map(|a| a.as_str().to_string()).collect();
+            let labels = build_member_labels(&addr_strings);
             Ok(HashrateResponse {
                 group_id: id,
                 total_hashrate,
@@ -1422,7 +1552,11 @@ where
                     .into_iter()
                     .map(|a| MemberHashrate {
                         hashrate: per_addr.get(a.as_str()).copied().unwrap_or(0.0),
-                        address: a.as_str().to_string(),
+                        member_id: member_id(id, a.as_str()),
+                        address_label: labels
+                            .get(a.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| mask_address_tail(a.as_str(), 5)),
                     })
                     .collect(),
             })
@@ -1444,7 +1578,8 @@ struct DistributionResponse {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DistributionEntry {
-    address: String,
+    member_id: String,
+    address_label: String,
     total_shares: f64,
     percent: f64,
     total_rejected: f64,
@@ -1477,6 +1612,8 @@ where
                 // round, not an all-time total.
                 let total_rejected: f64 = stats.total_rejected;
                 let rejected_by_addr = stats.rejected_per_address;
+                let addr_strings: Vec<String> = stats.per_address.keys().cloned().collect();
+                let labels = build_member_labels(&addr_strings);
 
                 let mut entries: Vec<DistributionEntry> = stats
                     .per_address
@@ -1490,7 +1627,11 @@ where
                         let total_rejected_for_addr =
                             rejected_by_addr.get(&address).copied().unwrap_or(0.0);
                         DistributionEntry {
-                            address,
+                            member_id: member_id(id, &address),
+                            address_label: labels
+                                .get(&address)
+                                .cloned()
+                                .unwrap_or_else(|| mask_address_tail(&address, 5)),
                             total_shares: shares,
                             percent,
                             total_rejected: total_rejected_for_addr,
@@ -1525,11 +1666,19 @@ where
 struct WindowTimelineResponse {
     /// Sliding-window length in days; 0 for a non-Window group.
     window_days: i64,
-    /// Every address that contributed anywhere in the window, biggest total
-    /// first (stable stacking + colour order across the views).
-    addresses: Vec<String>,
+    /// Every contributor in the window, biggest total first (stable stacking +
+    /// colour order). Pseudonymised — memberId is the series key, addressLabel
+    /// the legend text; the full address is never sent.
+    contributors: Vec<TimelineContributor>,
     /// One entry per calendar day that has data, oldest→newest.
     days: Vec<TimelineDay>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelineContributor {
+    member_id: String,
+    address_label: String,
 }
 
 #[derive(Serialize)]
@@ -1543,7 +1692,10 @@ struct TimelineDay {
 
 /// Fold the per-hour-bucket timeline into per-day, per-address sums and shape
 /// the response. Pure (no I/O) so it unit-tests without Redis.
-fn build_window_timeline_response(timeline: WindowTimeline) -> WindowTimelineResponse {
+fn build_window_timeline_response(
+    group_id: Uuid,
+    timeline: WindowTimeline,
+) -> WindowTimelineResponse {
     // Mirrors `bp_group_solo_engine::round::WINDOW_BUCKET_MS` (1h buckets).
     const HOUR_MS: i64 = 60 * 60 * 1000;
     const DAY_MS: i64 = 24 * HOUR_MS;
@@ -1578,9 +1730,22 @@ fn build_window_timeline_response(timeline: WindowTimeline) -> WindowTimelineRes
         })
         .collect();
 
+    // Pseudonymise the series identity (index-aligned to each day's `values`).
+    let labels = build_member_labels(&addresses);
+    let contributors = addresses
+        .iter()
+        .map(|a| TimelineContributor {
+            member_id: member_id(group_id, a),
+            address_label: labels
+                .get(a)
+                .cloned()
+                .unwrap_or_else(|| mask_address_tail(a, 5)),
+        })
+        .collect();
+
     WindowTimelineResponse {
         window_days: timeline.window_ms / DAY_MS,
-        addresses,
+        contributors,
         days,
     }
 }
@@ -1606,7 +1771,7 @@ where
                     .as_deref()
                     .ok_or(ApiError::Unavailable("group-solo-engine not wired"))?;
                 let timeline = engine.reader().window_timeline(id).await?;
-                Ok(build_window_timeline_response(timeline))
+                Ok(build_window_timeline_response(id, timeline))
             },
         )
         .await?;
@@ -1619,7 +1784,8 @@ where
 #[serde(rename_all = "camelCase")]
 struct BestDifficultyResponse {
     best_difficulty: u64,
-    address: Option<String>,
+    /// Masked submitter address (never the full address).
+    address_label: Option<String>,
     /// ISO-8601 wall-clock of the share; `None` when the current
     /// round has no recorded best yet (post-block-found reset state).
     time: Option<String>,
@@ -1650,13 +1816,13 @@ where
                 let Some(best) = engine.reader().best_difficulty(id).await? else {
                     return Ok(BestDifficultyResponse {
                         best_difficulty: 0,
-                        address: None,
+                        address_label: None,
                         time: None,
                     });
                 };
                 Ok(BestDifficultyResponse {
                     best_difficulty: best.difficulty.floor() as u64,
-                    address: Some(best.address),
+                    address_label: Some(mask_address_tail(&best.address, 5)),
                     time: Some(crate::time_range::format_slot_label(best.timestamp_ms)),
                 })
             },
@@ -1681,7 +1847,8 @@ struct HistoryEntry {
     block_height: i32,
     /// ISO-8601 timestamp the history row was written.
     created_at: String,
-    address: String,
+    /// Masked payout address (never the full address).
+    address_label: String,
     paid_sats: i64,
     percent: f64,
     shares_in_round: i64,
@@ -1712,7 +1879,7 @@ where
                     group_id: h.group_id,
                     block_height: h.block_height,
                     created_at: crate::time_range::format_slot_label(h.created_at),
-                    address: h.address.as_str().to_string(),
+                    address_label: mask_address_tail(h.address.as_str(), 5),
                     paid_sats: h.paid_sats.to_i64(),
                     percent: h.percent as f64,
                     shares_in_round: h.shares_in_round,
@@ -2274,11 +2441,21 @@ mod tests {
                 (130, HashMap::from([(a.clone(), 7.0), (b.clone(), 3.0)])),
             ],
         };
-        let resp = build_window_timeline_response(timeline);
+        let resp = build_window_timeline_response(Uuid::nil(), timeline);
 
         assert_eq!(resp.window_days, 30);
-        // A total 37 > B total 8 → A stacked/coloured first.
-        assert_eq!(resp.addresses, vec![a, b]);
+        // A total 37 > B total 8 → A stacked/coloured first. The short test
+        // addresses are below the mask threshold so their labels are verbatim.
+        let labels: Vec<&str> = resp
+            .contributors
+            .iter()
+            .map(|c| c.address_label.as_str())
+            .collect();
+        assert_eq!(labels, vec![a.as_str(), b.as_str()]);
+        assert!(
+            resp.contributors.iter().all(|c| !c.member_id.is_empty()),
+            "every contributor gets an opaque memberId"
+        );
         assert_eq!(resp.days.len(), 2, "two distinct calendar-day buckets");
         // Same-day hours summed; values index-aligned to [A, B].
         assert_eq!(resp.days[0].values, vec![30.0, 5.0]);
@@ -2296,12 +2473,15 @@ mod tests {
 
     #[test]
     fn window_timeline_empty_for_non_window_group() {
-        let resp = build_window_timeline_response(WindowTimeline {
-            window_ms: 0,
-            buckets: vec![],
-        });
+        let resp = build_window_timeline_response(
+            Uuid::nil(),
+            WindowTimeline {
+                window_ms: 0,
+                buckets: vec![],
+            },
+        );
         assert_eq!(resp.window_days, 0);
-        assert!(resp.addresses.is_empty());
+        assert!(resp.contributors.is_empty());
         assert!(resp.days.is_empty());
     }
 
@@ -2402,5 +2582,81 @@ mod tests {
         assert_eq!(v["name"], "g");
         assert_eq!(v["memberCount"], 3);
         assert_eq!(v["isPublic"], true);
+    }
+
+    #[test]
+    fn mask_address_tail_shows_first4_and_last_n() {
+        let a = "bc1qxyzabcdefghijklmnop9k2p4";
+        assert_eq!(mask_address_tail(a, 5), "bc1q...9k2p4");
+        assert_eq!(mask_address_tail(a, 9), "bc1q...mnop9k2p4");
+        // Too short to shorten → returned verbatim.
+        assert_eq!(mask_address_tail("bc1qab", 5), "bc1qab");
+        // Never contains the full middle of the address.
+        assert!(!mask_address_tail(a, 5).contains("xyzabc"));
+    }
+
+    #[test]
+    fn member_id_is_stable_group_scoped_and_opaque() {
+        let g1 = Uuid::from_u128(1);
+        let g2 = Uuid::from_u128(2);
+        let a = "bc1qsomeaddressaaaa";
+        // Deterministic.
+        assert_eq!(member_id(g1, a), member_id(g1, a));
+        // Group-scoped: same address, different group → different id.
+        assert_ne!(member_id(g1, a), member_id(g2, a));
+        // Different address → different id.
+        assert_ne!(member_id(g1, a), member_id(g1, "bc1qsomeaddressbbbb"));
+        // Opaque: doesn't leak the address, fixed 16-hex width.
+        let id = member_id(g1, a);
+        assert_eq!(id.len(), 16);
+        assert!(!id.contains("address"));
+    }
+
+    #[test]
+    fn build_member_labels_disambiguates_collisions() {
+        // Same first-4 ("bc1q") AND same last-5 ("12345") → base labels collide
+        // → both widened so two rows never render identically.
+        let a = "bc1qAAAAAAAAA12345".to_string();
+        let b = "bc1qBBBBBBBBB12345".to_string();
+        let labels = build_member_labels(&[a.clone(), b.clone()]);
+        assert_eq!(mask_address_tail(&a, 5), mask_address_tail(&b, 5)); // base collides
+        assert_ne!(labels[&a], labels[&b], "colliding labels must be widened");
+        // A non-colliding address keeps the short last-5 label.
+        let c = "bc1qCCCCCCCCCC99999".to_string();
+        let labels2 = build_member_labels(&[a, c.clone()]);
+        assert_eq!(labels2[&c], mask_address_tail(&c, 5));
+    }
+
+    #[test]
+    fn member_entry_hides_full_address_from_non_admin() {
+        let e = MemberEntry {
+            member_id: "abc123".into(),
+            address_label: "bc1q...12345".into(),
+            address: None, // non-admin / anonymous
+            is_self: false,
+            role: "member".into(),
+            joined_at: "2024-01-01T00:00:00.000Z".into(),
+            hashrate: 0.0,
+            best_difficulty: 0.0,
+            start_time: None,
+            last_seen: None,
+            last_accepted_share_at: None,
+            email: None,
+        };
+        let v: Value = serde_json::to_value(&e).unwrap();
+        assert!(
+            v.get("address").is_none(),
+            "a non-admin caller must not receive the full address, got: {v}"
+        );
+        assert_eq!(v["memberId"], "abc123");
+        assert_eq!(v["addressLabel"], "bc1q...12345");
+
+        // Admin variant (address = Some) carries the full address.
+        let admin = MemberEntry {
+            address: Some("bc1qfulladdr".into()),
+            ..e
+        };
+        let av: Value = serde_json::to_value(&admin).unwrap();
+        assert_eq!(av["address"], "bc1qfulladdr");
     }
 }

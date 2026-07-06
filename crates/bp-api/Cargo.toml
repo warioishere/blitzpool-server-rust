@@ -49,6 +49,8 @@ uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+# Opaque, stable per-member ids (pseudonymised group-detail endpoints).
+sha2 = { workspace = true }
 
 # UTC slot-label formatting for chart endpoints (time_range util).
 chrono = { workspace = true }
