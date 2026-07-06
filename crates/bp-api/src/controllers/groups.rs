@@ -1457,8 +1457,18 @@ where
                     email: email_out,
                 });
             }
+            let mut summary = GroupSummary::from(group);
+            if !is_admin {
+                // The creator is a member too and is pseudonymised in `entries`;
+                // don't re-leak their full address via the flattened summary to
+                // anonymous / member callers. Only an admin-token caller (the
+                // creator managing the group) sees it. The UI derives
+                // isCreator / "created by" from the member roster (isSelf +
+                // role + addressLabel), so it needs no creatorAddress here.
+                summary.creator_address = None;
+            }
             Ok(GroupDetailResponse {
-                summary: GroupSummary::from(group),
+                summary,
                 total_hashrate,
                 members: entries,
             })
@@ -2658,5 +2668,49 @@ mod tests {
         };
         let av: Value = serde_json::to_value(&admin).unwrap();
         assert_eq!(av["address"], "bc1qfulladdr");
+    }
+
+    #[test]
+    fn group_detail_hides_creator_address_from_non_admin() {
+        // Mirrors by_id: the flattened summary's creatorAddress is nulled for
+        // non-admin callers (the creator is a pseudonymised member in the
+        // roster), and present only for an admin-token caller.
+        fn summary(creator: Option<String>) -> GroupSummary {
+            GroupSummary {
+                id: Uuid::nil(),
+                name: "g".into(),
+                creator_address: creator,
+                active: true,
+                created_at: "2024-01-01T00:00:00.000Z".into(),
+                round_reset_preset: None,
+                round_reset_interval_days: None,
+                round_reset_timezone: None,
+                finder_bonus_sats: 0,
+                last_round_reset_at: None,
+                next_reset_at: None,
+                is_public: true,
+                reset_round_on_block: false,
+                max_members: None,
+                mode: "prop".into(),
+            }
+        }
+        let non_admin = GroupDetailResponse {
+            summary: summary(None),
+            total_hashrate: 0.0,
+            members: vec![],
+        };
+        let v: Value = serde_json::to_value(&non_admin).unwrap();
+        assert!(
+            v.get("creatorAddress").is_none(),
+            "a non-admin by_id caller must not receive creatorAddress, got: {v}"
+        );
+
+        let admin = GroupDetailResponse {
+            summary: summary(Some("bc1qcreator".into())),
+            total_hashrate: 0.0,
+            members: vec![],
+        };
+        let av: Value = serde_json::to_value(&admin).unwrap();
+        assert_eq!(av["creatorAddress"], "bc1qcreator");
     }
 }
