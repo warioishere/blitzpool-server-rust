@@ -939,7 +939,12 @@ fn admin_token(headers: &HeaderMap) -> Option<&str> {
 struct GroupSummary {
     id: Uuid,
     name: String,
-    creator_address: String,
+    /// The creator's payout address. Present on authenticated/address-scoped
+    /// views (drives the "created by" line + the isCreator/admin gate), but
+    /// nulled on the public directory shapes (`list_public` / `public_one`) so
+    /// the creator's on-chain address is never exposed to anonymous viewers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    creator_address: Option<String>,
     active: bool,
     /// ISO-8601 (`Date.toISOString()` shape).
     created_at: String,
@@ -982,7 +987,7 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
         Self {
             id: r.id,
             name: r.name,
-            creator_address: r.creator_address.as_str().to_string(),
+            creator_address: Some(r.creator_address.as_str().to_string()),
             active: r.active,
             created_at: crate::time_range::format_slot_label(r.created_at),
             round_reset_preset: r.round_reset_preset,
@@ -1139,8 +1144,10 @@ where
                     let members = svc.list_members(g.id).await?;
                     let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
                     let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
+                    let mut summary = GroupSummary::from(g.clone());
+                    summary.creator_address = None; // never expose the creator publicly
                     items.push(PublicGroupEntry {
-                        summary: GroupSummary::from(g.clone()),
+                        summary,
                         member_count: members.len(),
                         total_hashrate,
                     });
@@ -1210,6 +1217,8 @@ where
                 let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
                 let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
                 let history = bp_db::find_recent_group_block_history(&s.pool, id, 20).await?;
+                let mut summary = GroupSummary::from(group);
+                summary.creator_address = None; // never expose the creator publicly
                 Ok(PublicGroupDetail {
                     recent_blocks: history
                         .into_iter()
@@ -1226,7 +1235,7 @@ where
                             row_type: h.row_type,
                         })
                         .collect(),
-                    summary: GroupSummary::from(group),
+                    summary,
                     member_count: members.len(),
                     total_hashrate,
                 })
@@ -2325,7 +2334,7 @@ mod tests {
         let g = GroupSummary {
             id: Uuid::nil(),
             name: "g".into(),
-            creator_address: "bc1q".into(),
+            creator_address: Some("bc1q".into()),
             active: false,
             created_at: "2024-01-01T00:00:00.000Z".into(),
             round_reset_preset: None,
@@ -2352,5 +2361,46 @@ mod tests {
         let members = v["members"].as_array().unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0]["role"], "creator");
+    }
+
+    #[test]
+    fn public_group_entry_omits_creator_address() {
+        let mut summary = GroupSummary {
+            id: Uuid::nil(),
+            name: "g".into(),
+            creator_address: Some("bc1qcreator".into()),
+            active: true,
+            created_at: "2024-01-01T00:00:00.000Z".into(),
+            round_reset_preset: None,
+            round_reset_interval_days: None,
+            round_reset_timezone: None,
+            finder_bonus_sats: 0,
+            last_round_reset_at: None,
+            next_reset_at: None,
+            is_public: true,
+            reset_round_on_block: false,
+            max_members: None,
+            mode: "prop".into(),
+        };
+        // Authenticated/address-scoped views keep the creator address.
+        let authed: Value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(authed["creatorAddress"], "bc1qcreator");
+
+        // The public directory shape nulls it → the key must be absent entirely.
+        summary.creator_address = None;
+        let entry = PublicGroupEntry {
+            summary,
+            member_count: 3,
+            total_hashrate: 1.5,
+        };
+        let v: Value = serde_json::to_value(&entry).unwrap();
+        assert!(
+            v.get("creatorAddress").is_none(),
+            "public group entry must not expose creatorAddress, got: {v}"
+        );
+        // Other public fields are still present.
+        assert_eq!(v["name"], "g");
+        assert_eq!(v["memberCount"], 3);
+        assert_eq!(v["isPublic"], true);
     }
 }
