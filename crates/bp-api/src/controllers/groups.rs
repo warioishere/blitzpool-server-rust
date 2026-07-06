@@ -104,7 +104,6 @@ where
         ));
 
     let public_routes = Router::new()
-        .route("/api/pplns/groups", get(list::<H, M>))
         .route("/api/pplns/groups/public", get(list_public::<H, M>))
         .route(
             "/api/pplns/groups/finder-bonus-cap",
@@ -179,7 +178,6 @@ where
     M: EmailHooks + 'static,
 {
     let id_str = id.to_string();
-    state.cache.invalidate("GROUP_LIST").await;
     state.cache.invalidate_prefix("GROUP_PUBLIC_LIST").await;
     for prefix in [
         "GROUP_PUBLIC_DETAIL_",
@@ -272,7 +270,6 @@ where
     let res = svc
         .create_group_with_mode(&body.name, &body.creator_address, mode)
         .await?;
-    state.cache.invalidate("GROUP_LIST").await;
     state.cache.invalidate_prefix("GROUP_PUBLIC_LIST").await;
     if let Ok(addr) = AddressId::new(body.creator_address.clone()) {
         invalidate_address_group_cache(&state, &addr).await;
@@ -1075,29 +1072,6 @@ fn compute_next_reset_at(
         }
         _ => None,
     }
-}
-
-// ─── GET /api/groups ─────────────────────────────────────────────
-
-async fn list<H, M>(State(state): State<SharedState<H, M>>) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let s = state.clone();
-    let bytes = state
-        .cache
-        .get_or_fetch::<Vec<GroupSummary>, _, ApiError>(
-            "GROUP_LIST".to_string(),
-            TtlKind::GroupList,
-            async move {
-                let svc = require_group_service(&s)?;
-                let groups = svc.list_groups().await?;
-                Ok(groups.into_iter().map(GroupSummary::from).collect())
-            },
-        )
-        .await?;
-    Ok(JsonBytes(bytes))
 }
 
 // ─── GET /api/groups/public ──────────────────────────────────────

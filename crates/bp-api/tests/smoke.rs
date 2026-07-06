@@ -150,7 +150,7 @@ async fn groups_returns_503_when_service_unwired() {
     let resp = router
         .oneshot(
             Request::builder()
-                .uri("/api/pplns/groups")
+                .uri("/api/pplns/groups/public")
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )

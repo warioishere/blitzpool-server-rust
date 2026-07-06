@@ -127,7 +127,6 @@ pplns_address_secs          = 60    # /api/pplns/:address
 pplns_address_history_secs  = 60    # /api/pplns/:address/history
 
 # Group endpoints
-group_list_secs             = 60    # /api/pplns/groups
 group_public_list_secs      = 60    # /api/pplns/groups/public
 group_by_address_secs       = 60    # /api/pplns/groups/by-address/:address
 group_detail_secs           = 60    # /api/pplns/groups/:id

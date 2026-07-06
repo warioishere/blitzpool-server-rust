@@ -391,8 +391,6 @@ pub struct ApiCacheConfig {
 
     // ─── Group endpoints ────────────────────────────────────────
     #[serde(default = "ttl_60")]
-    pub group_list_secs: u64,
-    #[serde(default = "ttl_60")]
     pub group_public_list_secs: u64,
     #[serde(default = "ttl_60")]
     pub group_by_address_secs: u64,
@@ -460,7 +458,6 @@ impl Default for ApiCacheConfig {
             pplns_address_secs: ttl_60(),
             pplns_address_history_secs: ttl_60(),
 
-            group_list_secs: ttl_60(),
             group_public_list_secs: ttl_60(),
             group_by_address_secs: ttl_60(),
             group_detail_secs: ttl_60(),

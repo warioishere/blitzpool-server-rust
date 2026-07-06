@@ -60,7 +60,6 @@ pub enum TtlKind {
     PplnsAddress,
     PplnsAddressHistory,
 
-    GroupList,
     GroupPublicList,
     GroupByAddress,
     GroupDetail,
@@ -122,7 +121,6 @@ impl ResponseCache {
             TtlKind::PplnsAddress => self.ttls.pplns_address_secs,
             TtlKind::PplnsAddressHistory => self.ttls.pplns_address_history_secs,
 
-            TtlKind::GroupList => self.ttls.group_list_secs,
             TtlKind::GroupPublicList => self.ttls.group_public_list_secs,
             TtlKind::GroupByAddress => self.ttls.group_by_address_secs,
             TtlKind::GroupDetail => self.ttls.group_detail_secs,
