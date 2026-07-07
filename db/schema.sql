@@ -496,6 +496,37 @@ CREATE TABLE public.pplns_email_verification (
 
 
 --
+-- Name: pplns_ownership_challenge; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pplns_ownership_challenge (
+    address character varying(62) NOT NULL,
+    message text NOT NULL,
+    "createdAt" bigint NOT NULL,
+    "expiresAt" bigint NOT NULL,
+    CONSTRAINT pplns_ownership_challenge_pkey PRIMARY KEY (address)
+);
+
+
+--
+-- Name: pplns_address_ownership; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pplns_address_ownership (
+    address character varying(62) NOT NULL,
+    method character varying(16) NOT NULL,
+    "scriptType" character varying(16) NOT NULL,
+    "verifiedAt" bigint NOT NULL,
+    "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
+    "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
+    CONSTRAINT pplns_address_ownership_pkey PRIMARY KEY (address)
+);
+
+CREATE INDEX IF NOT EXISTS "IDX_pplns_ownership_challenge_expiresAt"
+    ON public.pplns_ownership_challenge USING btree ("expiresAt");
+
+
+--
 -- Name: pplns_group; Type: TABLE; Schema: public; Owner: -
 --
 

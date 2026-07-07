@@ -35,6 +35,7 @@
 //! projection is derived — those are type-checked at the `FromRow` boundary.
 
 mod address;
+mod address_ownership;
 mod block;
 mod blockparty;
 mod client;
@@ -60,6 +61,11 @@ pub use address::{
     find_best_difficulty_trackers_for_addresses, find_high_scores,
     reset_address_settings_best_difficulty, upsert_best_difficulty_trackers, AddressSettingsRow,
     BestDifficultyTrackerRow, HighScoreRow,
+};
+pub use address_ownership::{
+    delete_ownership_challenge, find_address_ownership, find_ownership_challenge,
+    is_address_ownership_verified, upsert_address_ownership_verified, upsert_ownership_challenge,
+    AddressOwnershipRow, OwnershipChallengeRow,
 };
 pub use block::{
     delete_old_rpc_blocks, find_block, find_found_blocks, find_rpc_block, insert_found_block,

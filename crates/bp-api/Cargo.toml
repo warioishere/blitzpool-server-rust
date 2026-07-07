@@ -76,7 +76,13 @@ bp-share = { workspace = true }
 # /api/client/:address/block-template handler. bitcoin crate gives us
 # Block / Transaction serialisation for the blockHex preview.
 bp-mining-job = { workspace = true }
-bitcoin = { workspace = true }
+# `secp-recovery` enables `sign_message::MessageSignature` (recover_pubkey +
+# is_signed_by_address) for verifying BIP-137 / Electrum recoverable message
+# signatures in the address-ownership verify endpoint.
+bitcoin = { workspace = true, features = ["secp-recovery", "base64"] }
+# BIP-322 generic message-signature verification (covers taproot p2tr + segwit),
+# the modern format alongside the legacy recoverable-signature path above.
+bip322 = "0.0.10"
 # Chart-visibility cutoff helper shared with the writer-side
 # accumulator — keeps `/api/info/chart/mode/:mode` consistent with the
 # slot bookkeeping that drives the writes.

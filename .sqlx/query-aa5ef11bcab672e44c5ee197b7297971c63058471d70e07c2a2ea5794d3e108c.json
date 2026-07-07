@@ -1,0 +1,55 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pplns_address_ownership\n             (address, method, \"scriptType\", \"verifiedAt\", \"createdAt\", \"updatedAt\")\n           VALUES ($1, $2, $3, $4, $4, $4)\n           ON CONFLICT (address) DO UPDATE SET\n             method = EXCLUDED.method,\n             \"scriptType\" = EXCLUDED.\"scriptType\",\n             \"verifiedAt\" = EXCLUDED.\"verifiedAt\",\n             \"updatedAt\" = EXCLUDED.\"updatedAt\"\n           RETURNING\n            address AS \"address!: AddressId\",\n            method AS \"method!\",\n            \"scriptType\" AS \"script_type!\",\n            \"verifiedAt\" AS \"verified_at!\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "method!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "script_type!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "verified_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "updated_at!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "aa5ef11bcab672e44c5ee197b7297971c63058471d70e07c2a2ea5794d3e108c"
+}

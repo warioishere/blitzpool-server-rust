@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pplns_ownership_challenge\n             (address, message, \"createdAt\", \"expiresAt\")\n           VALUES ($1, $2, $3, $4)\n           ON CONFLICT (address) DO UPDATE SET\n             message = EXCLUDED.message,\n             \"createdAt\" = EXCLUDED.\"createdAt\",\n             \"expiresAt\" = EXCLUDED.\"expiresAt\"\n           RETURNING\n            address AS \"address!: AddressId\",\n            message AS \"message!\",\n            \"createdAt\" AS \"created_at!\",\n            \"expiresAt\" AS \"expires_at!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "message!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "expires_at!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "badca35dcbb229a69d18bee25f9849d4c4c7388b5c6d9c3b9c11052e9b247660"
+}
