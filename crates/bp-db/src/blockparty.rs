@@ -468,25 +468,6 @@ pub async fn update_blockparty_member_percent_bp(
     .map_err(DbError::from)
 }
 
-/// Reset non-admin confirmations after an admin %-edit. Returns rows touched.
-pub async fn reset_blockparty_member_confirmations_non_admin(
-    pool: &PgPool,
-    group_id: Uuid,
-    updated_at: i64,
-) -> Result<u64, DbError> {
-    sqlx::query!(
-        r#"UPDATE blockparty_member
-           SET "confirmedAt" = NULL, "updatedAt" = $2
-           WHERE "groupId" = $1 AND role <> 'admin'"#,
-        group_id,
-        updated_at,
-    )
-    .execute(pool)
-    .await
-    .map(|r| r.rows_affected())
-    .map_err(DbError::from)
-}
-
 pub async fn update_blockparty_member_confirmed<'e, E>(
     executor: E,
     group_id: Uuid,

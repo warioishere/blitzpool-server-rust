@@ -79,7 +79,7 @@ pub use blockparty::{
     insert_blockparty_invitation, insert_blockparty_member, list_all_blockparty_members,
     list_blockparty_block_history, list_blockparty_groups, list_blockparty_groups_non_dissolved,
     list_blockparty_invitations_for_group, list_blockparty_members_for_group,
-    reset_blockparty_member_confirmations_non_admin, reset_blockparty_member_onboarding,
+    reset_blockparty_member_onboarding,
     update_blockparty_group_dissolved, update_blockparty_group_last_share_and_status,
     update_blockparty_group_rental_hint, update_blockparty_group_status,
     update_blockparty_invitation_status, update_blockparty_member_confirmed,
