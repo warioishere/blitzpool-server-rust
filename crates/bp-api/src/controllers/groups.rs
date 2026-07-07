@@ -1265,6 +1265,14 @@ where
             let addr_strings: Vec<String> =
                 addrs.iter().map(|a| a.as_str().to_string()).collect();
             let labels = build_member_labels(&addr_strings);
+            // Batch the signature-ownership lookup (admin-only, for the
+            // verified-via badge) into one query rather than one per member —
+            // avoids an N+1 fan-out on the roster read.
+            let owned_signatures = if is_admin {
+                bp_db::addresses_with_ownership_proof(&s.pool, &addr_strings).await?
+            } else {
+                std::collections::HashSet::new()
+            };
 
             let mut entries = Vec::with_capacity(members.len());
             for m in members {
@@ -1286,7 +1294,7 @@ where
                 let verified_via: Option<&'static str> = if is_admin {
                     if email.as_ref().and_then(|b| b.verified_at).is_some() {
                         Some("email")
-                    } else if bp_db::is_address_ownership_verified(&s.pool, &m.address).await? {
+                    } else if owned_signatures.contains(addr_str) {
                         Some("signature")
                     } else {
                         None

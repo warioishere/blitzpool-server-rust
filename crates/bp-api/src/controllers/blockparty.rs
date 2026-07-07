@@ -110,25 +110,38 @@ impl MemberPublicView {
     }
 }
 
-/// Verification method for a blockparty member — a non-empty snapshot email
-/// (captured from a verified binding at join) reads as `"email"`; otherwise a
-/// signature ownership proof reads as `"signature"`. `None` only for a member
-/// with neither on record.
-async fn member_verified_via<H, M>(
+/// Batch the signature-ownership lookup for a roster into a single query: the
+/// set of email-less member addresses that have an ownership proof. Avoids an
+/// N+1 fan-out (one query per member) on the roster read paths.
+async fn ownership_set_for_members<H, M>(
     state: &SharedState<H, M>,
-    m: &BlockpartyMemberRow,
-) -> Result<Option<&'static str>, ApiError>
+    members: &[BlockpartyMemberRow],
+) -> Result<std::collections::HashSet<String>, ApiError>
 where
     H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
     M: bp_group_mgmt_engine::EmailHooks + 'static,
 {
+    let addrs: Vec<String> = members
+        .iter()
+        .filter(|m| m.email.trim().is_empty())
+        .map(|m| m.address.as_str().to_owned())
+        .collect();
+    Ok(bp_db::addresses_with_ownership_proof(&state.pool, &addrs).await?)
+}
+
+/// Verification method for a member given the pre-fetched ownership set — a
+/// non-empty snapshot email reads as `"email"`; otherwise a signature proof
+/// reads as `"signature"`. `None` when neither is on record.
+fn verified_via_for(
+    m: &BlockpartyMemberRow,
+    owned: &std::collections::HashSet<String>,
+) -> Option<&'static str> {
     if !m.email.trim().is_empty() {
-        return Ok(Some("email"));
-    }
-    if bp_db::is_address_ownership_verified(&state.pool, &m.address).await? {
-        Ok(Some("signature"))
+        Some("email")
+    } else if owned.contains(m.address.as_str()) {
+        Some("signature")
     } else {
-        Ok(None)
+        None
     }
 }
 
@@ -338,11 +351,11 @@ where
     let svc = require_blockparty(&state)?;
     let group = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
     let members = svc.list_members(id).await?;
-    let mut member_views = Vec::with_capacity(members.len());
-    for m in &members {
-        let verified_via = member_verified_via(&state, m).await?;
-        member_views.push(MemberPublicView::from_row_masked(m, verified_via));
-    }
+    let owned = ownership_set_for_members(&state, &members).await?;
+    let member_views = members
+        .iter()
+        .map(|m| MemberPublicView::from_row_masked(m, verified_via_for(m, &owned)))
+        .collect();
     Ok(Json(DetailResponse {
         group: GroupPublicView::from_row(&group),
         members: member_views,
@@ -377,15 +390,11 @@ where
         .await?;
     let group = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
     let members = svc.list_members(id).await?;
-    let mut member_views = Vec::with_capacity(members.len());
-    for m in &members {
-        let verified_via = member_verified_via(&state, m).await?;
-        member_views.push(MemberPublicView::from_row_for_viewer(
-            m,
-            &viewer,
-            verified_via,
-        ));
-    }
+    let owned = ownership_set_for_members(&state, &members).await?;
+    let member_views = members
+        .iter()
+        .map(|m| MemberPublicView::from_row_for_viewer(m, &viewer, verified_via_for(m, &owned)))
+        .collect();
     Ok(Json(DetailResponse {
         group: GroupPublicView::from_row(&group),
         members: member_views,

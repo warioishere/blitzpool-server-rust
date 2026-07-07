@@ -182,6 +182,28 @@ pub async fn is_address_ownership_verified(
     .map_err(DbError::from)
 }
 
+/// Batch form of [`is_address_ownership_verified`]: given a set of addresses,
+/// return the subset that has a signature-ownership proof — one query instead of
+/// one per address (avoids an N+1 fan-out on the roster read paths). Empty input
+/// short-circuits without a round-trip.
+pub async fn addresses_with_ownership_proof(
+    pool: &PgPool,
+    addresses: &[String],
+) -> Result<std::collections::HashSet<String>, DbError> {
+    if addresses.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let rows = sqlx::query_scalar!(
+        r#"SELECT address AS "address!"
+           FROM pplns_address_ownership WHERE address = ANY($1)"#,
+        addresses,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows.into_iter().collect())
+}
+
 /// True when the address is verified by EITHER a confirmed email binding
 /// (`pplns_address_email.verifiedAt`) OR a signature ownership proof
 /// (`pplns_address_ownership`). This is the unified onboarding gate — a joining
