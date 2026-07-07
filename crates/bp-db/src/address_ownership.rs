@@ -181,3 +181,20 @@ pub async fn is_address_ownership_verified(
     .await
     .map_err(DbError::from)
 }
+
+/// True when the address is verified by EITHER a confirmed email binding
+/// (`pplns_address_email.verifiedAt`) OR a signature ownership proof
+/// (`pplns_address_ownership`). This is the unified onboarding gate — a joining
+/// address must satisfy one of the two. Existing verified emails keep counting.
+pub async fn is_address_verified(pool: &PgPool, address: &AddressId) -> Result<bool, DbError> {
+    sqlx::query_scalar!(
+        r#"SELECT (
+             EXISTS(SELECT 1 FROM pplns_address_email WHERE address = $1 AND "verifiedAt" IS NOT NULL)
+             OR EXISTS(SELECT 1 FROM pplns_address_ownership WHERE address = $1)
+           ) AS "verified!""#,
+        address.as_str()
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(DbError::from)
+}

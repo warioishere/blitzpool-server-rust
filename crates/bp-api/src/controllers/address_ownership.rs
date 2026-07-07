@@ -61,6 +61,7 @@ where
             post(verify::<H, M>).layer(rate_limit::per_minute_layer(5)),
         )
         .route("/api/address/ownership/:address", get(by_address::<H, M>))
+        .route("/api/address/verified/:address", get(verified_status::<H, M>))
 }
 
 // ─── POST /api/address/ownership/challenge ───────────────────────
@@ -218,6 +219,45 @@ where
             verified_at: None,
         })),
     }
+}
+
+// ─── GET /api/address/verified/:address ──────────────────────────
+// The unified onboarding gate status: is this address verified by email OR by a
+// signature ownership proof? Drives the shared "verify your address" UI.
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifiedStatusResponse {
+    verified: bool,
+    email_verified: bool,
+    signature_verified: bool,
+}
+
+async fn verified_status<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(address): Path<String>,
+) -> Result<Json<VerifiedStatusResponse>, ApiError>
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    let Ok(addr) = AddressId::new(address) else {
+        return Ok(Json(VerifiedStatusResponse {
+            verified: false,
+            email_verified: false,
+            signature_verified: false,
+        }));
+    };
+    let email_verified = bp_db::find_address_email(&state.pool, &addr)
+        .await?
+        .and_then(|b| b.verified_at)
+        .is_some();
+    let signature_verified = bp_db::is_address_ownership_verified(&state.pool, &addr).await?;
+    Ok(Json(VerifiedStatusResponse {
+        verified: email_verified || signature_verified,
+        email_verified,
+        signature_verified,
+    }))
 }
 
 // ─── signature verification ──────────────────────────────────────

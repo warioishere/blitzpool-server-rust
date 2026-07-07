@@ -64,8 +64,8 @@ pub use address::{
 };
 pub use address_ownership::{
     delete_ownership_challenge, find_address_ownership, find_ownership_challenge,
-    is_address_ownership_verified, upsert_address_ownership_verified, upsert_ownership_challenge,
-    AddressOwnershipRow, OwnershipChallengeRow,
+    is_address_ownership_verified, is_address_verified, upsert_address_ownership_verified,
+    upsert_ownership_challenge, AddressOwnershipRow, OwnershipChallengeRow,
 };
 pub use block::{
     delete_old_rpc_blocks, find_block, find_found_blocks, find_rpc_block, insert_found_block,

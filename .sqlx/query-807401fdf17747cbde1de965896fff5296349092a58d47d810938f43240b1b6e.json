@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (\n             EXISTS(SELECT 1 FROM pplns_address_email WHERE address = $1 AND \"verifiedAt\" IS NOT NULL)\n             OR EXISTS(SELECT 1 FROM pplns_address_ownership WHERE address = $1)\n           ) AS \"verified!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "verified!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "807401fdf17747cbde1de965896fff5296349092a58d47d810938f43240b1b6e"
+}
