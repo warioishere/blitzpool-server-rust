@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::middleware::rate_limit;
 use crate::state::SharedState;
 
 // ─── DTOs (camelCase JSON, ms-epoch i64 timestamps) ───────────────
@@ -241,8 +242,13 @@ where
                 .delete(revoke_join_link::<H, M>),
         )
         .route(
+            // Public self-service join — throttled per client IP (matches the
+            // group-solo open-invite accept). Covers both the POST join (DB
+            // write + member-token mint) and the GET context (token probing).
             "/api/blockparty/join/:token",
-            get(get_join_context::<H, M>).post(join_via_link::<H, M>),
+            get(get_join_context::<H, M>)
+                .post(join_via_link::<H, M>)
+                .layer(rate_limit::per_minute_layer(10)),
         )
         .route(
             "/api/blockparty/:id/members/:address",
