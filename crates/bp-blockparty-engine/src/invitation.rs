@@ -147,12 +147,16 @@ impl<H: BlockpartyHooks, M: EmailHooks> BlockpartyInvitationService<H, M> {
         }
         let _ = member; // consume the row; we only needed the confirmed_at check
 
-        let email = self
-            .service
-            .hooks()
-            .verified_email_for(&normalized)
-            .await
-            .ok_or(BlockpartyInvitationServiceError::EmailNotVerified)?;
+        // Unified gate: verified by a confirmed email OR a signature ownership
+        // proof. Email is optional now — a signature-only member's invitation
+        // carries an empty email and the (best-effort) invite mail isn't delivered.
+        let email = self.service.hooks().verified_email_for(&normalized).await;
+        if email.is_none()
+            && !bp_db::is_address_ownership_verified(&self.pool, &normalized).await?
+        {
+            return Err(BlockpartyInvitationServiceError::EmailNotVerified);
+        }
+        let email = email.unwrap_or_default();
 
         let now = now_ms();
         let ttl_days = ttl_days.unwrap_or(DEFAULT_INVITATION_TTL_DAYS).max(1);

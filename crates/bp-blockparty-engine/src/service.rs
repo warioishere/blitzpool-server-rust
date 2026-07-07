@@ -468,12 +468,14 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             return Err(BlockpartyServiceError::AddressInPplnsGroup);
         }
 
-        let email = self
-            .hooks
-            .verified_email_for(&address)
-            .await
-            .ok_or(BlockpartyServiceError::EmailNotVerified)?;
-        let email = email.to_ascii_lowercase();
+        // Unified onboarding gate: verified by a confirmed email OR a signature
+        // ownership proof. The email (if any) is snapshotted onto the member row;
+        // a signature-only member has none.
+        let email = self.hooks.verified_email_for(&address).await;
+        if email.is_none() && !bp_db::is_address_ownership_verified(&self.pool, &address).await? {
+            return Err(BlockpartyServiceError::EmailNotVerified);
+        }
+        let email = email.map(|e| e.to_ascii_lowercase()).unwrap_or_default();
 
         let now = now_ms();
         let inserted = match bp_db::insert_blockparty_member(
