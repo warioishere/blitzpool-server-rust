@@ -88,7 +88,7 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let address = parse_supported_address(&body.address)?;
+    let address = parse_supported_address(&body.address, state.network)?;
     let addr_str = address.as_str().to_string();
 
     let now = crate::time_range::now_ms();
@@ -138,7 +138,7 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let address = parse_supported_address(&body.address)?;
+    let address = parse_supported_address(&body.address, state.network)?;
     let signature = body.signature.trim();
     if signature.is_empty() {
         return Err(ownership_error("missing-signature", StatusCode::BAD_REQUEST));
@@ -155,7 +155,7 @@ where
 
     // Verify against the STORED challenge message — never a client-supplied one.
     let Some((method, script_type)) =
-        verify_message_signature(address.as_str(), &pending.message, signature)
+        verify_message_signature(address.as_str(), &pending.message, signature, state.network)
     else {
         return Err(ownership_error("invalid-signature", StatusCode::BAD_REQUEST));
     };
@@ -269,8 +269,9 @@ fn verify_message_signature(
     address: &str,
     message: &str,
     signature: &str,
+    network: Network,
 ) -> Option<(String, String)> {
-    let addr = Address::from_str(address).ok()?.require_network(Network::Bitcoin).ok()?;
+    let addr = Address::from_str(address).ok()?.require_network(network).ok()?;
     let script_type = script_type_label(addr.address_type()?);
 
     // 1) BIP-322 (any address type, incl. taproot).
@@ -291,7 +292,7 @@ fn verify_message_signature(
         AddressType::P2wpkh => {
             let pk = sig.recover_pubkey(&secp, msg_hash).ok()?;
             let cpk = CompressedPublicKey::try_from(pk).ok()?;
-            let derived = Address::p2wpkh(&cpk, Network::Bitcoin);
+            let derived = Address::p2wpkh(&cpk, network);
             if derived == addr {
                 return Some(("bip137".to_string(), "p2wpkh".to_string()));
             }
@@ -300,7 +301,7 @@ fn verify_message_signature(
             // Wrapped segwit (p2sh-p2wpkh): recover + re-derive + compare.
             let pk = sig.recover_pubkey(&secp, msg_hash).ok()?;
             let cpk = CompressedPublicKey::try_from(pk).ok()?;
-            let derived = Address::p2shwpkh(&cpk, Network::Bitcoin);
+            let derived = Address::p2shwpkh(&cpk, network);
             if derived == addr {
                 return Some(("bip137".to_string(), "p2sh-p2wpkh".to_string()));
             }
@@ -329,11 +330,11 @@ fn script_type_label(t: AddressType) -> &'static str {
 /// (lowercase bech32, preserve case-sensitive Base58) so the ownership row is
 /// keyed identically to what every verification gate looks up — otherwise a
 /// mixed-case Base58 (or upper-case bech32) proof would never match.
-fn parse_supported_address(raw: &str) -> Result<AddressId, ApiError> {
+fn parse_supported_address(raw: &str, network: Network) -> Result<AddressId, ApiError> {
     let trimmed = raw.trim();
     Address::from_str(trimmed)
         .ok()
-        .and_then(|a| a.require_network(Network::Bitcoin).ok())
+        .and_then(|a| a.require_network(network).ok())
         .ok_or_else(|| ownership_error("invalid-address", StatusCode::BAD_REQUEST))?;
     AddressId::new(bp_mining_job::normalize_btc_address(trimmed))
         .map_err(|_| ownership_error("invalid-address", StatusCode::BAD_REQUEST))
@@ -384,19 +385,19 @@ mod tests {
         // derived from the key — the verifier recovers the pubkey and re-derives.
         let p2pkh = Address::p2pkh(&pk, Network::Bitcoin).to_string();
         assert_eq!(
-            verify_message_signature(&p2pkh, msg, &sig),
+            verify_message_signature(&p2pkh, msg, &sig, Network::Bitcoin),
             Some(("bip137".to_string(), "p2pkh".to_string()))
         );
 
         let p2wpkh = Address::p2wpkh(&cpk, Network::Bitcoin).to_string();
         assert_eq!(
-            verify_message_signature(&p2wpkh, msg, &sig),
+            verify_message_signature(&p2wpkh, msg, &sig, Network::Bitcoin),
             Some(("bip137".to_string(), "p2wpkh".to_string()))
         );
 
         let p2sh = Address::p2shwpkh(&cpk, Network::Bitcoin).to_string();
         assert_eq!(
-            verify_message_signature(&p2sh, msg, &sig),
+            verify_message_signature(&p2sh, msg, &sig, Network::Bitcoin),
             Some(("bip137".to_string(), "p2sh-p2wpkh".to_string()))
         );
     }
@@ -409,15 +410,18 @@ mod tests {
         let addr = Address::p2wpkh(&cpk, Network::Bitcoin).to_string();
 
         // Right sig, wrong message → recovers a different key → no match.
-        assert_eq!(verify_message_signature(&addr, "a different message", &sig), None);
+        assert_eq!(verify_message_signature(&addr, "a different message", &sig, Network::Bitcoin), None);
 
         // Right sig+message, but a different address (different key) → no match.
         let other_sk = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
         let other_cpk = CompressedPublicKey(other_sk.public_key(&Secp256k1::new()));
         let other_addr = Address::p2wpkh(&other_cpk, Network::Bitcoin).to_string();
-        assert_eq!(verify_message_signature(&other_addr, msg, &sig), None);
+        assert_eq!(verify_message_signature(&other_addr, msg, &sig, Network::Bitcoin), None);
 
         // Garbage signature → None, not a panic.
-        assert_eq!(verify_message_signature(&addr, msg, "not-a-signature"), None);
+        assert_eq!(
+            verify_message_signature(&addr, msg, "not-a-signature", Network::Bitcoin),
+            None
+        );
     }
 }
