@@ -197,7 +197,7 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let Ok(addr) = AddressId::new(address) else {
+    let Ok(addr) = AddressId::new(bp_mining_job::normalize_btc_address(&address)) else {
         return Ok(Json(ByAddressResponse {
             verified: false,
             method: None,
@@ -241,7 +241,7 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let Ok(addr) = AddressId::new(address) else {
+    let Ok(addr) = AddressId::new(bp_mining_job::normalize_btc_address(&address)) else {
         return Ok(Json(VerifiedStatusResponse {
             verified: false,
             email_verified: false,
@@ -323,15 +323,19 @@ fn script_type_label(t: AddressType) -> &'static str {
 
 // ─── helpers ─────────────────────────────────────────────────────
 
-/// Parse + validate a mainnet BTC address into an `AddressId`. Rejects testnet
-/// / malformed addresses at the API boundary.
+/// Parse + validate a mainnet BTC address into a **canonical** `AddressId`.
+/// Rejects testnet / malformed addresses at the API boundary, then normalises
+/// via the single source of truth [`bp_mining_job::normalize_btc_address`]
+/// (lowercase bech32, preserve case-sensitive Base58) so the ownership row is
+/// keyed identically to what every verification gate looks up — otherwise a
+/// mixed-case Base58 (or upper-case bech32) proof would never match.
 fn parse_supported_address(raw: &str) -> Result<AddressId, ApiError> {
     let trimmed = raw.trim();
     Address::from_str(trimmed)
         .ok()
         .and_then(|a| a.require_network(Network::Bitcoin).ok())
         .ok_or_else(|| ownership_error("invalid-address", StatusCode::BAD_REQUEST))?;
-    AddressId::new(trimmed.to_string())
+    AddressId::new(bp_mining_job::normalize_btc_address(trimmed))
         .map_err(|_| ownership_error("invalid-address", StatusCode::BAD_REQUEST))
 }
 

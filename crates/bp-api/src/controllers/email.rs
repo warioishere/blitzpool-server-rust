@@ -65,7 +65,10 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let address = AddressId::new(body.address.trim().to_string())
+    // Canonicalise (lowercase bech32, preserve Base58) so the binding is keyed
+    // identically to what every verification gate looks up — otherwise a
+    // mixed-case Base58 / upper-case bech32 email binding would never match.
+    let address = AddressId::new(bp_mining_job::normalize_btc_address(&body.address))
         .map_err(|_| email_error("invalid-address", StatusCode::BAD_REQUEST))?;
     let email = body.email.trim().to_ascii_lowercase();
     if !is_email_shape(&email) {
@@ -195,8 +198,9 @@ where
     M: EmailHooks + 'static,
 {
     // Invalid address returns the empty shape since the lookup
-    // naturally returns null (no 4xx on bad address).
-    let Ok(addr) = AddressId::new(address) else {
+    // naturally returns null (no 4xx on bad address). Canonicalise so the
+    // lookup key matches the (canonical) stored binding.
+    let Ok(addr) = AddressId::new(bp_mining_job::normalize_btc_address(&address)) else {
         return Ok(Json(ByAddressResponse {
             email: None,
             verified_at: None,
