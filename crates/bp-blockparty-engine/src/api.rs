@@ -51,8 +51,6 @@ pub trait BlockpartyApi: Send + Sync {
         &self,
         group_id: Uuid,
     ) -> Result<Vec<BlockpartyMemberRow>, BlockpartyServiceError>;
-    async fn list_groups(&self) -> Result<Vec<BlockpartyGroupRow>, BlockpartyServiceError>;
-    async fn list_groups_public(&self) -> Result<Vec<BlockpartyGroupRow>, BlockpartyServiceError>;
     async fn get_history(
         &self,
         group_id: Uuid,
@@ -199,12 +197,6 @@ impl<H: BlockpartyHooks + 'static> BlockpartyApi for BlockpartyService<H> {
         group_id: Uuid,
     ) -> Result<Vec<BlockpartyMemberRow>, BlockpartyServiceError> {
         BlockpartyService::list_members(self, group_id).await
-    }
-    async fn list_groups(&self) -> Result<Vec<BlockpartyGroupRow>, BlockpartyServiceError> {
-        BlockpartyService::list_groups(self).await
-    }
-    async fn list_groups_public(&self) -> Result<Vec<BlockpartyGroupRow>, BlockpartyServiceError> {
-        BlockpartyService::list_groups_public(self).await
     }
     async fn get_history(
         &self,

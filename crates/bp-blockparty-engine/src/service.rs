@@ -255,17 +255,6 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(bp_db::list_blockparty_members_for_group(&self.pool, group_id).await?)
     }
 
-    pub async fn list_groups(&self) -> Result<Vec<BlockpartyGroupRow>, BlockpartyServiceError> {
-        Ok(bp_db::list_blockparty_groups(&self.pool).await?)
-    }
-
-    /// Non-dissolved subset — drives `/api/blockparty/public`.
-    pub async fn list_groups_public(
-        &self,
-    ) -> Result<Vec<BlockpartyGroupRow>, BlockpartyServiceError> {
-        Ok(bp_db::list_blockparty_groups_non_dissolved(&self.pool).await?)
-    }
-
     pub async fn get_history(
         &self,
         group_id: Uuid,

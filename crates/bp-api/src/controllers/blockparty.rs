@@ -216,8 +216,8 @@ where
 {
     Router::new()
         // ── Reads ────────────────────────────────────────────────
-        .route("/api/blockparty", get(list_groups::<H, M>))
-        .route("/api/blockparty/public", get(list_groups_public::<H, M>))
+        // NB: no public directory listing — blockparty is invite-only, so the
+        // group id is not enumerable. Detail/by-address need the id up front.
         .route(
             "/api/blockparty/by-address/:address",
             get(by_address::<H, M>),
@@ -267,30 +267,6 @@ where
 }
 
 // ─── Read handlers ─────────────────────────────────────────────────
-
-async fn list_groups<H, M>(
-    State(state): State<SharedState<H, M>>,
-) -> Result<Json<Vec<GroupPublicView>>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
-    let svc = require_blockparty(&state)?;
-    let rows = svc.list_groups().await?;
-    Ok(Json(rows.iter().map(GroupPublicView::from_row).collect()))
-}
-
-async fn list_groups_public<H, M>(
-    State(state): State<SharedState<H, M>>,
-) -> Result<Json<Vec<GroupPublicView>>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
-    let svc = require_blockparty(&state)?;
-    let rows = svc.list_groups_public().await?;
-    Ok(Json(rows.iter().map(GroupPublicView::from_row).collect()))
-}
 
 /// `{ groupId: null }` when no party found for this address;
 /// `{ groupId, groupName, status, role }` when matched. `untagged`

@@ -77,7 +77,7 @@ pub use blockparty::{
     find_blockparty_join_link_by_token, find_blockparty_join_link_for_group,
     find_blockparty_member_by_address, find_blockparty_member_in_group,
     insert_blockparty_block_history, insert_blockparty_group, insert_blockparty_member,
-    list_all_blockparty_members, list_blockparty_block_history, list_blockparty_groups,
+    list_all_blockparty_members, list_blockparty_block_history,
     list_blockparty_groups_non_dissolved, list_blockparty_members_for_group,
     update_blockparty_group_dissolved, update_blockparty_group_last_share_and_status,
     update_blockparty_group_rental_hint, update_blockparty_group_status,

@@ -114,27 +114,6 @@ pub async fn find_blockparty_group_by_admin_address(
     .map_err(DbError::from)
 }
 
-pub async fn list_blockparty_groups(pool: &PgPool) -> Result<Vec<BlockpartyGroupRow>, DbError> {
-    sqlx::query_as!(
-        BlockpartyGroupRow,
-        r#"SELECT
-            id AS "id!",
-            name AS "name!",
-            "adminAddress" AS "admin_address!: AddressId",
-            "adminTokenHash" AS "admin_token_hash!",
-            status AS "status!",
-            "lastShareAt" AS "last_share_at?",
-            "rentalProviderHint" AS "rental_provider_hint?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
-            "dissolvedAt" AS "dissolved_at?"
-           FROM blockparty_group ORDER BY "createdAt" ASC"#,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::from)
-}
-
 pub async fn list_blockparty_groups_non_dissolved(
     pool: &PgPool,
 ) -> Result<Vec<BlockpartyGroupRow>, DbError> {
