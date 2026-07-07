@@ -15,9 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_blockparty_engine::{
-    BlockpartyApi, BlockpartyHooks, BlockpartyInvitationApi, BlockpartyInvitationService,
-    BlockpartyInvitationServiceConfig, BlockpartyService, BlockpartyServiceConfig,
-    CoinbaseReservation,
+    BlockpartyApi, BlockpartyHooks, BlockpartyService, BlockpartyServiceConfig, CoinbaseReservation,
 };
 use bp_common::{AddressId, MiningMode, Sats, StreamKind};
 use bp_config::AppConfig;
@@ -28,7 +26,6 @@ use tracing::{info, warn};
 
 use crate::boot::FoundationHandles;
 use crate::group_service::SharedGroupService;
-use crate::hooks::ProductionHooks;
 
 /// Production [`BlockpartyHooks`] impl. Looks up verified email
 /// bindings against the same `pplns_address_email` table the
@@ -63,7 +60,6 @@ pub(crate) enum BlockpartySpawnError {
 #[allow(dead_code)]
 pub(crate) struct SharedBlockparty {
     pub(crate) service: Arc<dyn BlockpartyApi>,
-    pub(crate) invitations: Arc<dyn BlockpartyInvitationApi>,
     /// Membership reader — handed to `GroupService::set_blockparty_reader`
     /// so the PPLNS-group side rejects addresses already in a Blockparty.
     pub(crate) membership_reader: Arc<dyn bp_group_mgmt_engine::BlockpartyMembershipReader>,
@@ -75,7 +71,6 @@ pub(crate) async fn spawn(
     cfg: &AppConfig,
     foundation: &FoundationHandles,
     group_service: &SharedGroupService,
-    production_hooks: &ProductionHooks,
 ) -> Result<Option<SharedBlockparty>, BlockpartySpawnError> {
     let Some(bp_cfg) = cfg.blockparty.as_ref() else {
         info!("blockparty: feature disabled (no `[blockparty]` config block)");
@@ -126,22 +121,8 @@ pub(crate) async fn spawn(
     let membership_reader: Arc<dyn bp_group_mgmt_engine::BlockpartyMembershipReader> =
         Arc::new(concrete.cache());
 
-    // The invitation service reuses the existing MultiChannelInvitationEmail
-    // production hook — the URL template (`/#/blockparty/invite/<token>`)
-    // is owned by the service, not the hook, so a single SMTP impl can
-    // dispatch both group-mgmt and blockparty invitations.
-    let invitations_concrete = Arc::new(BlockpartyInvitationService::new(
-        foundation.db.pool().clone(),
-        concrete.clone(),
-        production_hooks.invitation_email.clone(),
-        BlockpartyInvitationServiceConfig {
-            pool_base_url: cfg.pool_base_url.clone(),
-        },
-    ));
-
     Ok(Some(SharedBlockparty {
         service: concrete,
-        invitations: invitations_concrete,
         membership_reader,
     }))
 }

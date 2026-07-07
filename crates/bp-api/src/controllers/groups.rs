@@ -55,11 +55,6 @@ where
     // router after the layer call), so this is the canonical pattern
     // for per-route auth in axum 0.7.
     let admin_routes = Router::new()
-        // ─── admin readers ───────────────────────────────────────
-        .route(
-            "/api/pplns/groups/:id/invitations",
-            get(list_invitations::<H, M>),
-        )
         // ─── admin writers ───────────────────────────────────────
         .route("/api/pplns/groups/:id/transfer", post(transfer::<H, M>))
         .route(
@@ -68,24 +63,12 @@ where
         )
         .route("/api/pplns/groups/:id", delete(dissolve::<H, M>))
         .route(
-            "/api/pplns/groups/:id/invitations",
-            post(create_invitation::<H, M>).layer(rate_limit::per_minute_layer(5)),
-        )
-        .route(
-            "/api/pplns/groups/:id/invitations/batch",
-            post(create_invitations_batch::<H, M>).layer(rate_limit::per_minute_layer(10)),
-        )
-        .route(
             // POST is rate-limited (5/min); DELETE sibling shares the path
             // but is added without the layer.
             "/api/pplns/groups/:id/invitations/open",
             post(create_open_invite::<H, M>)
                 .layer(rate_limit::per_minute_layer(5))
                 .delete(revoke_open_invite::<H, M>),
-        )
-        .route(
-            "/api/pplns/groups/:id/invitations/by-address/:address",
-            delete(cancel_invitation::<H, M>),
         )
         .route(
             "/api/pplns/groups/:id/members/:address",
@@ -545,118 +528,6 @@ where
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateInvitationBody {
-    address: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateInvitationResponse {
-    invited: bool,
-    email: String,
-    expires_at: String,
-}
-
-async fn create_invitation<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(id): Path<Uuid>,
-    Extension(auth): Extension<AdminAuth>,
-    Json(body): Json<CreateInvitationBody>,
-) -> Result<(StatusCode, Json<CreateInvitationResponse>), ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let inv_svc = require_invitation_service(&state)?;
-    let created = inv_svc
-        .create_invitation(id, &body.address, Some(&auth.admin_token))
-        .await
-        .map_err(crate::controllers::invitation::invitation_to_api_error)?;
-    invalidate_group_cache(&state, id).await;
-    Ok((
-        StatusCode::CREATED,
-        Json(CreateInvitationResponse {
-            invited: true,
-            email: crate::utils::mask_email(&created.email),
-            expires_at: crate::time_range::format_iso_ms(created.expires_at),
-        }),
-    ))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateInvitationsBatchBody {
-    addresses: Vec<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BatchInvited {
-    address: String,
-    email: String,
-    expires_at: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BatchSkipped {
-    address: String,
-    reason: &'static str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateInvitationsBatchResponse {
-    invited: Vec<BatchInvited>,
-    skipped: Vec<BatchSkipped>,
-}
-
-async fn create_invitations_batch<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(id): Path<Uuid>,
-    Extension(auth): Extension<AdminAuth>,
-    Json(body): Json<CreateInvitationsBatchBody>,
-) -> Result<Json<CreateInvitationsBatchResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let inv_svc = require_invitation_service(&state)?;
-    let token = Some(auth.admin_token.as_str());
-    // Dedup + normalize-ish before invoking — service will re-normalize
-    // internally but pre-dedup saves redundant DB hits on obvious dupes.
-    let mut seen = std::collections::HashSet::new();
-    let mut invited = Vec::new();
-    let mut skipped = Vec::new();
-    for addr in body.addresses {
-        let key = addr.trim().to_ascii_lowercase();
-        if !seen.insert(key.clone()) {
-            skipped.push(BatchSkipped {
-                address: addr,
-                reason: "duplicate-in-request",
-            });
-            continue;
-        }
-        match inv_svc.create_invitation(id, &addr, token).await {
-            Ok(c) => invited.push(BatchInvited {
-                address: addr,
-                email: crate::utils::mask_email(&c.email),
-                expires_at: crate::time_range::format_iso_ms(c.expires_at),
-            }),
-            Err(e) => skipped.push(BatchSkipped {
-                address: addr,
-                // The InvitationServiceError::code returns a &'static str
-                // for known variants — perfect for the reason field.
-                reason: e.code(),
-            }),
-        }
-    }
-    invalidate_group_cache(&state, id).await;
-    Ok(Json(CreateInvitationsBatchResponse { invited, skipped }))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CreateOpenInviteBody {
     /// `"1h"` / `"24h"` / `"7d"` / `"30d"`.
     ttl: String,
@@ -731,30 +602,6 @@ where
         .map_err(crate::controllers::invitation::invitation_to_api_error)?;
     invalidate_group_cache(&state, id).await;
     Ok(Json(OpenInviteRevokedResponse { revoked: true }))
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CancelledResponse {
-    cancelled: bool,
-}
-
-async fn cancel_invitation<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path((id, address)): Path<(Uuid, String)>,
-    Extension(auth): Extension<AdminAuth>,
-) -> Result<Json<CancelledResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let inv_svc = require_invitation_service(&state)?;
-    inv_svc
-        .cancel_invitation_by_address(id, &address, Some(&auth.admin_token))
-        .await
-        .map_err(crate::controllers::invitation::invitation_to_api_error)?;
-    invalidate_group_cache(&state, id).await;
-    Ok(Json(CancelledResponse { cancelled: true }))
 }
 
 #[derive(Serialize)]
@@ -901,7 +748,7 @@ where
 
 fn require_invitation_service<H, M>(
     state: &SharedState<H, M>,
-) -> Result<&bp_group_mgmt_engine::InvitationService<H, M>, ApiError>
+) -> Result<&bp_group_mgmt_engine::InvitationService<H>, ApiError>
 where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
@@ -1898,56 +1745,6 @@ where
                 })
                 .collect())
         })
-        .await?;
-    Ok(JsonBytes(bytes))
-}
-
-// ─── GET /api/groups/:id/invitations (admin) ─────────────────────
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PendingInvitationEntry {
-    address: Option<String>,
-    email: Option<String>,
-    created_at: String,
-    expires_at: String,
-    status: String,
-}
-
-async fn list_invitations<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(id): Path<Uuid>,
-    Extension(_auth): Extension<AdminAuth>,
-) -> Result<JsonBytes, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let key = format!("GROUP_INVITATIONS_{id}");
-    let s = state.clone();
-    let bytes = state
-        .cache
-        .get_or_fetch::<Vec<PendingInvitationEntry>, _, ApiError>(
-            key,
-            TtlKind::GroupInvitations,
-            async move {
-                let inv_svc = require_invitation_service(&s)?;
-                let rows = inv_svc
-                    .list_pending_for_group(id)
-                    .await
-                    .map_err(crate::controllers::invitation::invitation_to_api_error)?;
-                Ok(rows
-                    .into_iter()
-                    .map(|r| PendingInvitationEntry {
-                        address: r.address.map(|a| a.as_str().to_string()),
-                        email: r.email.as_deref().map(crate::utils::mask_email),
-                        created_at: crate::time_range::format_iso_ms(r.created_at),
-                        expires_at: crate::time_range::format_iso_ms(r.expires_at),
-                        status: r.status,
-                    })
-                    .collect())
-            },
-        )
         .await?;
     Ok(JsonBytes(bytes))
 }

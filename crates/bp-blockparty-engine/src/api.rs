@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Trait-object surfaces for the bp-api crate.
+//! Trait-object surface for the bp-api crate.
 //!
-//! `BlockpartyService<H>` and `BlockpartyInvitationService<H, M>` are
-//! generic over their hook traits, which makes them awkward to store in
-//! the generic `bp_api::AppState<H, M>` without forcing every existing
-//! handler to gain a third generic param. We hide the generics behind
-//! object-safe `#[async_trait]` traits — the api crate stores
+//! `BlockpartyService<H>` is generic over its hook trait, which makes it
+//! awkward to store in the generic `bp_api::AppState<H, M>` without forcing
+//! every existing handler to gain a third generic param. We hide the generic
+//! behind an object-safe `#[async_trait]` trait — the api crate stores
 //! `Option<Arc<dyn BlockpartyApi>>` and the dynamic dispatch cost is
 //! invisible next to the JSON / SQL roundtrips per request.
 
@@ -15,19 +14,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bp_common::{AddressId, Sats};
 use bp_db::{
-    BlockpartyBlockHistoryRow, BlockpartyGroupRow, BlockpartyInvitationRow, BlockpartyMemberRow,
-    BlockpartySplitSnapshot,
+    BlockpartyBlockHistoryRow, BlockpartyGroupRow, BlockpartyMemberRow, BlockpartySplitSnapshot,
 };
 use uuid::Uuid;
 
-use crate::error::{BlockpartyInvitationServiceError, BlockpartyServiceError};
+use crate::error::BlockpartyServiceError;
 use crate::hooks::BlockpartyHooks;
-use crate::invitation::{BlockpartyInvitationService, DirectedInvitationCreated};
-use crate::service::{
-    BlockpartyCreateResult, BlockpartyService, MarkMemberConfirmedResult, PendingPartyFeeRoute,
-};
+use crate::service::{BlockpartyCreateResult, BlockpartyService, PendingPartyFeeRoute};
 use bp_blockparty::{BlockpartyDistributionResult, BlockpartyStatus};
-use bp_group_mgmt_engine::EmailHooks;
 
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
@@ -76,13 +70,6 @@ pub trait BlockpartyApi: Send + Sync {
         admin_email: &str,
         admin_percent_bp: i32,
     ) -> Result<BlockpartyCreateResult, BlockpartyServiceError>;
-    async fn add_member(
-        &self,
-        group_id: Uuid,
-        member_address: &str,
-        percent_bp: i32,
-        token: Option<&str>,
-    ) -> Result<BlockpartyMemberRow, BlockpartyServiceError>;
     async fn create_join_link(
         &self,
         group_id: Uuid,
@@ -238,15 +225,6 @@ impl<H: BlockpartyHooks + 'static> BlockpartyApi for BlockpartyService<H> {
         BlockpartyService::create_group(self, name, admin_address, admin_email, admin_percent_bp)
             .await
     }
-    async fn add_member(
-        &self,
-        group_id: Uuid,
-        member_address: &str,
-        percent_bp: i32,
-        token: Option<&str>,
-    ) -> Result<BlockpartyMemberRow, BlockpartyServiceError> {
-        BlockpartyService::add_member(self, group_id, member_address, percent_bp, token).await
-    }
     async fn create_join_link(
         &self,
         group_id: Uuid,
@@ -371,117 +349,5 @@ impl<H: BlockpartyHooks + 'static> BlockpartyApi for BlockpartyService<H> {
             found_at,
         )
         .await
-    }
-}
-
-#[async_trait]
-pub trait BlockpartyInvitationApi: Send + Sync {
-    async fn get_by_token(
-        &self,
-        token: &str,
-    ) -> Result<
-        Option<(BlockpartyInvitationRow, BlockpartyGroupRow)>,
-        BlockpartyInvitationServiceError,
-    >;
-    async fn list_for_group(
-        &self,
-        group_id: Uuid,
-        admin_token: Option<&str>,
-    ) -> Result<Vec<BlockpartyInvitationRow>, BlockpartyInvitationServiceError>;
-    async fn create_invitation(
-        &self,
-        group_id: Uuid,
-        address: &str,
-        ttl_days: Option<i64>,
-        admin_token: Option<&str>,
-    ) -> Result<DirectedInvitationCreated, BlockpartyInvitationServiceError>;
-    async fn resend_invitation(
-        &self,
-        group_id: Uuid,
-        address: &str,
-        ttl_days: Option<i64>,
-        admin_token: Option<&str>,
-    ) -> Result<DirectedInvitationCreated, BlockpartyInvitationServiceError>;
-    async fn revoke(
-        &self,
-        group_id: Uuid,
-        token: &str,
-        admin_token: Option<&str>,
-    ) -> Result<(), BlockpartyInvitationServiceError>;
-    async fn accept(
-        &self,
-        token: &str,
-    ) -> Result<MarkMemberConfirmedResult, BlockpartyInvitationServiceError>;
-    async fn decline(&self, token: &str) -> Result<(), BlockpartyInvitationServiceError>;
-}
-
-#[async_trait]
-impl<H: BlockpartyHooks + 'static, M: EmailHooks + 'static> BlockpartyInvitationApi
-    for BlockpartyInvitationService<H, M>
-{
-    async fn get_by_token(
-        &self,
-        token: &str,
-    ) -> Result<
-        Option<(BlockpartyInvitationRow, BlockpartyGroupRow)>,
-        BlockpartyInvitationServiceError,
-    > {
-        BlockpartyInvitationService::get_by_token(self, token).await
-    }
-    async fn list_for_group(
-        &self,
-        group_id: Uuid,
-        admin_token: Option<&str>,
-    ) -> Result<Vec<BlockpartyInvitationRow>, BlockpartyInvitationServiceError> {
-        BlockpartyInvitationService::list_for_group(self, group_id, admin_token).await
-    }
-    async fn create_invitation(
-        &self,
-        group_id: Uuid,
-        address: &str,
-        ttl_days: Option<i64>,
-        admin_token: Option<&str>,
-    ) -> Result<DirectedInvitationCreated, BlockpartyInvitationServiceError> {
-        BlockpartyInvitationService::create_invitation(
-            self,
-            group_id,
-            address,
-            ttl_days,
-            admin_token,
-        )
-        .await
-    }
-    async fn resend_invitation(
-        &self,
-        group_id: Uuid,
-        address: &str,
-        ttl_days: Option<i64>,
-        admin_token: Option<&str>,
-    ) -> Result<DirectedInvitationCreated, BlockpartyInvitationServiceError> {
-        BlockpartyInvitationService::resend_invitation(
-            self,
-            group_id,
-            address,
-            ttl_days,
-            admin_token,
-        )
-        .await
-    }
-    async fn revoke(
-        &self,
-        group_id: Uuid,
-        token: &str,
-        admin_token: Option<&str>,
-    ) -> Result<(), BlockpartyInvitationServiceError> {
-        BlockpartyInvitationService::revoke(self, group_id, token, admin_token).await
-    }
-    async fn accept(
-        &self,
-        token: &str,
-    ) -> Result<MarkMemberConfirmedResult, BlockpartyInvitationServiceError> {
-        BlockpartyInvitationService::accept(self, token).await
-    }
-    async fn decline(&self, token: &str) -> Result<(), BlockpartyInvitationServiceError> {
-        BlockpartyInvitationService::decline(self, token).await
     }
 }

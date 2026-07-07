@@ -459,7 +459,7 @@ async fn main() -> ExitCode {
     };
 
     let blockparty =
-        match blockparty_service::spawn(&cfg, &handles, &group_service, &production_hooks).await {
+        match blockparty_service::spawn(&cfg, &handles, &group_service).await {
             Ok(bp) => bp,
             Err(err) => {
                 tracing::error!(%err, "blockparty spawn failed");

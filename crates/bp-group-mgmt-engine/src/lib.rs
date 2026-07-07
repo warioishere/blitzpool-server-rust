@@ -39,8 +39,7 @@ pub use hooks::{
     BlockpartyMembershipReader, GroupServiceHooks, MembershipChangeNotifier, NoopHooks,
 };
 pub use invitation::{
-    DirectedInvitationCreated, InvitationService, InvitationServiceConfig, OpenInviteActive,
-    OpenInviteCreated, OpenInvitePublicView, OpenInviteTtl, PendingForAddressView,
+    InvitationService, OpenInviteActive, OpenInviteCreated, OpenInvitePublicView, OpenInviteTtl,
 };
 pub use join_request::{
     JoinRequestLimits, JoinRequestService, JoinRequestServiceConfig,

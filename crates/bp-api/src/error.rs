@@ -46,11 +46,6 @@ pub enum ApiError {
         code: &'static str,
         status: StatusCode,
     },
-    #[error("blockparty-invitation: {code}")]
-    BlockpartyInvitation {
-        code: &'static str,
-        status: StatusCode,
-    },
     #[error("database error: {0}")]
     Db(#[from] bp_db::DbError),
     #[error("engine error: {0}")]
@@ -76,8 +71,7 @@ impl ApiError {
             Self::GroupService { code, .. }
             | Self::Invitation { code, .. }
             | Self::JoinRequest { code, .. }
-            | Self::Blockparty { code, .. }
-            | Self::BlockpartyInvitation { code, .. } => code,
+            | Self::Blockparty { code, .. } => code,
             Self::Db(_) | Self::PplnsEngine(_) | Self::GroupSoloEngine(_) | Self::Internal(_) => {
                 "internal-error"
             }
@@ -94,8 +88,7 @@ impl ApiError {
             Self::GroupService { status, .. }
             | Self::Invitation { status, .. }
             | Self::JoinRequest { status, .. }
-            | Self::Blockparty { status, .. }
-            | Self::BlockpartyInvitation { status, .. } => *status,
+            | Self::Blockparty { status, .. } => *status,
             Self::Db(_) | Self::PplnsEngine(_) | Self::GroupSoloEngine(_) | Self::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -238,46 +231,5 @@ impl From<bp_blockparty_engine::BlockpartyServiceError> for ApiError {
             B::Db(_) | B::Token(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError::Blockparty { code, status }
-    }
-}
-
-impl From<bp_blockparty_engine::BlockpartyInvitationServiceError> for ApiError {
-    fn from(e: bp_blockparty_engine::BlockpartyInvitationServiceError) -> Self {
-        use bp_blockparty_engine::BlockpartyInvitationServiceError as I;
-        // Inner Service-error pass-through: pick up the upstream code +
-        // status via the existing From impl rather than duplicating the
-        // mapping table.
-        if let I::Service(inner) = e {
-            return ApiError::from(inner);
-        }
-        let code: &'static str = match e.code() {
-            "invitation-not-found" => "invitation-not-found",
-            "invitation-not-pending" => "invitation-not-pending",
-            "invitation-pending" => "invitation-pending",
-            "invitation-expired" => "invitation-expired",
-            "invalid-address" => "invalid-address",
-            "email-not-verified" => "email-not-verified",
-            "group-dissolved" => "group-dissolved",
-            "already-member" => "already-member",
-            "address-in-blockparty" => "address-in-blockparty",
-            "config-missing" => "config-missing",
-            "email-send-failed" => "email-send-failed",
-            _ => "internal-error",
-        };
-        let status = match e {
-            I::NotFound => StatusCode::NOT_FOUND,
-            I::NotPending
-            | I::Pending
-            | I::AlreadyMember
-            | I::AddressInBlockparty
-            | I::GroupDissolved => StatusCode::CONFLICT,
-            I::Expired => StatusCode::GONE,
-            I::InvalidAddress => StatusCode::BAD_REQUEST,
-            I::EmailNotVerified => StatusCode::FAILED_DEPENDENCY,
-            I::ConfigMissing => StatusCode::INTERNAL_SERVER_ERROR,
-            I::EmailSendFailed(_) => StatusCode::BAD_GATEWAY,
-            I::Service(_) | I::Db(_) | I::Token(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        ApiError::BlockpartyInvitation { code, status }
     }
 }

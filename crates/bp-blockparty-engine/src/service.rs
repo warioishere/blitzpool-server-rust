@@ -812,19 +812,6 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(MarkMemberConfirmedResult { member_token })
     }
 
-    /// Clear a member's confirmedAt + memberTokenHash. Called by
-    /// invitation-resend so the next accept can mint a fresh token
-    /// when the original was lost.
-    pub async fn reset_member_onboarding(
-        &self,
-        group_id: Uuid,
-        address: &AddressId,
-    ) -> Result<(), BlockpartyServiceError> {
-        bp_db::reset_blockparty_member_onboarding(&self.pool, group_id, address, now_ms()).await?;
-        self.recompute_status(group_id).await?;
-        Ok(())
-    }
-
     /// Member-token-gated re-confirmation. Used by members to flip
     /// `confirmedAt` back to non-null after an admin splits-edit reset
     /// their confirmation. Does NOT mint a new token — the persistent

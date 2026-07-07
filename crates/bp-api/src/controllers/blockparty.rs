@@ -15,8 +15,7 @@ use axum::{
 use bp_blockparty::BlockpartyStatus;
 use bp_common::AddressId;
 use bp_db::{
-    BlockpartyBlockHistoryRow, BlockpartyGroupRow, BlockpartyInvitationRow, BlockpartyMemberRow,
-    BlockpartySplitSnapshot,
+    BlockpartyBlockHistoryRow, BlockpartyGroupRow, BlockpartyMemberRow, BlockpartySplitSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -99,55 +98,6 @@ impl MemberPublicView {
     }
 }
 
-/// Member shape embedded in the public invitation view: roster + splits
-/// only, no contact details. The invitee sees who is in and at what
-/// percentage before accepting.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InviteMemberView {
-    address: String,
-    percent_bp: i32,
-    role: String,
-    confirmed: bool,
-}
-
-impl InviteMemberView {
-    fn from_row(r: &BlockpartyMemberRow) -> Self {
-        Self {
-            address: r.address.as_str().to_owned(),
-            percent_bp: r.percent_bp,
-            role: r.role.clone(),
-            confirmed: r.confirmed_at.is_some(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InvitationAdminView {
-    token: String,
-    address: String,
-    email: String,
-    status: String,
-    created_at: i64,
-    expires_at: i64,
-    responded_at: Option<i64>,
-}
-
-impl InvitationAdminView {
-    fn from_row(r: BlockpartyInvitationRow) -> Self {
-        Self {
-            token: r.token,
-            address: r.address.into_inner(),
-            email: mask_email(&r.email),
-            status: r.status,
-            created_at: r.created_at,
-            expires_at: r.expires_at,
-            responded_at: r.responded_at,
-        }
-    }
-}
-
 /// History row shape — drops `id`, `groupId`, `createdAt` from the
 /// stored row (those are internal).
 #[derive(Serialize)]
@@ -210,21 +160,6 @@ where
         .ok_or(ApiError::Unavailable("blockparty-service not wired"))
 }
 
-fn require_blockparty_invitations<H, M>(
-    state: &SharedState<H, M>,
-) -> Result<&dyn bp_blockparty_engine::BlockpartyInvitationApi, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
-    state
-        .blockparty_invitations
-        .as_deref()
-        .ok_or(ApiError::Unavailable(
-            "blockparty-invitation-service not wired",
-        ))
-}
-
 fn normalize(addr: &str) -> Result<AddressId, ApiError> {
     AddressId::new(addr.trim().to_ascii_lowercase()).map_err(|_| ApiError::InvalidAddress)
 }
@@ -256,10 +191,6 @@ where
         .route("/api/blockparty/:id", get(detail::<H, M>))
         .route("/api/blockparty/:id/history", get(history::<H, M>))
         .route(
-            "/api/blockparty/:id/invitations",
-            get(list_invitations::<H, M>),
-        )
-        .route(
             "/api/blockparty/:id/member-view/:address",
             get(member_view::<H, M>),
         )
@@ -270,7 +201,6 @@ where
             "/api/blockparty/:id/rental-hint",
             patch(update_rental_hint::<H, M>),
         )
-        .route("/api/blockparty/:id/members", post(add_member::<H, M>))
         .route(
             "/api/blockparty/:id/join-link",
             post(create_join_link::<H, M>).delete(revoke_join_link::<H, M>),
@@ -280,40 +210,18 @@ where
             get(get_join_context::<H, M>).post(join_via_link::<H, M>),
         )
         .route(
-            "/api/blockparty/:id/members/batch",
-            post(add_members_batch::<H, M>),
-        )
-        .route(
             "/api/blockparty/:id/members/:address",
             delete(remove_member::<H, M>),
-        )
-        .route(
-            "/api/blockparty/:id/members/:address/resend-invitation",
-            post(resend_invitation::<H, M>),
         )
         .route(
             "/api/blockparty/:id/transition-confirming",
             post(transition_confirming::<H, M>),
         )
         .route("/api/blockparty/:id/dissolve", post(dissolve::<H, M>))
-        .route(
-            "/api/blockparty/:id/invitations/:token",
-            delete(revoke_invitation::<H, M>),
-        )
         // ── Member-token gated ───────────────────────────────────
         .route(
             "/api/blockparty/:id/members/:address/reconfirm",
             post(reconfirm_member::<H, M>),
-        )
-        // ── Invitation (public; token IS the auth) ───────────────
-        .route("/api/blockparty/invite/:token", get(get_invitation::<H, M>))
-        .route(
-            "/api/blockparty/invite/:token/accept",
-            post(accept_invitation::<H, M>),
-        )
-        .route(
-            "/api/blockparty/invite/:token/decline",
-            post(decline_invitation::<H, M>),
         )
 }
 
@@ -433,26 +341,6 @@ where
     let svc = require_blockparty(&state)?;
     let rows = svc.get_history(id).await?;
     Ok(Json(rows.into_iter().map(HistoryRowView::from).collect()))
-}
-
-async fn list_invitations<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(id): Path<Uuid>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<InvitationAdminView>>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
-    let inv = require_blockparty_invitations(&state)?;
-    let rows = inv
-        .list_for_group(id, admin_token(&headers).as_deref())
-        .await?;
-    Ok(Json(
-        rows.into_iter()
-            .map(InvitationAdminView::from_row)
-            .collect(),
-    ))
 }
 
 async fn member_view<H, M>(
@@ -604,58 +492,6 @@ where
     Ok(Json(&OK))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AddMemberBody {
-    address: String,
-    percent_bp: i32,
-    #[serde(default)]
-    #[allow(dead_code)]
-    email: Option<String>,
-    #[serde(default)]
-    ttl_days: Option<i64>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AddMemberResponse {
-    member: MemberPublicView,
-    /// One-shot — admin shares this out-of-band with the member.
-    invite_token: String,
-}
-
-async fn add_member<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(id): Path<Uuid>,
-    headers: HeaderMap,
-    Json(body): Json<AddMemberBody>,
-) -> Result<Json<AddMemberResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
-    let svc = require_blockparty(&state)?;
-    let inv = require_blockparty_invitations(&state)?;
-    let token = admin_token(&headers);
-    let member = svc
-        .add_member(id, &body.address, body.percent_bp, token.as_deref())
-        .await?;
-    let invitation = inv
-        .create_invitation(id, &body.address, body.ttl_days, token.as_deref())
-        .await?;
-    Ok(Json(AddMemberResponse {
-        member: MemberPublicView {
-            address: member.address.as_str().to_owned(),
-            email: mask_email(&member.email),
-            percent_bp: member.percent_bp,
-            role: member.role,
-            // Freshly added members are never auto-confirmed.
-            confirmed: false,
-        },
-        invite_token: invitation.token,
-    }))
-}
-
 // ─── Self-service join link ──────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -766,116 +602,6 @@ where
     }))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BatchMembersBody {
-    members: Option<Vec<BatchMemberInput>>,
-    #[serde(default)]
-    ttl_days: Option<i64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BatchMemberInput {
-    address: String,
-    percent_bp: i32,
-    #[serde(default)]
-    #[allow(dead_code)]
-    email: Option<String>,
-}
-
-/// Per-row result for `POST /:id/members/batch`.
-/// `{ address, ok: true, inviteToken } | { address, ok: false, code, message }`
-#[derive(Serialize)]
-#[serde(untagged)]
-enum BatchMemberResult {
-    Ok {
-        address: String,
-        ok: bool, // always true
-        #[serde(rename = "inviteToken")]
-        invite_token: String,
-    },
-    Err {
-        address: String,
-        ok: bool, // always false
-        code: &'static str,
-        message: String,
-    },
-}
-
-#[derive(Serialize)]
-struct BatchMembersResponse {
-    results: Vec<BatchMemberResult>,
-}
-
-async fn add_members_batch<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(id): Path<Uuid>,
-    headers: HeaderMap,
-    Json(body): Json<BatchMembersBody>,
-) -> Result<Json<BatchMembersResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
-    let svc = require_blockparty(&state)?;
-    let inv = require_blockparty_invitations(&state)?;
-    let inputs = body.members.unwrap_or_default();
-    if inputs.is_empty() {
-        return Err(ApiError::BadRequest("no-members"));
-    }
-    let token = admin_token(&headers);
-    // Process one-by-one — a single bad input returns a structured
-    // partial result rather than rolling back valid invites.
-    let mut results = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        match process_batch_one(svc, inv, id, &input, body.ttl_days, token.as_deref()).await {
-            Ok(invite_token) => results.push(BatchMemberResult::Ok {
-                address: input.address,
-                ok: true,
-                invite_token,
-            }),
-            Err(err) => results.push(BatchMemberResult::Err {
-                address: input.address,
-                ok: false,
-                code: err.code,
-                message: err.message,
-            }),
-        }
-    }
-    Ok(Json(BatchMembersResponse { results }))
-}
-
-struct BatchErr {
-    code: &'static str,
-    message: String,
-}
-
-async fn process_batch_one(
-    svc: &dyn bp_blockparty_engine::BlockpartyApi,
-    inv: &dyn bp_blockparty_engine::BlockpartyInvitationApi,
-    group_id: Uuid,
-    input: &BatchMemberInput,
-    ttl_days: Option<i64>,
-    token: Option<&str>,
-) -> Result<String, BatchErr> {
-    let member = svc
-        .add_member(group_id, &input.address, input.percent_bp, token)
-        .await
-        .map_err(|e| BatchErr {
-            code: e.code(),
-            message: e.to_string(),
-        })?;
-    let invitation = inv
-        .create_invitation(group_id, member.address.as_str(), ttl_days, token)
-        .await
-        .map_err(|e| BatchErr {
-            code: e.code(),
-            message: e.to_string(),
-        })?;
-    Ok(invitation.token)
-}
-
 async fn remove_member<H, M>(
     State(state): State<SharedState<H, M>>,
     Path((id, address)): Path<(Uuid, String)>,
@@ -889,33 +615,6 @@ where
     svc.remove_member(id, &address, admin_token(&headers).as_deref())
         .await?;
     Ok(Json(&OK))
-}
-
-#[derive(Serialize)]
-struct ResendResponse {
-    ok: bool,
-    resent: bool,
-}
-
-async fn resend_invitation<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path((id, address)): Path<(Uuid, String)>,
-    headers: HeaderMap,
-) -> Result<Json<ResendResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
-    let inv = require_blockparty_invitations(&state)?;
-    // The invitation service gates through admin-token-gated path
-    // inside resend_invitation — safe to call directly.
-    let r = inv
-        .resend_invitation(id, &address, None, admin_token(&headers).as_deref())
-        .await?;
-    Ok(Json(ResendResponse {
-        ok: true,
-        resent: r.resent,
-    }))
 }
 
 #[derive(Serialize)]
@@ -946,21 +645,6 @@ where
     }))
 }
 
-async fn revoke_invitation<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path((id, token_path)): Path<(Uuid, String)>,
-    headers: HeaderMap,
-) -> Result<Json<&'static Ok>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
-    let inv = require_blockparty_invitations(&state)?;
-    inv.revoke(id, &token_path, admin_token(&headers).as_deref())
-        .await?;
-    Ok(Json(&OK))
-}
-
 // ─── Member-token gated ────────────────────────────────────────────
 
 async fn reconfirm_member<H, M>(
@@ -976,108 +660,6 @@ where
     let addr = normalize(&address)?;
     svc.confirm_as_member(id, &addr, member_token(&headers).as_deref())
         .await?;
-    Ok(Json(&OK))
-}
-
-// ─── Public invitation handlers (token IS the auth) ───────────────
-
-/// Public invitation view. `groupName` flattened in, `members[]` summary
-/// embedded, `poolFeePercent` echoed back. Effective status replaces a
-/// `pending` row with `expired` when `expiresAt` is in the past.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InvitationView {
-    token: String,
-    group_id: Uuid,
-    group_name: String,
-    address: String,
-    email: String,
-    status: String,
-    expires_at: i64,
-    members: Vec<InviteMemberView>,
-    pool_fee_percent: f64,
-}
-
-async fn get_invitation<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(token_path): Path<String>,
-) -> Result<Json<InvitationView>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
-    let svc = require_blockparty(&state)?;
-    let inv = require_blockparty_invitations(&state)?;
-    let (invitation, group) =
-        inv.get_by_token(&token_path)
-            .await?
-            .ok_or_else(|| ApiError::Blockparty {
-                code: "invitation-not-found",
-                status: StatusCode::NOT_FOUND,
-            })?;
-    let members = svc.list_members(group.id).await?;
-    let effective_status = compute_effective_invitation_status(&invitation).to_owned();
-    Ok(Json(InvitationView {
-        token: invitation.token,
-        group_id: invitation.group_id,
-        group_name: group.name,
-        address: invitation.address.into_inner(),
-        email: invitation.email,
-        status: effective_status,
-        expires_at: invitation.expires_at,
-        members: members.iter().map(InviteMemberView::from_row).collect(),
-        pool_fee_percent: svc.pool_fee_percent(),
-    }))
-}
-
-/// Returns `"expired"` for pending rows whose `expiresAt` is in the past.
-fn compute_effective_invitation_status(row: &BlockpartyInvitationRow) -> &str {
-    if row.status != "pending" {
-        return row.status.as_str();
-    }
-    let now = chrono::Utc::now().timestamp_millis();
-    if row.expires_at < now {
-        "expired"
-    } else {
-        "pending"
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AcceptResponse {
-    ok: bool,
-    /// Persistent member token — surfaces exactly once. `None` when
-    /// the accept was idempotent (member already had a token).
-    member_token: Option<String>,
-}
-
-async fn accept_invitation<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(token_path): Path<String>,
-) -> Result<Json<AcceptResponse>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
-    let inv = require_blockparty_invitations(&state)?;
-    let r = inv.accept(&token_path).await?;
-    Ok(Json(AcceptResponse {
-        ok: true,
-        member_token: r.member_token,
-    }))
-}
-
-async fn decline_invitation<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(token_path): Path<String>,
-) -> Result<Json<&'static Ok>, ApiError>
-where
-    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
-    M: bp_group_mgmt_engine::EmailHooks + 'static,
-{
-    let inv = require_blockparty_invitations(&state)?;
-    inv.decline(&token_path).await?;
     Ok(Json(&OK))
 }
 

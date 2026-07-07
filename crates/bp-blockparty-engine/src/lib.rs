@@ -15,18 +15,14 @@ mod api;
 mod cache;
 mod error;
 mod hooks;
-mod invitation;
 mod service;
 mod util;
 
-pub use api::{BlockpartyApi, BlockpartyInvitationApi};
+pub use api::BlockpartyApi;
 
 pub use cache::{AdminCacheEntry, BlockpartyCache};
-pub use error::{BlockpartyInvitationServiceError, BlockpartyServiceError};
+pub use error::BlockpartyServiceError;
 pub use hooks::{BlockpartyHooks, NoopHooks};
-pub use invitation::{
-    BlockpartyInvitationService, BlockpartyInvitationServiceConfig, DirectedInvitationCreated,
-};
 pub use service::{
     BlockpartyCreateResult, BlockpartyService, BlockpartyServiceConfig, CoinbaseReservation,
     MarkMemberConfirmedResult, PendingPartyFeeRoute,

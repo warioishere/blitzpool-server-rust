@@ -20,9 +20,7 @@ use std::sync::Arc;
 
 use bp_api::{build_router, response_cache::ResponseCache, AppState};
 use bp_config::AppConfig;
-use bp_group_mgmt_engine::{
-    InvitationService, InvitationServiceConfig, JoinRequestService, JoinRequestServiceConfig,
-};
+use bp_group_mgmt_engine::{InvitationService, JoinRequestService, JoinRequestServiceConfig};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -110,14 +108,7 @@ fn build_app_state(
 ) -> Arc<AppState<ProductionGroupServiceHooks, SmtpInvitationEmailHooks>> {
     let pool = foundation.db.pool().clone();
     let group_service = group_service.service.clone();
-    let invitation_service = Arc::new(InvitationService::new(
-        pool.clone(),
-        group_service.clone(),
-        production_hooks.invitation_email.clone(),
-        InvitationServiceConfig {
-            pool_base_url: cfg.pool_base_url.clone(),
-        },
-    ));
+    let invitation_service = Arc::new(InvitationService::new(pool.clone(), group_service.clone()));
     let join_request_service = Arc::new(JoinRequestService::new(
         pool.clone(),
         group_service.clone(),
@@ -144,7 +135,6 @@ fn build_app_state(
         invitation_service: Some(invitation_service),
         join_request_service: Some(join_request_service),
         blockparty: blockparty.map(|bp| bp.service.clone()),
-        blockparty_invitations: blockparty.map(|bp| bp.invitations.clone()),
         tdp: tdp_clone,
         tdp_staleness_threshold_ms: (cfg.tdp.staleness_threshold_secs as i64) * 1000,
         bitcoin_rpc: bitcoin_rpc_arc,

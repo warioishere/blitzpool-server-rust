@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use bp_bitcoin::BitcoinRpc;
-use bp_blockparty_engine::{BlockpartyApi, BlockpartyInvitationApi};
+use bp_blockparty_engine::BlockpartyApi;
 use bp_geoip::GeoIpServiceHandle;
 use bp_group_mgmt_engine::{
     EmailHooks, GroupService, GroupServiceHooks, InvitationService, JoinRequestService,
@@ -39,12 +39,11 @@ pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     pub pplns: Option<Arc<PplnsEngine>>,
     pub group_solo: Option<Arc<GroupSoloEngine>>,
     pub group_service: Option<Arc<GroupService<H>>>,
-    pub invitation_service: Option<Arc<InvitationService<H, M>>>,
+    pub invitation_service: Option<Arc<InvitationService<H>>>,
     pub join_request_service: Option<Arc<JoinRequestService<H, M>>>,
     /// Blockparty service handle, type-erased so the bp-api AppState
     /// doesn't need a third generic param for `BlockpartyHooks`.
     pub blockparty: Option<Arc<dyn BlockpartyApi>>,
-    pub blockparty_invitations: Option<Arc<dyn BlockpartyInvitationApi>>,
     pub tdp: Option<TdpHandle>,
     /// Age (ms) past which the TDP snapshot's last template/prev-hash is
     /// reported stale by `/api/health`. Fed from `[tdp]
@@ -102,7 +101,6 @@ impl<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> AppState<H, M> {
             invitation_service: None,
             join_request_service: None,
             blockparty: None,
-            blockparty_invitations: None,
             tdp: None,
             tdp_staleness_threshold_ms: 120_000,
             bitcoin_rpc: None,

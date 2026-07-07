@@ -191,7 +191,7 @@ async fn invitation_returns_503_when_service_unwired() {
     let resp = router
         .oneshot(
             Request::builder()
-                .uri("/api/pplns/invitations/by-address/test_addr")
+                .uri("/api/pplns/invitations/open/some-token")
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )
@@ -320,17 +320,19 @@ async fn invitation_accept_returns_503_when_service_unwired() {
         return;
     };
     let router = build_router(minimal_state(pool));
-    // `/api/pplns/invitations/:token/accept` is rate-limited (20/min);
+    // `/api/pplns/invitations/open/:token/accept` is rate-limited (10/min);
     // SmartIpKeyExtractor needs an IP source — set the proxy-style
     // header so the layer can key by client IP instead of erroring
-    // with 500.
+    // with 500. A valid JSON body clears the extractor so the handler
+    // reaches the service-unwired 503.
     let resp = router
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/pplns/invitations/some-token/accept")
+                .uri("/api/pplns/invitations/open/some-token/accept")
                 .header("x-forwarded-for", "127.0.0.1")
-                .body(axum::body::Body::empty())
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"address":"test_addr"}"#))
                 .unwrap(),
         )
         .await

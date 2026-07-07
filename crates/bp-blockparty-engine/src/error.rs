@@ -71,62 +71,6 @@ pub enum BlockpartyServiceError {
     Token(#[from] bp_group_mgmt::TokenError),
 }
 
-/// Errors thrown by the invitation service.
-#[derive(Debug, thiserror::Error)]
-pub enum BlockpartyInvitationServiceError {
-    #[error("invitation not found")]
-    NotFound,
-    #[error("invitation is not pending (already accepted/declined/expired)")]
-    NotPending,
-    #[error("invitation for this address already pending")]
-    Pending,
-    #[error("invitation expired")]
-    Expired,
-    #[error("address is invalid or missing")]
-    InvalidAddress,
-    #[error("address has no verified email binding")]
-    EmailNotVerified,
-    #[error("group has been dissolved")]
-    GroupDissolved,
-    #[error("address is already a member of this blockparty")]
-    AlreadyMember,
-    #[error("address is already a member of another blockparty")]
-    AddressInBlockparty,
-    #[error("required configuration is missing (POOL_BASE_URL)")]
-    ConfigMissing,
-    #[error("email send failed: {0}")]
-    EmailSendFailed(String),
-    #[error("blockparty service error: {0}")]
-    Service(#[from] BlockpartyServiceError),
-    #[error("database error: {0}")]
-    Db(#[from] bp_db::DbError),
-    #[error("token CSPRNG failure: {0}")]
-    Token(#[from] bp_group_mgmt::TokenError),
-}
-
-impl BlockpartyInvitationServiceError {
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::NotFound => "invitation-not-found",
-            Self::NotPending => "invitation-not-pending",
-            Self::Pending => "invitation-pending",
-            Self::Expired => "invitation-expired",
-            Self::InvalidAddress => "invalid-address",
-            Self::EmailNotVerified => "email-not-verified",
-            Self::GroupDissolved => "group-dissolved",
-            Self::AlreadyMember => "already-member",
-            Self::AddressInBlockparty => "address-in-blockparty",
-            Self::ConfigMissing => "config-missing",
-            Self::EmailSendFailed(_) => "email-send-failed",
-            // Surface the inner BlockpartyServiceError code verbatim so
-            // the UI sees the same vocabulary regardless of which layer
-            // tripped.
-            Self::Service(e) => e.code(),
-            Self::Db(_) | Self::Token(_) => "internal-error",
-        }
-    }
-}
-
 impl BlockpartyServiceError {
     /// Stable wire-code. The HTTP layer maps these to status codes;
     /// the UI surfaces them verbatim.

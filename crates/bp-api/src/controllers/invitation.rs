@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `/api/pplns/invitations/*` — directed + open invitation reader endpoints.
-//!
-//! Writer endpoints (accept/decline/open-accept) are in `controllers/groups.rs`.
+//! `/api/pplns/invitations/*` — open-invite reader + accept endpoints.
 
 use axum::{
     extract::{Path, State},
@@ -25,25 +23,12 @@ where
 {
     Router::new()
         .route(
-            "/api/pplns/invitations/by-address/:address",
-            get(by_address::<H, M>),
-        )
-        .route(
             "/api/pplns/invitations/open/:token",
             get(open_public::<H, M>),
         )
         .route(
             "/api/pplns/invitations/open/:token/accept",
             post(accept_open::<H, M>).layer(rate_limit::per_minute_layer(10)),
-        )
-        .route("/api/pplns/invitations/:token", get(get_token::<H, M>))
-        .route(
-            "/api/pplns/invitations/:token/accept",
-            post(accept::<H, M>).layer(rate_limit::per_minute_layer(20)),
-        )
-        .route(
-            "/api/pplns/invitations/:token/decline",
-            post(decline::<H, M>).layer(rate_limit::per_minute_layer(20)),
         )
 }
 
@@ -57,43 +42,6 @@ struct MemberCreatedResponse {
     /// ISO-8601 millisecond-precision timestamp.
     joined_at: String,
     group_id: Uuid,
-}
-
-async fn accept<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(token): Path<String>,
-) -> Result<Json<MemberCreatedResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let svc = require_invitation(&state)?;
-    let member = svc.accept(&token).await.map_err(invitation_to_api_error)?;
-    Ok(Json(MemberCreatedResponse {
-        address: member.address.as_str().to_string(),
-        role: member.role,
-        joined_at: crate::time_range::format_iso_ms(member.joined_at),
-        group_id: member.group_id,
-    }))
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OkResponse {
-    ok: bool,
-}
-
-async fn decline<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(token): Path<String>,
-) -> Result<Json<OkResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let svc = require_invitation(&state)?;
-    svc.decline(&token).await.map_err(invitation_to_api_error)?;
-    Ok(Json(OkResponse { ok: true }))
 }
 
 #[derive(Deserialize)]
@@ -126,7 +74,7 @@ where
 
 fn require_invitation<H, M>(
     state: &SharedState<H, M>,
-) -> Result<&bp_group_mgmt_engine::InvitationService<H, M>, ApiError>
+) -> Result<&bp_group_mgmt_engine::InvitationService<H>, ApiError>
 where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
@@ -135,96 +83,6 @@ where
         .invitation_service
         .as_deref()
         .ok_or(ApiError::Unavailable("invitation-service not wired"))
-}
-
-// ─── GET /api/invitations/by-address/:address ────────────────────
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PendingForAddressEntry {
-    group_id: Uuid,
-    group_name: String,
-    inviter_address: String,
-    masked_email: String,
-    /// ISO-8601 millisecond timestamp.
-    created_at: String,
-    expires_at: String,
-}
-
-async fn by_address<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(address): Path<String>,
-) -> Result<Json<Vec<PendingForAddressEntry>>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let svc = require_invitation(&state)?;
-    let entries = svc
-        .list_pending_for_address(&address)
-        .await
-        .map_err(invitation_to_api_error)?;
-    Ok(Json(
-        entries
-            .into_iter()
-            .map(|e| PendingForAddressEntry {
-                group_id: e.group_id,
-                group_name: e.group_name,
-                inviter_address: e.inviter_address.as_str().to_string(),
-                masked_email: e.masked_email,
-                created_at: crate::time_range::format_iso_ms(e.created_at),
-                expires_at: crate::time_range::format_iso_ms(e.expires_at),
-            })
-            .collect(),
-    ))
-}
-
-// ─── GET /api/invitations/:token ─────────────────────────────────
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InvitationByTokenResponse {
-    token: String,
-    group_id: Uuid,
-    group_name: String,
-    inviter_address: String,
-    /// Populated for directed invites; `null` for open invitations
-    /// (the row carries no pre-bound address).
-    address: Option<String>,
-    email: Option<String>,
-    status: String,
-    /// ISO-8601 millisecond timestamp.
-    created_at: String,
-    expires_at: String,
-    responded_at: Option<String>,
-}
-
-async fn get_token<H, M>(
-    State(state): State<SharedState<H, M>>,
-    Path(token): Path<String>,
-) -> Result<Json<InvitationByTokenResponse>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let svc = require_invitation(&state)?;
-    let (invitation, group) = svc
-        .get_by_token(&token)
-        .await
-        .map_err(invitation_to_api_error)?
-        .ok_or(ApiError::NotFound)?;
-    Ok(Json(InvitationByTokenResponse {
-        token: invitation.token,
-        group_id: group.id,
-        group_name: group.name,
-        inviter_address: group.creator_address.as_str().to_string(),
-        address: invitation.address.map(|a| a.as_str().to_string()),
-        email: invitation.email,
-        status: invitation.status,
-        created_at: crate::time_range::format_iso_ms(invitation.created_at),
-        expires_at: crate::time_range::format_iso_ms(invitation.expires_at),
-        responded_at: crate::time_range::format_iso_ms_opt(invitation.responded_at),
-    }))
 }
 
 // ─── GET /api/invitations/open/:token ────────────────────────────
