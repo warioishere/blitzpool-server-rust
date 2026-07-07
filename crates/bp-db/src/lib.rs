@@ -86,6 +86,7 @@ pub use blockparty::{
     update_blockparty_member_percent_bp, upsert_blockparty_join_link, BlockpartyBlockHistoryRow,
     BlockpartyGroupRow, BlockpartyInvitationRow, BlockpartyJoinLinkRow, BlockpartyMemberRow,
     BlockpartySplitSnapshot, delete_blockparty_join_link, find_blockparty_join_link_by_token,
+    find_blockparty_join_link_for_group,
 };
 pub use client::{
     bulk_set_client_hashrate, bulk_touch_clients_for_share, delete_client_for_session,

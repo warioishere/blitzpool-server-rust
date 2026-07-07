@@ -845,3 +845,22 @@ pub async fn find_blockparty_join_link_by_token(
     .await
     .map_err(DbError::from)
 }
+
+/// The single active join link for a group (admin readback), or `None`.
+pub async fn find_blockparty_join_link_for_group(
+    pool: &PgPool,
+    group_id: Uuid,
+) -> Result<Option<BlockpartyJoinLinkRow>, DbError> {
+    sqlx::query_as!(
+        BlockpartyJoinLinkRow,
+        r#"SELECT
+            "groupId" AS "group_id!",
+            token AS "token!",
+            "expiresAt" AS "expires_at!"
+           FROM blockparty_join_link WHERE "groupId" = $1 LIMIT 1"#,
+        group_id,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::from)
+}

@@ -550,6 +550,21 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(())
     }
 
+    /// Admin readback of the group's active (non-expired) join link, or `None`.
+    /// Admin-gated. Returns `(token, expires_at)` so the admin UI can re-display
+    /// the shareable link + its expiry without minting a fresh one.
+    pub async fn active_join_link(
+        &self,
+        group_id: Uuid,
+        token: Option<&str>,
+    ) -> Result<Option<(String, i64)>, BlockpartyServiceError> {
+        let _ = self.require_admin_token(group_id, token).await?;
+        let link = bp_db::find_blockparty_join_link_for_group(&self.pool, group_id).await?;
+        Ok(link
+            .filter(|l| l.expires_at >= now_ms())
+            .map(|l| (l.token, l.expires_at)))
+    }
+
     /// Self-service join via a shared link. No admin token — the joining address
     /// proves itself (verified email OR signature ownership). Adds the member
     /// unconfirmed with a 0 % placeholder split (the admin assigns it) and mints

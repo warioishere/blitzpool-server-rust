@@ -67,22 +67,32 @@ struct MemberPublicView {
     percent_bp: i32,
     role: String,
     confirmed: bool,
+    /// How the member proved ownership — `"email"` or `"signature"`. Lets the
+    /// admin roster show a "verified via signature" badge for email-less
+    /// members. `None` only for the (legacy) case of no verification on record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_via: Option<&'static str>,
 }
 
 impl MemberPublicView {
-    fn from_row_masked(r: &BlockpartyMemberRow) -> Self {
+    fn from_row_masked(r: &BlockpartyMemberRow, verified_via: Option<&'static str>) -> Self {
         Self {
             address: r.address.as_str().to_owned(),
             email: mask_email(&r.email),
             percent_bp: r.percent_bp,
             role: r.role.clone(),
             confirmed: r.confirmed_at.is_some(),
+            verified_via,
         }
     }
 
     /// `member-view` variant: members see their own email unmasked but
     /// other members' emails masked.
-    fn from_row_for_viewer(r: &BlockpartyMemberRow, viewer: &AddressId) -> Self {
+    fn from_row_for_viewer(
+        r: &BlockpartyMemberRow,
+        viewer: &AddressId,
+        verified_via: Option<&'static str>,
+    ) -> Self {
         let own = r.address == *viewer;
         Self {
             address: r.address.as_str().to_owned(),
@@ -94,7 +104,30 @@ impl MemberPublicView {
             percent_bp: r.percent_bp,
             role: r.role.clone(),
             confirmed: r.confirmed_at.is_some(),
+            verified_via,
         }
+    }
+}
+
+/// Verification method for a blockparty member — a non-empty snapshot email
+/// (captured from a verified binding at join) reads as `"email"`; otherwise a
+/// signature ownership proof reads as `"signature"`. `None` only for a member
+/// with neither on record.
+async fn member_verified_via<H, M>(
+    state: &SharedState<H, M>,
+    m: &BlockpartyMemberRow,
+) -> Result<Option<&'static str>, ApiError>
+where
+    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
+    M: bp_group_mgmt_engine::EmailHooks + 'static,
+{
+    if !m.email.trim().is_empty() {
+        return Ok(Some("email"));
+    }
+    if bp_db::is_address_ownership_verified(&state.pool, &m.address).await? {
+        Ok(Some("signature"))
+    } else {
+        Ok(None)
     }
 }
 
@@ -203,7 +236,9 @@ where
         )
         .route(
             "/api/blockparty/:id/join-link",
-            post(create_join_link::<H, M>).delete(revoke_join_link::<H, M>),
+            get(active_join_link::<H, M>)
+                .post(create_join_link::<H, M>)
+                .delete(revoke_join_link::<H, M>),
         )
         .route(
             "/api/blockparty/join/:token",
@@ -321,12 +356,14 @@ where
     let svc = require_blockparty(&state)?;
     let group = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
     let members = svc.list_members(id).await?;
+    let mut member_views = Vec::with_capacity(members.len());
+    for m in &members {
+        let verified_via = member_verified_via(&state, m).await?;
+        member_views.push(MemberPublicView::from_row_masked(m, verified_via));
+    }
     Ok(Json(DetailResponse {
         group: GroupPublicView::from_row(&group),
-        members: members
-            .iter()
-            .map(MemberPublicView::from_row_masked)
-            .collect(),
+        members: member_views,
     }))
 }
 
@@ -358,12 +395,18 @@ where
         .await?;
     let group = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
     let members = svc.list_members(id).await?;
+    let mut member_views = Vec::with_capacity(members.len());
+    for m in &members {
+        let verified_via = member_verified_via(&state, m).await?;
+        member_views.push(MemberPublicView::from_row_for_viewer(
+            m,
+            &viewer,
+            verified_via,
+        ));
+    }
     Ok(Json(DetailResponse {
         group: GroupPublicView::from_row(&group),
-        members: members
-            .iter()
-            .map(|m| MemberPublicView::from_row_for_viewer(m, &viewer))
-            .collect(),
+        members: member_views,
     }))
 }
 
@@ -539,6 +582,44 @@ where
     svc.revoke_join_link(id, admin_token(&headers).as_deref())
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveJoinLinkResponse {
+    active: bool,
+    token: Option<String>,
+    expires_at: Option<i64>,
+}
+
+/// `GET /api/blockparty/:id/join-link` (admin) — the group's active join link,
+/// so the admin UI can re-display the shareable link + expiry without minting a
+/// fresh one. `{ active: false }` when none / expired.
+async fn active_join_link<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<ActiveJoinLinkResponse>, ApiError>
+where
+    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
+    M: bp_group_mgmt_engine::EmailHooks + 'static,
+{
+    let svc = require_blockparty(&state)?;
+    let active = svc
+        .active_join_link(id, admin_token(&headers).as_deref())
+        .await?;
+    Ok(Json(match active {
+        Some((token, expires_at)) => ActiveJoinLinkResponse {
+            active: true,
+            token: Some(token),
+            expires_at: Some(expires_at),
+        },
+        None => ActiveJoinLinkResponse {
+            active: false,
+            token: None,
+            expires_at: None,
+        },
+    }))
 }
 
 #[derive(Serialize)]
@@ -722,7 +803,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         };
-        let dto = MemberPublicView::from_row_masked(&row);
+        let dto = MemberPublicView::from_row_masked(&row, Some("email"));
         let json = serde_json::to_value(&dto).unwrap();
         let expected: serde_json::Value = serde_json::from_str(
             r#"{
@@ -730,7 +811,8 @@ mod tests {
                 "email": "m***@y***.ch",
                 "percentBp": 2500,
                 "role": "member",
-                "confirmed": true
+                "confirmed": true,
+                "verifiedVia": "email"
             }"#,
         )
         .unwrap();

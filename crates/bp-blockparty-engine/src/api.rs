@@ -81,6 +81,11 @@ pub trait BlockpartyApi: Send + Sync {
         group_id: Uuid,
         token: Option<&str>,
     ) -> Result<(), BlockpartyServiceError>;
+    async fn active_join_link(
+        &self,
+        group_id: Uuid,
+        token: Option<&str>,
+    ) -> Result<Option<(String, i64)>, BlockpartyServiceError>;
     async fn join_via_link(
         &self,
         link_token: &str,
@@ -239,6 +244,13 @@ impl<H: BlockpartyHooks + 'static> BlockpartyApi for BlockpartyService<H> {
         token: Option<&str>,
     ) -> Result<(), BlockpartyServiceError> {
         BlockpartyService::revoke_join_link(self, group_id, token).await
+    }
+    async fn active_join_link(
+        &self,
+        group_id: Uuid,
+        token: Option<&str>,
+    ) -> Result<Option<(String, i64)>, BlockpartyServiceError> {
+        BlockpartyService::active_join_link(self, group_id, token).await
     }
     async fn join_via_link(
         &self,

@@ -1207,6 +1207,12 @@ struct MemberEntry {
     /// on auth.
     #[serde(skip_serializing_if = "Option::is_none")]
     email: Option<String>,
+    /// How the member proved address ownership — `"email"` or `"signature"`.
+    /// Admin-only (like `email`); `None` for non-admin callers or a member
+    /// with no verification on record. Lets the admin roster show a
+    /// "verified via signature" badge for email-less members.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_via: Option<&'static str>,
 }
 
 async fn by_id<H, M>(
@@ -1274,6 +1280,20 @@ where
                     (true, Some(b)) => Some(crate::utils::mask_email(&b.email)),
                     _ => None,
                 };
+                // Verification method for the admin roster badge: a verified
+                // email binding wins; otherwise a signature ownership proof.
+                // Admin-only, same as `email`.
+                let verified_via: Option<&'static str> = if is_admin {
+                    if email.as_ref().and_then(|b| b.verified_at).is_some() {
+                        Some("email")
+                    } else if bp_db::is_address_ownership_verified(&s.pool, &m.address).await? {
+                        Some("signature")
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let hashrate = per_addr_hashrate.get(addr_str).copied().unwrap_or(0.0);
                 // Per-member worker stats folded in server-side (best-diff /
                 // uptime / last-seen) so the UI no longer fetches per-member
@@ -1302,6 +1322,7 @@ where
                     last_accepted_share_at: last_active
                         .map(crate::time_range::format_slot_label),
                     email: email_out,
+                    verified_via,
                 });
             }
             let mut summary = GroupSummary::from(group);
@@ -2449,6 +2470,7 @@ mod tests {
             last_seen: None,
             last_accepted_share_at: None,
             email: None,
+            verified_via: None,
         };
         let v: Value = serde_json::to_value(&e).unwrap();
         assert!(
