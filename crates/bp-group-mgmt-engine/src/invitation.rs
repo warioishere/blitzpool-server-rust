@@ -604,11 +604,11 @@ impl<H: GroupServiceHooks, M: EmailHooks> InvitationService<H, M> {
         }
         let normalized =
             normalize_address(address).map_err(|_| InvitationServiceError::InvalidAddress)?;
-        let binding = bp_db::find_address_email(&self.pool, &normalized)
-            .await?
-            .filter(|b| b.verified_at.is_some())
-            .ok_or(InvitationServiceError::EmailNotVerified)?;
-        let _ = binding; // (kept for clarity; the email isn't carried over to the open row)
+        // Unified onboarding gate: the joining address must be verified by a
+        // confirmed email OR a signature ownership proof.
+        if !bp_db::is_address_verified(&self.pool, &normalized).await? {
+            return Err(InvitationServiceError::EmailNotVerified);
+        }
 
         let group = bp_db::find_group(&self.pool, invitation.group_id).await?;
         let _group = match group {

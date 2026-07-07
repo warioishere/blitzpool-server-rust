@@ -72,6 +72,30 @@ async fn seed_verified_email(pool: &PgPool, address: &str, email: &str) {
     .expect("seed email");
 }
 
+/// Seed a verified signature ownership proof (no email) — the unified gate's
+/// second path.
+async fn seed_signature_verified(pool: &PgPool, address: &str) {
+    let now = 1_700_000_000_000_i64;
+    sqlx::query(
+        r#"INSERT INTO pplns_address_ownership
+             (address, method, "scriptType", "verifiedAt", "createdAt", "updatedAt")
+           VALUES ($1, 'bip322', 'p2wpkh', $2, $2, $2)
+           ON CONFLICT (address) DO UPDATE SET "verifiedAt" = EXCLUDED."verifiedAt""#,
+    )
+    .bind(address)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("seed signature");
+}
+
+async fn delete_signature_for(pool: &PgPool, address: &str) {
+    let _ = sqlx::query("DELETE FROM pplns_address_ownership WHERE address = $1")
+        .bind(address)
+        .execute(pool)
+        .await;
+}
+
 async fn delete_email_for(pool: &PgPool, address: &str) {
     let _ = sqlx::query("DELETE FROM pplns_address_email WHERE address = $1")
         .bind(address)
@@ -431,6 +455,35 @@ async fn accept_open_invite_creates_member() {
     assert_eq!(row.status, "pending");
     cleanup_group(&pool, g.group.id).await;
     delete_email_for(&pool, &joiner).await;
+}
+
+#[tokio::test]
+async fn accept_open_invite_creates_member_via_signature() {
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let (group_svc, inv_svc, _email) = build_services(pool.clone());
+    let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
+    let joiner = format!("bc1qjoin{}", Uuid::new_v4().simple());
+    // NO verified email — only a signature ownership proof. The unified gate
+    // must still admit the joiner.
+    seed_signature_verified(&pool, &joiner).await;
+    let g = group_svc
+        .create_group(&format!("ojs-{}", Uuid::new_v4()), &creator)
+        .await
+        .expect("g");
+    let open = inv_svc
+        .create_open_invite(g.group.id, OpenInviteTtl::SevenDays, Some(&g.admin_token), false)
+        .await
+        .expect("o");
+    let member = inv_svc
+        .accept_open_invite(&open.token, &joiner)
+        .await
+        .expect("join via signature");
+    assert_eq!(member.address.as_str(), joiner.to_lowercase());
+    cleanup_group(&pool, g.group.id).await;
+    delete_signature_for(&pool, &joiner).await;
 }
 
 #[tokio::test]

@@ -115,10 +115,18 @@ impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
         // (2) Validate + normalize address shape.
         let normalized =
             normalize_address(address).map_err(|_| JoinRequestServiceError::InvalidAddress)?;
-        let binding = bp_db::find_address_email(&self.pool, &normalized)
+        // Unified onboarding gate: verified by email OR a signature ownership
+        // proof. The email (if any) is snapshotted for the approval notification;
+        // a signature-only joiner has none and simply won't be emailed on the decision.
+        let email = bp_db::find_address_email(&self.pool, &normalized)
             .await?
             .filter(|b| b.verified_at.is_some())
-            .ok_or(JoinRequestServiceError::EmailNotVerified)?;
+            .map(|b| b.email);
+        if email.is_none()
+            && !bp_db::is_address_ownership_verified(&self.pool, &normalized).await?
+        {
+            return Err(JoinRequestServiceError::EmailNotVerified);
+        }
 
         // (3) Already a member?
         if let Some(existing) = bp_db::find_group_member_by_address(&self.pool, &normalized).await?
@@ -182,7 +190,7 @@ impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
             &self.pool,
             group.id,
             &normalized,
-            &binding.email,
+            email.as_deref().unwrap_or(""),
             trimmed.as_deref(),
             now,
         )
