@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM blockparty_join_link WHERE \"groupId\" = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1e3a87d11c473966197fb56d8685381ba9af8772a90660c4e2bcc36a027f9485"
+}

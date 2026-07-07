@@ -520,6 +520,155 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         Ok(inserted)
     }
 
+    /// Create (or replace) the group's single self-service join link. Admin-gated.
+    /// Returns the plaintext link token to share.
+    pub async fn create_join_link(
+        &self,
+        group_id: Uuid,
+        ttl_days: Option<i64>,
+        token: Option<&str>,
+    ) -> Result<String, BlockpartyServiceError> {
+        let group = self.require_admin_token(group_id, token).await?;
+        assert_editable(&group)?;
+        let now = now_ms();
+        let ttl_days = ttl_days.unwrap_or(7).clamp(1, 90);
+        let expires_at = now + ttl_days * 24 * 60 * 60 * 1000;
+        let link = InvitationToken::generate()?;
+        bp_db::upsert_blockparty_join_link(&self.pool, group_id, link.as_str(), expires_at, now)
+            .await?;
+        Ok(link.as_str().to_owned())
+    }
+
+    /// Revoke the group's join link. Admin-gated.
+    pub async fn revoke_join_link(
+        &self,
+        group_id: Uuid,
+        token: Option<&str>,
+    ) -> Result<(), BlockpartyServiceError> {
+        let _ = self.require_admin_token(group_id, token).await?;
+        bp_db::delete_blockparty_join_link(&self.pool, group_id).await?;
+        Ok(())
+    }
+
+    /// Self-service join via a shared link. No admin token — the joining address
+    /// proves itself (verified email OR signature ownership). Adds the member
+    /// unconfirmed with a 0 % placeholder split (the admin assigns it) and mints
+    /// the member token used to later confirm that split. Returns
+    /// `(member_token, group_id)`.
+    pub async fn join_via_link(
+        &self,
+        link_token: &str,
+        member_address: &str,
+    ) -> Result<(String, Uuid), BlockpartyServiceError> {
+        let link = bp_db::find_blockparty_join_link_by_token(&self.pool, link_token)
+            .await?
+            .ok_or(BlockpartyServiceError::NotFound)?;
+        let now = now_ms();
+        // An expired/invalid link surfaces as not-found (no info leak).
+        if link.expires_at < now {
+            return Err(BlockpartyServiceError::NotFound);
+        }
+        let group = bp_db::find_blockparty_group(&self.pool, link.group_id)
+            .await?
+            .ok_or(BlockpartyServiceError::NotFound)?;
+        assert_editable(&group)?;
+
+        let address = normalize_address(member_address)?;
+        if address == group.admin_address {
+            return Err(BlockpartyServiceError::AdminCannotRejoin);
+        }
+        if bp_db::find_blockparty_member_by_address(&self.pool, &address)
+            .await?
+            .is_some()
+        {
+            return Err(BlockpartyServiceError::AddressInBlockparty);
+        }
+        if self.pplns_cache.get(&address).await.is_some() {
+            return Err(BlockpartyServiceError::AddressInPplnsGroup);
+        }
+
+        // Unified onboarding gate: verified email OR signature ownership proof.
+        let email = self.hooks.verified_email_for(&address).await;
+        if email.is_none() && !bp_db::is_address_ownership_verified(&self.pool, &address).await? {
+            return Err(BlockpartyServiceError::EmailNotVerified);
+        }
+        let email = email.map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+
+        // Insert unconfirmed with a 0 % placeholder (the admin sets the real split).
+        match bp_db::insert_blockparty_member(
+            &self.pool,
+            group.id,
+            &address,
+            &email,
+            0,
+            "member",
+            None,
+            now,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(bp_db::DbError::Sqlx(sqlx::Error::Database(db_err)))
+                if db_err.code().as_deref() == Some("23505") =>
+            {
+                return Err(BlockpartyServiceError::AddressInBlockparty);
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        // Mint the member token now (no confirm) so the member can confirm the
+        // split the admin will assign.
+        let t = InvitationToken::generate()?;
+        let hash = t.hash();
+        bp_db::update_blockparty_member_confirmed(
+            &self.pool,
+            group.id,
+            &address,
+            None,
+            Some(hash.as_str()),
+            now,
+        )
+        .await?;
+
+        // DRAFT → CONFIRMING + cache + status recompute (mirrors add_member).
+        if group.status == BlockpartyStatus::Draft.as_str() {
+            bp_db::update_blockparty_group_status(
+                &self.pool,
+                group.id,
+                BlockpartyStatus::Confirming.as_str(),
+                now,
+            )
+            .await?;
+            self.cache
+                .set_admin_status(&group.admin_address, group.id, BlockpartyStatus::Confirming)
+                .await;
+        }
+        self.cache.insert_member(&address, group.id).await;
+        self.recompute_status(group.id).await?;
+
+        Ok((t.as_str().to_owned(), group.id))
+    }
+
+    /// Public read: the group behind a valid, non-expired join link (for the
+    /// join landing page). `None` if the link is unknown, expired, or dissolved.
+    /// Returns `(group, link_expires_at)`.
+    pub async fn join_link_group(
+        &self,
+        link_token: &str,
+    ) -> Result<Option<(BlockpartyGroupRow, i64)>, BlockpartyServiceError> {
+        let link = match bp_db::find_blockparty_join_link_by_token(&self.pool, link_token).await? {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        if link.expires_at < now_ms() {
+            return Ok(None);
+        }
+        let group = bp_db::find_blockparty_group(&self.pool, link.group_id).await?;
+        Ok(group
+            .filter(|g| g.dissolved_at.is_none())
+            .map(|g| (g, link.expires_at)))
+    }
+
     /// Remove a member. Admin-token gated. Refuses admin removal.
     pub async fn remove_member(
         &self,

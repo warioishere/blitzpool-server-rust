@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO blockparty_join_link (\"groupId\", token, \"expiresAt\", \"createdAt\")\n           VALUES ($1, $2, $3, $4)\n           ON CONFLICT (\"groupId\") DO UPDATE SET\n             token = EXCLUDED.token,\n             \"expiresAt\" = EXCLUDED.\"expiresAt\",\n             \"createdAt\" = EXCLUDED.\"createdAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fe8196c6d143e58623de4c170f5d8b00a9b97020f08f48c7b8afca4dd7b50e3c"
+}

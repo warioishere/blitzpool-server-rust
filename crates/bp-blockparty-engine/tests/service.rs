@@ -179,6 +179,62 @@ async fn add_member_flips_to_confirming_and_inserts_member_cache() {
 }
 
 #[tokio::test]
+async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-joinlink-1";
+    let admin = "bc1qadminjoin1";
+    let carol = "bc1qcaroljoin1";
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(carol)
+        .execute(&pool)
+        .await;
+
+    let svc = svc(&pool);
+    let create = svc
+        .create_group(name, admin, "admin@test.example", 5_000)
+        .await
+        .expect("create");
+
+    // Admin mints a join link; Carol self-joins via it (no admin token).
+    let link = svc
+        .create_join_link(create.group.id, Some(7), Some(&create.admin_token))
+        .await
+        .expect("create_join_link");
+    let (member_token, group_id) = svc.join_via_link(&link, carol).await.expect("join_via_link");
+    assert_eq!(group_id, create.group.id);
+    assert!(!member_token.is_empty());
+
+    // Member exists, UNCONFIRMED (must still confirm the split the admin sets),
+    // 0 % placeholder, cached; group flipped DRAFT → CONFIRMING.
+    let members = svc.list_members(create.group.id).await.unwrap();
+    let carol_row = members
+        .iter()
+        .find(|m| m.address.as_str() == addr(carol).as_str())
+        .expect("carol is a member");
+    assert!(carol_row.confirmed_at.is_none());
+    assert_eq!(carol_row.percent_bp, 0);
+    assert_eq!(svc.member_group_id(&addr(carol)).await, Some(create.group.id));
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert_eq!(g.status, "confirming");
+
+    // Unknown link → error (not found).
+    assert!(svc.join_via_link("nonexistent-token", "bc1qzzz").await.is_err());
+
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(carol)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM blockparty_join_link WHERE token = $1")
+        .bind(&link)
+        .execute(&pool)
+        .await;
+}
+
+#[tokio::test]
 async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
     let Some(pool) = connect_or_skip().await else {
         return;

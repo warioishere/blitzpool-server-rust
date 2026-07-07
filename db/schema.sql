@@ -1547,6 +1547,15 @@ CREATE TABLE public.blockparty_invitation (
     "respondedAt" bigint
 );
 
+CREATE TABLE public.blockparty_join_link (
+    "groupId" uuid NOT NULL,
+    token character varying(64) NOT NULL,
+    "expiresAt" bigint NOT NULL,
+    "createdAt" bigint NOT NULL,
+    CONSTRAINT blockparty_join_link_pkey PRIMARY KEY ("groupId"),
+    CONSTRAINT blockparty_join_link_token_key UNIQUE (token)
+);
+
 CREATE TABLE public.blockparty_block_history (
     id bigint NOT NULL,
     "groupId" uuid NOT NULL,

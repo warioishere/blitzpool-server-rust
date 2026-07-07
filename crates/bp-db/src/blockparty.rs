@@ -798,3 +798,69 @@ pub async fn insert_blockparty_block_history(
     .await
     .map_err(DbError::from)
 }
+
+// ── Self-service join link (one active link per group) ──────────────
+
+#[derive(Clone, Debug, FromRow)]
+pub struct BlockpartyJoinLinkRow {
+    #[sqlx(rename = "groupId")]
+    pub group_id: Uuid,
+    pub token: String,
+    #[sqlx(rename = "expiresAt")]
+    pub expires_at: i64,
+}
+
+/// INSERT-or-replace the single active join link for a group (PK groupId).
+pub async fn upsert_blockparty_join_link(
+    pool: &PgPool,
+    group_id: Uuid,
+    token: &str,
+    expires_at: i64,
+    created_at: i64,
+) -> Result<(), DbError> {
+    sqlx::query!(
+        r#"INSERT INTO blockparty_join_link ("groupId", token, "expiresAt", "createdAt")
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT ("groupId") DO UPDATE SET
+             token = EXCLUDED.token,
+             "expiresAt" = EXCLUDED."expiresAt",
+             "createdAt" = EXCLUDED."createdAt""#,
+        group_id,
+        token,
+        expires_at,
+        created_at,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(())
+}
+
+pub async fn delete_blockparty_join_link(pool: &PgPool, group_id: Uuid) -> Result<u64, DbError> {
+    let r = sqlx::query!(
+        r#"DELETE FROM blockparty_join_link WHERE "groupId" = $1"#,
+        group_id,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(r.rows_affected())
+}
+
+pub async fn find_blockparty_join_link_by_token(
+    pool: &PgPool,
+    token: &str,
+) -> Result<Option<BlockpartyJoinLinkRow>, DbError> {
+    sqlx::query_as!(
+        BlockpartyJoinLinkRow,
+        r#"SELECT
+            "groupId" AS "group_id!",
+            token AS "token!",
+            "expiresAt" AS "expires_at!"
+           FROM blockparty_join_link WHERE token = $1 LIMIT 1"#,
+        token,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::from)
+}

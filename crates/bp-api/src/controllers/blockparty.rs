@@ -272,6 +272,14 @@ where
         )
         .route("/api/blockparty/:id/members", post(add_member::<H, M>))
         .route(
+            "/api/blockparty/:id/join-link",
+            post(create_join_link::<H, M>).delete(revoke_join_link::<H, M>),
+        )
+        .route(
+            "/api/blockparty/join/:token",
+            get(get_join_context::<H, M>).post(join_via_link::<H, M>),
+        )
+        .route(
             "/api/blockparty/:id/members/batch",
             post(add_members_batch::<H, M>),
         )
@@ -645,6 +653,116 @@ where
             confirmed: false,
         },
         invite_token: invitation.token,
+    }))
+}
+
+// ─── Self-service join link ──────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JoinLinkBody {
+    ttl_days: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JoinLinkResponse {
+    token: String,
+}
+
+/// `POST /api/blockparty/:id/join-link` (admin) — create/replace the group's
+/// single self-service join link. UI builds `/blockparty/join/<token>` from it.
+async fn create_join_link<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<JoinLinkBody>,
+) -> Result<Json<JoinLinkResponse>, ApiError>
+where
+    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
+    M: bp_group_mgmt_engine::EmailHooks + 'static,
+{
+    let svc = require_blockparty(&state)?;
+    let token = svc
+        .create_join_link(id, body.ttl_days, admin_token(&headers).as_deref())
+        .await?;
+    Ok(Json(JoinLinkResponse { token }))
+}
+
+/// `DELETE /api/blockparty/:id/join-link` (admin) — revoke the join link.
+async fn revoke_join_link<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError>
+where
+    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
+    M: bp_group_mgmt_engine::EmailHooks + 'static,
+{
+    let svc = require_blockparty(&state)?;
+    svc.revoke_join_link(id, admin_token(&headers).as_deref())
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JoinContextResponse {
+    group_id: Uuid,
+    group_name: String,
+    expires_at: i64,
+}
+
+/// `GET /api/blockparty/join/:token` (public) — the join landing page context.
+async fn get_join_context<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(token): Path<String>,
+) -> Result<Json<JoinContextResponse>, ApiError>
+where
+    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
+    M: bp_group_mgmt_engine::EmailHooks + 'static,
+{
+    let svc = require_blockparty(&state)?;
+    let (group, expires_at) = svc
+        .join_link_group(&token)
+        .await?
+        .ok_or_else(|| ApiError::from(bp_blockparty_engine::BlockpartyServiceError::NotFound))?;
+    Ok(Json(JoinContextResponse {
+        group_id: group.id,
+        group_name: group.name,
+        expires_at,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JoinBody {
+    address: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JoinResponse {
+    member_token: String,
+    group_id: Uuid,
+}
+
+/// `POST /api/blockparty/join/:token` (public) — self-join. Address proves itself
+/// (email OR signature); returns the one-shot member token + group id.
+async fn join_via_link<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(token): Path<String>,
+    Json(body): Json<JoinBody>,
+) -> Result<Json<JoinResponse>, ApiError>
+where
+    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
+    M: bp_group_mgmt_engine::EmailHooks + 'static,
+{
+    let svc = require_blockparty(&state)?;
+    let (member_token, group_id) = svc.join_via_link(&token, &body.address).await?;
+    Ok(Json(JoinResponse {
+        member_token,
+        group_id,
     }))
 }
 

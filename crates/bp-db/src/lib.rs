@@ -83,8 +83,9 @@ pub use blockparty::{
     update_blockparty_group_dissolved, update_blockparty_group_last_share_and_status,
     update_blockparty_group_rental_hint, update_blockparty_group_status,
     update_blockparty_invitation_status, update_blockparty_member_confirmed,
-    update_blockparty_member_percent_bp, BlockpartyBlockHistoryRow, BlockpartyGroupRow,
-    BlockpartyInvitationRow, BlockpartyMemberRow, BlockpartySplitSnapshot,
+    update_blockparty_member_percent_bp, upsert_blockparty_join_link, BlockpartyBlockHistoryRow,
+    BlockpartyGroupRow, BlockpartyInvitationRow, BlockpartyJoinLinkRow, BlockpartyMemberRow,
+    BlockpartySplitSnapshot, delete_blockparty_join_link, find_blockparty_join_link_by_token,
 };
 pub use client::{
     bulk_set_client_hashrate, bulk_touch_clients_for_share, delete_client_for_session,

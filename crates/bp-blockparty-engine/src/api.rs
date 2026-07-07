@@ -83,6 +83,26 @@ pub trait BlockpartyApi: Send + Sync {
         percent_bp: i32,
         token: Option<&str>,
     ) -> Result<BlockpartyMemberRow, BlockpartyServiceError>;
+    async fn create_join_link(
+        &self,
+        group_id: Uuid,
+        ttl_days: Option<i64>,
+        token: Option<&str>,
+    ) -> Result<String, BlockpartyServiceError>;
+    async fn revoke_join_link(
+        &self,
+        group_id: Uuid,
+        token: Option<&str>,
+    ) -> Result<(), BlockpartyServiceError>;
+    async fn join_via_link(
+        &self,
+        link_token: &str,
+        member_address: &str,
+    ) -> Result<(String, Uuid), BlockpartyServiceError>;
+    async fn join_link_group(
+        &self,
+        link_token: &str,
+    ) -> Result<Option<(BlockpartyGroupRow, i64)>, BlockpartyServiceError>;
     async fn remove_member(
         &self,
         group_id: Uuid,
@@ -226,6 +246,34 @@ impl<H: BlockpartyHooks + 'static> BlockpartyApi for BlockpartyService<H> {
         token: Option<&str>,
     ) -> Result<BlockpartyMemberRow, BlockpartyServiceError> {
         BlockpartyService::add_member(self, group_id, member_address, percent_bp, token).await
+    }
+    async fn create_join_link(
+        &self,
+        group_id: Uuid,
+        ttl_days: Option<i64>,
+        token: Option<&str>,
+    ) -> Result<String, BlockpartyServiceError> {
+        BlockpartyService::create_join_link(self, group_id, ttl_days, token).await
+    }
+    async fn revoke_join_link(
+        &self,
+        group_id: Uuid,
+        token: Option<&str>,
+    ) -> Result<(), BlockpartyServiceError> {
+        BlockpartyService::revoke_join_link(self, group_id, token).await
+    }
+    async fn join_via_link(
+        &self,
+        link_token: &str,
+        member_address: &str,
+    ) -> Result<(String, Uuid), BlockpartyServiceError> {
+        BlockpartyService::join_via_link(self, link_token, member_address).await
+    }
+    async fn join_link_group(
+        &self,
+        link_token: &str,
+    ) -> Result<Option<(BlockpartyGroupRow, i64)>, BlockpartyServiceError> {
+        BlockpartyService::join_link_group(self, link_token).await
     }
     async fn remove_member(
         &self,
