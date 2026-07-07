@@ -97,6 +97,44 @@ fn svc(pool: &PgPool) -> BlockpartyService<AllVerified> {
     )
 }
 
+// ── Test hook: NO address has a verified email — forces the gate onto the
+//    signature-ownership branch (or the reject branch when neither is present). ──
+struct NoEmail;
+
+#[async_trait]
+impl BlockpartyHooks for NoEmail {
+    async fn verified_email_for(&self, _address: &AddressId) -> Option<String> {
+        None
+    }
+}
+
+fn svc_no_email(pool: &PgPool) -> BlockpartyService<NoEmail> {
+    BlockpartyService::new(pool.clone(), Arc::new(NoEmail), PplnsAddressCache::new(), config())
+}
+
+/// Seed a verified signature-ownership proof for `address`, stored VERBATIM
+/// (case-preserved) exactly as the `/api/address/ownership/verify` path writes it.
+async fn seed_signature(pool: &PgPool, address: &str) {
+    let now = 1_700_000_000_000_i64;
+    let _ = sqlx::query(
+        r#"INSERT INTO pplns_address_ownership
+             (address, method, "scriptType", "verifiedAt", "createdAt", "updatedAt")
+           VALUES ($1, 'bip137', 'p2pkh', $2, $2, $2)
+           ON CONFLICT (address) DO UPDATE SET "verifiedAt" = EXCLUDED."verifiedAt""#,
+    )
+    .bind(address)
+    .bind(now)
+    .execute(pool)
+    .await;
+}
+
+async fn delete_signature(pool: &PgPool, address: &str) {
+    let _ = sqlx::query(r#"DELETE FROM pplns_address_ownership WHERE address = $1"#)
+        .bind(address)
+        .execute(pool)
+        .await;
+}
+
 /// Best-effort row cleanup. We use unique-per-test addresses + names so
 /// concurrent runs don't collide, and the FK CASCADE on group dissolve
 /// would take care of children — but tests don't always reach dissolve.
@@ -230,6 +268,104 @@ async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
         .await;
     let _ = sqlx::query("DELETE FROM blockparty_join_link WHERE token = $1")
         .bind(&link)
+        .execute(&pool)
+        .await;
+}
+
+#[tokio::test]
+async fn join_via_link_admits_signature_verified_email_less_base58_address() {
+    // The unified gate's whole point: an address with NO verified email but a
+    // valid signature-ownership proof may join. Uses a mixed-case legacy Base58
+    // address to also prove the case-normalization fix (the proof is stored
+    // verbatim `1BvBM…`; the gate must not lowercase it).
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-sigjoin-1";
+    let admin = "bc1qadminsigjoin1";
+    let carol = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"; // legacy P2PKH, mixed case
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(carol)
+        .execute(&pool)
+        .await;
+    delete_signature(&pool, carol).await;
+    seed_signature(&pool, carol).await;
+
+    let svc = svc_no_email(&pool);
+    let create = svc
+        .create_group(name, admin, "admin@test.example", 5_000)
+        .await
+        .expect("create");
+    let link = svc
+        .create_join_link(create.group.id, Some(7), Some(&create.admin_token))
+        .await
+        .expect("create_join_link");
+    // NoEmail hook → email.is_none() is true → the gate falls through to the
+    // signature-ownership lookup, which must find the verbatim Base58 row.
+    let (member_token, group_id) = svc
+        .join_via_link(&link, carol)
+        .await
+        .expect("signature-verified base58 address should join");
+    assert_eq!(group_id, create.group.id);
+    assert!(!member_token.is_empty());
+    let members = svc.list_members(create.group.id).await.unwrap();
+    assert!(
+        members.iter().any(|m| m.address.as_str() == carol),
+        "member row keyed by the verbatim (case-preserved) Base58 address"
+    );
+
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(carol)
+        .execute(&pool)
+        .await;
+    delete_signature(&pool, carol).await;
+    let _ = sqlx::query("DELETE FROM blockparty_join_link WHERE \"groupId\" = $1")
+        .bind(create.group.id)
+        .execute(&pool)
+        .await;
+}
+
+#[tokio::test]
+async fn join_via_link_rejects_unverified_address() {
+    // Neither a verified email nor a signature proof → the gate must reject.
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-unverjoin-1";
+    let admin = "bc1qadminunverjoin1";
+    let dave = "bc1qdaveunverified1";
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+        .bind(dave)
+        .execute(&pool)
+        .await;
+    delete_signature(&pool, dave).await;
+
+    let svc = svc_no_email(&pool);
+    let create = svc
+        .create_group(name, admin, "admin@test.example", 5_000)
+        .await
+        .expect("create");
+    let link = svc
+        .create_join_link(create.group.id, Some(7), Some(&create.admin_token))
+        .await
+        .expect("create_join_link");
+    let err = svc
+        .join_via_link(&link, dave)
+        .await
+        .expect_err("unverified address must be rejected");
+    assert!(
+        matches!(err, BlockpartyServiceError::EmailNotVerified),
+        "expected EmailNotVerified, got {err:?}"
+    );
+    // No member row was created.
+    assert!(svc.member_group_id(&addr(dave)).await.is_none());
+
+    cleanup(&pool, name, admin).await;
+    let _ = sqlx::query("DELETE FROM blockparty_join_link WHERE \"groupId\" = $1")
+        .bind(create.group.id)
         .execute(&pool)
         .await;
 }
