@@ -20,13 +20,13 @@
 //!   `seed_worker_shares_from_client_statistics`).
 
 use bp_db::{
-    bulk_update_address_settings_shares, bulk_upsert_client_rejected_statistics_entity,
-    bulk_upsert_client_statistics_entity, bulk_upsert_pool_mode_hashrate,
-    bulk_upsert_pool_rejected_statistics, bulk_upsert_pool_share_statistics,
-    bulk_upsert_worker_shares_entity, count_worker_shares,
-    seed_worker_shares_from_client_statistics, AddressSharesUpdate, ClientRejectedStatsUpsert,
-    ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert,
-    WorkerSharesUpsert,
+    bulk_update_address_settings_shares, bulk_upsert_address_best_difficulty,
+    bulk_upsert_client_rejected_statistics_entity, bulk_upsert_client_statistics_entity,
+    bulk_upsert_pool_mode_hashrate, bulk_upsert_pool_rejected_statistics,
+    bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity, count_worker_shares,
+    seed_worker_shares_from_client_statistics, AddressBestDifficultyUpsert, AddressSharesUpdate,
+    ClientRejectedStatsUpsert, ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert,
+    PoolShareStatsUpsert, WorkerSharesUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
@@ -454,6 +454,115 @@ async fn address_shares_update_increments_existing_rows_only() {
             .expect("read absent");
     assert_eq!(absent_rows, 0, "missing row stays missing");
 
+    tx.rollback().await.expect("rollback");
+}
+
+// ── address_settings_entity."bestDifficulty" (GREATEST upsert) ──────
+
+fn bd(address: &str, best: f64, ua: Option<&str>) -> AddressBestDifficultyUpsert {
+    AddressBestDifficultyUpsert {
+        address: address.to_string(),
+        best_difficulty: best,
+        user_agent: ua.map(str::to_string),
+    }
+}
+
+async fn read_best(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, address: &str) -> (f64, Option<String>) {
+    let row = sqlx::query(
+        r#"SELECT "bestDifficulty", "bestDifficultyUserAgent"
+           FROM address_settings_entity WHERE address = $1"#,
+    )
+    .bind(address)
+    .fetch_one(&mut **tx)
+    .await
+    .expect("read best");
+    (row.get("bestDifficulty"), row.get("bestDifficultyUserAgent"))
+}
+
+#[tokio::test]
+async fn best_difficulty_upsert_inserts_then_climbs_via_greatest() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("begin tx");
+    let addr = "test_bd_greatest";
+
+    // Fresh address → INSERT.
+    bulk_upsert_address_best_difficulty(&mut *tx, &[bd(addr, 100.0, Some("bitaxe"))])
+        .await
+        .expect("insert");
+    assert_eq!(read_best(&mut tx, addr).await, (100.0, Some("bitaxe".into())));
+
+    // Higher → climbs + stamps the new firmware.
+    bulk_upsert_address_best_difficulty(&mut *tx, &[bd(addr, 250.0, Some("nerdqaxe"))])
+        .await
+        .expect("climb");
+    assert_eq!(read_best(&mut tx, addr).await, (250.0, Some("nerdqaxe".into())));
+
+    // Lower → GREATEST keeps the stored max AND its user-agent.
+    bulk_upsert_address_best_difficulty(&mut *tx, &[bd(addr, 40.0, Some("worker"))])
+        .await
+        .expect("lower");
+    assert_eq!(read_best(&mut tx, addr).await, (250.0, Some("nerdqaxe".into())));
+
+    tx.rollback().await.expect("rollback");
+}
+
+/// Regression: after a best-difficulty RESET zeroes the row (out of band,
+/// via the UI/Telegram reset), the very next accepted-share flush must
+/// re-establish the best via GREATEST — even a share LOWER than the old
+/// all-time high. This is exactly the divergence the old write-through
+/// cache caused (stale cached high blocked every re-write → the row stuck
+/// at 0 for days); the batched GREATEST upsert cannot get stuck.
+#[tokio::test]
+async fn best_difficulty_recovers_after_a_reset() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("begin tx");
+    let addr = "test_bd_reset_recovery";
+
+    // Climb to a high all-time best.
+    bulk_upsert_address_best_difficulty(&mut *tx, &[bd(addr, 623_932_928.0, Some("octaxe"))])
+        .await
+        .expect("high");
+    assert_eq!(read_best(&mut tx, addr).await.0, 623_932_928.0);
+
+    // Out-of-band reset zeroes the row (mirrors reset_address_settings_best_difficulty).
+    sqlx::query(
+        r#"UPDATE address_settings_entity
+           SET "bestDifficulty" = 0, "bestDifficultyUserAgent" = NULL WHERE address = $1"#,
+    )
+    .bind(addr)
+    .execute(&mut *tx)
+    .await
+    .expect("reset");
+    assert_eq!(read_best(&mut tx, addr).await, (0.0, None));
+
+    // Next flush carries a share LOWER than the old high → it must climb
+    // back from 0 (GREATEST(0, x) = x), not stay stuck at 0.
+    bulk_upsert_address_best_difficulty(&mut *tx, &[bd(addr, 19_987_136.0, Some("bitaxe"))])
+        .await
+        .expect("recover");
+    assert_eq!(
+        read_best(&mut tx, addr).await,
+        (19_987_136.0, Some("bitaxe".into())),
+        "best difficulty recovers from 0 after a reset"
+    );
+
+    tx.rollback().await.expect("rollback");
+}
+
+#[tokio::test]
+async fn best_difficulty_upsert_empty_slice_is_noop() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("begin tx");
+    let n = bulk_upsert_address_best_difficulty(&mut *tx, &[])
+        .await
+        .expect("empty");
+    assert_eq!(n, 0);
     tx.rollback().await.expect("rollback");
 }
 

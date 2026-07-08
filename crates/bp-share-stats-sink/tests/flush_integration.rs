@@ -245,6 +245,64 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
     cleanup(&pool, slot.as_millis(), prefix).await;
 }
 
+/// The best-difficulty accumulator folds the window max into
+/// `address_settings_entity."bestDifficulty"` via GREATEST at flush time —
+/// end-to-end (accumulator → `flush_once` → PG), no per-share write, no
+/// pre-existing row required.
+#[tokio::test]
+async fn flush_once_folds_best_difficulty_via_greatest() {
+    let _guard = FLUSH_TEST_LOCK.lock().await;
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let prefix = "test_flush_bd_";
+    let address = format!("{prefix}octaxe");
+    let _ = sqlx::query(r#"DELETE FROM address_settings_entity WHERE address LIKE $1"#)
+        .bind(format!("{prefix}%"))
+        .execute(&pool)
+        .await;
+
+    let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
+
+    // No row yet: the flush inserts it at the window max.
+    let accs = Arc::new(Accumulators::default());
+    accs.best_difficulty.add(addr(&address), 100.0, Some("bitaxe"));
+    accs.best_difficulty.add(addr(&address), 623_932_928.0, Some("octaxe")); // window max
+    accs.best_difficulty.add(addr(&address), 40.0, Some("worker")); // lower — ignored
+    flush_once(&pool, &accs, &health, 1000).await;
+
+    let (best, ua): (f64, Option<String>) = {
+        let row = sqlx::query(
+            r#"SELECT "bestDifficulty", "bestDifficultyUserAgent"
+               FROM address_settings_entity WHERE address = $1"#,
+        )
+        .bind(&address)
+        .fetch_one(&pool)
+        .await
+        .expect("row inserted by flush");
+        (row.get("bestDifficulty"), row.get("bestDifficultyUserAgent"))
+    };
+    assert_eq!(best, 623_932_928.0, "flush persisted the window max");
+    assert_eq!(ua.as_deref(), Some("octaxe"));
+
+    // A later window with a LOWER max leaves the stored all-time best alone.
+    let accs2 = Arc::new(Accumulators::default());
+    accs2.best_difficulty.add(addr(&address), 1_000.0, Some("bitaxe"));
+    flush_once(&pool, &accs2, &health, 1000).await;
+    let best_after: f64 =
+        sqlx::query_scalar(r#"SELECT "bestDifficulty" FROM address_settings_entity WHERE address = $1"#)
+            .bind(&address)
+            .fetch_one(&pool)
+            .await
+            .expect("read");
+    assert_eq!(best_after, 623_932_928.0, "GREATEST keeps the all-time high");
+
+    let _ = sqlx::query(r#"DELETE FROM address_settings_entity WHERE address LIKE $1"#)
+        .bind(format!("{prefix}%"))
+        .execute(&pool)
+        .await;
+}
+
 #[tokio::test]
 async fn empty_accumulators_no_op_all_flushers() {
     let _guard = FLUSH_TEST_LOCK.lock().await;

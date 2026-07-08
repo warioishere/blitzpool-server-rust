@@ -379,8 +379,8 @@ async fn spawn_session_persistence(
         ..SessionPersistenceConfig::default()
     };
     info!(
-        address_cache_capacity = cfg.address_cache_capacity,
-        reconcile_hashrate_on_boot, "session-persistence: spawning engine"
+        reconcile_hashrate_on_boot,
+        "session-persistence: spawning engine"
     );
     let handle = SessionPersistenceEngine::spawn(cfg, handles.db.pool().clone()).await?;
     Ok(handle)
@@ -661,7 +661,6 @@ pub(crate) fn build_accepted_sinks(
 
     let aux: Vec<Arc<dyn SharedAcceptedShareSink>> = vec![
         Arc::new(ShareStatsAcceptedSink::new(stats.accumulators())),
-        Arc::new(session_persistence.best_difficulty_sink()),
         Arc::new(session_persistence.client_row_touch_sink()),
         Arc::new(session_persistence.client_difficulty_statistics_sink()),
         Arc::new(crate::live_mode_marker::LiveModeMarkerSink::new(

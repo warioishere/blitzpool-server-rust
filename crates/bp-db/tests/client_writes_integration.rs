@@ -3,17 +3,16 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for the 3 session-persistence write-primitives
-//! (`upsert_client`, `delete_client_for_session`,
-//! `upsert_address_best_difficulty`). Each test wraps writes in
-//! TX-rollback for isolation.
+//! Integration tests for the session-persistence write-primitives
+//! (`upsert_client`, `delete_client_for_session`, …). Each test wraps
+//! writes in TX-rollback for isolation.
 
 use bp_common::AddressId;
 use bp_db::{
     bulk_set_client_hashrate, bulk_touch_clients_for_share, delete_client_for_session,
     find_addresses_for_ntfy_listener, find_client_recent_first_seen, kill_dead_clients,
     reset_all_client_hashrate, touch_client_for_share, update_sv2_user_agent_by_address,
-    upsert_address_best_difficulty, upsert_client, upsert_ntfy_subscription, ClientUpsert,
+    upsert_client, upsert_ntfy_subscription, ClientUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
@@ -488,117 +487,6 @@ async fn kill_dead_clients_skips_already_deleted() {
         original_del.is_some(),
         "row stays soft-deleted (idempotent)"
     );
-    tx.rollback().await.expect("rollback");
-}
-
-// ── upsert_address_best_difficulty ─────────────────────────────────
-
-#[tokio::test]
-async fn upsert_best_difficulty_inserts_when_address_row_missing() {
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    // Cleanup leftover from previous test runs (no FK).
-    sqlx::query(r#"DELETE FROM address_settings_entity WHERE address = $1"#)
-        .bind("test_bd_addr_new")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-
-    let n = upsert_address_best_difficulty(&mut *tx, "test_bd_addr_new", 100.5, Some("bitaxe"))
-        .await
-        .unwrap();
-    assert_eq!(n, 1, "insert path");
-
-    let row = sqlx::query(
-        r#"SELECT "bestDifficulty", "bestDifficultyUserAgent"
-           FROM address_settings_entity WHERE address = $1"#,
-    )
-    .bind("test_bd_addr_new")
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    let bd: f64 = row.get("bestDifficulty");
-    let ua: Option<String> = row.get("bestDifficultyUserAgent");
-    assert!((bd - 100.5).abs() < 0.01);
-    assert_eq!(ua.as_deref(), Some("bitaxe"));
-    tx.rollback().await.expect("rollback");
-}
-
-#[tokio::test]
-async fn upsert_best_difficulty_updates_only_when_candidate_is_strictly_greater() {
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    sqlx::query(r#"DELETE FROM address_settings_entity WHERE address = $1"#)
-        .bind("test_bd_cas")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-
-    // Seed with 50.
-    upsert_address_best_difficulty(&mut *tx, "test_bd_cas", 50.0, Some("v1"))
-        .await
-        .unwrap();
-    // Lower candidate — no-op.
-    let n_low = upsert_address_best_difficulty(&mut *tx, "test_bd_cas", 40.0, Some("v2"))
-        .await
-        .unwrap();
-    assert_eq!(n_low, 0, "lower candidate must not update");
-    // Equal candidate — also no-op (strictly greater semantic).
-    let n_eq = upsert_address_best_difficulty(&mut *tx, "test_bd_cas", 50.0, Some("v3"))
-        .await
-        .unwrap();
-    assert_eq!(n_eq, 0, "equal candidate must not update");
-    // Higher candidate — updates.
-    let n_hi = upsert_address_best_difficulty(&mut *tx, "test_bd_cas", 75.0, Some("v4"))
-        .await
-        .unwrap();
-    assert_eq!(n_hi, 1, "higher candidate must update");
-
-    let row = sqlx::query(
-        r#"SELECT "bestDifficulty", "bestDifficultyUserAgent"
-           FROM address_settings_entity WHERE address = $1"#,
-    )
-    .bind("test_bd_cas")
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    let bd: f64 = row.get("bestDifficulty");
-    let ua: Option<String> = row.get("bestDifficultyUserAgent");
-    assert!((bd - 75.0).abs() < 0.01);
-    assert_eq!(ua.as_deref(), Some("v4"));
-    tx.rollback().await.expect("rollback");
-}
-
-#[tokio::test]
-async fn upsert_best_difficulty_with_no_user_agent_clears_field() {
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    sqlx::query(r#"DELETE FROM address_settings_entity WHERE address = $1"#)
-        .bind("test_bd_no_ua")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-
-    upsert_address_best_difficulty(&mut *tx, "test_bd_no_ua", 10.0, Some("v1"))
-        .await
-        .unwrap();
-    upsert_address_best_difficulty(&mut *tx, "test_bd_no_ua", 20.0, None)
-        .await
-        .unwrap();
-    let ua: Option<String> = sqlx::query_scalar(
-        r#"SELECT "bestDifficultyUserAgent" FROM address_settings_entity WHERE address = $1"#,
-    )
-    .bind("test_bd_no_ua")
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    assert!(ua.is_none(), "None overwrites previous user agent");
     tx.rollback().await.expect("rollback");
 }
 

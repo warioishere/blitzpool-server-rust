@@ -77,6 +77,15 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
                 ..Default::default()
             },
         );
+        // All-time best difficulty tracks the SOLVED difficulty (can exceed
+        // the credited/clamped one), stamped with the miner's firmware. Folded
+        // into `address_settings_entity."bestDifficulty"` at flush time via
+        // GREATEST — no per-share PG write, no write-through cache to diverge.
+        self.accumulators.best_difficulty.add(
+            address_id.clone(),
+            share.submission_difficulty,
+            share.user_agent,
+        );
         self.accumulators
             .share_totals
             .add(address_id, share.worker.to_string(), diff);

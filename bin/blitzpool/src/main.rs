@@ -1371,8 +1371,8 @@ fn print_engine_error_help(err: &EngineError) {
         }
         EngineError::SessionPersistence(_) => {
             eprintln!(
-                "hint: session-persistence config rejected — check the \
-                 `address_cache_capacity` knob (must be > 0)."
+                "hint: session-persistence config rejected — the flush/sample \
+                 intervals must be > 0."
             );
         }
         EngineError::InvalidAddress(_, _) => {

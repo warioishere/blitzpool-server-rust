@@ -11,17 +11,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bp_db::{
-    bulk_update_address_settings_shares, bulk_upsert_client_rejected_statistics_entity,
-    bulk_upsert_client_statistics_entity, bulk_upsert_pool_mode_hashrate,
-    bulk_upsert_pool_rejected_statistics, bulk_upsert_pool_share_statistics,
-    bulk_upsert_worker_shares_entity, AddressSharesUpdate, ClientRejectedStatsUpsert,
-    ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert,
-    WorkerSharesUpsert,
+    bulk_update_address_settings_shares, bulk_upsert_address_best_difficulty,
+    bulk_upsert_client_rejected_statistics_entity, bulk_upsert_client_statistics_entity,
+    bulk_upsert_pool_mode_hashrate, bulk_upsert_pool_rejected_statistics,
+    bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity,
+    AddressBestDifficultyUpsert, AddressSharesUpdate, ClientRejectedStatsUpsert, ClientStatsUpsert,
+    PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert, WorkerSharesUpsert,
 };
 use bp_stats::{
-    ClientRejectedAccumulator, ClientStatisticsAccumulator, FlushHealthMonitor,
-    PoolModeHashrateAccumulator, PoolRejectedAccumulator, PoolSharesAccumulator,
-    ShareTotalsAccumulator,
+    BestDifficultyAccumulator, ClientRejectedAccumulator, ClientStatisticsAccumulator,
+    FlushHealthMonitor, PoolModeHashrateAccumulator, PoolRejectedAccumulator,
+    PoolSharesAccumulator, ShareTotalsAccumulator,
 };
 use sqlx::PgPool;
 use tracing::warn;
@@ -38,6 +38,7 @@ pub enum Flusher {
     ClientRejected,
     AddressTotals,
     WorkerTotals,
+    BestDifficulty,
 }
 
 /// The six accumulators the sink owns + the health monitor it updates
@@ -50,6 +51,7 @@ pub struct Accumulators {
     pub client_statistics: ClientStatisticsAccumulator,
     pub client_rejected: ClientRejectedAccumulator,
     pub share_totals: ShareTotalsAccumulator,
+    pub best_difficulty: BestDifficultyAccumulator,
 }
 
 impl Default for Accumulators {
@@ -61,6 +63,7 @@ impl Default for Accumulators {
             client_statistics: ClientStatisticsAccumulator::new(),
             client_rejected: ClientRejectedAccumulator::new(),
             share_totals: ShareTotalsAccumulator::new(),
+            best_difficulty: BestDifficultyAccumulator::new(),
         }
     }
 }
@@ -86,6 +89,7 @@ pub async fn flush_once(
     let worker_rejected_fanout = flush_client_statistics(pool, accs, health, batch_size).await;
     flush_client_rejected(pool, accs, health).await;
     flush_address_totals(pool, accs, health).await;
+    flush_best_difficulty(pool, accs, health).await;
     flush_worker_totals(pool, accs, health, &worker_rejected_fanout).await;
 }
 
@@ -330,6 +334,36 @@ async fn flush_address_totals(
         Err(e) => {
             warn!(error = %e, "address_settings.shares flush failed");
             record_failure(health, Flusher::AddressTotals);
+        }
+    }
+}
+
+async fn flush_best_difficulty(
+    pool: &PgPool,
+    accs: &Accumulators,
+    health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
+) {
+    let snapshot = accs.best_difficulty.drain();
+    if snapshot.is_empty() {
+        record_success(health, Flusher::BestDifficulty);
+        return;
+    }
+    let rows: Vec<AddressBestDifficultyUpsert> = snapshot
+        .iter()
+        .map(|(addr, entry)| AddressBestDifficultyUpsert {
+            address: addr.as_str().to_string(),
+            best_difficulty: entry.best_difficulty,
+            user_agent: entry.user_agent.clone(),
+        })
+        .collect();
+    match bulk_upsert_address_best_difficulty(pool, &rows).await {
+        Ok(_) => {
+            accs.best_difficulty.confirm(&snapshot);
+            record_success(health, Flusher::BestDifficulty);
+        }
+        Err(e) => {
+            warn!(error = %e, "address_settings.bestDifficulty flush failed");
+            record_failure(health, Flusher::BestDifficulty);
         }
     }
 }

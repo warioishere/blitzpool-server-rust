@@ -22,7 +22,6 @@
 //! - **[`engine::SessionPersistenceEngine`]** — `spawn(config, pool)` →
 //!   handle exposing the cache + hooks-ready references.
 
-pub mod address_settings_cache;
 pub mod client_row;
 pub mod config;
 pub mod engine;
@@ -31,10 +30,7 @@ mod hashrate_sampler;
 pub mod hooks;
 mod touch_buffer;
 
-pub use address_settings_cache::{
-    AddressSettingsCache, CachedAddressSettings, InMemoryAddressSettingsCache,
-};
 pub use config::SessionPersistenceConfig;
 pub use engine::{SessionPersistenceEngine, SessionPersistenceEngineHandle};
 pub use error::SessionPersistenceError;
-pub use hooks::{BestDifficultySink, ClientDifficultyStatisticsSink, SessionPersistenceHook};
+pub use hooks::{ClientDifficultyStatisticsSink, SessionPersistenceHook};

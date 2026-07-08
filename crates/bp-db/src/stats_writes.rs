@@ -373,6 +373,65 @@ where
     Ok(result.rows_affected())
 }
 
+/// One row in an `address_settings_entity."bestDifficulty"` bulk-upsert.
+/// `best_difficulty` is the window's MAX candidate for the address (folded
+/// in via `GREATEST`, not added).
+#[derive(Clone, Debug)]
+pub struct AddressBestDifficultyUpsert {
+    pub address: String,
+    pub best_difficulty: f64,
+    pub user_agent: Option<String>,
+}
+
+/// Fold each address's window-max best difficulty into
+/// `address_settings_entity."bestDifficulty"` via `GREATEST` — the
+/// all-time record only grows. Idempotent: re-applying the same batch is a
+/// no-op. `"bestDifficultyUserAgent"` + `"updatedAt"` move only when the
+/// value actually grows (so `/api/info` keeps showing when the best was
+/// last set). Inserts the row if the address has none yet.
+pub async fn bulk_upsert_address_best_difficulty<'e, E>(
+    executor: E,
+    rows: &[AddressBestDifficultyUpsert],
+) -> Result<u64, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let addresses: Vec<String> = rows.iter().map(|r| r.address.clone()).collect();
+    let bests: Vec<f64> = rows.iter().map(|r| r.best_difficulty).collect();
+    let user_agents: Vec<Option<String>> = rows.iter().map(|r| r.user_agent.clone()).collect();
+
+    let result = sqlx::query!(
+        r#"INSERT INTO address_settings_entity
+             (address, "bestDifficulty", "bestDifficultyUserAgent", "createdAt", "updatedAt")
+           SELECT u.address, u.bd, u.ua,
+                  (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
+                  (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
+           FROM UNNEST($1::varchar[], $2::double precision[], $3::varchar[])
+                AS u(address, bd, ua)
+           ON CONFLICT (address) DO UPDATE SET
+             "bestDifficultyUserAgent" = CASE
+                 WHEN EXCLUDED."bestDifficulty" > address_settings_entity."bestDifficulty"
+                 THEN EXCLUDED."bestDifficultyUserAgent"
+                 ELSE address_settings_entity."bestDifficultyUserAgent" END,
+             "updatedAt" = CASE
+                 WHEN EXCLUDED."bestDifficulty" > address_settings_entity."bestDifficulty"
+                 THEN EXCLUDED."updatedAt"
+                 ELSE address_settings_entity."updatedAt" END,
+             "bestDifficulty" = GREATEST(
+                 address_settings_entity."bestDifficulty", EXCLUDED."bestDifficulty")"#,
+        &addresses,
+        &bests,
+        &user_agents as &[Option<String>],
+    )
+    .execute(executor)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
 /// One row in a `worker_shares_entity` bulk-upsert. Both deltas add to
 /// existing values; missing rows are inserted with the delta as the
 /// initial value.

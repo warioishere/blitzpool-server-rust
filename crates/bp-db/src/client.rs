@@ -972,37 +972,3 @@ pub async fn reset_all_client_hashrate(pool: &PgPool) -> Result<u64, DbError> {
     Ok(result.rows_affected())
 }
 
-/// Atomic compare-and-set on `address_settings_entity.bestDifficulty`.
-/// INSERTs a fresh row if the address has none yet (cold-path on the
-/// very first share); on conflict, only UPDATEs when the candidate
-/// strictly exceeds the stored value. Returns the rows-affected count
-/// — 1 if the row was inserted/updated, 0 if the candidate was ≤ stored.
-pub async fn upsert_address_best_difficulty<'e, E>(
-    executor: E,
-    address: &str,
-    candidate_difficulty: f64,
-    user_agent: Option<&str>,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let result = sqlx::query!(
-        r#"INSERT INTO address_settings_entity
-             (address, "bestDifficulty", "bestDifficultyUserAgent", "createdAt", "updatedAt")
-           VALUES ($1, $2, $3,
-                   (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
-                   (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)
-           ON CONFLICT (address) DO UPDATE
-           SET "bestDifficulty"          = EXCLUDED."bestDifficulty",
-               "bestDifficultyUserAgent" = EXCLUDED."bestDifficultyUserAgent",
-               "updatedAt"               = EXCLUDED."updatedAt"
-           WHERE EXCLUDED."bestDifficulty" > address_settings_entity."bestDifficulty""#,
-        address,
-        candidate_difficulty,
-        user_agent,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}

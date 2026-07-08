@@ -206,10 +206,9 @@ pub fn now_ms() -> i64 {
 /// producer-stamped [`SharedAcceptedShare::mode`] internally.
 ///
 /// **Hot path**: this trait method is called once per accepted share.
-/// Implementations should keep the work minimal — accumulator
-/// `add_*` calls are good; PG round-trips should be guarded by a
-/// cache predicate (see `bp_session_persistence::hooks::BestDifficultySink`
-/// for the pattern).
+/// Implementations should keep the work minimal — accumulator `add_*`
+/// calls are good; avoid a per-share PG round-trip (batch it into a
+/// coordinator-tick flush, as the stats sink does).
 #[async_trait]
 pub trait SharedAcceptedShareSink: Send + Sync {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>);
