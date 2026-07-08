@@ -3,7 +3,7 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for the 9 stats-coordinator bulk-write primitives
+//! Integration tests for the 8 stats-coordinator bulk-write primitives
 //! in `stats_writes.rs`. Mirrors `pplns_bulk_writes.rs`
 //! pattern: each test wraps in TX-rollback for isolation.
 //!
@@ -14,19 +14,20 @@
 //!   `client_statistics_entity`, `client_rejected_statistics_entity`):
 //!   first-call inserts, second-call ON-CONFLICT-INCREMENT, empty-slice
 //!   no-op.
-//! - 2 lifetime-totals writes (`address_settings_entity.shares` UPDATE
-//!   FROM UNNEST + `worker_shares_entity` composite-PK upsert).
+//! - 2 lifetime-totals writes (`address_settings_entity` — one upsert
+//!   folds the `shares` increment AND the `bestDifficulty` GREATEST —
+//!   plus `worker_shares_entity` composite-PK upsert).
 //! - 2 seed-bootstrap functions (`count_worker_shares` +
 //!   `seed_worker_shares_from_client_statistics`).
 
 use bp_db::{
-    bulk_update_address_settings_shares, bulk_upsert_address_best_difficulty,
-    bulk_upsert_client_rejected_statistics_entity, bulk_upsert_client_statistics_entity,
-    bulk_upsert_pool_mode_hashrate, bulk_upsert_pool_rejected_statistics,
-    bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity, count_worker_shares,
-    seed_worker_shares_from_client_statistics, AddressBestDifficultyUpsert, AddressSharesUpdate,
-    ClientRejectedStatsUpsert, ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert,
-    PoolShareStatsUpsert, WorkerSharesUpsert,
+    bulk_upsert_address_settings, bulk_upsert_client_rejected_statistics_entity,
+    bulk_upsert_client_statistics_entity, bulk_upsert_pool_mode_hashrate,
+    bulk_upsert_pool_rejected_statistics, bulk_upsert_pool_share_statistics,
+    bulk_upsert_worker_shares_entity, count_worker_shares,
+    seed_worker_shares_from_client_statistics, AddressSettingsUpsert, ClientRejectedStatsUpsert,
+    ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert,
+    WorkerSharesUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
@@ -386,20 +387,40 @@ async fn client_rejected_stats_dual_field_increment() {
     tx.rollback().await.expect("rollback");
 }
 
-// ── address_settings_entity.shares (UPDATE FROM UNNEST) ─────────────
+// ── address_settings_entity (merged shares + bestDifficulty upsert) ──
+
+/// A pure share-accumulation upsert (best_difficulty = 0, no user-agent).
+fn shares(address: &str, delta: f64) -> AddressSettingsUpsert {
+    AddressSettingsUpsert {
+        address: address.to_string(),
+        delta_shares: delta,
+        best_difficulty: 0.0,
+        user_agent: None,
+    }
+}
+
+/// A pure best-difficulty upsert (no share delta).
+fn bd(address: &str, best: f64, ua: Option<&str>) -> AddressSettingsUpsert {
+    AddressSettingsUpsert {
+        address: address.to_string(),
+        delta_shares: 0.0,
+        best_difficulty: best,
+        user_agent: ua.map(str::to_string),
+    }
+}
 
 #[tokio::test]
-async fn address_shares_update_increments_existing_rows_only() {
+async fn address_settings_shares_increment_and_create_missing_rows() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
 
-    // Pre-populate one address with a known updatedAt; another we don't
-    // insert to verify the UPDATE silently skips missing rows. The fixed
-    // updatedAt also lets the follow-up assertion verify the bulk-update
-    // path leaves it alone (only bestDifficulty changes bump
-    // the timestamp, not share accumulation).
+    // Seed one address with a known updatedAt so the follow-up assertion
+    // can prove a pure share-accumulation upsert (best_difficulty = 0)
+    // leaves the timestamp alone. The second address has NO row — the
+    // merged upsert must CREATE it (the old UPDATE-only path dropped a
+    // brand-new address's first flush window of shares).
     let seeded_updated_at = 1_700_000_000_000_i64;
     sqlx::query(
         r#"INSERT INTO address_settings_entity (address, shares, "bestDifficulty", "createdAt", "updatedAt")
@@ -412,20 +433,12 @@ async fn address_shares_update_increments_existing_rows_only() {
     .await
     .expect("seed row");
 
-    let rows = vec![
-        AddressSharesUpdate {
-            address: "test_as_present".to_string(),
-            delta_shares: 42.0,
-        },
-        AddressSharesUpdate {
-            address: "test_as_absent".to_string(),
-            delta_shares: 99.0,
-        },
-    ];
-    let affected = bulk_update_address_settings_shares(&mut *tx, &rows)
-        .await
-        .expect("update");
-    assert_eq!(affected, 1, "only the existing row should be updated");
+    bulk_upsert_address_settings(
+        &mut *tx,
+        &[shares("test_as_present", 42.0), shares("test_as_absent", 99.0)],
+    )
+    .await
+    .expect("upsert");
 
     let present: f64 =
         sqlx::query_scalar(r#"SELECT shares FROM address_settings_entity WHERE address = $1"#)
@@ -443,28 +456,84 @@ async fn address_shares_update_increments_existing_rows_only() {
             .expect("read updatedAt");
     assert_eq!(
         updated_at_after, seeded_updated_at,
-        "updatedAt must be preserved on share accumulation (only bestDifficulty bumps it)"
+        "updatedAt must be preserved on share accumulation (only a new best bumps it)"
     );
 
-    let absent_rows: i64 =
-        sqlx::query_scalar(r#"SELECT COUNT(*) FROM address_settings_entity WHERE address = $1"#)
+    let absent: f64 =
+        sqlx::query_scalar(r#"SELECT shares FROM address_settings_entity WHERE address = $1"#)
             .bind("test_as_absent")
             .fetch_one(&mut *tx)
             .await
             .expect("read absent");
-    assert_eq!(absent_rows, 0, "missing row stays missing");
+    assert!(
+        (absent - 99.0).abs() < 0.01,
+        "missing row created with the delta as initial shares: {absent}"
+    );
 
     tx.rollback().await.expect("rollback");
 }
 
-// ── address_settings_entity."bestDifficulty" (GREATEST upsert) ──────
+/// The merge's whole point: one upsert lands BOTH the share increment and
+/// the best-difficulty GREATEST, and `"updatedAt"` moves only when the best
+/// actually grows.
+#[tokio::test]
+async fn address_settings_upsert_folds_shares_and_best_in_one_write() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("begin tx");
+    let addr = "test_as_combined";
 
-fn bd(address: &str, best: f64, ua: Option<&str>) -> AddressBestDifficultyUpsert {
-    AddressBestDifficultyUpsert {
-        address: address.to_string(),
-        best_difficulty: best,
-        user_agent: ua.map(str::to_string),
-    }
+    // Fresh address: a single upsert carrying a share delta AND a best.
+    bulk_upsert_address_settings(
+        &mut *tx,
+        &[AddressSettingsUpsert {
+            address: addr.to_string(),
+            delta_shares: 10.0,
+            best_difficulty: 500.0,
+            user_agent: Some("bitaxe".into()),
+        }],
+    )
+    .await
+    .expect("insert combined");
+    assert_eq!(read_row(&mut tx, addr).await, (10.0, 500.0, Some("bitaxe".into())));
+    let ts_after_insert: i64 =
+        sqlx::query_scalar(r#"SELECT "updatedAt" FROM address_settings_entity WHERE address = $1"#)
+            .bind(addr)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("ts");
+
+    // Second window: more shares + a LOWER best. Shares accumulate; the
+    // best + its user-agent stay; updatedAt is NOT bumped (no new best).
+    bulk_upsert_address_settings(
+        &mut *tx,
+        &[AddressSettingsUpsert {
+            address: addr.to_string(),
+            delta_shares: 7.0,
+            best_difficulty: 300.0,
+            user_agent: Some("worker".into()),
+        }],
+    )
+    .await
+    .expect("second window");
+    assert_eq!(
+        read_row(&mut tx, addr).await,
+        (17.0, 500.0, Some("bitaxe".into())),
+        "shares accumulate; lower best + its ua are kept"
+    );
+    let ts_after_second: i64 =
+        sqlx::query_scalar(r#"SELECT "updatedAt" FROM address_settings_entity WHERE address = $1"#)
+            .bind(addr)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("ts2");
+    assert_eq!(
+        ts_after_second, ts_after_insert,
+        "updatedAt must not move when the best difficulty does not grow"
+    );
+
+    tx.rollback().await.expect("rollback");
 }
 
 async fn read_best(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, address: &str) -> (f64, Option<String>) {
@@ -479,6 +548,26 @@ async fn read_best(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, address: &str
     (row.get("bestDifficulty"), row.get("bestDifficultyUserAgent"))
 }
 
+/// Reads the full merged triple: `(shares, bestDifficulty, userAgent)`.
+async fn read_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    address: &str,
+) -> (f64, f64, Option<String>) {
+    let row = sqlx::query(
+        r#"SELECT shares, "bestDifficulty", "bestDifficultyUserAgent"
+           FROM address_settings_entity WHERE address = $1"#,
+    )
+    .bind(address)
+    .fetch_one(&mut **tx)
+    .await
+    .expect("read row");
+    (
+        row.get("shares"),
+        row.get("bestDifficulty"),
+        row.get("bestDifficultyUserAgent"),
+    )
+}
+
 #[tokio::test]
 async fn best_difficulty_upsert_inserts_then_climbs_via_greatest() {
     let Some(pool) = connect_or_skip().await else {
@@ -488,19 +577,19 @@ async fn best_difficulty_upsert_inserts_then_climbs_via_greatest() {
     let addr = "test_bd_greatest";
 
     // Fresh address → INSERT.
-    bulk_upsert_address_best_difficulty(&mut *tx, &[bd(addr, 100.0, Some("bitaxe"))])
+    bulk_upsert_address_settings(&mut *tx, &[bd(addr, 100.0, Some("bitaxe"))])
         .await
         .expect("insert");
     assert_eq!(read_best(&mut tx, addr).await, (100.0, Some("bitaxe".into())));
 
     // Higher → climbs + stamps the new firmware.
-    bulk_upsert_address_best_difficulty(&mut *tx, &[bd(addr, 250.0, Some("nerdqaxe"))])
+    bulk_upsert_address_settings(&mut *tx, &[bd(addr, 250.0, Some("nerdqaxe"))])
         .await
         .expect("climb");
     assert_eq!(read_best(&mut tx, addr).await, (250.0, Some("nerdqaxe".into())));
 
     // Lower → GREATEST keeps the stored max AND its user-agent.
-    bulk_upsert_address_best_difficulty(&mut *tx, &[bd(addr, 40.0, Some("worker"))])
+    bulk_upsert_address_settings(&mut *tx, &[bd(addr, 40.0, Some("worker"))])
         .await
         .expect("lower");
     assert_eq!(read_best(&mut tx, addr).await, (250.0, Some("nerdqaxe".into())));
@@ -523,7 +612,7 @@ async fn best_difficulty_recovers_after_a_reset() {
     let addr = "test_bd_reset_recovery";
 
     // Climb to a high all-time best.
-    bulk_upsert_address_best_difficulty(&mut *tx, &[bd(addr, 623_932_928.0, Some("octaxe"))])
+    bulk_upsert_address_settings(&mut *tx, &[bd(addr, 623_932_928.0, Some("octaxe"))])
         .await
         .expect("high");
     assert_eq!(read_best(&mut tx, addr).await.0, 623_932_928.0);
@@ -541,7 +630,7 @@ async fn best_difficulty_recovers_after_a_reset() {
 
     // Next flush carries a share LOWER than the old high → it must climb
     // back from 0 (GREATEST(0, x) = x), not stay stuck at 0.
-    bulk_upsert_address_best_difficulty(&mut *tx, &[bd(addr, 19_987_136.0, Some("bitaxe"))])
+    bulk_upsert_address_settings(&mut *tx, &[bd(addr, 19_987_136.0, Some("bitaxe"))])
         .await
         .expect("recover");
     assert_eq!(
@@ -559,7 +648,7 @@ async fn best_difficulty_upsert_empty_slice_is_noop() {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
-    let n = bulk_upsert_address_best_difficulty(&mut *tx, &[])
+    let n = bulk_upsert_address_settings(&mut *tx, &[])
         .await
         .expect("empty");
     assert_eq!(n, 0);

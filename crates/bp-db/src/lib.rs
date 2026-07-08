@@ -176,12 +176,11 @@ pub use pplns::{
     PplnsPayoutHistoryRow, TouchUpdate,
 };
 pub use stats_writes::{
-    bulk_update_address_settings_shares, bulk_upsert_address_best_difficulty,
-    bulk_upsert_client_rejected_statistics_entity, bulk_upsert_client_statistics_entity,
-    bulk_upsert_pool_mode_hashrate, bulk_upsert_pool_rejected_statistics,
-    bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity, count_worker_shares,
-    seed_worker_shares_from_client_statistics, AddressBestDifficultyUpsert, AddressSharesUpdate,
-    ClientRejectedStatsUpsert,
+    bulk_upsert_address_settings, bulk_upsert_client_rejected_statistics_entity,
+    bulk_upsert_client_statistics_entity, bulk_upsert_pool_mode_hashrate,
+    bulk_upsert_pool_rejected_statistics, bulk_upsert_pool_share_statistics,
+    bulk_upsert_worker_shares_entity, count_worker_shares,
+    seed_worker_shares_from_client_statistics, AddressSettingsUpsert, ClientRejectedStatsUpsert,
     ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert,
     WorkerSharesUpsert,
 };

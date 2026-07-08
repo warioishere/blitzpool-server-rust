@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Coordinator-tick flush: drain 6 accumulators, build 7 bulk-upserts,
-//! confirm on success, update [`FlushHealthMonitor`].
+//! Coordinator-tick flush: drain 7 accumulators, write 7 tables,
+//! confirm on success, update [`FlushHealthMonitor`]. The share-total
+//! and best-difficulty accumulators share one destination table
+//! (`address_settings_entity`) and are folded into a single upsert.
 //!
 //! **Per-flusher failure isolation**: one flusher's PG error doesn't abort the tick.
 //! The accumulator-drain/confirm contract preserves un-confirmed
@@ -11,12 +13,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bp_db::{
-    bulk_update_address_settings_shares, bulk_upsert_address_best_difficulty,
-    bulk_upsert_client_rejected_statistics_entity, bulk_upsert_client_statistics_entity,
-    bulk_upsert_pool_mode_hashrate, bulk_upsert_pool_rejected_statistics,
-    bulk_upsert_pool_share_statistics, bulk_upsert_worker_shares_entity,
-    AddressBestDifficultyUpsert, AddressSharesUpdate, ClientRejectedStatsUpsert, ClientStatsUpsert,
-    PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert, WorkerSharesUpsert,
+    bulk_upsert_address_settings, bulk_upsert_client_rejected_statistics_entity,
+    bulk_upsert_client_statistics_entity, bulk_upsert_pool_mode_hashrate,
+    bulk_upsert_pool_rejected_statistics, bulk_upsert_pool_share_statistics,
+    bulk_upsert_worker_shares_entity, AddressSettingsUpsert, ClientRejectedStatsUpsert,
+    ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert,
+    WorkerSharesUpsert,
 };
 use bp_stats::{
     BestDifficultyAccumulator, ClientRejectedAccumulator, ClientStatisticsAccumulator,
@@ -36,12 +38,11 @@ pub enum Flusher {
     PoolRejected,
     ClientStatistics,
     ClientRejected,
-    AddressTotals,
+    AddressSettings,
     WorkerTotals,
-    BestDifficulty,
 }
 
-/// The six accumulators the sink owns + the health monitor it updates
+/// The seven accumulators the sink owns + the health monitor it updates
 /// at the end of each tick. `Arc`-shared with the hook impls so the
 /// share path can mutate without going through the engine handle.
 pub struct Accumulators {
@@ -88,8 +89,7 @@ pub async fn flush_once(
     // keep `worker_shares_entity` writes serial.
     let worker_rejected_fanout = flush_client_statistics(pool, accs, health, batch_size).await;
     flush_client_rejected(pool, accs, health).await;
-    flush_address_totals(pool, accs, health).await;
-    flush_best_difficulty(pool, accs, health).await;
+    flush_address_settings(pool, accs, health).await;
     flush_worker_totals(pool, accs, health, &worker_rejected_fanout).await;
 }
 
@@ -309,61 +309,63 @@ async fn flush_client_rejected(
     }
 }
 
-async fn flush_address_totals(
+/// Merged lifetime-per-address flush: drains BOTH the share-total deltas
+/// and the best-difficulty window maxima, then folds them into
+/// `address_settings_entity` with one upsert per address — a single
+/// row-write per flush instead of a separate shares-UPDATE and
+/// best-difficulty-upsert. Both accumulators are confirmed only on
+/// success, so a PG error re-includes both snapshots on the next tick.
+async fn flush_address_settings(
     pool: &PgPool,
     accs: &Accumulators,
     health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
 ) {
-    let snapshot = accs.share_totals.drain_addresses();
-    if snapshot.is_empty() {
-        record_success(health, Flusher::AddressTotals);
+    let shares_snapshot = accs.share_totals.drain_addresses();
+    let best_snapshot = accs.best_difficulty.drain();
+    if shares_snapshot.is_empty() && best_snapshot.is_empty() {
+        record_success(health, Flusher::AddressSettings);
         return;
     }
-    let rows: Vec<AddressSharesUpdate> = snapshot
-        .iter()
-        .map(|(addr, delta)| AddressSharesUpdate {
-            address: addr.as_str().to_string(),
-            delta_shares: *delta,
-        })
-        .collect();
-    match bulk_update_address_settings_shares(pool, &rows).await {
-        Ok(_) => {
-            accs.share_totals.confirm_addresses(&snapshot);
-            record_success(health, Flusher::AddressTotals);
-        }
-        Err(e) => {
-            warn!(error = %e, "address_settings.shares flush failed");
-            record_failure(health, Flusher::AddressTotals);
-        }
-    }
-}
 
-async fn flush_best_difficulty(
-    pool: &PgPool,
-    accs: &Accumulators,
-    health: &Arc<std::sync::Mutex<FlushHealthMonitor<Flusher>>>,
-) {
-    let snapshot = accs.best_difficulty.drain();
-    if snapshot.is_empty() {
-        record_success(health, Flusher::BestDifficulty);
-        return;
+    // Union the two snapshots by address. A share fans into both
+    // accumulators, but the drain/confirm cycles are independent, so an
+    // address can surface in the share side, the best side, or both on
+    // any given tick — key on the address string and merge.
+    let mut merged: HashMap<String, (f64, f64, Option<String>)> = HashMap::new();
+    for (addr, delta) in &shares_snapshot {
+        merged.insert(addr.as_str().to_string(), (*delta, 0.0, None));
     }
-    let rows: Vec<AddressBestDifficultyUpsert> = snapshot
-        .iter()
-        .map(|(addr, entry)| AddressBestDifficultyUpsert {
-            address: addr.as_str().to_string(),
-            best_difficulty: entry.best_difficulty,
-            user_agent: entry.user_agent.clone(),
-        })
+    for (addr, entry) in &best_snapshot {
+        merged
+            .entry(addr.as_str().to_string())
+            .and_modify(|(_, bd, ua)| {
+                *bd = entry.best_difficulty;
+                *ua = entry.user_agent.clone();
+            })
+            .or_insert((0.0, entry.best_difficulty, entry.user_agent.clone()));
+    }
+
+    let rows: Vec<AddressSettingsUpsert> = merged
+        .into_iter()
+        .map(
+            |(address, (delta_shares, best_difficulty, user_agent))| AddressSettingsUpsert {
+                address,
+                delta_shares,
+                best_difficulty,
+                user_agent,
+            },
+        )
         .collect();
-    match bulk_upsert_address_best_difficulty(pool, &rows).await {
+
+    match bulk_upsert_address_settings(pool, &rows).await {
         Ok(_) => {
-            accs.best_difficulty.confirm(&snapshot);
-            record_success(health, Flusher::BestDifficulty);
+            accs.share_totals.confirm_addresses(&shares_snapshot);
+            accs.best_difficulty.confirm(&best_snapshot);
+            record_success(health, Flusher::AddressSettings);
         }
         Err(e) => {
-            warn!(error = %e, "address_settings.bestDifficulty flush failed");
-            record_failure(health, Flusher::BestDifficulty);
+            warn!(error = %e, "address_settings flush failed");
+            record_failure(health, Flusher::AddressSettings);
         }
     }
 }

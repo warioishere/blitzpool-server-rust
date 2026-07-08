@@ -10,7 +10,7 @@
 //! the next tick, and `+= snapshot` on both sides keeps the totals
 //! eventually consistent.
 //!
-//! The 9 functions in this file split into three groups:
+//! The 8 functions in this file split into three groups:
 //!
 //! 1. **Slot-bucketed stats** (5 tables, 10-minute slot granularity):
 //!    `pool_share_statistics_entity`, `pool_mode_hashrate`,
@@ -18,9 +18,9 @@
 //!    `client_rejected_statistics_entity`. All use UNNEST + ON CONFLICT
 //!    DO UPDATE with `+ EXCLUDED.col` accumulation.
 //! 2. **Lifetime totals** (2 tables, no slot dim):
-//!    `address_settings_entity.shares` (UPDATE FROM UNNEST — row already
-//!    exists, no insert) and `worker_shares_entity` (composite-PK INSERT
-//!    … ON CONFLICT DO UPDATE — may need to create the row).
+//!    `address_settings_entity` (one upsert folds the `shares` increment
+//!    AND the `bestDifficulty` GREATEST into a single row-write) and
+//!    `worker_shares_entity` (composite-PK INSERT … ON CONFLICT DO UPDATE).
 //! 3. **Seed bootstrap** (2 funcs): `count_worker_shares` +
 //!    `seed_worker_shares_from_client_statistics` for the one-shot boot
 //!    one-shot boot migration that seeds worker-share rows from accumulated client statistics.
@@ -330,24 +330,40 @@ where
 
 // ── 2. Lifetime totals ──────────────────────────────────────────────
 
-/// One row in a `address_settings_entity.shares` bulk-update.
-/// `delta_shares` is added to the existing value (not absolute).
+/// One row in an `address_settings_entity` bulk-upsert — folds a window's
+/// lifetime share delta and best-difficulty candidate into the single
+/// per-address row in one write. `delta_shares` is ADDED to the stored
+/// total; `best_difficulty` is the window MAX, folded via `GREATEST` (not
+/// added). `user_agent` stamps the firmware of the share that set a new
+/// best. Either side may be zero/`None` on a given tick.
 #[derive(Clone, Debug)]
-pub struct AddressSharesUpdate {
+pub struct AddressSettingsUpsert {
     pub address: String,
     pub delta_shares: f64,
+    pub best_difficulty: f64,
+    pub user_agent: Option<String>,
 }
 
-/// Bulk-increment lifetime per-address share totals. Address rows must
-/// already exist (created on first authorize via `bp-session-persistence`);
-/// missing rows are silently skipped. `updatedAt` is intentionally NOT
-/// touched: it tracks the moment a miner set a new best difficulty
-/// (surfaced as the timestamp next to each entry on /api/info).
-/// Bumping it on every share-flush would destroy that semantic — the UI
-/// would show "updated just now" for every actively mining address.
-pub async fn bulk_update_address_settings_shares<'e, E>(
+/// Bulk-upsert the per-address lifetime row: increment `shares` by the
+/// window delta AND fold the window-max best difficulty in via `GREATEST`
+/// — one write to `address_settings_entity` per address per flush, in
+/// place of a separate shares-UPDATE and best-difficulty-upsert.
+///
+/// Semantics preserved from the two writes it replaces:
+/// - `shares` is increment-semantic (`shares + EXCLUDED.shares`); a
+///   missing row is INSERTed with the delta as its initial value, so a
+///   brand-new address no longer loses its first flush window of shares.
+/// - `"bestDifficulty"` only grows (`GREATEST`) — re-applying the same
+///   batch is a no-op, keeping partial/retried flushes idempotent.
+/// - `"bestDifficultyUserAgent"` + `"updatedAt"` move ONLY when the best
+///   difficulty actually grows: a pure share-accumulation flush never
+///   bumps `"updatedAt"` (it tracks when a miner last set a new best,
+///   surfaced next to each entry on /api/info). Postgres evaluates every
+///   SET RHS against the pre-update row, so the CASE guards compare
+///   against the stored best regardless of clause order.
+pub async fn bulk_upsert_address_settings<'e, E>(
     executor: E,
-    rows: &[AddressSharesUpdate],
+    rows: &[AddressSettingsUpsert],
 ) -> Result<u64, DbError>
 where
     E: sqlx::PgExecutor<'e>,
@@ -357,61 +373,19 @@ where
     }
     let addresses: Vec<String> = rows.iter().map(|r| r.address.clone()).collect();
     let deltas: Vec<f64> = rows.iter().map(|r| r.delta_shares).collect();
-
-    let result = sqlx::query!(
-        r#"UPDATE address_settings_entity AS t
-           SET shares = t.shares + u.d
-           FROM (SELECT UNNEST($1::varchar[]) AS address,
-                        UNNEST($2::double precision[]) AS d) AS u
-           WHERE t.address = u.address"#,
-        &addresses,
-        &deltas,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
-/// One row in an `address_settings_entity."bestDifficulty"` bulk-upsert.
-/// `best_difficulty` is the window's MAX candidate for the address (folded
-/// in via `GREATEST`, not added).
-#[derive(Clone, Debug)]
-pub struct AddressBestDifficultyUpsert {
-    pub address: String,
-    pub best_difficulty: f64,
-    pub user_agent: Option<String>,
-}
-
-/// Fold each address's window-max best difficulty into
-/// `address_settings_entity."bestDifficulty"` via `GREATEST` — the
-/// all-time record only grows. Idempotent: re-applying the same batch is a
-/// no-op. `"bestDifficultyUserAgent"` + `"updatedAt"` move only when the
-/// value actually grows (so `/api/info` keeps showing when the best was
-/// last set). Inserts the row if the address has none yet.
-pub async fn bulk_upsert_address_best_difficulty<'e, E>(
-    executor: E,
-    rows: &[AddressBestDifficultyUpsert],
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    if rows.is_empty() {
-        return Ok(0);
-    }
-    let addresses: Vec<String> = rows.iter().map(|r| r.address.clone()).collect();
     let bests: Vec<f64> = rows.iter().map(|r| r.best_difficulty).collect();
     let user_agents: Vec<Option<String>> = rows.iter().map(|r| r.user_agent.clone()).collect();
 
     let result = sqlx::query!(
         r#"INSERT INTO address_settings_entity
-             (address, "bestDifficulty", "bestDifficultyUserAgent", "createdAt", "updatedAt")
-           SELECT u.address, u.bd, u.ua,
+             (address, shares, "bestDifficulty", "bestDifficultyUserAgent", "createdAt", "updatedAt")
+           SELECT u.address, u.dshares, u.bd, u.ua,
                   (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
                   (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
-           FROM UNNEST($1::varchar[], $2::double precision[], $3::varchar[])
-                AS u(address, bd, ua)
+           FROM UNNEST($1::varchar[], $2::double precision[], $3::double precision[], $4::varchar[])
+                AS u(address, dshares, bd, ua)
            ON CONFLICT (address) DO UPDATE SET
+             shares = address_settings_entity.shares + EXCLUDED.shares,
              "bestDifficultyUserAgent" = CASE
                  WHEN EXCLUDED."bestDifficulty" > address_settings_entity."bestDifficulty"
                  THEN EXCLUDED."bestDifficultyUserAgent"
@@ -423,6 +397,7 @@ where
              "bestDifficulty" = GREATEST(
                  address_settings_entity."bestDifficulty", EXCLUDED."bestDifficulty")"#,
         &addresses,
+        &deltas,
         &bests,
         &user_agents as &[Option<String>],
     )

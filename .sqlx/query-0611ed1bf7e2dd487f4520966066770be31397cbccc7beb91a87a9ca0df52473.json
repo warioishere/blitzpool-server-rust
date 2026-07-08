@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO address_settings_entity\n             (address, shares, \"bestDifficulty\", \"bestDifficultyUserAgent\", \"createdAt\", \"updatedAt\")\n           SELECT u.address, u.dshares, u.bd, u.ua,\n                  (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,\n                  (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint\n           FROM UNNEST($1::varchar[], $2::double precision[], $3::double precision[], $4::varchar[])\n                AS u(address, dshares, bd, ua)\n           ON CONFLICT (address) DO UPDATE SET\n             shares = address_settings_entity.shares + EXCLUDED.shares,\n             \"bestDifficultyUserAgent\" = CASE\n                 WHEN EXCLUDED.\"bestDifficulty\" > address_settings_entity.\"bestDifficulty\"\n                 THEN EXCLUDED.\"bestDifficultyUserAgent\"\n                 ELSE address_settings_entity.\"bestDifficultyUserAgent\" END,\n             \"updatedAt\" = CASE\n                 WHEN EXCLUDED.\"bestDifficulty\" > address_settings_entity.\"bestDifficulty\"\n                 THEN EXCLUDED.\"updatedAt\"\n                 ELSE address_settings_entity.\"updatedAt\" END,\n             \"bestDifficulty\" = GREATEST(\n                 address_settings_entity.\"bestDifficulty\", EXCLUDED.\"bestDifficulty\")",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "VarcharArray",
+        "Float8Array",
+        "Float8Array",
+        "VarcharArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0611ed1bf7e2dd487f4520966066770be31397cbccc7beb91a87a9ca0df52473"
+}

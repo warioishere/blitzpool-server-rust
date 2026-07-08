@@ -235,7 +235,7 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
             Flusher::PoolRejected,
             Flusher::ClientStatistics,
             Flusher::ClientRejected,
-            Flusher::AddressTotals,
+            Flusher::AddressSettings,
             Flusher::WorkerTotals,
         ] {
             assert_eq!(h.consecutive_failures(&flusher), 0, "flusher: {flusher:?}");
