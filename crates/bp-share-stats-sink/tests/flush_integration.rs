@@ -266,9 +266,9 @@ async fn flush_once_folds_best_difficulty_via_greatest() {
 
     // No row yet: the flush inserts it at the window max.
     let accs = Arc::new(Accumulators::default());
-    accs.best_difficulty.add(addr(&address), 100.0, Some("bitaxe"));
-    accs.best_difficulty.add(addr(&address), 623_932_928.0, Some("octaxe")); // window max
-    accs.best_difficulty.add(addr(&address), 40.0, Some("worker")); // lower — ignored
+    accs.best_difficulty.add(&addr(&address), 100.0, Some("bitaxe"));
+    accs.best_difficulty.add(&addr(&address), 623_932_928.0, Some("octaxe")); // window max
+    accs.best_difficulty.add(&addr(&address), 40.0, Some("worker")); // lower — ignored
     flush_once(&pool, &accs, &health, 1000).await;
 
     let (best, ua): (f64, Option<String>) = {
@@ -287,7 +287,7 @@ async fn flush_once_folds_best_difficulty_via_greatest() {
 
     // A later window with a LOWER max leaves the stored all-time best alone.
     let accs2 = Arc::new(Accumulators::default());
-    accs2.best_difficulty.add(addr(&address), 1_000.0, Some("bitaxe"));
+    accs2.best_difficulty.add(&addr(&address), 1_000.0, Some("bitaxe"));
     flush_once(&pool, &accs2, &health, 1000).await;
     let best_after: f64 =
         sqlx::query_scalar(r#"SELECT "bestDifficulty" FROM address_settings_entity WHERE address = $1"#)

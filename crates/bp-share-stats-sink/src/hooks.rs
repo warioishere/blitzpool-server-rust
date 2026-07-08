@@ -82,7 +82,7 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
         // into `address_settings_entity."bestDifficulty"` at flush time via
         // GREATEST — no per-share PG write, no write-through cache to diverge.
         self.accumulators.best_difficulty.add(
-            address_id.clone(),
+            &address_id,
             share.submission_difficulty,
             share.user_agent,
         );
