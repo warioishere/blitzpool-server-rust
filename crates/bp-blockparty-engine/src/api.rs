@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_common::{AddressId, Sats};
+use bp_group_mgmt_engine::OpenInviteTtl;
 use bp_db::{
     BlockpartyBlockHistoryRow, BlockpartyGroupRow, BlockpartyMemberRow, BlockpartySplitSnapshot,
 };
@@ -70,9 +71,14 @@ pub trait BlockpartyApi: Send + Sync {
     async fn create_join_link(
         &self,
         group_id: Uuid,
-        ttl_days: Option<i64>,
+        ttl: OpenInviteTtl,
         token: Option<&str>,
     ) -> Result<String, BlockpartyServiceError>;
+    async fn request_member_confirmation(
+        &self,
+        group_id: Uuid,
+        token: Option<&str>,
+    ) -> Result<(), BlockpartyServiceError>;
     async fn revoke_join_link(
         &self,
         group_id: Uuid,
@@ -222,10 +228,17 @@ impl<H: BlockpartyHooks + 'static> BlockpartyApi for BlockpartyService<H> {
     async fn create_join_link(
         &self,
         group_id: Uuid,
-        ttl_days: Option<i64>,
+        ttl: OpenInviteTtl,
         token: Option<&str>,
     ) -> Result<String, BlockpartyServiceError> {
-        BlockpartyService::create_join_link(self, group_id, ttl_days, token).await
+        BlockpartyService::create_join_link(self, group_id, ttl, token).await
+    }
+    async fn request_member_confirmation(
+        &self,
+        group_id: Uuid,
+        token: Option<&str>,
+    ) -> Result<(), BlockpartyServiceError> {
+        BlockpartyService::request_member_confirmation(self, group_id, token).await
     }
     async fn revoke_join_link(
         &self,

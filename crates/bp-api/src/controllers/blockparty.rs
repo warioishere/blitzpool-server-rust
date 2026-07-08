@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use bp_group_mgmt_engine::OpenInviteTtl;
 use crate::middleware::rate_limit;
 use crate::state::SharedState;
 
@@ -40,6 +41,9 @@ struct GroupPublicView {
     dissolved_at: Option<i64>,
     /// `null` rather than omitted when the hint is unset.
     rental_provider_hint: Option<String>,
+    /// When the admin requested member confirmation (button next to Save
+    /// Splits). `null` → the member dashboard suppresses the confirm prompt.
+    confirmation_requested_at: Option<i64>,
 }
 
 impl GroupPublicView {
@@ -53,6 +57,7 @@ impl GroupPublicView {
             created_at: r.created_at,
             dissolved_at: r.dissolved_at,
             rental_provider_hint: r.rental_provider_hint.clone(),
+            confirmation_requested_at: r.confirmation_requested_at,
         }
     }
 }
@@ -244,6 +249,10 @@ where
         // ── Admin lifecycle ──────────────────────────────────────
         .route("/api/blockparty", post(create::<H, M>))
         .route("/api/blockparty/:id/splits", patch(update_splits::<H, M>))
+        .route(
+            "/api/blockparty/:id/request-confirmation",
+            post(request_confirmation::<H, M>),
+        )
         .route(
             "/api/blockparty/:id/rental-hint",
             patch(update_rental_hint::<H, M>),
@@ -439,6 +448,25 @@ where
     }))
 }
 
+/// `POST /api/blockparty/:id/request-confirmation` (admin) — signal that
+/// members may now confirm their split (button next to Save Splits). Flips the
+/// group's `confirmationRequestedAt` so the member dashboard starts surfacing
+/// the confirm prompt.
+async fn request_confirmation<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<&'static Ok>, ApiError>
+where
+    H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
+    M: bp_group_mgmt_engine::EmailHooks + 'static,
+{
+    let svc = require_blockparty(&state)?;
+    svc.request_member_confirmation(id, admin_token(&headers).as_deref())
+        .await?;
+    Ok(Json(&OK))
+}
+
 async fn dissolve<H, M>(
     State(state): State<SharedState<H, M>>,
     Path(id): Path<Uuid>,
@@ -525,7 +553,7 @@ where
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JoinLinkBody {
-    ttl_days: Option<i64>,
+    ttl: String,
 }
 
 #[derive(Serialize)]
@@ -546,9 +574,13 @@ where
     H: bp_group_mgmt_engine::GroupServiceHooks + 'static,
     M: bp_group_mgmt_engine::EmailHooks + 'static,
 {
+    let ttl = OpenInviteTtl::parse(&body.ttl).ok_or(ApiError::Invitation {
+        code: "invalid-ttl",
+        status: StatusCode::BAD_REQUEST,
+    })?;
     let svc = require_blockparty(&state)?;
     let token = svc
-        .create_join_link(id, body.ttl_days, admin_token(&headers).as_deref())
+        .create_join_link(id, ttl, admin_token(&headers).as_deref())
         .await?;
     Ok(Json(JoinLinkResponse { token }))
 }

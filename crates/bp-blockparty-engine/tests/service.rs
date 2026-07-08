@@ -25,7 +25,7 @@ use bp_blockparty_engine::{
     CoinbaseReservation,
 };
 use bp_common::{AddressId, Sats};
-use bp_group_mgmt_engine::AddressCache as PplnsAddressCache;
+use bp_group_mgmt_engine::{AddressCache as PplnsAddressCache, OpenInviteTtl};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
@@ -238,7 +238,7 @@ async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
 
     // Admin mints a join link; Carol self-joins via it (no admin token).
     let link = svc
-        .create_join_link(create.group.id, Some(7), Some(&create.admin_token))
+        .create_join_link(create.group.id, OpenInviteTtl::SevenDays, Some(&create.admin_token))
         .await
         .expect("create_join_link");
     let (member_token, group_id) = svc.join_via_link(&link, carol).await.expect("join_via_link");
@@ -302,7 +302,7 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
         .await
         .expect("create");
     let link = svc
-        .create_join_link(create.group.id, Some(7), Some(&create.admin_token))
+        .create_join_link(create.group.id, OpenInviteTtl::SevenDays, Some(&create.admin_token))
         .await
         .expect("create_join_link");
     // NoEmail hook → email.is_none() is true → the gate falls through to the
@@ -358,7 +358,7 @@ async fn join_via_link_rejects_unverified_address() {
         .await
         .expect("create");
     let link = svc
-        .create_join_link(create.group.id, Some(7), Some(&create.admin_token))
+        .create_join_link(create.group.id, OpenInviteTtl::SevenDays, Some(&create.admin_token))
         .await
         .expect("create_join_link");
     let err = svc
@@ -437,6 +437,42 @@ async fn create_group_rejects_unverified_admin() {
             .await
             .unwrap();
     assert_eq!(group_count, 0, "no group row should exist for a rejected create");
+
+    cleanup(&pool, name, admin).await;
+}
+
+/// The admin "members may confirm now" signal: unset at creation, admin-gated,
+/// stamps `confirmationRequestedAt` on success.
+#[tokio::test]
+async fn request_member_confirmation_stamps_flag_and_is_admin_gated() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-reqconfirm-1";
+    let admin = "bc1qadminreqconfirm1";
+    cleanup(&pool, name, admin).await;
+
+    let svc = svc(&pool);
+    let create = svc.create_group(name, admin, 10_000).await.expect("create");
+
+    // Unset at creation — a freshly-joined member must not be nagged yet.
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert!(g.confirmation_requested_at.is_none());
+
+    // Wrong admin token is rejected; the flag stays unset.
+    assert!(svc
+        .request_member_confirmation(create.group.id, Some("GRP-nope"))
+        .await
+        .is_err());
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert!(g.confirmation_requested_at.is_none());
+
+    // Correct admin token stamps the flag.
+    svc.request_member_confirmation(create.group.id, Some(&create.admin_token))
+        .await
+        .expect("request confirmation");
+    let g = svc.get_group(create.group.id).await.unwrap().unwrap();
+    assert!(g.confirmation_requested_at.is_some());
 
     cleanup(&pool, name, admin).await;
 }

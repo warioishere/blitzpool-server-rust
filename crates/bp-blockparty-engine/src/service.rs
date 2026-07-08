@@ -25,7 +25,7 @@ use bp_db::{
     BlockpartyBlockHistoryRow, BlockpartyGroupRow, BlockpartyMemberRow, BlockpartySplitSnapshot,
 };
 use bp_group_mgmt::token::{AdminToken, InvitationToken, TokenHash};
-use bp_group_mgmt_engine::AddressCache as PplnsAddressCache;
+use bp_group_mgmt_engine::{AddressCache as PplnsAddressCache, OpenInviteTtl};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -525,18 +525,32 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
     pub async fn create_join_link(
         &self,
         group_id: Uuid,
-        ttl_days: Option<i64>,
+        ttl: OpenInviteTtl,
         token: Option<&str>,
     ) -> Result<String, BlockpartyServiceError> {
         let group = self.require_admin_token(group_id, token).await?;
         assert_editable(&group)?;
         let now = now_ms();
-        let ttl_days = ttl_days.unwrap_or(7).clamp(1, 90);
-        let expires_at = now + ttl_days * 24 * 60 * 60 * 1000;
+        let expires_at = now + ttl.as_ms();
         let link = InvitationToken::generate()?;
         bp_db::upsert_blockparty_join_link(&self.pool, group_id, link.as_str(), expires_at, now)
             .await?;
         Ok(link.as_str().to_owned())
+    }
+
+    /// Admin signals that members may now confirm their split (the button next
+    /// to Save Splits). Stamps `confirmationRequestedAt`; the member dashboard
+    /// only surfaces the confirm prompt once this is set, so a freshly-joined
+    /// member isn't nagged before the admin has assigned the real splits.
+    pub async fn request_member_confirmation(
+        &self,
+        group_id: Uuid,
+        token: Option<&str>,
+    ) -> Result<(), BlockpartyServiceError> {
+        let group = self.require_admin_token(group_id, token).await?;
+        assert_editable(&group)?;
+        bp_db::set_blockparty_confirmation_requested(&self.pool, group_id, now_ms()).await?;
+        Ok(())
     }
 
     /// Revoke the group's join link. Admin-gated.

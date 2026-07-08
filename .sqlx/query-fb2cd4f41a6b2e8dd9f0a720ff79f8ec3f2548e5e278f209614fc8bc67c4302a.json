@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"adminAddress\" AS \"admin_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            status AS \"status!\",\n            \"lastShareAt\" AS \"last_share_at?\",\n            \"rentalProviderHint\" AS \"rental_provider_hint?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\"\n           FROM blockparty_group WHERE name = $1 LIMIT 1",
+  "query": "SELECT\n            id AS \"id!\",\n            name AS \"name!\",\n            \"adminAddress\" AS \"admin_address!: AddressId\",\n            \"adminTokenHash\" AS \"admin_token_hash!\",\n            status AS \"status!\",\n            \"lastShareAt\" AS \"last_share_at?\",\n            \"rentalProviderHint\" AS \"rental_provider_hint?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"dissolvedAt\" AS \"dissolved_at?\",\n            \"confirmationRequestedAt\" AS \"confirmation_requested_at?\"\n           FROM blockparty_group WHERE \"adminAddress\" = $1 LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -52,6 +52,11 @@
         "ordinal": 9,
         "name": "dissolved_at?",
         "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "confirmation_requested_at?",
+        "type_info": "Int8"
       }
     ],
     "parameters": {
@@ -69,8 +74,9 @@
       true,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "5689e5810c7143018ca29a7fd6f17ce21ba56b32f3cc639608a22836fe391065"
+  "hash": "fb2cd4f41a6b2e8dd9f0a720ff79f8ec3f2548e5e278f209614fc8bc67c4302a"
 }

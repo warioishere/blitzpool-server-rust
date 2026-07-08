@@ -34,6 +34,11 @@ pub struct BlockpartyGroupRow {
     pub updated_at: i64,
     #[sqlx(rename = "dissolvedAt")]
     pub dissolved_at: Option<i64>,
+    /// Set when the admin requests member confirmation (button next to Save
+    /// Splits). Null → the member dashboard suppresses the "confirm your share"
+    /// prompt so a freshly-joined member isn't nagged pre-assignment.
+    #[sqlx(rename = "confirmationRequestedAt")]
+    pub confirmation_requested_at: Option<i64>,
 }
 
 pub async fn find_blockparty_group<'e, E>(
@@ -55,7 +60,8 @@ where
             "rentalProviderHint" AS "rental_provider_hint?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
-            "dissolvedAt" AS "dissolved_at?"
+            "dissolvedAt" AS "dissolved_at?",
+            "confirmationRequestedAt" AS "confirmation_requested_at?"
            FROM blockparty_group WHERE id = $1 LIMIT 1"#,
         id,
     )
@@ -80,7 +86,8 @@ pub async fn find_blockparty_group_by_name(
             "rentalProviderHint" AS "rental_provider_hint?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
-            "dissolvedAt" AS "dissolved_at?"
+            "dissolvedAt" AS "dissolved_at?",
+            "confirmationRequestedAt" AS "confirmation_requested_at?"
            FROM blockparty_group WHERE name = $1 LIMIT 1"#,
         name,
     )
@@ -105,7 +112,8 @@ pub async fn find_blockparty_group_by_admin_address(
             "rentalProviderHint" AS "rental_provider_hint?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
-            "dissolvedAt" AS "dissolved_at?"
+            "dissolvedAt" AS "dissolved_at?",
+            "confirmationRequestedAt" AS "confirmation_requested_at?"
            FROM blockparty_group WHERE "adminAddress" = $1 LIMIT 1"#,
         admin_address.as_str(),
     )
@@ -129,7 +137,8 @@ pub async fn list_blockparty_groups_non_dissolved(
             "rentalProviderHint" AS "rental_provider_hint?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
-            "dissolvedAt" AS "dissolved_at?"
+            "dissolvedAt" AS "dissolved_at?",
+            "confirmationRequestedAt" AS "confirmation_requested_at?"
            FROM blockparty_group WHERE status <> 'dissolved' ORDER BY "createdAt" ASC"#,
     )
     .fetch_all(pool)
@@ -162,7 +171,8 @@ pub async fn insert_blockparty_group(
             "rentalProviderHint" AS "rental_provider_hint?",
             "createdAt" AS "created_at!",
             "updatedAt" AS "updated_at!",
-            "dissolvedAt" AS "dissolved_at?""#,
+            "dissolvedAt" AS "dissolved_at?",
+            "confirmationRequestedAt" AS "confirmation_requested_at?""#,
         id,
         name,
         admin_address.as_str(),
@@ -253,6 +263,26 @@ pub async fn update_blockparty_group_rental_hint(
         id,
         hint,
         updated_at,
+    )
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(DbError::from)
+}
+
+/// Stamp the admin's "members may now confirm their split" request. Idempotent
+/// re-stamp (a re-nudge) just moves the timestamp forward.
+pub async fn set_blockparty_confirmation_requested(
+    pool: &PgPool,
+    id: Uuid,
+    requested_at: i64,
+) -> Result<(), DbError> {
+    sqlx::query!(
+        r#"UPDATE blockparty_group
+           SET "confirmationRequestedAt" = $2, "updatedAt" = $2
+           WHERE id = $1"#,
+        id,
+        requested_at,
     )
     .execute(pool)
     .await
