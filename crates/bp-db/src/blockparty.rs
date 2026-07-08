@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Blockparty mining mode — group / member / invitation / block-history rows.
+//! Blockparty mining mode — group / member / block-history rows.
 //!
 //! - `blockparty_group` — UUID PK, status FSM (draft/confirming/ready/active/dissolved)
 //! - `blockparty_member` — bigint PK, UNIQUE on address (pool-wide single membership)
-//! - `blockparty_invitation` — token PK, partial unique on (groupId, address) WHERE status='pending'
 //! - `blockparty_block_history` — bigint PK, UNIQUE (groupId, blockHash) for replay-safety
 
 use bp_common::{AddressId, Sats};
