@@ -162,7 +162,7 @@ async fn create_group_seeds_draft_and_routing_cache() {
 
     let svc = svc(&pool);
     let res = svc
-        .create_group(name, admin, "admin@test.example", 10_000)
+        .create_group(name, admin, 10_000)
         .await
         .expect("create_group");
 
@@ -195,7 +195,7 @@ async fn add_member_flips_to_confirming_and_inserts_member_cache() {
 
     let svc = svc(&pool);
     let create = svc
-        .create_group(name, admin, "admin@test.example", 5_000)
+        .create_group(name, admin, 5_000)
         .await
         .expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
@@ -232,7 +232,7 @@ async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
 
     let svc = svc(&pool);
     let create = svc
-        .create_group(name, admin, "admin@test.example", 5_000)
+        .create_group(name, admin, 5_000)
         .await
         .expect("create");
 
@@ -291,10 +291,14 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
         .await;
     delete_signature(&pool, carol).await;
     seed_signature(&pool, carol).await;
+    // The admin must itself clear the create gate (email OR signature); the
+    // NoEmail hook gives no email, so seed the admin's signature proof too.
+    delete_signature(&pool, admin).await;
+    seed_signature(&pool, admin).await;
 
     let svc = svc_no_email(&pool);
     let create = svc
-        .create_group(name, admin, "admin@test.example", 5_000)
+        .create_group(name, admin, 5_000)
         .await
         .expect("create");
     let link = svc
@@ -321,6 +325,7 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
         .execute(&pool)
         .await;
     delete_signature(&pool, carol).await;
+    delete_signature(&pool, admin).await;
     let _ = sqlx::query("DELETE FROM blockparty_join_link WHERE \"groupId\" = $1")
         .bind(create.group.id)
         .execute(&pool)
@@ -342,10 +347,14 @@ async fn join_via_link_rejects_unverified_address() {
         .execute(&pool)
         .await;
     delete_signature(&pool, dave).await;
+    // The admin must clear the create gate; only the join target (dave) is
+    // left unverified so the join — not the create — is what gets rejected.
+    delete_signature(&pool, admin).await;
+    seed_signature(&pool, admin).await;
 
     let svc = svc_no_email(&pool);
     let create = svc
-        .create_group(name, admin, "admin@test.example", 5_000)
+        .create_group(name, admin, 5_000)
         .await
         .expect("create");
     let link = svc
@@ -364,10 +373,72 @@ async fn join_via_link_rejects_unverified_address() {
     assert!(svc.member_group_id(&addr(dave)).await.is_none());
 
     cleanup(&pool, name, admin).await;
+    delete_signature(&pool, admin).await;
     let _ = sqlx::query("DELETE FROM blockparty_join_link WHERE \"groupId\" = $1")
         .bind(create.group.id)
         .execute(&pool)
         .await;
+}
+
+/// The create gate itself: a signature-verified but email-less admin can open
+/// a party, and the admin member row stores an empty email (badge = signature).
+#[tokio::test]
+async fn create_group_admits_signature_verified_email_less_admin() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-sigcreate-1";
+    let admin = "bc1qadminsigcreate1";
+    cleanup(&pool, name, admin).await;
+    delete_signature(&pool, admin).await;
+    seed_signature(&pool, admin).await;
+
+    let svc = svc_no_email(&pool);
+    let create = svc
+        .create_group(name, admin, 10_000)
+        .await
+        .expect("signature-verified admin should create");
+    assert_eq!(create.group.status, "draft");
+    assert_eq!(create.admin_member.role, "admin");
+    assert_eq!(
+        create.admin_member.email, "",
+        "signature-only admin stores an empty email"
+    );
+
+    cleanup(&pool, name, admin).await;
+    delete_signature(&pool, admin).await;
+}
+
+/// The create gate rejects an admin with neither a verified email nor a
+/// signature proof — the party is never inserted.
+#[tokio::test]
+async fn create_group_rejects_unverified_admin() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let name = "bp-test-unvercreate-1";
+    let admin = "bc1qadminunvercreate1";
+    cleanup(&pool, name, admin).await;
+    delete_signature(&pool, admin).await;
+
+    let svc = svc_no_email(&pool);
+    let err = svc
+        .create_group(name, admin, 10_000)
+        .await
+        .expect_err("unverified admin must be rejected");
+    assert!(
+        matches!(err, BlockpartyServiceError::EmailNotVerified),
+        "expected EmailNotVerified, got {err:?}"
+    );
+    let group_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM blockparty_group WHERE name = $1")
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(group_count, 0, "no group row should exist for a rejected create");
+
+    cleanup(&pool, name, admin).await;
 }
 
 #[tokio::test]
@@ -386,7 +457,7 @@ async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
 
     let svc = svc(&pool);
     let create = svc
-        .create_group(name, admin, "admin@test.example", 5_000)
+        .create_group(name, admin, 5_000)
         .await
         .expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
@@ -438,7 +509,7 @@ async fn on_share_accepted_promotes_ready_to_active_only() {
 
     let svc = svc(&pool);
     let create = svc
-        .create_group(name, admin, "admin@test.example", 5_000)
+        .create_group(name, admin, 5_000)
         .await
         .expect("create");
     let admin_addr = addr(admin);
@@ -488,7 +559,7 @@ async fn dissolve_blocked_during_active_cooldown() {
 
     let svc = svc(&pool);
     let create = svc
-        .create_group(name, admin, "admin@test.example", 5_000)
+        .create_group(name, admin, 5_000)
         .await
         .expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
@@ -540,7 +611,7 @@ async fn on_block_found_is_idempotent_on_duplicate_hash() {
 
     let svc = svc(&pool);
     let create = svc
-        .create_group(name, admin, "admin@test.example", 10_000)
+        .create_group(name, admin, 10_000)
         .await
         .expect("create");
     let splits = vec![bp_db::BlockpartySplitSnapshot {
@@ -598,11 +669,11 @@ async fn name_collision_rejects_second_create() {
     cleanup(&pool, name, admin_b).await;
 
     let svc = svc(&pool);
-    svc.create_group(name, admin_a, "a@test.example", 10_000)
+    svc.create_group(name, admin_a, 10_000)
         .await
         .expect("first");
     let err = svc
-        .create_group(name, admin_b, "b@test.example", 10_000)
+        .create_group(name, admin_b, 10_000)
         .await
         .expect_err("second must fail");
     assert!(matches!(err, BlockpartyServiceError::NameTaken));
@@ -638,7 +709,7 @@ async fn ready_transition_sizes_coinbase_reservation_to_roster() {
     })));
 
     let create = svc
-        .create_group(name, admin, "admin@test.example", 5_000)
+        .create_group(name, admin, 5_000)
         .await
         .expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
@@ -689,7 +760,7 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
 
     let svc = svc(&pool);
     let create = svc
-        .create_group(name, admin, "admin@test.example", 5_000)
+        .create_group(name, admin, 5_000)
         .await
         .expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
@@ -765,7 +836,7 @@ async fn update_rental_hint_sets_cleans_and_clears() {
 
     let svc = svc(&pool);
     let create = svc
-        .create_group(name, admin, "admin@test.example", 10_000)
+        .create_group(name, admin, 10_000)
         .await
         .expect("create_group");
     let gid = create.group.id;

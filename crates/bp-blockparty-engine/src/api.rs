@@ -65,7 +65,6 @@ pub trait BlockpartyApi: Send + Sync {
         &self,
         name: &str,
         admin_address: &str,
-        admin_email: &str,
         admin_percent_bp: i32,
     ) -> Result<BlockpartyCreateResult, BlockpartyServiceError>;
     async fn create_join_link(
@@ -216,11 +215,9 @@ impl<H: BlockpartyHooks + 'static> BlockpartyApi for BlockpartyService<H> {
         &self,
         name: &str,
         admin_address: &str,
-        admin_email: &str,
         admin_percent_bp: i32,
     ) -> Result<BlockpartyCreateResult, BlockpartyServiceError> {
-        BlockpartyService::create_group(self, name, admin_address, admin_email, admin_percent_bp)
-            .await
+        BlockpartyService::create_group(self, name, admin_address, admin_percent_bp).await
     }
     async fn create_join_link(
         &self,

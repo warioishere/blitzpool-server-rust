@@ -353,13 +353,24 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         &self,
         name: &str,
         admin_address: &str,
-        admin_email: &str,
         admin_percent_bp: i32,
     ) -> Result<BlockpartyCreateResult, BlockpartyServiceError> {
         validate_name(name)?;
         validate_percent_bp(admin_percent_bp)?;
-        validate_email(admin_email)?;
         let admin_addr = normalize_address(admin_address)?;
+
+        // Unified onboarding gate: the admin address must be verified by a
+        // confirmed email OR a signature ownership proof. The verified email
+        // (if any) is snapshotted onto the admin member row; a signature-only
+        // admin stores "". The binding is the single source of truth — the
+        // client never supplies the email.
+        let admin_email = self.hooks.verified_email_for(&admin_addr).await;
+        if admin_email.is_none()
+            && !bp_db::is_address_ownership_verified(&self.pool, &admin_addr).await?
+        {
+            return Err(BlockpartyServiceError::EmailNotVerified);
+        }
+        let admin_email = admin_email.map(|e| e.to_ascii_lowercase()).unwrap_or_default();
 
         // Bidirectional mode-collision — reuse the PplnsGroup cache.
         if self.pplns_cache.get(&admin_addr).await.is_some() {
@@ -409,7 +420,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             &self.pool,
             id,
             &admin_addr,
-            admin_email,
+            &admin_email,
             admin_percent_bp,
             "admin",
             Some(now),
@@ -1166,36 +1177,6 @@ fn validate_name(name: &str) -> Result<(), BlockpartyServiceError> {
     Ok(())
 }
 
-fn validate_email(email: &str) -> Result<(), BlockpartyServiceError> {
-    let trimmed = email.trim();
-    if trimmed.is_empty() || trimmed.len() > bp_blockparty::EMAIL_MAX_LEN {
-        return Err(BlockpartyServiceError::InvalidEmail);
-    }
-    // Shape: no whitespace, one @, domain contains a dot with non-empty
-    // parts before and after the last dot (local@domain.tld).
-    if trimmed.chars().any(|c| c.is_whitespace()) {
-        return Err(BlockpartyServiceError::InvalidEmail);
-    }
-    let at = trimmed
-        .find('@')
-        .ok_or(BlockpartyServiceError::InvalidEmail)?;
-    if at == 0 {
-        return Err(BlockpartyServiceError::InvalidEmail);
-    }
-    let domain = &trimmed[at + 1..];
-    if domain.is_empty() || domain.contains('@') {
-        return Err(BlockpartyServiceError::InvalidEmail);
-    }
-    // Domain must have a dot with non-empty TLD after it.
-    let last_dot = domain
-        .rfind('.')
-        .ok_or(BlockpartyServiceError::InvalidEmail)?;
-    if last_dot == 0 || last_dot == domain.len() - 1 {
-        return Err(BlockpartyServiceError::InvalidEmail);
-    }
-    Ok(())
-}
-
 fn validate_percent_bp(bp: i32) -> Result<(), BlockpartyServiceError> {
     if !(MIN_PERCENT_BP..=MAX_PERCENT_BP).contains(&bp) {
         return Err(BlockpartyServiceError::InvalidPercent);
@@ -1214,46 +1195,3 @@ fn assert_editable(group: &BlockpartyGroupRow) -> Result<(), BlockpartyServiceEr
     Ok(())
 }
 
-#[cfg(test)]
-mod email_validation_tests {
-    use super::*;
-
-    #[test]
-    fn valid_emails_pass() {
-        assert!(validate_email("user@example.com").is_ok());
-        assert!(validate_email("a.b+tag@sub.domain.org").is_ok());
-        assert!(validate_email("x@y.z").is_ok());
-    }
-
-    #[test]
-    fn dotless_domain_fails() {
-        assert!(validate_email("user@nodot").is_err());
-        assert!(validate_email("user@localhost").is_err());
-    }
-
-    #[test]
-    fn no_local_part_fails() {
-        assert!(validate_email("@example.com").is_err());
-    }
-
-    #[test]
-    fn no_at_sign_fails() {
-        assert!(validate_email("userexample.com").is_err());
-    }
-
-    #[test]
-    fn whitespace_fails() {
-        assert!(validate_email("user @example.com").is_err());
-        assert!(validate_email("user@exam ple.com").is_err());
-    }
-
-    #[test]
-    fn empty_tld_fails() {
-        assert!(validate_email("user@domain.").is_err());
-    }
-
-    #[test]
-    fn multiple_at_signs_fail() {
-        assert!(validate_email("user@@example.com").is_err());
-    }
-}

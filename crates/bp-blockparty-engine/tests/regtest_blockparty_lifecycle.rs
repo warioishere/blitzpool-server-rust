@@ -77,7 +77,7 @@ async fn blockparty_two_member_block_accepted_by_core_and_history_idempotent() {
 
     // ── Lifecycle: create → addMember → confirm → READY ─────────
     let create = svc
-        .create_group(&name, &addr_admin, "admin@regtest.example", 6_000)
+        .create_group(&name, &addr_admin, 6_000)
         .await
         .expect("create_group");
     assert_eq!(create.group.status, "draft");

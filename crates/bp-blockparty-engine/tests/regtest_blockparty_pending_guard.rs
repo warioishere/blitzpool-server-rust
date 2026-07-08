@@ -79,7 +79,7 @@ async fn pending_party_admin_routes_block_to_pool_fee_accepted_by_core() {
 
     // Create + add member but DON'T confirm Bob. Status: CONFIRMING.
     let create = svc
-        .create_group(&name, &addr_admin, "admin@regtest.example", 6_000)
+        .create_group(&name, &addr_admin, 6_000)
         .await
         .expect("create_group");
     svc.add_member(create.group.id, &addr_bob, 4_000, Some(&create.admin_token))

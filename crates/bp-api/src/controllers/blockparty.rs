@@ -408,7 +408,6 @@ where
 struct CreateBody {
     name: String,
     admin_address: String,
-    admin_email: String,
     admin_percent_bp: i32,
 }
 
@@ -431,12 +430,7 @@ where
 {
     let svc = require_blockparty(&state)?;
     let res = svc
-        .create_group(
-            &body.name,
-            &body.admin_address,
-            &body.admin_email,
-            body.admin_percent_bp,
-        )
+        .create_group(&body.name, &body.admin_address, body.admin_percent_bp)
         .await?;
     Ok(Json(CreateResponse {
         group: GroupPublicView::from_row(&res.group),
