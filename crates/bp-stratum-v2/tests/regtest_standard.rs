@@ -175,6 +175,12 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
     match resp {
         AnyMessage::Common(CommonMessages::SetupConnectionSuccess(s)) => {
             assert_eq!(s.used_version, 2, "must use SV2 version 2");
+            // Server capability bits (SV2 §5.3.2) built fresh, NOT echoed — a
+            // version-rolling client must NOT get REQUIRES_FIXED_VERSION back.
+            assert_eq!(
+                s.flags, 0,
+                "Success.flags must be 0, not an echo of the request flags"
+            );
         }
         other => panic!(
             "expected SetupConnectionSuccess, got: {:?}",

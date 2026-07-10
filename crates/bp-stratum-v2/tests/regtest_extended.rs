@@ -160,6 +160,12 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
     match resp {
         AnyMessage::Common(CommonMessages::SetupConnectionSuccess(s)) => {
             assert_eq!(s.used_version, 2);
+            // Server capability bits (SV2 §5.3.2) are built fresh, NOT echoed:
+            // a version-rolling client must NOT get REQUIRES_FIXED_VERSION back.
+            assert_eq!(
+                s.flags, 0,
+                "Success.flags must be 0, not an echo of the request flags"
+            );
         }
         other => panic!(
             "expected SetupConnectionSuccess, got: {:?}",
@@ -167,15 +173,16 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
         ),
     }
 
-    // OpenExtendedMiningChannel: min_extranonce_size = 8 (typical
-    // miner-rollable bytes; pool can allocate 8 or clamp up to 12).
+    // OpenExtendedMiningChannel: request 10 rollable bytes — ABOVE the old
+    // 8-byte cap. This exercises that the pool now HONORS a >8 request exactly
+    // (an aggregating proxy needs this) instead of silently under-granting.
     let open = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
         OpenExtendedMiningChannel {
             request_id: 7,
             user_identity: format!("{REGTEST_ADDR}.worker-ext").try_into().unwrap(),
             nominal_hash_rate: 5.0e12,
             max_target: [0xFFu8; 32].into(),
-            min_extranonce_size: 8,
+            min_extranonce_size: 10,
         }
         .into_static(),
     ));
@@ -259,19 +266,18 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
 
     // ── Assertions on Extended-channel fields ─────────────────────────
     //
-    // The pool's ExtranonceAllocator emits 4-byte prefixes by default.
-    // Extranonce-size = 12 -
-    // prefix_len = 8 by default (`open_ext_mining_channel` clamps the
-    // miner's min_extranonce_size against 12 - prefix.len).
+    // The pool's ExtranonceAllocator emits 4-byte prefixes by default. The
+    // granted extranonce_size must EXACTLY honor the requested
+    // min_extranonce_size (10) — the pool no longer caps it at 8.
     let extranonce_size = seen_extranonce_size.expect("Success captured");
     let extranonce_prefix_len = seen_extranonce_prefix_len.expect("Success captured");
     assert_eq!(
         extranonce_prefix_len, 4,
         "pool allocates 4-byte extranonce_prefix by default"
     );
-    assert!(
-        (8..=12).contains(&extranonce_size),
-        "extranonce_size must be in the valid SV2 range: {extranonce_size}"
+    assert_eq!(
+        extranonce_size, 10,
+        "pool must honor the requested min_extranonce_size (10) exactly, not cap it"
     );
 
     // NewExtendedMiningJob carries the version-rolling-allowed flag
@@ -298,6 +304,49 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
     assert!(
         coinbase_suffix_len > 0,
         "coinbase_tx_suffix must carry the sequence + outputs + locktime"
+    );
+
+    // ── Oversize extranonce request → OpenMiningChannelError (not a
+    //    silently-smaller grant). SV2 §5.3.2: grant >= requested min or reject.
+    //    17 > the pool's 16-byte rollable cap.
+    let oversize = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
+        OpenExtendedMiningChannel {
+            request_id: 8,
+            user_identity: format!("{REGTEST_ADDR}.worker-ext").try_into().unwrap(),
+            nominal_hash_rate: 5.0e12,
+            max_target: [0xFFu8; 32].into(),
+            min_extranonce_size: 17,
+        }
+        .into_static(),
+    ));
+    write_any_message(&mut writer, oversize).await;
+    let mut got_reject = false;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while !got_reject {
+            match read_any_message(&mut reader).await {
+                AnyMessage::Mining(Mining::OpenMiningChannelError(e)) => {
+                    assert_eq!(e.request_id, 8);
+                    assert_eq!(
+                        std::str::from_utf8(e.error_code.as_ref()).unwrap(),
+                        "min-extranonce-size-too-large"
+                    );
+                    got_reject = true;
+                }
+                // Broadcast job / prev-hash / target frames for the already-open
+                // channel may interleave — ignore them while awaiting the reject.
+                AnyMessage::Mining(_) => {}
+                other => panic!(
+                    "unexpected frame while awaiting oversize reject: {:?}",
+                    decode_label(&other)
+                ),
+            }
+        }
+    })
+    .await
+    .ok();
+    assert!(
+        got_reject,
+        "oversize min_extranonce_size must be rejected with OpenMiningChannelError"
     );
 
     // ── Clean teardown ────────────────────────────────────────────────
