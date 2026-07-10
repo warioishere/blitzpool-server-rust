@@ -89,6 +89,24 @@ pub const FLAG_REQUIRES_WORK_SELECTION: u32 = 1 << 1;
 /// Miner REQUIRES BIP-320 version-rolling support.
 pub const FLAG_REQUIRES_VERSION_ROLLING: u32 = 1 << 2;
 
+// `SetupConnection.Success.flags` (SV2 spec §5.3.2, server→client) is a
+// SEPARATE capability bitset whose bit meanings are UNRELATED to the client
+// request flags above — the two spaces merely reuse bit indices 0/1.
+/// Server will NOT accept version-field changes. Per spec MUST NOT be set if
+/// the client requested [`FLAG_REQUIRES_VERSION_ROLLING`].
+pub const FLAG_SUCCESS_REQUIRES_FIXED_VERSION: u32 = 1 << 0;
+/// Server will NOT accept opening of standard channels (extended channels only).
+pub const FLAG_SUCCESS_REQUIRES_EXTENDED_CHANNELS: u32 = 1 << 1;
+
+/// Maximum miner-rollable extranonce region (bytes) an Extended channel can be
+/// granted. 16 matches the common pool default so an aggregating proxy has room
+/// to subdivide the space among many downstream rigs; with our 4-byte pool
+/// prefix the total extranonce is 20 bytes, well within the SV2 32-byte cap
+/// (and the 100-byte coinbase scriptSig limit). A miner that requests more than
+/// this in `OpenExtendedMiningChannel.min_extranonce_size` is rejected with
+/// [`ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE`] rather than silently under-granted.
+pub const MAX_EXTENDED_ROLLABLE: usize = 16;
+
 /// Minimum supported SV2 protocol version (currently 2 per the spec
 /// finalisation).
 pub const MIN_PROTOCOL_VERSION: u16 = 2;
@@ -119,6 +137,15 @@ pub const ERR_MAX_TARGET_OUT_OF_RANGE: &str = "max-target-out-of-range";
 /// `OpenMiningChannel` request whose `user_identity` resolves to a
 /// different address than the connection's first channel.
 pub const ERR_ADDRESS_LOCKED: &str = "address-locked";
+
+/// `min-extranonce-size-too-large` — an `OpenExtendedMiningChannel`
+/// requested a `min_extranonce_size` larger than the rollable region the
+/// pool can grant ([`MAX_EXTENDED_ROLLABLE`] bytes, bounded so the total
+/// extranonce stays within the SV2 32-byte cap). SV2 §5.3.2 requires the
+/// server to grant at least the requested minimum or reject — we reject
+/// rather than silently hand back a smaller region (which would make an
+/// aggregating proxy tear down the upstream).
+pub const ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE: &str = "min-extranonce-size-too-large";
 
 /// `invalid-channel-id` — `UpdateChannel` / `CloseChannel` referenced
 /// an unknown channel on this connection.
@@ -617,8 +644,9 @@ impl<C: Clock + Clone> MiningSessionState<C> {
 /// - Mismatched protocol version → `SetupConnectionError`
 /// - Mismatched sub-protocol (we accept Mining only for now) →
 ///   `SetupConnectionError`
-/// - Else → `SetupConnectionSuccess` + flag echo (we mirror the flags
-///   the miner advertised that we also support)
+/// - Else → `SetupConnectionSuccess` whose `flags` are the SERVER
+///   capability bits (SV2 §5.3.2), built fresh — NOT an echo of the
+///   client's request flags (the two bitsets have different meanings).
 ///
 /// SV2 spec returns `SetupConnectionError.flags` as the bitset of
 /// flags we DON'T accept — for `protocol-version-mismatch` it's 0;
@@ -662,10 +690,30 @@ pub fn handle_setup_connection<C: Clock>(
     state.work_selection = (input.flags & FLAG_REQUIRES_WORK_SELECTION) != 0;
     state.version_rolling = (input.flags & FLAG_REQUIRES_VERSION_ROLLING) != 0;
 
+    // Build `Success.flags` fresh — NEVER echo `input.flags`. The success
+    // bitset (SV2 §5.3.2) is a distinct server-capability field: bit 0 is
+    // REQUIRES_FIXED_VERSION, bit 1 is REQUIRES_EXTENDED_CHANNELS. Echoing the
+    // request would map the client's REQUIRES_STANDARD_JOBS (bit 0) onto
+    // REQUIRES_FIXED_VERSION and REQUIRES_WORK_SELECTION (bit 1) onto
+    // REQUIRES_EXTENDED_CHANNELS. The spec forbids REQUIRES_FIXED_VERSION when
+    // the client asked for version rolling, so an echo can tell a version-
+    // rolling proxy it may not roll — a contradiction that makes strict
+    // clients drop the connection right after setup/first job.
+    //
+    // We impose no fixed version (we serve version-rollable jobs) and we DO
+    // accept standard channels, so both bits are 0 by default. A work-selection
+    // (custom-job) connection can only carry its custom jobs on an Extended
+    // channel, so we advertise REQUIRES_EXTENDED_CHANNELS for it.
+    let response_flags = if state.work_selection {
+        FLAG_SUCCESS_REQUIRES_EXTENDED_CHANNELS
+    } else {
+        0
+    };
+
     HandlerOutcome {
         outbound: vec![OutboundFrame::SetupConnectionSuccess {
             used_version,
-            flags: input.flags,
+            flags: response_flags,
         }],
         events: vec![SessionEvent::SetupComplete],
     }
@@ -852,21 +900,42 @@ fn assign_channel_to_group<C: Clock>(
 
 /// Handle `OpenExtendedMiningChannel`. Same flow as Standard plus:
 ///
-/// - `rollable_size = min(input.min_extranonce_size,
-///   12 - extranonce_prefix.len())`. The clamp upper-bound is the
-///   `MiningJob` total-extranonce-slot of 12 bytes (4 prefix + 8
-///   miner-rollable default; firmware quirk: BitAxe/NerdQAxe ignore
-///   advertised sizes larger than that).
-/// - `extranonce_size = 0` in Standard is replaced by the clamped
-///   rollable size for Extended.
+/// - The miner-rollable extranonce region **exactly honors** the requested
+///   `min_extranonce_size` (SV2 §5.3.2: the granted size must be at least the
+///   requested minimum). We grant up to [`MAX_EXTENDED_ROLLABLE`] bytes so an
+///   aggregating proxy has room to subdivide the space; a request larger than
+///   that (or larger than the SV2 32-byte total-extranonce cap allows after
+///   the pool prefix) is REJECTED with [`ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE`]
+///   rather than silently under-granted — silently handing back fewer bytes
+///   than requested makes an aggregating proxy tear down the upstream.
+/// - `extranonce_size = 0` in Standard is replaced by this rollable size for
+///   Extended.
 pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
     state: &mut MiningSessionState<C>,
     input: &OpenExtendedMiningChannelInput,
     extranonce_prefix: Vec<u8>,
 ) -> HandlerOutcome {
     let prefix_len = extranonce_prefix.len();
-    let max_rollable = 12usize.saturating_sub(prefix_len);
-    let rollable_size = (input.min_extranonce_size as usize).min(max_rollable) as u8;
+    // Cap the rollable region at MAX_EXTENDED_ROLLABLE, further bounded so the
+    // total extranonce (prefix + rollable) never exceeds the SV2 32-byte cap.
+    let rollable_cap = MAX_EXTENDED_ROLLABLE.min(32usize.saturating_sub(prefix_len));
+    let requested = input.min_extranonce_size as usize;
+    if requested > rollable_cap {
+        return HandlerOutcome::with_frame(OutboundFrame::OpenMiningChannelError {
+            request_id: input.request_id,
+            error_code: ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE.to_string(),
+        });
+    }
+    // Grant exactly the requested minimum. SV2 §5.3.2 only constrains the
+    // granted size to be >= the requested minimum; the server picks the value.
+    // Honoring the request (rather than always granting the cap) keeps the
+    // granted size byte-identical to what every direct miner already receives
+    // — e.g. Axe-class firmware requests a small size and mines with exactly
+    // what the pool grants — so this only changes behaviour for aggregating
+    // proxies that need more than the old cap. It also never over-grants, so it
+    // can't misfeed firmware that assumes a fixed rollable width. An
+    // aggregating proxy still gets the full size it asks for.
+    let rollable_size = requested as u8;
 
     let ctx = match resolve_open_context(
         state,
@@ -2548,6 +2617,52 @@ mod tests {
         assert!(s.version_rolling);
     }
 
+    /// SV2 §5.3.2: `Success.flags` is the SERVER bitset and MUST NOT echo the
+    /// client's request flags. A miner that asked for REQUIRES_STANDARD_JOBS +
+    /// REQUIRES_VERSION_ROLLING must NOT get REQUIRES_FIXED_VERSION (bit 0) or
+    /// REQUIRES_EXTENDED_CHANNELS (bit 1) back — both are 0 for our pool (we
+    /// serve rollable jobs and accept standard channels). Guards the flag-echo
+    /// regression that told version-rolling proxies "fixed version required".
+    #[test]
+    fn setup_connection_success_flags_are_not_echoed() {
+        let mut s = fresh_session();
+        let mut input = good_setup();
+        input.flags = FLAG_REQUIRES_STANDARD_JOBS | FLAG_REQUIRES_VERSION_ROLLING;
+        let out = handle_setup_connection(&mut s, &input);
+        match out.outbound[0] {
+            OutboundFrame::SetupConnectionSuccess { flags, .. } => {
+                assert_eq!(
+                    flags, 0,
+                    "Success.flags must be 0 (no FIXED_VERSION / EXTENDED_CHANNELS), not an echo"
+                );
+                assert_eq!(flags & FLAG_SUCCESS_REQUIRES_FIXED_VERSION, 0);
+            }
+            _ => panic!("expected SetupConnectionSuccess"),
+        }
+        // Request flags are still parsed into session state.
+        assert!(s.requires_standard_jobs);
+        assert!(s.version_rolling);
+    }
+
+    /// A work-selection (custom-job) connection can only carry custom jobs on
+    /// an Extended channel, so the server advertises REQUIRES_EXTENDED_CHANNELS
+    /// (bit 1) — and still NOT REQUIRES_FIXED_VERSION (bit 0).
+    #[test]
+    fn setup_connection_success_flags_extended_for_work_selection() {
+        let mut s = fresh_session();
+        let mut input = good_setup();
+        input.flags = FLAG_REQUIRES_WORK_SELECTION | FLAG_REQUIRES_VERSION_ROLLING;
+        let out = handle_setup_connection(&mut s, &input);
+        match out.outbound[0] {
+            OutboundFrame::SetupConnectionSuccess { flags, .. } => {
+                assert_eq!(flags, FLAG_SUCCESS_REQUIRES_EXTENDED_CHANNELS);
+                assert_eq!(flags & FLAG_SUCCESS_REQUIRES_FIXED_VERSION, 0);
+            }
+            _ => panic!("expected SetupConnectionSuccess"),
+        }
+        assert!(s.work_selection);
+    }
+
     #[test]
     fn setup_connection_rejects_protocol_version_mismatch() {
         let mut s = fresh_session();
@@ -2735,24 +2850,65 @@ mod tests {
 
     // ── OpenExtendedMiningChannel ──────────────────────────────────
 
+    /// The rollable extranonce EXACTLY honors the requested minimum (up to
+    /// [`MAX_EXTENDED_ROLLABLE`]). An aggregating proxy that needs >8 bytes
+    /// (the old cap) now gets what it asked for instead of a silently smaller
+    /// region that made it tear down the upstream.
     #[test]
-    fn open_extended_channel_clamps_rollable_to_remaining_slot() {
+    fn open_extended_channel_honors_requested_rollable_size() {
         let mut s = fresh_session();
         handle_setup_connection(&mut s, &good_setup());
+        // 10 bytes: previously capped to 8 (→ proxy fallback); now granted 10.
         let mut input = open_ext(1, &format!("{}.w", REGTEST_ADDR));
-        input.min_extranonce_size = 16; // > 12 - 4 = 8 → clamp to 8
+        input.min_extranonce_size = 10;
         let out = handle_open_extended_mining_channel(&mut s, &input, vec![0; 4]);
         match &out.outbound[0] {
             OutboundFrame::OpenExtendedMiningChannelSuccess {
                 extranonce_size, ..
-            } => {
-                assert_eq!(*extranonce_size, 8);
-            }
+            } => assert_eq!(*extranonce_size, 10),
             _ => panic!("expected extended success"),
         }
         let ch = s.channels.values().next().unwrap();
-        assert_eq!(ch.extranonce_size, 8);
+        assert_eq!(ch.extranonce_size, 10);
         assert_eq!(ch.kind, ChannelKind::Extended);
+    }
+
+    /// The full SRI-parity size (16 rollable bytes) is granted for a proxy
+    /// that requests it.
+    #[test]
+    fn open_extended_channel_grants_full_sixteen() {
+        let mut s = fresh_session();
+        handle_setup_connection(&mut s, &good_setup());
+        let mut input = open_ext(1, &format!("{}.w", REGTEST_ADDR));
+        input.min_extranonce_size = MAX_EXTENDED_ROLLABLE as u16; // 16
+        let out = handle_open_extended_mining_channel(&mut s, &input, vec![0; 4]);
+        match &out.outbound[0] {
+            OutboundFrame::OpenExtendedMiningChannelSuccess {
+                extranonce_size, ..
+            } => assert_eq!(*extranonce_size, 16),
+            _ => panic!("expected extended success"),
+        }
+    }
+
+    /// A request larger than the pool can grant is REJECTED (SV2 §5.3.2 —
+    /// grant the minimum or reject), never silently under-granted.
+    #[test]
+    fn open_extended_channel_rejects_oversize_request() {
+        let mut s = fresh_session();
+        handle_setup_connection(&mut s, &good_setup());
+        let mut input = open_ext(1, &format!("{}.w", REGTEST_ADDR));
+        input.min_extranonce_size = (MAX_EXTENDED_ROLLABLE + 1) as u16; // 17 > cap
+        let out = handle_open_extended_mining_channel(&mut s, &input, vec![0; 4]);
+        match &out.outbound[0] {
+            OutboundFrame::OpenMiningChannelError { error_code, .. } => {
+                assert_eq!(error_code, ERR_MIN_EXTRANONCE_SIZE_TOO_LARGE);
+            }
+            _ => panic!("expected OpenMiningChannelError, got {:?}", out.outbound[0]),
+        }
+        assert!(
+            s.channels.is_empty(),
+            "no channel must be inserted on a rejected open"
+        );
     }
 
     /// `hash_rate_to_difficulty` produces fractional diffs (e.g.
