@@ -131,6 +131,14 @@ docker compose $COMPOSE up -d --no-deps blitzpool-core
 #   → miners reconnect (unavoidable for this class of change).
 ```
 
+> **Running a Stratum proxy in front of the pool?** If you front the pool with
+> an aggregation or hashrate-rental proxy on a separate host, restart that proxy
+> after a `blitzpool-core` recreate. A proxy that held its upstream session
+> across the pool restart may not recover on its own — it can keep forwarding
+> stale, low-difficulty work until it reconnects fresh. Restart your proxy
+> service once the core swap is done. (This is a property of such a proxy, not
+> the pool — adapt it to your own topology.)
+
 **Verify the swap took:**
 
 ```bash
