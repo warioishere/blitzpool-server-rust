@@ -426,6 +426,7 @@ struct CreateResponse {
     group: GroupPublicView,
     /// Plaintext admin token — shown to the creator exactly once.
     admin_token: String,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     pool_fee_percent: f64,
 }
 

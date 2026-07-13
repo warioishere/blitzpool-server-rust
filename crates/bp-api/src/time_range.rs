@@ -215,6 +215,40 @@ pub fn ser_count_map<S: serde::Serializer>(
     map.end()
 }
 
+/// `f32` variant of [`ser_f64_jsnum`]: int-when-whole (via widening to
+/// f64), else float. Used for the few f32 API fields.
+pub fn ser_f32_jsnum<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    ser_f64_jsnum(&(*v as f64), s)
+}
+
+/// `Option<f32>` variant of [`ser_f32_jsnum`]: `None` → `null`.
+pub fn ser_opt_f32_jsnum<S: serde::Serializer>(v: &Option<f32>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(x) => ser_f32_jsnum(x, s),
+        None => s.serialize_none(),
+    }
+}
+
+/// `Vec<f64>` serializer applying [`ser_f64_jsnum`] element-wise, so
+/// chart value arrays emit ints when whole (no `.0` / JS-number badge).
+pub fn ser_vec_f64_jsnum<S: serde::Serializer>(v: &[f64], s: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = s.serialize_seq(Some(v.len()))?;
+    for x in v {
+        let n = if x.is_finite()
+            && x.fract() == 0.0
+            && *x >= i64::MIN as f64
+            && *x <= i64::MAX as f64
+        {
+            serde_json::Number::from(*x as i64)
+        } else {
+            serde_json::Number::from_f64(*x).unwrap_or_else(|| serde_json::Number::from(0))
+        };
+        seq.serialize_element(&n)?;
+    }
+    seq.end()
+}
+
 /// Point on a hashrate-or-similar chart. `data` serialises as a JS
 /// integer when whole so /api/info/chart emits clean number values.
 #[derive(Serialize, Debug, Clone)]

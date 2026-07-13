@@ -111,6 +111,7 @@ struct PeerEntry {
     bytesrecv: u64,
     bytessent: u64,
     network: Option<String>,
+    #[serde(serialize_with = "crate::time_range::ser_opt_f64_jsnum")]
     pingtime: Option<f64>,
 }
 
@@ -258,7 +259,9 @@ fn format_location(loc: &bp_geoip::GeoLocation) -> String {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DifficultyResponse {
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     current: f64,
+    #[serde(serialize_with = "crate::time_range::ser_opt_f64_jsnum")]
     previous: Option<f64>,
     updated_at: String,
 }
@@ -1301,7 +1304,9 @@ struct FoundBlockEntry {
 struct UserAgentEntry {
     user_agent: Option<String>,
     count: i64,
+    #[serde(serialize_with = "crate::time_range::ser_opt_f32_jsnum")]
     best_difficulty: Option<f32>,
+    #[serde(serialize_with = "crate::time_range::ser_opt_f64_jsnum")]
     total_hash_rate: Option<f64>,
 }
 
@@ -1310,6 +1315,7 @@ struct UserAgentEntry {
 struct HighScoreEntry {
     /// ISO-8601 timestamp; null if `updatedAt` is unrepresentable.
     updated_at: Option<String>,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     best_difficulty: f64,
     best_difficulty_user_agent: Option<String>,
 }

@@ -282,7 +282,9 @@ where
 #[derive(Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 struct RejectCounts {
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     count: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     diff_minus_one: f64,
 }
 
@@ -306,7 +308,9 @@ struct RejectedResponse {
 struct ClientResponse {
     best_difficulty: Option<u64>,
     workers_count: usize,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_shares: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_hashrate: f64,
     workers: Vec<WorkerEntry>,
 }
@@ -319,6 +323,7 @@ struct WorkerEntry {
     /// Two-decimal string form so the UI can render the value
     /// without further formatting.
     best_difficulty: String,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     hash_rate: f64,
     #[serde(serialize_with = "crate::time_range::ser_opt_f64_jsnum")]
     current_difficulty: Option<f64>,
@@ -430,13 +435,21 @@ where
 #[serde(rename_all = "camelCase")]
 struct WorkerChartEntry {
     label: String,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     data: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     accepted: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     rejected_job_not_found: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     rejected_job_not_found_diff1: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     rejected_duplicated_share: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     rejected_duplicated_share_diff1: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     rejected_low_difficulty_share: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     rejected_low_difficulty_share_diff1: f64,
 }
 
@@ -761,6 +774,7 @@ struct DiffScoresQuery {
 #[serde(rename_all = "camelCase")]
 struct DiffScoreSlot {
     time: String,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     difficulty: f64,
 }
 

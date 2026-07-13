@@ -41,6 +41,7 @@ struct TopDiffEntry {
     user_agent: Option<String>,
     time: i64,
     external_pool_name: Option<String>,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     difficulty: f64,
 }
 
@@ -83,6 +84,7 @@ struct ExternalShareBody {
 #[serde(rename_all = "camelCase")]
 struct SubmitResponse {
     success: bool,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     calculated_difficulty: f64,
 }
 

@@ -951,6 +951,7 @@ struct PublicGroupEntry {
     #[serde(flatten)]
     summary: GroupSummary,
     member_count: usize,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_hashrate: f64,
 }
 
@@ -1020,6 +1021,7 @@ struct PublicGroupDetail {
     #[serde(flatten)]
     summary: GroupSummary,
     member_count: usize,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_hashrate: f64,
     recent_blocks: Vec<RecentBlock>,
 }
@@ -1035,6 +1037,7 @@ struct RecentBlock {
     /// Masked payout address (never the full address).
     address_label: String,
     paid_sats: i64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     percent: f64,
     shares_in_round: i64,
     total_shares_in_round: i64,
@@ -1168,6 +1171,7 @@ struct ViewerQuery {
 struct GroupDetailResponse {
     #[serde(flatten)]
     summary: GroupSummary,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_hashrate: f64,
     members: Vec<MemberEntry>,
 }
@@ -1191,9 +1195,11 @@ struct MemberEntry {
     role: String,
     /// ISO-8601.
     joined_at: String,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     hashrate: f64,
     /// All-time best difficulty for the member (folded in so the UI no longer
     /// fetches per-member client info by full address).
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     best_difficulty: f64,
     /// Earliest worker start (uptime basis), ISO-8601; None when offline.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1397,6 +1403,7 @@ where
 #[serde(rename_all = "camelCase")]
 struct HashrateResponse {
     group_id: Uuid,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_hashrate: f64,
     members: Vec<MemberHashrate>,
 }
@@ -1406,6 +1413,7 @@ struct HashrateResponse {
 struct MemberHashrate {
     member_id: String,
     address_label: String,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     hashrate: f64,
 }
 
@@ -1456,7 +1464,9 @@ where
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DistributionResponse {
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_shares: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_rejected: f64,
     per_address: Vec<DistributionEntry>,
 }
@@ -1466,8 +1476,11 @@ struct DistributionResponse {
 struct DistributionEntry {
     member_id: String,
     address_label: String,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_shares: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     percent: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_rejected: f64,
 }
 
@@ -1573,6 +1586,7 @@ struct TimelineDay {
     /// ISO-8601 day-start (UTC).
     date: String,
     /// Diff-weighted contribution per address, index-aligned to `addresses`.
+    #[serde(serialize_with = "crate::time_range::ser_vec_f64_jsnum")]
     values: Vec<f64>,
 }
 
@@ -1736,6 +1750,7 @@ struct HistoryEntry {
     /// Masked payout address (never the full address).
     address_label: String,
     paid_sats: i64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     percent: f64,
     shares_in_round: i64,
     total_shares_in_round: i64,
@@ -2135,7 +2150,9 @@ where
 #[derive(Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 struct GroupRejectCounts {
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     count: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     diff_minus_one: f64,
 }
 

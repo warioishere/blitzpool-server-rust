@@ -101,7 +101,9 @@ where
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WindowStatsBody {
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_shares: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     window_size: f64,
     miner_count: u32,
 }
@@ -121,6 +123,7 @@ struct UserAgentEntry {
     /// String-as-number so existing UI can parse with parseInt.
     count: String,
     best_difficulty: Option<u64>,
+    #[serde(serialize_with = "crate::time_range::ser_opt_f64_jsnum")]
     total_hash_rate: Option<f64>,
 }
 
@@ -338,11 +341,13 @@ where
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FeesResponse {
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     fee_percent: f64,
     fee_address: Option<String>,
     coinbase_weight_budget: u32,
     /// Shared `[group_fees]` lane percent (Group-Solo + Blockparty).
     /// Falls back to the PPLNS `fee_percent` when no group fee is wired.
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     group_fee_percent: f64,
     group_fee_address: Option<String>,
     dust_limit_sats: u64,
@@ -424,7 +429,9 @@ where
 #[serde(rename_all = "camelCase")]
 struct DistributionEntry {
     address: String,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     total_shares: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     percent: f64,
 }
 
@@ -510,7 +517,9 @@ where
 struct AddressSummary {
     balance_sats: i64,
     total_paid_sats: i64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     current_window_shares: f64,
+    #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     current_window_percent: f64,
     balance_label: &'static str,
 }
@@ -577,6 +586,7 @@ struct HistoryEntry {
     block_height: i32,
     address: String,
     paid_sats: i64,
+    #[serde(serialize_with = "crate::time_range::ser_f32_jsnum")]
     percent: f32,
     row_type: String,
     created_at: String,
