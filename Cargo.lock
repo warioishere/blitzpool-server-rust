@@ -501,6 +501,7 @@ dependencies = [
  "redis",
  "serde",
  "serde_json",
+ "socket2",
  "sqlx",
  "stratum-apps",
  "thiserror 1.0.69",

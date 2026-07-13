@@ -41,6 +41,7 @@ use bp_notifications::dispatcher::NotificationDispatcher;
 use bp_protocol_detect::{detect, Detected};
 use bp_stratum_v1::{PortConfig as Sv1PortConfig, StratumV1Server};
 use bp_stratum_v2::server::StratumV2MiningServer;
+use socket2::{SockRef, TcpKeepalive};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -281,6 +282,19 @@ async fn dispatch_connection(
     // once here so both SV1 and SV2 connections inherit it.
     if let Err(err) = socket.set_nodelay(true) {
         warn!(%err, ?peer, port, "stratum: set_nodelay(true) failed (continuing)");
+    }
+    // Enable TCP keepalive so long-lived but quiet miner connections (idle
+    // between shares / new templates) don't get silently evicted from an
+    // upstream NAT/firewall state table, and dead peers are detected: start
+    // probing after 60 s idle, then every 20 s, drop after 4 missed probes
+    // (~140 s). The per-socket SO_KEEPALIVE opt-in is required — the
+    // net.ipv4.tcp_keepalive_* sysctls only tune the timing once it's on.
+    let keepalive = TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(20))
+        .with_retries(4);
+    if let Err(err) = SockRef::from(&socket).set_tcp_keepalive(&keepalive) {
+        warn!(%err, ?peer, port, "stratum: set_tcp_keepalive(60s) failed (continuing)");
     }
     let detected = match timeout(std::time::Duration::from_secs(30), peek_first_byte(&socket)).await
     {

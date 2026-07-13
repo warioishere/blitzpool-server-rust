@@ -85,6 +85,9 @@ uuid = { workspace = true }
 
 # Async runtime — multi-thread per design-prinzip 1.
 tokio = { workspace = true }
+# TCP keepalive on accepted stratum sockets (keeps long-lived miner
+# connections alive across NAT/firewall state timeouts; detects dead peers).
+socket2 = { workspace = true }
 # CancellationToken used by the SV1 accept-loop in `stratum_v1.rs` to
 # propagate shutdown across all per-port listener tasks.
 tokio-util = { workspace = true }

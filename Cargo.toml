@@ -64,6 +64,8 @@ tikv-jemallocator = "0.6"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
+# Low-level socket options (TCP keepalive on accepted stratum sockets)
+socket2 = "0.6"
 futures = "0.3"
 async-trait = "0.1"
 
