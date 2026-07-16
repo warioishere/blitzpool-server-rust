@@ -4,7 +4,7 @@
 //! encoding, BIP-141 witness commitment, and stateless extranonce splicing.
 
 use bitcoin::Network;
-use bp_share::sha256d;
+use bp_share::sha256d_from_parts;
 
 use crate::address;
 
@@ -84,13 +84,15 @@ impl MiningJob {
     /// scriptsig and return the resulting coinbase txid (sha256d of the
     /// non-witness serialization).
     pub fn coinbase_txid_with_extranonce(&self, enonce1: &[u8; 4], enonce2: &[u8; 8]) -> [u8; 32] {
-        let total = self.coinbase_prefix.len() + EXTRANONCE_SLOT_LEN + self.coinbase_suffix.len();
-        let mut buf = Vec::with_capacity(total);
-        buf.extend_from_slice(&self.coinbase_prefix);
-        buf.extend_from_slice(enonce1);
-        buf.extend_from_slice(enonce2);
-        buf.extend_from_slice(&self.coinbase_suffix);
-        sha256d(&buf)
+        // Stream prefix + extranonce + suffix straight into the hasher — no
+        // per-share `Vec` (SHA-256 is a streaming hash, so this yields the exact
+        // same txid as hashing the concatenation).
+        sha256d_from_parts(&[
+            self.coinbase_prefix.as_slice(),
+            enonce1.as_slice(),
+            enonce2.as_slice(),
+            self.coinbase_suffix.as_slice(),
+        ])
     }
 
     /// Splice the extranonce in and return the **witness-form** coinbase
