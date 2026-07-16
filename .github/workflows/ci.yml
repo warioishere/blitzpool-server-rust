@@ -1,9 +1,25 @@
 name: CI
 
-# Disabled auto-trigger: this CI environment lacks the local Postgres + Redis
-# the integration tests connect to, so the suite fails by design. Keep the
-# workflow file so it can be triggered manually from the Actions tab if needed.
+# The compile/lint gates (fmt, clippy, check, and the test-BUILD step below)
+# run automatically on every push to main and every PR. They need NO infra:
+# sqlx::query! macros validate against the committed .sqlx offline cache
+# (SQLX_OFFLINE=true), and nothing connects to Postgres/Redis at compile time.
+#
+# Actually RUNNING the suite needs a local Postgres + Redis (+ bitcoin-node for
+# the regtests) that GitHub runners lack, so the test-RUN step stays manual —
+# it only fires on a `workflow_dispatch` from the Actions tab.
+#
+# Why the split matters: `cargo check --all-targets`, `cargo clippy
+# --all-targets`, and `cargo test --all-targets --no-run` all COMPILE every
+# test target, so a test that stops compiling (e.g. a struct literal missing a
+# newly-added field) fails the gate on every push — even though the tests
+# themselves can't be executed here. The whole workflow used to be
+# workflow_dispatch-only, so exactly such a break once slipped through a
+# release unnoticed.
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -62,4 +78,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-targets --locked
+      # GUARD (auto, no infra): compile + link EVERY test binary without running
+      # it. This is what catches a test target that stopped compiling.
+      - name: Build all test targets (compile guard)
+        run: cargo test --workspace --all-targets --no-run --locked
+      # Full run (manual only): the integration/regtest suite connects to a local
+      # Postgres + Redis (+ bitcoin-node), which GitHub runners don't provide.
+      - name: Run full suite (needs Postgres + Redis + bitcoin-node)
+        if: github.event_name == 'workflow_dispatch'
+        run: cargo test --workspace --all-targets --locked
