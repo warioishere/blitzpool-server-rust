@@ -106,8 +106,11 @@ jobs:
           for f in crates/bp-db/migrations/*.sql; do
             psql -h localhost -p 15433 -U postgres -d public_pool -v ON_ERROR_STOP=1 -f "$f"
           done
-      # --test-threads=1: the integration tests share the one Postgres/Redis, so
-      # run them serially (matches the local `test-strict` alias). Regtests
-      # self-skip (no bitcoin-node here).
+      # No --all-targets here: that would also RUN the criterion benches, which
+      # reject `--test-threads`. Benches/examples are still COMPILE-checked by the
+      # `check` + `clippy` jobs. This runs lib + bin + integration tests + doctests
+      # (matches the local `test-strict` alias). --test-threads=1: the integration
+      # tests share the one Postgres/Redis, so run serially. Regtests self-skip
+      # (no bitcoin-node here).
       - name: cargo test
-        run: cargo test --workspace --all-targets --locked -- --test-threads=1
+        run: cargo test --workspace --locked -- --test-threads=1
