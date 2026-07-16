@@ -788,6 +788,7 @@ mod tests {
             created_at: 1_779_464_858_619,
             updated_at: 0, // never surfaced
             dissolved_at: None,
+            confirmation_requested_at: None,
         };
         let dto = GroupPublicView::from_row(&row);
         let json = serde_json::to_value(&dto).expect("serialize");
@@ -800,7 +801,8 @@ mod tests {
                 "lastShareAt": 1779523779828,
                 "createdAt": 1779464858619,
                 "dissolvedAt": null,
-                "rentalProviderHint": null
+                "rentalProviderHint": null,
+                "confirmationRequestedAt": null
             }"#,
         )
         .unwrap();
