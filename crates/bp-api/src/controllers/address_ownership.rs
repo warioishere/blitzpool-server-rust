@@ -201,7 +201,7 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let Ok(addr) = AddressId::new(bp_mining_job::normalize_btc_address(&address)) else {
+    let Ok(addr) = crate::utils::normalized_address_id(&address) else {
         return Ok(Json(ByAddressResponse {
             verified: false,
             method: None,
@@ -245,7 +245,7 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    let Ok(addr) = AddressId::new(bp_mining_job::normalize_btc_address(&address)) else {
+    let Ok(addr) = crate::utils::normalized_address_id(&address) else {
         return Ok(Json(VerifiedStatusResponse {
             verified: false,
             email_verified: false,
@@ -350,7 +350,7 @@ fn parse_supported_address(raw: &str, network: Network) -> Result<AddressId, Api
         .ok()
         .and_then(|a| a.require_network(network).ok())
         .ok_or_else(|| ownership_error("invalid-address", StatusCode::BAD_REQUEST))?;
-    AddressId::new(bp_mining_job::normalize_btc_address(trimmed))
+    crate::utils::normalized_address_id(trimmed)
         .map_err(|_| ownership_error("invalid-address", StatusCode::BAD_REQUEST))
 }
 
