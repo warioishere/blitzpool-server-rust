@@ -181,19 +181,18 @@ impl TemplateUpdate {
                 future_template: t.future_template,
                 version: t.version,
                 coinbase_tx_version: t.coinbase_tx_version,
-                coinbase_prefix: t.coinbase_prefix.inner_as_ref().to_vec(),
+                coinbase_prefix: t.coinbase_prefix.as_bytes().to_vec(),
                 coinbase_tx_input_sequence: t.coinbase_tx_input_sequence,
                 coinbase_tx_value_remaining: t.coinbase_tx_value_remaining,
                 coinbase_tx_outputs_count: t.coinbase_tx_outputs_count,
-                coinbase_tx_outputs: t.coinbase_tx_outputs.inner_as_ref().to_vec(),
+                coinbase_tx_outputs: t.coinbase_tx_outputs.as_bytes().to_vec(),
                 coinbase_tx_locktime: t.coinbase_tx_locktime,
                 merkle_path: t
                     .merkle_path
-                    .to_vec()
-                    .into_iter()
+                    .iter_bytes()
                     .map(|h| {
                         let mut out = [0u8; 32];
-                        // U256 to_vec yields 32-byte arrays — guard against
+                        // Each merkle node is a 32-byte U256 — guard against
                         // unexpected lengths by padding/truncating.
                         let len = h.len().min(32);
                         out[..len].copy_from_slice(&h[..len]);
@@ -203,12 +202,12 @@ impl TemplateUpdate {
             })),
             TemplateDistribution::SetNewPrevHash(p) => {
                 let mut prev = [0u8; 32];
-                let pref = p.prev_hash.inner_as_ref();
+                let pref = p.prev_hash.as_bytes();
                 let plen = pref.len().min(32);
                 prev[..plen].copy_from_slice(&pref[..plen]);
 
                 let mut tgt = [0u8; 32];
-                let tref = p.target.inner_as_ref();
+                let tref = p.target.as_bytes();
                 let tlen = tref.len().min(32);
                 tgt[..tlen].copy_from_slice(&tref[..tlen]);
 
@@ -223,8 +222,8 @@ impl TemplateUpdate {
             TemplateDistribution::RequestTransactionDataSuccess(s) => Some(
                 Self::RequestTransactionDataSuccess(RequestTransactionDataSuccess {
                     template_id: s.template_id,
-                    excess_data: s.excess_data.inner_as_ref().to_vec(),
-                    transaction_list: s.transaction_list.to_vec(),
+                    excess_data: s.excess_data.as_bytes().to_vec(),
+                    transaction_list: s.transaction_list.iter_bytes().map(|t| t.to_vec()).collect(),
                 }),
             ),
             TemplateDistribution::RequestTransactionDataError(e) => Some(

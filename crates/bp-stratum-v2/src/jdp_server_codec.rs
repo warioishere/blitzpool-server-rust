@@ -195,10 +195,10 @@ fn decode_setup_connection(
         min_version: m.min_version,
         max_version: m.max_version,
         flags: m.flags,
-        vendor: utf8_from_bytes(m.vendor.inner_as_ref())?,
-        firmware: utf8_from_bytes(m.firmware.inner_as_ref())?,
-        hardware_version: utf8_from_bytes(m.hardware_version.inner_as_ref())?,
-        device_id: utf8_from_bytes(m.device_id.inner_as_ref())?,
+        vendor: utf8_from_bytes(m.vendor.as_bytes())?,
+        firmware: utf8_from_bytes(m.firmware.as_bytes())?,
+        hardware_version: utf8_from_bytes(m.hardware_version.as_bytes())?,
+        device_id: utf8_from_bytes(m.device_id.as_bytes())?,
     })
 }
 
@@ -216,21 +216,21 @@ fn decode_allocate(
 ) -> Result<AllocateMiningJobTokenInput, CodecError> {
     Ok(AllocateMiningJobTokenInput {
         request_id: m.request_id,
-        user_identifier: utf8_from_bytes(m.user_identifier.inner_as_ref())?,
+        user_identifier: utf8_from_bytes(m.user_identifier.as_bytes())?,
     })
 }
 
 fn decode_declare(m: Sv2DeclareMiningJob<'static>) -> Result<DeclareMiningJobInput, CodecError> {
-    let mut wtxid_list = Vec::with_capacity(m.wtxid_list.inner_as_ref().len());
-    for b in m.wtxid_list.inner_as_ref() {
+    let mut wtxid_list = Vec::with_capacity(m.wtxid_list.as_slice().len());
+    for b in m.wtxid_list.iter_bytes() {
         wtxid_list.push(bytes_to_32(b)?);
     }
     Ok(DeclareMiningJobInput {
         request_id: m.request_id,
-        mining_job_token: token_from_bytes(m.mining_job_token.inner_as_ref())?,
+        mining_job_token: token_from_bytes(m.mining_job_token.as_bytes())?,
         version: m.version,
-        coinbase_tx_prefix: m.coinbase_tx_prefix.inner_as_ref().to_vec(),
-        coinbase_tx_suffix: m.coinbase_tx_suffix.inner_as_ref().to_vec(),
+        coinbase_tx_prefix: m.coinbase_tx_prefix.as_bytes().to_vec(),
+        coinbase_tx_suffix: m.coinbase_tx_suffix.as_bytes().to_vec(),
         wtxid_list,
         // excess_data dropped — DEFERRED
     })
@@ -241,8 +241,7 @@ fn decode_provide_success(
 ) -> Result<ProvideMissingTransactionsSuccessInput, CodecError> {
     let transaction_list: Vec<Vec<u8>> = m
         .transaction_list
-        .inner_as_ref()
-        .into_iter()
+        .iter_bytes()
         .map(|b| b.to_vec())
         .collect();
     Ok(ProvideMissingTransactionsSuccessInput {
@@ -253,8 +252,8 @@ fn decode_provide_success(
 
 fn decode_push_solution(m: Sv2PushSolution<'static>) -> Result<PushSolutionInput, CodecError> {
     Ok(PushSolutionInput {
-        extranonce: m.extranonce.inner_as_ref().to_vec(),
-        prev_hash: bytes_to_32(m.prev_hash.inner_as_ref())?,
+        extranonce: m.extranonce.as_bytes().to_vec(),
+        prev_hash: bytes_to_32(m.prev_hash.as_bytes())?,
         ntime: m.ntime,
         nonce: m.nonce,
         n_bits: m.nbits,
@@ -291,7 +290,7 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
             ExtensionsNegotiation::RequestExtensionsSuccess(
                 Sv2ReqExtSuccess {
                     request_id,
-                    supported_extensions: supported_extensions.into(),
+                    supported_extensions: supported_extensions.try_into().map_err(conv)?,
                 }
                 .into_static(),
             ),
@@ -304,8 +303,8 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
             ExtensionsNegotiation::RequestExtensionsError(
                 Sv2ReqExtError {
                     request_id,
-                    unsupported_extensions: unsupported_extensions.into(),
-                    required_extensions: required_extensions.into(),
+                    unsupported_extensions: unsupported_extensions.try_into().map_err(conv)?,
+                    required_extensions: required_extensions.try_into().map_err(conv)?,
                 }
                 .into_static(),
             ),
@@ -368,7 +367,8 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
                         .into_iter()
                         .map(|x| x as u16)
                         .collect::<Vec<u16>>()
-                        .into(),
+                        .try_into()
+                        .map_err(conv)?,
                 }
                 .into_static(),
             ),
@@ -617,8 +617,8 @@ mod tests {
         match msg {
             AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobTokenSuccess(s)) => {
                 assert_eq!(s.request_id, 7);
-                assert_eq!(s.mining_job_token.inner_as_ref(), &[0xAAu8; 16]);
-                assert_eq!(s.coinbase_outputs.inner_as_ref(), &[0x01, 0x02, 0x03]);
+                assert_eq!(s.mining_job_token.as_bytes(), &[0xAAu8; 16]);
+                assert_eq!(s.coinbase_outputs.as_bytes(), &[0x01, 0x02, 0x03]);
             }
             _ => panic!("expected AllocateMiningJobTokenSuccess"),
         }
@@ -634,7 +634,7 @@ mod tests {
         match msg {
             AnyMessage::JobDeclaration(JobDeclaration::DeclareMiningJobSuccess(s)) => {
                 assert_eq!(s.request_id, 5);
-                assert_eq!(s.new_mining_job_token.inner_as_ref(), &[0xCCu8; 16]);
+                assert_eq!(s.new_mining_job_token.as_bytes(), &[0xCCu8; 16]);
             }
             _ => panic!("expected DeclareMiningJobSuccess"),
         }
@@ -651,10 +651,10 @@ mod tests {
         match msg {
             AnyMessage::JobDeclaration(JobDeclaration::DeclareMiningJobError(s)) => {
                 assert_eq!(
-                    utf8_from_bytes(s.error_code.inner_as_ref()).unwrap(),
+                    utf8_from_bytes(s.error_code.as_bytes()).unwrap(),
                     "invalid-mining-job-token"
                 );
-                assert_eq!(s.error_details.inner_as_ref(), b"token expired");
+                assert_eq!(s.error_details.as_bytes(), b"token expired");
             }
             _ => panic!("expected DeclareMiningJobError"),
         }

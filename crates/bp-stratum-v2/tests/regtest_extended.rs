@@ -206,14 +206,14 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
                 AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(s)) => {
                     assert_eq!(s.request_id, 7);
                     seen_extranonce_size = Some(s.extranonce_size);
-                    seen_extranonce_prefix_len = Some(s.extranonce_prefix.inner_as_ref().len());
+                    seen_extranonce_prefix_len = Some(s.extranonce_prefix.as_bytes().len());
                     got_open_success = true;
                 }
                 AnyMessage::Mining(Mining::NewExtendedMiningJob(j)) => {
                     seen_version_rolling_allowed = Some(j.version_rolling_allowed);
-                    seen_merkle_path_len = Some(j.merkle_path.inner_as_ref().len());
-                    seen_coinbase_prefix_len = Some(j.coinbase_tx_prefix.inner_as_ref().len());
-                    seen_coinbase_suffix_len = Some(j.coinbase_tx_suffix.inner_as_ref().len());
+                    seen_merkle_path_len = Some(j.merkle_path.as_slice().len());
+                    seen_coinbase_prefix_len = Some(j.coinbase_tx_prefix.as_bytes().len());
+                    seen_coinbase_suffix_len = Some(j.coinbase_tx_suffix.as_bytes().len());
                     got_new_ext_job = true;
                 }
                 AnyMessage::Mining(Mining::SetNewPrevHash(_)) => {}
@@ -248,9 +248,9 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
                 let m = read_any_message(&mut reader).await;
                 if let AnyMessage::Mining(Mining::NewExtendedMiningJob(j)) = m {
                     seen_version_rolling_allowed = Some(j.version_rolling_allowed);
-                    seen_merkle_path_len = Some(j.merkle_path.inner_as_ref().len());
-                    seen_coinbase_prefix_len = Some(j.coinbase_tx_prefix.inner_as_ref().len());
-                    seen_coinbase_suffix_len = Some(j.coinbase_tx_suffix.inner_as_ref().len());
+                    seen_merkle_path_len = Some(j.merkle_path.as_slice().len());
+                    seen_coinbase_prefix_len = Some(j.coinbase_tx_prefix.as_bytes().len());
+                    seen_coinbase_suffix_len = Some(j.coinbase_tx_suffix.as_bytes().len());
                     got_new_ext_job = true;
                     break;
                 }

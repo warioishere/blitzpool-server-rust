@@ -158,8 +158,8 @@ mod tests {
             version: 0x2000_0000,
         };
         let upstream = req.into_upstream().expect("valid extranonce length");
-        assert_eq!(upstream.extranonce.inner_as_ref(), &[0xaa, 0xbb, 0xcc]);
-        assert_eq!(upstream.prev_hash.inner_as_ref(), &[0x42; 32]);
+        assert_eq!(upstream.extranonce.as_bytes(), &[0xaa, 0xbb, 0xcc]);
+        assert_eq!(upstream.prev_hash.as_bytes(), &[0x42; 32]);
         assert_eq!(upstream.ntime, 1_700_000_000);
         assert_eq!(upstream.nonce, 0xdead_beef);
         assert_eq!(upstream.nbits, 0x1d00_ffff);

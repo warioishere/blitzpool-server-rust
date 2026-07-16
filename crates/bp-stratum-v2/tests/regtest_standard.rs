@@ -211,8 +211,8 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
             let m = read_any_message(&mut reader).await;
             match m {
                 AnyMessage::Mining(Mining::OpenStandardMiningChannelSuccess(s)) => {
-                    assert_eq!(u32::from(&s.request_id), 1);
-                    assert_eq!(s.extranonce_prefix.inner_as_ref().len(), 4);
+                    assert_eq!(s.request_id, 1);
+                    assert_eq!(s.extranonce_prefix.as_bytes().len(), 4);
                     got_open_success = true;
                 }
                 AnyMessage::Mining(Mining::NewMiningJob(_)) => {

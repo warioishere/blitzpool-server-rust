@@ -310,7 +310,7 @@ async fn sv2_solo_connection_routes_to_solo_stream_and_block_accepted() {
                 match read_any_message(&mut reader).await {
                     AnyMessage::Mining(Mining::SubmitSharesError(e)) => {
                         errors
-                            .push(String::from_utf8_lossy(e.error_code.inner_as_ref()).to_string());
+                            .push(String::from_utf8_lossy(e.error_code.as_bytes()).to_string());
                     }
                     AnyMessage::Mining(Mining::SubmitSharesSuccess(_)) => successes += 1,
                     // Track job refresh so we don't submit against a stale id.

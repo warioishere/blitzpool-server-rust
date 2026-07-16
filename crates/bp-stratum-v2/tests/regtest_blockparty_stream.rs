@@ -303,7 +303,7 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
                 match read_any_message(&mut reader).await {
                     AnyMessage::Mining(Mining::SubmitSharesError(e)) => {
                         errors
-                            .push(String::from_utf8_lossy(e.error_code.inner_as_ref()).to_string());
+                            .push(String::from_utf8_lossy(e.error_code.as_bytes()).to_string());
                     }
                     AnyMessage::Mining(Mining::SubmitSharesSuccess(_)) => successes += 1,
                     AnyMessage::Mining(Mining::NewMiningJob(j)) => {

@@ -233,10 +233,10 @@ fn decode_setup_connection(
         min_version: m.min_version,
         max_version: m.max_version,
         flags: m.flags,
-        vendor: utf8_from_bytes(m.vendor.inner_as_ref())?,
-        firmware: utf8_from_bytes(m.firmware.inner_as_ref())?,
-        hardware_version: utf8_from_bytes(m.hardware_version.inner_as_ref())?,
-        device_id: utf8_from_bytes(m.device_id.inner_as_ref())?,
+        vendor: utf8_from_bytes(m.vendor.as_bytes())?,
+        firmware: utf8_from_bytes(m.firmware.as_bytes())?,
+        hardware_version: utf8_from_bytes(m.hardware_version.as_bytes())?,
+        device_id: utf8_from_bytes(m.device_id.as_bytes())?,
     })
 }
 
@@ -256,9 +256,9 @@ fn decode_open_std_channel(
     Ok((
         OpenStandardMiningChannelInput {
             request_id: m.get_request_id_as_u32(),
-            user_identity: utf8_from_bytes(m.user_identity.inner_as_ref())?,
+            user_identity: utf8_from_bytes(m.user_identity.as_bytes())?,
             nominal_hash_rate: m.nominal_hash_rate,
-            max_target: bytes_to_32(m.max_target.inner_as_ref())?,
+            max_target: bytes_to_32(m.max_target.as_bytes())?,
         },
         extranonce_prefix,
     ))
@@ -271,9 +271,9 @@ fn decode_open_ext_channel(
     Ok((
         OpenExtendedMiningChannelInput {
             request_id: m.get_request_id_as_u32(),
-            user_identity: utf8_from_bytes(m.user_identity.inner_as_ref())?,
+            user_identity: utf8_from_bytes(m.user_identity.as_bytes())?,
             nominal_hash_rate: m.nominal_hash_rate,
-            max_target: bytes_to_32(m.max_target.inner_as_ref())?,
+            max_target: bytes_to_32(m.max_target.as_bytes())?,
             min_extranonce_size: m.min_extranonce_size,
         },
         extranonce_prefix,
@@ -284,14 +284,14 @@ fn decode_update_channel(m: Sv2UpdateChannel<'static>) -> Result<UpdateChannelIn
     Ok(UpdateChannelInput {
         channel_id: m.channel_id,
         nominal_hash_rate: m.nominal_hash_rate,
-        maximum_target: bytes_to_32(m.maximum_target.inner_as_ref())?,
+        maximum_target: bytes_to_32(m.maximum_target.as_bytes())?,
     })
 }
 
 fn decode_close_channel(m: Sv2CloseChannel<'static>) -> Result<CloseChannelInput, CodecError> {
     Ok(CloseChannelInput {
         channel_id: m.channel_id,
-        reason_code: utf8_from_bytes(m.reason_code.inner_as_ref())?,
+        reason_code: utf8_from_bytes(m.reason_code.as_bytes())?,
     })
 }
 
@@ -316,7 +316,7 @@ fn decode_submit_shares_extended(
         nonce: m.nonce,
         ntime: m.ntime,
         version: m.version,
-        extranonce: m.extranonce.inner_as_ref().into(),
+        extranonce: m.extranonce.as_bytes().into(),
         // Tail TLVs (ext 0x0002 Worker-ID etc.) live in the frame
         // payload AFTER the SubmitSharesExtended base fields. The
         // upstream `AnyMessage` parser doesn't carry them — the IO
@@ -333,15 +333,15 @@ fn decode_set_custom_mining_job(
     Ok(SetCustomMiningJobInput {
         channel_id: m.channel_id,
         request_id: m.request_id,
-        mining_job_token: token_from_bytes(m.token.inner_as_ref())?,
+        mining_job_token: token_from_bytes(m.token.as_bytes())?,
         version: m.version,
-        prev_hash: bytes_to_32(m.prev_hash.inner_as_ref())?,
+        prev_hash: bytes_to_32(m.prev_hash.as_bytes())?,
         min_ntime: m.min_ntime,
         n_bits: m.nbits,
         coinbase_tx_version: m.coinbase_tx_version,
-        coinbase_prefix: m.coinbase_prefix.inner_as_ref().to_vec(),
+        coinbase_prefix: m.coinbase_prefix.as_bytes().to_vec(),
         coinbase_tx_input_n_sequence: m.coinbase_tx_input_n_sequence,
-        coinbase_tx_outputs: m.coinbase_tx_outputs.inner_as_ref().to_vec(),
+        coinbase_tx_outputs: m.coinbase_tx_outputs.as_bytes().to_vec(),
         coinbase_tx_locktime: m.coinbase_tx_locktime,
         merkle_path: merkle_path_from_seq(&m.merkle_path)?,
     })
@@ -381,7 +381,7 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
             ExtensionsNegotiation::RequestExtensionsSuccess(
                 Sv2ReqExtSuccess {
                     request_id,
-                    supported_extensions: supported_extensions.into(),
+                    supported_extensions: supported_extensions.try_into().map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -394,8 +394,8 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
             ExtensionsNegotiation::RequestExtensionsError(
                 Sv2ReqExtError {
                     request_id,
-                    unsupported_extensions: unsupported_extensions.into(),
-                    required_extensions: required_extensions.into(),
+                    unsupported_extensions: unsupported_extensions.try_into().map_err(CodecError::from_conv)?,
+                    required_extensions: required_extensions.try_into().map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -526,7 +526,7 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
                 min_ntime: stratum_core::binary_sv2::Sv2Option::new(min_ntime),
                 version,
                 version_rolling_allowed,
-                merkle_path: seq_from_merkle_path(merkle_path),
+                merkle_path: seq_from_merkle_path(merkle_path)?,
                 coinbase_tx_prefix: coinbase_tx_prefix
                     .try_into()
                     .map_err(CodecError::from_conv)?,
@@ -633,8 +633,8 @@ fn token_from_bytes(b: &[u8]) -> Result<Token, CodecError> {
 fn merkle_path_from_seq(
     seq: &stratum_core::binary_sv2::Seq0255<'_, stratum_core::binary_sv2::U256<'_>>,
 ) -> Result<Vec<[u8; 32]>, CodecError> {
-    let mut out = Vec::with_capacity(seq.inner_as_ref().len());
-    for u in seq.inner_as_ref() {
+    let mut out = Vec::with_capacity(seq.as_slice().len());
+    for u in seq.iter_bytes() {
         out.push(bytes_to_32(u)?);
     }
     Ok(out)
@@ -642,10 +642,11 @@ fn merkle_path_from_seq(
 
 fn seq_from_merkle_path(
     path: Vec<[u8; 32]>,
-) -> stratum_core::binary_sv2::Seq0255<'static, stratum_core::binary_sv2::U256<'static>> {
+) -> Result<stratum_core::binary_sv2::Seq0255<'static, stratum_core::binary_sv2::U256<'static>>, CodecError>
+{
     let items: Vec<stratum_core::binary_sv2::U256<'static>> =
         path.into_iter().map(Into::into).collect();
-    items.into()
+    items.try_into().map_err(CodecError::from_conv)
 }
 
 fn str0255(s: String) -> Result<stratum_core::binary_sv2::Str0255<'static>, CodecError> {
@@ -713,7 +714,7 @@ mod tests {
 
     #[test]
     fn decode_request_extensions_maps_fields() {
-        let seq: Seq064K<u16> = vec![0x0002u16, 0x0003u16].into();
+        let seq: Seq064K<u16> = vec![0x0002u16, 0x0003u16].try_into().unwrap();
         let msg = AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
             ExtensionsNegotiation::RequestExtensions(Sv2RequestExtensions {
                 request_id: 7,
@@ -864,7 +865,7 @@ mod tests {
         match msg {
             AnyMessage::Common(CommonMessages::SetupConnectionError(e)) => {
                 assert_eq!(
-                    utf8_from_bytes(e.error_code.inner_as_ref()).unwrap(),
+                    utf8_from_bytes(e.error_code.as_bytes()).unwrap(),
                     "unsupported-protocol"
                 );
             }
@@ -904,7 +905,7 @@ mod tests {
                 assert_eq!(e.channel_id, 1);
                 assert_eq!(e.sequence_number, 7);
                 assert_eq!(
-                    utf8_from_bytes(e.error_code.inner_as_ref()).unwrap(),
+                    utf8_from_bytes(e.error_code.as_bytes()).unwrap(),
                     "stale-share"
                 );
             }
@@ -922,7 +923,7 @@ mod tests {
         match msg {
             AnyMessage::Mining(Mining::SetTarget(s)) => {
                 assert_eq!(s.channel_id, 1);
-                assert_eq!(s.maximum_target.inner_as_ref(), &[0xAA; 32]);
+                assert_eq!(s.maximum_target.as_bytes(), &[0xAA; 32]);
             }
             _ => panic!("expected SetTarget"),
         }
@@ -939,7 +940,7 @@ mod tests {
             AnyMessage::Mining(Mining::SetExtranoncePrefix(s)) => {
                 assert_eq!(s.channel_id, 4);
                 assert_eq!(
-                    s.extranonce_prefix.inner_as_ref(),
+                    s.extranonce_prefix.as_bytes(),
                     &[0xDE, 0xAD, 0xBE, 0xEF]
                 );
             }
@@ -961,7 +962,7 @@ mod tests {
             AnyMessage::Mining(Mining::SetNewPrevHash(p)) => {
                 assert_eq!(p.channel_id, 1);
                 assert_eq!(p.job_id, 7);
-                assert_eq!(p.prev_hash.inner_as_ref(), &[0xAB; 32]);
+                assert_eq!(p.prev_hash.as_bytes(), &[0xAB; 32]);
                 assert_eq!(p.min_ntime, 0x6500_0001);
                 assert_eq!(p.nbits, 0x1d00_ffff);
             }
@@ -984,7 +985,7 @@ mod tests {
                 assert_eq!(j.channel_id, 1);
                 assert_eq!(j.job_id, 7);
                 assert_eq!(j.version, 0x2000_0000);
-                assert_eq!(j.merkle_root.inner_as_ref(), &[0x12; 32]);
+                assert_eq!(j.merkle_root.as_bytes(), &[0x12; 32]);
                 assert_eq!(j.min_ntime.clone().into_inner(), Some(0x6500_0001));
             }
             _ => panic!("expected NewMiningJob"),
@@ -1008,9 +1009,9 @@ mod tests {
             AnyMessage::Mining(Mining::NewExtendedMiningJob(j)) => {
                 assert_eq!(j.channel_id, 1);
                 assert!(j.version_rolling_allowed);
-                assert_eq!(j.merkle_path.inner_as_ref().len(), 2);
-                assert_eq!(j.coinbase_tx_prefix.inner_as_ref(), &[0xAA; 8]);
-                assert_eq!(j.coinbase_tx_suffix.inner_as_ref(), &[0xBB; 8]);
+                assert_eq!(j.merkle_path.as_slice().len(), 2);
+                assert_eq!(j.coinbase_tx_prefix.as_bytes(), &[0xAA; 8]);
+                assert_eq!(j.coinbase_tx_suffix.as_bytes(), &[0xBB; 8]);
             }
             _ => panic!("expected NewExtendedMiningJob"),
         }
@@ -1028,11 +1029,11 @@ mod tests {
         let msg = encode_mining_outbound(frame).unwrap();
         match msg {
             AnyMessage::Mining(Mining::OpenStandardMiningChannelSuccess(s)) => {
-                assert_eq!(u32::from(&s.request_id), 42);
+                assert_eq!(s.request_id, 42);
                 assert_eq!(s.channel_id, 1);
-                assert_eq!(s.target.inner_as_ref(), &[0xCC; 32]);
+                assert_eq!(s.target.as_bytes(), &[0xCC; 32]);
                 assert_eq!(
-                    s.extranonce_prefix.inner_as_ref(),
+                    s.extranonce_prefix.as_bytes(),
                     &[0x01, 0x02, 0x03, 0x04]
                 );
             }
