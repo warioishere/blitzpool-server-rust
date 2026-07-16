@@ -1,21 +1,18 @@
 name: CI
 
-# The compile/lint gates (fmt, clippy, check, and the test-BUILD step below)
-# run automatically on every push to main and every PR. They need NO infra:
-# sqlx::query! macros validate against the committed .sqlx offline cache
-# (SQLX_OFFLINE=true), and nothing connects to Postgres/Redis at compile time.
+# Every push to main and every PR runs the full gate set:
+#   - fmt / clippy / check       — compile + lint, no infra needed
+#   - test                       — the actual suite, with Postgres + Redis
+#                                  service containers (see the `test` job).
 #
-# Actually RUNNING the suite needs a local Postgres + Redis (+ bitcoin-node for
-# the regtests) that GitHub runners lack, so the test-RUN step stays manual —
-# it only fires on a `workflow_dispatch` from the Actions tab.
+# sqlx::query! macros validate at COMPILE time against the committed .sqlx
+# offline cache (SQLX_OFFLINE=true); the live Postgres is only used at RUNTIME
+# by the integration tests.
 #
-# Why the split matters: `cargo check --all-targets`, `cargo clippy
-# --all-targets`, and `cargo test --all-targets --no-run` all COMPILE every
-# test target, so a test that stops compiling (e.g. a struct literal missing a
-# newly-added field) fails the gate on every push — even though the tests
-# themselves can't be executed here. The whole workflow used to be
-# workflow_dispatch-only, so exactly such a break once slipped through a
-# release unnoticed.
+# The bitcoin-core regtests (TDP/JDP/mining/block-submit) self-skip here: they
+# need the SV2-IPC `bitcoin-node` v31 binary, which GitHub runners don't have
+# (`RegtestConfig::is_available()` is false → the test prints "skipping" and
+# returns). Those run on a self-hosted runner that has the binary.
 on:
   push:
     branches: [main]
@@ -25,9 +22,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # bp-db uses sqlx::query! macros — they validate against a Postgres schema at compile time.
-  # In CI we use the committed .sqlx/ offline cache instead of a live DB. Devs regenerate the
-  # cache locally via `cargo sqlx prepare --workspace` against a local PG container (see db/README.md).
   SQLX_OFFLINE: "true"
 
 concurrency:
@@ -70,20 +64,50 @@ jobs:
       - run: cargo check --workspace --all-targets --locked
 
   test:
-    name: cargo test
+    name: cargo test (Postgres + Redis)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: public_pool
+        ports:
+          # Host port 15433 = the default the tests connect to
+          # (bp-test-support PG_DEFAULT_URL / BP_PG_URL).
+          - 15433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: valkey/valkey:8-alpine
+        ports:
+          # Host port 16379 = the default the tests connect to
+          # (bp-test-support REDIS_DEFAULT_URL / BP_REDIS_URL).
+          - 16379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev postgresql-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # GUARD (auto, no infra): compile + link EVERY test binary without running
-      # it. This is what catches a test target that stopped compiling.
-      - name: Build all test targets (compile guard)
-        run: cargo test --workspace --all-targets --no-run --locked
-      # Full run (manual only): the integration/regtest suite connects to a local
-      # Postgres + Redis (+ bitcoin-node), which GitHub runners don't provide.
-      - name: Run full suite (needs Postgres + Redis + bitcoin-node)
-        if: github.event_name == 'workflow_dispatch'
-        run: cargo test --workspace --all-targets --locked
+      - name: Load DB schema + migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -p 15433 -U postgres -d public_pool -v ON_ERROR_STOP=1 -f db/schema.sql
+          for f in crates/bp-db/migrations/*.sql; do
+            psql -h localhost -p 15433 -U postgres -d public_pool -v ON_ERROR_STOP=1 -f "$f"
+          done
+      # --test-threads=1: the integration tests share the one Postgres/Redis, so
+      # run them serially (matches the local `test-strict` alias). Regtests
+      # self-skip (no bitcoin-node here).
+      - name: cargo test
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1
