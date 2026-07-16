@@ -394,7 +394,7 @@ mod tests {
     }
 
     fn dummy_active_template() -> ActiveSV1Template {
-        ActiveSV1Template {
+        let mut active = ActiveSV1Template {
             template_id: 1,
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
@@ -423,7 +423,9 @@ mod tests {
             version_hex: String::new(),
             n_bits_hex: String::new(),
             header_timestamp_hex: String::new(),
-        }
+        };
+        active.recompute_notify_header_hex();
+        active
     }
 
     fn dummy_mining_job() -> MiningJob {
@@ -612,10 +614,14 @@ mod tests {
     // ── cleanup_for_tip: prev-hash-conditioned retire ──────────────────
 
     fn template_with_prev(prev: u8) -> ActiveSV1Template {
-        ActiveSV1Template {
+        let mut active = ActiveSV1Template {
             prev_hash: [prev; 32],
             ..dummy_active_template()
-        }
+        };
+        // The struct-update inherited the base fixture's prev_hash_hex, which
+        // is for the OLD prev_hash — re-sync now that prev_hash changed.
+        active.recompute_notify_header_hex();
+        active
     }
 
     /// Entries built on the OLD tip get retired; entries already on the

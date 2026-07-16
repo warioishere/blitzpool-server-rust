@@ -95,15 +95,24 @@ impl ActiveSV1Template {
         self.coinbase_tx_locktime = t.coinbase_tx_locktime;
         self.merkle_path = t.merkle_path.clone();
         self.merkle_branch_hex = encode_merkle_branch(&self.merkle_path);
-        // `version` changed above → refresh the cached notify header hex.
-        self.recompute_notify_header_hex();
+        // A refresh changes only `version` among the four header-hex sources
+        // (prev_hash/n_bits/header_timestamp are left untouched, see doc above),
+        // so refresh just that one cached string instead of re-encoding all
+        // four. The debug guard in `build_notify_frame` verifies the untouched
+        // three stayed in sync.
+        self.version_hex = format!("{:08x}", self.version);
     }
 
     /// (Re)compute the cached hex of the notify header-constant fields —
     /// prev_hash (word-swapped) + version + n_bits + header_timestamp. Same
     /// once-per-template caching `merkle_branch_hex` gets, so per-client
     /// `mining.notify` borrows them instead of re-encoding for every miner.
-    fn recompute_notify_header_hex(&mut self) {
+    ///
+    /// `pub(crate)` so intra-crate test fixtures that build the struct
+    /// literal directly can re-sync the cache the way the production
+    /// constructor does; every source-field mutation must call it (the
+    /// debug guard in [`build_notify_frame`] enforces this in test builds).
+    pub(crate) fn recompute_notify_header_hex(&mut self) {
         self.prev_hash_hex = hex::encode(swap_endian_words(&self.prev_hash));
         self.version_hex = format!("{:08x}", self.version);
         self.n_bits_hex = format!("{:08x}", self.n_bits);
@@ -347,6 +356,42 @@ pub fn build_notify_frame(
     job_id_hex: &str,
     clean_jobs: bool,
 ) -> Vec<u8> {
+    // Debug-only stale-cache guard: every borrowed `*_hex` must equal a fresh
+    // encode of its source field. Compiles to nothing in release; in every
+    // test/regtest (debug) a forgotten `recompute_notify_header_hex` or a
+    // desynced coinbase hex fails loudly here instead of silently broadcasting
+    // a `mining.notify` with wrong header/coinbase values to miners.
+    debug_assert_eq!(
+        state.prev_hash_hex,
+        hex::encode(swap_endian_words(&state.prev_hash)),
+        "stale prev_hash_hex cache"
+    );
+    debug_assert_eq!(
+        state.version_hex,
+        format!("{:08x}", state.version),
+        "stale version_hex cache"
+    );
+    debug_assert_eq!(
+        state.n_bits_hex,
+        format!("{:08x}", state.n_bits),
+        "stale n_bits_hex cache"
+    );
+    debug_assert_eq!(
+        state.header_timestamp_hex,
+        format!("{:08x}", state.header_timestamp),
+        "stale header_timestamp_hex cache"
+    );
+    debug_assert_eq!(
+        job.coinbase_prefix_hex(),
+        hex::encode(job.coinbase_prefix()),
+        "stale coinbase_prefix_hex cache"
+    );
+    debug_assert_eq!(
+        job.coinbase_suffix_hex(),
+        hex::encode(job.coinbase_suffix()),
+        "stale coinbase_suffix_hex cache"
+    );
+
     let params: MiningNotifyParams = (
         job_id_hex,
         state.prev_hash_hex.as_str(),
@@ -764,6 +809,60 @@ mod tests {
         assert_eq!(params[5].as_str().unwrap(), "00000002");
         assert_eq!(params[6].as_str().unwrap(), "000000ff");
         assert_eq!(params[7].as_str().unwrap(), "00000010");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "stale version_hex")]
+    fn build_notify_frame_debug_guard_rejects_stale_header_hex() {
+        // Mutate a source field WITHOUT re-syncing the cache. The debug guard
+        // in build_notify_frame must catch the desync — this is the net that
+        // stops a forgotten recompute from ever broadcasting a wrong-header
+        // mining.notify to miners.
+        let mut active = assembled_active();
+        active.version = 0x1234_5678; // version_hex now stale
+        let job = job_from_active(&active);
+        let _ = build_notify_frame(&active, &job, "1", false);
+    }
+
+    #[test]
+    fn new_block_notify_carries_new_prev_hash_not_stale_cache() {
+        // End-to-end pin for the header-hex cache: a genuinely new block must
+        // produce a mining.notify carrying the NEW prev_hash, never the
+        // previous template's cached hex. Drive the real assembler path
+        // (NewTemplate + SetNewPrevHash) twice with different prev_hashes and
+        // assert the built notify's prevhash field tracks each block.
+        let notify_prevhash = |asm: &SV1TemplateAssembler| -> String {
+            let active = asm.current().expect("active template");
+            let job = job_from_active(active);
+            let bytes = build_notify_frame(active, &job, "1", true);
+            let v: serde_json::Value =
+                serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+            v["params"].as_array().unwrap()[1]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // Block A — prev_hash 0xAA.
+        let mut asm = SV1TemplateAssembler::new();
+        asm.apply(&TemplateUpdate::NewTemplate(dummy_new_template(1, true)));
+        let mut snph_a = dummy_prev_hash(1, 0x1d00_ffff);
+        snph_a.prev_hash = [0xAA; 32];
+        asm.apply(&TemplateUpdate::SetNewPrevHash(snph_a));
+        let notify_a = notify_prevhash(&asm);
+        assert_eq!(notify_a, hex::encode(swap_endian_words(&[0xAA; 32])));
+
+        // Block B — a genuinely new tip, prev_hash 0xBB.
+        asm.apply(&TemplateUpdate::NewTemplate(dummy_new_template(2, true)));
+        let mut snph_b = dummy_prev_hash(2, 0x1d00_ffff);
+        snph_b.prev_hash = [0xBB; 32];
+        asm.apply(&TemplateUpdate::SetNewPrevHash(snph_b));
+        let notify_b = notify_prevhash(&asm);
+        assert_eq!(notify_b, hex::encode(swap_endian_words(&[0xBB; 32])));
+
+        // The second notify must NOT carry the first block's prev_hash.
+        assert_ne!(notify_a, notify_b, "new block served a stale prev_hash");
     }
 
     #[test]

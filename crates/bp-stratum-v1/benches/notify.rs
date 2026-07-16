@@ -75,8 +75,12 @@ fn make_job() -> MiningJob {
 }
 
 /// A realistic active template with the header hex cache populated the way the
-/// production constructor does (`recompute_notify_header_hex` is private, so the
-/// bench sets the public cache fields itself).
+/// production constructor does. `recompute_notify_header_hex` is `pub(crate)`
+/// and this bench is a separate crate, so it can't call it and must fill the
+/// cache by hand below — **the encoding here MUST mirror
+/// `ActiveSV1Template::recompute_notify_header_hex` exactly** (prev_hash
+/// word-swap + `{:08x}` padding); if that convention changes, update both or
+/// the bench silently measures a frame shape production no longer emits.
 fn make_template(merkle_depth: usize) -> ActiveSV1Template {
     let mut t = ActiveSV1Template {
         template_id: 1,
@@ -140,10 +144,6 @@ fn report_allocs() {
     let _ = allocs_for_notify(&t, &job); // warm
     let cached = allocs_for_notify(&t, &job);
     let removed = allocs_for_removed_encodes(&t, &job);
-    // Hard floor: the builder must make exactly one allocation — the single
-    // pre-sized output frame Vec. Anything above means the `with_capacity`
-    // upper bound in `build_notify_frame` was too small and the buffer
-    // reallocated; widen it.
     // Hard floor: the builder must make exactly one allocation — the single
     // pre-sized output frame Vec. Anything above means the `with_capacity`
     // upper bound in `build_notify_frame` was too small and the buffer
