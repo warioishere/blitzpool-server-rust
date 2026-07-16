@@ -863,7 +863,7 @@ mod tests {
     }
 
     fn template_for_regtest() -> ActiveSV1Template {
-        ActiveSV1Template {
+        let mut active = ActiveSV1Template {
             template_id: 1,
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
@@ -888,11 +888,35 @@ mod tests {
             merkle_branch_hex: vec![
                 "1111111111111111111111111111111111111111111111111111111111111111".into(),
             ],
-        }
+            prev_hash_hex: String::new(),
+            version_hex: String::new(),
+            n_bits_hex: String::new(),
+            header_timestamp_hex: String::new(),
+        };
+        // Sync the header-hex cache the way the production constructor does —
+        // build_notify_frame borrows it and its debug guard rejects a stale one.
+        active.recompute_notify_header_hex();
+        active
     }
 
     // Real regtest bech32 — accepted by `address_to_script(Network::Regtest, ...)`.
     const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+    /// Parse a `mining.notify` frame and assert its header-constant params
+    /// carry `template_for_regtest`'s real values. Pins that the production
+    /// path emits proper header hex — a desynced fixture (empty cache) would
+    /// emit `""` for these and this catches it.
+    fn assert_regtest_notify_header(frame: &[u8]) {
+        let v: serde_json::Value =
+            serde_json::from_slice(&frame[..frame.len() - 1]).expect("notify is JSON");
+        let p = v["params"].as_array().expect("params array");
+        // prev_hash [0xAB; 32] word-swapped is identity (all four-byte words
+        // are 0xABABABAB), so the advertised prevhash is 64× 'ab'.
+        assert_eq!(p[1].as_str().unwrap(), "ab".repeat(32), "prevhash");
+        assert_eq!(p[5].as_str().unwrap(), "20000000", "version");
+        assert_eq!(p[6].as_str().unwrap(), "207fffff", "nbits");
+        assert!(!p[7].as_str().unwrap().is_empty(), "ntime present");
+    }
 
     /// Test fixture: builds a `SubscribeRequest` with the **refined** UA
     /// (`refine_user_agent` strips `/version` and collapses known firmware
@@ -1329,6 +1353,7 @@ mod tests {
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.contains("\"mining.notify\""));
         assert!(s.ends_with("true]}\n"));
+        assert_regtest_notify_header(&out.outbound_frames[0]);
     }
 
     #[test]
@@ -1359,6 +1384,7 @@ mod tests {
         );
         let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
         assert!(s.ends_with("false]}\n"));
+        assert_regtest_notify_header(&out.outbound_frames[0]);
     }
 
     #[test]

@@ -15,10 +15,10 @@ bp-common = { workspace = true }
 bp-share = { workspace = true }
 bitcoin = { workspace = true }
 thiserror = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 bp-test-support = { workspace = true }
-hex = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
 bp-regtest-harness = { workspace = true }
