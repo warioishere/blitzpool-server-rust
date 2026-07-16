@@ -64,6 +64,17 @@ pub struct ActiveSV1Template {
     /// templates/min × ~12 branch entries that's a measurable per-second
     /// allocation rate this cache removes.
     pub merkle_branch_hex: Vec<String>,
+    /// Pre-encoded hex of the notify **header-constant** fields — prev_hash
+    /// (word-swapped), version, n_bits, header_timestamp — cached once per
+    /// template alongside `merkle_branch_hex`. These are identical for every
+    /// connection on a template, so `mining.notify` borrows them instead of
+    /// re-hex-encoding for each of ~600 per-client broadcasts. Kept in sync by
+    /// [`ActiveSV1Template::recompute_notify_header_hex`] (construction +
+    /// mempool refresh — the only paths that change the source fields).
+    pub prev_hash_hex: String,
+    pub version_hex: String,
+    pub n_bits_hex: String,
+    pub header_timestamp_hex: String,
 }
 
 impl ActiveSV1Template {
@@ -84,6 +95,19 @@ impl ActiveSV1Template {
         self.coinbase_tx_locktime = t.coinbase_tx_locktime;
         self.merkle_path = t.merkle_path.clone();
         self.merkle_branch_hex = encode_merkle_branch(&self.merkle_path);
+        // `version` changed above → refresh the cached notify header hex.
+        self.recompute_notify_header_hex();
+    }
+
+    /// (Re)compute the cached hex of the notify header-constant fields —
+    /// prev_hash (word-swapped) + version + n_bits + header_timestamp. Same
+    /// once-per-template caching `merkle_branch_hex` gets, so per-client
+    /// `mining.notify` borrows them instead of re-encoding for every miner.
+    fn recompute_notify_header_hex(&mut self) {
+        self.prev_hash_hex = hex::encode(swap_endian_words(&self.prev_hash));
+        self.version_hex = format!("{:08x}", self.version);
+        self.n_bits_hex = format!("{:08x}", self.n_bits);
+        self.header_timestamp_hex = format!("{:08x}", self.header_timestamp);
     }
 }
 
@@ -206,7 +230,7 @@ impl SV1TemplateAssembler {
 
         let network_difficulty = network_difficulty_from_n_bits(p.n_bits);
         let merkle_branch_hex = encode_merkle_branch(&template.merkle_path);
-        let active = ActiveSV1Template {
+        let mut active = ActiveSV1Template {
             template_id: template.template_id,
             version: template.version,
             prev_hash: p.prev_hash,
@@ -223,7 +247,12 @@ impl SV1TemplateAssembler {
             coinbase_tx_locktime: template.coinbase_tx_locktime,
             merkle_path: template.merkle_path,
             merkle_branch_hex,
+            prev_hash_hex: String::new(),
+            version_hex: String::new(),
+            n_bits_hex: String::new(),
+            header_timestamp_hex: String::new(),
         };
+        active.recompute_notify_header_hex();
         self.active = Some(active);
         Some(TemplateChange::NewBlock)
     }
@@ -290,13 +319,13 @@ struct MiningNotifyFrame<'a> {
 /// don't re-hex-encode or re-allocate the branch vector.
 type MiningNotifyParams<'a> = (
     &'a str,      // jobId
-    String,       // prevHash (word-swapped + hex)
-    String,       // coinb1 hex
-    String,       // coinb2 hex
+    &'a str,      // prevHash (word-swapped + hex) — cached on the template
+    &'a str,      // coinb1 hex — cached on the shared MiningJob
+    &'a str,      // coinb2 hex — cached on the shared MiningJob
     &'a [String], // merkle branch (each entry 64-hex chars)
-    String,       // version (8-hex padded)
-    String,       // nbits (8-hex padded)
-    String,       // ntime (8-hex padded)
+    &'a str,      // version (8-hex padded) — cached
+    &'a str,      // nbits (8-hex padded) — cached
+    &'a str,      // ntime (8-hex padded) — cached
     bool,         // clean_jobs
 );
 
@@ -318,17 +347,15 @@ pub fn build_notify_frame(
     job_id_hex: &str,
     clean_jobs: bool,
 ) -> Vec<u8> {
-    let prev_hash_swapped = swap_endian_words(&state.prev_hash);
-
     let params: MiningNotifyParams = (
         job_id_hex,
-        hex::encode(prev_hash_swapped),
-        hex::encode(job.coinbase_prefix()),
-        hex::encode(job.coinbase_suffix()),
+        state.prev_hash_hex.as_str(),
+        job.coinbase_prefix_hex(),
+        job.coinbase_suffix_hex(),
         state.merkle_branch_hex.as_slice(),
-        format!("{:08x}", state.version),
-        format!("{:08x}", state.n_bits),
-        format!("{:08x}", state.header_timestamp),
+        state.version_hex.as_str(),
+        state.n_bits_hex.as_str(),
+        state.header_timestamp_hex.as_str(),
         clean_jobs,
     );
     let frame = MiningNotifyFrame {
@@ -336,7 +363,37 @@ pub fn build_notify_frame(
         method: "mining.notify",
         params,
     };
-    let mut bytes = serde_json::to_vec(&frame).expect("mining.notify shape is always valid JSON");
+    // Pre-size the output buffer to an upper bound so serde_json writes the
+    // whole frame without a single realloc — that Vec is then the only
+    // allocation this builder makes, and it's unavoidable (the bytes are
+    // returned to be written to the socket). Base 64 covers the fixed JSON
+    // scaffolding `{"id":null,"method":"mining.notify","params":[ … ]}`; each
+    // string field adds its length + 3 for the two quotes and a comma.
+    let est = 64
+        + job_id_hex.len()
+        + 3
+        + state.prev_hash_hex.len()
+        + 3
+        + job.coinbase_prefix_hex().len()
+        + 3
+        + job.coinbase_suffix_hex().len()
+        + 3
+        + state.version_hex.len()
+        + 3
+        + state.n_bits_hex.len()
+        + 3
+        + state.header_timestamp_hex.len()
+        + 3
+        + 2 // the merkle branch's own `[` `]`
+        + state
+            .merkle_branch_hex
+            .iter()
+            .map(|h| h.len() + 3)
+            .sum::<usize>()
+        + 6 // "false," — the widest clean_jobs rendering
+        + 1; // trailing '\n'
+    let mut bytes = Vec::with_capacity(est);
+    serde_json::to_writer(&mut bytes, &frame).expect("mining.notify shape is always valid JSON");
     bytes.push(b'\n');
     bytes
 }
@@ -557,7 +614,7 @@ mod tests {
 
     fn assembled_active() -> ActiveSV1Template {
         // Fully-deterministic active template — used by frame-build tests.
-        ActiveSV1Template {
+        let mut active = ActiveSV1Template {
             template_id: 1,
             version: 0x2000_0000,
             prev_hash: {
@@ -591,7 +648,13 @@ mod tests {
                 "1111111111111111111111111111111111111111111111111111111111111111".into(),
                 "2222222222222222222222222222222222222222222222222222222222222222".into(),
             ],
-        }
+            prev_hash_hex: String::new(),
+            version_hex: String::new(),
+            n_bits_hex: String::new(),
+            header_timestamp_hex: String::new(),
+        };
+        active.recompute_notify_header_hex();
+        active
     }
 
     fn job_from_active(active: &ActiveSV1Template) -> MiningJob {
@@ -691,6 +754,9 @@ mod tests {
         active.version = 2;
         active.n_bits = 0x0000_00ff;
         active.header_timestamp = 0x10;
+        // Direct field mutation bypasses the constructor/refresh — refresh the
+        // cached header hex the way production does before building a notify.
+        active.recompute_notify_header_hex();
         let job = job_from_active(&active);
         let bytes = build_notify_frame(&active, &job, "1", false);
         let parsed: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();

@@ -69,6 +69,12 @@ pub struct CoinbaseTemplate {
 pub struct MiningJob {
     coinbase_prefix: Vec<u8>,
     coinbase_suffix: Vec<u8>,
+    /// Lowercase-hex of `coinbase_prefix`/`coinbase_suffix`, precomputed at
+    /// build time. The `MiningJob` is shared (one per template for PPLNS), so
+    /// the SV1 `mining.notify` broadcast borrows these instead of re-hex-
+    /// encoding the coinbase for every per-client build.
+    coinbase_prefix_hex: String,
+    coinbase_suffix_hex: String,
 }
 
 impl MiningJob {
@@ -78,6 +84,18 @@ impl MiningJob {
 
     pub fn coinbase_suffix(&self) -> &[u8] {
         &self.coinbase_suffix
+    }
+
+    /// Precomputed lowercase-hex of the coinbase prefix — the `coinb1` slot of
+    /// a `mining.notify`.
+    pub fn coinbase_prefix_hex(&self) -> &str {
+        &self.coinbase_prefix_hex
+    }
+
+    /// Precomputed lowercase-hex of the coinbase suffix — the `coinb2` slot of
+    /// a `mining.notify`.
+    pub fn coinbase_suffix_hex(&self) -> &str {
+        &self.coinbase_suffix_hex
     }
 
     /// Splice the 4-byte extranonce1 and 8-byte extranonce2 into the
@@ -228,10 +246,14 @@ pub fn build_mining_job(
 
     let coinbase_prefix = serialized[..prefix_end].to_vec();
     let coinbase_suffix = serialized[suffix_start..].to_vec();
+    let coinbase_prefix_hex = hex::encode(&coinbase_prefix);
+    let coinbase_suffix_hex = hex::encode(&coinbase_suffix);
 
     Ok(MiningJob {
         coinbase_prefix,
         coinbase_suffix,
+        coinbase_prefix_hex,
+        coinbase_suffix_hex,
     })
 }
 
@@ -381,10 +403,14 @@ pub(crate) fn assemble_tdp_job(
 
     let coinbase_prefix = serialized[..prefix_end].to_vec();
     let coinbase_suffix = serialized[suffix_start..].to_vec();
+    let coinbase_prefix_hex = hex::encode(&coinbase_prefix);
+    let coinbase_suffix_hex = hex::encode(&coinbase_suffix);
 
     MiningJob {
         coinbase_prefix,
         coinbase_suffix,
+        coinbase_prefix_hex,
+        coinbase_suffix_hex,
     }
 }
 

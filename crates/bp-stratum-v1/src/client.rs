@@ -888,6 +888,10 @@ mod tests {
             merkle_branch_hex: vec![
                 "1111111111111111111111111111111111111111111111111111111111111111".into(),
             ],
+            prev_hash_hex: String::new(),
+            version_hex: String::new(),
+            n_bits_hex: String::new(),
+            header_timestamp_hex: String::new(),
         }
     }
 

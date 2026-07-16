@@ -508,6 +508,10 @@ mod tests {
             coinbase_tx_locktime: 0,
             merkle_path: vec![[0x11; 32]],
             merkle_branch_hex: vec![],
+            prev_hash_hex: String::new(),
+            version_hex: String::new(),
+            n_bits_hex: String::new(),
+            header_timestamp_hex: String::new(),
         }
     }
 
