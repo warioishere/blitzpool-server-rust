@@ -109,7 +109,12 @@ impl BlockpartyHooks for NoEmail {
 }
 
 fn svc_no_email(pool: &PgPool) -> BlockpartyService<NoEmail> {
-    BlockpartyService::new(pool.clone(), Arc::new(NoEmail), PplnsAddressCache::new(), config())
+    BlockpartyService::new(
+        pool.clone(),
+        Arc::new(NoEmail),
+        PplnsAddressCache::new(),
+        config(),
+    )
 }
 
 /// Seed a verified signature-ownership proof for `address`, stored VERBATIM
@@ -194,10 +199,7 @@ async fn add_member_flips_to_confirming_and_inserts_member_cache() {
         .await;
 
     let svc = svc(&pool);
-    let create = svc
-        .create_group(name, admin, 5_000)
-        .await
-        .expect("create");
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
         .await
         .expect("add_member");
@@ -231,17 +233,21 @@ async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
         .await;
 
     let svc = svc(&pool);
-    let create = svc
-        .create_group(name, admin, 5_000)
-        .await
-        .expect("create");
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
 
     // Admin mints a join link; Carol self-joins via it (no admin token).
     let link = svc
-        .create_join_link(create.group.id, OpenInviteTtl::SevenDays, Some(&create.admin_token))
+        .create_join_link(
+            create.group.id,
+            OpenInviteTtl::SevenDays,
+            Some(&create.admin_token),
+        )
         .await
         .expect("create_join_link");
-    let (member_token, group_id) = svc.join_via_link(&link, carol).await.expect("join_via_link");
+    let (member_token, group_id) = svc
+        .join_via_link(&link, carol)
+        .await
+        .expect("join_via_link");
     assert_eq!(group_id, create.group.id);
     assert!(!member_token.is_empty());
 
@@ -254,12 +260,18 @@ async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
         .expect("carol is a member");
     assert!(carol_row.confirmed_at.is_none());
     assert_eq!(carol_row.percent_bp, 0);
-    assert_eq!(svc.member_group_id(&addr(carol)).await, Some(create.group.id));
+    assert_eq!(
+        svc.member_group_id(&addr(carol)).await,
+        Some(create.group.id)
+    );
     let g = svc.get_group(create.group.id).await.unwrap().unwrap();
     assert_eq!(g.status, "confirming");
 
     // Unknown link → error (not found).
-    assert!(svc.join_via_link("nonexistent-token", "bc1qzzz").await.is_err());
+    assert!(svc
+        .join_via_link("nonexistent-token", "bc1qzzz")
+        .await
+        .is_err());
 
     cleanup(&pool, name, admin).await;
     let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
@@ -297,12 +309,13 @@ async fn join_via_link_admits_signature_verified_email_less_base58_address() {
     seed_signature(&pool, admin).await;
 
     let svc = svc_no_email(&pool);
-    let create = svc
-        .create_group(name, admin, 5_000)
-        .await
-        .expect("create");
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let link = svc
-        .create_join_link(create.group.id, OpenInviteTtl::SevenDays, Some(&create.admin_token))
+        .create_join_link(
+            create.group.id,
+            OpenInviteTtl::SevenDays,
+            Some(&create.admin_token),
+        )
         .await
         .expect("create_join_link");
     // NoEmail hook → email.is_none() is true → the gate falls through to the
@@ -353,12 +366,13 @@ async fn join_via_link_rejects_unverified_address() {
     seed_signature(&pool, admin).await;
 
     let svc = svc_no_email(&pool);
-    let create = svc
-        .create_group(name, admin, 5_000)
-        .await
-        .expect("create");
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let link = svc
-        .create_join_link(create.group.id, OpenInviteTtl::SevenDays, Some(&create.admin_token))
+        .create_join_link(
+            create.group.id,
+            OpenInviteTtl::SevenDays,
+            Some(&create.admin_token),
+        )
         .await
         .expect("create_join_link");
     let err = svc
@@ -436,7 +450,10 @@ async fn create_group_rejects_unverified_admin() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(group_count, 0, "no group row should exist for a rejected create");
+    assert_eq!(
+        group_count, 0,
+        "no group row should exist for a rejected create"
+    );
 
     cleanup(&pool, name, admin).await;
 }
@@ -492,10 +509,7 @@ async fn mark_member_confirmed_promotes_to_ready_and_unblocks_routing() {
         .await;
 
     let svc = svc(&pool);
-    let create = svc
-        .create_group(name, admin, 5_000)
-        .await
-        .expect("create");
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
         .await
         .expect("add_member");
@@ -544,10 +558,7 @@ async fn on_share_accepted_promotes_ready_to_active_only() {
         .await;
 
     let svc = svc(&pool);
-    let create = svc
-        .create_group(name, admin, 5_000)
-        .await
-        .expect("create");
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
     let admin_addr = addr(admin);
 
     // Pre-confirm: share in DRAFT should NOT promote (defensive).
@@ -594,10 +605,7 @@ async fn dissolve_blocked_during_active_cooldown() {
         .await;
 
     let svc = svc(&pool);
-    let create = svc
-        .create_group(name, admin, 5_000)
-        .await
-        .expect("create");
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
         .await
         .expect("add");
@@ -646,10 +654,7 @@ async fn on_block_found_is_idempotent_on_duplicate_hash() {
     cleanup(&pool, name, admin).await;
 
     let svc = svc(&pool);
-    let create = svc
-        .create_group(name, admin, 10_000)
-        .await
-        .expect("create");
+    let create = svc.create_group(name, admin, 10_000).await.expect("create");
     let splits = vec![bp_db::BlockpartySplitSnapshot {
         address: admin.to_owned(),
         percent_bp: 10_000,
@@ -744,10 +749,7 @@ async fn ready_transition_sizes_coinbase_reservation_to_roster() {
         calls: calls.clone(),
     })));
 
-    let create = svc
-        .create_group(name, admin, 5_000)
-        .await
-        .expect("create");
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
         .await
         .expect("add_member");
@@ -795,10 +797,7 @@ async fn update_splits_confirms_admin_and_resets_non_admin() {
         .await;
 
     let svc = svc(&pool);
-    let create = svc
-        .create_group(name, admin, 5_000)
-        .await
-        .expect("create");
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
     svc.add_member(create.group.id, bob, 5_000, Some(&create.admin_token))
         .await
         .expect("add_member");

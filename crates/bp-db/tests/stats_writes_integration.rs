@@ -435,7 +435,10 @@ async fn address_settings_shares_increment_and_create_missing_rows() {
 
     bulk_upsert_address_settings(
         &mut *tx,
-        &[shares("test_as_present", 42.0), shares("test_as_absent", 99.0)],
+        &[
+            shares("test_as_present", 42.0),
+            shares("test_as_absent", 99.0),
+        ],
     )
     .await
     .expect("upsert");
@@ -496,7 +499,10 @@ async fn address_settings_upsert_folds_shares_and_best_in_one_write() {
     )
     .await
     .expect("insert combined");
-    assert_eq!(read_row(&mut tx, addr).await, (10.0, 500.0, Some("bitaxe".into())));
+    assert_eq!(
+        read_row(&mut tx, addr).await,
+        (10.0, 500.0, Some("bitaxe".into()))
+    );
     let ts_after_insert: i64 =
         sqlx::query_scalar(r#"SELECT "updatedAt" FROM address_settings_entity WHERE address = $1"#)
             .bind(addr)
@@ -536,7 +542,10 @@ async fn address_settings_upsert_folds_shares_and_best_in_one_write() {
     tx.rollback().await.expect("rollback");
 }
 
-async fn read_best(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, address: &str) -> (f64, Option<String>) {
+async fn read_best(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    address: &str,
+) -> (f64, Option<String>) {
     let row = sqlx::query(
         r#"SELECT "bestDifficulty", "bestDifficultyUserAgent"
            FROM address_settings_entity WHERE address = $1"#,
@@ -545,7 +554,10 @@ async fn read_best(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, address: &str
     .fetch_one(&mut **tx)
     .await
     .expect("read best");
-    (row.get("bestDifficulty"), row.get("bestDifficultyUserAgent"))
+    (
+        row.get("bestDifficulty"),
+        row.get("bestDifficultyUserAgent"),
+    )
 }
 
 /// Reads the full merged triple: `(shares, bestDifficulty, userAgent)`.
@@ -580,19 +592,28 @@ async fn best_difficulty_upsert_inserts_then_climbs_via_greatest() {
     bulk_upsert_address_settings(&mut *tx, &[bd(addr, 100.0, Some("bitaxe"))])
         .await
         .expect("insert");
-    assert_eq!(read_best(&mut tx, addr).await, (100.0, Some("bitaxe".into())));
+    assert_eq!(
+        read_best(&mut tx, addr).await,
+        (100.0, Some("bitaxe".into()))
+    );
 
     // Higher → climbs + stamps the new firmware.
     bulk_upsert_address_settings(&mut *tx, &[bd(addr, 250.0, Some("nerdqaxe"))])
         .await
         .expect("climb");
-    assert_eq!(read_best(&mut tx, addr).await, (250.0, Some("nerdqaxe".into())));
+    assert_eq!(
+        read_best(&mut tx, addr).await,
+        (250.0, Some("nerdqaxe".into()))
+    );
 
     // Lower → GREATEST keeps the stored max AND its user-agent.
     bulk_upsert_address_settings(&mut *tx, &[bd(addr, 40.0, Some("worker"))])
         .await
         .expect("lower");
-    assert_eq!(read_best(&mut tx, addr).await, (250.0, Some("nerdqaxe".into())));
+    assert_eq!(
+        read_best(&mut tx, addr).await,
+        (250.0, Some("nerdqaxe".into()))
+    );
 
     tx.rollback().await.expect("rollback");
 }

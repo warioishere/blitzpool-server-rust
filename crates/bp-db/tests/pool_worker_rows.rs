@@ -12,6 +12,10 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
+// Test-only skip diagnostics: the workspace denies `print_stderr` for
+// production code, but printing why an integration test skipped (no local PG)
+// is exactly what stderr is for here.
+#[allow(clippy::print_stderr)]
 async fn connect_or_skip() -> Option<PgPool> {
     let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
     match tokio::time::timeout(
@@ -47,11 +51,11 @@ async fn skinny_reader_returns_active_rows_in_window() {
 
     // (address, worker, session, time, deleted?)
     let seed: &[(&str, &str, &str, i64, Option<i64>)] = &[
-        ("bp_pwr_X", "w1", "s1", base, None),         // in window
+        ("bp_pwr_X", "w1", "s1", base, None),           // in window
         ("bp_pwr_X", "w2", "s1", base + 600_000, None), // in window, later slot
-        ("bp_pwr_Y", "w1", "s1", base, None),         // in window
-        ("bp_pwr_OLD", "w1", "s1", base - 1, None),   // before since → excluded
-        ("bp_pwr_DEL", "w1", "s1", base, Some(base)), // soft-deleted → excluded
+        ("bp_pwr_Y", "w1", "s1", base, None),           // in window
+        ("bp_pwr_OLD", "w1", "s1", base - 1, None),     // before since → excluded
+        ("bp_pwr_DEL", "w1", "s1", base, Some(base)),   // soft-deleted → excluded
     ];
     for (addr, worker, session, time, deleted) in seed {
         sqlx::query(

@@ -31,8 +31,8 @@ use axum::{
 use base64::Engine;
 use bitcoin::{
     address::AddressType,
-    sign_message::{signed_msg_hash, MessageSignature},
     secp256k1::Secp256k1,
+    sign_message::{signed_msg_hash, MessageSignature},
     Address, CompressedPublicKey, Network,
 };
 use bp_common::AddressId;
@@ -61,7 +61,10 @@ where
             post(verify::<H, M>).layer(rate_limit::per_minute_layer(5)),
         )
         .route("/api/address/ownership/:address", get(by_address::<H, M>))
-        .route("/api/address/verified/:address", get(verified_status::<H, M>))
+        .route(
+            "/api/address/verified/:address",
+            get(verified_status::<H, M>),
+        )
 }
 
 // ─── POST /api/address/ownership/challenge ───────────────────────
@@ -141,7 +144,10 @@ where
     let address = parse_supported_address(&body.address, state.network)?;
     let signature = body.signature.trim();
     if signature.is_empty() {
-        return Err(ownership_error("missing-signature", StatusCode::BAD_REQUEST));
+        return Err(ownership_error(
+            "missing-signature",
+            StatusCode::BAD_REQUEST,
+        ));
     }
 
     let pending = bp_db::find_ownership_challenge(&state.pool, &address)
@@ -157,17 +163,15 @@ where
     let Some((method, script_type)) =
         verify_message_signature(address.as_str(), &pending.message, signature, state.network)
     else {
-        return Err(ownership_error("invalid-signature", StatusCode::BAD_REQUEST));
+        return Err(ownership_error(
+            "invalid-signature",
+            StatusCode::BAD_REQUEST,
+        ));
     };
 
-    let saved = bp_db::upsert_address_ownership_verified(
-        &state.pool,
-        &address,
-        &method,
-        &script_type,
-        now,
-    )
-    .await?;
+    let saved =
+        bp_db::upsert_address_ownership_verified(&state.pool, &address, &method, &script_type, now)
+            .await?;
     // Consume the challenge.
     bp_db::delete_ownership_challenge(&state.pool, &address).await?;
     Ok(Json(VerifyResponse {
@@ -265,13 +269,20 @@ where
 /// Verify `signature` signs `message` for `address`. Returns `(method,
 /// script_type)` on success. Tries BIP-322 first (covers every type incl.
 /// taproot), then the legacy/Electrum/BIP-137 recoverable path.
+// The per-address-type `match` arms each run a distinct verification (recover +
+// re-derive + compare) — keeping the explicit `if` inside each arm is clearer
+// for security review than collapsing into match guards, so allow the lint.
+#[allow(clippy::collapsible_match)]
 fn verify_message_signature(
     address: &str,
     message: &str,
     signature: &str,
     network: Network,
 ) -> Option<(String, String)> {
-    let addr = Address::from_str(address).ok()?.require_network(network).ok()?;
+    let addr = Address::from_str(address)
+        .ok()?
+        .require_network(network)
+        .ok()?;
     let script_type = script_type_label(addr.address_type()?);
 
     // 1) BIP-322 (any address type, incl. taproot).
@@ -285,7 +296,10 @@ fn verify_message_signature(
     let secp = Secp256k1::verification_only();
     match addr.address_type()? {
         AddressType::P2pkh => {
-            if sig.is_signed_by_address(&secp, &addr, msg_hash).unwrap_or(false) {
+            if sig
+                .is_signed_by_address(&secp, &addr, msg_hash)
+                .unwrap_or(false)
+            {
                 return Some(("bip137".to_string(), "p2pkh".to_string()));
             }
         }
@@ -383,7 +397,7 @@ mod tests {
 
         // The same recoverable signature proves control of every address type
         // derived from the key — the verifier recovers the pubkey and re-derives.
-        let p2pkh = Address::p2pkh(&pk, Network::Bitcoin).to_string();
+        let p2pkh = Address::p2pkh(pk, Network::Bitcoin).to_string();
         assert_eq!(
             verify_message_signature(&p2pkh, msg, &sig, Network::Bitcoin),
             Some(("bip137".to_string(), "p2pkh".to_string()))
@@ -410,13 +424,19 @@ mod tests {
         let addr = Address::p2wpkh(&cpk, Network::Bitcoin).to_string();
 
         // Right sig, wrong message → recovers a different key → no match.
-        assert_eq!(verify_message_signature(&addr, "a different message", &sig, Network::Bitcoin), None);
+        assert_eq!(
+            verify_message_signature(&addr, "a different message", &sig, Network::Bitcoin),
+            None
+        );
 
         // Right sig+message, but a different address (different key) → no match.
         let other_sk = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
         let other_cpk = CompressedPublicKey(other_sk.public_key(&Secp256k1::new()));
         let other_addr = Address::p2wpkh(&other_cpk, Network::Bitcoin).to_string();
-        assert_eq!(verify_message_signature(&other_addr, msg, &sig, Network::Bitcoin), None);
+        assert_eq!(
+            verify_message_signature(&other_addr, msg, &sig, Network::Bitcoin),
+            None
+        );
 
         // Garbage signature → None, not a panic.
         assert_eq!(

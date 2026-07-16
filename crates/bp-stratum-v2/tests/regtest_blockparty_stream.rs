@@ -238,7 +238,7 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
         &mut writer,
         AnyMessage::Mining(Mining::OpenStandardMiningChannel(
             OpenStandardMiningChannel {
-                request_id: 1u32.into(),
+                request_id: 1u32,
                 user_identity: format!("{REGTEST_ADDR}.w1").try_into().unwrap(),
                 // 0 H/s → assigned `min_difficulty` (1e-18) → trivial target →
                 // every submit accepted, ~every accepted share a block candidate.
@@ -302,8 +302,7 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
             loop {
                 match read_any_message(&mut reader).await {
                     AnyMessage::Mining(Mining::SubmitSharesError(e)) => {
-                        errors
-                            .push(String::from_utf8_lossy(e.error_code.as_bytes()).to_string());
+                        errors.push(String::from_utf8_lossy(e.error_code.as_bytes()).to_string());
                     }
                     AnyMessage::Mining(Mining::SubmitSharesSuccess(_)) => successes += 1,
                     AnyMessage::Mining(Mining::NewMiningJob(j)) => {

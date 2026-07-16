@@ -122,7 +122,10 @@ mod tests {
         let acc = BestDifficultyAccumulator::new();
         acc.add(&a("bc1qalice"), 100.0, Some("x"));
         let snap = acc.drain();
-        assert_eq!(acc.drain().get(&a("bc1qalice")).unwrap().best_difficulty, 100.0);
+        assert_eq!(
+            acc.drain().get(&a("bc1qalice")).unwrap().best_difficulty,
+            100.0
+        );
         acc.confirm(&snap);
         assert!(acc.drain().is_empty(), "confirmed entry dropped");
     }
@@ -135,7 +138,10 @@ mod tests {
         acc.add(&a("bc1qalice"), 300.0, Some("y")); // new high arrives mid-flush
         acc.confirm(&snap);
         let e = acc.drain().get(&a("bc1qalice")).cloned().unwrap();
-        assert_eq!(e.best_difficulty, 300.0, "higher mid-flush value survives confirm");
+        assert_eq!(
+            e.best_difficulty, 300.0,
+            "higher mid-flush value survives confirm"
+        );
         assert_eq!(e.user_agent.as_deref(), Some("y"));
     }
 }

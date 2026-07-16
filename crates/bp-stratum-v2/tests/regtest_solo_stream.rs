@@ -239,7 +239,7 @@ async fn sv2_solo_connection_routes_to_solo_stream_and_block_accepted() {
         &mut writer,
         AnyMessage::Mining(Mining::OpenStandardMiningChannel(
             OpenStandardMiningChannel {
-                request_id: 1u32.into(),
+                request_id: 1u32,
                 user_identity: format!("{REGTEST_ADDR}.w1").try_into().unwrap(),
                 // 0 H/s → the server assigns `min_difficulty` (1e-18 here) →
                 // trivial session target → every submit is accepted, and on
@@ -309,8 +309,7 @@ async fn sv2_solo_connection_routes_to_solo_stream_and_block_accepted() {
             loop {
                 match read_any_message(&mut reader).await {
                     AnyMessage::Mining(Mining::SubmitSharesError(e)) => {
-                        errors
-                            .push(String::from_utf8_lossy(e.error_code.as_bytes()).to_string());
+                        errors.push(String::from_utf8_lossy(e.error_code.as_bytes()).to_string());
                     }
                     AnyMessage::Mining(Mining::SubmitSharesSuccess(_)) => successes += 1,
                     // Track job refresh so we don't submit against a stale id.

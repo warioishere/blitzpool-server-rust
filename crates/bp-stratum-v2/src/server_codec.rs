@@ -381,7 +381,9 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
             ExtensionsNegotiation::RequestExtensionsSuccess(
                 Sv2ReqExtSuccess {
                     request_id,
-                    supported_extensions: supported_extensions.try_into().map_err(CodecError::from_conv)?,
+                    supported_extensions: supported_extensions
+                        .try_into()
+                        .map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -394,8 +396,12 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
             ExtensionsNegotiation::RequestExtensionsError(
                 Sv2ReqExtError {
                     request_id,
-                    unsupported_extensions: unsupported_extensions.try_into().map_err(CodecError::from_conv)?,
-                    required_extensions: required_extensions.try_into().map_err(CodecError::from_conv)?,
+                    unsupported_extensions: unsupported_extensions
+                        .try_into()
+                        .map_err(CodecError::from_conv)?,
+                    required_extensions: required_extensions
+                        .try_into()
+                        .map_err(CodecError::from_conv)?,
                 }
                 .into_static(),
             ),
@@ -409,7 +415,7 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessage<'static
         } => Ok(AnyMessage::Mining(
             Mining::OpenStandardMiningChannelSuccess(
                 Sv2OpenStdChannelSuccess {
-                    request_id: request_id.into(),
+                    request_id,
                     channel_id,
                     target: target.into(),
                     extranonce_prefix: extranonce_prefix
@@ -642,8 +648,10 @@ fn merkle_path_from_seq(
 
 fn seq_from_merkle_path(
     path: Vec<[u8; 32]>,
-) -> Result<stratum_core::binary_sv2::Seq0255<'static, stratum_core::binary_sv2::U256<'static>>, CodecError>
-{
+) -> Result<
+    stratum_core::binary_sv2::Seq0255<'static, stratum_core::binary_sv2::U256<'static>>,
+    CodecError,
+> {
     let items: Vec<stratum_core::binary_sv2::U256<'static>> =
         path.into_iter().map(Into::into).collect();
     items.try_into().map_err(CodecError::from_conv)
@@ -762,7 +770,7 @@ mod tests {
     #[test]
     fn decode_open_std_channel_maps_fields() {
         let msg = AnyMessage::Mining(Mining::OpenStandardMiningChannel(Sv2OpenStdChannel {
-            request_id: 42u32.into(),
+            request_id: 42u32,
             user_identity: "miner.worker1".to_string().try_into().unwrap(),
             nominal_hash_rate: 1_000_000.0,
             max_target: [0xFFu8; 32].into(),
@@ -939,10 +947,7 @@ mod tests {
         match msg {
             AnyMessage::Mining(Mining::SetExtranoncePrefix(s)) => {
                 assert_eq!(s.channel_id, 4);
-                assert_eq!(
-                    s.extranonce_prefix.as_bytes(),
-                    &[0xDE, 0xAD, 0xBE, 0xEF]
-                );
+                assert_eq!(s.extranonce_prefix.as_bytes(), &[0xDE, 0xAD, 0xBE, 0xEF]);
             }
             _ => panic!("expected SetExtranoncePrefix"),
         }
@@ -1032,10 +1037,7 @@ mod tests {
                 assert_eq!(s.request_id, 42);
                 assert_eq!(s.channel_id, 1);
                 assert_eq!(s.target.as_bytes(), &[0xCC; 32]);
-                assert_eq!(
-                    s.extranonce_prefix.as_bytes(),
-                    &[0x01, 0x02, 0x03, 0x04]
-                );
+                assert_eq!(s.extranonce_prefix.as_bytes(), &[0x01, 0x02, 0x03, 0x04]);
             }
             _ => panic!("expected OpenStandardMiningChannelSuccess"),
         }

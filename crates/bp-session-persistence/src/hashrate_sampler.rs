@@ -218,7 +218,10 @@ pub(crate) async fn run_sample_loop(
 ) {
     if reconcile_on_boot {
         match reset_all_client_hashrate(&pool).await {
-            Ok(n) => debug!(cleared = n, "hashrate sampler: zeroed stale hashRate on boot"),
+            Ok(n) => debug!(
+                cleared = n,
+                "hashrate sampler: zeroed stale hashRate on boot"
+            ),
             Err(e) => warn!(error = %e, "hashrate sampler: boot hashRate reset failed"),
         }
     }

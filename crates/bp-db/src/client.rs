@@ -971,4 +971,3 @@ pub async fn reset_all_client_hashrate(pool: &PgPool) -> Result<u64, DbError> {
     .map_err(DbError::from)?;
     Ok(result.rows_affected())
 }
-

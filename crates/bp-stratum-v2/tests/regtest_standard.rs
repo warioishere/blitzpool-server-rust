@@ -191,7 +191,7 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
     // Send OpenStandardMiningChannel.
     let open = AnyMessage::Mining(Mining::OpenStandardMiningChannel(
         OpenStandardMiningChannel {
-            request_id: 1u32.into(),
+            request_id: 1u32,
             user_identity: format!("{REGTEST_ADDR}.worker1").try_into().unwrap(),
             nominal_hash_rate: 1_000_000.0,
             max_target: [0xFFu8; 32].into(),

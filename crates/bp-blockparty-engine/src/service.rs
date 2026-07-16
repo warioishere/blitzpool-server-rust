@@ -370,7 +370,9 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         {
             return Err(BlockpartyServiceError::EmailNotVerified);
         }
-        let admin_email = admin_email.map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+        let admin_email = admin_email
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
 
         // Bidirectional mode-collision — reuse the PplnsGroup cache.
         if self.pplns_cache.get(&admin_addr).await.is_some() {
@@ -625,14 +627,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
 
         // Insert unconfirmed with a 0 % placeholder (the admin sets the real split).
         match bp_db::insert_blockparty_member(
-            &self.pool,
-            group.id,
-            &address,
-            &email,
-            0,
-            "member",
-            None,
-            now,
+            &self.pool, group.id, &address, &email, 0, "member", None, now,
         )
         .await
         {
@@ -1208,4 +1203,3 @@ fn assert_editable(group: &BlockpartyGroupRow) -> Result<(), BlockpartyServiceEr
     }
     Ok(())
 }
-

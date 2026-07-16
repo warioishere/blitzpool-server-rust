@@ -440,7 +440,7 @@ mod tests {
         assert_eq!(r[0].sats, 75_000_000); // floor(1.5% × 5e9)
         assert_eq!(r[1].address, "bc1qminer");
         assert_eq!(r[1].sats, TEST_REWARD - 75_000_000); // miner takes the remainder
-        // The two outputs sum to exactly the reward.
+                                                         // The two outputs sum to exactly the reward.
         assert_eq!(r[0].sats + r[1].sats, TEST_REWARD);
     }
 

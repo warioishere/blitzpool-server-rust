@@ -704,13 +704,11 @@ async fn bulk_set_client_hashrate_overwrites_and_skips_deleted() {
             .expect("seed hashRate");
     }
     // Soft-delete one of them — the sampler must not resurrect its value.
-    sqlx::query(
-        r#"UPDATE client_entity SET "deletedAt" = 1 WHERE "sessionId" = $1"#,
-    )
-    .bind(DELETED)
-    .execute(&pool)
-    .await
-    .expect("soft-delete");
+    sqlx::query(r#"UPDATE client_entity SET "deletedAt" = 1 WHERE "sessionId" = $1"#)
+        .bind(DELETED)
+        .execute(&pool)
+        .await
+        .expect("soft-delete");
 
     // One live write (a fresh estimate) + one 0 (a faded/idle session).
     let addresses = vec!["test_hr_addr".to_string(); 2];
@@ -718,37 +716,30 @@ async fn bulk_set_client_hashrate_overwrites_and_skips_deleted() {
     let session_ids = vec![ACTIVE.to_string(), DELETED.to_string()];
     let hash_rates = vec![9.0e12_f64, 0.0_f64];
 
-    let affected = bulk_set_client_hashrate(
-        &pool,
-        &addresses,
-        &client_names,
-        &session_ids,
-        &hash_rates,
-    )
-    .await
-    .expect("bulk set hashrate");
+    let affected =
+        bulk_set_client_hashrate(&pool, &addresses, &client_names, &session_ids, &hash_rates)
+            .await
+            .expect("bulk set hashrate");
     assert_eq!(affected, 1, "only the non-deleted row must update");
 
-    let active_hr: f64 = sqlx::query_scalar(
-        r#"SELECT "hashRate" FROM client_entity WHERE "sessionId" = $1"#,
-    )
-    .bind(ACTIVE)
-    .fetch_one(&pool)
-    .await
-    .expect("read active");
+    let active_hr: f64 =
+        sqlx::query_scalar(r#"SELECT "hashRate" FROM client_entity WHERE "sessionId" = $1"#)
+            .bind(ACTIVE)
+            .fetch_one(&pool)
+            .await
+            .expect("read active");
     assert!(
         (active_hr - 9.0e12).abs() < 1.0,
         "active row overwritten with the new estimate, got {active_hr}"
     );
 
     // The soft-deleted row keeps its stale value — the guard skipped it.
-    let deleted_hr: f64 = sqlx::query_scalar(
-        r#"SELECT "hashRate" FROM client_entity WHERE "sessionId" = $1"#,
-    )
-    .bind(DELETED)
-    .fetch_one(&pool)
-    .await
-    .expect("read deleted");
+    let deleted_hr: f64 =
+        sqlx::query_scalar(r#"SELECT "hashRate" FROM client_entity WHERE "sessionId" = $1"#)
+            .bind(DELETED)
+            .fetch_one(&pool)
+            .await
+            .expect("read deleted");
     assert!(
         (deleted_hr - 5.0e11).abs() < 1.0,
         "soft-deleted row untouched (excluded from active SUM anyway), got {deleted_hr}"
@@ -764,13 +755,12 @@ async fn bulk_set_client_hashrate_overwrites_and_skips_deleted() {
     )
     .await
     .expect("zero write");
-    let zeroed: f64 = sqlx::query_scalar(
-        r#"SELECT "hashRate" FROM client_entity WHERE "sessionId" = $1"#,
-    )
-    .bind(ACTIVE)
-    .fetch_one(&pool)
-    .await
-    .expect("read zeroed");
+    let zeroed: f64 =
+        sqlx::query_scalar(r#"SELECT "hashRate" FROM client_entity WHERE "sessionId" = $1"#)
+            .bind(ACTIVE)
+            .fetch_one(&pool)
+            .await
+            .expect("read zeroed");
     assert_eq!(zeroed, 0.0, "idle session self-zeroes");
 
     for sid in [ACTIVE, DELETED] {
@@ -830,7 +820,10 @@ async fn reset_all_client_hashrate_zeroes_active_only() {
         .expect("soft-delete");
 
     let cleared = reset_all_client_hashrate(&pool).await.expect("reset");
-    assert!(cleared >= 2, "at least our two active non-zero rows are cleared, got {cleared}");
+    assert!(
+        cleared >= 2,
+        "at least our two active non-zero rows are cleared, got {cleared}"
+    );
 
     for sid in [ACTIVE_A, ACTIVE_B] {
         let hr: f64 =
@@ -850,9 +843,7 @@ async fn reset_all_client_hashrate_zeroes_active_only() {
     assert!((del_hr - 7.0e12).abs() < 1.0, "soft-deleted row untouched");
 
     // Idempotent + the `<> 0` guard: a second call clears nothing.
-    let again = reset_all_client_hashrate(&pool)
-        .await
-        .expect("reset again");
+    let again = reset_all_client_hashrate(&pool).await.expect("reset again");
     assert_eq!(again, 0, "no non-zero active rows left to clear");
 
     for sid in [ACTIVE_A, ACTIVE_B, DELETED] {

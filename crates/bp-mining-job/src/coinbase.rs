@@ -808,7 +808,10 @@ mod tests {
         ];
         let outs = build_payout_outputs(Network::Bitcoin, &payouts, reward).unwrap();
         assert_eq!(outs[0].0, 4_750_092);
-        assert_eq!(outs[1].0, 50_000_000, "finder bonus placed verbatim, not floored");
+        assert_eq!(
+            outs[1].0, 50_000_000,
+            "finder bonus placed verbatim, not floored"
+        );
         assert_eq!(outs[2].0, reward - 4_750_092 - 50_000_000);
         let total: u64 = outs.iter().map(|(amt, _)| *amt).sum();
         assert_eq!(total, reward, "coinbase sums to exactly the reward");
@@ -821,7 +824,11 @@ mod tests {
         let template = template_with_height(100);
         let percent = 100.0 / 3.0;
         let payouts = vec![
-            PayoutEntry::from_percent("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", percent, 5_000_000_000),
+            PayoutEntry::from_percent(
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                percent,
+                5_000_000_000,
+            ),
             PayoutEntry::from_percent("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", percent, 5_000_000_000),
             PayoutEntry::from_percent("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", percent, 5_000_000_000),
         ];
@@ -1107,7 +1114,11 @@ mod tests {
         let (prefix, outputs) = tdp_template_for([0u8; 32]);
         let percent = 100.0 / 3.0;
         let payouts = vec![
-            PayoutEntry::from_percent("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", percent, 5_000_000_000),
+            PayoutEntry::from_percent(
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                percent,
+                5_000_000_000,
+            ),
             PayoutEntry::from_percent("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", percent, 5_000_000_000),
             PayoutEntry::from_percent("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", percent, 5_000_000_000),
         ];

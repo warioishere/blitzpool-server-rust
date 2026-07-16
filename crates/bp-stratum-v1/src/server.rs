@@ -1746,10 +1746,7 @@ mod tests {
             en1_a.starts_with("01") && en1_b.starts_with("01"),
             "both extranonce1 must be from worker 1: {en1_a} / {en1_b}"
         );
-        assert_ne!(
-            en1_a, en1_b,
-            "two connections must never share extranonce1"
-        );
+        assert_ne!(en1_a, en1_b, "two connections must never share extranonce1");
 
         server.shutdown().await;
     }

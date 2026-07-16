@@ -1566,10 +1566,7 @@ pub fn apply_vardiff_check<C: Clock>(state: &mut MiningSessionState<C>) -> Handl
                 channel_id: channel.channel_id,
                 maximum_target: difficulty_to_target(clamped).to_le_bytes(),
             });
-            outcome.push_event(SessionEvent::DifficultyChanged {
-                old,
-                new: clamped,
-            });
+            outcome.push_event(SessionEvent::DifficultyChanged { old, new: clamped });
         }
     }
     outcome
@@ -2513,9 +2510,9 @@ fn encode_varint(n: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use crate::mining::jobs::ExtendedJob;
     use bp_vardiff::TestClock;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     /// Test shim mirroring the handler's inline projection: builds the
@@ -3724,10 +3721,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            targets.contains(&fast),
-            "fast channel must get a SetTarget"
-        );
+        assert!(targets.contains(&fast), "fast channel must get a SetTarget");
     }
 
     // ── handle_request_extensions ──────────────────────────────────

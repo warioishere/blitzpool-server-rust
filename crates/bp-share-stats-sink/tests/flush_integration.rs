@@ -266,9 +266,12 @@ async fn flush_once_folds_best_difficulty_via_greatest() {
 
     // No row yet: the flush inserts it at the window max.
     let accs = Arc::new(Accumulators::default());
-    accs.best_difficulty.add(&addr(&address), 100.0, Some("bitaxe"));
-    accs.best_difficulty.add(&addr(&address), 623_932_928.0, Some("octaxe")); // window max
-    accs.best_difficulty.add(&addr(&address), 40.0, Some("worker")); // lower — ignored
+    accs.best_difficulty
+        .add(&addr(&address), 100.0, Some("bitaxe"));
+    accs.best_difficulty
+        .add(&addr(&address), 623_932_928.0, Some("octaxe")); // window max
+    accs.best_difficulty
+        .add(&addr(&address), 40.0, Some("worker")); // lower — ignored
     flush_once(&pool, &accs, &health, 1000).await;
 
     let (best, ua): (f64, Option<String>) = {
@@ -280,22 +283,31 @@ async fn flush_once_folds_best_difficulty_via_greatest() {
         .fetch_one(&pool)
         .await
         .expect("row inserted by flush");
-        (row.get("bestDifficulty"), row.get("bestDifficultyUserAgent"))
+        (
+            row.get("bestDifficulty"),
+            row.get("bestDifficultyUserAgent"),
+        )
     };
     assert_eq!(best, 623_932_928.0, "flush persisted the window max");
     assert_eq!(ua.as_deref(), Some("octaxe"));
 
     // A later window with a LOWER max leaves the stored all-time best alone.
     let accs2 = Arc::new(Accumulators::default());
-    accs2.best_difficulty.add(&addr(&address), 1_000.0, Some("bitaxe"));
+    accs2
+        .best_difficulty
+        .add(&addr(&address), 1_000.0, Some("bitaxe"));
     flush_once(&pool, &accs2, &health, 1000).await;
-    let best_after: f64 =
-        sqlx::query_scalar(r#"SELECT "bestDifficulty" FROM address_settings_entity WHERE address = $1"#)
-            .bind(&address)
-            .fetch_one(&pool)
-            .await
-            .expect("read");
-    assert_eq!(best_after, 623_932_928.0, "GREATEST keeps the all-time high");
+    let best_after: f64 = sqlx::query_scalar(
+        r#"SELECT "bestDifficulty" FROM address_settings_entity WHERE address = $1"#,
+    )
+    .bind(&address)
+    .fetch_one(&pool)
+    .await
+    .expect("read");
+    assert_eq!(
+        best_after, 623_932_928.0,
+        "GREATEST keeps the all-time high"
+    );
 
     let _ = sqlx::query(r#"DELETE FROM address_settings_entity WHERE address LIKE $1"#)
         .bind(format!("{prefix}%"))

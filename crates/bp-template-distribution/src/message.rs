@@ -223,7 +223,11 @@ impl TemplateUpdate {
                 Self::RequestTransactionDataSuccess(RequestTransactionDataSuccess {
                     template_id: s.template_id,
                     excess_data: s.excess_data.as_bytes().to_vec(),
-                    transaction_list: s.transaction_list.iter_bytes().map(|t| t.to_vec()).collect(),
+                    transaction_list: s
+                        .transaction_list
+                        .iter_bytes()
+                        .map(|t| t.to_vec())
+                        .collect(),
                 }),
             ),
             TemplateDistribution::RequestTransactionDataError(e) => Some(

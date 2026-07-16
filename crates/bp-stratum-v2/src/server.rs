@@ -1760,7 +1760,8 @@ mod tests {
         )
         .await;
         assert_eq!(
-            recording.accepted.lock().unwrap()[0].channel_count, 1,
+            recording.accepted.lock().unwrap()[0].channel_count,
+            1,
             "a single-channel connection reports 1"
         );
 
@@ -1782,7 +1783,8 @@ mod tests {
         )
         .await;
         assert_eq!(
-            recording.accepted.lock().unwrap()[0].channel_count, 3,
+            recording.accepted.lock().unwrap()[0].channel_count,
+            3,
             "a bundled rig reports its open-channel count"
         );
     }
@@ -2088,7 +2090,11 @@ mod tests {
             );
             let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
         }
-        assert_eq!(alloc.lock().unwrap().allocated_count(), 2, "two member prefixes allocated");
+        assert_eq!(
+            alloc.lock().unwrap().allocated_count(),
+            2,
+            "two member prefixes allocated"
+        );
         let gid = s
             .groups
             .group_for_channel(s.primary_channel.unwrap())

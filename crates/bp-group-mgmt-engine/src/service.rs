@@ -264,7 +264,8 @@ impl<H: GroupServiceHooks> GroupService<H> {
             // The creator is added as the sole member just below, so the group
             // starts active whenever a single member already meets the floor
             // (MIN_MEMBERS_ACTIVE == 1) — it can mine immediately.
-            /* active = */ is_active(1),
+            /* active = */
+            is_active(1),
             /* is_public = */ false,
             mode.as_str(),
             now,

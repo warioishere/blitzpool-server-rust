@@ -30,10 +30,10 @@ use axum::{
 use bp_common::{AddressId, Sats};
 use bp_db::PatchField;
 use bp_group_mgmt::group::{PayoutMode, RoundResetPreset};
-use bp_group_solo_engine::reader::WindowTimeline;
 use bp_group_mgmt_engine::{
     EmailHooks, GroupService, GroupServiceHooks, OpenInviteTtl, UpdateRoundResetSettings,
 };
+use bp_group_solo_engine::reader::WindowTimeline;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -1268,8 +1268,7 @@ where
             let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
             let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
             let per_addr_hashrate = per_address_hashrate(&s.pool, &addrs).await?;
-            let addr_strings: Vec<String> =
-                addrs.iter().map(|a| a.as_str().to_string()).collect();
+            let addr_strings: Vec<String> = addrs.iter().map(|a| a.as_str().to_string()).collect();
             let labels = build_member_labels(&addr_strings);
             // Batch the signature-ownership lookup (admin-only, for the
             // verified-via badge) into one query rather than one per member —
@@ -1333,8 +1332,7 @@ where
                     best_difficulty,
                     start_time: start_time.map(crate::time_range::format_slot_label),
                     last_seen: last_seen.map(crate::time_range::format_slot_label),
-                    last_accepted_share_at: last_active
-                        .map(crate::time_range::format_slot_label),
+                    last_accepted_share_at: last_active.map(crate::time_range::format_slot_label),
                     email: email_out,
                     verified_via,
                 });
@@ -1436,8 +1434,7 @@ where
             let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
             let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
             let per_addr = per_address_hashrate(&s.pool, &addrs).await?;
-            let addr_strings: Vec<String> =
-                addrs.iter().map(|a| a.as_str().to_string()).collect();
+            let addr_strings: Vec<String> = addrs.iter().map(|a| a.as_str().to_string()).collect();
             let labels = build_member_labels(&addr_strings);
             Ok(HashrateResponse {
                 group_id: id,

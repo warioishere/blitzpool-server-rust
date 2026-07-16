@@ -16,9 +16,7 @@ mod pool_rejected;
 mod pool_shares;
 mod share_totals;
 
-pub use best_difficulty::{
-    BestDifficultyAccumulator, BestDifficultyEntry, BestDifficultySnapshot,
-};
+pub use best_difficulty::{BestDifficultyAccumulator, BestDifficultyEntry, BestDifficultySnapshot};
 pub use client_rejected::{ClientRejectedAccumulator, ClientRejectedKey, ClientRejectedSnapshot};
 pub use client_statistics::{
     ClientStatisticsAccumulator, ClientStatisticsKey, ClientStatisticsRecord,

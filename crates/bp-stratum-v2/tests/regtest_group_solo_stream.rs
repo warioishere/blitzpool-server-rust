@@ -320,7 +320,7 @@ async fn run_scenario(
         &mut writer,
         AnyMessage::Mining(Mining::OpenStandardMiningChannel(
             OpenStandardMiningChannel {
-                request_id: 1u32.into(),
+                request_id: 1u32,
                 user_identity: format!("{REGTEST_ADDR}.w1").try_into().unwrap(),
                 // 0 H/s → assigned `min_difficulty` (1e-18) → trivial target →
                 // every submit accepted, ~every accepted share a block candidate.

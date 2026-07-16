@@ -122,8 +122,7 @@ impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
             .await?
             .filter(|b| b.verified_at.is_some())
             .map(|b| b.email);
-        if email.is_none()
-            && !bp_db::is_address_ownership_verified(&self.pool, &normalized).await?
+        if email.is_none() && !bp_db::is_address_ownership_verified(&self.pool, &normalized).await?
         {
             return Err(JoinRequestServiceError::EmailNotVerified);
         }

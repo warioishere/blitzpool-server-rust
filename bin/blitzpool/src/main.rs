@@ -458,15 +458,14 @@ async fn main() -> ExitCode {
         }
     };
 
-    let blockparty =
-        match blockparty_service::spawn(&cfg, &handles, &group_service).await {
-            Ok(bp) => bp,
-            Err(err) => {
-                tracing::error!(%err, "blockparty spawn failed");
-                eprintln!("blitzpool: {err}");
-                return ExitCode::from(11);
-            }
-        };
+    let blockparty = match blockparty_service::spawn(&cfg, &handles, &group_service).await {
+        Ok(bp) => bp,
+        Err(err) => {
+            tracing::error!(%err, "blockparty spawn failed");
+            eprintln!("blitzpool: {err}");
+            return ExitCode::from(11);
+        }
+    };
     if let Some(ref bp) = blockparty {
         // Hook the trait object into EngineHandles so the
         // ProductionPayoutResolver constructed by stratum::spawn picks
@@ -632,7 +631,9 @@ async fn main() -> ExitCode {
     // so the SCAN/DUMP burst never touches the share hot-path. Restore is never
     // automatic — see `--restore-redis-state`.
     let _redis_state_backup = if cfg.has_role(Role::Payout) {
-        let backup_redis = handles.dedicated_redis(&cfg.redis, "redis-state-backup").await;
+        let backup_redis = handles
+            .dedicated_redis(&cfg.redis, "redis-state-backup")
+            .await;
         Some(crate::redis_backup::spawn_backup_task(
             backup_redis,
             handles.db.pool().clone(),
@@ -682,7 +683,9 @@ async fn main() -> ExitCode {
             None,
             Some(handles.redis.clone()),
         );
-        let bf_redis = handles.dedicated_redis(&cfg.redis, "block-found-ledger").await;
+        let bf_redis = handles
+            .dedicated_redis(&cfg.redis, "block-found-ledger")
+            .await;
         Some(crate::block_found_consumer::spawn(
             bf_redis,
             applier,
@@ -698,8 +701,9 @@ async fn main() -> ExitCode {
     let block_found_notify_consumer = if consumes_notify_streams {
         match dispatcher.clone() {
             Some(d) => {
-                let bf_notify_redis =
-                    handles.dedicated_redis(&cfg.redis, "block-found-notify").await;
+                let bf_notify_redis = handles
+                    .dedicated_redis(&cfg.redis, "block-found-notify")
+                    .await;
                 let applier =
                     crate::block_sink::BlockFoundApplier::new(None, None, None, Some(d), None);
                 Some(crate::block_found_consumer::spawn(

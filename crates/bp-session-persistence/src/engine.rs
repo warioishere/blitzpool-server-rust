@@ -23,9 +23,7 @@ use tracing::warn;
 use crate::config::SessionPersistenceConfig;
 use crate::error::SessionPersistenceError;
 use crate::hashrate_sampler::{run_sample_loop, HashrateSampler};
-use crate::hooks::{
-    ClientDifficultyStatisticsSink, ClientRowTouchSink, SessionPersistenceHook,
-};
+use crate::hooks::{ClientDifficultyStatisticsSink, ClientRowTouchSink, SessionPersistenceHook};
 use crate::touch_buffer::{run_flush_loop, TouchBuffer};
 
 pub struct SessionPersistenceEngine {

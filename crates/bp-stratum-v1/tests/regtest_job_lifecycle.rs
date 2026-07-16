@@ -110,7 +110,9 @@ async fn sv1_job_lifecycle_stale_and_pruning_against_regtest() {
     let mut reader = BufReader::new(read);
 
     write
-        .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"lifecycle-miner/1.0\"]}\n")
+        .write_all(
+            b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"lifecycle-miner/1.0\"]}\n",
+        )
         .await
         .expect("write subscribe");
     let _ = read_frame(&mut reader).await;
@@ -157,7 +159,10 @@ async fn sv1_job_lifecycle_stale_and_pruning_against_regtest() {
         "old-tip share past grace must be rejected: {resp}"
     );
     let err = resp.get("error").expect("stale reject carries an error");
-    assert!(!err.is_null(), "stale reject error must be non-null: {resp}");
+    assert!(
+        !err.is_null(),
+        "stale reject error must be non-null: {resp}"
+    );
     assert_eq!(
         err.get(0).and_then(|v| v.as_i64()),
         Some(21),
@@ -272,7 +277,10 @@ async fn submit(
     let line = format!(
         "{{\"id\":{id},\"method\":\"mining.submit\",\"params\":[\"{REGTEST_ADDR}.x\",\"{job_id}\",\"0000000000000000\",\"{ntime}\",\"{nonce}\",\"00000000\"]}}\n"
     );
-    write.write_all(line.as_bytes()).await.expect("write submit");
+    write
+        .write_all(line.as_bytes())
+        .await
+        .expect("write submit");
     let mut resp = None;
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

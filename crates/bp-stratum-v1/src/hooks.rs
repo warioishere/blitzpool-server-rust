@@ -404,11 +404,7 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl PayoutResolver for RecordingHooks {
-        async fn resolve_payouts(
-            &self,
-            miner_address: &str,
-            reward_sats: u64,
-        ) -> Vec<PayoutEntry> {
+        async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> Vec<PayoutEntry> {
             vec![PayoutEntry {
                 address: miner_address.to_string(),
                 sats: reward_sats,

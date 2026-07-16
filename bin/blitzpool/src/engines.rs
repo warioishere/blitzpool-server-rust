@@ -170,8 +170,7 @@ pub(crate) async fn spawn(
     // Only the Front role feeds + writes hashRate, so only it reconciles
     // stale hashRate on boot (see run_sample_loop); a non-writing role
     // zeroing the column would wipe the Front's live values.
-    let session_persistence =
-        spawn_session_persistence(handles, cfg.has_role(Role::Front)).await?;
+    let session_persistence = spawn_session_persistence(handles, cfg.has_role(Role::Front)).await?;
 
     // Only the front builds the Stratum fan-out sinks, and it always produces
     // to the Redis streams (the Satellite consumes them). A pure back / api
@@ -871,7 +870,10 @@ mod tests {
 
         // The cache-sync reconcile flips a live solo miner to group-solo so its
         // running connection's shares route to the group from the next share.
-        gate.override_mode("bc1qsolo", MiningModeResult::group_solo(group_id.to_string()));
+        gate.override_mode(
+            "bc1qsolo",
+            MiningModeResult::group_solo(group_id.to_string()),
+        );
         assert_eq!(mode_of(&gate, "bc1qsolo"), MiningMode::GroupSolo);
         assert_eq!(gate.group_for_address("bc1qsolo"), Some(group_id));
 
@@ -881,7 +883,10 @@ mod tests {
         assert_eq!(mode_of(&gate, "bc1qsolo"), MiningMode::Solo);
 
         // Override on a disconnected (absent) address is a no-op — never resurrects.
-        gate.override_mode("bc1qabsent", MiningModeResult::group_solo(group_id.to_string()));
+        gate.override_mode(
+            "bc1qabsent",
+            MiningModeResult::group_solo(group_id.to_string()),
+        );
         assert_eq!(mode_of(&gate, "bc1qabsent"), MiningMode::Solo);
     }
 
