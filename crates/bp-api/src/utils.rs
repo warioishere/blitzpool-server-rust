@@ -4,6 +4,18 @@
 //! share the same wire-shape transforms (email masking, etc.) without
 //! drifting per-file.
 
+use bp_common::{AddressId, InvalidAddressError};
+
+/// Normalize a user-supplied Bitcoin address and parse it into an [`AddressId`].
+///
+/// The single source of truth for the "normalize (trim + lowercase bech32) →
+/// validate shape" step every address-taking endpoint runs, so the controllers
+/// don't each re-spell `AddressId::new(normalize_btc_address(x))` (and can't
+/// drift on whether they normalize first).
+pub fn normalized_address_id(raw: &str) -> Result<AddressId, InvalidAddressError> {
+    AddressId::new(bp_mining_job::normalize_btc_address(raw))
+}
+
 /// Mask an email for over-the-wire exposure.
 ///
 /// Format: `<first-char-local>***@<first-char-SLD>***<tld-and-below>`.
@@ -81,5 +93,17 @@ mod tests {
     #[test]
     fn domain_without_dot() {
         assert_eq!(mask_email("alice@nodomain"), "a***@***");
+    }
+
+    #[test]
+    fn normalized_address_id_trims_and_lowercases_bech32() {
+        let a = normalized_address_id("  BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4  ")
+            .expect("valid bech32");
+        assert_eq!(a.as_str(), "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+    }
+
+    #[test]
+    fn normalized_address_id_rejects_empty() {
+        assert!(normalized_address_id("   ").is_err());
     }
 }
