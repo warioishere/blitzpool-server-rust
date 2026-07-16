@@ -836,8 +836,7 @@ mod tests {
             let active = asm.current().expect("active template");
             let job = job_from_active(active);
             let bytes = build_notify_frame(active, &job, "1", true);
-            let v: serde_json::Value =
-                serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
             v["params"].as_array().unwrap()[1]
                 .as_str()
                 .unwrap()
