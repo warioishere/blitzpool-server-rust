@@ -40,7 +40,7 @@
 
 use bp_jobs_lifecycle::JobClassification;
 use bp_mining_job::{build_block_header, merkle_root_from_coinbase};
-use bp_share::{calculate_difficulty, sha256d, Difficulty, Target};
+use bp_share::{calculate_difficulty, sha256d_from_parts, Difficulty, Target};
 use smallvec::SmallVec;
 
 /// Inline storage for the per-share `extranonce` buffer. Extended-channel
@@ -553,19 +553,20 @@ pub fn validate_submit_extended(
     // at share-build time). Validator must mirror miner's reconstruction
     // byte-for-byte or the resulting hash diverges → 100% diff-too-low
     // rejections.
-    let mut coinbase = Vec::with_capacity(
-        ext_job.coinbase_prefix.len()
-            + view.extranonce_prefix.len()
-            + submission.extranonce.len()
-            + ext_job.coinbase_suffix.len(),
-    );
-    coinbase.extend_from_slice(&ext_job.coinbase_prefix);
-    coinbase.extend_from_slice(view.extranonce_prefix);
-    coinbase.extend_from_slice(&submission.extranonce);
-    coinbase.extend_from_slice(&ext_job.coinbase_suffix);
+    let coinbase_parts: [&[u8]; 4] = [
+        &ext_job.coinbase_prefix[..],
+        view.extranonce_prefix,
+        &submission.extranonce[..],
+        &ext_job.coinbase_suffix[..],
+    ];
 
-    // 2. Coinbase txid = sha256d(coinbase).
-    let coinbase_txid = sha256d(&coinbase);
+    // 2. Coinbase txid = sha256d(prefix + extranonce_prefix + extranonce +
+    //    suffix). Streamed into the hasher so the accepted-share hot path never
+    //    allocates the full coinbase `Vec` — it's only materialised (via
+    //    `coinbase_parts.concat()`) in the two cold branches below that need the
+    //    bytes: the difficulty-too-low reject diagnostics and the (rare)
+    //    block-candidate witness coinbase.
+    let coinbase_txid = sha256d_from_parts(&coinbase_parts);
 
     // 3. Walk the merkle path to derive the root.
     let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &ext_job.merkle_path);
@@ -617,7 +618,7 @@ pub fn validate_submit_extended(
             s
         };
         let hash_prefix = to_hex(&pow.submission_hash[..8]);
-        let coinbase_hex = to_hex(&coinbase);
+        let coinbase_hex = to_hex(&coinbase_parts.concat());
         let merkle_root_hex = to_hex(&merkle_root);
         let header_hex = to_hex(&header);
         let prefix_hex = to_hex(&ext_job.coinbase_prefix);
@@ -657,7 +658,7 @@ pub fn validate_submit_extended(
     // path (every non-candidate share goes through the validator,
     // ~95+% of them).
     let witness_coinbase = if is_block_candidate {
-        assemble_witness_coinbase(&coinbase)
+        assemble_witness_coinbase(&coinbase_parts.concat())
     } else {
         Vec::new()
     };

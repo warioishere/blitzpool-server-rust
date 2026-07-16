@@ -8,22 +8,24 @@
 //!
 //! Two figures per case:
 //!   - **allocations per call** — the leanness metric. A validated share
-//!     now costs 2 allocs: the coinbase buffer (one `Vec`) and the
-//!     `Box<ShareAccept>`. The merkle walk, the worker-name resolver and —
+//!     now costs 1 alloc: the `Box<ShareAccept>`. The coinbase txid is
+//!     streamed straight into the hasher (`sha256d_from_parts`, no coinbase
+//!     `Vec`), the merkle walk and worker-name resolver are zero-alloc, and —
 //!     since C1 — `bp_share::calculate_difficulty` (now `f64`, was
-//!     `num-bigint`) are zero-alloc. The separately-measured `ext_job
-//!     clone` is the per-share `ExtendedJob` copy the extended handler used
-//!     to make to release the channel-map borrow — since removed via
-//!     disjoint-field borrows (kept here as a baseline).
+//!     `num-bigint`) is too. The separately-measured `ext_job clone` is the
+//!     per-share `ExtendedJob` copy the extended handler used to make to
+//!     release the channel-map borrow — since removed via disjoint-field
+//!     borrows (kept here as a baseline).
 //!   - **ns/op** (criterion) — wall-clock, dominated by the per-merkle-level
 //!     SHA-256d (so it scales with merkle depth) plus the coinbase + header
 //!     double-hashes.
 //!
 //! Findings: the SV2 share path is hash-bound, not parse-bound (unlike
-//! SV1). Two allocation sources were removed: the ext_job clone (B,
-//! 3 allocs/share, disjoint-field borrows) and the num-bigint difficulty
-//! calc (C1, ~6 allocs/share, now f64 in `bp_share`). A validated share
-//! is down to 2 allocs (coinbase buffer + Box<ShareAccept>); the hashing
+//! SV1). Three allocation sources were removed: the ext_job clone (B,
+//! 3 allocs/share, disjoint-field borrows), the num-bigint difficulty
+//! calc (C1, ~6 allocs/share, now f64 in `bp_share`), and the coinbase
+//! buffer (streamed via `sha256d_from_parts`, no per-share `Vec`). A
+//! validated share is down to 1 alloc (`Box<ShareAccept>`); the hashing
 //! itself is irreducible verifier work.
 //!
 //! Run: `cargo bench -p bp-stratum-v2 --bench submit`
@@ -226,10 +228,8 @@ fn report_allocs() {
         "  {:>3} allocs     └─ of which: bp_share::calculate_difficulty   ← C1: now f64 (was 6, num-bigint)",
         allocs_for_difficulty_calc()
     );
-    println!(
-        "                   (the remaining allocs are the coinbase buffer + Box<ShareAccept>;"
-    );
-    println!("                    merkle walk + worker-name resolver are zero-alloc)");
+    println!("                   (the remaining alloc is the Box<ShareAccept>; the coinbase txid");
+    println!("                    is streamed, merkle walk + worker-name resolver are zero-alloc)");
     println!("======================================================\n");
 }
 

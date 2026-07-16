@@ -180,6 +180,22 @@ pub fn sha256d(data: &[u8]) -> [u8; 32] {
     second.into()
 }
 
+/// SHA256d over the concatenation of `parts`, streamed straight into the
+/// hasher so the caller never allocates a joined buffer. Bit-identical to
+/// `sha256d(&parts.concat())` — SHA-256 is a streaming hash, so feeding the
+/// pieces one after another yields the same digest as hashing the whole.
+///
+/// Used on the per-share hot path to hash `coinbase_prefix + extranonce +
+/// suffix` without the per-share `Vec` a concatenation would need.
+pub fn sha256d_from_parts(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    let first = hasher.finalize();
+    Sha256::digest(first).into()
+}
+
 // ============================================================================
 // Share validation
 // ============================================================================
@@ -369,6 +385,26 @@ mod tests {
         const SCALE: u64 = 1_000_000_000_000_000;
         let scaled = (&*TRUE_DIFF_ONE * SCALE) / divisor;
         scaled.to_f64().unwrap_or(f64::MAX) / 1e15
+    }
+
+    #[test]
+    fn sha256d_from_parts_matches_concatenation() {
+        // Streaming the pieces into the hasher must be bit-identical to hashing
+        // the joined buffer — the invariant the per-share hot path relies on.
+        let parts: [&[u8]; 4] = [
+            b"coinbase-prefix",
+            &[0x01, 0x02, 0x03, 0x04],
+            &[0xaa; 8],
+            b"suffix-bytes",
+        ];
+        let mut joined = Vec::new();
+        for p in parts {
+            joined.extend_from_slice(p);
+        }
+        assert_eq!(sha256d_from_parts(&parts), sha256d(&joined));
+        // Trivial single-part and empty cases hold too.
+        assert_eq!(sha256d_from_parts(&[b"x"]), sha256d(b"x"));
+        assert_eq!(sha256d_from_parts(&[]), sha256d(&[]));
     }
 
     #[test]
