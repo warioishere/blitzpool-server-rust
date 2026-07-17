@@ -563,6 +563,15 @@ pub struct MiningSessionState<C: Clock> {
     /// gates the `🎯 Extended share difficulty` trace in the submit
     /// validator. Defaults to `false`.
     pub share_logs: bool,
+
+    /// `true` once a customer extranonce override was found for this
+    /// connection's `(address, worker)` at channel-open. Gates the
+    /// per-template re-check on the broadcast hot path: a connection without
+    /// an override (every connection but the paying customer's) leaves this
+    /// `false`, so the broadcast arm skips the override logic with a single
+    /// bool test — no cache lookup, no lock, no behaviour change. See
+    /// `crate::server::custom_extranonce_broadcast_frames`.
+    pub uses_custom_extranonce: bool,
 }
 
 /// Per-port config slice passed at construction. The full
@@ -622,6 +631,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             target_shares_per_minute: port.target_shares_per_minute,
             vardiff_interval_ms: port.vardiff_interval_ms,
             share_logs: false,
+            uses_custom_extranonce: false,
         }
     }
 

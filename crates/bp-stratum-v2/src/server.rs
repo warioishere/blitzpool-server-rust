@@ -960,13 +960,25 @@ async fn run_mining_connection(
                         continue;
                     }
                 };
-                let outcome = apply_template_broadcast(
+                // Live custom-extranonce change (stage 2): for a connection with
+                // an override, swap any channel whose value changed and collect
+                // the SetExtranoncePrefix frames. Empty (one bool test) for every
+                // other connection — its jobs below are byte-for-byte unchanged.
+                // Runs BEFORE the job build so the new job pins the new prefix.
+                let mut en_frames = custom_extranonce_broadcast_frames(&mut state, &hooks);
+                let mut outcome = apply_template_broadcast(
                     &mut state,
                     &payload,
                     &mining_job_inputs,
                     now_ms(),
                     None,
                 );
+                // SetExtranoncePrefix must precede the job it applies to
+                // (§5.3.10): announce the switch, then the job built with it.
+                if !en_frames.is_empty() {
+                    en_frames.append(&mut outcome.outbound);
+                    outcome.outbound = en_frames;
+                }
                 if let Err(err) = write_outbound_frames(
                     &mut writer,
                     outcome.outbound,
@@ -1068,6 +1080,10 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
             .custom_extranonce
             .lookup(address.as_str(), &state.worker_name)?
     };
+    // An override exists for this Solo worker → arm the per-template re-check on
+    // the broadcast path, so a later change (the customer setting a new value)
+    // lands at the next template without a reconnect.
+    state.uses_custom_extranonce = true;
     let channel = state.channels.get_mut(&channel_id)?;
     // Extended only: the per-job prefix pin + the miner's own coinbase splice
     // are Extended-channel mechanics. A Standard channel bakes the prefix into
@@ -1083,6 +1099,69 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
         channel_id,
         extranonce_prefix: prefix.to_vec(),
     })
+}
+
+/// Per-template custom-extranonce re-check on the broadcast hot path — the
+/// live mid-session change without a reconnect.
+///
+/// **Cheap gate first.** A connection without an override
+/// (`uses_custom_extranonce` false — every connection but the paying
+/// customer's) returns immediately: no cache lookup, no lock, no allocation.
+/// One bool test is the entire cost the feature adds to the shared broadcast
+/// path for other miners; the jobs they receive are byte-for-byte unchanged.
+///
+/// For a connection that DOES carry an override, look up its current value and,
+/// for every Extended channel whose prefix differs, swap it and emit a
+/// `SetExtranoncePrefix`. The caller writes these BEFORE the template's jobs, so
+/// the miner switches prefix and the job it then gets (via the per-job pin on
+/// [`crate::mining::jobs::ExtendedJob`]) is built with the new value — the same
+/// race-free ordering as channel-open. In-flight shares for the previous job
+/// stay valid: each job pins the prefix it went out under, so a block-change job
+/// keeps the old prefix and only the next template after a change switches.
+///
+/// A removed override (lookup now `None`) leaves the channel on its last value;
+/// reverting to a pool-allocated prefix needs a reconnect. The customer workflow
+/// only ever changes the value, never clears it — a documented edge, not a
+/// silent gap.
+fn custom_extranonce_broadcast_frames<C: bp_vardiff::Clock>(
+    state: &mut MiningSessionState<C>,
+    hooks: &MiningServerHooks,
+) -> Vec<OutboundFrame> {
+    if !state.uses_custom_extranonce {
+        return Vec::new();
+    }
+    // Armed only on the Solo stream, but re-assert the gate so it can't weaken
+    // if the arming rule ever changes.
+    if state.stream != StreamKind::Solo {
+        return Vec::new();
+    }
+    let prefix = {
+        let Some(address) = state.address.as_ref() else {
+            return Vec::new();
+        };
+        match hooks
+            .custom_extranonce
+            .lookup(address.as_str(), &state.worker_name)
+        {
+            Some(p) => p,
+            None => return Vec::new(),
+        }
+    };
+    let mut frames = Vec::new();
+    for (channel_id, channel) in state.channels.iter_mut() {
+        if channel.kind != crate::mining::channel::ChannelKind::Extended {
+            continue;
+        }
+        if channel.extranonce_prefix.as_slice() == prefix.as_slice() {
+            continue; // already on this prefix — nothing to switch
+        }
+        channel.extranonce_prefix = prefix.to_vec();
+        frames.push(OutboundFrame::SetExtranoncePrefix {
+            channel_id: *channel_id,
+            extranonce_prefix: prefix.to_vec(),
+        });
+    }
+    frames
 }
 
 /// Translate an [`InboundMiningFrame`] into a call to the matching
@@ -1752,6 +1831,110 @@ mod tests {
         );
         let hooks = hooks_with_override(ADDR, "wrk", [0xC0, 0xDE, 0xBA, 0xBE]);
         assert!(maybe_apply_custom_extranonce(&mut s, &hooks, 7).is_none());
+    }
+
+    // ── Custom extranonce arming + live change (broadcast path) ────
+
+    /// An override at channel-open arms the broadcast re-check flag, so a later
+    /// change lands live at the next template.
+    #[test]
+    fn channel_open_arms_broadcast_flag() {
+        let mut s = solo_session_with_extended_channel(7, vec![0x00, 0x00, 0x00, 0x05]);
+        assert!(!s.uses_custom_extranonce);
+        let hooks = hooks_with_override(ADDR, "wrk", [0xC0, 0xDE, 0xBA, 0xBE]);
+        let _ = maybe_apply_custom_extranonce(&mut s, &hooks, 7);
+        assert!(
+            s.uses_custom_extranonce,
+            "an override at channel-open must arm the broadcast re-check"
+        );
+    }
+
+    /// The isolation guarantee: a connection with NO override is never armed,
+    /// so the broadcast path skips it with a single bool test forever.
+    #[test]
+    fn channel_open_without_override_does_not_arm_flag() {
+        let mut s = solo_session_with_extended_channel(7, vec![0x00, 0x00, 0x00, 0x05]);
+        let hooks = hooks_with_override(ADDR, "different-worker", [0xC0, 0xDE, 0xBA, 0xBE]);
+        let _ = maybe_apply_custom_extranonce(&mut s, &hooks, 7);
+        assert!(
+            !s.uses_custom_extranonce,
+            "no override → flag stays false → broadcast path never touches this connection"
+        );
+    }
+
+    /// The non-user gate: an unarmed connection returns no frames and is left
+    /// untouched even if an override somehow exists for it. This is the branch
+    /// every non-customer connection takes on every broadcast.
+    #[test]
+    fn broadcast_frames_empty_when_not_armed() {
+        let mut s = solo_session_with_extended_channel(7, vec![0x00, 0x00, 0x00, 0x05]);
+        let hooks = hooks_with_override(ADDR, "wrk", [0xC0, 0xDE, 0xBA, 0xBE]);
+        assert!(custom_extranonce_broadcast_frames(&mut s, &hooks).is_empty());
+        assert_eq!(
+            s.channels.get(&7).unwrap().extranonce_prefix,
+            vec![0x00, 0x00, 0x00, 0x05]
+        );
+    }
+
+    /// Armed + the override changed → swap the channel and emit the switch.
+    #[test]
+    fn broadcast_frames_switch_when_override_changed() {
+        const NEW: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+        let mut s = solo_session_with_extended_channel(7, vec![0xC0, 0xDE, 0xBA, 0xBE]);
+        s.uses_custom_extranonce = true;
+        let hooks = hooks_with_override(ADDR, "wrk", NEW);
+        let frames = custom_extranonce_broadcast_frames(&mut s, &hooks);
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            OutboundFrame::SetExtranoncePrefix {
+                channel_id,
+                extranonce_prefix,
+            } => {
+                assert_eq!(*channel_id, 7);
+                assert_eq!(extranonce_prefix, &NEW.to_vec());
+            }
+            other => panic!("expected SetExtranoncePrefix, got {other:?}"),
+        }
+        assert_eq!(s.channels.get(&7).unwrap().extranonce_prefix, NEW.to_vec());
+    }
+
+    /// Armed but the override is unchanged → no redundant switch. Every template
+    /// where the customer didn't change the value is a no-op.
+    #[test]
+    fn broadcast_frames_empty_when_override_unchanged() {
+        const CUSTOM: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
+        let mut s = solo_session_with_extended_channel(7, CUSTOM.to_vec());
+        s.uses_custom_extranonce = true;
+        let hooks = hooks_with_override(ADDR, "wrk", CUSTOM);
+        assert!(custom_extranonce_broadcast_frames(&mut s, &hooks).is_empty());
+    }
+
+    /// Armed but the override was removed (lookup None) → keep the last value.
+    /// Reverting to a pool prefix needs a reconnect; the customer never clears.
+    #[test]
+    fn broadcast_frames_keep_last_value_when_override_removed() {
+        let mut s = solo_session_with_extended_channel(7, vec![0xC0, 0xDE, 0xBA, 0xBE]);
+        s.uses_custom_extranonce = true;
+        let hooks = hooks_with_override(ADDR, "different-worker", [0x11, 0x22, 0x33, 0x44]);
+        assert!(custom_extranonce_broadcast_frames(&mut s, &hooks).is_empty());
+        assert_eq!(
+            s.channels.get(&7).unwrap().extranonce_prefix,
+            vec![0xC0, 0xDE, 0xBA, 0xBE]
+        );
+    }
+
+    /// Defensive gate: armed but somehow non-Solo → no switch, prefix untouched.
+    #[test]
+    fn broadcast_frames_empty_on_non_solo_even_if_armed() {
+        let mut s = solo_session_with_extended_channel(7, vec![0xC0, 0xDE, 0xBA, 0xBE]);
+        s.uses_custom_extranonce = true;
+        s.stream = StreamKind::Pplns;
+        let hooks = hooks_with_override(ADDR, "wrk", [0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(custom_extranonce_broadcast_frames(&mut s, &hooks).is_empty());
+        assert_eq!(
+            s.channels.get(&7).unwrap().extranonce_prefix,
+            vec![0xC0, 0xDE, 0xBA, 0xBE]
+        );
     }
 
     // ── Handle lifecycle ───────────────────────────────────────────

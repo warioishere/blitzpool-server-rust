@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Regtest: the custom-extranonce override applied at channel-open (stage 1).
+//! Regtest: the custom-extranonce override, at channel-open AND live.
 //!
-//! Two Extended miners connect to the same Solo-routed server:
-//!   - one whose `(address, worker)` has an override → must receive a
-//!     `SetExtranoncePrefix(custom)` BEFORE its first `NewExtendedMiningJob`,
-//!     so it switches prefix and then gets a job built with it;
-//!   - one whose worker has NO override → must receive its
-//!     `OpenExtendedMiningChannelSuccess` + `NewExtendedMiningJob` with NO
-//!     `SetExtranoncePrefix` at all.
+//! Two Extended miners stay connected to the same Solo-routed server:
+//!   - one whose `(address, worker)` has an override;
+//!   - one whose worker has none.
 //!
-//! The second miner is the isolation proof for stage 1: a connection without an
-//! override sees exactly the frames it would without the feature.
+//! Stage 1 (channel-open): the override miner receives `SetExtranoncePrefix`
+//! before its first job; the other receives none.
+//!
+//! Stage 2 (live change, no reconnect): the override value is changed and a new
+//! template is triggered (mining a block). The override miner receives a
+//! `SetExtranoncePrefix` with the NEW value plus a fresh job — without
+//! reconnecting. The other miner, across every broadcast in that window,
+//! receives its normal jobs and NEVER a `SetExtranoncePrefix`. That second
+//! miner is the isolation proof: the live path leaves non-customers untouched.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -30,6 +33,7 @@ use bp_stratum_v2::server::{ServerConfig, StratumV2MiningServer};
 use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig, TdpHandle};
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
+use stratum_apps::network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf};
 use stratum_core::codec_sv2::StandardSv2Frame;
 use stratum_core::common_messages_sv2::{Protocol, SetupConnection};
 use stratum_core::framing_sv2::framing::Frame;
@@ -45,7 +49,11 @@ const SRI_TEST_PRV: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
 
 const CUSTOM_WORKER: &str = "custom";
 const NORMAL_WORKER: &str = "normal";
-const CUSTOM_PREFIX: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
+const PREFIX_1: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
+const PREFIX_2: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+
+type Reader = NoiseTcpReadHalf<AnyMessage<'static>>;
+type Writer = NoiseTcpWriteHalf<AnyMessage<'static>>;
 
 struct SoloResolver;
 
@@ -66,27 +74,24 @@ impl PayoutResolver for SoloResolver {
     }
 }
 
-/// Override present only for `(REGTEST_ADDR, CUSTOM_WORKER)`.
-struct FixedCustomSource;
-
-impl CustomExtranonceSource for FixedCustomSource {
-    fn lookup(&self, address: &str, worker: &str) -> Option<[u8; 4]> {
-        (address == REGTEST_ADDR && worker == CUSTOM_WORKER).then_some(CUSTOM_PREFIX)
-    }
+/// Override for `(REGTEST_ADDR, CUSTOM_WORKER)` that the test can change live.
+struct MutableCustomSource {
+    prefix: Mutex<Option<[u8; 4]>>,
 }
 
-/// What a miner saw between OpenExtendedMiningChannel and its first job.
-struct OpenObservation {
-    /// The prefix in `OpenExtendedMiningChannelSuccess` (pool-allocated).
-    success_prefix: Vec<u8>,
-    /// The prefix in a `SetExtranoncePrefix`, if one arrived before the job.
-    set_extranonce_prefix: Option<Vec<u8>>,
-    got_job: bool,
+impl CustomExtranonceSource for MutableCustomSource {
+    fn lookup(&self, address: &str, worker: &str) -> Option<[u8; 4]> {
+        if address == REGTEST_ADDR && worker == CUSTOM_WORKER {
+            *self.prefix.lock().unwrap()
+        } else {
+            None
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
-async fn sv2_custom_extranonce_applies_at_open_and_leaves_others_untouched() {
+async fn sv2_custom_extranonce_applies_at_open_and_live_and_leaves_others_untouched() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
@@ -103,36 +108,20 @@ async fn sv2_custom_extranonce_applies_at_open_and_leaves_others_untouched() {
         .await
         .expect("mine 101 for IBD-exit + maturity");
 
-    let tdp_default = TdpHandle::spawn(
-        TdpConfig::new(node.ipc_socket_path())
-            .with_fee_threshold(1)
-            .with_min_interval_secs(1)
-            .with_coinbase_constraints(TdpCoinbaseConstraints {
-                max_additional_size: 50_000,
-                max_additional_sigops: 0,
-            }),
-    )
-    .expect("spawn default TDP");
-    let tdp_solo = TdpHandle::spawn(
-        TdpConfig::new(node.ipc_socket_path())
-            .with_fee_threshold(1)
-            .with_min_interval_secs(1)
-            .with_coinbase_constraints(TdpCoinbaseConstraints {
-                max_additional_size: 1_000,
-                max_additional_sigops: 0,
-            }),
-    )
-    .expect("spawn solo TDP");
-
+    let tdp_default = spawn_tdp(&node, 50_000);
+    let tdp_solo = spawn_tdp(&node, 1_000);
     let updates_rx = tdp_default.subscribe();
     let solo_updates_rx = tdp_solo.subscribe();
     node.generate_to_self(1)
         .await
         .expect("mine 1 for templates");
 
+    let source = Arc::new(MutableCustomSource {
+        prefix: Mutex::new(Some(PREFIX_1)),
+    });
     let hooks = MiningServerHooks {
         payout_resolver: Arc::new(SoloResolver),
-        custom_extranonce: Arc::new(FixedCustomSource),
+        custom_extranonce: source.clone(),
         ..MiningServerHooks::no_op()
     };
     let noise_config =
@@ -175,10 +164,34 @@ async fn sv2_custom_extranonce_applies_at_open_and_leaves_others_untouched() {
         }
     });
 
-    // Miner with an override.
-    let custom = open_extended(addr, CUSTOM_WORKER).await;
-    // Miner without one.
-    let normal = open_extended(addr, NORMAL_WORKER).await;
+    // ── Stage 1: open both channels, keep them connected ──
+    let (mut c_reader, _c_writer) = connect_and_open(addr, CUSTOM_WORKER).await;
+    let c_open = drain_until_first_job(&mut c_reader).await;
+    let (mut n_reader, _n_writer) = connect_and_open(addr, NORMAL_WORKER).await;
+    let n_open = drain_until_first_job(&mut n_reader).await;
+
+    eprintln!("[custom-en] open custom: set={:02x?}", c_open.set_prefix);
+    eprintln!("[custom-en] open normal: set={:02x?}", n_open.set_prefix);
+    assert_eq!(
+        c_open.set_prefix.as_deref(),
+        Some(PREFIX_1.as_slice()),
+        "override miner must get SetExtranoncePrefix(PREFIX_1) at open"
+    );
+    assert!(
+        n_open.set_prefix.is_none(),
+        "normal miner must get none at open"
+    );
+
+    // ── Stage 2: change the override live, trigger a template ──
+    *source.prefix.lock().unwrap() = Some(PREFIX_2);
+    node.generate_to_self(1)
+        .await
+        .expect("mine 1 to trigger a template");
+
+    // Drain a window on each connection (no reconnect). Collect every
+    // SetExtranoncePrefix seen + whether a fresh job arrived.
+    let c_live = drain_window(&mut c_reader, Duration::from_secs(8)).await;
+    let n_live = drain_window(&mut n_reader, Duration::from_secs(6)).await;
 
     server.shutdown().await;
     tdp_default.shutdown().ok();
@@ -187,41 +200,61 @@ async fn sv2_custom_extranonce_applies_at_open_and_leaves_others_untouched() {
     accept_handle.abort();
 
     eprintln!(
-        "[custom-en] custom: success_prefix={:02x?} set_extranonce={:02x?} job={}",
-        custom.success_prefix, custom.set_extranonce_prefix, custom.got_job
+        "[custom-en] live custom: set_prefixes={:02x?} job={}",
+        c_live.set_prefixes, c_live.got_job
     );
     eprintln!(
-        "[custom-en] normal: success_prefix={:02x?} set_extranonce={:02x?} job={}",
-        normal.success_prefix, normal.set_extranonce_prefix, normal.got_job
+        "[custom-en] live normal: set_prefixes={:02x?} job={}",
+        n_live.set_prefixes, n_live.got_job
     );
 
-    // The pool allocates from worker 0 (`0x00…`) for both.
-    assert_eq!(custom.success_prefix.first(), Some(&0x00));
-    assert_eq!(normal.success_prefix.first(), Some(&0x00));
-
-    // Custom miner: a SetExtranoncePrefix with the customer's value arrives
-    // before the first job.
-    assert_eq!(
-        custom.set_extranonce_prefix.as_deref(),
-        Some(CUSTOM_PREFIX.as_slice()),
-        "custom miner must receive SetExtranoncePrefix with its override before the job"
-    );
-    assert!(custom.got_job, "custom miner must receive a job");
-
-    // Normal miner: no SetExtranoncePrefix at all — byte-for-byte the frames it
-    // would see without the feature.
+    // Override miner switched to the new value live, without reconnecting.
     assert!(
-        normal.set_extranonce_prefix.is_none(),
-        "a miner without an override must never receive SetExtranoncePrefix; got {:02x?}",
-        normal.set_extranonce_prefix
+        c_live.set_prefixes.iter().any(|p| p.as_slice() == PREFIX_2),
+        "override miner must receive SetExtranoncePrefix(PREFIX_2) live; got {:02x?}",
+        c_live.set_prefixes
     );
-    assert!(normal.got_job, "normal miner must receive a job");
+    assert!(c_live.got_job, "override miner must receive a fresh job");
+
+    // Normal miner: fresh jobs, but NEVER a SetExtranoncePrefix — the isolation
+    // proof for the live path.
+    assert!(
+        n_live.set_prefixes.is_empty(),
+        "normal miner must never receive SetExtranoncePrefix; got {:02x?}",
+        n_live.set_prefixes
+    );
+    assert!(n_live.got_job, "normal miner must keep receiving jobs");
 }
 
-/// Connect, handshake, open an Extended channel for `worker`, and drain frames
-/// until the first `NewExtendedMiningJob` (or timeout), recording whether a
-/// `SetExtranoncePrefix` arrived first and the success/set prefixes.
-async fn open_extended(server_addr: std::net::SocketAddr, worker: &str) -> OpenObservation {
+// ── observation types ───────────────────────────────────────────────────
+
+struct OpenObs {
+    set_prefix: Option<Vec<u8>>,
+}
+
+struct WindowObs {
+    set_prefixes: Vec<Vec<u8>>,
+    got_job: bool,
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────
+
+fn spawn_tdp(node: &RegtestNode, max_additional_size: u32) -> TdpHandle {
+    TdpHandle::spawn(
+        TdpConfig::new(node.ipc_socket_path())
+            .with_fee_threshold(1)
+            .with_min_interval_secs(1)
+            .with_coinbase_constraints(TdpCoinbaseConstraints {
+                max_additional_size,
+                max_additional_sigops: 0,
+            }),
+    )
+    .expect("spawn TDP")
+}
+
+/// Noise handshake + SetupConnection + OpenExtendedMiningChannel for `worker`.
+/// Returns the split halves; the caller drains the response.
+async fn connect_and_open(server_addr: std::net::SocketAddr, worker: &str) -> (Reader, Writer) {
     let socket = TcpStream::connect(server_addr).await.expect("connect");
     socket.set_nodelay(true).ok();
     let pub_key: Secp256k1PublicKey = SRI_TEST_PUB.parse().expect("parse pub key");
@@ -265,46 +298,54 @@ async fn open_extended(server_addr: std::net::SocketAddr, worker: &str) -> OpenO
         )),
     )
     .await;
+    (reader, writer)
+}
 
-    let mut success_prefix: Option<Vec<u8>> = None;
-    let mut set_extranonce_prefix: Option<Vec<u8>> = None;
-    let mut got_job = false;
+/// Drain until the first `NewExtendedMiningJob`, recording any
+/// `SetExtranoncePrefix` seen before it (the channel-open apply).
+async fn drain_until_first_job(reader: &mut Reader) -> OpenObs {
+    let mut set_prefix = None;
     let _ = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
-            match read_any_message(&mut reader).await {
-                AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(s)) => {
-                    success_prefix = Some(s.extranonce_prefix.as_ref().to_vec());
-                }
+            match read_any_message(reader).await {
                 AnyMessage::Mining(Mining::SetExtranoncePrefix(s)) => {
-                    set_extranonce_prefix = Some(s.extranonce_prefix.as_ref().to_vec());
+                    set_prefix = Some(s.extranonce_prefix.as_ref().to_vec());
+                }
+                AnyMessage::Mining(Mining::NewExtendedMiningJob(_)) => return,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    OpenObs { set_prefix }
+}
+
+/// Drain for `window`, collecting every `SetExtranoncePrefix` prefix and
+/// whether at least one fresh job arrived.
+async fn drain_window(reader: &mut Reader, window: Duration) -> WindowObs {
+    let mut set_prefixes = Vec::new();
+    let mut got_job = false;
+    let _ = tokio::time::timeout(window, async {
+        loop {
+            match read_any_message(reader).await {
+                AnyMessage::Mining(Mining::SetExtranoncePrefix(s)) => {
+                    set_prefixes.push(s.extranonce_prefix.as_ref().to_vec());
                 }
                 AnyMessage::Mining(Mining::NewExtendedMiningJob(_)) => {
                     got_job = true;
-                    return; // first job — we've seen the full open sequence
                 }
                 _ => {}
             }
         }
     })
     .await;
-
-    drop(writer);
-    drop(reader);
-    OpenObservation {
-        success_prefix: success_prefix.unwrap_or_default(),
-        set_extranonce_prefix,
+    WindowObs {
+        set_prefixes,
         got_job,
     }
 }
 
-// ── helpers (mirror the sibling regtests) ───────────────────────────────
-
-async fn write_any_message(
-    writer: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpWriteHalf<
-        AnyMessage<'static>,
-    >,
-    msg: AnyMessage<'static>,
-) {
+async fn write_any_message(writer: &mut Writer, msg: AnyMessage<'static>) {
     let sv2_frame: StandardSv2Frame<AnyMessage<'static>> =
         msg.try_into().expect("AnyMessage → StandardSv2Frame");
     writer
@@ -313,9 +354,7 @@ async fn write_any_message(
         .expect("write_frame");
 }
 
-async fn read_any_message(
-    reader: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpReadHalf<AnyMessage<'static>>,
-) -> AnyMessage<'static> {
+async fn read_any_message(reader: &mut Reader) -> AnyMessage<'static> {
     let frame = reader.read_frame().await.expect("read_frame");
     let mut sv2_frame = match frame {
         Frame::Sv2(f) => f,
