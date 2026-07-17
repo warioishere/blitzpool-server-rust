@@ -269,11 +269,14 @@ where
 /// Verify `signature` signs `message` for `address`. Returns `(method,
 /// script_type)` on success. Tries BIP-322 first (covers every type incl.
 /// taproot), then the legacy/Electrum/BIP-137 recoverable path.
+///
+/// `pub(crate)` so the custom-extranonce controller authorises its changes with
+/// the same verification rather than a second copy of it.
 // The per-address-type `match` arms each run a distinct verification (recover +
 // re-derive + compare) — keeping the explicit `if` inside each arm is clearer
 // for security review than collapsing into match guards, so allow the lint.
 #[allow(clippy::collapsible_match)]
-fn verify_message_signature(
+pub(crate) fn verify_message_signature(
     address: &str,
     message: &str,
     signature: &str,
@@ -344,7 +347,7 @@ fn script_type_label(t: AddressType) -> &'static str {
 /// (lowercase bech32, preserve case-sensitive Base58) so the ownership row is
 /// keyed identically to what every verification gate looks up — otherwise a
 /// mixed-case Base58 (or upper-case bech32) proof would never match.
-fn parse_supported_address(raw: &str, network: Network) -> Result<AddressId, ApiError> {
+pub(crate) fn parse_supported_address(raw: &str, network: Network) -> Result<AddressId, ApiError> {
     let trimmed = raw.trim();
     Address::from_str(trimmed)
         .ok()
@@ -358,7 +361,7 @@ fn ownership_error(code: &'static str, status: StatusCode) -> ApiError {
     ApiError::GroupService { code, status }
 }
 
-fn random_nonce() -> String {
+pub(crate) fn random_nonce() -> String {
     let mut bytes = [0u8; 16];
     getrandom::getrandom(&mut bytes).expect("OS CSPRNG");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
