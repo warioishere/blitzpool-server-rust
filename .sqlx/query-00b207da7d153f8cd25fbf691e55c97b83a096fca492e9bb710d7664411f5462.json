@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM pplns_extranonce_challenge WHERE address = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "00b207da7d153f8cd25fbf691e55c97b83a096fca492e9bb710d7664411f5462"
+}
