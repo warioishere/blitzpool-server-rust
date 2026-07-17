@@ -179,6 +179,10 @@ async fn run_block_submit_case(miner_extranonce_size: u8) {
         coinbase_prefix: tx_prefix.clone(),
         coinbase_suffix: tx_suffix.clone(),
         merkle_path: template.merkle_path.clone(),
+        // Same prefix the channel below is opened with — the validator
+        // splices the JOB's copy in, so a mismatch here would break the
+        // coinbase reconstruction and the block submit with it.
+        extranonce_prefix: extranonce_prefix.clone(),
         version: template.version,
         prev_hash: prev_hash.prev_hash,
         n_bits: prev_hash.n_bits,
@@ -245,7 +249,6 @@ async fn run_block_submit_case(miner_extranonce_size: u8) {
     let job_target = channel.target_for(job_difficulty);
     let view = ExtendedChannelView {
         kind: channel.kind,
-        extranonce_prefix: &channel.extranonce_prefix,
         extranonce_size: channel.extranonce_size,
         job_target,
     };

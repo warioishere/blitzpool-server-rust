@@ -391,6 +391,7 @@ mod tests {
             coinbase_prefix: vec![0xAA],
             coinbase_suffix: vec![0xBB],
             merkle_path: vec![],
+            extranonce_prefix: Vec::new(),
             version: 0x2000_0000,
             prev_hash: [0u8; 32],
             n_bits: 0x1d00_ffff,

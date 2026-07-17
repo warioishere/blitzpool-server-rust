@@ -89,6 +89,9 @@ fn ext_job(merkle_depth: usize) -> ExtendedJob {
         coinbase_prefix: vec![0xAA; 64],
         coinbase_suffix: vec![0xBB; 100],
         merkle_path: vec![[0x33; 32]; merkle_depth],
+        // Same 4-byte prefix `ext_channel()` opens with — the validator
+        // splices the job's copy into the coinbase.
+        extranonce_prefix: vec![0u8; 4],
         version: 0x2000_0000,
         prev_hash: [0x11; 32],
         n_bits: 0x1d00_ffff,
@@ -129,7 +132,6 @@ fn run_validate(channel: &mut ChannelState, sub: &SubmitSharesExtendedInput, job
     let job_target = channel.target_for(job.difficulty);
     let view = ExtendedChannelView {
         kind: channel.kind,
-        extranonce_prefix: &channel.extranonce_prefix,
         extranonce_size: channel.extranonce_size,
         job_target,
     };

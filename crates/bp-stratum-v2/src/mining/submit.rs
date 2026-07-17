@@ -17,7 +17,7 @@
 //!   recomputing the merkle root on every share, which is more reliable).
 //!   Extranonce is implicitly zero-filled in the coinbase slot.
 //! - **Extended**: reconstructs the coinbase from
-//!   `extJob.coinbase_prefix + channel.extranonce_prefix +
+//!   `extJob.coinbase_prefix + extJob.extranonce_prefix +
 //!   submission.extranonce + extJob.coinbase_suffix`, walks the
 //!   `extJob.merkle_path` to derive the root, then assembles the
 //!   header. Worker-name override via ext 0x0002 TLV is the caller's
@@ -436,9 +436,8 @@ pub fn validate_submit_standard(
 /// per-share clone of the job. Mirrors the SV1 `validate_submit`
 /// projection (`SessionContext` + `&mut share_cache`).
 #[derive(Clone, Copy, Debug)]
-pub struct ExtendedChannelView<'a> {
+pub struct ExtendedChannelView {
     pub kind: ChannelKind,
-    pub extranonce_prefix: &'a [u8],
     pub extranonce_size: u8,
     /// `channel.target_for(job_difficulty)` — precomputed by the caller
     /// so the validator needs no `&mut` access to the channel's memo.
@@ -473,7 +472,7 @@ pub struct ExtendedChannelView<'a> {
 #[allow(clippy::too_many_arguments)]
 pub fn validate_submit_extended(
     submission_cache: &mut SubmissionCache,
-    view: &ExtendedChannelView<'_>,
+    view: &ExtendedChannelView,
     submission: &SubmitSharesExtendedInput,
     ext_job: &ExtendedJob,
     job_difficulty: Difficulty,
@@ -542,20 +541,25 @@ pub fn validate_submit_extended(
     // 1. Reconstruct the coinbase exactly how the miner does it:
     //
     //   coinbase = ext_job.coinbase_prefix
-    //            + channel.extranonce_prefix
+    //            + ext_job.extranonce_prefix
     //            + submission.extranonce
     //            + ext_job.coinbase_suffix
     //
     // `ext_job.coinbase_prefix` here is the bytes BEFORE the
-    // extranonce slot — `apply_template_to_channel` no longer bakes
-    // `channel.extranonce_prefix` into it (doing so would double-count
-    // the prefix on the miner side, since miners append it themselves
-    // at share-build time). Validator must mirror miner's reconstruction
-    // byte-for-byte or the resulting hash diverges → 100% diff-too-low
-    // rejections.
+    // extranonce slot — the job build no longer bakes the extranonce
+    // prefix into it (doing so would double-count the prefix on the
+    // miner side, since miners append it themselves at share-build
+    // time). Validator must mirror miner's reconstruction byte-for-byte
+    // or the resulting hash diverges → 100% diff-too-low rejections.
+    //
+    // The prefix is read off the JOB, never off the channel: SV2 §5.3.10
+    // makes a `SetExtranoncePrefix` effective only from the next job on,
+    // so a share for an older job was built with that job's prefix. Taking
+    // it from the channel would reject every in-flight share of the old
+    // job after a prefix change.
     let coinbase_parts: [&[u8]; 4] = [
         &ext_job.coinbase_prefix[..],
-        view.extranonce_prefix,
+        &ext_job.extranonce_prefix[..],
         &submission.extranonce[..],
         &ext_job.coinbase_suffix[..],
     ];
@@ -714,7 +718,7 @@ pub fn validate_submit_extended(
 /// [`bp_mining_job::MiningJob::witness_coinbase_with_extranonce`] but
 /// operates on already-assembled stratum-coinbase bytes — the SV2
 /// extended-validator path reconstructs them from
-/// `ext_job.coinbase_prefix + channel.extranonce_prefix +
+/// `ext_job.coinbase_prefix + ext_job.extranonce_prefix +
 /// submission.extranonce + ext_job.coinbase_suffix` and has no
 /// `MiningJob` handle. Output is byte-identical to the SV1 path.
 ///
@@ -778,6 +782,9 @@ mod tests {
             prev_hash: prev,
             n_bits,
             min_ntime: 0,
+            // Must match `ext_channel()`'s prefix: these fixtures pair up, and
+            // the validator now reconstructs the coinbase from the JOB's prefix.
+            extranonce_prefix: vec![0u8; 4],
             difficulty: Difficulty(1.0 / 4_294_967_296.0),
             // Unreasonably hard pinned network difficulty → not a block
             // candidate. Tests that exercise the candidate gate set this
@@ -843,7 +850,6 @@ mod tests {
         let job_target = ch.target_for(job_difficulty);
         let view = ExtendedChannelView {
             kind: ch.kind,
-            extranonce_prefix: &ch.extranonce_prefix,
             extranonce_size: ch.extranonce_size,
             job_target,
         };

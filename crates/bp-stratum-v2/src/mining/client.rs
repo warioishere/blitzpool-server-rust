@@ -1296,16 +1296,20 @@ pub fn handle_submit_shares_extended<C: Clock>(
     // `channel.extended_jobs` — which a whole-`&mut channel` signature
     // could not express, forcing the old per-share job clone.
     let job_target = channel.target_for(job_difficulty);
-    let view = ExtendedChannelView {
-        kind: channel.kind,
-        extranonce_prefix: &channel.extranonce_prefix,
-        extranonce_size: channel.extranonce_size,
-        job_target,
-    };
     let ext_job = channel
         .extended_jobs
         .get(&submission.job_id)
         .expect("ext_job presence checked above");
+    // The prefix is no longer part of the view: the validator reads it off
+    // `ext_job` itself (SV2 §5.3.10 — a new prefix only takes effect from the
+    // next job on, so a share for an older job must be reconstructed with the
+    // prefix that job went out under). Sourcing it from the channel here is
+    // what would silently reject every in-flight share after a change.
+    let view = ExtendedChannelView {
+        kind: channel.kind,
+        extranonce_size: channel.extranonce_size,
+        job_target,
+    };
 
     let validation = validate_submit_extended(
         &mut channel.submission_cache,
@@ -2036,6 +2040,7 @@ pub fn apply_template_broadcast<C: Clock>(
                     prev_hash: template.prev_hash,
                     n_bits: template.n_bits,
                     min_ntime: template.header_timestamp,
+                    extranonce_prefix: channel.extranonce_prefix.clone(),
                     difficulty: channel.session_difficulty,
                     network_difficulty: template.network_difficulty,
                     coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
@@ -2083,8 +2088,9 @@ pub fn apply_template_broadcast<C: Clock>(
     //     downstream proxy fans it out to its own channels).
 
     // Build the group's shared coinbase template (coinbase parts + header
-    // fields) for `full_size`. The `difficulty` placeholder is overridden per
-    // member. `None` if the mining-job build fails.
+    // fields) for `full_size`. The `difficulty` and `extranonce_prefix`
+    // placeholders are overridden per member — members share the job but each
+    // holds its own prefix. `None` if the mining-job build fails.
     let build_group_template = |full_size: usize| -> Option<GroupTemplateParts> {
         let mining_job = mining_job_inputs.build(full_size).ok()?;
         let tx_prefix = mining_job.coinbase_prefix().to_vec();
@@ -2098,6 +2104,7 @@ pub fn apply_template_broadcast<C: Clock>(
             prev_hash: template.prev_hash,
             n_bits: template.n_bits,
             min_ntime: template.header_timestamp,
+            extranonce_prefix: Vec::new(),
             difficulty: Difficulty(0.0),
             network_difficulty: template.network_difficulty,
             coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
@@ -2163,6 +2170,7 @@ pub fn apply_template_broadcast<C: Clock>(
                     if let Some(ch) = state.channels.get_mut(&new_id) {
                         let mut job = tmpl.clone();
                         job.difficulty = ch.session_difficulty;
+                        job.extranonce_prefix = ch.extranonce_prefix.clone();
                         job.created_at = now_ms;
                         ch.latest_extended_prev_hash = Some(job.prev_hash);
                         ch.latest_extended_n_bits = Some(job.n_bits);
@@ -2230,6 +2238,7 @@ pub fn apply_template_broadcast<C: Clock>(
             if channel.kind == ChannelKind::Extended {
                 let mut ext_job = group_template.clone();
                 ext_job.difficulty = channel.session_difficulty;
+                ext_job.extranonce_prefix = channel.extranonce_prefix.clone();
                 channel.extended_jobs.insert(group_job_id, ext_job);
             }
         }
@@ -2461,6 +2470,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             prev_hash: input.prev_hash,
             n_bits: input.n_bits,
             min_ntime: input.min_ntime,
+            extranonce_prefix: channel.extranonce_prefix.clone(),
             difficulty: channel.session_difficulty,
             // Custom (JDC-declared) job: derive the block-found gate's network
             // difficulty from the declared job's own n_bits (no pool template).
@@ -2530,7 +2540,6 @@ mod tests {
         let job_target = ch.target_for(job_difficulty);
         let view = ExtendedChannelView {
             kind: ch.kind,
-            extranonce_prefix: &ch.extranonce_prefix,
             extranonce_size: ch.extranonce_size,
             job_target,
         };
@@ -3365,6 +3374,9 @@ mod tests {
             coinbase_prefix: vec![0xAA; 8],
             coinbase_suffix: vec![0xBB; 8],
             merkle_path: vec![[0u8; 32]],
+            // Matches the prefix the channel above was opened with — the
+            // validator reconstructs the coinbase from the job's copy.
+            extranonce_prefix: vec![0; 4],
             version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,
@@ -3395,6 +3407,95 @@ mod tests {
             out.outbound[0],
             OutboundFrame::SubmitSharesSuccess { .. }
         ));
+    }
+
+    /// A share for a job issued under the OLD extranonce prefix stays valid
+    /// after the channel's prefix changes.
+    ///
+    /// SV2 §5.3.10: `SetExtranoncePrefix` takes effect from the NEXT job on,
+    /// so a miner still working an older job keeps building its coinbase with
+    /// the prefix that job went out under. The validator has to reconstruct
+    /// with that same prefix — reading the channel's current one instead makes
+    /// the coinbase diverge and rejects every in-flight share as diff-too-low.
+    ///
+    /// Pins the reason `ExtendedJob::extranonce_prefix` exists: source the
+    /// prefix from `channel.extranonce_prefix` in the validator and this fails.
+    ///
+    /// Asserts on the derived HASH, not on accept/reject. The job difficulty
+    /// here is trivial (target ≈ MAX), so a coinbase reconstructed from the
+    /// wrong prefix still hashes to something that clears the target and gets
+    /// accepted — accept/reject cannot tell the two apart. The hash can: it is
+    /// a direct fingerprint of which coinbase the validator actually built.
+    #[test]
+    fn submit_extended_accepts_share_for_job_issued_under_previous_prefix() {
+        const OLD_PREFIX: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
+        const NEW_PREFIX: [u8; 4] = [0x01, 0x02, 0x03, 0x04];
+
+        // Validate one fixed share for job 7 — always issued under OLD_PREFIX —
+        // against a channel whose CURRENT prefix is `channel_prefix`. Returns
+        // the hash the validator derived. Each call gets its own session so the
+        // dedup cache never sees the submission twice.
+        fn hash_for(channel_prefix: [u8; 4]) -> [u8; 32] {
+            let mut s = fresh_session();
+            handle_setup_connection(&mut s, &good_setup());
+            let _ = handle_open_extended_mining_channel(
+                &mut s,
+                &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
+                OLD_PREFIX.to_vec(),
+            );
+            let channel_id = s.primary_channel.unwrap();
+            let job = ExtendedJob {
+                coinbase_prefix: vec![0xAA; 8],
+                coinbase_suffix: vec![0xBB; 8],
+                merkle_path: vec![[0u8; 32]],
+                extranonce_prefix: OLD_PREFIX.to_vec(),
+                version: 0x2000_0000,
+                prev_hash: [0xCC; 32],
+                n_bits: 0x1d00_ffff,
+                min_ntime: 0,
+                difficulty: Difficulty(1.0 / 4_294_967_296.0),
+                network_difficulty: Difficulty(1e15),
+                coinbase_tx_value_remaining: 5_000_000_000,
+                template_id: None,
+                created_at: 0,
+                retired_at: None,
+            };
+            {
+                let ch = s.channels.get_mut(&channel_id).unwrap();
+                ch.extended_jobs.insert(7, job);
+                ch.extranonce_prefix = channel_prefix.to_vec();
+            }
+            let sub = SubmitSharesExtendedInput {
+                channel_id,
+                sequence_number: 1,
+                job_id: 7,
+                nonce: 0x1234_5678,
+                version: 0x2000_0000,
+                ntime: 0x6500_0001,
+                extranonce: ExtranonceBytes::from_slice(&[0x11; 8]),
+                tail_tlvs: Vec::new(),
+            };
+            let out = handle_submit_shares_extended(&mut s, &sub, 0);
+            match out.events.first() {
+                Some(SessionEvent::ShareAccepted { accept, .. }) => accept.hash,
+                other => panic!("expected ShareAccepted, got {other:?}"),
+            }
+        }
+
+        // Reference: nothing changed yet — the channel still holds the prefix
+        // job 7 went out under, so this is the coinbase the miner hashed.
+        let miner_hash = hash_for(OLD_PREFIX);
+        // Now the prefix changes mid-session. Job 7 predates the change, so per
+        // SV2 §5.3.10 the miner keeps hashing OLD_PREFIX until the next job —
+        // validation must land on exactly the same hash.
+        let after_prefix_change = hash_for(NEW_PREFIX);
+        assert_eq!(
+            miner_hash, after_prefix_change,
+            "changing the channel's extranonce prefix must not change how a \
+             share for a job issued under the PREVIOUS prefix validates — \
+             sourcing the prefix from the channel rebuilds a coinbase the miner \
+             never hashed (SV2 §5.3.10)"
+        );
     }
 
     // ── UpdateChannel ──────────────────────────────────────────────
@@ -4692,6 +4793,7 @@ mod tests {
                     coinbase_prefix: vec![],
                     coinbase_suffix: vec![],
                     merkle_path: vec![],
+                    extranonce_prefix: vec![],
                     version: 0,
                     prev_hash: [0; 32],
                     n_bits: 0,

@@ -67,6 +67,20 @@ pub struct ExtendedJob {
     pub prev_hash: [u8; 32],
     pub n_bits: u32,
     pub min_ntime: u32,
+    /// The channel's extranonce prefix **as of send-time**. Extended jobs
+    /// do NOT bake the prefix into `coinbase_prefix` — the miner appends it
+    /// itself at share-build time — so the validator has to splice it back
+    /// in to reproduce the miner's coinbase byte-for-byte.
+    ///
+    /// It is pinned per-job rather than read live off the channel because
+    /// SV2 §5.3.10 lets `SetExtranoncePrefix` take effect only from the
+    /// **next** job onward: a miner still working the current job keeps
+    /// using the old prefix. Validating those in-flight shares against the
+    /// channel's new prefix would diverge the reconstructed coinbase and
+    /// reject every one of them as diff-too-low. Same send-time-pinning
+    /// rationale as [`Self::difficulty`] and [`Self::network_difficulty`]
+    /// (§5.3.14), applied to the one input those two don't cover.
+    pub extranonce_prefix: Vec<u8>,
     /// Per-job session difficulty stored at send-time. SV2 spec §5.3.14
     /// requires share validation against the target the job was issued
     /// at, NOT the current `session_difficulty` — without this a vardiff
@@ -428,6 +442,7 @@ mod tests {
             coinbase_prefix: vec![0; 8],
             coinbase_suffix: vec![0; 8],
             merkle_path: vec![[0u8; 32]],
+            extranonce_prefix: Vec::new(),
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             n_bits: 0x1d00_ffff,
