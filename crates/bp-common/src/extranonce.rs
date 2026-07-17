@@ -1,12 +1,44 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Pool-side extranonce-prefix allocation, shared by the SV1 and SV2
-//! stratum servers. Two mining connections MUST NOT share the same
-//! prefix or their coinbases collide on the same
-//! `(extranonce_prefix + extranonce)` pair and produce identical hashes
-//! (wasted hashrate + duplicate-share rejects on the colliding session).
+//! stratum servers.
 //!
-//! Allocation strategy: prefixes live in a per-worker partition. The
+//! ## What prefix uniqueness actually buys
+//!
+//! Two connections search the same space only if they hash the **same
+//! coinbase** — the header commits to it through the merkle root, so a
+//! shared `(extranonce_prefix + extranonce)` pair produces identical
+//! hashes only when everything *else* in the coinbase is identical too.
+//! "Same coinbase" is exactly `bp_mining_job`'s job-cache key
+//! (`network, pool_identifier, extranonce_slot_size, payouts, template…`
+//! — see `cache::job_key_tuple`):
+//!
+//! - **Same cache key** ⟺ same coinbase ⟺ the prefix is the sole
+//!   work-partitioner. A shared prefix here means overlapping search plus
+//!   duplicate-share rejects on the colliding session.
+//! - **Different cache key** ⟺ a shared prefix is harmless: the coinbases,
+//!   and therefore the headers, differ no matter what the prefix is.
+//!
+//! The payout set is part of that key, and this pool is non-custodial, so
+//! the distinction is not academic: Solo / Group-Solo / Blockparty sessions
+//! each hash their own payout outputs and can never collide with a
+//! different address, whatever prefix they hold. PPLNS is the mode where
+//! the prefix carries the entire burden — `build_distribution(reward_sats)`
+//! is address-independent, so every PPLNS miner on a stream hashes one
+//! identical coinbase.
+//!
+//! The allocator nonetheless guarantees prefixes unique **pool-wide**, not
+//! merely per coinbase class. That is deliberate: the global guarantee
+//! subsumes the per-class one, costs nothing (a worker partition holds
+//! 2^24 prefixes — orders of magnitude past any realistic connection
+//! count), and spares every caller from having to reason about which mode
+//! a session ended up resolving to. Treat pool-wide uniqueness as a
+//! simplifying invariant, not as a claim that a shared prefix is always
+//! harmful.
+//!
+//! ## Allocation strategy
+//!
+//! Prefixes live in a per-worker partition. The
 //! prefix is `prefix_size` bytes; the top 8 bits select the worker
 //! (0..=255) and the remaining `(prefix_size - 1) * 8` bits are the
 //! per-worker prefix counter. The allocator hands out the next free
@@ -18,7 +50,19 @@
 //! allocator without ever handing out overlapping prefixes: each server
 //! constructs its own instance on a distinct worker id, so an SV1 prefix
 //! (`0x01…`) and an SV2 prefix (`0x00…`) can never collide even though
-//! the two protocols run separate instances.
+//! the two protocols run separate instances. The partition is a namespace
+//! split, not a rationing device — it buys the two instances freedom from
+//! having to coordinate (no shared instance, no shared lock, no
+//! cross-crate wiring), and uniqueness falls out by construction.
+//!
+//! Only workers 0 and 1 are assigned; **workers 2..=255 are unowned**, so
+//! nothing is ever emitted from `0x02…`..`0xFF…`. That is headroom, not
+//! waste: a partition serves 2^24 concurrent prefixes, so two of them
+//! already cover both protocols with room to spare, and any future
+//! independent allocator (another protocol, another region) can claim a
+//! worker id and stay collision-free without talking to the others. The
+//! same property makes the unowned range the natural home for a
+//! hand-administered prefix: no counter will ever reach it.
 //!
 //! `total_extranonce_size` defaults to 12 bytes (4 prefix + 8
 //! miner-controlled) to match `bp_mining_job`'s coinbase slot size and
