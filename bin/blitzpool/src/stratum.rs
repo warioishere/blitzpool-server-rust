@@ -159,6 +159,10 @@ pub(crate) async fn spawn(
     )?;
     let noise_config = stratum_v2::build_noise_config(cfg)?;
     let bridge = stratum_v2::build_bridge();
+    // Warm the customer-extranonce cache before the servers start serving, then
+    // it self-refreshes off PG. Shared across every SV2 port.
+    let custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource> =
+        crate::custom_extranonce::CustomExtranonceCache::spawn(foundation.db.pool().clone()).await;
     let sv2_servers = stratum_v2::build_per_port_servers(
         cfg,
         foundation,
@@ -167,6 +171,7 @@ pub(crate) async fn spawn(
         noise_config,
         bridge,
         sv2_resolver,
+        custom_extranonce,
         dispatcher,
         job_cache,
     );

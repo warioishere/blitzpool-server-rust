@@ -176,6 +176,7 @@ pub(crate) fn build_per_port_servers(
     noise_config: NoiseConfig,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     payout_resolver: Arc<dyn PayoutResolver>,
+    custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
 ) -> Vec<Sv2PortServer> {
@@ -247,6 +248,7 @@ pub(crate) fn build_per_port_servers(
             lookup.clone(),
             mode_gate.clone(),
             device_status_sink.clone(),
+            custom_extranonce.clone(),
         );
 
         // Subscribe + snapshot — broadcast catches future updates,
@@ -313,6 +315,7 @@ pub(crate) fn build_per_port_servers(
 
 // ─── MiningServerHooks composition ────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn build_port_hooks(
     port_payout_mode: MiningMode,
     payout_resolver: Arc<dyn PayoutResolver>,
@@ -321,6 +324,7 @@ fn build_port_hooks(
     group_lookup: Arc<dyn GroupLookup>,
     mode_gate: Arc<BlitzpoolModeGate>,
     device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink>,
+    custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
 ) -> MiningServerHooks {
     // Front-only path (Stratum spawns only on the front), where
     // `engines::spawn` always builds these composites.
@@ -359,6 +363,7 @@ fn build_port_hooks(
         rejected_sink: rejected,
         session_persistence: session,
         device_status_sink,
+        custom_extranonce,
     }
 }
 

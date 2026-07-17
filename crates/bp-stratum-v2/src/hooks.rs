@@ -193,6 +193,23 @@ pub trait DeviceStatusSink: Send + Sync {
     );
 }
 
+// ── CustomExtranonceSource ──────────────────────────────────────────
+
+/// Look up a customer-set extranonce prefix for a `(address, worker)`.
+///
+/// Backs the custom-extranonce override: an address that proved control of
+/// its key (via the ownership signature) may pin its own 4-byte prefix per
+/// worker through the API. The stratum server consults this at channel-open
+/// to swap the pool-allocated prefix for the customer's chosen one.
+///
+/// Sync on purpose — the production impl reads an in-memory cache the core
+/// refreshes off PG periodically (never a per-lookup DB round-trip), mirroring
+/// how the mode-gate lookup is a plain map hit. Returns `None` for the
+/// overwhelming majority of workers, which have no override.
+pub trait CustomExtranonceSource: Send + Sync {
+    fn lookup(&self, address: &str, worker: &str) -> Option<[u8; 4]>;
+}
+
 // ── ServerHooks aggregator ──────────────────────────────────────────
 
 /// Composite hook handle for the SV2 mining server. Cheap to clone
@@ -207,6 +224,9 @@ pub struct MiningServerHooks {
     pub rejected_sink: Arc<dyn RejectedShareSink>,
     pub session_persistence: Arc<dyn SessionPersistence>,
     pub device_status_sink: Arc<dyn DeviceStatusSink>,
+    /// Customer extranonce overrides. [`NoOpHooks`] returns `None` for every
+    /// worker, so a deployment without the feature behaves exactly as before.
+    pub custom_extranonce: Arc<dyn CustomExtranonceSource>,
 }
 
 impl MiningServerHooks {
@@ -221,7 +241,8 @@ impl MiningServerHooks {
             accepted_sink: no_op.clone(),
             rejected_sink: no_op.clone(),
             session_persistence: no_op.clone(),
-            device_status_sink: no_op,
+            device_status_sink: no_op.clone(),
+            custom_extranonce: no_op,
         }
     }
 }
@@ -290,6 +311,12 @@ impl DeviceStatusSink for NoOpHooks {
 impl SessionPersistence for NoOpHooks {
     async fn register_session(&self, _: &str, _: &str, _: &str, _: u32, _: Option<&str>) {}
     async fn deregister_session(&self, _: &str) {}
+}
+
+impl CustomExtranonceSource for NoOpHooks {
+    fn lookup(&self, _: &str, _: &str) -> Option<[u8; 4]> {
+        None
+    }
 }
 
 // ── test_support ────────────────────────────────────────────────────
@@ -372,6 +399,8 @@ pub mod test_support {
                 rejected_sink: arc.clone(),
                 session_persistence: arc.clone(),
                 device_status_sink: arc,
+                // RecordingHooks doesn't record EN lookups — no override in tests.
+                custom_extranonce: Arc::new(NoOpHooks),
             }
         }
     }
