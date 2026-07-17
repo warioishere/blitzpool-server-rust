@@ -325,6 +325,19 @@ impl StratumV2MiningServer {
         self.inner.template_tx.subscribe()
     }
 
+    /// How many extranonce prefixes the pool-wide allocator currently holds.
+    ///
+    /// A prefix is taken at channel-open and returned on `CloseChannel` or
+    /// connection teardown, so on a healthy server this tracks the number of
+    /// live channels. A count that only ever climbs means prefixes are being
+    /// stranded by a release path that isn't firing.
+    pub fn allocated_prefix_count(&self) -> usize {
+        match self.inner.extranonce_allocator.lock() {
+            Ok(guard) => guard.allocated_count(),
+            Err(poisoned) => poisoned.into_inner().allocated_count(),
+        }
+    }
+
     /// Spawn a per-connection task. The TCP-accept loop in
     /// `bin/blitzpool` calls this for each socket
     /// `bp_protocol_detect` identifies as SV2 mining.
@@ -971,6 +984,26 @@ async fn run_mining_connection(
                     break;
                 }
             }
+        }
+    }
+
+    // Release every prefix this connection still holds. `CloseChannel`
+    // already releases on a graceful close, but a miner that drops its TCP
+    // connection (power-cut, crash, network blip) never sends one — without
+    // this the prefix stays in the allocator's `used` set until the process
+    // restarts. Every exit from the loop above lands here: the arms only
+    // `break`, none of them `?`. Releasing a key with no allocation is a
+    // no-op, so double-releasing an already-closed channel is harmless.
+    {
+        let mut alloc = match extranonce_allocator.lock() {
+            Ok(guard) => guard,
+            // A poisoned allocator mutex must not strand the prefixes — the
+            // map itself is still consistent (no `.await` is ever held across
+            // the lock), so recover rather than panic on the teardown path.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for channel_id in state.channels.keys() {
+            alloc.release(channel_alloc_key(state.session_id, *channel_id));
         }
     }
 
