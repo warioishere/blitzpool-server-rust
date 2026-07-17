@@ -1069,17 +1069,29 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
     hooks: &MiningServerHooks,
     channel_id: u32,
 ) -> Option<OutboundFrame> {
-    if state.stream != StreamKind::Solo {
-        return None;
-    }
-    // Scope the immutable borrow of address/worker so the `&mut channels`
-    // below doesn't conflict; the prefix is `Copy`.
+    // Look up the override BEFORE the Solo gate: a non-Solo connection that
+    // carries one is a misconfiguration (the API rejects the determinable
+    // non-Solo addresses, but a non-grouped address mining PPLNS by port still
+    // reaches here), and it must produce a loud log rather than a silent drop.
+    // Scope the immutable borrow of address/worker so the `&mut channels` below
+    // doesn't conflict; the prefix is `Copy`.
     let prefix = {
         let address = state.address.as_ref()?;
         hooks
             .custom_extranonce
             .lookup(address.as_str(), &state.worker_name)?
     };
+    // Solo-only: on any other stream the prefix is the sole work-partitioner
+    // across a shared coinbase, so a customer value could overlap another miner.
+    if state.stream != StreamKind::Solo {
+        warn!(
+            worker = %state.worker_name,
+            stream = ?state.stream,
+            "custom-extranonce override set for a non-Solo connection; ignoring \
+             (the override applies only while mining Solo)"
+        );
+        return None;
+    }
     // An override exists for this Solo worker → arm the per-template re-check on
     // the broadcast path, so a later change (the customer setting a new value)
     // lands at the next template without a reconnect.

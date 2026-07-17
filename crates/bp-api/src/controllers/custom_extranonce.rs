@@ -31,8 +31,10 @@
 //! space.
 
 use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
+use bp_common::AddressId;
 use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 
 use super::address_ownership::{parse_supported_address, random_nonce, verify_message_signature};
 use crate::error::ApiError;
@@ -91,6 +93,9 @@ where
     let address = parse_supported_address(&body.address, state.network)?;
     let worker = normalize_worker(&body.worker);
     let prefix = parse_prefix(&body.extranonce)?;
+    // Reject non-Solo addresses up front so a customer isn't handed a message to
+    // sign for an override the core would never apply.
+    ensure_solo_eligible(&state.pool, state.pplns.as_deref(), &address).await?;
 
     let now = crate::time_range::now_ms();
     let expires_at = now + CHALLENGE_TTL_MINUTES * 60 * 1000;
@@ -152,6 +157,9 @@ where
     let address = parse_supported_address(&body.address, state.network)?;
     let worker = normalize_worker(&body.worker);
     let prefix = parse_prefix(&body.extranonce)?;
+    // Defense in depth: re-check here too, in case the address joined a group
+    // between the challenge and this apply.
+    ensure_solo_eligible(&state.pool, state.pplns.as_deref(), &address).await?;
     let signature = body.signature.trim();
     if signature.is_empty() {
         return Err(en_error("missing-signature", StatusCode::BAD_REQUEST));
@@ -251,6 +259,62 @@ fn parse_prefix(raw: &str) -> Result<u32, ApiError> {
     Ok(prefix)
 }
 
+/// Reject an address that can't mine Solo, so it can't set an override the core
+/// would silently never apply (the core gate is `state.stream == Solo`).
+///
+/// Two signals, both false-positive-free (a pure Solo address is in neither):
+///  - **Group / Group-Solo / Blockparty membership** — persistent DB rows, and
+///    membership overrides the port (`resolve_mode`), so it's always non-Solo.
+///  - **Active PPLNS window presence** — an address contributing to the PPLNS
+///    share window right now is mining PPLNS by port, which group membership
+///    can't see. Gated strictly on live window shares; a past PPLNS miner with
+///    only a balance row is not treated as active (it may have switched).
+///
+/// Residual: an *offline* PPLNS miner (aged out of the window, or not yet
+/// connected) still slips through — the core Solo gate drops that safely and
+/// logs it (see `maybe_apply_custom_extranonce`).
+async fn ensure_solo_eligible(
+    pool: &PgPool,
+    pplns: Option<&bp_pplns_engine::engine::PplnsEngine>,
+    address: &AddressId,
+) -> Result<(), ApiError> {
+    let in_group = bp_db::find_group_member_by_address(pool, address)
+        .await?
+        .is_some();
+    let in_blockparty = bp_db::find_blockparty_member_by_address(pool, address)
+        .await?
+        .is_some();
+    if in_group || in_blockparty {
+        return Err(en_error("not-solo-mode", StatusCode::CONFLICT));
+    }
+    // Best-effort PPLNS-window check. On a window-read error we log and allow
+    // rather than couple the feature to Redis availability — the core Solo gate
+    // is the actual guarantee, this is just an earlier, clearer rejection.
+    if let Some(engine) = pplns {
+        match engine.reader().address_status(address.as_str()).await {
+            Ok(status) if pplns_active(status.as_ref()) => {
+                return Err(en_error("not-solo-mode", StatusCode::CONFLICT));
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                %e,
+                "custom-en: PPLNS window check failed; allowing (core Solo gate still enforces it)"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Whether a PPLNS address status means the address is *actively* mining PPLNS
+/// (contributing to the current window), and thus not Solo-eligible. Absent
+/// status or zero live shares → not active; a balance-only (past) miner is not
+/// blocked, since it may have switched to Solo.
+fn pplns_active(status: Option<&bp_pplns_engine::reader::AddressStatus>) -> bool {
+    status
+        .map(|s| s.current_window_shares > 0.0)
+        .unwrap_or(false)
+}
+
 /// The `UNIQUE (address, prefix)` violation is a user error, not a 500: this
 /// address already points another worker at that prefix, which in Solo would
 /// have both workers grinding one search space (same payouts -> same coinbase).
@@ -282,6 +346,27 @@ mod tests {
     use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
     use bitcoin::sign_message::{signed_msg_hash, MessageSignature};
     use bitcoin::{Address, CompressedPublicKey, Network};
+
+    /// The PPLNS-window branch of the Solo guard: block only on LIVE window
+    /// shares, so a Solo address (never in the window) and a past PPLNS miner
+    /// (balance but zero current shares — may have switched to Solo) both pass.
+    #[test]
+    fn pplns_active_gates_on_live_window_shares() {
+        use bp_pplns_engine::reader::AddressStatus;
+        let with_shares = |shares: f64, balance: i64| AddressStatus {
+            address: "bc1qexample".to_string(),
+            balance_sats: balance,
+            total_paid_sats: 0,
+            current_window_shares: shares,
+            current_window_percent: 0.0,
+        };
+        // No status (not in the window, no balance row) → Solo-eligible.
+        assert!(!pplns_active(None));
+        // In the window right now → actively PPLNS.
+        assert!(pplns_active(Some(&with_shares(0.5, 0))));
+        // Zero live shares → not active, even with a non-zero past balance.
+        assert!(!pplns_active(Some(&with_shares(0.0, 12_345))));
+    }
 
     // A real recoverable "Bitcoin Signed Message" signature over `message`,
     // base64 — the exact shape a wallet returns. Mirrors the ownership test's
