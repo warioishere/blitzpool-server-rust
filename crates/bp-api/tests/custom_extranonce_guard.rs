@@ -65,13 +65,16 @@ async fn cleanup(pool: &PgPool) {
         .await;
 }
 
-async fn post_challenge(router: axum::Router, address: &str) -> (StatusCode, serde_json::Value) {
-    let body = format!(r#"{{"address":"{address}","worker":"w1","extranonce":"c0debabe"}}"#);
+async fn post_json(
+    router: axum::Router,
+    uri: &str,
+    body: String,
+) -> (StatusCode, serde_json::Value) {
     let resp = router
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/address/extranonce/challenge")
+                .uri(uri)
                 // The layer keys rate-limits by client IP; give it a source so it
                 // doesn't 500 on a missing one.
                 .header("x-forwarded-for", "127.0.0.1")
@@ -85,6 +88,11 @@ async fn post_challenge(router: axum::Router, address: &str) -> (StatusCode, ser
     let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, json)
+}
+
+async fn post_challenge(router: axum::Router, address: &str) -> (StatusCode, serde_json::Value) {
+    let body = format!(r#"{{"address":"{address}"}}"#);
+    post_json(router, "/api/address/extranonce/challenge", body).await
 }
 
 #[tokio::test]
@@ -132,5 +140,57 @@ async fn challenge_rejects_group_member_and_allows_solo() {
     assert!(
         solo_ok,
         "non-grouped address must get a challenge (200 + message); got {solo_status} {solo_json}"
+    );
+}
+
+/// `set` is token-gated: a Solo-eligible address that passes the Solo guard but
+/// presents no token (or a wrong one) must be rejected 401 — never persisting an
+/// override on the strength of the address alone.
+#[tokio::test]
+async fn set_rejects_without_valid_token() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // Make sure no stale token/override for SOLO_ADDR lingers from a prior run.
+    let _ = sqlx::query("DELETE FROM pplns_extranonce_token WHERE address = $1")
+        .bind(SOLO_ADDR)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM pplns_custom_extranonce WHERE address = $1")
+        .bind(SOLO_ADDR)
+        .execute(&pool)
+        .await;
+
+    // No token has ever been issued for this address → 401 no-token.
+    let body = format!(
+        r#"{{"address":"{SOLO_ADDR}","worker":"w1","extranonce":"c0debabe","token":"deadbeef"}}"#
+    );
+    let (status, json) = post_json(
+        build_router(minimal_state(pool.clone())),
+        "/api/address/extranonce/set",
+        body,
+    )
+    .await;
+
+    // The override must NOT have been written.
+    let persisted: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pplns_custom_extranonce WHERE address = $1")
+            .bind(SOLO_ADDR)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0);
+
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "set without a token must be 401; got {status} {json}"
+    );
+    assert_eq!(
+        json["code"], "no-token",
+        "expected no-token code; got {json}"
+    );
+    assert_eq!(
+        persisted, 0,
+        "no override may be persisted on a rejected set"
     );
 }

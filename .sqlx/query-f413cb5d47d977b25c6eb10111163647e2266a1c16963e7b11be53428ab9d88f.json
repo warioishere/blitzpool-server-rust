@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            message AS \"message!\",\n            \"createdAt\" AS \"created_at!\",\n            \"expiresAt\" AS \"expires_at!\"\n           FROM pplns_extranonce_challenge WHERE address = $1 LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "message!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "expires_at!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f413cb5d47d977b25c6eb10111163647e2266a1c16963e7b11be53428ab9d88f"
+}

@@ -103,8 +103,8 @@ pub use client::{
 };
 pub use custom_extranonce::{
     all_custom_extranonces, delete_extranonce_challenge, find_extranonce_challenge,
-    upsert_custom_extranonce, upsert_extranonce_challenge, CustomExtranonceRow,
-    ExtranonceChallengeRow,
+    find_extranonce_token, upsert_custom_extranonce, upsert_extranonce_challenge,
+    upsert_extranonce_token, CustomExtranonceRow, ExtranonceChallengeRow, ExtranonceTokenRow,
 };
 pub use email::{
     delete_email_verification_by_token, delete_email_verifications_for_address,

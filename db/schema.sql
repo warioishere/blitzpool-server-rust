@@ -1652,13 +1652,22 @@ CREATE INDEX redis_state_backup_captured_at_idx ON public.redis_state_backup USI
 
 CREATE TABLE public.pplns_extranonce_challenge (
     address character varying(62) NOT NULL,
-    worker character varying NOT NULL,
-    prefix bigint NOT NULL,
     message text NOT NULL,
     "createdAt" bigint NOT NULL,
     "expiresAt" bigint NOT NULL,
-    CONSTRAINT pplns_extranonce_challenge_pkey PRIMARY KEY (address),
-    CONSTRAINT pplns_extranonce_challenge_prefix_u32 CHECK (prefix >= 0 AND prefix <= 4294967295)
+    CONSTRAINT pplns_extranonce_challenge_pkey PRIMARY KEY (address)
+);
+
+
+--
+-- Name: pplns_extranonce_token; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pplns_extranonce_token (
+    address character varying(62) NOT NULL,
+    "tokenHash" character varying(64) NOT NULL,
+    "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
+    CONSTRAINT pplns_extranonce_token_pkey PRIMARY KEY (address)
 );
 
 

@@ -1,8 +1,10 @@
 # Custom Extranonce API
 
 Let a **Solo** miner pin its own 4-byte extranonce prefix per worker instead of
-the pool-allocated one, authorised by a Bitcoin message signature. This is a
-niche, opt-in feature — most miners never touch it.
+the pool-allocated one. Authorisation is a **bearer token**: you prove control
+of the address **once** by signing a challenge, the API hands you a token, and
+every subsequent "set the prefix for worker X" call carries that token. This is
+a niche, opt-in feature — most miners never touch it.
 
 ---
 
@@ -10,7 +12,7 @@ niche, opt-in feature — most miners never touch it.
 
 Two processes are involved and they do **not** share memory:
 
-1. **API process** — receives your HTTP calls, verifies a Bitcoin signature, and
+1. **API process** — receives your HTTP calls, issues/verifies the token, and
    writes the override into Postgres (`pplns_custom_extranonce`).
 2. **Stratum core** — the process your miner actually connects to. It refreshes
    an in-memory copy of the override table from Postgres **every 10 seconds**.
@@ -21,34 +23,47 @@ Two processes are involved and they do **not** share memory:
 So a change you make via the API lands on the core within ~10 s and then applies
 at the next opportunity (see [When the EN is used](#when-the-en-is-used)).
 
-There is **no** requirement that the address has ever mined. Verification checks
-only the signature and the address format — a brand-new, never-mined address can
-be verified and can have an override set. The prefix takes effect the first time
-a miner authorises with that address and opens an Extended channel.
+There is **no** requirement that the address has ever mined. The token is issued
+purely on a valid signature over the challenge — a brand-new, never-mined
+address can be verified and have an override set. The prefix takes effect the
+first time a miner authorises with that address and opens an Extended channel.
+
+### The auth model
+
+- The **signature** is used exactly once, to issue a token. It is nonced and
+  expiring, so it can't be replayed.
+- The **token** is the reusable credential. It is a random 32-byte value; only
+  its SHA-256 hash is stored server-side (the same pattern as the group admin
+  token), so it can't be recovered later — **store it when it's returned**.
+- Re-issuing a token (sign a fresh challenge again) **overwrites and revokes**
+  the previous one. That is also how you rotate or revoke a leaked token.
+- The token's only power is setting a custom extranonce prefix on this address's
+  own Solo workers. It can **not** move money — the coinbase still pays the
+  address — which is why a long-lived token is an acceptable, low-stakes
+  credential.
 
 ---
 
 ## Endpoints
 
-Both are rate-limited to **5 requests/minute per client IP**.
+`challenge` and `token` are rate-limited to **5 requests/minute per client IP**;
+`set` to **30/minute** (you may have many workers to configure).
 
 ### 1. `POST /api/address/extranonce/challenge`
 
-Ask for the exact message to sign.
+Ask for the exact message to sign. Takes the address only.
 
 ```jsonc
 // request
 {
-  "address": "bc1q…",        // your Solo payout address (mainnet)
-  "worker":  "rig1",          // worker name; empty → "default"
-  "extranonce": "c0debabe"    // desired prefix, 8 hex chars (see below)
+  "address": "bc1q…"          // your Solo payout address (mainnet)
 }
 ```
 
 ```jsonc
 // 200 response
 {
-  "message": "Blitzpool extranonce change\nAddress: bc1q…\nWorker: rig1\nExtranonce: c0debabe\nNonce: …\nIssued(ms): …\nExpires(ms): …",
+  "message": "Blitzpool extranonce token request\nAddress: bc1q…\nNonce: …\nIssued(ms): …\nExpires(ms): …",
   "expiresAt": 1730000000000  // epoch ms; the message is valid for 15 minutes
 }
 ```
@@ -59,20 +74,48 @@ signature families are accepted, so any wallet works:
 - **BIP-322** (covers taproot `bc1p…` and segwit)
 - **BIP-137 / Electrum** legacy recoverable signatures (base64)
 
-The message binds the address, worker, prefix, a nonce and an expiry, so a
-captured signature can't be replayed for a different change or after it expires.
+The message binds the address, a nonce and an expiry, so a captured signature
+can't be replayed after it expires or after the token is issued (the challenge
+is consumed on issue).
 
-### 2. `POST /api/address/extranonce/apply`
+### 2. `POST /api/address/extranonce/token`
 
-Submit the signature to store the override.
+Submit the signature to be issued a token.
 
 ```jsonc
 // request
 {
   "address": "bc1q…",
-  "worker":  "rig1",
-  "extranonce": "c0debabe",   // must match the challenge exactly
-  "signature": "…"             // base64 (BIP-137) or BIP-322 encoded
+  "signature": "…"            // base64 (BIP-137) or BIP-322 encoded
+}
+```
+
+```jsonc
+// 200 response
+{
+  "address": "bc1q…",
+  "token": "3f9a…64hex…",      // ← store this; it is shown only once
+  "createdAt": 1730000000000
+}
+```
+
+The signature is verified against the **stored** challenge message (never a
+client-supplied one), the challenge is consumed, and a fresh token is returned.
+Only the token's hash is kept, so it cannot be retrieved again — if you lose it,
+sign a new challenge to mint a replacement (which revokes the old one).
+
+### 3. `POST /api/address/extranonce/set`
+
+Headless, no-UI call: set (or change) the prefix for one worker. Repeat per
+worker, and per change, with the **same** token.
+
+```jsonc
+// request
+{
+  "address": "bc1q…",
+  "worker":  "rig1",          // worker name; empty → "default"
+  "extranonce": "c0debabe",   // desired prefix, 8 hex chars (see below)
+  "token": "3f9a…64hex…"       // the token from step 2
 }
 ```
 
@@ -86,12 +129,10 @@ Submit the signature to store the override.
 }
 ```
 
-The signature is verified against the **stored** challenge message (never a
-client-supplied one), and the challenge is checked to name this exact
-`(worker, extranonce)` — so one signature authorises exactly one change.
-
-To change the prefix again, request a **new** challenge and sign it again. Every
-change is a fresh signature; there is no long-lived token.
+The token is hashed and compared to the stored hash for this address; the Solo
+guard still applies. To set a different worker, call `set` again with the same
+token and a different `worker`. To change a worker's prefix, call `set` again
+with a new `extranonce`.
 
 ---
 
@@ -141,7 +182,8 @@ custom prefix there could overlap another miner's search space.
 
 - The API rejects addresses it can tell are non-Solo — members of a group /
   Group-Solo / Blockparty, or an address currently mining in the PPLNS window —
-  with `409 not-solo-mode`.
+  with `409 not-solo-mode`. This is checked both when issuing the challenge and
+  on every `set`.
 - A non-grouped address that mines PPLNS purely by connecting on a PPLNS port
   can't be detected at write time, but the core still refuses to apply the
   override on a non-Solo connection and logs a warning. Either way the override
@@ -167,7 +209,7 @@ What **is** enforced, and what isn't:
   the extranonce is per **connection**. If you run **two physical devices under
   the same `address.worker`**, both receive the same prefix and grind the same
   space — they collide with each other. Give each device a **distinct worker
-  name**.
+  name**. Setting one prefix per worker is exactly what the `set` call is for.
 - **Multi-channel connections:** only the **primary** (first) channel of a
   connection receives the override; any additional channels keep their distinct
   pool-allocated prefixes. An aggregating proxy therefore never collapses, but
@@ -197,10 +239,12 @@ What **is** enforced, and what isn't:
 |------|----------------------------|--------------------------------------------------------------------|
 | 400  | `invalid-extranonce`       | prefix isn't 8 hex chars                                            |
 | 400  | `reserved-extranonce-range`| prefix top byte is `0x00`/`0x01`                                    |
-| 400  | `missing-signature`        | empty signature on apply                                           |
+| 400  | `missing-signature`        | empty signature when requesting a token                            |
 | 400  | `invalid-signature`        | signature doesn't verify against the stored challenge message      |
-| 400  | `challenge-mismatch`       | apply's `(worker, extranonce)` differs from the stored challenge   |
-| 404  | `no-challenge`             | apply with no pending challenge for the address                    |
+| 401  | `missing-token`            | empty token on `set`                                               |
+| 401  | `no-token`                 | no token has been issued for this address                          |
+| 401  | `invalid-token`            | token doesn't match the stored hash                                |
+| 404  | `no-challenge`             | token request with no pending challenge for the address           |
 | 409  | `not-solo-mode`            | address is (determinably) not mining Solo                          |
 | 409  | `extranonce-in-use`        | this address already points another worker at that prefix          |
 | 410  | `challenge-expired`        | the challenge is older than 15 minutes                             |
@@ -210,13 +254,22 @@ What **is** enforced, and what isn't:
 ## Typical flow
 
 ```
-1. POST /api/address/extranonce/challenge {address, worker, extranonce}
+One-time, to get a token:
+1. POST /api/address/extranonce/challenge {address}
         → sign the returned `message` with the address key
-2. POST /api/address/extranonce/apply     {address, worker, extranonce, signature}
+2. POST /api/address/extranonce/token     {address, signature}
+        → 200: store the returned `token` (shown only once)
+
+Per worker, any time (reuse the token):
+3. POST /api/address/extranonce/set        {address, worker, extranonce, token}
         → 200: override stored
-3. (Re)start the miner authorising as `address.worker` on a Solo port,
+
+4. (Re)start the miner authorising as `address.worker` on a Solo port,
    opening an SV2 Extended channel
         → the core applies the prefix on the first job
-4. To change it while running: repeat 1–2 with a new value; it lands at the
-   next template (armed connection), no reconnect.
+5. To change a worker while running: repeat step 3 with a new value; it lands
+   at the next template (armed connection), no reconnect.
+
+Lost the token, or want to rotate it? Repeat steps 1–2 — the new token
+replaces (revokes) the old one.
 ```

@@ -1,18 +1,19 @@
 -- Customer-set extranonce prefix per worker (the custom-extranonce API).
 --
--- One paying customer wants to pick his own extranonce-1 instead of taking the
--- pool-allocated one. Authorisation is a FRESH Bitcoin message signature per
--- change: an existing pplns_address_ownership row proves the address signed at
--- SOME point, which is not an auth check (anyone could then post for that
--- address), so each change carries its own signed challenge.
+-- One paying customer wants to pick his own extranonce-1 per worker instead of
+-- taking the pool-allocated one. Auth is a stored bearer TOKEN: the address
+-- proves key control once by signing a challenge, the API issues a token
+-- (random, only its hash stored — the `adminTokenHash` pattern), and every
+-- headless "set the EN for this worker" call carries that token. The feature is
+-- Solo-only and cannot move money (the coinbase still pays the address), so a
+-- long-lived token is an acceptable, low-stakes credential.
 --
---   pplns_extranonce_challenge — the short-lived message the address must sign.
---                                The requested change is stored ALONGSIDE the
---                                message so verify can check that the signature
---                                covers this exact (worker, prefix) and not
---                                some other one. PK address: one pending
---                                change per address at a time, mirroring
---                                pplns_ownership_challenge.
+--   pplns_extranonce_challenge — the short-lived message an address signs to be
+--                                issued a token (PK address; nonced + expiring
+--                                so the signature itself is one-time and never
+--                                becomes a reusable credential).
+--   pplns_extranonce_token     — the issued token's hash (PK address). Re-issue
+--                                overwrites it, revoking the previous token.
 --   pplns_custom_extranonce    — the applied override, read at channel-open.
 --
 -- `prefix` is the 4-byte extranonce prefix as an unsigned 32-bit value. Stored
@@ -20,13 +21,13 @@
 -- u32 range so the Rust side can narrow bigint -> u32 without a fallible
 -- conversion at every read.
 --
--- UNIQUE (address, prefix) — deliberately scoped to ONE address, not global.
--- Prefix uniqueness only matters between connections that hash the SAME
--- coinbase (same bp_mining_job cache key = same payouts + template; see
--- bp_common::extranonce). The pool is non-custodial, so:
+-- UNIQUE (address, prefix) on the overrides — deliberately scoped to ONE
+-- address, not global. Prefix uniqueness only matters between connections that
+-- hash the SAME coinbase (same payouts + template; see bp_common::extranonce).
+-- The pool is non-custodial, so:
 --   * same address, two workers, same prefix -> Solo pays the same address ->
 --     identical coinbase -> the prefix is the sole work-partitioner -> the two
---     workers really would grind the same search space. Rejected here.
+--     workers would grind the same search space. Rejected here.
 --   * different addresses, same prefix -> different payout outputs ->
 --     different coinbase -> different header regardless of the prefix ->
 --     harmless. Allowed; a global UNIQUE would reject it for no reason.
@@ -35,13 +36,17 @@
 -- already has these tables, so this migration is a no-op there.
 CREATE TABLE IF NOT EXISTS pplns_extranonce_challenge (
     address character varying(62) NOT NULL,
-    worker character varying NOT NULL,
-    prefix bigint NOT NULL,
     message text NOT NULL,
     "createdAt" bigint NOT NULL,
     "expiresAt" bigint NOT NULL,
-    CONSTRAINT pplns_extranonce_challenge_pkey PRIMARY KEY (address),
-    CONSTRAINT pplns_extranonce_challenge_prefix_u32 CHECK (prefix >= 0 AND prefix <= 4294967295)
+    CONSTRAINT pplns_extranonce_challenge_pkey PRIMARY KEY (address)
+);
+
+CREATE TABLE IF NOT EXISTS pplns_extranonce_token (
+    address character varying(62) NOT NULL,
+    "tokenHash" character varying(64) NOT NULL,
+    "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
+    CONSTRAINT pplns_extranonce_token_pkey PRIMARY KEY (address)
 );
 
 CREATE TABLE IF NOT EXISTS pplns_custom_extranonce (

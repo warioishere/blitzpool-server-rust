@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pplns_extranonce_token (address, \"tokenHash\", \"createdAt\")\n           VALUES ($1, $2, $3)\n           ON CONFLICT (address) DO UPDATE SET\n             \"tokenHash\" = EXCLUDED.\"tokenHash\",\n             \"createdAt\" = EXCLUDED.\"createdAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b09705292ae4e904262a21d19097087a63f30f78405f38c0956b30f19675b6cf"
+}

@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"tokenHash\" AS \"token_hash!\",\n            \"createdAt\" AS \"created_at!\"\n           FROM pplns_extranonce_token WHERE address = $1 LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "token_hash!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "77eedb4d8432719cfa19d64cce482c57ec79b8add7cbfea74d6afafa6b75f182"
+}

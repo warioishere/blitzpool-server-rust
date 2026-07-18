@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Customer-set extranonce prefix per worker.
+//! Customer-set extranonce prefix per worker, with a stored bearer token.
 //!
-//! - `pplns_extranonce_challenge` — the short-lived message an address must sign
-//!   to authorise ONE change, stored next to the exact change it authorises (PK
-//!   address; only the most recent challenge is valid).
+//! - `pplns_extranonce_challenge` — the short-lived message an address signs to
+//!   be issued a token (PK address, nonced + expiring, consumed on issue — so
+//!   the signature itself is one-time and never a reusable credential).
+//! - `pplns_extranonce_token`     — the issued token's hash (PK address).
+//!   Re-issuing overwrites it, which revokes the previous token.
 //! - `pplns_custom_extranonce`    — the applied override, read at channel-open.
 //!
-//! Authorisation is a FRESH signature per change. An existing
-//! [`crate::is_address_ownership_verified`] row only proves the address signed at
-//! some point in the past, which would let anyone post a change for any
-//! previously-verified address — so `verify` re-checks a signature over the
-//! stored message and confirms that message names this exact `(worker, prefix)`.
+//! The token (not the signature) is the reusable credential: the customer signs
+//! once to be issued a token, then presents that token on every headless
+//! "set the EN for worker X" call. Only its SHA-256 hash is stored, mirroring
+//! `pplns_group.adminTokenHash`.
 //!
 //! `prefix` is the 4-byte extranonce prefix, a `u32` everywhere in the pool (see
 //! `bp_common::extranonce`). Postgres has no unsigned integer type, so the column
@@ -24,17 +25,21 @@ use sqlx::postgres::PgPool;
 
 use crate::DbError;
 
-/// A pending, signature-authorised extranonce change.
+/// A pending token-issuance challenge (address-scoped, nonced, expiring).
 #[derive(Clone, Debug)]
 pub struct ExtranonceChallengeRow {
     pub address: AddressId,
-    pub worker: String,
-    /// The prefix the signed message authorises — compared against the apply
-    /// request so a captured signature can't be replayed for a different value.
-    pub prefix: u32,
     pub message: String,
     pub created_at: i64,
     pub expires_at: i64,
+}
+
+/// The issued token's hash for an address.
+#[derive(Clone, Debug)]
+pub struct ExtranonceTokenRow {
+    pub address: AddressId,
+    pub token_hash: String,
+    pub created_at: i64,
 }
 
 /// An applied extranonce override.
@@ -54,37 +59,31 @@ fn prefix_to_u32(v: i64) -> u32 {
     v as u32
 }
 
+// ── Token-issuance challenge ─────────────────────────────────────────
+
 /// INSERT-or-replace the pending challenge for an address. PK address, so a
 /// re-request overwrites the old one — only the most recent is ever valid.
 pub async fn upsert_extranonce_challenge(
     pool: &PgPool,
     address: &AddressId,
-    worker: &str,
-    prefix: u32,
     message: &str,
     created_at_ms: i64,
     expires_at_ms: i64,
 ) -> Result<ExtranonceChallengeRow, DbError> {
     let r = sqlx::query!(
         r#"INSERT INTO pplns_extranonce_challenge
-             (address, worker, prefix, message, "createdAt", "expiresAt")
-           VALUES ($1, $2, $3, $4, $5, $6)
+             (address, message, "createdAt", "expiresAt")
+           VALUES ($1, $2, $3, $4)
            ON CONFLICT (address) DO UPDATE SET
-             worker = EXCLUDED.worker,
-             prefix = EXCLUDED.prefix,
              message = EXCLUDED.message,
              "createdAt" = EXCLUDED."createdAt",
              "expiresAt" = EXCLUDED."expiresAt"
            RETURNING
             address AS "address!: AddressId",
-            worker AS "worker!",
-            prefix AS "prefix!",
             message AS "message!",
             "createdAt" AS "created_at!",
             "expiresAt" AS "expires_at!""#,
         address.as_str(),
-        worker,
-        i64::from(prefix),
         message,
         created_at_ms,
         expires_at_ms,
@@ -94,8 +93,6 @@ pub async fn upsert_extranonce_challenge(
     .map_err(DbError::from)?;
     Ok(ExtranonceChallengeRow {
         address: r.address,
-        worker: r.worker,
-        prefix: prefix_to_u32(r.prefix),
         message: r.message,
         created_at: r.created_at,
         expires_at: r.expires_at,
@@ -109,8 +106,6 @@ pub async fn find_extranonce_challenge(
     let r = sqlx::query!(
         r#"SELECT
             address AS "address!: AddressId",
-            worker AS "worker!",
-            prefix AS "prefix!",
             message AS "message!",
             "createdAt" AS "created_at!",
             "expiresAt" AS "expires_at!"
@@ -122,15 +117,13 @@ pub async fn find_extranonce_challenge(
     .map_err(DbError::from)?;
     Ok(r.map(|r| ExtranonceChallengeRow {
         address: r.address,
-        worker: r.worker,
-        prefix: prefix_to_u32(r.prefix),
         message: r.message,
         created_at: r.created_at,
         expires_at: r.expires_at,
     }))
 }
 
-/// DELETE the pending challenge for an address. Called after a successful apply
+/// DELETE the pending challenge for an address. Called after a token is issued
 /// (consume it) or when it has expired.
 pub async fn delete_extranonce_challenge(
     pool: &PgPool,
@@ -145,6 +138,52 @@ pub async fn delete_extranonce_challenge(
     .map_err(DbError::from)?;
     Ok(result.rows_affected())
 }
+
+// ── Bearer token ─────────────────────────────────────────────────────
+
+/// INSERT-or-replace the token hash for an address. PK address, so re-issuing a
+/// token overwrites (revokes) the previous one.
+pub async fn upsert_extranonce_token(
+    pool: &PgPool,
+    address: &AddressId,
+    token_hash: &str,
+    now_ms: i64,
+) -> Result<(), DbError> {
+    sqlx::query!(
+        r#"INSERT INTO pplns_extranonce_token (address, "tokenHash", "createdAt")
+           VALUES ($1, $2, $3)
+           ON CONFLICT (address) DO UPDATE SET
+             "tokenHash" = EXCLUDED."tokenHash",
+             "createdAt" = EXCLUDED."createdAt""#,
+        address.as_str(),
+        token_hash,
+        now_ms,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(())
+}
+
+pub async fn find_extranonce_token(
+    pool: &PgPool,
+    address: &AddressId,
+) -> Result<Option<ExtranonceTokenRow>, DbError> {
+    sqlx::query_as!(
+        ExtranonceTokenRow,
+        r#"SELECT
+            address AS "address!: AddressId",
+            "tokenHash" AS "token_hash!",
+            "createdAt" AS "created_at!"
+           FROM pplns_extranonce_token WHERE address = $1 LIMIT 1"#,
+        address.as_str()
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::from)
+}
+
+// ── Applied override ─────────────────────────────────────────────────
 
 /// INSERT-or-update the override for `(address, worker)`.
 ///
