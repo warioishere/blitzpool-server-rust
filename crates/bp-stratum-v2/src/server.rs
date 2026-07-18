@@ -1096,6 +1096,21 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
     // the broadcast path, so a later change (the customer setting a new value)
     // lands at the next template without a reconnect.
     state.uses_custom_extranonce = true;
+    // Custom EN targets ONE channel per connection — the primary. Every channel
+    // of a connection shares its (address, worker) and so resolves to the SAME
+    // override; in Solo the prefix is the sole work-partitioner (identical
+    // coinbase), so applying it to a second channel would collapse the two
+    // search spaces and roughly halve effective hashrate. The primary keeps the
+    // custom value; any additional channel keeps its distinct allocated prefix.
+    if Some(channel_id) != state.primary_channel {
+        warn!(
+            worker = %state.worker_name,
+            channel_id,
+            "custom-extranonce applies to the primary channel only; this additional \
+             channel keeps its pool-allocated prefix"
+        );
+        return None;
+    }
     let channel = state.channels.get_mut(&channel_id)?;
     // Extended only: the per-job prefix pin + the miner's own coinbase splice
     // are Extended-channel mechanics. A Standard channel bakes the prefix into
@@ -1159,19 +1174,24 @@ fn custom_extranonce_broadcast_frames<C: bp_vardiff::Clock>(
             None => return Vec::new(),
         }
     };
+    // Only the primary channel carries the override — the same one-channel rule
+    // as channel-open (`maybe_apply_custom_extranonce`). Touching every channel
+    // here would collapse a multi-channel connection's distinct prefixes onto
+    // one and halve its hashrate.
+    let Some(primary) = state.primary_channel else {
+        return Vec::new();
+    };
     let mut frames = Vec::new();
-    for (channel_id, channel) in state.channels.iter_mut() {
-        if channel.kind != crate::mining::channel::ChannelKind::Extended {
-            continue;
+    if let Some(channel) = state.channels.get_mut(&primary) {
+        if channel.kind == crate::mining::channel::ChannelKind::Extended
+            && channel.extranonce_prefix.as_slice() != prefix.as_slice()
+        {
+            channel.extranonce_prefix = prefix.to_vec();
+            frames.push(OutboundFrame::SetExtranoncePrefix {
+                channel_id: primary,
+                extranonce_prefix: prefix.to_vec(),
+            });
         }
-        if channel.extranonce_prefix.as_slice() == prefix.as_slice() {
-            continue; // already on this prefix — nothing to switch
-        }
-        channel.extranonce_prefix = prefix.to_vec();
-        frames.push(OutboundFrame::SetExtranoncePrefix {
-            channel_id: *channel_id,
-            extranonce_prefix: prefix.to_vec(),
-        });
     }
     frames
 }
@@ -1760,6 +1780,8 @@ mod tests {
                 [0xFF; 32],
             ),
         );
+        // First channel opened is the primary — the only one the override targets.
+        s.primary_channel = Some(channel_id);
         s
     }
 
@@ -1946,6 +1968,79 @@ mod tests {
         assert_eq!(
             s.channels.get(&7).unwrap().extranonce_prefix,
             vec![0xC0, 0xDE, 0xBA, 0xBE]
+        );
+    }
+
+    fn add_extended_channel(
+        s: &mut MiningSessionState<Arc<TestClock>>,
+        channel_id: u32,
+        prefix: Vec<u8>,
+    ) {
+        s.channels.insert(
+            channel_id,
+            crate::mining::channel::ChannelState::new_extended(
+                channel_id,
+                prefix,
+                8,
+                Difficulty(1024.0),
+                [0xFF; 32],
+            ),
+        );
+    }
+
+    /// Multi-channel connection: the override applies to the primary channel
+    /// only. A second channel keeps its distinct allocated prefix, so the two
+    /// never collapse onto one search space (which in Solo would halve hashrate).
+    #[test]
+    fn custom_extranonce_applies_only_to_primary_channel_at_open() {
+        const CUSTOM: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
+        let alloc2 = vec![0x00, 0x00, 0x00, 0x09];
+        let mut s = solo_session_with_extended_channel(7, vec![0x00, 0x00, 0x00, 0x05]);
+        add_extended_channel(&mut s, 8, alloc2.clone());
+        let hooks = hooks_with_override(ADDR, "wrk", CUSTOM);
+
+        // Primary (7) applies.
+        assert!(matches!(
+            maybe_apply_custom_extranonce(&mut s, &hooks, 7),
+            Some(OutboundFrame::SetExtranoncePrefix { channel_id: 7, .. })
+        ));
+        assert_eq!(
+            s.channels.get(&7).unwrap().extranonce_prefix,
+            CUSTOM.to_vec()
+        );
+
+        // Non-primary (8) is skipped and keeps its distinct allocated prefix.
+        assert!(maybe_apply_custom_extranonce(&mut s, &hooks, 8).is_none());
+        assert_eq!(s.channels.get(&8).unwrap().extranonce_prefix, alloc2);
+        assert_ne!(
+            s.channels.get(&7).unwrap().extranonce_prefix,
+            s.channels.get(&8).unwrap().extranonce_prefix,
+            "the two channels must keep distinct prefixes — no collapse"
+        );
+    }
+
+    /// Same one-channel rule on the live broadcast path: a change switches only
+    /// the primary; other channels stay on their distinct prefixes.
+    #[test]
+    fn broadcast_frames_switch_only_the_primary_channel() {
+        const NEW: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+        let alloc2 = vec![0x00, 0x00, 0x00, 0x09];
+        let mut s = solo_session_with_extended_channel(7, vec![0xC0, 0xDE, 0xBA, 0xBE]);
+        s.uses_custom_extranonce = true;
+        add_extended_channel(&mut s, 8, alloc2.clone());
+        let hooks = hooks_with_override(ADDR, "wrk", NEW);
+
+        let frames = custom_extranonce_broadcast_frames(&mut s, &hooks);
+        assert_eq!(frames.len(), 1, "exactly one switch — the primary");
+        assert!(matches!(
+            &frames[0],
+            OutboundFrame::SetExtranoncePrefix { channel_id: 7, .. }
+        ));
+        assert_eq!(s.channels.get(&7).unwrap().extranonce_prefix, NEW.to_vec());
+        assert_eq!(
+            s.channels.get(&8).unwrap().extranonce_prefix,
+            alloc2,
+            "non-primary channel must be untouched — no collapse"
         );
     }
 
