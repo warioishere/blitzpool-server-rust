@@ -1,0 +1,222 @@
+# Custom Extranonce API
+
+Let a **Solo** miner pin its own 4-byte extranonce prefix per worker instead of
+the pool-allocated one, authorised by a Bitcoin message signature. This is a
+niche, opt-in feature — most miners never touch it.
+
+---
+
+## How it works (roughly)
+
+Two processes are involved and they do **not** share memory:
+
+1. **API process** — receives your HTTP calls, verifies a Bitcoin signature, and
+   writes the override into Postgres (`pplns_custom_extranonce`).
+2. **Stratum core** — the process your miner actually connects to. It refreshes
+   an in-memory copy of the override table from Postgres **every 10 seconds**.
+   When your miner opens a channel (and, for an already-armed connection, on
+   each new job), the core swaps in your prefix and tells the miner with an SV2
+   `SetExtranoncePrefix` message.
+
+So a change you make via the API lands on the core within ~10 s and then applies
+at the next opportunity (see [When the EN is used](#when-the-en-is-used)).
+
+There is **no** requirement that the address has ever mined. Verification checks
+only the signature and the address format — a brand-new, never-mined address can
+be verified and can have an override set. The prefix takes effect the first time
+a miner authorises with that address and opens an Extended channel.
+
+---
+
+## Endpoints
+
+Both are rate-limited to **5 requests/minute per client IP**.
+
+### 1. `POST /api/address/extranonce/challenge`
+
+Ask for the exact message to sign.
+
+```jsonc
+// request
+{
+  "address": "bc1q…",        // your Solo payout address (mainnet)
+  "worker":  "rig1",          // worker name; empty → "default"
+  "extranonce": "c0debabe"    // desired prefix, 8 hex chars (see below)
+}
+```
+
+```jsonc
+// 200 response
+{
+  "message": "Blitzpool extranonce change\nAddress: bc1q…\nWorker: rig1\nExtranonce: c0debabe\nNonce: …\nIssued(ms): …\nExpires(ms): …",
+  "expiresAt": 1730000000000  // epoch ms; the message is valid for 15 minutes
+}
+```
+
+Sign the returned `message` **verbatim** with the address's private key. Both
+signature families are accepted, so any wallet works:
+
+- **BIP-322** (covers taproot `bc1p…` and segwit)
+- **BIP-137 / Electrum** legacy recoverable signatures (base64)
+
+The message binds the address, worker, prefix, a nonce and an expiry, so a
+captured signature can't be replayed for a different change or after it expires.
+
+### 2. `POST /api/address/extranonce/apply`
+
+Submit the signature to store the override.
+
+```jsonc
+// request
+{
+  "address": "bc1q…",
+  "worker":  "rig1",
+  "extranonce": "c0debabe",   // must match the challenge exactly
+  "signature": "…"             // base64 (BIP-137) or BIP-322 encoded
+}
+```
+
+```jsonc
+// 200 response
+{
+  "address": "bc1q…",
+  "worker": "rig1",
+  "extranonce": "c0debabe",
+  "updatedAt": 1730000000000
+}
+```
+
+The signature is verified against the **stored** challenge message (never a
+client-supplied one), and the challenge is checked to name this exact
+`(worker, extranonce)` — so one signature authorises exactly one change.
+
+To change the prefix again, request a **new** challenge and sign it again. Every
+change is a fresh signature; there is no long-lived token.
+
+---
+
+## Prefix format & reserved range
+
+- 8 hex characters (a `0x` prefix is accepted and ignored), case-insensitive.
+- Allowed range: **`0x02000000` – `0xFFFFFFFF`**.
+- **`0x00……` and `0x01……` are rejected** (`reserved-extranonce-range`). Those
+  top bytes are the partitions the SV2 and SV1 servers allocate from
+  automatically, so a value there could later be handed to another miner. Values
+  from `0x02……` up are never auto-allocated, so they are yours exclusively.
+
+That leaves ~99 % of the space. If you need a value in `0x00……`/`0x01……`, you
+can't — pick anything from `0x02000000` on.
+
+---
+
+## When the EN is used
+
+- **At channel-open.** The override applies when your miner opens an Extended
+  channel — i.e. when it connects or reconnects. Set the override **before** the
+  miner connects and it is baked into the first job.
+- **Live, without reconnect.** If the connection was already carrying an override
+  when it opened (it is then "armed"), a new value you set via the API lands at
+  the **next job/template** — within one cache refresh (~10 s) plus the next
+  template. No reconnect needed.
+- **Caveat — the first override needs a connect.** If your miner is already
+  connected with **no** override when you set the very first one, it won't apply
+  until the miner reconnects (the connection is armed at channel-open). After
+  that first one, further changes are live. In practice: set your initial
+  override before starting the miner, then change it freely while it runs.
+- **Your old EN stays valid during a switch.** Each job remembers the prefix it
+  went out under, so shares still in flight for the previous job are accepted —
+  no rejected-share burst at the moment of change.
+- **Not retroactive on a block-change job.** When a new block appears the pool
+  builds and sends the block job to every miner in milliseconds — long before
+  your script can react and call the API. Your new value therefore lands on the
+  **next** job after your call, not on that block's first job.
+
+---
+
+## Solo-only
+
+The feature only works while mining **Solo**, because a non-Solo (PPLNS /
+Group-Solo / Blockparty) miner does not hash its own dedicated coinbase, so a
+custom prefix there could overlap another miner's search space.
+
+- The API rejects addresses it can tell are non-Solo — members of a group /
+  Group-Solo / Blockparty, or an address currently mining in the PPLNS window —
+  with `409 not-solo-mode`.
+- A non-grouped address that mines PPLNS purely by connecting on a PPLNS port
+  can't be detected at write time, but the core still refuses to apply the
+  override on a non-Solo connection and logs a warning. Either way the override
+  never applies off Solo.
+
+---
+
+## No collision check (by design)
+
+There is **no cross-address collision check**, and this is intentional and safe:
+
+- The pool is non-custodial, so in Solo every address hashes a coinbase with its
+  **own** payout outputs. Two **different** addresses using the **same** prefix
+  therefore produce different block headers — they can never overlap. Enforcing
+  global prefix uniqueness would reject harmless cases for no reason.
+
+What **is** enforced, and what isn't:
+
+- **Enforced:** `UNIQUE (address, prefix)`. One address may **not** point two of
+  its own workers at the same prefix — in Solo that would collapse their search
+  spaces and waste hashrate. Violating it returns `409 extranonce-in-use`.
+- **Not enforced (your footgun):** the override is per `(address, worker)`, but
+  the extranonce is per **connection**. If you run **two physical devices under
+  the same `address.worker`**, both receive the same prefix and grind the same
+  space — they collide with each other. Give each device a **distinct worker
+  name**.
+- **Multi-channel connections:** only the **primary** (first) channel of a
+  connection receives the override; any additional channels keep their distinct
+  pool-allocated prefixes. An aggregating proxy therefore never collapses, but
+  the custom value applies to one of its channels only.
+
+---
+
+## Current limitations
+
+- **Solo mode only** (see above).
+- **SV2 Extended channels only.** A Standard channel (SV1-translated or
+  `REQUIRES_STANDARD_JOBS` firmware) does not receive the override; the core logs
+  a warning if one is set for such a worker.
+- **Primary channel only** on multi-channel connections (see above).
+- **First-override-needs-connect** arming caveat (see
+  [When the EN is used](#when-the-en-is-used)).
+- **~10 s propagation.** The core polls Postgres every 10 s, so a change is not
+  instant; it lands within one interval plus the next template.
+- **No revert-to-allocated over the wire.** Clearing an override affects the
+  worker at its next reconnect; a live connection keeps the last value until then.
+
+---
+
+## Error codes
+
+| HTTP | `code`                     | Meaning                                                            |
+|------|----------------------------|--------------------------------------------------------------------|
+| 400  | `invalid-extranonce`       | prefix isn't 8 hex chars                                            |
+| 400  | `reserved-extranonce-range`| prefix top byte is `0x00`/`0x01`                                    |
+| 400  | `missing-signature`        | empty signature on apply                                           |
+| 400  | `invalid-signature`        | signature doesn't verify against the stored challenge message      |
+| 400  | `challenge-mismatch`       | apply's `(worker, extranonce)` differs from the stored challenge   |
+| 404  | `no-challenge`             | apply with no pending challenge for the address                    |
+| 409  | `not-solo-mode`            | address is (determinably) not mining Solo                          |
+| 409  | `extranonce-in-use`        | this address already points another worker at that prefix          |
+| 410  | `challenge-expired`        | the challenge is older than 15 minutes                             |
+
+---
+
+## Typical flow
+
+```
+1. POST /api/address/extranonce/challenge {address, worker, extranonce}
+        → sign the returned `message` with the address key
+2. POST /api/address/extranonce/apply     {address, worker, extranonce, signature}
+        → 200: override stored
+3. (Re)start the miner authorising as `address.worker` on a Solo port,
+   opening an SV2 Extended channel
+        → the core applies the prefix on the first job
+4. To change it while running: repeat 1–2 with a new value; it lands at the
+   next template (armed connection), no reconnect.
+```
