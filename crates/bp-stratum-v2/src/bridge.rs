@@ -101,6 +101,21 @@ pub struct RegisteredDeclaredJob {
     pub registered_at_ms: u64,
 }
 
+/// Slim projection of a bridge entry for the mining-side
+/// `SetCustomMiningJob` cross-checks: the miner identity plus the tip the
+/// declaration was accepted under — not the (potentially large)
+/// declared-job payload the handler doesn't need.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BridgeJobRef {
+    /// Miner address bound to the token (cross-checked against the mining
+    /// channel's locked address).
+    pub miner_address: AddressId,
+    /// Pool chain-tip the declaration was accepted under. `None` when the
+    /// pool had no tip at accept time (cold start) — then the mining-side
+    /// tip binding is not checkable.
+    pub declared_prev_hash: Option<[u8; 32]>,
+}
+
 // ── IssuedPayoutSet (ext 0x0003) ─────────────────────────────────────
 
 /// One issued ext-0x0003 payout output set, tracked pool-wide so the
@@ -191,6 +206,17 @@ impl JdpDeclaredJobRegistry {
     /// (mining-handler emits `invalid-job-id`-equivalent).
     pub fn lookup(&self, token: &Token) -> Option<&RegisteredDeclaredJob> {
         self.entries.get(token)
+    }
+
+    /// Slim projection of a token's bridge entry for the mining-side
+    /// `SetCustomMiningJob` cross-checks. `None` for unknown / evicted
+    /// tokens (the mining-handler fails closed on that, together with an
+    /// absent payout set).
+    pub fn job_ref(&self, token: &Token) -> Option<BridgeJobRef> {
+        self.entries.get(token).map(|e| BridgeJobRef {
+            miner_address: e.miner_address.clone(),
+            declared_prev_hash: e.declared_job.prev_hash,
+        })
     }
 
     /// Register an issued ext-0x0003 payout set. Overwrites any prior set

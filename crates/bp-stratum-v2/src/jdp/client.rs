@@ -119,6 +119,14 @@ pub const ERR_INVALID_JOB_PARAM_COINBASE: &str = "invalid-job-param-value-coinba
 pub const ERR_STALE_PAYOUT_OUTPUTS: &str =
     crate::extensions::payout_outputs_error_codes::STALE_PAYOUT_OUTPUTS;
 
+/// `stale-chain-tip` — the chain tip advanced while this declaration was
+/// in flight (between the initial `DeclareMiningJob` and the completion of
+/// its `ProvideMissingTransactions` round-trip), so the declared job
+/// references a superseded template. A benign race, not a protocol
+/// violation — this exact string matters, because JDCs treat
+/// `stale-chain-tip` as retryable and any other declaration error as fatal.
+pub const ERR_STALE_CHAIN_TIP: &str = "stale-chain-tip";
+
 // ── Inputs (typed wrappers over deserialized SV2 frames) ────────────
 
 /// Inputs from a deserialized JDP `SetupConnection` frame. Analogous to
@@ -436,6 +444,12 @@ pub struct PendingState {
     pub pending: PendingDeclaration,
     pub original_token: Token,
     pub miner_address: AddressId,
+    /// Pool chain-tip when the `DeclareMiningJob` arrived. Compared against
+    /// the tip when `ProvideMissingTransactions.Success` completes the
+    /// round-trip — drift means the declared job references a superseded
+    /// template and is rejected `stale-chain-tip` instead of accepted (and
+    /// stamped with a tip it was never built for).
+    pub prev_hash_at_declare: Option<[u8; 32]>,
 }
 
 impl JdpSessionState {
@@ -817,6 +831,7 @@ pub fn handle_declare_mining_job(
         },
         original_token,
         miner_address,
+        prev_hash_at_declare: current_prev_hash,
     });
     // Epoch staleness is observed in `accept_declaration` (the path that
     // actually validates the payout set), reached here once the
@@ -850,6 +865,19 @@ pub fn handle_provide_missing_transactions_success(
         state.pending_declaration = Some(pending);
         return JdpHandlerOutcome::default();
     }
+    // Tip-drift check: if the chain advanced during the missing-transactions
+    // round-trip, the declared job references a superseded template. Reject
+    // `stale-chain-tip` (retryable — the JDC re-declares against its new
+    // template) instead of accepting a job stamped with a tip it was never
+    // built for.
+    if pending.prev_hash_at_declare != current_prev_hash {
+        return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
+            request_id: input.request_id,
+            error_code: ERR_STALE_CHAIN_TIP.to_string(),
+            error_details: b"chain tip advanced during the missing-transactions round-trip"
+                .to_vec(),
+        });
+    }
     let merged = match merge_provided_with_known(pending.pending, input.transaction_list.clone()) {
         Ok(m) => m,
         Err(_) => return JdpHandlerOutcome::default(),
@@ -863,6 +891,17 @@ pub fn handle_provide_missing_transactions_success(
         current_prev_hash,
         now_ms,
     )
+}
+
+/// Lowercase hex of a 32-byte hash for log lines. Hand-rolled like
+/// `Token::to_hex` — the `hex` crate is a dev-only dependency here.
+fn hash_hex(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 // ── Internal: accept_declaration ────────────────────────────────────
@@ -1018,12 +1057,26 @@ pub fn handle_push_solution(
     input: &PushSolutionInput,
     miner_address: AddressId,
 ) -> JdpHandlerOutcome {
+    // The drops below are WARN-logged: a PushSolution is a found BLOCK, and
+    // discarding one silently would make a lost pool-side block booking
+    // undiagnosable. (The block itself is safe either way — the JDC submits
+    // through its own node too.)
     if !state.full_template_mode {
+        tracing::warn!(
+            prev_hash = %hash_hex(&input.prev_hash),
+            "jdp: PushSolution dropped — connection not in Full-Template mode"
+        );
         return JdpHandlerOutcome::default();
     }
     let job = match state.declared_jobs.match_for_solution(&input.prev_hash) {
         Some(j) => j,
-        None => return JdpHandlerOutcome::default(),
+        None => {
+            tracing::warn!(
+                prev_hash = %hash_hex(&input.prev_hash),
+                "jdp: PushSolution dropped — no matching declared job (reconnect gap or stale solution)"
+            );
+            return JdpHandlerOutcome::default();
+        }
     };
 
     // Snapshot the fields we'll emit + the new_token (immutable
@@ -1039,7 +1092,14 @@ pub fn handle_push_solution(
     for i in 0..wtxid_count {
         match job.raw_transactions.get(&(i as u32)) {
             Some(raw) => transactions.push(raw.clone()),
-            None => return JdpHandlerOutcome::default(),
+            None => {
+                tracing::warn!(
+                    prev_hash = %hash_hex(&input.prev_hash),
+                    position = i,
+                    "jdp: PushSolution dropped — declared job is missing raw tx data"
+                );
+                return JdpHandlerOutcome::default();
+            }
         }
     }
 
@@ -1827,6 +1887,45 @@ mod tests {
         }
         assert_eq!(s.declared_jobs.len(), 1);
         assert!(s.pending_declaration.is_none());
+    }
+
+    /// Chain tip advances during the missing-transactions round-trip →
+    /// the declaration is rejected `stale-chain-tip` (retryable) instead
+    /// of being accepted and stamped with a tip it was never built for.
+    #[test]
+    fn provide_missing_with_tip_drift_rejects_stale_chain_tip() {
+        let mut s = fresh();
+        let token = complete_setup_and_allocate(&mut s);
+        let wtxid_a = [0x01; 32];
+        let wtxid_b = [0x02; 32];
+        let mut tpl = HashMap::new();
+        tpl.insert(wtxid_a, vec![0xCA; 16]);
+        let input = declare(5, token, vec![wtxid_a, wtxid_b]);
+        // Declared under tip 0xAB…
+        let _ = handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), 3_000);
+        let success = ProvideMissingTransactionsSuccessInput {
+            request_id: 5,
+            transaction_list: vec![vec![0xFE; 16]],
+        };
+        // …but the round-trip completes under tip 0xCD.
+        let out =
+            handle_provide_missing_transactions_success(&mut s, &success, Some([0xCD; 32]), 4_000);
+        match &out.outbound[0] {
+            JdpOutboundFrame::DeclareMiningJobError {
+                request_id,
+                error_code,
+                ..
+            } => {
+                assert_eq!(*request_id, 5);
+                assert_eq!(error_code, ERR_STALE_CHAIN_TIP);
+            }
+            f => panic!("expected DeclareMiningJobError, got {f:?}"),
+        }
+        assert_eq!(s.declared_jobs.len(), 0, "stale job must not be stored");
+        assert!(
+            s.pending_declaration.is_none(),
+            "pending state is consumed — the JDC re-declares fresh"
+        );
     }
 
     #[test]

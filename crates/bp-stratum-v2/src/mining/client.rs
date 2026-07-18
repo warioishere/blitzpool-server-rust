@@ -160,9 +160,33 @@ pub const ERR_INVALID_JOB_ID: &str = "invalid-job-id";
 /// `SetCustomMiningJob.mining_job_token` was registered in the
 /// bridge under a different miner address than the channel's locked
 /// address. IO-layer cross-check for token validation. Caller passes
-/// the bridge miner-address in via [`handle_set_custom_mining_job`]'s
-/// `bridge_miner_address` argument; pass `None` to skip validation.
+/// the bridge projection in via [`handle_set_custom_mining_job`]'s
+/// `bridge_job` argument.
 pub const ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH: &str = "invalid-job-param-value-token-mismatch";
+
+/// `invalid-mining-job-token` — the `SetCustomMiningJob.mining_job_token`
+/// resolves to neither a declared job (bridge) nor an issued ext-0x0003
+/// payout set: never declared here, expired, or evicted with its JDP
+/// session. Fail-closed: without either there is nothing a non-custodial
+/// pool could validate the custom job's coinbase against.
+pub const ERR_INVALID_MINING_JOB_TOKEN: &str = "invalid-mining-job-token";
+
+/// `stale-chain-tip` — the `SetCustomMiningJob.prev_hash` differs from the
+/// tip its declaration was accepted under: the chain advanced between
+/// declaration and submission. A benign race, not a protocol violation —
+/// this exact string matters, because JDCs treat `stale-chain-tip` as
+/// retryable and any other declaration error as fatal.
+pub const ERR_STALE_CHAIN_TIP: &str = "stale-chain-tip";
+
+/// `custom-jobs-require-solo` — a base-protocol custom job (no ext-0x0003
+/// payout set) on a non-Solo stream. Off Solo the shares enter SHARED
+/// accounting (PPLNS window / group), but nothing validates that the
+/// self-built coinbase pays that accounting — the job's finder would collect
+/// window share while contributing blocks that pay the pool's window
+/// nothing. With an ext-0x0003 payout set the multiset check forces the
+/// coinbase to carry the committed distribution, so non-Solo is legitimate
+/// there (the whole point of the extension).
+pub const ERR_CUSTOM_JOB_REQUIRES_SOLO: &str = "custom-jobs-require-solo";
 
 /// `invalid-job-param-value-coinbase_tx_outputs` — the
 /// `SetCustomMiningJob.coinbase_tx_outputs` doesn't carry one of the pool's
@@ -2307,11 +2331,21 @@ pub struct SetCustomMiningJobInput {
 ///
 /// **Caller-resolved context**: the IO layer looks up the declared-job
 /// entry for `mining_job_token` in [`crate::bridge::JdpDeclaredJobRegistry`]
-/// and passes only its `miner_address` as `bridge_miner_address` (cloning
-/// the address, not the whole entry — the handler doesn't need the job
-/// payload). If `Some(addr)`, the handler cross-checks the channel's locked
-/// miner address against it; mismatch → reject
-/// `invalid-job-param-value-token-mismatch`. `None` skips the check.
+/// and passes its slim projection as `bridge_job`
+/// ([`crate::bridge::BridgeJobRef`] — address + declared tip, not the job
+/// payload). If `Some`, the handler cross-checks the channel's locked miner
+/// address (mismatch → `invalid-job-param-value-token-mismatch`) and the
+/// tip binding: the custom job MUST build on the tip its declaration was
+/// accepted under (drift → `stale-chain-tip`, the retryable stale-race
+/// classification).
+///
+/// **Fail-closed token check**: a token that resolves to neither a bridge
+/// entry nor an issued payout set is unknown (never declared here, expired,
+/// or evicted with its JDP session) → `invalid-mining-job-token`. This
+/// deliberately leaves base-protocol Coinbase-only custom jobs unsupported:
+/// without a declared job or a payout set, a non-custodial pool has nothing
+/// to validate the coinbase against, and accepting would let arbitrary
+/// self-built jobs feed the share pipeline.
 ///
 /// **ext 0x0003 payout validation**: the IO layer also passes the issued
 /// payout set (`payout_set`) for `mining_job_token`, if any. When present,
@@ -2327,8 +2361,13 @@ pub struct SetCustomMiningJobInput {
 /// - Channel kind ≠ Extended → `invalid-job-id` (Standard channels
 ///   don't carry an extranonce slot — custom jobs are
 ///   Extended-only).
-/// - Bridge miner-address present + mismatch →
+/// - Token unknown (no bridge entry AND no payout set) →
+///   `invalid-mining-job-token`.
+/// - Bridge miner-address mismatch →
 ///   `invalid-job-param-value-token-mismatch`.
+/// - Bridge declared-tip mismatch → `stale-chain-tip`.
+/// - No payout set + non-Solo stream → `custom-jobs-require-solo`
+///   (base custom jobs must not feed shared accounting).
 /// - Else: rebuild `coinbase_tx_prefix` + `coinbase_tx_suffix` from
 ///   the JDC's scriptSig fragments, allocate
 ///   `channel.next_job_id`, insert [`ExtendedJob`] (with
@@ -2337,7 +2376,7 @@ pub struct SetCustomMiningJobInput {
 pub fn handle_set_custom_mining_job<C: Clock>(
     state: &mut MiningSessionState<C>,
     input: &SetCustomMiningJobInput,
-    bridge_miner_address: Option<&AddressId>,
+    bridge_job: Option<&crate::bridge::BridgeJobRef>,
     payout_set: Option<&crate::bridge::IssuedPayoutSet>,
     now_ms: u64,
 ) -> HandlerOutcome {
@@ -2357,17 +2396,45 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         return reject(ERR_INVALID_JOB_ID);
     }
 
+    // Fail-closed token check: the token must resolve to SOMETHING we can
+    // validate against — a declared job (Full-Template) or an issued
+    // ext-0x0003 payout set (either mode). Neither → unknown/expired/evicted
+    // token; accepting would register an arbitrary self-built job whose
+    // shares feed the pipeline with nothing backing the coinbase.
+    if bridge_job.is_none() && payout_set.is_none() {
+        return reject(ERR_INVALID_MINING_JOB_TOKEN);
+    }
+
     // Channel-locked miner address — cross-checked below against the bridge
     // entry and/or the issued payout set.
     let channel_addr = state.address.as_ref().map(|a| a.as_str()).unwrap_or("");
 
-    // Optional bridge cross-check: a declared-job hit's miner address MUST
-    // match the channel's locked address (stops one miner claiming another's
-    // declared job).
-    if let Some(bridge_addr) = bridge_miner_address {
-        if channel_addr != bridge_addr.as_str() {
+    // Bridge cross-checks for a declared job.
+    if let Some(job) = bridge_job {
+        // The miner address MUST match the channel's locked address (stops
+        // one miner claiming another's declared job).
+        if channel_addr != job.miner_address.as_str() {
             return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
         }
+        // Tip binding: the custom job MUST build on the tip its declaration
+        // was accepted under. A mismatch is the stale-tip race (the chain
+        // advanced between declare and submit) — classified retryable via
+        // `stale-chain-tip`, never as a parameter violation. Unknowable
+        // (`None`) when the pool had no tip at accept time.
+        if let Some(declared) = job.declared_prev_hash {
+            if input.prev_hash != declared {
+                return reject(ERR_STALE_CHAIN_TIP);
+            }
+        }
+    }
+
+    // Solo gate for base-protocol custom jobs: without an ext-0x0003 payout
+    // set, nothing validates that the self-built coinbase pays the shared
+    // accounting its shares would enter — off Solo that's freeloading on the
+    // PPLNS window / group. With a payout set (checked below) the coinbase
+    // is bound to the committed distribution, so non-Solo is legitimate.
+    if payout_set.is_none() && state.stream != StreamKind::Solo {
+        return reject(ERR_CUSTOM_JOB_REQUIRES_SOLO);
     }
 
     // ext 0x0003 (Non-Custodial Pool Payouts): when a payout set was issued
@@ -4969,16 +5036,18 @@ mod tests {
         }
     }
 
-    /// Extended channel + no bridge entry → accept without validation.
-    /// Verify ExtendedJob is stored with assembled non-witness
-    /// coinbase prefix/suffix.
+    /// Extended channel + declared-job bridge hit → accept. Verify the
+    /// ExtendedJob is stored with assembled non-witness coinbase
+    /// prefix/suffix.
     #[test]
     fn set_custom_mining_job_extended_accepts_and_stores_ext_job() {
-        let mut s = session_with_extended_channel();
+        let mut s = solo_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
+        let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
         let input = custom_job_input(cid, token);
-        let out = handle_set_custom_mining_job(&mut s, &input, None, None, 1_000);
+        let out =
+            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobSuccess {
                 channel_id,
@@ -5019,17 +5088,36 @@ mod tests {
         assert_eq!(ext.created_at, 1_000);
     }
 
+    /// Slim handler-side projection of a bridge entry (what the IO layer's
+    /// `job_ref()` produces).
+    fn job_ref_for(entry: &RegisteredDeclaredJob) -> crate::bridge::BridgeJobRef {
+        crate::bridge::BridgeJobRef {
+            miner_address: entry.miner_address.clone(),
+            declared_prev_hash: entry.declared_job.prev_hash,
+        }
+    }
+
+    /// Extended-channel session on the SOLO stream — the only stream where a
+    /// base-protocol custom job (no ext-0x0003 payout set) is accepted. The
+    /// ext-0x0003 tests deliberately keep the default (PPLNS) stream, which
+    /// doubles as proof that a payout-set-backed custom job passes off Solo.
+    fn solo_session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
+        let mut s = session_with_extended_channel();
+        s.stream = StreamKind::Solo;
+        s
+    }
+
     /// Bridge entry whose miner_address matches the channel's locked
     /// address → accept. Verifies the cross-check.
     #[test]
     fn set_custom_mining_job_bridge_entry_matching_address_accepts() {
-        let mut s = session_with_extended_channel();
+        let mut s = solo_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
         let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
         let input = custom_job_input(cid, token);
         let out =
-            handle_set_custom_mining_job(&mut s, &input, Some(&entry.miner_address), None, 1_000);
+            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
         assert!(matches!(
             out.outbound[0],
             OutboundFrame::SetCustomMiningJobSuccess { .. }
@@ -5048,7 +5136,7 @@ mod tests {
         let entry = bridge_entry_for(token, other_addr, 42);
         let input = custom_job_input(cid, token);
         let out =
-            handle_set_custom_mining_job(&mut s, &input, Some(&entry.miner_address), None, 1_000);
+            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
         match &out.outbound[0] {
             OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
@@ -5058,6 +5146,94 @@ mod tests {
         // No ExtendedJob inserted.
         let ch = s.channels.get(&cid).unwrap();
         assert!(ch.extended_jobs.is_empty());
+    }
+
+    /// Fail-closed token check: a token resolving to neither a bridge entry
+    /// nor a payout set (never declared / expired / evicted) is rejected —
+    /// never accepted as an unvalidated self-built job.
+    #[test]
+    fn set_custom_mining_job_unknown_token_rejects() {
+        let mut s = session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let input = custom_job_input(cid, Token([0xEEu8; 16]));
+        let out = handle_set_custom_mining_job(&mut s, &input, None, None, 1_000);
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_INVALID_MINING_JOB_TOKEN);
+            }
+            _ => panic!("expected invalid-mining-job-token error"),
+        }
+        let ch = s.channels.get(&cid).unwrap();
+        assert!(ch.extended_jobs.is_empty(), "no job may be registered");
+    }
+
+    /// Tip binding: the custom job's `prev_hash` must equal the tip its
+    /// declaration was accepted under; drift → `stale-chain-tip` (the
+    /// retryable classification — NOT a parameter error, which JDCs treat
+    /// as fatal).
+    #[test]
+    fn set_custom_mining_job_declared_tip_mismatch_rejects_stale_chain_tip() {
+        let mut s = session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let token = Token([1u8; 16]);
+        let mut entry = bridge_entry_for(token, REGTEST_ADDR, 42);
+        // Declared under a DIFFERENT tip than the job builds on (0xAB).
+        entry.declared_job.prev_hash = Some([0xCD; 32]);
+        let input = custom_job_input(cid, token);
+        let out =
+            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_STALE_CHAIN_TIP);
+            }
+            _ => panic!("expected stale-chain-tip error"),
+        }
+        let ch = s.channels.get(&cid).unwrap();
+        assert!(ch.extended_jobs.is_empty(), "stale job must not register");
+    }
+
+    /// Solo gate: a base-protocol custom job (valid declared token, but NO
+    /// ext-0x0003 payout set) on a non-Solo stream is rejected — its shares
+    /// would enter shared accounting with an unvalidated coinbase. The
+    /// ext-0x0003 acceptance tests below run on the default (PPLNS) stream,
+    /// proving a payout-set-backed job passes exactly where this one fails.
+    #[test]
+    fn set_custom_mining_job_without_payout_set_rejected_off_solo() {
+        // Default-stream session = PPLNS.
+        let mut s = session_with_extended_channel();
+        assert_ne!(s.stream, StreamKind::Solo, "fixture must be non-Solo");
+        let cid = s.primary_channel.unwrap();
+        let token = Token([1u8; 16]);
+        let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
+        let input = custom_job_input(cid, token);
+        let out =
+            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_CUSTOM_JOB_REQUIRES_SOLO);
+            }
+            _ => panic!("expected custom-jobs-require-solo error"),
+        }
+        let ch = s.channels.get(&cid).unwrap();
+        assert!(ch.extended_jobs.is_empty(), "no job may be registered");
+    }
+
+    /// A declaration accepted while the pool had no tip (`None`) is not
+    /// checkable — the tip binding is skipped, not failed.
+    #[test]
+    fn set_custom_mining_job_unknowable_declared_tip_accepts() {
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let token = Token([1u8; 16]);
+        let mut entry = bridge_entry_for(token, REGTEST_ADDR, 42);
+        entry.declared_job.prev_hash = None;
+        let input = custom_job_input(cid, token);
+        let out =
+            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        assert!(matches!(
+            out.outbound[0],
+            OutboundFrame::SetCustomMiningJobSuccess { .. }
+        ));
     }
 
     // ── ext 0x0003 payout-set validation on SetCustomMiningJob ─────
@@ -5199,14 +5375,16 @@ mod tests {
     /// allocate monotonic job_ids.
     #[test]
     fn set_custom_mining_job_allocates_monotonic_job_ids() {
-        let mut s = session_with_extended_channel();
+        let mut s = solo_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
+        let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
+        let job_ref = job_ref_for(&entry);
         let input1 = custom_job_input(cid, token);
-        let out1 = handle_set_custom_mining_job(&mut s, &input1, None, None, 1_000);
+        let out1 = handle_set_custom_mining_job(&mut s, &input1, Some(&job_ref), None, 1_000);
         let mut input2 = custom_job_input(cid, token);
         input2.request_id = 2;
-        let out2 = handle_set_custom_mining_job(&mut s, &input2, None, None, 2_000);
+        let out2 = handle_set_custom_mining_job(&mut s, &input2, Some(&job_ref), None, 2_000);
         let id1 = match out1.outbound[0] {
             OutboundFrame::SetCustomMiningJobSuccess { job_id, .. } => job_id,
             _ => unreachable!(),
@@ -5224,12 +5402,14 @@ mod tests {
     /// varint (0xFD + u16-LE).
     #[test]
     fn set_custom_mining_job_emits_3byte_varint_for_large_scriptsig() {
-        let mut s = session_with_extended_channel();
+        let mut s = solo_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
+        let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
         let mut input = custom_job_input(cid, token);
         input.coinbase_prefix = vec![0xAA; 253];
-        let _ = handle_set_custom_mining_job(&mut s, &input, None, None, 1_000);
+        let _ =
+            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
         let ch = s.channels.get(&cid).unwrap();
         let ext = ch.extended_jobs.get(&1).expect("must be stored");
         // After 4(version) + 1(input_count) + 36(null_outpoint) = 41

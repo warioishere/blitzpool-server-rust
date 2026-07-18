@@ -1115,21 +1115,19 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
             handle_submit_shares_extended(state, &input, now_ms)
         }
         InboundMiningFrame::SetCustomMiningJob(input) => {
-            let (bridge_addr, payout_set) = {
+            let (bridge_job, payout_set) = {
                 let guard = bridge.read().expect("bridge RwLock poisoned");
                 (
-                    // Clone only the miner address — the handler doesn't need
-                    // the (potentially large) declared-job payload.
-                    guard
-                        .lookup(&input.mining_job_token)
-                        .map(|e| e.miner_address.clone()),
+                    // Slim projection (address + declared tip) — the handler
+                    // doesn't need the (potentially large) declared-job payload.
+                    guard.job_ref(&input.mining_job_token),
                     guard.lookup_payout_set(&input.mining_job_token).cloned(),
                 )
             };
             let outcome = handle_set_custom_mining_job(
                 state,
                 &input,
-                bridge_addr.as_ref(),
+                bridge_job.as_ref(),
                 payout_set.as_ref(),
                 now_ms,
             );
