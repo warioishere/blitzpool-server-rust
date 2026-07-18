@@ -231,21 +231,20 @@ pub fn build_mining_job(
         &template.witness_commitment,
     )?;
 
-    // BIP-54: nLockTime = block_height - 1, non-final nSequence.
+    // BIP-54: nLockTime = block_height - 1, non-final nSequence. Serialize the
+    // prefix (up to the extranonce slot) and suffix (from nSequence on)
+    // DIRECTLY into their own buffers — the slot bytes between them are never
+    // materialized (spliced per-share), so there is no full-coinbase buffer to
+    // build and slice. Version 2 is the RPC-path coinbase version.
     let locktime = template.block_height.saturating_sub(1);
-    let serialized =
-        serialize_coinbase_non_witness(&script_sig, &outputs, COINBASE_NONFINAL_SEQUENCE, locktime);
-
-    // Compute the split offsets. Layout:
-    //   version(4) + input_count(1) + prev_txid(32) + prev_vout(4)
-    //   + scriptsig_varint(varint_len) + scriptsig(N: last `extranonce_slot_size` = extranonce)
-    //   + sequence(4) + output_count(varint) + ... outputs ... + locktime(4)
-    let varint_len = varint_size(script_sig.len() as u64);
-    let prefix_end = 4 + 1 + 32 + 4 + varint_len + script_sig.len() - extranonce_slot_size;
-    let suffix_start = prefix_end + extranonce_slot_size;
-
-    let coinbase_prefix = serialized[..prefix_end].to_vec();
-    let coinbase_suffix = serialized[suffix_start..].to_vec();
+    let coinbase_prefix = serialize_coinbase_prefix(2, &script_sig, extranonce_slot_size);
+    let coinbase_suffix = serialize_coinbase_suffix(
+        COINBASE_NONFINAL_SEQUENCE,
+        outputs.len() as u64,
+        &outputs,
+        &[], // RPC path: no template-provided raw outputs (witness commit is in `outputs`)
+        locktime,
+    );
     let coinbase_prefix_hex = hex::encode(&coinbase_prefix);
     let coinbase_suffix_hex = hex::encode(&coinbase_suffix);
 
@@ -383,26 +382,21 @@ pub(crate) fn assemble_tdp_job(
     let total_output_count =
         payout_outputs.len() as u64 + u64::from(template.coinbase_tx_outputs_count);
 
-    let serialized = serialize_coinbase_with_raw_tdp_outputs(
+    // Serialize prefix (up to the extranonce slot) and suffix (from nSequence
+    // on) DIRECTLY — the slot bytes in between are never materialized (spliced
+    // per-share), so there is no full-coinbase buffer to build and slice.
+    let coinbase_prefix = serialize_coinbase_prefix(
         template.coinbase_tx_version,
         &script_sig,
+        extranonce_slot_size,
+    );
+    let coinbase_suffix = serialize_coinbase_suffix(
         template.coinbase_tx_input_sequence,
         total_output_count,
         payout_outputs,
         template.coinbase_tx_outputs,
         template.coinbase_tx_locktime,
     );
-
-    // Split offsets. Layout:
-    //   version(4) + input_count(1) + prev_txid(32) + prev_vout(4)
-    //   + scriptsig_varint(varint_len) + scriptsig(N: last `extranonce_slot_size` = extranonce)
-    //   + sequence(4) + output_count(varint) + ... outputs ... + locktime(4)
-    let varint_len = varint_size(script_sig.len() as u64);
-    let prefix_end = 4 + 1 + 32 + 4 + varint_len + script_sig.len() - extranonce_slot_size;
-    let suffix_start = prefix_end + extranonce_slot_size;
-
-    let coinbase_prefix = serialized[..prefix_end].to_vec();
-    let coinbase_suffix = serialized[suffix_start..].to_vec();
     let coinbase_prefix_hex = hex::encode(&coinbase_prefix);
     let coinbase_suffix_hex = hex::encode(&coinbase_suffix);
 
@@ -422,34 +416,50 @@ fn build_tdp_scriptsig(tdp_prefix: &[u8], identifier: &[u8], slot_len: usize) ->
     s
 }
 
-fn serialize_coinbase_with_raw_tdp_outputs(
-    version: u32,
-    scriptsig: &[u8],
-    input_sequence: u32,
-    total_output_count: u64,
-    payout_outputs: &[(u64, Vec<u8>)],
-    raw_tdp_outputs: &[u8],
-    locktime: u32,
-) -> Vec<u8> {
-    let payout_size: usize = payout_outputs.iter().map(|(_, s)| 8 + 9 + s.len()).sum();
-    let cap =
-        4 + 1 + 32 + 4 + 9 + scriptsig.len() + 4 + 9 + payout_size + raw_tdp_outputs.len() + 4;
-    let mut buf = Vec::with_capacity(cap);
-
+/// Serialize the coinbase **prefix**: everything up to (but not including) the
+/// extranonce slot — version, input count, null prev-outpoint, the scriptsig
+/// length varint, and the scriptsig bytes *before* the slot.
+///
+/// The scriptsig length varint encodes the **full** scriptsig length (the real
+/// coinbase carries the extranonce inside the scriptsig); only the trailing
+/// `slot_len` scriptsig bytes are omitted here — the per-share hot path splices
+/// the extranonce into exactly that gap. Building the prefix directly (rather
+/// than serializing the whole coinbase and slicing) avoids one full-buffer
+/// allocation + copy per job and never materializes the discarded slot bytes.
+fn serialize_coinbase_prefix(version: u32, scriptsig: &[u8], slot_len: usize) -> Vec<u8> {
+    let head = scriptsig.len() - slot_len;
+    let mut buf = Vec::with_capacity(4 + 1 + 32 + 4 + 9 + head);
     // version (LE u32 — consensus-equivalent to i32 for positive values)
     buf.extend_from_slice(&version.to_le_bytes());
     // input count = 1
     buf.push(0x01);
-    // prev txid (32 zeros)
+    // prev txid (32 zeros) + prev vout = 0xFFFFFFFF
     buf.extend_from_slice(&[0u8; 32]);
-    // prev vout = 0xFFFFFFFF
     buf.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
-    // scriptsig length + scriptsig
+    // scriptsig length (FULL length, incl. the slot) + scriptsig up to the slot
     encode_varint(&mut buf, scriptsig.len() as u64);
-    buf.extend_from_slice(scriptsig);
+    buf.extend_from_slice(&scriptsig[..head]);
+    buf
+}
+
+/// Serialize the coinbase **suffix**: everything from nSequence on — input
+/// sequence, output-count varint, our payout outputs, any template-provided raw
+/// outputs (TDP path; empty on the RPC path), and locktime. Counterpart to
+/// [`serialize_coinbase_prefix`]; together they replace the old
+/// build-full-then-slice path.
+fn serialize_coinbase_suffix(
+    input_sequence: u32,
+    total_output_count: u64,
+    payout_outputs: &[(u64, Vec<u8>)],
+    raw_extra_outputs: &[u8],
+    locktime: u32,
+) -> Vec<u8> {
+    let payout_size: usize = payout_outputs.iter().map(|(_, s)| 8 + 9 + s.len()).sum();
+    let cap = 4 + 9 + payout_size + raw_extra_outputs.len() + 4;
+    let mut buf = Vec::with_capacity(cap);
     // input sequence
     buf.extend_from_slice(&input_sequence.to_le_bytes());
-    // total output count (payouts + TDP-provided outputs)
+    // total output count (payouts + any template-provided outputs)
     encode_varint(&mut buf, total_output_count);
     // our payout outputs first
     for (value, script) in payout_outputs {
@@ -457,8 +467,8 @@ fn serialize_coinbase_with_raw_tdp_outputs(
         encode_varint(&mut buf, script.len() as u64);
         buf.extend_from_slice(script);
     }
-    // TDP-provided outputs (already in raw TxOut wire form)
-    buf.extend_from_slice(raw_tdp_outputs);
+    // template-provided outputs (already in raw TxOut wire form; empty on RPC)
+    buf.extend_from_slice(raw_extra_outputs);
     // locktime
     buf.extend_from_slice(&locktime.to_le_bytes());
     buf
@@ -548,49 +558,6 @@ fn build_outputs(
     Ok(outputs)
 }
 
-fn serialize_coinbase_non_witness(
-    scriptsig: &[u8],
-    outputs: &[(u64, Vec<u8>)],
-    sequence: u32,
-    locktime: u32,
-) -> Vec<u8> {
-    let cap = 4
-        + 1
-        + 32
-        + 4
-        + 9
-        + scriptsig.len()
-        + 4
-        + 9
-        + outputs.iter().map(|(_, s)| 8 + 9 + s.len()).sum::<usize>()
-        + 4;
-    let mut buf = Vec::with_capacity(cap);
-
-    // version = 2 (LE i32)
-    buf.extend_from_slice(&2u32.to_le_bytes());
-    // input count = 1
-    buf.push(0x01);
-    // prev txid (32 zeros)
-    buf.extend_from_slice(&[0u8; 32]);
-    // prev vout = 0xFFFFFFFF
-    buf.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
-    // scriptsig length + scriptsig
-    encode_varint(&mut buf, scriptsig.len() as u64);
-    buf.extend_from_slice(scriptsig);
-    // sequence (BIP-54: must be non-final)
-    buf.extend_from_slice(&sequence.to_le_bytes());
-    // output count
-    encode_varint(&mut buf, outputs.len() as u64);
-    for (value, script) in outputs {
-        buf.extend_from_slice(&value.to_le_bytes());
-        encode_varint(&mut buf, script.len() as u64);
-        buf.extend_from_slice(script);
-    }
-    // locktime (BIP-54: block_height - 1)
-    buf.extend_from_slice(&locktime.to_le_bytes());
-    buf
-}
-
 /// BIP-34 minimal CScriptNum encoding of a positive block height.
 /// Strips trailing zero bytes (high-order in LE) and appends a 0x00 sign
 /// disambiguator if the most-significant byte's high bit would otherwise
@@ -623,18 +590,6 @@ fn encode_varint(buf: &mut Vec<u8>, n: u64) {
     } else {
         buf.push(0xff);
         buf.extend_from_slice(&n.to_le_bytes());
-    }
-}
-
-fn varint_size(n: u64) -> usize {
-    if n < 0xfd {
-        1
-    } else if n <= 0xffff {
-        3
-    } else if n <= 0xffffffff {
-        5
-    } else {
-        9
     }
 }
 
@@ -1031,6 +986,94 @@ mod tests {
         prefix.extend_from_slice(&[0x00, 0x35, 0x0c]);
         let outputs = synthetic_witness_commit_txout_bytes(commit);
         (prefix, outputs)
+    }
+
+    /// Bit-identity guard for the direct prefix/suffix serialization: it MUST
+    /// produce exactly the bytes the pre-refactor path did (serialize the whole
+    /// coinbase, then slice out prefix/suffix around the extranonce slot). The
+    /// reference oracle below IS that old algorithm, kept in the test so any
+    /// future drift in the direct writers is caught.
+    #[test]
+    fn tdp_direct_split_matches_full_serialize_then_split() {
+        let (prefix, outputs) = tdp_template_for([0x5A; 32]);
+        // Two payouts so the output loop + the count varint are exercised, and
+        // a non-default sequence / locktime so those fields can't silently drift.
+        let payouts = vec![
+            PayoutEntry {
+                address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                sats: 3_000_000_000,
+            },
+            PayoutEntry {
+                address: "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+                    .to_string(),
+                sats: 2_000_000_000,
+            },
+        ];
+        let slot = EXTRANONCE_SLOT_LEN;
+        let template = TdpCoinbaseTemplate {
+            coinbase_prefix: &prefix,
+            coinbase_tx_version: 2,
+            coinbase_tx_input_sequence: 0xFFFF_FFFE,
+            coinbase_tx_value_remaining: 5_000_000_000,
+            coinbase_tx_outputs: &outputs,
+            coinbase_tx_outputs_count: 1,
+            coinbase_tx_locktime: 42,
+        };
+        let job =
+            build_mining_job_from_tdp(Network::Bitcoin, &payouts, &template, "BP", slot).unwrap();
+
+        // Reference oracle = the pre-refactor "build full, then slice" path.
+        let script_sig = checked_tdp_scriptsig(template.coinbase_prefix, "BP", slot).unwrap();
+        let payout_outputs = build_payout_outputs(
+            Network::Bitcoin,
+            &payouts,
+            template.coinbase_tx_value_remaining,
+        )
+        .unwrap();
+        let total_output_count =
+            payout_outputs.len() as u64 + u64::from(template.coinbase_tx_outputs_count);
+        let mut full = Vec::new();
+        full.extend_from_slice(&template.coinbase_tx_version.to_le_bytes());
+        full.push(0x01);
+        full.extend_from_slice(&[0u8; 32]);
+        full.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        encode_varint(&mut full, script_sig.len() as u64);
+        full.extend_from_slice(&script_sig);
+        full.extend_from_slice(&template.coinbase_tx_input_sequence.to_le_bytes());
+        encode_varint(&mut full, total_output_count);
+        for (v, s) in &payout_outputs {
+            full.extend_from_slice(&v.to_le_bytes());
+            encode_varint(&mut full, s.len() as u64);
+            full.extend_from_slice(s);
+        }
+        full.extend_from_slice(template.coinbase_tx_outputs);
+        full.extend_from_slice(&template.coinbase_tx_locktime.to_le_bytes());
+
+        let varint_len = match script_sig.len() as u64 {
+            n if n < 0xfd => 1,
+            n if n <= 0xffff => 3,
+            n if n <= 0xffff_ffff => 5,
+            _ => 9,
+        };
+        let prefix_end = 4 + 1 + 32 + 4 + varint_len + script_sig.len() - slot;
+        let suffix_start = prefix_end + slot;
+
+        assert_eq!(
+            job.coinbase_prefix(),
+            &full[..prefix_end],
+            "direct prefix must equal the old full-then-split prefix"
+        );
+        assert_eq!(
+            job.coinbase_suffix(),
+            &full[suffix_start..],
+            "direct suffix must equal the old full-then-split suffix"
+        );
+        // The precomputed hex mirrors the bytes exactly.
+        assert_eq!(job.coinbase_prefix_hex(), hex::encode(&full[..prefix_end]));
+        assert_eq!(
+            job.coinbase_suffix_hex(),
+            hex::encode(&full[suffix_start..])
+        );
     }
 
     #[test]
