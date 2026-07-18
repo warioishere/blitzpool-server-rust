@@ -1092,9 +1092,27 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
         );
         return None;
     }
-    // An override exists for this Solo worker → arm the per-template re-check on
-    // the broadcast path, so a later change (the customer setting a new value)
-    // lands at the next template without a reconnect.
+    // Extended-only, and LOUD — checked BEFORE arming so a Solo Standard channel
+    // neither arms the broadcast watch (wasted per-template work) nor drops the
+    // override in silence. The per-job prefix pin + the miner's own coinbase
+    // splice are Extended-channel mechanics; a Standard channel bakes the prefix
+    // into the coinbase differently, so an override can't reconstruct there.
+    let kind = match state.channels.get(&channel_id) {
+        Some(c) => c.kind,
+        None => return None,
+    };
+    if kind != crate::mining::channel::ChannelKind::Extended {
+        warn!(
+            worker = %state.worker_name,
+            channel_id,
+            "custom-extranonce is Extended-channel only; the override for this Solo \
+             worker does not apply to its Standard channel"
+        );
+        return None;
+    }
+    // An override exists for this Solo Extended worker → arm the per-template
+    // re-check on the broadcast path, so a later change (the customer setting a
+    // new value) lands at the next template without a reconnect.
     state.uses_custom_extranonce = true;
     // Custom EN targets ONE channel per connection — the primary. Every channel
     // of a connection shares its (address, worker) and so resolves to the SAME
@@ -1112,12 +1130,6 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
         return None;
     }
     let channel = state.channels.get_mut(&channel_id)?;
-    // Extended only: the per-job prefix pin + the miner's own coinbase splice
-    // are Extended-channel mechanics. A Standard channel bakes the prefix into
-    // the coinbase differently, so an override there wouldn't reconstruct.
-    if channel.kind != crate::mining::channel::ChannelKind::Extended {
-        return None;
-    }
     if channel.extranonce_prefix.as_slice() == prefix.as_slice() {
         return None; // already applied — nothing to announce
     }
@@ -1849,9 +1861,12 @@ mod tests {
     }
 
     /// Standard channels are out of scope: the prefix is baked into the
-    /// coinbase differently there, so an override wouldn't reconstruct.
+    /// coinbase differently there, so an override wouldn't reconstruct. It also
+    /// must NOT arm the broadcast flag — otherwise a Solo Standard connection
+    /// would run the per-template re-check forever for an override that can
+    /// never apply.
     #[test]
-    fn custom_extranonce_skips_standard_channel() {
+    fn custom_extranonce_skips_standard_channel_without_arming() {
         let mut s = fresh_session_with_address();
         s.stream = StreamKind::Solo;
         s.channels.insert(
@@ -1865,6 +1880,10 @@ mod tests {
         );
         let hooks = hooks_with_override(ADDR, "wrk", [0xC0, 0xDE, 0xBA, 0xBE]);
         assert!(maybe_apply_custom_extranonce(&mut s, &hooks, 7).is_none());
+        assert!(
+            !s.uses_custom_extranonce,
+            "a Standard channel must not arm the broadcast re-check"
+        );
     }
 
     // ── Custom extranonce arming + live change (broadcast path) ────
