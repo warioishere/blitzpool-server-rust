@@ -1050,6 +1050,29 @@ fn channel_alloc_key(session_id: u32, channel_id: u32) -> u64 {
     ((session_id as u64) << 32) | (channel_id as u64)
 }
 
+/// Compare-swap-emit shared by channel-open and the live broadcast path: if
+/// `channel` is Extended and not already on `prefix`, swap it and return the
+/// [`OutboundFrame::SetExtranoncePrefix`] announcing the change (the caller
+/// writes it before the channel's next job, per SV2 §5.3.10). Returns `None`
+/// when there is nothing to change. One copy keeps the two callers in lockstep
+/// on the equality guard and the §5.3.10 ordering contract.
+fn swap_channel_prefix(
+    channel: &mut crate::mining::channel::ChannelState,
+    channel_id: u32,
+    prefix: &[u8; 4],
+) -> Option<OutboundFrame> {
+    if channel.kind != crate::mining::channel::ChannelKind::Extended
+        || channel.extranonce_prefix.as_slice() == prefix.as_slice()
+    {
+        return None;
+    }
+    channel.extranonce_prefix = prefix.to_vec();
+    Some(OutboundFrame::SetExtranoncePrefix {
+        channel_id,
+        extranonce_prefix: prefix.to_vec(),
+    })
+}
+
 /// Swap the pool-allocated extranonce prefix for the customer's chosen one on a
 /// freshly-opened Extended channel, returning the
 /// [`OutboundFrame::SetExtranoncePrefix`] that announces it — or `None` when no
@@ -1130,14 +1153,7 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
         return None;
     }
     let channel = state.channels.get_mut(&channel_id)?;
-    if channel.extranonce_prefix.as_slice() == prefix.as_slice() {
-        return None; // already applied — nothing to announce
-    }
-    channel.extranonce_prefix = prefix.to_vec();
-    Some(OutboundFrame::SetExtranoncePrefix {
-        channel_id,
-        extranonce_prefix: prefix.to_vec(),
-    })
+    swap_channel_prefix(channel, channel_id, &prefix)
 }
 
 /// Per-template custom-extranonce re-check on the broadcast hot path — the
@@ -1195,14 +1211,8 @@ fn custom_extranonce_broadcast_frames<C: bp_vardiff::Clock>(
     };
     let mut frames = Vec::new();
     if let Some(channel) = state.channels.get_mut(&primary) {
-        if channel.kind == crate::mining::channel::ChannelKind::Extended
-            && channel.extranonce_prefix.as_slice() != prefix.as_slice()
-        {
-            channel.extranonce_prefix = prefix.to_vec();
-            frames.push(OutboundFrame::SetExtranoncePrefix {
-                channel_id: primary,
-                extranonce_prefix: prefix.to_vec(),
-            });
+        if let Some(frame) = swap_channel_prefix(channel, primary, &prefix) {
+            frames.push(frame);
         }
     }
     frames

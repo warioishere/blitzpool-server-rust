@@ -10,9 +10,11 @@
 //! query, and a change lands on the core within one interval and applies at the
 //! worker's next channel-open.
 //!
-//! The cache is read on the channel-open path only (once per connection), so
-//! the per-lookup `String` allocation is immaterial; it is never touched on the
-//! per-share or per-broadcast hot paths.
+//! The cache is read at channel-open (once per connection) and — for a
+//! connection that carries an override — on each template broadcast to pick up
+//! a live change. The lookup is allocation-free (a nested `address -> worker`
+//! map keyed by `&str` at both levels), so it adds nothing measurable to those
+//! paths.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -26,7 +28,9 @@ use tracing::{debug, warn};
 /// How often the core reloads the override table.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
-type OverrideMap = HashMap<(String, String), u32>;
+/// `address -> worker -> prefix`. Nested so `lookup` keys by `&str` at both
+/// levels with no per-call allocation.
+type OverrideMap = HashMap<String, HashMap<String, u32>>;
 
 /// `(address, worker) -> prefix` cache, refreshed off PG in the background.
 pub(crate) struct CustomExtranonceCache {
@@ -70,15 +74,21 @@ impl CustomExtranonceCache {
 
 impl CustomExtranonceSource for CustomExtranonceCache {
     fn lookup(&self, address: &str, worker: &str) -> Option<[u8; 4]> {
-        self.map
-            .read()
-            .expect("custom-en cache poisoned")
-            .get(&(address.to_string(), worker.to_string()))
-            // Big-endian to match the allocator's `prefix_to_be_bytes`
-            // convention (top byte first), so a customer prefix and an
-            // allocated one share one wire encoding.
-            .map(|prefix| prefix.to_be_bytes())
+        lookup_prefix(
+            &self.map.read().expect("custom-en cache poisoned"),
+            address,
+            worker,
+        )
     }
+}
+
+/// Nested `&str` lookup, allocation-free. Big-endian to match the allocator's
+/// `prefix_to_be_bytes` convention (top byte first), so a customer prefix and an
+/// allocated one share one wire encoding.
+fn lookup_prefix(map: &OverrideMap, address: &str, worker: &str) -> Option<[u8; 4]> {
+    map.get(address)
+        .and_then(|workers| workers.get(worker))
+        .map(|prefix| prefix.to_be_bytes())
 }
 
 /// Reload the whole override table into a fresh map. `None` on a DB error so
@@ -86,16 +96,48 @@ impl CustomExtranonceSource for CustomExtranonceCache {
 async fn load(pool: &PgPool) -> Option<OverrideMap> {
     match bp_db::all_custom_extranonces(pool).await {
         Ok(rows) => {
-            let map: OverrideMap = rows
-                .into_iter()
-                .map(|r| ((r.address.as_str().to_string(), r.worker), r.prefix))
-                .collect();
-            debug!(overrides = map.len(), "custom-extranonce cache reloaded");
+            let count = rows.len();
+            let mut map: OverrideMap = HashMap::new();
+            for r in rows {
+                map.entry(r.address.as_str().to_string())
+                    .or_default()
+                    .insert(r.worker, r.prefix);
+            }
+            debug!(overrides = count, "custom-extranonce cache reloaded");
             Some(map)
         }
         Err(e) => {
             warn!(%e, "custom-extranonce cache reload failed; keeping previous snapshot");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_prefix_finds_the_right_worker_and_encodes_big_endian() {
+        let mut map: OverrideMap = HashMap::new();
+        map.entry("bc1qalice".to_string())
+            .or_default()
+            .insert("rig1".to_string(), 0xC0DE_BABE);
+        map.entry("bc1qalice".to_string())
+            .or_default()
+            .insert("rig2".to_string(), 0x0200_0001);
+
+        // Hit → big-endian bytes (top byte first).
+        assert_eq!(
+            lookup_prefix(&map, "bc1qalice", "rig1"),
+            Some([0xC0, 0xDE, 0xBA, 0xBE])
+        );
+        assert_eq!(
+            lookup_prefix(&map, "bc1qalice", "rig2"),
+            Some([0x02, 0x00, 0x00, 0x01])
+        );
+        // Misses: unknown worker, unknown address.
+        assert_eq!(lookup_prefix(&map, "bc1qalice", "rig3"), None);
+        assert_eq!(lookup_prefix(&map, "bc1qbob", "rig1"), None);
     }
 }

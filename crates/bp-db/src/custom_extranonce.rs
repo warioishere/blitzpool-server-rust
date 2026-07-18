@@ -191,53 +191,6 @@ pub async fn upsert_custom_extranonce(
     })
 }
 
-pub async fn find_custom_extranonce(
-    pool: &PgPool,
-    address: &AddressId,
-    worker: &str,
-) -> Result<Option<CustomExtranonceRow>, DbError> {
-    let r = sqlx::query!(
-        r#"SELECT
-            address AS "address!: AddressId",
-            worker AS "worker!",
-            prefix AS "prefix!",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!"
-           FROM pplns_custom_extranonce
-           WHERE address = $1 AND worker = $2 LIMIT 1"#,
-        address.as_str(),
-        worker,
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(r.map(|r| CustomExtranonceRow {
-        address: r.address,
-        worker: r.worker,
-        prefix: prefix_to_u32(r.prefix),
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-    }))
-}
-
-/// DELETE the override for `(address, worker)` — the customer reverting to a
-/// pool-allocated prefix. Returns the number of rows removed (0 if none).
-pub async fn delete_custom_extranonce(
-    pool: &PgPool,
-    address: &AddressId,
-    worker: &str,
-) -> Result<u64, DbError> {
-    let result = sqlx::query!(
-        r#"DELETE FROM pplns_custom_extranonce WHERE address = $1 AND worker = $2"#,
-        address.as_str(),
-        worker,
-    )
-    .execute(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
 /// Every override, for the stratum core's in-memory cache.
 ///
 /// The core refreshes this periodically instead of hitting PG per connection:
