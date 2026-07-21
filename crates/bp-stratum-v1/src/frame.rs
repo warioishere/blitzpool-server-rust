@@ -164,6 +164,12 @@ pub struct SuggestDifficultyRequest {
 /// buffer, and `worker` is a [`Cow`] that only allocates if the JSON
 /// string carried an escape (worker names are plain in practice, so this
 /// is borrow-only). No DOM, no per-field `String` — see [`parse_request`].
+///
+/// The borrow-only claim holds because `worker` is deserialized through
+/// [`CowStr`], **not** the blanket `Deserialize for Cow` (which always
+/// allocates). Pinned by `parse_submit_plain_worker_is_borrowed_not_allocated`;
+/// swapping the deserializer back would silently reintroduce a per-share
+/// allocation while leaving this comment looking correct.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubmitRequest<'a> {
     pub id: RpcId,
@@ -226,6 +232,54 @@ pub enum FrameParseError {
 
 // ── Parser ───────────────────────────────────────────────────────────
 
+/// A `Cow<str>` that actually borrows from the input.
+///
+/// serde's blanket `Deserialize for Cow<'a, T>` **always** yields
+/// `Cow::Owned` — it deserializes a `String` and wraps it — so a field
+/// merely *typed* `Cow<'a, str>` allocates on every parse even when the
+/// input needed no unescaping. `#[serde(borrow)]` does not rescue it
+/// through an `Option<…>` either (measured: both `worker` and `method`
+/// came out `Owned` for a plain line).
+///
+/// This wrapper implements the borrowing visitor directly:
+/// `visit_borrowed_str` — the parser could point straight into the input
+/// buffer — yields `Cow::Borrowed`, and only `visit_str` / `visit_string`
+/// (serde had to unescape into a scratch buffer) allocates. That is the
+/// behaviour the `mining.submit` doc comment always claimed.
+struct CowStr<'a>(Cow<'a, str>);
+
+impl<'de> Deserialize<'de> for CowStr<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct CowStrVisitor;
+        impl<'de> Visitor<'de> for CowStrVisitor {
+            type Value = CowStr<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+            /// No escapes: the value is a contiguous span of the input.
+            fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(CowStr(Cow::Borrowed(v)))
+            }
+            /// Unescaped into serde's scratch buffer — must be copied out.
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(CowStr(Cow::Owned(v.to_string())))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(CowStr(Cow::Owned(v)))
+            }
+        }
+        de.deserialize_str(CowStrVisitor)
+    }
+}
+
+/// `Option<Cow<str>>` field adapter over [`CowStr`] — keeps the borrow.
+fn deserialize_opt_cow_str<'de, D>(de: D) -> Result<Option<Cow<'de, str>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<CowStr<'de>>::deserialize(de)?.map(|c| c.0))
+}
+
 /// Zero-copy view of the JSON-RPC envelope. `serde_json::from_str` fills
 /// this without building a DOM: `method` borrows the input string and
 /// `id` / `params` are captured as un-parsed [`RawValue`] spans. Unknown
@@ -234,7 +288,7 @@ pub enum FrameParseError {
 struct Envelope<'a> {
     #[serde(default, borrow)]
     id: Option<&'a RawValue>,
-    #[serde(default, borrow)]
+    #[serde(default, borrow, deserialize_with = "deserialize_opt_cow_str")]
     method: Option<Cow<'a, str>>,
     #[serde(default, borrow)]
     params: Option<&'a RawValue>,
@@ -264,9 +318,12 @@ impl<'de> Deserialize<'de> for SubmitParams<'de> {
                 f.write_str("a mining.submit params array of five hex strings")
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let worker: Cow<'de, str> = seq
+                // `CowStr` (not a bare `Cow`) so a plain worker name is
+                // borrowed from the input instead of allocated — see its docs.
+                let worker: CowStr<'de> = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let worker = worker.0;
                 let job_id: &str = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
@@ -994,6 +1051,60 @@ mod tests {
             SV1Request::Submit(s) => assert_eq!(s.version_mask_hex, "1fffe000"),
             _ => unreachable!(),
         }
+    }
+
+    /// The other half of the `Cow` contract, and the regression guard for
+    /// the borrow fix: a PLAIN worker name (the overwhelmingly common case)
+    /// must be **borrowed** from the input line, not copied.
+    ///
+    /// Before the `CowStr` deserializer this asserted `Owned` in practice —
+    /// serde's blanket `Deserialize for Cow` never borrows — so the hot
+    /// submit path allocated ~50 bytes for the worker on every single share
+    /// while the doc comment claimed it was borrow-only.
+    #[test]
+    fn parse_submit_plain_worker_is_borrowed_not_allocated() {
+        let line = r#"{"id":5,"method":"mining.submit","params":["bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.worker1","000a","1122","ntime","nonce"]}"#;
+        let req = parse_request(line).expect("ok");
+        match req {
+            SV1Request::Submit(s) => {
+                assert_eq!(
+                    &*s.worker,
+                    "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.worker1"
+                );
+                assert!(
+                    matches!(s.worker, std::borrow::Cow::Borrowed(_)),
+                    "a plain worker name must borrow from the input, not allocate"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Same contract for the envelope's `method`, which had the identical
+    /// bug: `#[serde(borrow)]` does not reach through `Option<Cow<_>>`, so
+    /// every frame allocated for `"mining.submit"` too.
+    #[test]
+    fn envelope_plain_method_is_borrowed_not_allocated() {
+        let line = r#"{"id":1,"method":"mining.submit","params":[]}"#;
+        let env: Envelope = serde_json::from_str(line).expect("envelope");
+        let method = env.method.expect("method present");
+        assert_eq!(&*method, "mining.submit");
+        assert!(
+            matches!(method, std::borrow::Cow::Borrowed(_)),
+            "a plain method name must borrow from the input, not allocate"
+        );
+    }
+
+    /// An escaped method still round-trips correctly (unescaping forces an
+    /// allocation — the one case where `Cow` must own).
+    #[test]
+    fn envelope_escaped_method_unescapes_into_owned() {
+        // JSON `"a\\b"` is the 3-char value `a\b`; unescaping forces the copy.
+        let line = r#"{"id":1,"method":"a\\b","params":[]}"#;
+        let env: Envelope = serde_json::from_str(line).expect("envelope");
+        let method = env.method.expect("method present");
+        assert_eq!(&*method, "a\\b");
+        assert!(matches!(method, std::borrow::Cow::Owned(_)));
     }
 
     #[test]
