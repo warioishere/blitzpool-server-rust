@@ -887,7 +887,12 @@ async fn run_mining_connection(
                 // Inline vardiff after an accepted share: up-adjusts an active
                 // miner promptly instead of waiting for the next timer tick.
                 // Same shared path as the timer arm — see run_vardiff_check.
+                // Gated exactly like SV1's inline check: an accepted share
+                // may bring the retarget forward, but not more often than
+                // the configured interval. Ungated this swept every channel
+                // on the connection per share.
                 if has_accepted_share
+                    && state.vardiff_cooldown_elapsed()
                     && run_vardiff_check(
                         &mut state,
                         &mut writer,
@@ -1215,6 +1220,7 @@ async fn run_vardiff_check(
     session_id_hex: &str,
     hooks: &MiningServerHooks,
 ) -> Result<(), ()> {
+    state.mark_vardiff_checked();
     let outcome = apply_vardiff_check(state);
     if let Err(err) =
         write_outbound_frames(writer, outcome.outbound, debug_messages, session_id_hex).await
@@ -1382,7 +1388,11 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                         .await;
                 }
             }
-            SessionEvent::DifficultyChanged { .. } => {}
+            SessionEvent::DifficultyChanged { .. } => {
+                // Retarget counter — see the SV1 arm. Per channel here,
+                // since SV2 difficulty is per channel.
+                bp_metrics::record_stratum_difficulty_adjustment();
+            }
             SessionEvent::ShareAccepted { channel_id, accept } => {
                 // ext 0x0002 Worker-ID TLV: when the per-share TLV
                 // resolves to a non-empty worker name, attribute the

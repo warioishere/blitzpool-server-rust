@@ -1050,7 +1050,14 @@ pub(crate) async fn process_event_generic<C: bp_vardiff::Clock>(
 ) -> bool {
     match event {
         SessionEvent::Subscribed => true,
-        SessionEvent::DifficultyChanged { .. } => true,
+        SessionEvent::DifficultyChanged { .. } => {
+            // Retarget counter. Without it the vardiff controller is
+            // invisible in production: nothing else on either protocol
+            // reports that a difficulty moved, so there is no way to tell a
+            // healthy session apart from one being walked up and down.
+            bp_metrics::record_stratum_difficulty_adjustment();
+            true
+        }
         SessionEvent::Authorized { address, worker } => {
             // `register_session` (mode-gate publish + client_entity write)
             // already ran in the connection loop's authorize block, BEFORE

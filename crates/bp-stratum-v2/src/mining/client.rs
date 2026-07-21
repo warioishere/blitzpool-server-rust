@@ -580,6 +580,10 @@ pub struct MiningSessionState<C: Clock> {
     /// Drives the tick in `server::run_connection`; every channel on the
     /// connection is re-evaluated on it.
     pub vardiff_interval_ms: u64,
+    /// Clock reading of the last vardiff evaluation, timer or inline.
+    /// Gates the post-share inline check so it cannot run more often than
+    /// `vardiff_interval_ms` — see [`Self::vardiff_cooldown_elapsed`].
+    pub last_difficulty_check_ms: u64,
 
     /// Per-share diagnostic logging toggle (server-level
     /// `stratum_share_logs`). Set by the I/O layer after construction;
@@ -642,8 +646,29 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             ),
             target_shares_per_minute: port.target_shares_per_minute,
             vardiff_interval_ms: port.vardiff_interval_ms,
+            last_difficulty_check_ms: 0,
             share_logs: false,
         }
+    }
+
+    /// Whether the post-share inline vardiff check may run again.
+    ///
+    /// SV1 has always gated its inline check this way
+    /// (`bp-stratum-v1::server`); SV2 did not, so every accepted share
+    /// re-swept EVERY channel's engine on the connection — a 30-sample sum
+    /// per channel, on the share hot path, at whatever rate the miner
+    /// submits. The timer arm is deliberately NOT gated: it is the only
+    /// trigger that fires when no shares arrive.
+    pub fn vardiff_cooldown_elapsed(&self) -> bool {
+        self.clock
+            .now_ms()
+            .saturating_sub(self.last_difficulty_check_ms)
+            >= self.vardiff_interval_ms
+    }
+
+    /// Stamp the current clock reading as the last vardiff evaluation.
+    pub fn mark_vardiff_checked(&mut self) {
+        self.last_difficulty_check_ms = self.clock.now_ms();
     }
 
     /// A fresh classic vardiff engine for a newly opened channel, seeded
@@ -3911,6 +3936,58 @@ mod tests {
             vec![0x01, 0x02, 0x03, 0x04],
         );
         s
+    }
+
+    // ── inline vardiff cooldown ───────────────────────────────────
+
+    /// The inline (post-share) check must not run more often than
+    /// `vardiff_interval_ms`. Before this gate existed, every accepted
+    /// share re-swept every channel's engine on the connection.
+    #[test]
+    fn vardiff_cooldown_blocks_a_second_inline_check_inside_the_interval() {
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let mut s = MiningSessionState::new(clock.clone(), 1, port_cfg());
+        assert_eq!(s.vardiff_interval_ms, 60_000, "fixture assumption");
+
+        s.mark_vardiff_checked();
+        assert!(
+            !s.vardiff_cooldown_elapsed(),
+            "a check that just ran must close the gate"
+        );
+        clock.advance_ms(59_999);
+        assert!(
+            !s.vardiff_cooldown_elapsed(),
+            "one ms short of the interval"
+        );
+        clock.advance_ms(1);
+        assert!(s.vardiff_cooldown_elapsed(), "exactly at the interval");
+    }
+
+    /// A fresh session has never been checked, so the first accepted share
+    /// is allowed to bring the retarget forward — the gate paces repeats,
+    /// it does not delay the first one. (`last_difficulty_check_ms` starts
+    /// at 0 against a wall-clock reading, so the difference is enormous;
+    /// SV1 has the same property.)
+    #[test]
+    fn vardiff_cooldown_is_open_on_a_fresh_session() {
+        let clock = Arc::new(TestClock::new(1_784_000_000_000));
+        let s = MiningSessionState::new(clock, 1, port_cfg());
+        assert_eq!(s.last_difficulty_check_ms, 0);
+        assert!(s.vardiff_cooldown_elapsed());
+    }
+
+    /// A backwards clock step must not wedge the gate shut forever —
+    /// `saturating_sub` floors the elapsed time at 0, so the gate simply
+    /// stays closed until the clock catches back up.
+    #[test]
+    fn vardiff_cooldown_survives_a_backwards_clock_step() {
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let mut s = MiningSessionState::new(clock.clone(), 1, port_cfg());
+        s.mark_vardiff_checked();
+        clock.set_ms(500_000);
+        assert!(!s.vardiff_cooldown_elapsed(), "no panic, gate just closed");
+        clock.set_ms(1_000_000 + 60_000);
+        assert!(s.vardiff_cooldown_elapsed());
     }
 
     /// Open one Extended channel against a fresh session.
