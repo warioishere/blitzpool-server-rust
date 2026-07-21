@@ -26,12 +26,19 @@
 //! safe to hold indefinitely. That leaves `0x02000000..=0xFFFFFFFF`, ~99% of the
 //! space.
 
-use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::Json,
+    routing::post,
+    Router,
+};
 use bp_common::AddressId;
 use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::collections::HashSet;
 
 use super::address_ownership::{parse_supported_address, random_nonce, verify_message_signature};
 use crate::error::ApiError;
@@ -168,27 +175,63 @@ where
 
 // ─── POST /api/address/extranonce/set ────────────────────────────
 
+/// Upper bound on one batch. Generous for any real rig fleet, but bounded
+/// so a single request can't pin the API on an unbounded transaction.
+const MAX_BATCH_WORKERS: usize = 256;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetEntry {
+    worker: String,
+    extranonce: String,
+}
+
+/// Batch body. `address` and the bearer token are carried once for the whole
+/// request — the token is bound to the address anyway, so repeating them per
+/// entry would be redundant and inviting inconsistency.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetBody {
     address: String,
+    workers: Vec<SetEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetEntryResult {
     worker: String,
+    /// Echoed as 8 hex chars, the same shape the request used.
     extranonce: String,
-    token: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SetResponse {
     address: String,
-    worker: String,
-    /// Echoed as 8 hex chars, the same shape the request used.
-    extranonce: String,
+    updated: Vec<SetEntryResult>,
     updated_at: i64,
 }
 
+/// Set the extranonce prefix for one or more workers of an address, in a
+/// single all-or-nothing request.
+///
+/// **Auth**: `Authorization: Bearer <token>` — the token from
+/// `/extranonce/token`. Kept in the header rather than the body so it stays
+/// out of request-body logs and is separated from the payload.
+///
+/// **Atomic**: every entry lands or none does. A partially-applied batch
+/// would leave the fleet in a state the operator never asked for, which for
+/// a setting that decides what the miners hash on is worse than a clean
+/// rejection.
+///
+/// In-batch conflicts are diagnosed here (naming the offending worker)
+/// rather than left to the database, which could only report the constraint.
+/// A *swap* between two of the address's own workers is explicitly legal —
+/// see [`bp_db::upsert_custom_extranonces_batch`] for how the deferred
+/// constraint makes that work.
 async fn set<H, M>(
     State(state): State<SharedState<H, M>>,
+    headers: HeaderMap,
     Json(body): Json<SetBody>,
 ) -> Result<Json<SetResponse>, ApiError>
 where
@@ -196,21 +239,58 @@ where
     M: EmailHooks + 'static,
 {
     let address = parse_supported_address(&body.address, state.network)?;
-    let worker = normalize_worker(&body.worker);
-    let prefix = parse_prefix(&body.extranonce)?;
-    ensure_solo_eligible(&state.pool, state.pplns.as_deref(), &address).await?;
 
-    verify_token(&state.pool, &address, &body.token).await?;
+    if body.workers.is_empty() {
+        return Err(en_error("empty-batch", StatusCode::BAD_REQUEST));
+    }
+    if body.workers.len() > MAX_BATCH_WORKERS {
+        return Err(en_error("batch-too-large", StatusCode::BAD_REQUEST));
+    }
+
+    // Normalise + validate every entry BEFORE touching the database, so a
+    // bad entry costs no writes and the error names the entry.
+    let mut entries: Vec<(String, u32)> = Vec::with_capacity(body.workers.len());
+    let mut seen_workers: HashSet<String> = HashSet::with_capacity(body.workers.len());
+    let mut seen_prefixes: HashSet<u32> = HashSet::with_capacity(body.workers.len());
+    for entry in &body.workers {
+        let worker = normalize_worker(&entry.worker);
+        let prefix = parse_prefix(&entry.extranonce)?;
+        if !seen_prefixes.insert(prefix) {
+            // Two entries in the SAME request claiming one prefix can never
+            // be satisfied — unlike a swap, this is a genuine duplicate.
+            return Err(en_error(
+                "duplicate-extranonce-in-batch",
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+        if !seen_workers.insert(worker.clone()) {
+            return Err(en_error(
+                "duplicate-worker-in-batch",
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+        entries.push((worker, prefix));
+    }
+
+    ensure_solo_eligible(&state.pool, state.pplns.as_deref(), &address).await?;
+    verify_token(&state.pool, &address, &bearer_token(&headers)).await?;
 
     let now = crate::time_range::now_ms();
-    let saved = bp_db::upsert_custom_extranonce(&state.pool, &address, &worker, prefix, now)
+    let saved = bp_db::upsert_custom_extranonces_batch(&state.pool, &address, &entries, now)
         .await
         .map_err(map_prefix_conflict)?;
+
+    let updated_at = saved.first().map(|r| r.updated_at).unwrap_or(now);
     Ok(Json(SetResponse {
-        address: saved.address.as_str().to_string(),
-        worker: saved.worker,
-        extranonce: format!("{:08x}", saved.prefix),
-        updated_at: saved.updated_at,
+        address: address.as_str().to_string(),
+        updated: saved
+            .into_iter()
+            .map(|r| SetEntryResult {
+                worker: r.worker,
+                extranonce: format!("{:08x}", r.prefix),
+            })
+            .collect(),
+        updated_at,
     }))
 }
 
@@ -239,6 +319,21 @@ fn random_token() -> String {
 
 fn sha256_hex(input: &str) -> String {
     hex::encode(Sha256::digest(input.as_bytes()))
+}
+
+/// Extract the bearer token from `Authorization: Bearer <token>`.
+///
+/// Returns an empty string when the header is absent or malformed —
+/// [`verify_token`] then rejects it as `missing-token`, so a missing header
+/// and an empty token land on the same, unambiguous error.
+fn bearer_token(headers: &HeaderMap) -> String {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// Check the presented token against the stored hash for this address.

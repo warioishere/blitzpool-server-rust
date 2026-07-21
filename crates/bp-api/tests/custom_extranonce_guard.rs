@@ -25,6 +25,14 @@ const GROUPED_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 const SOLO_ADDR: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
 const TEST_GROUP_NAME: &str = "custom-en-guard-test";
 
+// One address PER TEST: `pplns_extranonce_token` is keyed by address, so
+// tests sharing an address would overwrite each other's token and fail
+// spuriously under cargo's parallel test execution.
+const SWAP_ADDR: &str = "bc1qan5dp8qdayxfs4wtflhzaesjlxp3mq3808yssq";
+const ATOMIC_ADDR: &str = "bc1q2vfxp232rx0z9rzn0hay9jptagk8c86d9w4l7k";
+const DUP_ADDR: &str = "bc1qha7546x08qwudehuc724np522c2n65m4sseeae";
+const HEADER_ADDR: &str = "bc1qyr9dx2zjg7rdla2dwc20za975w2gxtr4q39arj";
+
 async fn connect_or_skip() -> Option<PgPool> {
     let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
     match tokio::time::timeout(
@@ -70,18 +78,27 @@ async fn post_json(
     uri: &str,
     body: String,
 ) -> (StatusCode, serde_json::Value) {
+    post_json_auth(router, uri, body, None).await
+}
+
+/// POST with an optional `Authorization: Bearer` token — the extranonce
+/// `set` endpoint takes its token in the header, not the body.
+async fn post_json_auth(
+    router: axum::Router,
+    uri: &str,
+    body: String,
+    bearer: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("x-forwarded-for", "127.0.0.1")
+        .header("content-type", "application/json");
+    if let Some(t) = bearer {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
     let resp = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(uri)
-                // The layer keys rate-limits by client IP; give it a source so it
-                // doesn't 500 on a missing one.
-                .header("x-forwarded-for", "127.0.0.1")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body))
-                .unwrap(),
-        )
+        .oneshot(req.body(axum::body::Body::from(body)).unwrap())
         .await
         .expect("oneshot");
     let status = resp.status();
@@ -163,12 +180,13 @@ async fn set_rejects_without_valid_token() {
 
     // No token has ever been issued for this address → 401 no-token.
     let body = format!(
-        r#"{{"address":"{SOLO_ADDR}","worker":"w1","extranonce":"c0debabe","token":"deadbeef"}}"#
+        r#"{{"address":"{SOLO_ADDR}","workers":[{{"worker":"w1","extranonce":"c0debabe"}}]}}"#
     );
-    let (status, json) = post_json(
+    let (status, json) = post_json_auth(
         build_router(minimal_state(pool.clone())),
         "/api/address/extranonce/set",
         body,
+        Some("deadbeef"),
     )
     .await;
 
@@ -193,4 +211,168 @@ async fn set_rejects_without_valid_token() {
         persisted, 0,
         "no override may be persisted on a rejected set"
     );
+}
+
+/// Issue a real token for `addr` straight into the DB (bypassing the
+/// challenge/signature dance, which is covered elsewhere) so the batch
+/// tests can exercise the `set` path itself.
+async fn seed_token(pool: &PgPool, addr: &str, token: &str) {
+    use sha2::{Digest, Sha256};
+    let hash = hex::encode(Sha256::digest(token.as_bytes()));
+    let _ = sqlx::query(
+        r#"INSERT INTO pplns_extranonce_token (address, "tokenHash", "createdAt")
+           VALUES ($1, $2, 0)
+           ON CONFLICT (address) DO UPDATE SET "tokenHash" = EXCLUDED."tokenHash""#,
+    )
+    .bind(addr)
+    .bind(hash)
+    .execute(pool)
+    .await;
+}
+
+async fn prefixes_of(pool: &PgPool, addr: &str) -> Vec<(String, i64)> {
+    sqlx::query_as::<_, (String, i64)>(
+        "SELECT worker, prefix FROM pplns_custom_extranonce WHERE address = $1 ORDER BY worker",
+    )
+    .bind(addr)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+/// THE case that motivated the deferrable constraint: swapping two workers'
+/// prefixes inside one batch. With a plain `UNIQUE (address, prefix)` the
+/// first row would collide with the second's still-unchanged row and abort
+/// the whole request, even though the END state is perfectly valid.
+#[tokio::test]
+async fn set_batch_can_swap_two_workers_prefixes() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let _ = sqlx::query("DELETE FROM pplns_custom_extranonce WHERE address = $1")
+        .bind(SWAP_ADDR)
+        .execute(&pool)
+        .await;
+    seed_token(&pool, SWAP_ADDR, "tok-swap").await;
+
+    // Start: rig1=0x0aaaaaaa, rig2=0x0bbbbbbb
+    let initial = format!(
+        r#"{{"address":"{SWAP_ADDR}","workers":[{{"worker":"rig1","extranonce":"0aaaaaaa"}},{{"worker":"rig2","extranonce":"0bbbbbbb"}}]}}"#
+    );
+    let (st, js) = post_json_auth(
+        build_router(minimal_state(pool.clone())),
+        "/api/address/extranonce/set",
+        initial,
+        Some("tok-swap"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "initial batch must apply; got {js}");
+
+    // Now SWAP them in one batch.
+    let swap = format!(
+        r#"{{"address":"{SWAP_ADDR}","workers":[{{"worker":"rig1","extranonce":"0bbbbbbb"}},{{"worker":"rig2","extranonce":"0aaaaaaa"}}]}}"#
+    );
+    let (st, js) = post_json_auth(
+        build_router(minimal_state(pool.clone())),
+        "/api/address/extranonce/set",
+        swap,
+        Some("tok-swap"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "swap batch must be accepted; got {js}");
+
+    let rows = prefixes_of(&pool, SWAP_ADDR).await;
+    assert_eq!(
+        rows,
+        vec![
+            ("rig1".to_string(), 0x0bbb_bbbb),
+            ("rig2".to_string(), 0x0aaa_aaaa)
+        ],
+        "prefixes must actually be swapped"
+    );
+
+    let _ = sqlx::query("DELETE FROM pplns_custom_extranonce WHERE address = $1")
+        .bind(SWAP_ADDR)
+        .execute(&pool)
+        .await;
+}
+
+/// All-or-nothing: a batch whose LAST entry is invalid must leave the
+/// earlier entries unwritten. A half-applied fleet config is worse than a
+/// clean rejection.
+#[tokio::test]
+async fn set_batch_is_all_or_nothing() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let _ = sqlx::query("DELETE FROM pplns_custom_extranonce WHERE address = $1")
+        .bind(ATOMIC_ADDR)
+        .execute(&pool)
+        .await;
+    seed_token(&pool, ATOMIC_ADDR, "tok-atomic").await;
+
+    // Second entry sits in the reserved 0x00/0x01 range → rejected.
+    let body = format!(
+        r#"{{"address":"{ATOMIC_ADDR}","workers":[{{"worker":"good","extranonce":"0cafe000"}},{{"worker":"bad","extranonce":"01000000"}}]}}"#
+    );
+    let (st, js) = post_json_auth(
+        build_router(minimal_state(pool.clone())),
+        "/api/address/extranonce/set",
+        body,
+        Some("tok-atomic"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "must reject; got {js}");
+    assert_eq!(js["code"], "reserved-extranonce-range");
+    assert!(
+        prefixes_of(&pool, ATOMIC_ADDR).await.is_empty(),
+        "no entry may be written when any entry is invalid"
+    );
+}
+
+/// Two entries in one request claiming the same prefix can never be
+/// satisfied (unlike a swap) — caught up front so the error names the
+/// problem instead of surfacing as a database constraint.
+#[tokio::test]
+async fn set_batch_rejects_duplicate_prefix_within_the_request() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    seed_token(&pool, DUP_ADDR, "tok-dup").await;
+    let body = format!(
+        r#"{{"address":"{DUP_ADDR}","workers":[{{"worker":"a","extranonce":"0dddddd1"}},{{"worker":"b","extranonce":"0dddddd1"}}]}}"#
+    );
+    let (st, js) = post_json_auth(
+        build_router(minimal_state(pool.clone())),
+        "/api/address/extranonce/set",
+        body,
+        Some("tok-dup"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(js["code"], "duplicate-extranonce-in-batch");
+}
+
+/// The token now travels in `Authorization: Bearer`, not the body. A
+/// request without the header must be rejected — and a token placed in the
+/// body (the old shape) must NOT be honoured.
+#[tokio::test]
+async fn set_requires_the_bearer_header() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    seed_token(&pool, HEADER_ADDR, "tok-header").await;
+    let body = format!(
+        r#"{{"address":"{HEADER_ADDR}","token":"tok-header","workers":[{{"worker":"w","extranonce":"0eeeeee1"}}]}}"#
+    );
+    // No Authorization header — a body token must not stand in for it.
+    let (st, js) = post_json_auth(
+        build_router(minimal_state(pool.clone())),
+        "/api/address/extranonce/set",
+        body,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "got {js}");
+    assert_eq!(js["code"], "missing-token");
 }

@@ -106,16 +106,21 @@ sign a new challenge to mint a replacement (which revokes the old one).
 
 ### 3. `POST /api/address/extranonce/set`
 
-Headless, no-UI call: set (or change) the prefix for one worker. Repeat per
-worker, and per change, with the **same** token.
+Headless, no-UI call: set (or change) the prefix for **one or more** workers
+in a single all-or-nothing request. Repeat any time with the **same** token.
+
+The token travels in the **`Authorization` header**, not the body — so it
+stays out of request-body logs and is cleanly separated from the payload.
 
 ```jsonc
 // request
+// Header: Authorization: Bearer 3f9a…64hex…
 {
   "address": "bc1q…",
-  "worker":  "rig1",          // worker name; empty → "default"
-  "extranonce": "c0debabe",   // desired prefix, 8 hex chars (see below)
-  "token": "3f9a…64hex…"       // the token from step 2
+  "workers": [
+    { "worker": "rig1", "extranonce": "c0debabe" },
+    { "worker": "rig2", "extranonce": "c0debabf" }
+  ]
 }
 ```
 
@@ -123,16 +128,26 @@ worker, and per change, with the **same** token.
 // 200 response
 {
   "address": "bc1q…",
-  "worker": "rig1",
-  "extranonce": "c0debabe",
+  "updated": [
+    { "worker": "rig1", "extranonce": "c0debabe" },
+    { "worker": "rig2", "extranonce": "c0debabf" }
+  ],
   "updatedAt": 1730000000000
 }
 ```
 
-The token is hashed and compared to the stored hash for this address; the Solo
-guard still applies. To set a different worker, call `set` again with the same
-token and a different `worker`. To change a worker's prefix, call `set` again
-with a new `extranonce`.
+**All or nothing.** Every entry lands or none does — a half-applied batch
+would leave your fleet in a state you never asked for. If any entry is
+rejected, nothing is written and the error names the problem.
+
+**Swapping prefixes between your own workers is allowed.** Sending
+`rig1 := rig2's prefix` and `rig2 := rig1's prefix` in one batch works: the
+uniqueness rule is checked at the end of the request, so a temporary
+in-request collision is fine. Two workers left on the **same** prefix is
+still rejected.
+
+Limits: at least 1 and at most **256** workers per request; no repeated
+worker and no repeated prefix within one request.
 
 ---
 
@@ -241,7 +256,11 @@ What **is** enforced, and what isn't:
 | 400  | `reserved-extranonce-range`| prefix top byte is `0x00`/`0x01`                                    |
 | 400  | `missing-signature`        | empty signature when requesting a token                            |
 | 400  | `invalid-signature`        | signature doesn't verify against the stored challenge message      |
-| 401  | `missing-token`            | empty token on `set`                                               |
+| 400  | `empty-batch`              | `workers` was empty                                                |
+| 400  | `batch-too-large`          | more than 256 workers in one request                               |
+| 400  | `duplicate-worker-in-batch`| the same worker appears twice in one request                       |
+| 400  | `duplicate-extranonce-in-batch` | two workers in one request claim the same prefix              |
+| 401  | `missing-token`            | no `Authorization: Bearer` header on `set`                         |
 | 401  | `no-token`                 | no token has been issued for this address                          |
 | 401  | `invalid-token`            | token doesn't match the stored hash                                |
 | 404  | `no-challenge`             | token request with no pending challenge for the address           |
@@ -260,9 +279,10 @@ One-time, to get a token:
 2. POST /api/address/extranonce/token     {address, signature}
         → 200: store the returned `token` (shown only once)
 
-Per worker, any time (reuse the token):
-3. POST /api/address/extranonce/set        {address, worker, extranonce, token}
-        → 200: override stored
+Any time, one or many workers at once (reuse the token):
+3. POST /api/address/extranonce/set   Authorization: Bearer <token>
+                                      {address, workers:[{worker, extranonce}, …]}
+        → 200: all overrides stored (or none, on any error)
 
 4. (Re)start the miner authorising as `address.worker` on a Solo port,
    opening an SV2 Extended channel

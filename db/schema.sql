@@ -1682,7 +1682,7 @@ CREATE TABLE public.pplns_custom_extranonce (
     "createdAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     "updatedAt" bigint DEFAULT ((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint NOT NULL,
     CONSTRAINT pplns_custom_extranonce_pkey PRIMARY KEY (address, worker),
-    CONSTRAINT pplns_custom_extranonce_address_prefix_key UNIQUE (address, prefix),
+    CONSTRAINT pplns_custom_extranonce_address_prefix_key UNIQUE (address, prefix) DEFERRABLE INITIALLY IMMEDIATE,
     CONSTRAINT pplns_custom_extranonce_prefix_u32 CHECK (prefix >= 0 AND prefix <= 4294967295)
 );
 

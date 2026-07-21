@@ -230,6 +230,70 @@ pub async fn upsert_custom_extranonce(
     })
 }
 
+/// Apply a whole batch of `(worker, prefix)` overrides for ONE address
+/// atomically — all rows land or none do.
+///
+/// Runs in a single transaction with the `UNIQUE (address, prefix)` check
+/// **deferred to COMMIT**. That is what makes a *swap* possible: setting
+/// `rig1` to `rig2`'s current prefix would otherwise collide with rig2's
+/// still-unchanged row and abort the batch, even though the end state is
+/// perfectly valid. Deferring moves the check to the end, where only the
+/// final state matters — a genuine duplicate (two workers left on the same
+/// prefix) still fails, and the error surfaces from `commit()`.
+///
+/// Returns the rows as written. The caller is responsible for rejecting
+/// in-batch duplicates up front so it can name the offending worker; this
+/// function's own guarantee is atomicity, not diagnosis.
+pub async fn upsert_custom_extranonces_batch(
+    pool: &PgPool,
+    address: &AddressId,
+    entries: &[(String, u32)],
+    now_ms: i64,
+) -> Result<Vec<CustomExtranonceRow>, DbError> {
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    sqlx::query("SET CONSTRAINTS pplns_custom_extranonce_address_prefix_key DEFERRED")
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::from)?;
+
+    let mut out = Vec::with_capacity(entries.len());
+    for (worker, prefix) in entries {
+        let r = sqlx::query!(
+            r#"INSERT INTO pplns_custom_extranonce
+                 (address, worker, prefix, "createdAt", "updatedAt")
+               VALUES ($1, $2, $3, $4, $4)
+               ON CONFLICT (address, worker) DO UPDATE SET
+                 prefix = EXCLUDED.prefix,
+                 "updatedAt" = EXCLUDED."updatedAt"
+               RETURNING
+                address AS "address!: AddressId",
+                worker AS "worker!",
+                prefix AS "prefix!",
+                "createdAt" AS "created_at!",
+                "updatedAt" AS "updated_at!""#,
+            address.as_str(),
+            worker,
+            i64::from(*prefix),
+            now_ms,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(DbError::from)?;
+        out.push(CustomExtranonceRow {
+            address: r.address,
+            worker: r.worker,
+            prefix: prefix_to_u32(r.prefix),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        });
+    }
+
+    // The deferred UNIQUE check fires HERE — a real duplicate surfaces as a
+    // commit error, and nothing has been written.
+    tx.commit().await.map_err(DbError::from)?;
+    Ok(out)
+}
+
 /// Every override, for the stratum core's in-memory cache.
 ///
 /// The core refreshes this periodically instead of hitting PG per connection:
