@@ -48,6 +48,7 @@
 //! warn — the window degrades gracefully (slightly under-sized) until
 //! the cron's first tick lands.
 
+use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -529,13 +530,20 @@ impl BlitzpoolModeGate {
 /// semantics that we don't need (these sinks are all
 /// log-and-continue on internal failure).
 pub(crate) struct CompositeAcceptedShareSink {
-    /// Held behind a sync `Mutex` so a one-shot startup append (via
-    /// [`Self::push`]) can extend the fan-out after the composite is
-    /// already wrapped in `Arc`. Read path clones the inner `Vec` of
-    /// `Arc`s under the brief critical section, then iterates without
-    /// holding the lock — every sink runs without contention with
-    /// concurrent shares on the same address.
-    sinks: Mutex<Vec<Arc<dyn SharedAcceptedShareSink>>>,
+    /// Copy-on-write behind an [`ArcSwap`] so a one-shot startup append (via
+    /// [`Self::push`]) can extend the fan-out after the composite is already
+    /// wrapped in `Arc`, **without putting a lock on the per-share read
+    /// path**.
+    ///
+    /// The read path is `load_full()` — one atomic load plus a refcount bump
+    /// — and the resulting `Arc` is held across the `await`s of the fan-out.
+    /// This replaces a `Mutex<Vec<_>>` whose read path locked and then deep-
+    /// cloned the whole `Vec` on **every accepted share**, i.e. a process-wide
+    /// lock acquisition + one allocation per share, paid forever for what is
+    /// only a startup-time mutation. (The `Vec` clone existed because the
+    /// fan-out `await`s each sink, so a `std` guard cannot be held across it;
+    /// `ArcSwap` removes both the lock and the clone.)
+    sinks: ArcSwap<Vec<Arc<dyn SharedAcceptedShareSink>>>,
     /// Assigns the producer `share_id` to every accepted share. This is the
     /// single fan-out point every share crosses regardless of protocol, so
     /// it is exactly where the id is stamped today — and where the stream
@@ -552,22 +560,23 @@ impl CompositeAcceptedShareSink {
     /// Append an extra sink to the fan-out. Intended for one-shot
     /// startup wiring (e.g. Blockparty, whose handle is constructed
     /// after the rest of the engines).
+    ///
+    /// Copy-on-write: builds the new list and swaps the pointer, so readers
+    /// concurrently fanning out a share keep iterating their own consistent
+    /// snapshot. Startup-only, so the clone here is not on any hot path.
     pub(crate) fn push(&self, sink: Arc<dyn SharedAcceptedShareSink>) {
-        self.sinks
-            .lock()
-            .expect("accepted-share composite mutex poisoned")
-            .push(sink);
+        let mut next = Vec::clone(&self.sinks.load_full());
+        next.push(sink);
+        self.sinks.store(Arc::new(next));
     }
 }
 
 #[async_trait]
 impl SharedAcceptedShareSink for CompositeAcceptedShareSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        let snapshot: Vec<Arc<dyn SharedAcceptedShareSink>> = self
-            .sinks
-            .lock()
-            .expect("accepted-share composite mutex poisoned")
-            .clone();
+        // One atomic load + refcount bump; no lock, no `Vec` clone. Held
+        // across the fan-out `await`s below.
+        let snapshot = self.sinks.load_full();
         // Stamp the producer fields here — one id + one mode resolution per
         // share, assigned at the single point every share crosses, before
         // any sink sees it. The adapters left them blank; idempotent sinks
@@ -684,7 +693,7 @@ fn build_producing_composite(
         AcceptedShareProducer::new(redis, ACCEPTED_STREAM_KEY),
     ));
     Arc::new(CompositeAcceptedShareSink {
-        sinks: Mutex::new(vec![producing]),
+        sinks: ArcSwap::new(Arc::new(vec![producing])),
         sequencer: ShareSequencer::new(core_epoch),
         gate,
     })
@@ -724,6 +733,100 @@ mod tests {
     use super::*;
     use bp_common::MiningMode;
     use bp_share_stream::AcceptedShareConsumer;
+
+    // ── CompositeAcceptedShareSink: ArcSwap fan-out list ─────────────
+    //
+    // The list is appended exactly once at startup (Blockparty) and then
+    // read on EVERY accepted share. It used to be a `Mutex<Vec<_>>` whose
+    // read path locked and deep-cloned the whole `Vec` per share; it is now
+    // an `ArcSwap` read via `load_full()` (atomic load + refcount bump).
+    // These tests pin the semantics that change had to preserve.
+
+    /// Counts how often it was invoked, so a fan-out can be observed.
+    struct CountingSink(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl SharedAcceptedShareSink for CountingSink {
+        async fn record_accepted(&self, _share: SharedAcceptedShare<'_>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn empty_composite() -> CompositeAcceptedShareSink {
+        CompositeAcceptedShareSink {
+            sinks: ArcSwap::new(Arc::new(Vec::new())),
+            sequencer: ShareSequencer::new(0),
+            gate: Arc::new(BlitzpoolModeGate::new()),
+        }
+    }
+
+    /// Minimal borrowed accepted-share; only the fan-out is under test.
+    fn test_share() -> SharedAcceptedShare<'static> {
+        SharedAcceptedShare {
+            address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+            worker: "w1",
+            session_id: "sess",
+            effective_difficulty: 1.0,
+            submission_difficulty: 1.0,
+            user_agent: None,
+            is_block_candidate: false,
+            hash_rate: 0.0,
+            channel_count: 1,
+            ts_ms: 0,
+            share_id: "",
+            mode: MiningMode::Solo,
+            group_id: None,
+        }
+    }
+
+    /// `push` must be visible to reads that happen after it — the whole
+    /// point of the late-append (Blockparty is wired after the composite
+    /// is already inside an `Arc`).
+    #[tokio::test]
+    async fn composite_push_is_visible_to_later_reads() {
+        let composite = empty_composite();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        composite.push(Arc::new(CountingSink(hits.clone())));
+
+        composite.record_accepted(test_share()).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a sink appended via push() must receive subsequent shares"
+        );
+    }
+
+    /// Every sink in the list is fanned out to, in order — `load_full()`
+    /// must expose the complete list, not a truncated snapshot.
+    #[tokio::test]
+    async fn composite_fans_out_to_every_pushed_sink() {
+        let composite = empty_composite();
+        let a = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let b = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        composite.push(Arc::new(CountingSink(a.clone())));
+        composite.push(Arc::new(CountingSink(b.clone())));
+
+        composite.record_accepted(test_share()).await;
+        assert_eq!(a.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(b.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(composite.sinks.load().len(), 2);
+    }
+
+    /// Copy-on-write: a snapshot taken before a `push` keeps its own view.
+    /// This is what makes the lock unnecessary — a reader mid-fan-out is
+    /// never mutated underneath.
+    #[test]
+    fn composite_push_is_copy_on_write() {
+        let composite = empty_composite();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        composite.push(Arc::new(CountingSink(hits.clone())));
+
+        let snapshot = composite.sinks.load_full();
+        assert_eq!(snapshot.len(), 1);
+        composite.push(Arc::new(CountingSink(hits)));
+        assert_eq!(snapshot.len(), 1, "held snapshot must not see the append");
+        assert_eq!(composite.sinks.load().len(), 2, "new readers see both");
+    }
 
     const REDIS_URL: &str = "redis://127.0.0.1:16379";
 

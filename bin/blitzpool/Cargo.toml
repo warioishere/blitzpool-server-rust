@@ -78,6 +78,7 @@ axum = { workspace = true }
 
 # Trait-object impls of async sinks (`async_trait`).
 async-trait = { workspace = true }
+arc-swap = { workspace = true }
 
 # Group-Solo's `GroupModeGate` returns `Option<Uuid>` so we need uuid
 # at the wiring layer too.

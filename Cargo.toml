@@ -68,6 +68,9 @@ tokio-util = { version = "0.7", features = ["codec", "io"] }
 socket2 = "0.6"
 futures = "0.3"
 async-trait = "0.1"
+# Lock-free copy-on-write for read-mostly shared state (the accepted-share
+# fan-out list: appended once at startup, then read on every share).
+arc-swap = "1"
 
 # Observability + errors
 tracing = "0.1"

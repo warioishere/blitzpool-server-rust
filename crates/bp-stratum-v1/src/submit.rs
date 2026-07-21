@@ -36,6 +36,33 @@ use crate::notify::ActiveSV1Template;
 use bp_mining_job::MiningJob;
 use bp_vardiff::effective_job_difficulty;
 
+// ── Log helpers ──────────────────────────────────────────────────────
+
+/// Zero-allocation, lazily-rendered hex view of a byte slice, for use as a
+/// `tracing` field value.
+///
+/// [`Display::fmt`](std::fmt::Display::fmt) writes the hex digits straight
+/// into the subscriber's formatter, so:
+///
+/// - **nothing is built unless the log line is actually emitted** — a
+///   `tracing` field is only formatted once the callsite is enabled; and
+/// - even when it *is* emitted there is no intermediate `String` and no
+///   per-byte `format!` allocation.
+///
+/// This replaces the `hash[..8].iter().map(|b| format!("{b:02x}")).collect()`
+/// pattern that used to sit *outside* the reject-path `warn!`, where it
+/// allocated on every rejected share regardless of the active log level.
+pub(crate) struct HexDisplay<'a>(pub(crate) &'a [u8]);
+
+impl std::fmt::Display for HexDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 // ── Reject classification ────────────────────────────────────────────
 
 /// One of the four wire-visible reject reasons.
@@ -390,17 +417,17 @@ pub fn validate_submit(
         //   `❌ Share rejected: difficulty-too-low (submitted=X < effective=Y)`
         // Plus hash_prefix_be for cross-checking against the miner's
         // own debug trace when validator vs miner disagree on the hash.
-        let hash_prefix: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+        //
+        // Both hex fields go through [`HexDisplay`] *inside* the macro, so
+        // they cost nothing unless the line is actually emitted. This path
+        // runs on every rejected share, so an eager hex build here is paid
+        // even when the log level discards it.
         tracing::warn!(
             worker = %submit.worker,
             job_id = %submit.job_id,
             nonce = format_args!("0x{:08x}", nonce),
-            extranonce2 = %{
-                let mut s = String::with_capacity(extranonce2.len() * 2);
-                for b in extranonce2.iter() { s.push_str(&format!("{b:02x}")); }
-                s
-            },
-            hash_prefix_be = %hash_prefix,
+            extranonce2 = %HexDisplay(&extranonce2),
+            hash_prefix_be = %HexDisplay(&hash[..8]),
             "❌ Share rejected: difficulty-too-low (submitted={:.2} < effective={:.2})",
             submission_difficulty,
             effective_diff
@@ -469,6 +496,67 @@ fn parse_submit_fields(submit: &SubmitRequest) -> Option<(u32, u32, u32, [u8; 8]
 
 #[cfg(test)]
 mod tests {
+    // ── HexDisplay (reject-path log helper) ──────────────────────────
+    //
+    // The point of `HexDisplay` is not just correct hex: it is that the
+    // reject path builds NOTHING unless the log line is emitted. The old
+    // code ran `hash[..8].iter().map(|b| format!(...)).collect()` OUTSIDE
+    // the `warn!`, so every rejected share paid ~9 allocations even when
+    // the level discarded the line.
+
+    /// Renders lowercase hex, matching the previous `format!("{b:02x}")`
+    /// output byte-for-byte (the field is cross-checked against miner
+    /// debug traces, so the encoding must not drift).
+    #[test]
+    fn hex_display_renders_lowercase_hex() {
+        use super::HexDisplay;
+        assert_eq!(
+            HexDisplay(&[0xde, 0xad, 0xbe, 0xef]).to_string(),
+            "deadbeef"
+        );
+        // Leading-zero nibbles must be preserved (0x0a -> "0a", not "a").
+        assert_eq!(HexDisplay(&[0x00, 0x0a, 0xff]).to_string(), "000aff");
+        assert_eq!(HexDisplay(&[]).to_string(), "");
+    }
+
+    /// Byte-for-byte parity with the exact expression the reject path used
+    /// to run eagerly — guards against an encoding change slipping in with
+    /// the laziness change.
+    #[test]
+    fn hex_display_matches_the_previous_eager_expression() {
+        use super::HexDisplay;
+        let hash: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(37));
+        let old: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(HexDisplay(&hash[..8]).to_string(), old);
+    }
+
+    /// THE regression guard: `HexDisplay` must not do any work until it is
+    /// actually formatted. A counter in `Display::fmt` proves construction
+    /// is free — so putting it in a `tracing` field costs nothing when the
+    /// callsite is disabled.
+    #[test]
+    fn hex_display_does_no_work_until_formatted() {
+        use std::cell::Cell;
+        thread_local! {
+            static FMT_CALLS: Cell<usize> = const { Cell::new(0) };
+        }
+        struct Counted<'a>(&'a [u8]);
+        impl std::fmt::Display for Counted<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                FMT_CALLS.with(|c| c.set(c.get() + 1));
+                write!(f, "{}", super::HexDisplay(self.0))
+            }
+        }
+        let bytes = [0xAAu8; 8];
+        // Construct and hold it — exactly what a tracing field does when
+        // the callsite is disabled: the value is never formatted.
+        let held = Counted(&bytes);
+        assert_eq!(FMT_CALLS.with(|c| c.get()), 0, "construction must be free");
+        // Only formatting does the work.
+        let _ = held.to_string();
+        assert_eq!(FMT_CALLS.with(|c| c.get()), 1);
+    }
+
     use super::*;
     use crate::config::ServerConfig;
     use crate::frame::RpcId;

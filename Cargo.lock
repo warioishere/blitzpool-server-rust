@@ -471,6 +471,7 @@ dependencies = [
 name = "blitzpool"
 version = "2.2.4"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum",
  "bitcoin",
