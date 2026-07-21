@@ -27,9 +27,8 @@ bp-group-solo = { workspace = true }
 # would otherwise hardcode as `SV2_STALE_GRACE_MS` etc.
 bp-jobs-lifecycle = { workspace = true }
 # Classic vardiff (sliding-window shares-per-minute) is shared with
-# bp-stratum-v1 — extracted as a pure-math leaf 2026-05-16. Standard +
-# Extended channels use it directly via `bp_vardiff::VarDiffEngine`;
-# the JDC-specific share-count vardiff lives in `mining::vardiff`.
+# bp-stratum-v1 — extracted as a pure-math leaf 2026-05-16. Every SV2
+# channel retargets through it via `bp_vardiff::VarDiffEngine`.
 bp-vardiff = { workspace = true }
 # Protocol-agnostic accepted-share hook surface — same role as in
 # bp-stratum-v1: engines impl `SharedAcceptedShareSink` once and our

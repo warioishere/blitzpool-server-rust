@@ -29,14 +29,6 @@
 //! `HashSet` tracks submitted shares for duplicate detection. Cleared on
 //! `SetNewPrevHash` (block change), the same point that retires the
 //! extended-jobs map.
-//!
-//! `is_jdc` flags channels owned by Job-Declaration-Client miners
-//! (BraiinsOS, custom firmware that uses ext-0x0003 + JDP). The flag
-//! gates pool job broadcast — JDC clients build their own jobs via
-//! `SetCustomMiningJob` and shouldn't receive pool-built
-//! `NewExtendedMiningJob` frames. The detection itself (cross-check
-//! against the JDP server's IP table) lives in the connection
-//! state-machine; this struct just carries the flag.
 
 use std::collections::{HashMap, HashSet};
 
@@ -123,21 +115,11 @@ pub struct ChannelState {
     /// change (`SetNewPrevHash`) is always sent. `None` until the first job.
     pub last_sent_job_signature: Option<u64>,
 
-    /// JD-Client flag (set when the connection's IP also has an
-    /// active JDP-server connection). Gates pool job broadcast.
-    pub is_jdc: bool,
-
     /// One-shot diagnostic flag — pool logs the actual extranonce length
     /// of the first share per channel so operators can spot firmware
     /// that ignores the advertised `extranonce_size`. The flag stays
     /// `false` until the first share is processed.
     pub first_share_logged: bool,
-
-    /// `submission_difficulty` of the most-recent accepted share — the
-    /// JDC vardiff algorithm reads this to cap retargets at the work
-    /// the JDC has actually proven.
-    /// `None` until the first share is accepted on this channel.
-    pub last_submission_difficulty: Option<Difficulty>,
 
     /// Memo for `difficulty_to_target` on the per-share accept check.
     /// Per-job difficulty changes only on a vardiff ratchet, so within a
@@ -174,9 +156,7 @@ impl ChannelState {
             next_job_id: 1,
             submission_cache: SubmissionCache::Standard(HashSet::new()),
             last_sent_job_signature: None,
-            is_jdc: false,
             first_share_logged: false,
-            last_submission_difficulty: None,
             target_memo: None,
         }
     }
@@ -206,9 +186,7 @@ impl ChannelState {
             next_job_id: 1,
             submission_cache: SubmissionCache::Extended(HashSet::new()),
             last_sent_job_signature: None,
-            is_jdc: false,
             first_share_logged: false,
-            last_submission_difficulty: None,
             target_memo: None,
         }
     }
@@ -406,7 +384,6 @@ mod tests {
         assert!(ch.submission_cache.is_empty());
         assert!(matches!(ch.submission_cache, SubmissionCache::Standard(_)));
         assert_eq!(ch.full_extranonce_size(), 4);
-        assert!(!ch.is_jdc);
         assert!(!ch.first_share_logged);
     }
 
@@ -517,16 +494,13 @@ mod tests {
         assert!(matches!(ch.submission_cache, SubmissionCache::Extended(_)));
     }
 
-    // ── is_jdc + first_share_logged toggles ────────────────────────
+    // ── first_share_logged toggle ──────────────────────────────────
 
-    /// The diagnostic flags are mutable (callers flip them on detect /
-    /// first-share-log).
+    /// The diagnostic flag is mutable (callers flip it on first-share-log).
     #[test]
     fn diagnostic_flags_can_be_toggled() {
         let mut ch = ChannelState::new_extended(1, vec![0; 4], 8, Difficulty(1.0), max_target());
-        ch.is_jdc = true;
         ch.first_share_logged = true;
-        assert!(ch.is_jdc);
         assert!(ch.first_share_logged);
     }
 

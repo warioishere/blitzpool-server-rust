@@ -13,10 +13,9 @@
 //!
 //! Implements the per-session VarDiff algorithm (shares-per-minute
 //! retarget) and the `effectiveJobDifficulty` helper used for the
-//! ckpool-style race-window clamp. The same algorithm is used
-//! pool-wide for the classic shares-per-minute retarget; SV2's
-//! JD-client-specific share-count vardiff is a different algorithm
-//! and lives in `bp-stratum-v2::mining::vardiff`.
+//! ckpool-style race-window clamp. This is the pool's only retarget
+//! algorithm — SV1, SV2 Standard, SV2 Extended and job-declaration
+//! channels all run it.
 //!
 //! Two pieces:
 //!

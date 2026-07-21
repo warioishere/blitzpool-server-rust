@@ -33,8 +33,8 @@
 //!
 //! All implemented: `apply_template_broadcast` (MiningJob-build + PPLNS /
 //! group-solo / solo mode-routing), `handle_request_extensions` (ext 0x0001
-//! negotiation), `handle_set_custom_mining_job` (JDC integration), the
-//! `JdcVardiff` variant in `apply_vardiff_check`, and Standard-channel
+//! negotiation), `handle_set_custom_mining_job` (JDC integration), and
+//! Standard-channel
 //! retire-not-clear (block change stamps `retired_at_ms` so in-flight Standard
 //! shares classify as the spec-correct `stale-share`, not `invalid-job-id`).
 //!
@@ -71,7 +71,6 @@ use super::submit::{
     SubmitSharesStandardInput,
 };
 use super::translator::{TemplateBroadcast, TemplateChange};
-use super::vardiff::JdcVardiff;
 
 // ── SetupConnection flags (BIP-310 / SV2 spec §4.1) ─────────────────
 
@@ -540,8 +539,8 @@ pub struct MiningSessionState<C: Clock> {
     // a set would force a fresh collect-to-Vec allocation per frame.
     pub negotiated_extensions: Vec<u16>,
 
-    // Connection default/initial difficulty; also the JDC vardiff base.
-    // Classic per-channel vardiff lives in `vardiff` (keyed by channel id).
+    // Connection default/initial difficulty. Live retargeting is
+    // per-channel and lives in `vardiff` (keyed by channel id).
     pub session_difficulty: Difficulty,
 
     // Channels
@@ -563,10 +562,9 @@ pub struct MiningSessionState<C: Clock> {
     /// Classic vardiff, one engine per channel id. SV2 difficulty is per
     /// channel, so each channel tracks its own share rate independently;
     /// several channels on one connection (multi-board, aggregating proxy)
-    /// don't combine into one inflated rate. Standard + Extended channels;
-    /// JDC channels retarget via `jdc_vardiff` instead.
+    /// don't combine into one inflated rate. Standard, Extended and
+    /// job-declaration channels all retarget through it.
     pub vardiff: HashMap<u32, VarDiffEngine<C>>,
-    pub jdc_vardiff: JdcVardiff,
 
     // Clock + per-port config
     pub clock: C,
@@ -578,8 +576,9 @@ pub struct MiningSessionState<C: Clock> {
     /// target. Vardiff retargets from there.
     pub initial_difficulty: Difficulty,
     pub target_shares_per_minute: f64,
-    /// JDC-vardiff check cadence (ms). 0 disables JDC vardiff entirely
-    /// (defensive — JDC `check()` already no-ops on `interval_ms == 0`).
+    /// Cadence of the connection's vardiff check loop in milliseconds.
+    /// Drives the tick in `server::run_connection`; every channel on the
+    /// connection is re-evaluated on it.
     pub vardiff_interval_ms: u64,
 
     /// Per-share diagnostic logging toggle (server-level
@@ -600,9 +599,8 @@ pub struct PortConfig {
     /// from this baseline up or down; never falls below `min_difficulty`.
     pub initial_difficulty: Difficulty,
     pub target_shares_per_minute: f64,
-    /// Cadence of the JDC vardiff check loop in milliseconds.
-    /// Typical 60 000. Classic vardiff reads its own cadence from
-    /// [`bp_vardiff`] and ignores this.
+    /// Cadence of the vardiff check loop in milliseconds. Typical
+    /// 60 000. Drives the connection's vardiff tick for every channel.
     pub vardiff_interval_ms: u64,
 }
 
@@ -635,7 +633,6 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             next_channel_id: 1,
             groups: GroupChannelRegistry::new(),
             vardiff: HashMap::new(),
-            jdc_vardiff: JdcVardiff::new(),
             clock,
             min_difficulty: port.min_difficulty,
             initial_difficulty: Difficulty(
@@ -1394,9 +1391,6 @@ fn finalize_submit(
     match validation {
         ShareValidation::Accepted(accept) => {
             channel.record_accepted_share(accept.effective_difficulty);
-            // Cache the actual solved difficulty (post-hash) so the JDC
-            // vardiff branch can cap retargets at proven work.
-            channel.last_submission_difficulty = Some(accept.submission_difficulty);
             HandlerOutcome {
                 outbound: vec![OutboundFrame::SubmitSharesSuccess {
                     channel_id,
@@ -1537,7 +1531,7 @@ pub fn handle_close_channel<C: Clock>(
 
 // ── apply_vardiff_check ─────────────────────────────────────────────
 
-/// Periodic vardiff tick. For each non-JDC channel, reads that channel's
+/// Periodic vardiff tick. For each channel, reads that channel's
 /// own [`bp_vardiff::VarDiffEngine::suggested_difficulty`] against the
 /// channel's current difficulty; if a retarget is recommended it clamps
 /// against the channel's `declared_max_target`, updates the channel's
@@ -1545,23 +1539,15 @@ pub fn handle_close_channel<C: Clock>(
 /// retargets independently from its own share rate — SV2 difficulty is per
 /// channel, so several channels on one connection never pool their rate.
 ///
-/// JDC channels (`is_jdc=true`) are skipped here — they retarget via
-/// [`crate::mining::vardiff::JdcVardiff::check`] on a different cadence
-/// (share-count-based instead of sample-window based).
+/// Job-declaration clients are retargeted by this same path. A JDC runs no
+/// vardiff of its own on the pool-facing channel — it only ever applies the
+/// `SetTarget` we send it — and it pre-filters its downstream miners' shares
+/// against exactly the target we assigned, forwarding only the ones that
+/// meet it. What arrives here is therefore the same signal a direct miner
+/// produces: shares at the difficulty we set, at the rate the aggregate
+/// hashrate behind the client implies. The per-miner distribution behind a
+/// JDC is invisible to us, but this estimator never needed it.
 pub fn apply_vardiff_check<C: Clock>(state: &mut MiningSessionState<C>) -> HandlerOutcome {
-    // SV2 vardiff has two algorithms — see `mining/vardiff.rs` for the
-    // why. If the primary channel is a Job-Declaration-Client, use
-    // the JDC-specific algorithm; otherwise fall through to classic
-    // shares-per-minute via [`bp_vardiff::VarDiffEngine`].
-    let primary_is_jdc = state
-        .primary_channel
-        .and_then(|cid| state.channels.get(&cid))
-        .map(|ch| ch.is_jdc)
-        .unwrap_or(false);
-    if primary_is_jdc {
-        return apply_jdc_vardiff_check(state);
-    }
-
     // Disjoint &mut borrows of the two sibling fields so each channel can
     // read+update its own vardiff engine and difficulty in one pass.
     let mut outcome = HandlerOutcome::default();
@@ -1569,9 +1555,6 @@ pub fn apply_vardiff_check<C: Clock>(state: &mut MiningSessionState<C>) -> Handl
         channels, vardiff, ..
     } = state;
     for channel in channels.values_mut() {
-        if channel.is_jdc {
-            continue;
-        }
         let Some(engine) = vardiff.get_mut(&channel.channel_id) else {
             continue;
         };
@@ -1594,67 +1577,6 @@ pub fn apply_vardiff_check<C: Clock>(state: &mut MiningSessionState<C>) -> Handl
         }
     }
     outcome
-}
-
-/// JDC variant of [`apply_vardiff_check`]. Runs only when the primary
-/// channel is JDC-flagged. Reads the primary channel's
-/// `accepted_share_count` + `last_submission_difficulty` snapshot,
-/// asks [`JdcVardiff::check`] for a target, then propagates to every
-/// JDC channel (clamped per-channel against `declared_max_target`).
-///
-/// Non-JDC channels on the same connection are untouched — the
-/// classic-vardiff loop next tick handles them. In practice JDC and
-/// non-JDC channels don't share a connection, so this is just
-/// defensive.
-fn apply_jdc_vardiff_check<C: Clock>(state: &mut MiningSessionState<C>) -> HandlerOutcome {
-    use crate::mining::vardiff::JdcVardiffOutcome;
-
-    let Some(primary_id) = state.primary_channel else {
-        return HandlerOutcome::default();
-    };
-    let Some(primary) = state.channels.get(&primary_id) else {
-        return HandlerOutcome::default();
-    };
-    let accepted = primary.accepted_share_count;
-    let latest_submit = primary
-        .last_submission_difficulty
-        .map(|d| d.as_f64())
-        .unwrap_or(0.0);
-
-    let outcome = state.jdc_vardiff.check(
-        accepted,
-        state.session_difficulty.as_f64(),
-        state.target_shares_per_minute,
-        state.vardiff_interval_ms,
-        latest_submit,
-    );
-    let new_diff = match outcome {
-        JdcVardiffOutcome::NoChange => return HandlerOutcome::default(),
-        JdcVardiffOutcome::Retarget(d) => Difficulty(d),
-    };
-
-    let old = state.session_difficulty;
-    state.session_difficulty = new_diff;
-
-    let mut result = HandlerOutcome::default();
-    for channel in state.channels.values_mut() {
-        if !channel.is_jdc {
-            continue;
-        }
-        let clamped = clamp_difficulty_to_max_target(
-            new_diff,
-            &Target::from_le_bytes(channel.declared_max_target),
-        );
-        if (clamped.as_f64() - channel.session_difficulty.as_f64()).abs() >= f64::EPSILON {
-            channel.session_difficulty = clamped;
-            result.push_frame(OutboundFrame::SetTarget {
-                channel_id: channel.channel_id,
-                maximum_target: difficulty_to_target(clamped).to_le_bytes(),
-            });
-        }
-    }
-    result.push_event(SessionEvent::DifficultyChanged { old, new: new_diff });
-    result
 }
 
 // ── MiningJobInputs ─────────────────────────────────────────────────
@@ -1885,10 +1807,6 @@ pub fn apply_template_broadcast<C: Clock>(
         let Some(channel) = state.channels.get_mut(&channel_id) else {
             continue;
         };
-        if channel.is_jdc {
-            continue;
-        }
-
         if is_new_block {
             channel.standard_jobs.retire(now_ms);
             channel.standard_jobs.cleanup_expired(now_ms);
@@ -4090,24 +4008,6 @@ mod tests {
         );
     }
 
-    /// JDC-flagged channels are skipped (they get jobs via
-    /// `SetCustomMiningJob` instead).
-    #[test]
-    fn template_broadcast_skips_jdc_channels() {
-        let mut s = session_with_standard_channel();
-        let cid = s.primary_channel.unwrap();
-        s.channels.get_mut(&cid).unwrap().is_jdc = true;
-        let mj = synthetic_mining_job_inputs();
-        let out = apply_template_broadcast(
-            &mut s,
-            &broadcast(TemplateChange::NewBlock, [0xAB; 32]),
-            &mj,
-            1_000,
-            None,
-        );
-        assert!(out.outbound.is_empty(), "JDC channel must be skipped");
-    }
-
     /// NewBlock against a Standard channel emits
     /// `SetNewPrevHash` + `NewMiningJob` with a non-trivial merkle
     /// root that's been stored on-channel for later submit-validation.
@@ -4833,93 +4733,6 @@ mod tests {
         };
         assert_eq!(job1, 1);
         assert_eq!(job2, 2);
-    }
-
-    // ── apply_vardiff_check JDC branch ─────────────────────────────
-
-    /// When the primary channel is JDC-flagged, the JDC algorithm
-    /// fires and emits SetTarget for JDC channels. The accepted-share
-    /// counter on the primary drives the JDC algorithm; we pre-seed
-    /// 12 accepted shares over a 60-s window → ratio 2.0 (boundary) →
-    /// retarget to 2× current_diff capped at latest_submit.
-    #[test]
-    fn apply_vardiff_check_jdc_branch_retargets_when_primary_jdc() {
-        let mut s = session_with_extended_channel();
-        let cid = s.primary_channel.unwrap();
-        s.session_difficulty = Difficulty(1024.0);
-        {
-            let ch = s.channels.get_mut(&cid).unwrap();
-            ch.is_jdc = true;
-            ch.session_difficulty = Difficulty(1024.0);
-            ch.accepted_share_count = 12;
-            ch.last_submission_difficulty = Some(Difficulty(4096.0));
-        }
-        let out = apply_vardiff_check(&mut s);
-        // Ratio = 12 spm / 6 spm target = 2.0 → boundary retarget.
-        // 1024 * 2.0 = 2048; cap = 4096; step(2048) = 2048.
-        assert_eq!(s.session_difficulty, Difficulty(2048.0));
-        // Emitted a SetTarget for the JDC channel.
-        assert!(matches!(
-            out.outbound[0],
-            OutboundFrame::SetTarget { channel_id: emitted_cid, .. } if emitted_cid == cid
-        ));
-        assert!(out
-            .events
-            .iter()
-            .any(|e| matches!(e, SessionEvent::DifficultyChanged { .. })));
-    }
-
-    /// JDC branch returns NoChange when share count below
-    /// `JDC_MIN_SHARES_PER_INTERVAL = 2`.
-    #[test]
-    fn apply_vardiff_check_jdc_branch_no_change_when_below_min_shares() {
-        let mut s = session_with_extended_channel();
-        let cid = s.primary_channel.unwrap();
-        s.session_difficulty = Difficulty(1024.0);
-        {
-            let ch = s.channels.get_mut(&cid).unwrap();
-            ch.is_jdc = true;
-            ch.session_difficulty = Difficulty(1024.0);
-            ch.accepted_share_count = 1;
-            ch.last_submission_difficulty = Some(Difficulty(4096.0));
-        }
-        let out = apply_vardiff_check(&mut s);
-        assert!(out.outbound.is_empty());
-        assert_eq!(s.session_difficulty, Difficulty(1024.0));
-    }
-
-    /// `last_submission_difficulty` gets populated on each accepted
-    /// share — the JDC vardiff branch depends on this snapshot.
-    #[test]
-    fn accepted_submit_caches_last_submission_difficulty() {
-        let mut s = fresh_session();
-        handle_setup_connection(&mut s, &good_setup());
-        let _ = handle_open_standard_mining_channel(
-            &mut s,
-            &open_std(1, &format!("{}.w", REGTEST_ADDR)),
-            vec![0; 4],
-        );
-        let cid = s.primary_channel.unwrap();
-        let easy = Difficulty(1.0 / 4_294_967_296.0);
-        {
-            let ch = s.channels.get_mut(&cid).unwrap();
-            ch.standard_jobs
-                .record_send_for_test(7, easy, [0xDD; 32], snapshot(), 0);
-        }
-        let sub = SubmitSharesStandardInput {
-            channel_id: cid,
-            sequence_number: 1,
-            job_id: 7,
-            nonce: 0x1234_5678,
-            version: 0x2000_0000,
-            ntime: 0x6500_0001,
-        };
-        let _ = handle_submit_shares_standard(&mut s, &sub, 0);
-        let ch = s.channels.get(&cid).unwrap();
-        assert!(
-            ch.last_submission_difficulty.is_some(),
-            "submission_difficulty must be cached after accept"
-        );
     }
 
     /// Multi-channel session: each channel gets its own SetNewPrevHash +
