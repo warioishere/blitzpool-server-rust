@@ -47,7 +47,7 @@ first time a miner authorises with that address and opens an Extended channel.
 ## Endpoints
 
 `challenge` and `token` are rate-limited to **5 requests/minute per client IP**;
-`set` to **30/minute** (you may have many workers to configure).
+`set` to **30/minute** — ample, since one request configures your whole fleet.
 
 ### 1. `POST /api/address/extranonce/challenge`
 
@@ -220,11 +220,14 @@ What **is** enforced, and what isn't:
 - **Enforced:** `UNIQUE (address, prefix)`. One address may **not** point two of
   its own workers at the same prefix — in Solo that would collapse their search
   spaces and waste hashrate. Violating it returns `409 extranonce-in-use`.
+  *Swapping* two of your workers' prefixes in one batch is fine (see
+  [`set`](#3-post-apiaddressextranonceset)) — what's rejected is two workers
+  actually ending up on the same prefix.
 - **Not enforced (your footgun):** the override is per `(address, worker)`, but
   the extranonce is per **connection**. If you run **two physical devices under
   the same `address.worker`**, both receive the same prefix and grind the same
   space — they collide with each other. Give each device a **distinct worker
-  name**. Setting one prefix per worker is exactly what the `set` call is for.
+  name** and list them all in one `set` request.
 - **Multi-channel connections:** only the **primary** (first) channel of a
   connection receives the override; any additional channels keep their distinct
   pool-allocated prefixes. An aggregating proxy therefore never collapses, but
