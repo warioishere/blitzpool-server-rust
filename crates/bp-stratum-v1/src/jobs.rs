@@ -76,7 +76,12 @@ pub struct JobLookup {
     pub classification: JobClassification,
     pub mining_job: Arc<MiningJob>,
     pub template: Arc<ActiveSV1Template>,
-    pub template_id_hex: String,
+    /// `Arc<str>` rather than `String`: every share-submit clones the
+    /// owning [`JobEntry`] out of the registry (a borrow-checker
+    /// requirement — the template lookup and the orphan-prune both need
+    /// `inner` afterwards), so a `String` here meant a deep copy of the id
+    /// on the hot path. The `Arc` makes that clone a refcount bump.
+    pub template_id_hex: Arc<str>,
 }
 
 // ── Internal entries ─────────────────────────────────────────────────
@@ -84,7 +89,9 @@ pub struct JobLookup {
 #[derive(Clone, Debug)]
 struct JobEntry {
     mining_job: Arc<MiningJob>,
-    template_id_hex: String,
+    /// See [`JobLookup::template_id_hex`] — `Arc<str>` keeps the per-share
+    /// entry clone allocation-free.
+    template_id_hex: Arc<str>,
     creation_ms: u64,
     retired_at_ms: Option<u64>,
 }
@@ -152,7 +159,7 @@ impl JobRegistry {
     /// used by tests. The hot broadcast path uses
     /// [`Self::add_template_shared`] to register the already-shared Arc
     /// without a deep copy.
-    pub fn add_template(&self, template: ActiveSV1Template, now_ms: u64) -> String {
+    pub fn add_template(&self, template: ActiveSV1Template, now_ms: u64) -> Arc<str> {
         self.add_template_shared(Arc::new(template), now_ms)
     }
 
@@ -160,13 +167,13 @@ impl JobRegistry {
     /// hex id. Each connection registers per broadcast, so taking the
     /// shared `Arc` here turns those N registrations into refcount bumps
     /// instead of N deep copies of the merkle path / coinbase buffers.
-    pub fn add_template_shared(&self, template: Arc<ActiveSV1Template>, now_ms: u64) -> String {
+    pub fn add_template_shared(&self, template: Arc<ActiveSV1Template>, now_ms: u64) -> Arc<str> {
         let mut inner = self.inner.lock().expect("job-registry mutex poisoned");
         let id = inner.next_template_id;
         inner.next_template_id += 1;
-        let id_hex = format!("{:x}", id);
+        let id_hex: Arc<str> = Arc::from(format!("{:x}", id).as_str());
         inner.templates.insert(
-            id_hex.clone(),
+            id_hex.to_string(),
             TemplateEntry {
                 template,
                 creation_ms: now_ms,
@@ -182,7 +189,7 @@ impl JobRegistry {
     /// wraps in `Arc` — used by tests. The hot broadcast path uses
     /// [`Self::add_job_shared`] to register the pool-wide memoized job
     /// without a deep copy.
-    pub fn add_job(&self, mining_job: MiningJob, template_id_hex: String, now_ms: u64) -> String {
+    pub fn add_job(&self, mining_job: MiningJob, template_id_hex: Arc<str>, now_ms: u64) -> String {
         self.add_job_shared(Arc::new(mining_job), template_id_hex, now_ms)
     }
 
@@ -193,7 +200,7 @@ impl JobRegistry {
     pub fn add_job_shared(
         &self,
         mining_job: Arc<MiningJob>,
-        template_id_hex: String,
+        template_id_hex: Arc<str>,
         now_ms: u64,
     ) -> String {
         let mut inner = self.inner.lock().expect("job-registry mutex poisoned");
@@ -224,7 +231,7 @@ impl JobRegistry {
         let mut inner = self.inner.lock().expect("job-registry mutex poisoned");
         let job_entry = inner.jobs.get(job_id_hex)?.clone();
 
-        let template_entry = match inner.templates.get(&job_entry.template_id_hex) {
+        let template_entry = match inner.templates.get(&*job_entry.template_id_hex) {
             Some(t) => t.clone(),
             None => {
                 // Orphan job — its template aged out. Self-prune so we
@@ -333,7 +340,7 @@ impl JobRegistry {
             if j.retired_at_ms.is_some() {
                 continue;
             }
-            let stale = match templates.get(&j.template_id_hex) {
+            let stale = match templates.get(&*j.template_id_hex) {
                 Some(t) => t.template.prev_hash != *tip_prev_hash,
                 None => true,
             };
@@ -460,8 +467,8 @@ mod tests {
         let reg = JobRegistry::new(cfg());
         let t1 = reg.add_template(dummy_active_template(), 1_000);
         let t2 = reg.add_template(dummy_active_template(), 1_000);
-        assert_eq!(t1, "1");
-        assert_eq!(t2, "2");
+        assert_eq!(&*t1, "1");
+        assert_eq!(&*t2, "2");
 
         let j1 = reg.add_job(dummy_mining_job(), t1.clone(), 1_000);
         let j2 = reg.add_job(dummy_mining_job(), t2.clone(), 1_000);
@@ -475,11 +482,50 @@ mod tests {
         assert_eq!(reg.peek_next_job_id(), 1);
         assert_eq!(reg.peek_next_job_id(), 1);
         reg.add_template(dummy_active_template(), 1_000);
-        reg.add_job(dummy_mining_job(), "1".to_string(), 1_000);
+        reg.add_job(dummy_mining_job(), std::sync::Arc::from("1"), 1_000);
         assert_eq!(reg.peek_next_job_id(), 2);
     }
 
     // ── classify: 3 outcomes + None ────────────────────────────────────
+
+    /// Every share-submit runs `classify`, which must clone the `JobEntry`
+    /// out of the registry (the borrow-checker forbids holding the `&jobs`
+    /// borrow while the template lookup / orphan-prune touch `inner`).
+    /// With `template_id_hex: String` that clone deep-copied the id on the
+    /// hot path; as an `Arc<str>` it is a refcount bump.
+    ///
+    /// Proven by identity, not by shape: the id handed back by `classify`
+    /// must be the SAME allocation the template was registered under.
+    #[test]
+    fn classify_shares_the_template_id_allocation_instead_of_copying() {
+        let reg = JobRegistry::new(cfg());
+        let tid = reg.add_template(dummy_active_template(), 1_000);
+        let jid = reg.add_job(dummy_mining_job(), tid.clone(), 1_000);
+
+        let lookup = reg.classify(&jid, 1_500).expect("must be found");
+        assert!(
+            std::sync::Arc::ptr_eq(&tid, &lookup.template_id_hex),
+            "classify must share the template-id allocation, not copy it"
+        );
+    }
+
+    /// Two shares on the same job must both get that shared allocation —
+    /// i.e. the registry keeps handing out the one `Arc`, and repeated
+    /// lookups never start copying.
+    #[test]
+    fn repeated_classify_keeps_sharing_one_template_id_allocation() {
+        let reg = JobRegistry::new(cfg());
+        let tid = reg.add_template(dummy_active_template(), 1_000);
+        let jid = reg.add_job(dummy_mining_job(), tid.clone(), 1_000);
+
+        let a = reg.classify(&jid, 1_500).expect("found");
+        let b = reg.classify(&jid, 1_600).expect("found");
+        assert!(std::sync::Arc::ptr_eq(
+            &a.template_id_hex,
+            &b.template_id_hex
+        ));
+        assert!(std::sync::Arc::ptr_eq(&tid, &a.template_id_hex));
+    }
 
     #[test]
     fn classify_returns_active_for_fresh_job() {
@@ -703,7 +749,11 @@ mod tests {
     #[test]
     fn cleanup_for_tip_retires_orphan_jobs() {
         let reg = JobRegistry::new(cfg());
-        let jid = reg.add_job(dummy_mining_job(), "nonexistent".to_string(), 1_000);
+        let jid = reg.add_job(
+            dummy_mining_job(),
+            std::sync::Arc::from("nonexistent"),
+            1_000,
+        );
 
         reg.cleanup_for_tip(&[0xAB; 32], 10_000);
 
