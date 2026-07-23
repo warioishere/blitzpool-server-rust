@@ -78,6 +78,7 @@ async fn ungraceful_disconnect_releases_extranonce_prefix() {
         initial_difficulty: Difficulty(1024.0),
         target_shares_per_minute: 6.0,
         vardiff_interval_ms: 200,
+        vardiff_silence_easing: false,
     };
     let server_clone = server.clone();
     tokio::spawn(async move {

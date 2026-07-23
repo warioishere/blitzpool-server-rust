@@ -1568,6 +1568,7 @@ mod tests {
             initial_difficulty: Difficulty(1024.0),
             target_shares_per_minute: 6.0,
             vardiff_interval_ms: 60_000,
+            vardiff_silence_easing: false,
         }
     }
 

@@ -508,6 +508,14 @@ pub struct StratumConfig {
     pub target_shares_per_minute: u32,
     pub high_diff_target_shares_per_minute: u32,
     pub difficulty_check_interval_ms: u64,
+    /// Let vardiff use elapsed silence as evidence: a session that stops
+    /// submitting has its difficulty walked down along the rate its own
+    /// silence still supports, instead of staying pinned at a target it
+    /// can no longer reach. Bounded (16x max descent, 8x max up-step) and
+    /// paused while rejected shares are still arriving. Off by default —
+    /// switch it on deliberately (staging first).
+    #[serde(default)]
+    pub vardiff_silence_easing_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

@@ -96,6 +96,11 @@ pub struct ServerConfig {
     pub min_retained_jobs: usize,
     /// How often each connection re-evaluates its vardiff target.
     pub difficulty_check_interval_ms: u64,
+    /// Whether vardiff may use elapsed silence as evidence and walk a
+    /// quiet session's difficulty down (see [`bp_vardiff`]'s module doc,
+    /// "Silence easing"). Off by default — it changes retarget behaviour
+    /// for every session, so operators switch it on per deployment.
+    pub vardiff_silence_easing: bool,
     /// cpuminer fallback target when the initial difficulty is below
     /// `cpuminer_high_diff_threshold`.
     pub cpuminer_fallback_difficulty: f64,
@@ -137,6 +142,7 @@ impl ServerConfig {
             job_retention_ms: DEFAULT_JOB_RETENTION_MS,
             min_retained_jobs: DEFAULT_MIN_RETAINED_JOBS,
             difficulty_check_interval_ms: DEFAULT_DIFFICULTY_CHECK_INTERVAL_MS,
+            vardiff_silence_easing: false,
             cpuminer_fallback_difficulty: DEFAULT_CPUMINER_FALLBACK_DIFFICULTY,
             cpuminer_high_diff_threshold: DEFAULT_CPUMINER_HIGH_DIFF_THRESHOLD,
             version_rolling_mask: DEFAULT_VERSION_ROLLING_MASK,

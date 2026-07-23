@@ -232,6 +232,7 @@ pub(crate) fn build_server_config(cfg: &AppConfig) -> ServerConfig {
     // `cfg.solo` directly); `ServerConfig` carries no fee fields.
     sc.job_retention_ms = cfg.stratum.job_retention_ms;
     sc.difficulty_check_interval_ms = cfg.stratum.difficulty_check_interval_ms;
+    sc.vardiff_silence_easing = cfg.stratum.vardiff_silence_easing_enabled;
     sc.protocol_debug = cfg.debug.stratum_wire_logs;
     sc.share_logs = cfg.debug.stratum_share_logs;
     sc.log_submit_latency = cfg.debug.submit_latency;
@@ -596,6 +597,7 @@ mod tests {
                 target_shares_per_minute: 6,
                 high_diff_target_shares_per_minute: 6,
                 difficulty_check_interval_ms: 60_000,
+                vardiff_silence_easing_enabled: false,
             },
             sv2: Default::default(),
             debug: Default::default(),

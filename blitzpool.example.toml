@@ -157,6 +157,28 @@ target_shares_per_minute = 15
 high_diff_target_shares_per_minute = 10
 difficulty_check_interval_ms = 240000
 
+# Vardiff silence easing.
+#
+# Vardiff's only sensor is the arriving share stream, and its rate
+# estimators historically ended their measurement window at the LAST
+# share. A session that went quiet was therefore evaluated against a
+# frozen window forever: the difficulty stayed pinned where the miner
+# could no longer reach it (throttled solar rigs, dropped hashboards,
+# power modes). With this on, the estimators end their window at *now* —
+# elapsed silence lowers the estimate, and the ordinary retarget walks
+# the difficulty down, one halving per doubling of the silence.
+#
+# Built-in bounds (not configurable): descent stops 16x below the rate
+# measured before the silence began (a rig that is GONE parks there
+# instead of sinking to the floor and flooding on return); no single
+# upward retarget exceeds 8x (burst-proof recovery). Rejected shares
+# count as alive: a miner in a duplicate/stale storm is hashing against
+# a stale job, so its difficulty is held, not eased.
+#
+# Off by default — switch it on deliberately (staging first) and watch
+# stratum_difficulty_adjustments_total for the retarget cadence.
+vardiff_silence_easing_enabled = false
+
 # ───────────────────────────────────────────────────────────────
 # Stratum V2 + JDP
 # ───────────────────────────────────────────────────────────────

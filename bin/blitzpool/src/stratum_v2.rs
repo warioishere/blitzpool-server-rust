@@ -294,6 +294,7 @@ pub(crate) fn build_per_port_servers(
             initial_difficulty: Difficulty(initial_diff),
             target_shares_per_minute: sv1_port_config.target_shares_per_minute,
             vardiff_interval_ms: cfg.stratum.difficulty_check_interval_ms,
+            vardiff_silence_easing: cfg.stratum.vardiff_silence_easing_enabled,
         };
         info!(
             port = sv1_port_config.port,
@@ -428,6 +429,7 @@ mod tests {
                 target_shares_per_minute: 6,
                 high_diff_target_shares_per_minute: 6,
                 difficulty_check_interval_ms: 60_000,
+                vardiff_silence_easing_enabled: false,
             },
             sv2: Sv2Config {
                 authority_privkey_hex: privkey,

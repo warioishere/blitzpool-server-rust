@@ -134,6 +134,7 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
         initial_difficulty: Difficulty(1024.0),
         target_shares_per_minute: 6.0,
         vardiff_interval_ms: 200,
+        vardiff_silence_easing: false,
     };
     let server_clone = server.clone();
     let port_config_clone = port_config;

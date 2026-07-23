@@ -580,6 +580,10 @@ pub struct MiningSessionState<C: Clock> {
     /// Drives the tick in `server::run_connection`; every channel on the
     /// connection is re-evaluated on it.
     pub vardiff_interval_ms: u64,
+    /// Whether vardiff may use elapsed silence as evidence and walk a
+    /// quiet channel's difficulty down (see [`bp_vardiff`]'s module doc,
+    /// "Silence easing"). Off by default.
+    pub vardiff_silence_easing: bool,
     /// Clock reading of the last vardiff evaluation, timer or inline.
     /// Gates the post-share inline check so it cannot run more often than
     /// `vardiff_interval_ms` — see [`Self::vardiff_cooldown_elapsed`].
@@ -606,6 +610,9 @@ pub struct PortConfig {
     /// Cadence of the vardiff check loop in milliseconds. Typical
     /// 60 000. Drives the connection's vardiff tick for every channel.
     pub vardiff_interval_ms: u64,
+    /// Whether vardiff may use elapsed silence as evidence and walk a
+    /// quiet channel's difficulty down. Off by default.
+    pub vardiff_silence_easing: bool,
 }
 
 impl<C: Clock + Clone> MiningSessionState<C> {
@@ -646,6 +653,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             ),
             target_shares_per_minute: port.target_shares_per_minute,
             vardiff_interval_ms: port.vardiff_interval_ms,
+            vardiff_silence_easing: port.vardiff_silence_easing,
             last_difficulty_check_ms: 0,
             share_logs: false,
         }
@@ -680,6 +688,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             self.target_shares_per_minute,
             self.min_difficulty.as_f64(),
         )
+        .with_silence_easing(self.vardiff_silence_easing)
     }
 }
 
@@ -1193,6 +1202,20 @@ fn graced_validation_difficulty(job_frozen: Difficulty, session: Difficulty) -> 
     Difficulty(job_frozen.as_f64().min(session.as_f64()))
 }
 
+/// Stamp the channel's vardiff liveness heartbeat for a submission that
+/// arrived on `channel_id`, whatever its outcome. Both submit handlers call
+/// this ONCE at the top, before any early-return reject (unknown/aged-out
+/// job after a core restart, wrong channel kind) — so a reject burst from a
+/// hashing miner is never misread as silence and eased down. The single
+/// choke point for the "rejected shares count as alive" rule; a new submit
+/// path that forgets it is the one way silence easing could regress.
+/// No-op for an unknown channel (no engine) or when easing is off.
+fn stamp_submission_heartbeat<C: Clock>(state: &mut MiningSessionState<C>, channel_id: u32) {
+    if let Some(engine) = state.vardiff.get_mut(&channel_id) {
+        engine.note_submission();
+    }
+}
+
 /// Handle `SubmitSharesStandard`. Resolves the channel + per-job
 /// context (stored merkle root + difficulty + template snapshot) and
 /// delegates to [`validate_submit_standard`]. Emits
@@ -1209,6 +1232,9 @@ pub fn handle_submit_shares_standard<C: Clock>(
     submission: &SubmitSharesStandardInput,
     now_ms: u64,
 ) -> HandlerOutcome {
+    // Liveness heartbeat before any early-return reject — see
+    // `stamp_submission_heartbeat`.
+    stamp_submission_heartbeat(state, submission.channel_id);
     let Some(channel) = state.channels.get_mut(&submission.channel_id) else {
         return submit_error(
             submission.channel_id,
@@ -1266,6 +1292,8 @@ pub fn handle_submit_shares_standard<C: Clock>(
     // target the moment vardiff moves), starving the sample cache — vardiff
     // then fell into its under-sampled fallback and drifted the difficulty
     // toward the floor. Extended never hit this because it always fed `true`.
+    // (Rejects stamp the liveness heartbeat at the top of the handler, so no
+    // arm for them here.)
     if let ShareValidation::Accepted(ref accept) = validation {
         if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
             engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
@@ -1304,6 +1332,9 @@ pub fn handle_submit_shares_extended<C: Clock>(
         .negotiated_extensions
         .contains(&crate::extensions::SV2_EXTENSION_TYPE_WORKER_ID);
     let share_logs = state.share_logs;
+    // Liveness heartbeat before any early-return reject — see
+    // `stamp_submission_heartbeat`.
+    stamp_submission_heartbeat(state, submission.channel_id);
     let Some(channel) = state.channels.get_mut(&submission.channel_id) else {
         return submit_error(
             submission.channel_id,
@@ -1366,7 +1397,8 @@ pub fn handle_submit_shares_extended<C: Clock>(
     // Feed classic vardiff with the accepted share so its submission
     // cache fills + `suggested_difficulty` can produce real retargets.
     // Drop the channel borrow first because state.vardiff is a sibling
-    // field; re-borrow the channel below for finalize.
+    // field; re-borrow the channel below for finalize. (Rejects stamp the
+    // liveness heartbeat at the top of the handler.)
     if let ShareValidation::Accepted(ref accept) = validation {
         if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
             engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
@@ -2563,11 +2595,24 @@ mod tests {
             initial_difficulty: Difficulty(1024.0),
             target_shares_per_minute: 6.0,
             vardiff_interval_ms: 60_000,
+            vardiff_silence_easing: false,
         }
     }
 
     fn fresh_session() -> MiningSessionState<Arc<TestClock>> {
         MiningSessionState::new(Arc::new(TestClock::new(0)), 1, port_cfg())
+    }
+
+    /// The silence-easing switch flows PortConfig → session state (from
+    /// where `new_channel_vardiff` hands it to every channel engine).
+    /// The engine behaviour itself is unit-tested in bp-vardiff.
+    #[test]
+    fn silence_easing_flag_flows_from_port_config() {
+        let mut cfg = port_cfg();
+        cfg.vardiff_silence_easing = true;
+        let s = MiningSessionState::new(Arc::new(TestClock::new(0)), 1, cfg);
+        assert!(s.vardiff_silence_easing);
+        assert!(!fresh_session().vardiff_silence_easing, "default off");
     }
 
     fn good_setup() -> SetupConnectionInput {
@@ -3936,6 +3981,94 @@ mod tests {
             vec![0x01, 0x02, 0x03, 0x04],
         );
         s
+    }
+
+    /// Review regression (v2 max review, bug 1): an SV2 Standard submit
+    /// against an unknown/aged-out job early-returns InvalidJobId BEFORE
+    /// the old vardiff match arm, so the reject-storm liveness heartbeat
+    /// was skipped and silence easing walked a hashing miner down. The fix
+    /// stamps note_submission at the top of the handler. Proof: build an
+    /// eased session whose channel WOULD ease on silence; a control run
+    /// eases, and the same setup with an invalid-job submit mid-silence
+    /// holds — showing the heartbeat fired on the early-return path.
+    fn eased_session_with_full_window(
+        clock: &Arc<TestClock>,
+    ) -> MiningSessionState<Arc<TestClock>> {
+        let mut cfg = port_cfg();
+        cfg.vardiff_silence_easing = true;
+        let mut s = MiningSessionState::new(clock.clone(), 1, cfg);
+        handle_setup_connection(&mut s, &good_setup());
+        let _ = handle_open_standard_mining_channel(
+            &mut s,
+            &open_std(1, &format!("{}.w", REGTEST_ADDR)),
+            vec![0; 4],
+        );
+        let cid = s.primary_channel.unwrap();
+        // 30 shares at the channel's own 1024, 10 s apart → equilibrium
+        // window for the 6/min target.
+        for _ in 0..30 {
+            clock.advance_ms(10_000);
+            s.vardiff
+                .get_mut(&cid)
+                .unwrap()
+                .update_hash_rate(1024.0, true);
+        }
+        s
+    }
+
+    #[test]
+    fn silence_eases_a_quiet_standard_channel_control() {
+        // Control: with no submission, 400 s of silence DOES ease down.
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = eased_session_with_full_window(&clock);
+        clock.advance_ms(400_000);
+        let out = apply_vardiff_check(&mut s);
+        assert!(
+            out.outbound
+                .iter()
+                .any(|f| matches!(f, OutboundFrame::SetTarget { .. })),
+            "control: a truly silent channel must ease down"
+        );
+    }
+
+    #[test]
+    fn invalid_job_reject_stamps_heartbeat_and_holds() {
+        // The fix: an invalid-job submit mid-silence stamps the liveness
+        // heartbeat (top of handler, before the early return), so the
+        // silence tail restarts and the channel HOLDS instead of easing.
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = eased_session_with_full_window(&clock);
+        let cid = s.primary_channel.unwrap();
+
+        clock.advance_ms(390_000);
+        // No job was ever sent → job_id 7 is unknown → InvalidJobId early
+        // return. The heartbeat must fire despite that early return.
+        let sub = SubmitSharesStandardInput {
+            channel_id: cid,
+            sequence_number: 1,
+            job_id: 7,
+            nonce: 0x1234_5678,
+            version: 0x2000_0000,
+            ntime: 0x6500_0001,
+        };
+        let out = handle_submit_shares_standard(&mut s, &sub, clock.now_ms());
+        assert!(
+            matches!(
+                out.outbound.first(),
+                Some(OutboundFrame::SubmitSharesError { .. })
+            ),
+            "precondition: the submit must be an invalid-job reject"
+        );
+        // 10 s later — total silence tail since the submit is 10 s, not
+        // 400 s — the channel must hold (the control proves 400 s eases).
+        clock.advance_ms(10_000);
+        let out = apply_vardiff_check(&mut s);
+        assert!(
+            !out.outbound
+                .iter()
+                .any(|f| matches!(f, OutboundFrame::SetTarget { .. })),
+            "an invalid-job reject must stamp the heartbeat and hold, not ease"
+        );
     }
 
     // ── inline vardiff cooldown ───────────────────────────────────

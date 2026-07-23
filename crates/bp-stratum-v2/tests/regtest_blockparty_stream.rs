@@ -195,6 +195,7 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
         initial_difficulty: Difficulty(1.0e-18),
         target_shares_per_minute: 6.0,
         vardiff_interval_ms: 200,
+        vardiff_silence_easing: false,
     };
     let server_clone = server.clone();
     let accept_handle = tokio::spawn(async move {
