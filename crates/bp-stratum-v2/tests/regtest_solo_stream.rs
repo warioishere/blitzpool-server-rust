@@ -196,6 +196,7 @@ async fn sv2_solo_connection_routes_to_solo_stream_and_block_accepted() {
         initial_difficulty: Difficulty(1.0e-18),
         target_shares_per_minute: 6.0,
         vardiff_interval_ms: 200,
+        vardiff_silence_easing: false,
     };
     let server_clone = server.clone();
     let accept_handle = tokio::spawn(async move {

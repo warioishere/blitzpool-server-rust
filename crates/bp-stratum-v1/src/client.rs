@@ -132,7 +132,8 @@ impl<C: Clock> SessionState<C> {
             clock,
             port_config.target_shares_per_minute,
             port_config.minimum_difficulty,
-        );
+        )
+        .with_silence_easing(server_config.vardiff_silence_easing);
 
         Self {
             session_id_hex,
@@ -631,6 +632,11 @@ pub fn handle_submit<C: Clock>(
             out.push_event(SessionEvent::ShareAccepted(accept));
         }
         ShareValidation::Rejected(reject) => {
+            // Liveness heartbeat for silence easing: a rejected share is
+            // still a submission — this miner is hashing (a duplicate burst
+            // from an exhausted search space, a stale job), not silent, so
+            // its difficulty must be held, not eased down.
+            state.vardiff.note_submission();
             out.push_frame(write_error(&id, reject.wire_code, reject.wire_message));
             out.push_event(SessionEvent::ShareRejected {
                 reason: reject.reason,
@@ -1318,6 +1324,122 @@ mod tests {
         assert!(out.outbound_frames.is_empty());
         // last_difficulty_check_ms is still updated.
         assert_eq!(state.last_difficulty_check_ms, 1_000);
+    }
+
+    // ── silence easing wiring ────────────────────────────────────────
+    //
+    // The engine math is unit-tested in bp-vardiff; these prove the
+    // operator switch survives ServerConfig → SessionState → engine and
+    // produces (or withholds) a real `mining.set_difficulty` frame.
+    //
+    // Setup: 30 accepted shares at the session's own 16384, 10 s apart —
+    // equilibrium for the default 6/min target (closed-window target
+    // ≈ 16949, inside the 2× deadband), so the share-driven math alone
+    // never retargets and anything observed is the silence path.
+
+    fn eased_session(
+        easing: bool,
+        clock: &Arc<TestClock>,
+    ) -> (SessionState<Arc<TestClock>>, ServerConfig, PortConfig) {
+        let mut sc = server_config();
+        sc.vardiff_silence_easing = easing;
+        let port = solo_port(16384.0);
+        let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
+        for _ in 0..30 {
+            state.vardiff.update_hash_rate(16384.0, true);
+            clock.advance_ms(10_000);
+        }
+        (state, sc, port)
+    }
+
+    #[test]
+    fn silence_easing_stays_off_by_default() {
+        let clock = Arc::new(TestClock::new(0));
+        let (mut state, sc, port) = eased_session(false, &clock); // easing off
+        clock.advance_ms(3_600_000); // an hour of total silence
+        let out = apply_vardiff_check(
+            &mut state,
+            &sc,
+            &port,
+            &empty_registry(),
+            &MiningJobCache::new(),
+            None,
+            &[],
+            clock.now_ms(),
+        );
+        assert!(
+            out.outbound_frames.is_empty(),
+            "default config must hold through any silence"
+        );
+        assert_eq!(state.session_difficulty, 16384.0);
+    }
+
+    #[test]
+    fn silence_easing_config_reaches_the_wire() {
+        let clock = Arc::new(TestClock::new(0));
+        let (mut state, sc, port) = eased_session(true, &clock);
+        // 400 s of silence: total window 690 s → target ≈ 7124 < 8192
+        // (= client/2) → retarget → step ≈ 6144.
+        clock.advance_ms(400_000);
+        let out = apply_vardiff_check(
+            &mut state,
+            &sc,
+            &port,
+            &empty_registry(),
+            &MiningJobCache::new(),
+            None,
+            &[],
+            clock.now_ms(),
+        );
+        let frame = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        assert!(
+            frame.contains("mining.set_difficulty"),
+            "expected a set_difficulty frame, got {frame}"
+        );
+        assert_eq!(state.session_difficulty, 6144.0, "one eased step down");
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::DifficultyChanged { .. })));
+    }
+
+    #[test]
+    fn a_rejected_share_holds_the_easing_back() {
+        // Sensor rule end-to-end: a VALIDATION reject (unknown job id from
+        // a fully set-up session — the shape a stale-job burst produces)
+        // flows through the Rejected arm, stamps the liveness heartbeat,
+        // and the silence clock restarts — the same check that would have
+        // eased now holds. Pre-handshake errors (not subscribed /
+        // unauthorized) deliberately do NOT stamp: they are protocol
+        // noise, not evidence of a hashing miner.
+        let clock = Arc::new(TestClock::new(0));
+        let (mut state, sc, port) = eased_session(true, &clock);
+        state.stratum_initialized = true;
+        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        clock.advance_ms(390_000);
+        // Rejected share at t+390 s — unknown job → validation reject.
+        let reg = empty_registry();
+        let out = handle_submit(&mut state, &port, &reg, submit_req("1"), clock.now_ms());
+        let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        assert!(s.contains("error"), "expected a reject frame, got {s}");
+        clock.advance_ms(10_000);
+        // t+400 s: without the reject this eased (see the wire test);
+        // with it, the tail is 10 s and the difficulty holds.
+        let out = apply_vardiff_check(
+            &mut state,
+            &sc,
+            &port,
+            &empty_registry(),
+            &MiningJobCache::new(),
+            None,
+            &[],
+            clock.now_ms(),
+        );
+        assert!(
+            out.outbound_frames.is_empty(),
+            "a rejecting miner must be held, not eased"
+        );
+        assert_eq!(state.session_difficulty, 16384.0);
     }
 
     // ── apply_new_template ────────────────────────────────────────────
