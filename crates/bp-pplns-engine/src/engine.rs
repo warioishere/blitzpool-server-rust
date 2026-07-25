@@ -43,7 +43,7 @@ use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{ConfigError, PplnsEngineConfig};
 use crate::distribution::{
@@ -543,20 +543,26 @@ impl PplnsEngine {
         )
         .await?;
 
-        // Consume the snapshot this block was frozen from. Without this the
-        // fingerprinted copy outlives its own block, and a redelivered
-        // block-found event re-prepares against the ledger it already
-        // credited. The shared key is cleared too — it is stale either way
-        // once a block has been booked.
-        if let Some(fp) = prepared.payouts_fingerprint {
-            if let Err(e) = self.inner.window.delete_snapshot_for(&fp).await {
-                warn!(
-                    error = %e,
-                    block_height = prepared.block_height,
-                    "failed to delete fingerprinted PPLNS snapshot after apply_prepared \
-                     — non-fatal, will TTL out"
-                );
-            }
+        // Applying moved the ledger, so EVERY snapshot built against the old
+        // one is now stale — their `balance_after` is an absolute state that
+        // would undo the pay-down this block's coinbase just made. Dropping
+        // them is the persisted counterpart of the distribution-cache
+        // invalidation below, and it is what reclaims the keyspace. A later
+        // block whose snapshot is gone fails loudly, which is what the
+        // pre-fingerprint code did; booking it from a stale absolute would be
+        // silent and wrong.
+        match self.inner.window.delete_all_fingerprinted_snapshots().await {
+            Ok(n) => debug!(
+                dropped = n,
+                block_height = prepared.block_height,
+                "dropped fingerprinted PPLNS snapshots invalidated by the apply"
+            ),
+            Err(e) => warn!(
+                error = %e,
+                block_height = prepared.block_height,
+                "failed to drop fingerprinted PPLNS snapshots after apply_prepared \
+                 — non-fatal, they TTL out"
+            ),
         }
         if let Err(e) = self.inner.window.delete_snapshot().await {
             warn!(

@@ -519,6 +519,41 @@ impl WindowStore {
         let key = snapshot_key_for(payouts_fingerprint);
         snapshot::delete_snapshot(&mut conn, &key).await
     }
+
+    /// Drop **every** fingerprint-keyed snapshot, returning how many were
+    /// removed.
+    ///
+    /// A snapshot's `balance_after` is an ABSOLUTE ledger state, valid only
+    /// against the ledger it was computed from. Applying a block moves that
+    /// ledger, so every snapshot built before it is stale — the same reason
+    /// the apply drops the in-process distribution cache. Keeping them would
+    /// let a later block freeze absolute balances that silently undo the pay-
+    /// down the applied block's coinbase already made; a block whose snapshot
+    /// is gone fails loudly instead, which is what the pre-fingerprint code
+    /// did.
+    ///
+    /// This is also what reclaims the keyspace: builds write one key each, and
+    /// nothing else removes them.
+    pub async fn delete_all_fingerprinted_snapshots(&self) -> Result<usize, RedisError> {
+        let mut conn = self.conn.clone();
+        // The pattern carries the `:` separator, so the shared `pplns:snapshot`
+        // key is not matched — it has its own lifecycle.
+        let pattern = format!("{KEY_SNAPSHOT}:*");
+        let keys: Vec<String> = {
+            let mut iter = conn.scan_match::<_, String>(&pattern).await?;
+            let mut found = Vec::new();
+            while let Some(k) = iter.next_item().await {
+                found.push(k);
+            }
+            found
+        };
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.clone();
+        conn.del::<_, ()>(&keys).await?;
+        Ok(keys.len())
+    }
 }
 
 /// Redis key holding the snapshot for one payout-list fingerprint. Stays under
