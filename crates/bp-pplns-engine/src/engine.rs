@@ -57,6 +57,14 @@ use crate::ledger::{
 use crate::sweep::{spawn_daily_task, DustSweepRunner, SweepError, SweepStats, SystemClock};
 use crate::window::{snapshot::ParsedSnapshot, NetworkDifficulty, WindowError, WindowStore};
 
+/// How often a transient Redis failure on the block-found snapshot read is
+/// retried before the block is given up on. That read is the only thing
+/// standing between a found block and its payout, and the caller does not
+/// retry — a connection reset mid-reconnect would otherwise cost the block.
+const SNAPSHOT_READ_RETRIES: u32 = 3;
+/// Backoff between those attempts, multiplied by the attempt number.
+const SNAPSHOT_READ_BACKOFF: std::time::Duration = std::time::Duration::from_millis(80);
+
 /// Errors surfaced across the engine boundary.
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -475,12 +483,29 @@ impl PplnsEngine {
         let fingerprint = payouts_fingerprint
             .filter(|fp| fp != &[0u8; 32])
             .ok_or(EngineError::NoPayoutFingerprint { block_height })?;
-        let snapshot = self
-            .inner
-            .window
-            .read_snapshot_for(&fingerprint)
-            .await?
-            .ok_or(EngineError::SnapshotMissing { block_height })?;
+        // Retry a transient Redis failure rather than discarding the block.
+        // This read is the only thing standing between a found block and its
+        // payout: a connection reset mid-reconnect would otherwise drop the
+        // whole prepare, and the caller has no retry of its own. A genuinely
+        // missing snapshot (Ok(None)) is NOT retried — it will not appear.
+        let mut attempt = 0;
+        let snapshot = loop {
+            match self.inner.window.read_snapshot_for(&fingerprint).await {
+                Ok(Some(s)) => break s,
+                Ok(None) => return Err(EngineError::SnapshotMissing { block_height }),
+                Err(e) if attempt < SNAPSHOT_READ_RETRIES => {
+                    warn!(
+                        error = %e,
+                        block_height,
+                        attempt,
+                        "PPLNS snapshot read failed — retrying before giving up on the block"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(SNAPSHOT_READ_BACKOFF * attempt).await;
+                }
+                Err(e) => return Err(EngineError::Redis(e)),
+            }
+        };
 
         if snapshot.block_reward_sats != block_reward_sats {
             warn!(

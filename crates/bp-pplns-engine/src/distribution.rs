@@ -111,12 +111,18 @@ pub struct DistributionResult {
     /// snapshot pins this so on-block-found can refuse to apply a
     /// stale snapshot whose reward disagrees with the actual coinbase.
     pub block_reward_sats: u64,
-    /// Identity of `payouts` — the key this build's snapshot is stored
-    /// under. Callers hand it down to whatever consumes the payout list
-    /// (the Stratum job build), so a block-found can later ask for the
-    /// distribution its own coinbase was built from instead of whatever
-    /// the shared snapshot key happens to hold. See
-    /// [`bp_mining_job::payouts_fingerprint`].
+    /// Identity of `payouts` — the key this build's snapshot is stored under.
+    ///
+    /// It is NOT threaded onward from here: the Stratum job build derives the
+    /// same value independently from the `PayoutEntry` list it turns into the
+    /// coinbase (`MiningJobCache`), and that is what a found block carries.
+    /// The two derivations agreeing is what makes the block-found lookup hit —
+    /// `payouts_fingerprint` and `payouts_fingerprint_from_parts` share one
+    /// encoding for exactly that reason, and the regtest
+    /// `ledger_books_exactly_what_the_accepted_coinbase_paid` pins it.
+    ///
+    /// Exposed so callers (and tests) can name the key this distribution
+    /// landed under. See [`bp_mining_job::payouts_fingerprint`].
     pub payouts_fingerprint: [u8; 32],
 }
 
@@ -350,10 +356,24 @@ async fn build_from_inputs(
             .iter()
             .map(|p| (p.address.as_str(), p.sats.to_i64().max(0) as u64)),
     );
-    window
+    // A failed snapshot write must NOT fail the build. The distribution
+    // itself is correct and is about to become a coinbase; returning `Err`
+    // here sends `pplns_payouts` into its solo fallback, and that miner is
+    // handed a job paying 100 % of the block to itself. Losing the snapshot
+    // costs a manual reprocess if a block lands on this job — losing the
+    // distribution costs the pool's miners the whole block, irreversibly.
+    if let Err(err) = window
         .write_snapshot_for(&payouts_fingerprint, &snapshot, config.snapshot_ttl_secs)
         .await
-        .map_err(DistributionError::Snapshot)?;
+    {
+        warn!(
+            %err,
+            block_reward_sats,
+            "PPLNS snapshot write failed — the coinbase distribution stands, but a \
+             block found on this job cannot be booked automatically and needs \
+             operator reprocessing"
+        );
+    }
 
     Ok(DistributionResult {
         payouts: math.payouts,
