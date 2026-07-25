@@ -456,6 +456,11 @@ impl WindowStore {
     }
 
     /// Snapshot accessor — convenience around [`snapshot::write_snapshot`].
+    ///
+    /// Writes the shared [`KEY_SNAPSHOT`] key, which every distribution build
+    /// overwrites. Prefer [`Self::write_snapshot_for`]: a block-found needs the
+    /// distribution its own coinbase was built from, and this key only ever
+    /// holds the most recent build's.
     pub async fn write_snapshot(
         &self,
         snapshot: &snapshot::StoredSnapshot,
@@ -466,6 +471,7 @@ impl WindowStore {
     }
 
     /// Snapshot reader — convenience around [`snapshot::read_snapshot`].
+    /// Reads the shared key; see [`Self::write_snapshot`].
     pub async fn read_snapshot(&self) -> Result<Option<snapshot::ParsedSnapshot>, RedisError> {
         let mut conn = self.conn.clone();
         snapshot::read_snapshot(&mut conn, KEY_SNAPSHOT).await
@@ -476,6 +482,91 @@ impl WindowStore {
         let mut conn = self.conn.clone();
         snapshot::delete_snapshot(&mut conn, KEY_SNAPSHOT).await
     }
+
+    /// Store a snapshot under the fingerprint of the payout list it
+    /// distributes. Concurrent builds for different rewards — and the
+    /// ext-0x0003 payout requests Job-Declaration clients make with their own
+    /// value — then no longer overwrite each other, and a block-found can ask
+    /// for exactly the distribution its coinbase was built from.
+    pub async fn write_snapshot_for(
+        &self,
+        payouts_fingerprint: &[u8; 32],
+        snapshot: &snapshot::StoredSnapshot,
+        ttl_seconds: u32,
+    ) -> Result<(), RedisError> {
+        let mut conn = self.conn.clone();
+        let key = snapshot_key_for(payouts_fingerprint);
+        snapshot::write_snapshot(&mut conn, &key, snapshot, ttl_seconds).await
+    }
+
+    /// Read the snapshot for one payout-list fingerprint. `None` when it was
+    /// never written or has since expired.
+    pub async fn read_snapshot_for(
+        &self,
+        payouts_fingerprint: &[u8; 32],
+    ) -> Result<Option<snapshot::ParsedSnapshot>, RedisError> {
+        let mut conn = self.conn.clone();
+        let key = snapshot_key_for(payouts_fingerprint);
+        snapshot::read_snapshot(&mut conn, &key).await
+    }
+
+    /// Delete one fingerprint-keyed snapshot.
+    pub async fn delete_snapshot_for(
+        &self,
+        payouts_fingerprint: &[u8; 32],
+    ) -> Result<(), RedisError> {
+        let mut conn = self.conn.clone();
+        let key = snapshot_key_for(payouts_fingerprint);
+        snapshot::delete_snapshot(&mut conn, &key).await
+    }
+
+    /// Drop **every** fingerprint-keyed snapshot, returning how many were
+    /// removed.
+    ///
+    /// A snapshot's `balance_after` is an ABSOLUTE ledger state, valid only
+    /// against the ledger it was computed from. Applying a block moves that
+    /// ledger, so every snapshot built before it is stale — the same reason
+    /// the apply drops the in-process distribution cache. Keeping them would
+    /// let a later block freeze absolute balances that silently undo the pay-
+    /// down the applied block's coinbase already made; a block whose snapshot
+    /// is gone fails loudly instead, which is what the pre-fingerprint code
+    /// did.
+    ///
+    /// This is also what reclaims the keyspace: builds write one key each, and
+    /// nothing else removes them.
+    pub async fn delete_all_fingerprinted_snapshots(&self) -> Result<usize, RedisError> {
+        let mut conn = self.conn.clone();
+        // The pattern carries the `:` separator, so the shared `pplns:snapshot`
+        // key is not matched — it has its own lifecycle.
+        let pattern = format!("{KEY_SNAPSHOT}:*");
+        let keys: Vec<String> = {
+            let mut iter = conn.scan_match::<_, String>(&pattern).await?;
+            let mut found = Vec::new();
+            while let Some(k) = iter.next_item().await {
+                found.push(k);
+            }
+            found
+        };
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.clone();
+        conn.del::<_, ()>(&keys).await?;
+        Ok(keys.len())
+    }
+}
+
+/// Redis key holding the snapshot for one payout-list fingerprint. Stays under
+/// the `pplns:` prefix so the redis-state backup scope keeps covering it.
+pub fn snapshot_key_for(payouts_fingerprint: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut key = String::with_capacity(KEY_SNAPSHOT.len() + 65);
+    key.push_str(KEY_SNAPSHOT);
+    key.push(':');
+    for byte in payouts_fingerprint {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
 }
 
 #[cfg(test)]

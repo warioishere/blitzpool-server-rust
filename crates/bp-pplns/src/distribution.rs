@@ -172,7 +172,7 @@ pub fn build_coinbase_distribution(
     let bonus_cap = ((reward_for_miners as f64) * 0.95).floor() as i64;
     let capped_bonus = want_bonus.min(bonus_cap);
     let bonus_emitted = capped_bonus >= min_payout;
-    let bonus_sats = if bonus_emitted { capped_bonus } else { 0 };
+    let mut bonus_sats = if bonus_emitted { capped_bonus } else { 0 };
     reward_for_miners -= bonus_sats;
 
     // ── Phase 1 + 2: rawFair + target per miner ───────────────────────
@@ -542,9 +542,8 @@ pub fn build_coinbase_distribution(
                 // No kept active miner to absorb the residuum — route it to
                 // the fee output (emitted in Phase 6) so the coinbase doesn't
                 // undershoot the block reward. Mirrors the Group-Solo
-                // donate-residuum-to-fee path. (If no fee output is emitted
-                // either, Phase 5c handles it; only a no-fee + no-active-miner
-                // config can still leave it unclaimed.)
+                // donate-residuum-to-fee path. If no fee output is emitted
+                // either, Phase 5c places it.
                 fee_bonus_sats += residuum;
             }
         }
@@ -559,16 +558,16 @@ pub fn build_coinbase_distribution(
 
     // ── Phase 5c: residuum fallback when no fee output emitted ───────
     //
-    // In `suppress_matching_debits` mode (Group-Solo) the trim_total and
-    // rounding residuum accumulate in `fee_bonus_sats`, which Phase 6
-    // only emits via the fee output. If `fee_emitted == false` (no fee
-    // address configured, or `want_fee` below `min_payout`) those sats
-    // would be silently dropped and the coinbase would undershoot the
+    // Trim donations (Group-Solo) and a residuum no kept-active miner
+    // could take (either mode) accumulate in `fee_bonus_sats`, which
+    // Phase 6 only emits via the fee output. If `fee_emitted == false`
+    // (no fee address configured, or `want_fee` below `min_payout`)
+    // those sats would be dropped and the coinbase would undershoot the
     // block reward by that many sats — money out the void.
     //
-    // Roll the accumulated `fee_bonus_sats` into the largest-share kept
-    // miner's on-chain payout (same residual-distribution pattern that
-    // the non-suppress path uses for rounding leftovers).
+    // Place them on a real output instead: the largest-share kept miner
+    // (same residual-distribution pattern the non-suppress path uses for
+    // rounding leftovers), else the fallbacks below.
     if fee_bonus_sats > 0 && !fee_emitted {
         let biggest_active = kept
             .iter()
@@ -586,15 +585,44 @@ pub fn build_coinbase_distribution(
                     .then_with(|| b.as_str().cmp(a.as_str()))
             })
             .cloned();
-        if let Some(addr) = biggest_active {
+        // No kept-active miner — every active one was trimmed and the
+        // kept outputs are dormant credit holders. Fall back to the
+        // largest kept output. On the PPLNS path (no fee output here, no
+        // finder bonus ever) that is `payouts[0]`, the very output the
+        // coinbase builder sweeps an undershoot onto: the block pays
+        // these sats either way, this only makes the ledger book them.
+        let recipient = biggest_active.or_else(|| {
+            kept.iter()
+                .max_by(|a, b| {
+                    let oa = computations.get(*a).map(|c| c.on_chain).unwrap_or(0);
+                    let ob = computations.get(*b).map(|c| c.on_chain).unwrap_or(0);
+                    oa.cmp(&ob).then_with(|| b.as_str().cmp(a.as_str()))
+                })
+                .cloned()
+        });
+        if let Some(addr) = recipient {
             if let Some(c) = computations.get_mut(&addr) {
                 c.on_chain += fee_bonus_sats;
+                // On the PPLNS path these sats are the trimmed miners'
+                // carry-forward credit, which they keep in `balance_new`.
+                // Without the matching debit the pool would owe them the
+                // credit AND have paid it on-chain to someone else.
+                if !input.suppress_matching_debits {
+                    c.balance_new -= fee_bonus_sats;
+                }
                 fee_bonus_sats = 0;
             }
         }
-        // If there's no kept-active miner (all trimmed) the residuum
-        // stays unclaimed — degenerate config; the chain still accepts
-        // the block, the operator loses the round's residual sats.
+        // Nothing kept at all: with a finder bonus emitted that output is
+        // the whole coinbase, so the builder would sweep the leftover onto
+        // it — fold it in here instead of letting the ledger disagree.
+        // Group-Solo only; PPLNS emits no finder bonus. Without a bonus
+        // either, `payouts` ends up empty and the fee-100 fallback at the
+        // end of Phase 6 takes over.
+        if fee_bonus_sats > 0 && bonus_emitted {
+            bonus_sats += fee_bonus_sats;
+            fee_bonus_sats = 0;
+        }
     }
 
     // ── Phase 6: build payouts + balanceAfter ────────────────────────
@@ -663,6 +691,16 @@ pub fn build_coinbase_distribution(
             considered_addresses,
         );
     }
+
+    // The payout list IS the coinbase. Anything it leaves unclaimed the
+    // coinbase builder reconciles onto the first output, paying sats no
+    // ledger row accounts for — the block-found snapshot would then book
+    // a distribution the chain did not make.
+    debug_assert_eq!(
+        payouts.iter().map(|p| p.sats.to_i64()).sum::<i64>(),
+        block_reward,
+        "distribution must consume the whole block reward"
+    );
 
     CoinbaseDistributionResult {
         payouts,
@@ -1197,6 +1235,105 @@ mod tests {
         );
     }
 
+    /// Same trim, no fee output: a zero-fee pool (`fee_percent = 0` ⇒
+    /// `fee_emitted == false`) whose budget keeps only dormant credit
+    /// holders. There is no kept-active miner to take the Phase 5b
+    /// residuum and no fee output to route it to, so Phase 5c's
+    /// largest-share-active lookup comes up empty. Without the
+    /// largest-kept fallback the payout list undershoots the reward by
+    /// ~94 %, and the coinbase builder's reconciliation sweeps that
+    /// shortfall onto the first output — one dormant address collects
+    /// ~2.9 BTC that the ledger books as 0.01 BTC.
+    #[test]
+    fn pplns_all_active_trimmed_without_fee_output_pays_the_whole_reward() {
+        // 20 dormant credit holders at 0.01 BTC; 320 active miners whose
+        // per-block fair share (~0.00977 BTC) ranks just below them, so
+        // the largest-target-first trim keeps credit holders only.
+        let mut balances: HashMap<AddressId, Sats> = HashMap::new();
+        for i in 0..20u32 {
+            balances.insert(addr(&format!("pendingcredit{i:04}")), Sats(1_000_000));
+        }
+        let mut shares: HashMap<AddressId, f64> = HashMap::new();
+        for i in 0..320u32 {
+            shares.insert(addr(&format!("activeminer{i:04}")), 1.0);
+        }
+        let fa = fee_addr();
+        let block_reward = 312_500_000_i64;
+        let input = CoinbaseDistributionInput {
+            fee_percent: 0.0,
+            // Room for 19 outputs — one short of the credit holders.
+            coinbase_weight_budget: 4_000,
+            min_payout_sats: Some(Sats(100_000)),
+            ..make_input(&shares, &balances, Some(&fa), block_reward)
+        };
+        let r = build_coinbase_distribution(input);
+
+        assert!(!r.payouts.is_empty(), "kept credit holders must be paid");
+        assert!(
+            !r.payouts.iter().any(|p| p.address == fa),
+            "a zero fee percent emits no fee output"
+        );
+        let total: i64 = r.payouts.iter().map(|p| p.sats.to_i64()).sum();
+        assert_eq!(
+            total, block_reward,
+            "coinbase must not undershoot when no kept-active miner can absorb the residuum"
+        );
+
+        // The sats came out of trimmed miners' carry-forward credit, so
+        // whoever receives them on-chain must carry the matching debit —
+        // otherwise the pool pays the same work twice.
+        let biggest = r
+            .payouts
+            .iter()
+            .max_by_key(|p| p.sats.to_i64())
+            .expect("non-empty payouts");
+        let recipient_balance = r
+            .balance_after
+            .get(&biggest.address)
+            .copied()
+            .unwrap_or(Sats(0))
+            .to_i64();
+        assert!(
+            recipient_balance < 0,
+            "residuum recipient must carry a matching debit, got {recipient_balance}"
+        );
+    }
+
+    /// Group-Solo with a finder bonus, no fee output and a budget that
+    /// keeps nothing: the bonus output is then the entire coinbase and
+    /// there is no kept miner for Phase 5c to hand the residuum to. The
+    /// coinbase builder sweeps the shortfall onto that bonus output, so
+    /// the distribution has to claim it too — otherwise the finder is
+    /// paid the whole block while the books record 100 000 sats.
+    #[test]
+    fn bonus_only_coinbase_claims_the_residuum_too() {
+        let m = miners_p2wpkh();
+        let finder = m[0].clone();
+        let mut shares = HashMap::new();
+        shares.insert(m[0].clone(), 3.0);
+        shares.insert(m[1].clone(), 1.0);
+        let balances = HashMap::new();
+        let block_reward = 5_000_000_000_i64;
+        let input = CoinbaseDistributionInput {
+            suppress_matching_debits: true,
+            fee_percent: 0.0,
+            // effective_budget saturates to 0 → nothing is kept.
+            coinbase_weight_budget: 1,
+            finder_bonus_sats: Some(Sats(100_000)),
+            finder_address: Some(&finder),
+            ..make_input(&shares, &balances, None, block_reward)
+        };
+        let r = build_coinbase_distribution(input);
+
+        assert_eq!(r.payouts.len(), 1, "only the finder-bonus output fits");
+        assert_eq!(r.payouts[0].address, finder);
+        let total: i64 = r.payouts.iter().map(|p| p.sats.to_i64()).sum();
+        assert_eq!(
+            total, block_reward,
+            "the sole output must claim the whole reward"
+        );
+    }
+
     // ----- finder bonus -----
 
     #[test]
@@ -1668,13 +1805,13 @@ mod tests {
         );
     }
 
-    // ----- property: total on-chain ≤ block reward, always -----
+    // ----- property: total on-chain == block reward, always -----
 
     use proptest::prelude::*;
 
     proptest! {
         #[test]
-        fn prop_total_never_exceeds_block_reward(
+        fn prop_total_equals_block_reward(
             seed_shares in proptest::collection::vec(1u32..1000u32, 1..6),
             reward in 1_000_000_000i64..10_000_000_000i64,
             fee_pct in 0.0f64..5.0f64,
@@ -1692,7 +1829,10 @@ mod tests {
             };
             let r = build_coinbase_distribution(input);
             let total: i64 = r.payouts.iter().map(|p| p.sats.to_i64()).sum();
-            prop_assert!(total <= reward, "emitted {total} > reward {reward}");
+            // Not just bounded — exact. A list that leaves sats unclaimed
+            // gets them swept onto the first output by the coinbase
+            // builder, which pays sats no ledger row accounts for.
+            prop_assert_eq!(total, reward, "emitted {} != reward {}", total, reward);
         }
 
         #[test]

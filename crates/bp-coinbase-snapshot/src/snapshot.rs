@@ -44,6 +44,15 @@ pub struct StoredSnapshot {
     pub considered_addresses: Vec<String>,
     /// Absolute new balance per address that changed.
     pub balance_after: Vec<(String, i64)>,
+    /// The balance each of those addresses had when this distribution was
+    /// computed. Together with `balance_after` it gives the DELTA the block
+    /// applies, which is what makes the snapshot safe to book against a
+    /// ledger that moved since — an absolute write would silently undo
+    /// whatever moved it. Empty for snapshots written before this field
+    /// existed (and by payout engines that do not use the delta path);
+    /// readers fall back to the absolute value then.
+    #[serde(default)]
+    pub balance_before: Vec<(String, i64)>,
 }
 
 impl StoredSnapshot {
@@ -69,7 +78,36 @@ impl StoredSnapshot {
                 .iter()
                 .map(|(a, s)| (a.as_str().to_string(), s.0))
                 .collect(),
+            balance_before: Vec::new(),
         }
+    }
+
+    /// [`Self::from_math`] plus the ledger state the distribution was
+    /// computed against, recorded for exactly the addresses `balance_after`
+    /// changes. Lets the apply write a delta instead of an absolute, so a
+    /// block can still be booked correctly after another one moved the
+    /// ledger.
+    pub fn from_math_with_before(
+        payouts: &[CoinbaseDistributionEntry],
+        block_reward_sats: u64,
+        considered_addresses: &HashSet<AddressId>,
+        balance_after: &HashMap<AddressId, Sats>,
+        ledger_at_build: &HashMap<AddressId, Sats>,
+    ) -> Self {
+        let mut snapshot = Self::from_math(
+            payouts,
+            block_reward_sats,
+            considered_addresses,
+            balance_after,
+        );
+        snapshot.balance_before = balance_after
+            .keys()
+            .map(|a| {
+                let before = ledger_at_build.get(a).map(|s| s.0).unwrap_or(0);
+                (a.as_str().to_string(), before)
+            })
+            .collect();
+        snapshot
     }
 }
 
@@ -82,6 +120,9 @@ pub struct ParsedSnapshot {
     pub block_reward_sats: u64,
     pub considered_addresses: HashSet<String>,
     pub balance_after: HashMap<String, i64>,
+    /// See [`StoredSnapshot::balance_before`]. Empty when the snapshot
+    /// predates the field — the caller then has only the absolute value.
+    pub balance_before: HashMap<String, i64>,
 }
 
 impl From<StoredSnapshot> for ParsedSnapshot {
@@ -96,6 +137,7 @@ impl From<StoredSnapshot> for ParsedSnapshot {
             block_reward_sats: s.block_reward_sats,
             considered_addresses: s.considered_addresses.into_iter().collect(),
             balance_after: s.balance_after.into_iter().collect(),
+            balance_before: s.balance_before.into_iter().collect(),
         }
     }
 }
@@ -138,6 +180,10 @@ pub async fn write_snapshot(
         "balanceAfter_count".to_string(),
         snapshot.balance_after.len().to_string(),
     ));
+    fields.push((
+        "balanceBefore_count".to_string(),
+        snapshot.balance_before.len().to_string(),
+    ));
 
     for (i, entry) in snapshot.distribution.iter().enumerate() {
         fields.push((format!("d{i}_addr"), entry.address.as_str().to_string()));
@@ -148,6 +194,11 @@ pub async fn write_snapshot(
     for (i, (addr, sats)) in snapshot.balance_after.iter().enumerate() {
         fields.push((format!("b{i}_addr"), addr.clone()));
         fields.push((format!("b{i}_sats"), sats.to_string()));
+    }
+
+    for (i, (addr, sats)) in snapshot.balance_before.iter().enumerate() {
+        fields.push((format!("bb{i}_addr"), addr.clone()));
+        fields.push((format!("bb{i}_sats"), sats.to_string()));
     }
 
     let _: () = conn.del(key).await?;
@@ -229,6 +280,20 @@ fn parse_hash(h: &HashMap<String, String>) -> Option<ParsedSnapshot> {
         balance_after.insert(addr, sats);
     }
 
+    // Absent on snapshots written before the field existed — an empty map
+    // means "no before state recorded", and the caller falls back to the
+    // absolute value rather than treating 0 as the prior balance.
+    let before_count: usize = h
+        .get("balanceBefore_count")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut balance_before = HashMap::with_capacity(before_count);
+    for i in 0..before_count {
+        let addr = h.get(&format!("bb{i}_addr"))?.clone();
+        let sats: i64 = h.get(&format!("bb{i}_sats"))?.parse().ok()?;
+        balance_before.insert(addr, sats);
+    }
+
     let considered_addresses = h
         .get("consideredAddresses")
         .map(|s| {
@@ -244,6 +309,7 @@ fn parse_hash(h: &HashMap<String, String>) -> Option<ParsedSnapshot> {
         block_reward_sats,
         considered_addresses,
         balance_after,
+        balance_before,
     })
 }
 

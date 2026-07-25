@@ -57,6 +57,14 @@ use crate::ledger::{
 use crate::sweep::{spawn_daily_task, DustSweepRunner, SweepError, SweepStats, SystemClock};
 use crate::window::{snapshot::ParsedSnapshot, NetworkDifficulty, WindowError, WindowStore};
 
+/// How often a transient Redis failure on the block-found snapshot read is
+/// retried before the block is given up on. That read is the only thing
+/// standing between a found block and its payout, and the caller does not
+/// retry — a connection reset mid-reconnect would otherwise cost the block.
+const SNAPSHOT_READ_RETRIES: u32 = 3;
+/// Backoff between those attempts, multiplied by the attempt number.
+const SNAPSHOT_READ_BACKOFF: std::time::Duration = std::time::Duration::from_millis(80);
+
 /// Errors surfaced across the engine boundary.
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -76,6 +84,12 @@ pub enum EngineError {
     Distribution(Arc<DistributionError>),
     #[error("snapshot missing for block {block_height} — pool restart or expired TTL?")]
     SnapshotMissing { block_height: i32 },
+    #[error(
+        "block {block_height} carried no payout fingerprint — the pool did not \
+         build this coinbase (JD-client custom job), so there is no pool-side \
+         distribution to book"
+    )]
+    NoPayoutFingerprint { block_height: i32 },
     #[error(
         "snapshot reward mismatch for block {block_height}: \
          snapshot={snapshot_reward} sats, block={actual_reward} sats — \
@@ -112,6 +126,12 @@ pub struct PreparedBlockFound {
     pub now_ms: i64,
     pub rows: Vec<PreparedAuditRow>,
     pub balances: Vec<PreparedBalanceWrite>,
+    /// The payout-list fingerprint whose snapshot this was frozen from, if
+    /// it came from one. Carried so the apply consumes exactly that key: a
+    /// snapshot outliving its own block is what lets a redelivered event
+    /// re-prepare against an already-credited ledger.
+    #[serde(default)]
+    pub payouts_fingerprint: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -137,11 +157,13 @@ impl PreparedBlockFound {
         now_ms: i64,
         rows: &[AuditRow],
         balances: &[BalanceWrite],
+        payouts_fingerprint: Option<[u8; 32]>,
     ) -> Self {
         Self {
             block_height,
             block_reward_sats,
             now_ms,
+            payouts_fingerprint,
             rows: rows
                 .iter()
                 .map(|r| PreparedAuditRow {
@@ -388,6 +410,19 @@ impl PplnsEngine {
         block_height: i32,
         block_reward_sats: u64,
     ) -> Result<ApplyDistributionResult, EngineError> {
+        self.on_block_found_for(block_height, block_reward_sats, None)
+            .await
+    }
+
+    /// [`Self::on_block_found`] for a block whose job carried the fingerprint
+    /// of the payout list its coinbase pays. Used by the immediate-apply arm,
+    /// which has the same fingerprint available as the gated one.
+    pub async fn on_block_found_for(
+        &self,
+        block_height: i32,
+        block_reward_sats: u64,
+        payouts_fingerprint: Option<[u8; 32]>,
+    ) -> Result<ApplyDistributionResult, EngineError> {
         if self
             .inner
             .block_found_in_progress
@@ -397,7 +432,7 @@ impl PplnsEngine {
         }
         let result = async {
             let prepared = self
-                .prepare_block_found(block_height, block_reward_sats)
+                .prepare_block_found_for(block_height, block_reward_sats, payouts_fingerprint)
                 .await?;
             self.apply_prepared(&prepared).await
         }
@@ -422,12 +457,55 @@ impl PplnsEngine {
         block_height: i32,
         block_reward_sats: u64,
     ) -> Result<PreparedBlockFound, EngineError> {
-        let snapshot = self
-            .inner
-            .window
-            .read_snapshot()
-            .await?
-            .ok_or(EngineError::SnapshotMissing { block_height })?;
+        self.prepare_block_found_for(block_height, block_reward_sats, None)
+            .await
+    }
+
+    /// [`Self::prepare_block_found`] for a block whose job carried the
+    /// fingerprint of the payout list its coinbase pays.
+    ///
+    /// The fingerprint is an assertion about WHICH distribution this block's
+    /// coinbase pays. If it resolves to nothing the assertion cannot be
+    /// honoured, and this refuses — falling back to the shared key would book
+    /// a distribution the coinbase demonstrably did not pay. Only a job that
+    /// carries no fingerprint at all (a JD client's own coinbase, or a path
+    /// not yet threaded) reads the shared key, with the reward check below as
+    /// its only guard.
+    pub async fn prepare_block_found_for(
+        &self,
+        block_height: i32,
+        block_reward_sats: u64,
+        payouts_fingerprint: Option<[u8; 32]>,
+    ) -> Result<PreparedBlockFound, EngineError> {
+        // A zeroed fingerprint means the pool did not build this coinbase
+        // (`SetCustomMiningJob`) — there is no pool-side distribution to bind,
+        // so it is treated as "none carried", not as a lookup that failed.
+        let fingerprint = payouts_fingerprint
+            .filter(|fp| fp != &[0u8; 32])
+            .ok_or(EngineError::NoPayoutFingerprint { block_height })?;
+        // Retry a transient Redis failure rather than discarding the block.
+        // This read is the only thing standing between a found block and its
+        // payout: a connection reset mid-reconnect would otherwise drop the
+        // whole prepare, and the caller has no retry of its own. A genuinely
+        // missing snapshot (Ok(None)) is NOT retried — it will not appear.
+        let mut attempt = 0;
+        let snapshot = loop {
+            match self.inner.window.read_snapshot_for(&fingerprint).await {
+                Ok(Some(s)) => break s,
+                Ok(None) => return Err(EngineError::SnapshotMissing { block_height }),
+                Err(e) if attempt < SNAPSHOT_READ_RETRIES => {
+                    warn!(
+                        error = %e,
+                        block_height,
+                        attempt,
+                        "PPLNS snapshot read failed — retrying before giving up on the block"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(SNAPSHOT_READ_BACKOFF * attempt).await;
+                }
+                Err(e) => return Err(EngineError::Redis(e)),
+            }
+        };
 
         if snapshot.block_reward_sats != block_reward_sats {
             warn!(
@@ -436,7 +514,7 @@ impl PplnsEngine {
                 block_height,
                 "PPLNS snapshot reward mismatch — deleting stale snapshot, operator must reprocess block"
             );
-            if let Err(e) = self.inner.window.delete_snapshot().await {
+            if let Err(e) = self.inner.window.delete_snapshot_for(&fingerprint).await {
                 warn!(error = %e, "failed to delete mismatched snapshot — will TTL out");
             }
             return Err(EngineError::SnapshotRewardMismatch {
@@ -458,6 +536,7 @@ impl PplnsEngine {
             now_ms,
             &audit_rows,
             &balance_writes,
+            Some(fingerprint),
         ))
     }
 
@@ -482,12 +561,21 @@ impl PplnsEngine {
         )
         .await?;
 
-        if let Err(e) = self.inner.window.delete_snapshot().await {
-            warn!(
-                error = %e,
-                block_height = prepared.block_height,
-                "failed to delete PPLNS snapshot after apply_prepared — non-fatal, will TTL out"
-            );
+        // Consume only this block's snapshot. Others stay usable: their
+        // balances are applied as a DELTA against the ledger at prepare time,
+        // so a block frozen before this apply still books correctly against
+        // the ledger this apply produced. Keeping the snapshot would let a
+        // redelivered event for THIS block re-prepare, which is why its own
+        // key goes. The rest are bounded by the snapshot TTL.
+        if let Some(fp) = prepared.payouts_fingerprint {
+            if let Err(e) = self.inner.window.delete_snapshot_for(&fp).await {
+                warn!(
+                    error = %e,
+                    block_height = prepared.block_height,
+                    "failed to delete the applied block's PPLNS snapshot \
+                     — non-fatal, it TTLs out"
+                );
+            }
         }
         self.inner.distribution_builder.invalidate_all();
 
@@ -558,19 +646,8 @@ impl PplnsEngine {
             audit_rows.push(coinbase_row(entry));
             emitted.insert(entry.address.as_str().to_string());
 
-            // New absolute balance: from the snapshot's balance_after,
-            // falling back to the address's current balance (the snapshot
-            // can omit addresses whose balance is unchanged).
-            let new_balance = snapshot
-                .balance_after
-                .get(entry.address.as_str())
-                .copied()
-                .or_else(|| {
-                    existing
-                        .get(entry.address.as_str())
-                        .map(|r| r.balance_sats.0)
-                })
-                .unwrap_or(0);
+            let new_balance =
+                Self::resolve_new_balance(snapshot, &existing, entry.address.as_str());
             let prev_total_paid = existing
                 .get(entry.address.as_str())
                 .map(|r| r.total_paid_sats.0)
@@ -584,7 +661,7 @@ impl PplnsEngine {
 
         // 2. Pending rows for addresses in balance_after that DIDN'T get
         //    an on-chain output (sub-dust credit accruals + matching debits).
-        for (addr_str, new_balance) in &snapshot.balance_after {
+        for addr_str in snapshot.balance_after.keys() {
             if emitted.contains(addr_str) {
                 continue;
             }
@@ -593,7 +670,8 @@ impl PplnsEngine {
                 .get(addr_str)
                 .map(|r| r.balance_sats.0)
                 .unwrap_or(0);
-            let delta = new_balance - prev_balance;
+            let resolved = Self::resolve_new_balance(snapshot, &existing, addr_str);
+            let delta = resolved - prev_balance;
             audit_rows.push(pending_row(addr_id.clone(), Sats(delta)));
             emitted.insert(addr_str.clone());
 
@@ -603,7 +681,7 @@ impl PplnsEngine {
                 .unwrap_or(0);
             balance_writes.push(BalanceWrite {
                 address: addr_id,
-                balance_sats: Sats(*new_balance),
+                balance_sats: Sats(resolved),
                 // No on-chain delta for pending rows.
                 total_paid_sats: Sats(prev_total_paid),
             });
@@ -628,6 +706,33 @@ impl PplnsEngine {
         }
 
         Ok((audit_rows, balance_writes))
+    }
+
+    /// The balance to write for `address`.
+    ///
+    /// When the snapshot recorded the ledger state it was computed against,
+    /// this applies the DELTA the distribution intends to the CURRENT ledger.
+    /// That is what lets a block be booked correctly after another one moved
+    /// the ledger: writing the snapshot's absolute would silently undo the
+    /// other block's pay-down (the hazard the flush-before-prepare in the
+    /// block sink exists to work around).
+    ///
+    /// Falls back to the absolute for snapshots written before
+    /// `balance_before` existed — same behaviour as before, no worse.
+    fn resolve_new_balance(
+        snapshot: &ParsedSnapshot,
+        existing: &HashMap<String, PplnsBalanceRow>,
+        address: &str,
+    ) -> i64 {
+        let current = existing.get(address).map(|r| r.balance_sats.0).unwrap_or(0);
+        let Some(after) = snapshot.balance_after.get(address).copied() else {
+            // Not in balance_after → this distribution does not change it.
+            return current;
+        };
+        match snapshot.balance_before.get(address).copied() {
+            Some(before) => current + (after - before),
+            None => after,
+        }
     }
 
     /// Run one manual dust-sweep tick. Exposes the sweep runner for
@@ -742,6 +847,7 @@ mod tests {
 
         // Snapshot built before this miner submitted their first share.
         let snapshot = ParsedSnapshot {
+            balance_before: HashMap::new(),
             distribution: vec![],
             block_reward_sats: 312_500_000,
             considered_addresses: HashSet::new(), // nobody was in the snapshot
@@ -789,6 +895,7 @@ mod tests {
         considered.insert(addr.clone());
 
         let snapshot = ParsedSnapshot {
+            balance_before: HashMap::new(),
             distribution: vec![],
             block_reward_sats: 312_500_000,
             considered_addresses: considered,

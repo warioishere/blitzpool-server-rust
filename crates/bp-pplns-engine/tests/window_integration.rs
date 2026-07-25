@@ -306,6 +306,7 @@ async fn snapshot_roundtrip_via_window_store() {
     let addr_b = AddressId::new("bc1qdebit00000000000000000000000".to_string()).unwrap();
 
     let snapshot = StoredSnapshot {
+        balance_before: Vec::new(),
         distribution: vec![
             CoinbaseDistributionEntry {
                 address: addr_a.clone(),

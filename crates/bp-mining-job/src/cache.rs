@@ -527,6 +527,9 @@ impl MiningJobCache {
                     &payout_outputs,
                     template,
                     extranonce_slot_size,
+                    // Only on a cache miss — a job hit never reaches this
+                    // closure, so the hash runs once per distinct job.
+                    crate::coinbase::payouts_fingerprint(reward, payouts),
                 )))
             },
         )?;

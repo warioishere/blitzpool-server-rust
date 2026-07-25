@@ -83,6 +83,7 @@ fn fixture_snapshot() -> StoredSnapshot {
     // the Σ = 0 invariant is observable. Realistic percent + sats
     // values that exercise the f64-to-string boundary.
     StoredSnapshot {
+        balance_before: Vec::new(),
         distribution: vec![
             CoinbaseDistributionEntry {
                 address: bp_common::AddressId::new(
@@ -203,6 +204,9 @@ async fn rust_write_emits_ts_wire_format_field_set() {
         "consideredAddresses",
         "distribution_count",
         "balanceAfter_count",
+        // No `bb{i}_*` here: this fixture uses `from_math`, which records no
+        // before-state, so only the count field appears.
+        "balanceBefore_count",
         "d0_addr",
         "d0_pct",
         "d0_sats",
@@ -250,6 +254,12 @@ async fn ts_style_hset_is_readable_by_rust() {
         ),
         ("distribution_count", "3".to_string()),
         ("balanceAfter_count", "2".to_string()),
+        // Added with the delta-apply change: the ledger state the
+        // distribution was computed against, so a block can be booked
+        // correctly after another one moved the ledger. Zero here because
+        // this fixture builds the snapshot via `from_math`, the
+        // no-before-state constructor the Group-Solo engine still uses.
+        ("balanceBefore_count", "0".to_string()),
         (
             "d0_addr",
             "bc1qfinder000000000000000000000000".to_string(),
@@ -382,6 +392,7 @@ async fn ts_spec_fixture_bytewise_mirror() {
     };
 
     let snap = StoredSnapshot {
+        balance_before: Vec::new(),
         distribution: vec![
             CoinbaseDistributionEntry {
                 address: bp_common::AddressId::new("bc1qfee".to_string()).unwrap(),
@@ -489,6 +500,7 @@ async fn empty_distribution_and_balance_roundtrip() {
         None => return,
     };
     let snap = StoredSnapshot {
+        balance_before: Vec::new(),
         distribution: vec![],
         block_reward_sats: 312_500_000,
         considered_addresses: vec!["bc1qsubdust0000000000000000000000".to_string()],
@@ -506,6 +518,7 @@ async fn empty_distribution_and_balance_roundtrip() {
         "consideredAddresses",
         "distribution_count",
         "balanceAfter_count",
+        "balanceBefore_count",
     ]
     .into_iter()
     .collect();

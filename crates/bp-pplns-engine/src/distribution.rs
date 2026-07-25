@@ -37,6 +37,7 @@ use bp_pplns::{
     build_coinbase_distribution, is_valid_payout_address, CoinbaseDistributionEntry,
     CoinbaseDistributionInput,
 };
+use bp_share::payouts_fingerprint_from_parts;
 use sqlx::PgPool;
 use thiserror::Error;
 use tracing::warn;
@@ -110,6 +111,21 @@ pub struct DistributionResult {
     /// snapshot pins this so on-block-found can refuse to apply a
     /// stale snapshot whose reward disagrees with the actual coinbase.
     pub block_reward_sats: u64,
+    /// Identity of `payouts` + the reward it was built over — the key this
+    /// build's snapshot is stored under.
+    ///
+    /// It is NOT threaded onward from here: the Stratum job build derives the
+    /// same value independently from the `PayoutEntry` list it turns into the
+    /// coinbase and that list's template reward (`MiningJobCache`), and that
+    /// is what a found block carries.
+    /// The two derivations agreeing is what makes the block-found lookup hit —
+    /// `payouts_fingerprint` and `payouts_fingerprint_from_parts` share one
+    /// encoding for exactly that reason, and the regtest
+    /// `ledger_books_exactly_what_the_accepted_coinbase_paid` pins it.
+    ///
+    /// Exposed so callers (and tests) can name the key this distribution
+    /// landed under. See [`bp_share::payouts_fingerprint_from_parts`].
+    pub payouts_fingerprint: [u8; 32],
 }
 
 /// Knobs for the distribution path. Built from
@@ -322,22 +338,52 @@ async fn build_from_inputs(
     }
 
     // 5. Persist snapshot so on-block-found can replay deterministically.
-    let snapshot = StoredSnapshot::from_math(
+    // Records the ledger state this distribution was computed against, so the
+    // apply can write a delta instead of an absolute — see
+    // `StoredSnapshot::balance_before`.
+    let snapshot = StoredSnapshot::from_math_with_before(
         &math.payouts,
         block_reward_sats,
         &math.considered_addresses,
         &math.balance_after,
+        &inputs.balances,
     );
-    window
-        .write_snapshot(&snapshot, config.snapshot_ttl_secs)
+    // Keyed by the payout list it distributes — the only snapshot written.
+    // Nothing else writes this key, so it still holds THIS distribution when
+    // the block that mined it is found, however many other builds ran in
+    // between. A block-found that cannot name a key gets no distribution
+    // rather than a stranger's.
+    let payouts_fingerprint = payouts_fingerprint_from_parts(
+        block_reward_sats,
+        math.payouts
+            .iter()
+            .map(|p| (p.address.as_str(), p.sats.to_i64().max(0) as u64)),
+    );
+    // A failed snapshot write must NOT fail the build. The distribution
+    // itself is correct and is about to become a coinbase; returning `Err`
+    // here sends `pplns_payouts` into its solo fallback, and that miner is
+    // handed a job paying 100 % of the block to itself. Losing the snapshot
+    // costs a manual reprocess if a block lands on this job — losing the
+    // distribution costs the pool's miners the whole block, irreversibly.
+    if let Err(err) = window
+        .write_snapshot_for(&payouts_fingerprint, &snapshot, config.snapshot_ttl_secs)
         .await
-        .map_err(DistributionError::Snapshot)?;
+    {
+        warn!(
+            %err,
+            block_reward_sats,
+            "PPLNS snapshot write failed — the coinbase distribution stands, but a \
+             block found on this job cannot be booked automatically and needs \
+             operator reprocessing"
+        );
+    }
 
     Ok(DistributionResult {
         payouts: math.payouts,
         considered_addresses: math.considered_addresses,
         balance_after: math.balance_after,
         block_reward_sats,
+        payouts_fingerprint,
     })
 }
 
@@ -411,6 +457,7 @@ mod tests {
             considered_addresses: HashSet::new(),
             balance_after: HashMap::new(),
             block_reward_sats: 312_500_000,
+            payouts_fingerprint: [0u8; 32],
         };
         let cloned = result.clone();
         assert_eq!(cloned.block_reward_sats, 312_500_000);

@@ -86,6 +86,7 @@ fn ext_channel() -> ChannelState {
 
 fn ext_job(merkle_depth: usize) -> ExtendedJob {
     ExtendedJob {
+        payouts_fingerprint: [0u8; 32],
         coinbase_prefix: vec![0xAA; 64],
         coinbase_suffix: vec![0xBB; 100],
         merkle_path: vec![[0x33; 32]; merkle_depth],

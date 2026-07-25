@@ -179,6 +179,7 @@ async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
         &group_key,
         "test_reset_finder",
         &snapshot::StoredSnapshot {
+            balance_before: Vec::new(),
             distribution: vec![],
             block_reward_sats: 100,
             considered_addresses: vec![],

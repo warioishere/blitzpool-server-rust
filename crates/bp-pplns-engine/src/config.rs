@@ -49,9 +49,21 @@ pub struct PplnsEngineConfig {
     /// network_difficulty`. Defaults to `4` (no env override).
     pub window_factor: f64,
 
-    /// Snapshot TTL in seconds. Defaults to 3600 (1h) — long enough for
-    /// onBlockFound to consume; short enough for cleanup if a template
-    /// goes stale (a block arrives within seconds of `buildDistribution`).
+    /// Snapshot TTL in seconds.
+    ///
+    /// Snapshots are keyed by the payout list they distribute, so one is
+    /// written per distinct distribution — roughly (connections × template
+    /// rate) — and only the applied block's own key is deleted. The TTL is
+    /// therefore what bounds the keyspace, and it is also what the 10-minute
+    /// `pplns:*` Redis→Postgres backup has to carry.
+    ///
+    /// A snapshot is only useful while a job built from it can still be
+    /// mined, and a job is GC-eligible once `bp_jobs_lifecycle`'s
+    /// `retention_ms` (10 min) has passed since it retired. The default of
+    /// 1200 s is twice that — comfortably past any job's life, without
+    /// hoarding an hour's worth of dead distributions the way the previous
+    /// 3600 did. That value made sense when a single shared key was
+    /// overwritten in place; per-job keys it merely multiplies.
     pub snapshot_ttl_secs: u32,
 
     /// Trim batch size — legacy per-share trim tunable. No longer used by the
@@ -101,7 +113,7 @@ impl Default for PplnsEngineConfig {
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
             coinbase_weight_budget: DEFAULT_COINBASE_WEIGHT_BUDGET,
             window_factor: 4.0,
-            snapshot_ttl_secs: 3_600,
+            snapshot_ttl_secs: 1_200,
             trim_batch_size: 100,
             bucket_shares: crate::window::DEFAULT_BUCKET_SHARES,
             touch_flush_interval_secs: 60,

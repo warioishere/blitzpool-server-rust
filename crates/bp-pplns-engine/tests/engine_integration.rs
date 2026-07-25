@@ -220,11 +220,11 @@ async fn on_block_found_applies_distribution_from_snapshot() {
         .record_share(None, &a, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    let _result = h.engine.build_distribution(312_500_000).await.expect("ok");
+    let result = h.engine.build_distribution(312_500_000).await.expect("ok");
     let block_height = 9_997_001;
     let outcome = h
         .engine
-        .on_block_found(block_height, 312_500_000)
+        .on_block_found_for(block_height, 312_500_000, Some(result.payouts_fingerprint))
         .await
         .expect("ok");
     assert!(outcome.history_inserted >= 1, "at least one audit row");
@@ -242,6 +242,107 @@ async fn on_block_found_applies_distribution_from_snapshot() {
     let snap = h.engine.window().read_snapshot().await.expect("ok");
     assert!(snap.is_none(), "snapshot cleared after on_block_found");
 
+    drop_harness(h).await;
+}
+
+// ── A later build must not cost the found block its distribution ───
+//
+// The bug this guards: the pool builds the job a block is later mined on,
+// then some other build — an ext-0x0003 payout request from a JD client with
+// its own payout value, or just a template refresh — overwrites the shared
+// `pplns:snapshot` key. `prepare_block_found` then reads a snapshot whose
+// reward disagrees with the coinbase, refuses, deletes it, and the block's
+// PPLNS distribution is never applied (WARN only, manual reprocessing).
+//
+// Looked up under the job's payout fingerprint it still resolves, because
+// nothing else writes that key.
+
+#[tokio::test]
+async fn later_build_does_not_cost_the_found_block_its_distribution() {
+    let _guard = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(1, "test_engine_fp_").await {
+        Some(h) => h,
+        None => return,
+    };
+    // Valid addresses — anything else is filtered out before the
+    // distribution math and would leave an empty payout list.
+    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    h.engine
+        .record_share(None, ADDR_A, 70.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, ADDR_B, 30.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+
+    // The build the block's coinbase is made from.
+    const MINED_REWARD: u64 = 312_500_000;
+    let mined = h
+        .engine
+        .build_distribution(MINED_REWARD)
+        .await
+        .expect("mined build ok");
+    assert!(
+        !mined.payouts.is_empty(),
+        "scenario needs a real distribution"
+    );
+    let fingerprint = mined.payouts_fingerprint;
+
+    // A JD client asks for its own payout value — this is what displaces the
+    // shared key today.
+    let jdc = h
+        .engine
+        .build_distribution(MINED_REWARD - 863)
+        .await
+        .expect("jdc build ok");
+    assert_ne!(
+        fingerprint, jdc.payouts_fingerprint,
+        "the two builds must be distinguishable"
+    );
+
+    let block_height = 9_997_101;
+
+    // Without the fingerprint: the shared key now holds the JDC's build, so
+    // the reward check refuses. This is the live failure.
+    let blind = h
+        .engine
+        .prepare_block_found(block_height, MINED_REWARD)
+        .await;
+    assert!(
+        blind.is_err(),
+        "the shared key holds the later build — preparing blind must refuse \
+         rather than book the wrong distribution"
+    );
+
+    // With it: the block's own distribution is still there.
+    let prepared = h
+        .engine
+        .prepare_block_found_for(block_height, MINED_REWARD, Some(fingerprint))
+        .await
+        .expect("the job's own distribution must still resolve");
+    let outcome = h.engine.apply_prepared(&prepared).await.expect("apply ok");
+    assert!(outcome.history_inserted >= 1, "audit rows written");
+
+    let count: (i64,) =
+        sqlx::query_as(r#"SELECT count(*) FROM pplns_payout_history WHERE "blockHeight" = $1"#)
+            .bind(block_height)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(count.0 >= 1, "audit row present in PG");
+
+    let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
+        .bind(block_height)
+        .execute(&h.pool)
+        .await;
+    for addr in [ADDR_A, ADDR_B] {
+        let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
+            .bind(addr)
+            .execute(&h.pool)
+            .await;
+    }
     drop_harness(h).await;
 }
 
@@ -446,7 +547,10 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         !d1.payouts.iter().any(|p| p.address.as_str() == TINY),
         "sub-threshold miner must NOT get a block-1 coinbase output"
     );
-    h.engine.on_block_found(h1, REWARD).await.expect("apply 1");
+    h.engine
+        .on_block_found_for(h1, REWARD, Some(d1.payouts_fingerprint))
+        .await
+        .expect("apply 1");
 
     let (bal1, paid1) = miner_balance_and_paid(&h.pool, TINY).await;
     assert!(
@@ -471,7 +575,10 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         d2.payouts.iter().any(|p| p.address.as_str() == TINY),
         "accrued credit must push the tiny miner over min_payout into a block-2 output"
     );
-    h.engine.on_block_found(h2, REWARD).await.expect("apply 2");
+    h.engine
+        .on_block_found_for(h2, REWARD, Some(d2.payouts_fingerprint))
+        .await
+        .expect("apply 2");
 
     let (bal2, paid2) = miner_balance_and_paid(&h.pool, TINY).await;
     assert_eq!(bal2, 0, "pending credit clears once paid (got {bal2})");
@@ -509,10 +616,10 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         .record_share(None, MINER, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    h.engine.build_distribution(REWARD).await.expect("build 1");
+    let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
     let p1 = h
         .engine
-        .prepare_block_found(h1, REWARD)
+        .prepare_block_found_for(h1, REWARD, Some(d1.payouts_fingerprint))
         .await
         .expect("prepare 1");
     h.engine.apply_prepared(&p1).await.expect("apply 1");
@@ -524,10 +631,10 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         .record_share(None, MINER, 100.0, 1_700_000_060_001)
         .await
         .unwrap();
-    h.engine.build_distribution(REWARD).await.expect("build 2");
+    let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
     let p2 = h
         .engine
-        .prepare_block_found(h2, REWARD)
+        .prepare_block_found_for(h2, REWARD, Some(d2.payouts_fingerprint))
         .await
         .expect("prepare 2");
     h.engine.apply_prepared(&p2).await.expect("apply 2");
@@ -566,10 +673,10 @@ async fn gated_two_prepares_against_same_ledger_clobber_without_flush() {
         .record_share(None, MINER, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    h.engine.build_distribution(REWARD).await.expect("build 1");
+    let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
     let p1 = h
         .engine
-        .prepare_block_found(h1, REWARD)
+        .prepare_block_found_for(h1, REWARD, Some(d1.payouts_fingerprint))
         .await
         .expect("prepare 1");
 
@@ -578,10 +685,10 @@ async fn gated_two_prepares_against_same_ledger_clobber_without_flush() {
         .record_share(None, MINER, 100.0, 1_700_000_060_001)
         .await
         .unwrap();
-    h.engine.build_distribution(REWARD).await.expect("build 2");
+    let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
     let p2 = h
         .engine
-        .prepare_block_found(h2, REWARD)
+        .prepare_block_found_for(h2, REWARD, Some(d2.payouts_fingerprint))
         .await
         .expect("prepare 2");
 
@@ -672,3 +779,213 @@ async fn spawn_core_skips_crons_but_build_distribution_works() {
 // Silence "unused: AddressId" if a future test wants it directly.
 #[allow(dead_code)]
 fn _force_use(_: AddressId) {}
+
+// ── An unresolvable fingerprint must refuse, never fall back ────────
+//
+// The fingerprint asserts WHICH distribution the coinbase pays. If it
+// resolves to nothing that assertion cannot be honoured, and reading the
+// shared last-writer-wins key instead would book a distribution the coinbase
+// demonstrably did not pay — silently, since the shared copy carries the
+// right reward and passes the reward check.
+
+#[tokio::test]
+async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
+    let _guard = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(3, "test_engine_unk_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    h.engine
+        .record_share(None, ADDR_A, 100.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+
+    const REWARD: u64 = 312_500_000;
+    // A perfectly good shared snapshot for exactly this reward exists — so a
+    // fallback would succeed and pass the reward check.
+    let _ = h.engine.build_distribution(REWARD).await.expect("build ok");
+
+    let never_written = [0x5au8; 32];
+    let err = h
+        .engine
+        .prepare_block_found_for(9_997_201, REWARD, Some(never_written))
+        .await
+        .expect_err("an unresolvable fingerprint must not be booked from the shared key");
+    eprintln!("refused with: {err}");
+
+    let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
+        .bind(ADDR_A)
+        .execute(&h.pool)
+        .await;
+    drop_harness(h).await;
+}
+
+// ── Apply consumes the snapshot the block was frozen from ───────────
+//
+// The block-found stream is at-least-once. If the fingerprinted snapshot
+// outlives its own block, a redelivered event re-prepares against the ledger
+// it already credited and double-credits `totalPaidSats`. Deleting on apply
+// is what makes the redelivery fail closed, exactly as it did before the
+// fingerprint key existed.
+
+#[tokio::test]
+async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() {
+    let _guard = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(4, "test_engine_consume_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    h.engine
+        .record_share(None, ADDR_A, 60.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, ADDR_B, 40.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+
+    const REWARD: u64 = 312_500_000;
+    let dist = h.engine.build_distribution(REWARD).await.expect("build ok");
+    let fp = dist.payouts_fingerprint;
+    let height = 9_997_301;
+
+    let prepared = h
+        .engine
+        .prepare_block_found_for(height, REWARD, Some(fp))
+        .await
+        .expect("prepare ok");
+    h.engine.apply_prepared(&prepared).await.expect("apply ok");
+
+    // The snapshot is gone, so the redelivery cannot re-prepare.
+    assert!(
+        h.engine
+            .window()
+            .read_snapshot_for(&fp)
+            .await
+            .expect("read ok")
+            .is_none(),
+        "apply must consume the snapshot its block was frozen from"
+    );
+    let redelivered = h
+        .engine
+        .prepare_block_found_for(height, REWARD, Some(fp))
+        .await;
+    assert!(
+        redelivered.is_err(),
+        "a redelivered block-found must fail closed, not re-prepare against the \
+         ledger it already credited"
+    );
+
+    let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
+        .bind(height)
+        .execute(&h.pool)
+        .await;
+    for addr in [ADDR_A, ADDR_B] {
+        let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
+            .bind(addr)
+            .execute(&h.pool)
+            .await;
+    }
+    drop_harness(h).await;
+}
+
+// ── A block frozen before another was applied still books correctly ──
+//
+// Two blocks can be in flight inside the confirmation window. The later one's
+// snapshot was written when its job was built — necessarily before the
+// earlier one was applied. Booking it must not undo the pay-down the earlier
+// coinbase just made: the snapshot's balances are applied as a DELTA against
+// the ledger as it stands at prepare time, not as the absolute it computed
+// against a ledger that has since moved.
+
+#[tokio::test]
+async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
+    let _guard = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(5, "test_engine_stale_").await {
+        Some(h) => h,
+        None => return,
+    };
+    // A dominant miner soaks the reward; the tiny one's share stays under
+    // min_payout, so it ACCRUES a pending credit each block. That accrual is
+    // what distinguishes a delta from an absolute: two blocks must leave it
+    // with two blocks' worth, not one.
+    const BIG: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+    const TINY: &str = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
+    const REWARD_FIRST: u64 = 3_000_000_000;
+    const REWARD_SECOND: u64 = 2_999_999_137;
+    let h1: i32 = 9_997_401;
+    let h2: i32 = 9_997_402;
+    cleanup_addr(&h.pool, BIG, &[h1, h2]).await;
+    cleanup_addr(&h.pool, TINY, &[h1, h2]).await;
+
+    h.engine
+        .record_share(None, BIG, 1_000_000.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, TINY, 1.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+
+    // Two blocks in flight, BOTH frozen against the same (empty) ledger.
+    let dist_first = h.engine.build_distribution(REWARD_FIRST).await.expect("ok");
+    let dist_second = h
+        .engine
+        .build_distribution(REWARD_SECOND)
+        .await
+        .expect("ok");
+    let fp_second = dist_second.payouts_fingerprint;
+    assert_ne!(dist_first.payouts_fingerprint, fp_second);
+
+    let prepared_first = h
+        .engine
+        .prepare_block_found_for(h1, REWARD_FIRST, Some(dist_first.payouts_fingerprint))
+        .await
+        .expect("prepare first");
+    h.engine
+        .apply_prepared(&prepared_first)
+        .await
+        .expect("apply first");
+    let (accrued_once, _) = miner_balance_and_paid(&h.pool, TINY).await;
+    assert!(
+        accrued_once > 0,
+        "the tiny miner must accrue a sub-threshold credit from the first block"
+    );
+
+    // The second block's snapshot was computed against the PRE-apply ledger
+    // and must survive — the delta is what makes it safe to book.
+    assert!(
+        h.engine
+            .window()
+            .read_snapshot_for(&fp_second)
+            .await
+            .expect("read ok")
+            .is_some(),
+        "only the applied block's own snapshot is consumed"
+    );
+    let prepared_second = h
+        .engine
+        .prepare_block_found_for(h2, REWARD_SECOND, Some(fp_second))
+        .await
+        .expect("a block frozen before the apply must still be bookable");
+    h.engine
+        .apply_prepared(&prepared_second)
+        .await
+        .expect("apply second");
+
+    // Writing the snapshot's ABSOLUTE would leave the credit at one block's
+    // worth — the second block's accrual silently lost.
+    let (accrued_twice, _) = miner_balance_and_paid(&h.pool, TINY).await;
+    assert!(
+        accrued_twice > accrued_once,
+        "the second block's accrual must ADD to the first, not overwrite it \
+         (after first={accrued_once}, after second={accrued_twice})"
+    );
+
+    cleanup_addr(&h.pool, BIG, &[h1, h2]).await;
+    cleanup_addr(&h.pool, TINY, &[h1, h2]).await;
+    drop_harness(h).await;
+}
