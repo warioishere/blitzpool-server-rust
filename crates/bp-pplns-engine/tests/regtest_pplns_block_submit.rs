@@ -225,61 +225,15 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
         .collect();
 
     // ── Build the MiningJob + brute-force a regtest-target nonce ──
-    let coinbase_template = TdpCoinbaseTemplate {
-        coinbase_prefix: &template.coinbase_prefix,
-        coinbase_tx_version: template.coinbase_tx_version,
-        coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,
-        coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
-        coinbase_tx_outputs: &template.coinbase_tx_outputs,
-        coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
-        coinbase_tx_locktime: template.coinbase_tx_locktime,
-    };
-    let job = build_mining_job_from_tdp(
-        Network::Regtest,
+    let (_height, _witness_coinbase) = mine_and_submit(
+        &node,
+        &tdp,
+        &template,
+        &prev_hash,
         &payouts,
-        &coinbase_template,
         "pplns-e2e-regtest",
-        EXTRANONCE_SLOT_LEN,
     )
-    .expect("build_mining_job_from_tdp");
-
-    let en1 = [0u8; 4];
-    let en2 = [0u8; 8];
-    let coinbase_txid = job.coinbase_txid_with_extranonce(&en1, &en2);
-    let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &template.merkle_path);
-    let target = Target::from_le_bytes(prev_hash.target);
-    let nonce = brute_force_nonce(
-        template.version,
-        &prev_hash.prev_hash,
-        &merkle_root,
-        prev_hash.header_timestamp,
-        prev_hash.n_bits,
-        &target,
-    )
-    .expect("must find a regtest-target-matching nonce within 1M tries");
-
-    // ── Submit + assert chain tip advances ───────────────────────
-    let witness_coinbase = job.witness_coinbase_with_extranonce(&en1, &en2);
-    let before_height = node.current_height().await.expect("current_height");
-
-    tdp.submit_solution(
-        template.template_id,
-        template.version,
-        prev_hash.header_timestamp,
-        nonce,
-        witness_coinbase,
-    )
-    .await
-    .expect("submit_solution");
-
-    let after = poll_for_height(&node, before_height + 1, Duration::from_secs(20))
-        .await
-        .expect(
-            "bitcoin-core must accept the block — a stuck tip means the \
-             engine-built distribution produced a coinbase the chain \
-             rejected (sat-sum drift, dust output, malformed script, ...)",
-        );
-    assert_eq!(after, before_height + 1);
+    .await;
 
     // ── Teardown ─────────────────────────────────────────────────
     engine.shutdown();
@@ -417,59 +371,15 @@ async fn pplns_block_with_real_txs_nonempty_merkle_path_accepted_by_core() {
         .collect();
 
     // ── Build coinbase, reconstruct the root over the NON-EMPTY branch ──
-    let coinbase_template = TdpCoinbaseTemplate {
-        coinbase_prefix: &template.coinbase_prefix,
-        coinbase_tx_version: template.coinbase_tx_version,
-        coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,
-        coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
-        coinbase_tx_outputs: &template.coinbase_tx_outputs,
-        coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
-        coinbase_tx_locktime: template.coinbase_tx_locktime,
-    };
-    let job = build_mining_job_from_tdp(
-        Network::Regtest,
+    let (_height, _witness_coinbase) = mine_and_submit(
+        &node,
+        &tdp,
+        &template,
+        &prev_hash,
         &payouts,
-        &coinbase_template,
         "pplns-merkle-regtest",
-        EXTRANONCE_SLOT_LEN,
     )
-    .expect("build_mining_job_from_tdp");
-
-    let en1 = [0u8; 4];
-    let en2 = [0u8; 8];
-    let coinbase_txid = job.coinbase_txid_with_extranonce(&en1, &en2);
-    let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &template.merkle_path);
-    let target = Target::from_le_bytes(prev_hash.target);
-    let nonce = brute_force_nonce(
-        template.version,
-        &prev_hash.prev_hash,
-        &merkle_root,
-        prev_hash.header_timestamp,
-        prev_hash.n_bits,
-        &target,
-    )
-    .expect("must find a regtest-target-matching nonce");
-
-    let witness_coinbase = job.witness_coinbase_with_extranonce(&en1, &en2);
-    let before_height = node.current_height().await.expect("current_height");
-    tdp.submit_solution(
-        template.template_id,
-        template.version,
-        prev_hash.header_timestamp,
-        nonce,
-        witness_coinbase,
-    )
-    .await
-    .expect("submit_solution");
-
-    let after = poll_for_height(&node, before_height + 1, Duration::from_secs(20))
-        .await
-        .expect(
-            "bitcoin-core must accept the block — a stuck tip with a non-empty merkle path \
-             means the reconstructed merkle root didn't match the block's transactions \
-             (merkle fold byte-order / sibling-order bug)",
-        );
-    assert_eq!(after, before_height + 1);
+    .await;
 
     engine.shutdown();
     tdp.shutdown().expect("TDP clean shutdown");
@@ -528,6 +438,84 @@ fn test_engine_config(fee_addr: &str) -> PplnsEngineConfig {
 // need it don't have to re-add.
 #[allow(dead_code)]
 fn _force_addr_id(_: AddressId) {}
+
+/// The `TdpCoinbaseTemplate` view of a `NewTemplate`. Pure field lowering —
+/// extracted because all three tests in this file need the identical literal.
+fn coinbase_template_from(t: &NewTemplate) -> TdpCoinbaseTemplate<'_> {
+    TdpCoinbaseTemplate {
+        coinbase_prefix: &t.coinbase_prefix,
+        coinbase_tx_version: t.coinbase_tx_version,
+        coinbase_tx_input_sequence: t.coinbase_tx_input_sequence,
+        coinbase_tx_value_remaining: t.coinbase_tx_value_remaining,
+        coinbase_tx_outputs: &t.coinbase_tx_outputs,
+        coinbase_tx_outputs_count: t.coinbase_tx_outputs_count,
+        coinbase_tx_locktime: t.coinbase_tx_locktime,
+    }
+}
+
+/// Build the coinbase from `payouts`, grind a regtest-target nonce, submit via
+/// TDP and wait for the tip to rise. Returns the new height and the exact
+/// witness-form coinbase that was submitted, so callers can assert against the
+/// bytes bitcoin-core accepted.
+///
+/// Panics with the sibling tests' wording if the tip does not advance — a
+/// stuck tip means the engine-built distribution produced a coinbase the chain
+/// rejected (sat-sum drift, dust output, malformed script, ...).
+async fn mine_and_submit(
+    node: &RegtestNode,
+    tdp: &TdpHandle,
+    template: &NewTemplate,
+    prev_hash: &bp_template_distribution::SetNewPrevHash,
+    payouts: &[PayoutEntry],
+    pool_identifier: &str,
+) -> (u32, Vec<u8>) {
+    let coinbase_template = coinbase_template_from(template);
+    let job = build_mining_job_from_tdp(
+        Network::Regtest,
+        payouts,
+        &coinbase_template,
+        pool_identifier,
+        EXTRANONCE_SLOT_LEN,
+    )
+    .expect("build_mining_job_from_tdp");
+
+    let en1 = [0u8; 4];
+    let en2 = [0u8; 8];
+    let coinbase_txid = job.coinbase_txid_with_extranonce(&en1, &en2);
+    let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &template.merkle_path);
+    let target = Target::from_le_bytes(prev_hash.target);
+    let nonce = brute_force_nonce(
+        template.version,
+        &prev_hash.prev_hash,
+        &merkle_root,
+        prev_hash.header_timestamp,
+        prev_hash.n_bits,
+        &target,
+    )
+    .expect("must find a regtest-target-matching nonce within 1M tries");
+
+    let witness_coinbase = job.witness_coinbase_with_extranonce(&en1, &en2);
+    let before_height = node.current_height().await.expect("current_height");
+    tdp.submit_solution(
+        template.template_id,
+        template.version,
+        prev_hash.header_timestamp,
+        nonce,
+        witness_coinbase.clone(),
+    )
+    .await
+    .expect("submit_solution");
+
+    let after = poll_for_height(node, before_height + 1, Duration::from_secs(20))
+        .await
+        .expect(
+            "bitcoin-core must accept the block — a stuck tip means the \
+             engine-built distribution produced a coinbase the chain \
+             rejected (sat-sum drift, dust output, malformed script, ...)",
+        );
+    assert_eq!(after, before_height + 1);
+    (after, witness_coinbase)
+}
 
 /// Separate logical DB for the coinbase↔ledger equality variant.
 const REDIS_TEST_DB_LEDGER: u8 = 11;
@@ -623,15 +611,9 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
         })
         .collect();
 
-    let coinbase_template = TdpCoinbaseTemplate {
-        coinbase_prefix: &template.coinbase_prefix,
-        coinbase_tx_version: template.coinbase_tx_version,
-        coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,
-        coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
-        coinbase_tx_outputs: &template.coinbase_tx_outputs,
-        coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
-        coinbase_tx_locktime: template.coinbase_tx_locktime,
-    };
+    // The engine and the job must agree on the identity of the payout list,
+    // otherwise the block-found lookup would miss and silently fall back.
+    let coinbase_template = coinbase_template_from(&template);
     let job = build_mining_job_from_tdp(
         Network::Regtest,
         &payouts,
@@ -640,52 +622,27 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
         EXTRANONCE_SLOT_LEN,
     )
     .expect("build_mining_job_from_tdp");
-
-    // The engine and the job must agree on the identity of the payout list,
-    // otherwise the block-found lookup would miss and silently fall back.
     assert_eq!(
         job.payouts_fingerprint(),
         &fingerprint,
         "engine-side and job-side fingerprints must be byte-identical"
     );
 
-    // ── A later build displaces the shared snapshot key ───────────
+    // ── A later build displaces any shared snapshot ──────────────
     let _jdc = engine
         .build_distribution(reward_sats - 997)
         .await
         .expect("jdc-style build");
 
-    // ── Mine + submit ────────────────────────────────────────────
-    let en1 = [0u8; 4];
-    let en2 = [0u8; 8];
-    let coinbase_txid = job.coinbase_txid_with_extranonce(&en1, &en2);
-    let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &template.merkle_path);
-    let target = Target::from_le_bytes(prev_hash.target);
-    let nonce = brute_force_nonce(
-        template.version,
-        &prev_hash.prev_hash,
-        &merkle_root,
-        prev_hash.header_timestamp,
-        prev_hash.n_bits,
-        &target,
+    let (height, witness_coinbase) = mine_and_submit(
+        &node,
+        &tdp,
+        &template,
+        &prev_hash,
+        &payouts,
+        "pplns-ledger-regtest",
     )
-    .expect("must find a regtest-target-matching nonce");
-
-    let witness_coinbase = job.witness_coinbase_with_extranonce(&en1, &en2);
-    let before_height = node.current_height().await.expect("current_height");
-    tdp.submit_solution(
-        template.template_id,
-        template.version,
-        prev_hash.header_timestamp,
-        nonce,
-        witness_coinbase.clone(),
-    )
-    .await
-    .expect("submit_solution");
-    let height = poll_for_height(&node, before_height + 1, Duration::from_secs(20))
-        .await
-        .expect("bitcoin-core must accept the block");
-    assert_eq!(height, before_height + 1);
+    .await;
 
     // ── Book it, using the fingerprint the job carried ───────────
     let prepared = engine
