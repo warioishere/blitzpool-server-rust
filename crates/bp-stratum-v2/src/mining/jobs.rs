@@ -62,6 +62,12 @@ pub use bp_jobs_lifecycle::JobClassification;
 pub struct ExtendedJob {
     pub coinbase_prefix: Vec<u8>,
     pub coinbase_suffix: Vec<u8>,
+    /// Identity of the payout list this job's coinbase pays — copied off
+    /// the `MiningJob` it was built from. Lets a block found on this job
+    /// look up the exact distribution the pool must book, instead of the
+    /// shared snapshot key whichever later build overwrote. Zeroed for
+    /// jobs the pool did not build the coinbase for (`SetCustomMiningJob`).
+    pub payouts_fingerprint: [u8; 32],
     pub merkle_path: Vec<[u8; 32]>,
     pub version: u32,
     pub prev_hash: [u8; 32],
@@ -208,6 +214,12 @@ pub struct StandardJobEntry {
     /// witness-form by [`bp_stratum_v2::mining::submit::assemble_witness_coinbase`]
     /// at submit time. Empty for `SetCustomMiningJob`-derived jobs.
     pub coinbase_stratum: Vec<u8>,
+    /// Identity of the payout list this job's coinbase pays — copied off
+    /// the `MiningJob` it was built from. Lets a block found on this job
+    /// look up the exact distribution the pool must book, instead of the
+    /// shared snapshot key whichever later build overwrote. Zeroed for
+    /// jobs the pool did not build the coinbase for (`SetCustomMiningJob`).
+    pub payouts_fingerprint: [u8; 32],
     /// TDP template id the job was built against. `None` for
     /// `SetCustomMiningJob`-derived jobs (no pool template).
     pub template_id: Option<u64>,
@@ -288,6 +300,7 @@ impl StandardJobMaps {
         merkle_root: [u8; 32],
         template_snapshot: StandardTemplateSnapshot,
         coinbase_stratum: Vec<u8>,
+        payouts_fingerprint: [u8; 32],
         template_id: Option<u64>,
         now_ms: u64,
     ) {
@@ -298,6 +311,7 @@ impl StandardJobMaps {
                 merkle_root,
                 template_snapshot,
                 coinbase_stratum,
+                payouts_fingerprint,
                 template_id,
                 created_at_ms: now_ms,
                 retired_at_ms: None,
@@ -323,6 +337,7 @@ impl StandardJobMaps {
             merkle_root,
             template_snapshot,
             Vec::new(),
+            [0u8; 32],
             None,
             now_ms,
         );
@@ -425,6 +440,7 @@ mod tests {
 
     fn ej(now_ms: u64) -> ExtendedJob {
         ExtendedJob {
+            payouts_fingerprint: [0u8; 32],
             coinbase_prefix: vec![0; 8],
             coinbase_suffix: vec![0; 8],
             merkle_path: vec![[0u8; 32]],

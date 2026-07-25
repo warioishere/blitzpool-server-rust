@@ -176,6 +176,7 @@ async fn run_block_submit_case(miner_extranonce_size: u8) {
     let tx_suffix = mining_job.coinbase_suffix().to_vec();
 
     let ext_job = ExtendedJob {
+        payouts_fingerprint: [0u8; 32],
         coinbase_prefix: tx_prefix.clone(),
         coinbase_suffix: tx_suffix.clone(),
         merkle_path: template.merkle_path.clone(),

@@ -170,6 +170,11 @@ pub struct ShareAccept {
     /// channels until [`StandardJobContext`] threads the template id
     /// through (Standard block-submit path).
     pub template_id: Option<u64>,
+    /// Identity of the payout list the job's coinbase pays. The block sink
+    /// hands it to the PPLNS engine so the ledger books the distribution
+    /// this block actually paid, not whatever the shared snapshot key holds
+    /// by then. Zeroed when the pool did not build the coinbase.
+    pub payouts_fingerprint: [u8; 32],
     /// Fully-assembled **witness-form** coinbase transaction bytes
     /// (BIP-141 layout: marker `0x00` + flag `0x01` inserted after
     /// version, 32-zero coinbase witness reserved value inserted
@@ -300,6 +305,12 @@ pub struct StandardJobContext<'a> {
     /// via `SetCustomMiningJob` (no pool template) — block-submit
     /// then falls through to a WARN at the bin block-sink.
     pub coinbase_stratum: &'a [u8],
+    /// Identity of the payout list this job's coinbase pays — copied off
+    /// the `MiningJob` it was built from. Lets a block found on this job
+    /// look up the exact distribution the pool must book, instead of the
+    /// shared snapshot key whichever later build overwrote. Zeroed for
+    /// jobs the pool did not build the coinbase for (`SetCustomMiningJob`).
+    pub payouts_fingerprint: [u8; 32],
     /// Block-reward portion the coinbase claims (per-job pinned
     /// `coinbase_tx_value_remaining`). Threaded onto [`ShareAccept`].
     pub coinbase_tx_value_remaining: u64,
@@ -414,6 +425,7 @@ pub fn validate_submit_standard(
         hash: pow.submission_hash,
         is_block_candidate,
         template_id: job_ctx.template_id,
+        payouts_fingerprint: job_ctx.payouts_fingerprint,
         witness_coinbase,
         // Standard-channel shares never carry a per-share Worker-ID
         // TLV — channel-default attribution only.
@@ -698,6 +710,7 @@ pub fn validate_submit_extended(
         hash: pow.submission_hash,
         is_block_candidate,
         template_id: ext_job.template_id,
+        payouts_fingerprint: ext_job.payouts_fingerprint,
         witness_coinbase,
         effective_worker_name,
         coinbase_tx_value_remaining: ext_job.coinbase_tx_value_remaining,
@@ -771,6 +784,7 @@ mod tests {
 
     fn ext_job(prev: [u8; 32], n_bits: u32) -> ExtendedJob {
         ExtendedJob {
+            payouts_fingerprint: [0u8; 32],
             coinbase_prefix: vec![0xAA; 8],
             coinbase_suffix: vec![0xBB; 8],
             merkle_path: vec![[0u8; 32]],
@@ -792,6 +806,7 @@ mod tests {
 
     fn std_ctx(class: JobClassification) -> StandardJobContext<'static> {
         StandardJobContext {
+            payouts_fingerprint: [0u8; 32],
             template_version: 0x2000_0000,
             prev_hash: [0xCC; 32],
             n_bits: 0x1d00_ffff,

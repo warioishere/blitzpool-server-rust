@@ -1741,6 +1741,7 @@ mod tests {
 
     fn accept() -> ShareAccept {
         ShareAccept {
+            payouts_fingerprint: [0u8; 32],
             classification: JobClassification::Active,
             effective_difficulty: Difficulty(1024.0),
             submission_difficulty: Difficulty(2048.0),

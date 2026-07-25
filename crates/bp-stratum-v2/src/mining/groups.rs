@@ -388,6 +388,7 @@ mod tests {
 
     fn dummy_job() -> ExtendedJob {
         ExtendedJob {
+            payouts_fingerprint: [0u8; 32],
             coinbase_prefix: vec![0xAA],
             coinbase_suffix: vec![0xBB],
             merkle_path: vec![],

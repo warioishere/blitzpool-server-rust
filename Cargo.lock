@@ -822,6 +822,7 @@ dependencies = [
  "bp-test-support",
  "hex",
  "proptest",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
 ]

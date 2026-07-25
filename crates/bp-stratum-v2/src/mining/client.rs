@@ -1250,6 +1250,7 @@ pub fn handle_submit_shares_standard<C: Clock>(
         n_bits: entry.template_snapshot.n_bits,
         network_difficulty: entry.template_snapshot.network_difficulty,
         classification,
+        payouts_fingerprint: entry.payouts_fingerprint,
         template_id: entry.template_id,
         coinbase_stratum: &entry.coinbase_stratum,
         coinbase_tx_value_remaining: entry.template_snapshot.coinbase_tx_value_remaining,
@@ -1920,6 +1921,7 @@ pub fn apply_template_broadcast<C: Clock>(
                     merkle_root,
                     template_snapshot,
                     coinbase_stratum,
+                    *mining_job.payouts_fingerprint(),
                     Some(template.template_id),
                     now_ms,
                 );
@@ -1998,6 +2000,7 @@ pub fn apply_template_broadcast<C: Clock>(
                 let ext_job = ExtendedJob {
                     coinbase_prefix: tx_prefix.clone(),
                     coinbase_suffix: tx_suffix.clone(),
+                    payouts_fingerprint: *mining_job.payouts_fingerprint(),
                     merkle_path: merkle_path.clone(),
                     version: template.version,
                     prev_hash: template.prev_hash,
@@ -2060,6 +2063,7 @@ pub fn apply_template_broadcast<C: Clock>(
         let tmpl = ExtendedJob {
             coinbase_prefix: tx_prefix.clone(),
             coinbase_suffix: tx_suffix.clone(),
+            payouts_fingerprint: *mining_job.payouts_fingerprint(),
             merkle_path: merkle_path.clone(),
             version: template.version,
             prev_hash: template.prev_hash,
@@ -2466,6 +2470,9 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         ExtendedJob {
             coinbase_prefix: coinbase_tx_prefix,
             coinbase_suffix: coinbase_tx_suffix,
+            // JDC-declared coinbase — the pool built no distribution for it,
+            // so there is no snapshot to bind and nothing to look up.
+            payouts_fingerprint: [0u8; 32],
             merkle_path: input.merkle_path.clone(),
             version: input.version,
             prev_hash: input.prev_hash,
@@ -3372,6 +3379,7 @@ mod tests {
         let channel_id = s.primary_channel.unwrap();
         let easy = Difficulty(1.0 / 4_294_967_296.0);
         let job = ExtendedJob {
+            payouts_fingerprint: [0u8; 32],
             coinbase_prefix: vec![0xAA; 8],
             coinbase_suffix: vec![0xBB; 8],
             merkle_path: vec![[0u8; 32]],
@@ -4733,6 +4741,7 @@ mod tests {
             ch.extended_jobs.insert(
                 99,
                 ExtendedJob {
+                    payouts_fingerprint: [0u8; 32],
                     coinbase_prefix: vec![],
                     coinbase_suffix: vec![],
                     merkle_path: vec![],
