@@ -245,6 +245,107 @@ async fn on_block_found_applies_distribution_from_snapshot() {
     drop_harness(h).await;
 }
 
+// ── A later build must not cost the found block its distribution ───
+//
+// The bug this guards: the pool builds the job a block is later mined on,
+// then some other build — an ext-0x0003 payout request from a JD client with
+// its own payout value, or just a template refresh — overwrites the shared
+// `pplns:snapshot` key. `prepare_block_found` then reads a snapshot whose
+// reward disagrees with the coinbase, refuses, deletes it, and the block's
+// PPLNS distribution is never applied (WARN only, manual reprocessing).
+//
+// Looked up under the job's payout fingerprint it still resolves, because
+// nothing else writes that key.
+
+#[tokio::test]
+async fn later_build_does_not_cost_the_found_block_its_distribution() {
+    let _guard = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(1, "test_engine_fp_").await {
+        Some(h) => h,
+        None => return,
+    };
+    // Valid addresses — anything else is filtered out before the
+    // distribution math and would leave an empty payout list.
+    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    h.engine
+        .record_share(None, ADDR_A, 70.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, ADDR_B, 30.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+
+    // The build the block's coinbase is made from.
+    const MINED_REWARD: u64 = 312_500_000;
+    let mined = h
+        .engine
+        .build_distribution(MINED_REWARD)
+        .await
+        .expect("mined build ok");
+    assert!(
+        !mined.payouts.is_empty(),
+        "scenario needs a real distribution"
+    );
+    let fingerprint = mined.payouts_fingerprint;
+
+    // A JD client asks for its own payout value — this is what displaces the
+    // shared key today.
+    let jdc = h
+        .engine
+        .build_distribution(MINED_REWARD - 863)
+        .await
+        .expect("jdc build ok");
+    assert_ne!(
+        fingerprint, jdc.payouts_fingerprint,
+        "the two builds must be distinguishable"
+    );
+
+    let block_height = 9_997_101;
+
+    // Without the fingerprint: the shared key now holds the JDC's build, so
+    // the reward check refuses. This is the live failure.
+    let blind = h
+        .engine
+        .prepare_block_found(block_height, MINED_REWARD)
+        .await;
+    assert!(
+        blind.is_err(),
+        "the shared key holds the later build — preparing blind must refuse \
+         rather than book the wrong distribution"
+    );
+
+    // With it: the block's own distribution is still there.
+    let prepared = h
+        .engine
+        .prepare_block_found_for(block_height, MINED_REWARD, Some(fingerprint))
+        .await
+        .expect("the job's own distribution must still resolve");
+    let outcome = h.engine.apply_prepared(&prepared).await.expect("apply ok");
+    assert!(outcome.history_inserted >= 1, "audit rows written");
+
+    let count: (i64,) =
+        sqlx::query_as(r#"SELECT count(*) FROM pplns_payout_history WHERE "blockHeight" = $1"#)
+            .bind(block_height)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(count.0 >= 1, "audit row present in PG");
+
+    let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
+        .bind(block_height)
+        .execute(&h.pool)
+        .await;
+    for addr in [ADDR_A, ADDR_B] {
+        let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
+            .bind(addr)
+            .execute(&h.pool)
+            .await;
+    }
+    drop_harness(h).await;
+}
+
 // ── Test 4 — reader.address_status combines window + balance ──────
 
 #[tokio::test]
