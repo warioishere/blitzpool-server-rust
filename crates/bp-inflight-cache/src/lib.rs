@@ -41,10 +41,24 @@ enum Slot<V, E> {
     Cached { value: Arc<V>, expires_at: Instant },
 }
 
+/// Slot map plus a monotonic generation counter.
+///
+/// Every invalidation bumps `generation`. A leader records the
+/// generation it started under, so when it finishes it can tell whether
+/// an invalidation landed mid-compute — in which case its result is
+/// already superseded and must not be cached. Without this, an
+/// invalidation that arrives while a compute is in flight is silently
+/// lost: the leader would install its pre-invalidation value for the
+/// full TTL.
+struct Inner<K, V, E> {
+    slots: HashMap<K, Slot<V, E>>,
+    generation: u64,
+}
+
 /// Generic per-key in-flight dedup + TTL cache. Cheap to clone (the
 /// inner state is `Arc<Mutex<…>>`).
 pub struct InflightResultCache<K, V, E> {
-    state: Arc<Mutex<HashMap<K, Slot<V, E>>>>,
+    state: Arc<Mutex<Inner<K, V, E>>>,
     ttl: Duration,
 }
 
@@ -68,7 +82,10 @@ where
 {
     pub fn new(ttl: Duration) -> Self {
         Self {
-            state: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(Inner {
+                slots: HashMap::new(),
+                generation: 0,
+            })),
             ttl,
         }
     }
@@ -87,9 +104,12 @@ where
     {
         // Critical section: probe the cache, install in-flight slot
         // if we're the leader, otherwise grab a follower receiver.
-        let receiver = {
+        // `generation_at_start` is the invalidation epoch the leader
+        // computes under (see `Inner`).
+        let (receiver, generation_at_start) = {
             let mut state = self.state.lock().expect("inflight mutex poisoned");
-            match state.get(&key) {
+            let generation_at_start = state.generation;
+            let receiver = match state.slots.get(&key) {
                 Some(Slot::Cached { value, expires_at }) if *expires_at > Instant::now() => {
                     return Ok(value.clone());
                 }
@@ -97,10 +117,11 @@ where
                 _ => {
                     // No entry OR expired entry — we're the leader.
                     let (tx, _) = broadcast::channel::<SharedResult<V, E>>(1);
-                    state.insert(key.clone(), Slot::InFlight(tx));
+                    state.slots.insert(key.clone(), Slot::InFlight(tx));
                     None
                 }
-            }
+            };
+            (receiver, generation_at_start)
         };
 
         if let Some(mut rx) = receiver {
@@ -129,29 +150,33 @@ where
             Err(e) => Err(Arc::new(e)),
         };
 
-        // Update state + broadcast.
+        // Update state + broadcast. Both happen under one lock so an
+        // invalidation can't slip between the remove and the re-insert.
         let prev = {
             let mut state = self.state.lock().expect("inflight mutex poisoned");
-            state.remove(&key)
+            let prev = state.slots.remove(&key);
+            // Cache only if no invalidation landed while we computed —
+            // otherwise this value is already superseded and installing
+            // it would resurrect pre-invalidation state for a full TTL.
+            if let Ok(value) = &shared {
+                if state.generation == generation_at_start {
+                    state.slots.insert(
+                        key,
+                        Slot::Cached {
+                            value: value.clone(),
+                            expires_at: Instant::now() + self.ttl,
+                        },
+                    );
+                }
+            }
+            prev
         };
         if let Some(Slot::InFlight(tx)) = prev {
             // Best-effort broadcast — if there are no followers it
-            // returns `Err(SendError)` which we ignore.
+            // returns `Err(SendError)` which we ignore. Followers still
+            // get this result even when it wasn't cached: it is the
+            // value they queued for, and the next caller recomputes.
             let _ = tx.send(shared.clone());
-        }
-        if shared.is_ok() {
-            let value = match &shared {
-                Ok(v) => v.clone(),
-                Err(_) => unreachable!(),
-            };
-            let mut state = self.state.lock().expect("inflight mutex poisoned");
-            state.insert(
-                key,
-                Slot::Cached {
-                    value,
-                    expires_at: Instant::now() + self.ttl,
-                },
-            );
         }
         shared
     }
@@ -160,20 +185,30 @@ where
     /// caller will run `compute` fresh. Used by the engine after
     /// state-mutating events that would change the distribution (e.g.
     /// a new share landed, network difficulty changed).
+    /// Also bumps the generation, so a compute already in flight for
+    /// this key does not install its now-superseded result.
     pub fn invalidate(&self, key: &K) {
         let mut state = self.state.lock().expect("inflight mutex poisoned");
-        state.remove(key);
+        state.slots.remove(key);
+        state.generation = state.generation.wrapping_add(1);
     }
 
     /// Drop all cached + in-flight entries. Useful at engine shutdown.
+    /// Like [`Self::invalidate`], in-flight computes started before this
+    /// call will not cache their results.
     pub fn clear(&self) {
         let mut state = self.state.lock().expect("inflight mutex poisoned");
-        state.clear();
+        state.slots.clear();
+        state.generation = state.generation.wrapping_add(1);
     }
 
     /// Snapshot of the current entry count (cached + in-flight).
     pub fn len(&self) -> usize {
-        self.state.lock().expect("inflight mutex poisoned").len()
+        self.state
+            .lock()
+            .expect("inflight mutex poisoned")
+            .slots
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -296,6 +331,100 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "retry runs compute again because failure isn't cached"
+        );
+    }
+
+    /// An invalidation that lands *while* a compute is in flight must
+    /// not be lost. The leader started from pre-invalidation state, so
+    /// caching its result would resurrect that state for a full TTL —
+    /// and every later caller would read it.
+    #[tokio::test]
+    async fn invalidate_during_inflight_is_not_resurrected() {
+        let cache: Arc<InflightResultCache<u64, u64, FakeError>> =
+            Arc::new(InflightResultCache::new(Duration::from_secs(60)));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let leader = {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_compute(1, || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        // Long enough for the invalidation below to land
+                        // mid-compute.
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        Ok(11u64)
+                    })
+                    .await
+            })
+        };
+
+        // Land the invalidation while the leader is still computing.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cache.invalidate(&1);
+
+        // The leader still returns its value to its own caller.
+        assert_eq!(*leader.await.unwrap().expect("leader ok"), 11);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // But it must not have been cached: the next caller recomputes.
+        let calls_clone = calls.clone();
+        let r = cache
+            .get_or_compute(1, || async move {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+                Ok(22u64)
+            })
+            .await
+            .expect("ok");
+        assert_eq!(
+            *r, 22,
+            "next caller must see fresh state, not the superseded value"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "invalidation during in-flight compute must force a recompute"
+        );
+    }
+
+    /// `clear()` carries the same guarantee as `invalidate()`.
+    #[tokio::test]
+    async fn clear_during_inflight_is_not_resurrected() {
+        let cache: Arc<InflightResultCache<u64, u64, FakeError>> =
+            Arc::new(InflightResultCache::new(Duration::from_secs(60)));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let leader = {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_compute(1, || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        Ok(11u64)
+                    })
+                    .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cache.clear();
+        let _ = leader.await.unwrap().expect("leader ok");
+
+        let calls_clone = calls.clone();
+        let _ = cache
+            .get_or_compute(1, || async move {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+                Ok(22u64)
+            })
+            .await
+            .expect("ok");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "clear during in-flight compute must force a recompute"
         );
     }
 
