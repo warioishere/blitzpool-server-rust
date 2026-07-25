@@ -111,11 +111,13 @@ pub struct DistributionResult {
     /// snapshot pins this so on-block-found can refuse to apply a
     /// stale snapshot whose reward disagrees with the actual coinbase.
     pub block_reward_sats: u64,
-    /// Identity of `payouts` — the key this build's snapshot is stored under.
+    /// Identity of `payouts` + the reward it was built over — the key this
+    /// build's snapshot is stored under.
     ///
     /// It is NOT threaded onward from here: the Stratum job build derives the
     /// same value independently from the `PayoutEntry` list it turns into the
-    /// coinbase (`MiningJobCache`), and that is what a found block carries.
+    /// coinbase and that list's template reward (`MiningJobCache`), and that
+    /// is what a found block carries.
     /// The two derivations agreeing is what makes the block-found lookup hit —
     /// `payouts_fingerprint` and `payouts_fingerprint_from_parts` share one
     /// encoding for exactly that reason, and the regtest
@@ -352,6 +354,7 @@ async fn build_from_inputs(
     // between. A block-found that cannot name a key gets no distribution
     // rather than a stranger's.
     let payouts_fingerprint = payouts_fingerprint_from_parts(
+        block_reward_sats,
         math.payouts
             .iter()
             .map(|p| (p.address.as_str(), p.sats.to_i64().max(0) as u64)),

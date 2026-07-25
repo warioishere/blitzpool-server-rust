@@ -196,8 +196,8 @@ pub fn sha256d_from_parts(parts: &[&[u8]]) -> [u8; 32] {
     Sha256::digest(first).into()
 }
 
-/// Identity of a coinbase payout list: `(address, sats)` pairs in coinbase
-/// order.
+/// Identity of a coinbase payout list: the block reward it was built against
+/// plus its `(address, sats)` pairs in coinbase order.
 ///
 /// This is the binding between a mined block and the payout accounting that
 /// must be booked for it — the distribution snapshot is stored under this
@@ -208,15 +208,22 @@ pub fn sha256d_from_parts(parts: &[&[u8]]) -> [u8; 32] {
 /// the `PayoutEntry` list it turns into the coinbase, and the two must agree
 /// byte-for-byte.
 ///
-/// Canonical, length-prefixed encoding so no two payout lists can alias: per
-/// entry, in list order, `sats` as 8 LE bytes, the address byte length as 4 LE
-/// bytes, then the address bytes. Order is part of the identity — coinbase
-/// output order is. Streamed into the hasher, so no allocation regardless of
-/// list length.
+/// Canonical, length-prefixed encoding so no two payout lists can alias:
+/// `block_reward_sats` as 8 LE bytes, then per entry, in list order, `sats` as
+/// 8 LE bytes, the address byte length as 4 LE bytes, then the address bytes.
+/// Order is part of the identity — coinbase output order is. Streamed into the
+/// hasher, so no allocation regardless of list length.
+///
+/// The reward is in the preimage because the list alone does not always imply
+/// it: a list that leaves sats unclaimed would be the same list at two
+/// different rewards, and the second build would take over the first one's
+/// snapshot key.
 pub fn payouts_fingerprint_from_parts<'a>(
+    block_reward_sats: u64,
     payouts: impl IntoIterator<Item = (&'a str, u64)>,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    hasher.update(block_reward_sats.to_le_bytes());
     for (address, sats) in payouts {
         hasher.update(sats.to_le_bytes());
         hasher.update((address.len() as u32).to_le_bytes());

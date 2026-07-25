@@ -50,9 +50,13 @@ impl PayoutEntry {
 
 /// Identity of the payout list a coinbase was built from — the
 /// [`PayoutEntry`] form of [`bp_share::payouts_fingerprint_from_parts`],
-/// where the encoding and the rationale live.
-pub fn payouts_fingerprint(payouts: &[PayoutEntry]) -> [u8; 32] {
-    bp_share::payouts_fingerprint_from_parts(payouts.iter().map(|p| (p.address.as_str(), p.sats)))
+/// where the encoding and the rationale live. `block_reward_sats` is the
+/// reward the list was distributed over (the template's coinbase value).
+pub fn payouts_fingerprint(block_reward_sats: u64, payouts: &[PayoutEntry]) -> [u8; 32] {
+    bp_share::payouts_fingerprint_from_parts(
+        block_reward_sats,
+        payouts.iter().map(|p| (p.address.as_str(), p.sats)),
+    )
 }
 
 /// The block-template fields needed for coinbase construction.
@@ -271,7 +275,7 @@ pub fn build_mining_job(
         coinbase_suffix,
         coinbase_prefix_hex,
         coinbase_suffix_hex,
-        payouts_fingerprint: payouts_fingerprint(payouts),
+        payouts_fingerprint: payouts_fingerprint(template.coinbase_value_sats, payouts),
     })
 }
 
@@ -361,7 +365,7 @@ pub fn build_mining_job_from_tdp(
         &payout_outputs,
         template,
         extranonce_slot_size,
-        payouts_fingerprint(payouts),
+        payouts_fingerprint(template.coinbase_tx_value_remaining, payouts),
     ))
 }
 
@@ -629,11 +633,33 @@ mod fingerprint_tests {
         }
     }
 
+    const REWARD: u64 = 100_000;
+
     #[test]
     fn same_payout_list_yields_same_fingerprint() {
         let a = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
         let b = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
-        assert_eq!(payouts_fingerprint(&a), payouts_fingerprint(&b));
+        assert_eq!(
+            payouts_fingerprint(REWARD, &a),
+            payouts_fingerprint(REWARD, &b)
+        );
+    }
+
+    /// Two builds at different rewards must never share a snapshot key,
+    /// however similar their payout lists. Reachable whenever a list does
+    /// not imply its reward — an empty one, or one leaving sats unclaimed.
+    #[test]
+    fn a_different_reward_changes_the_fingerprint() {
+        let payouts = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
+        assert_ne!(
+            payouts_fingerprint(REWARD, &payouts),
+            payouts_fingerprint(REWARD + 1, &payouts)
+        );
+        let empty: Vec<PayoutEntry> = Vec::new();
+        assert_ne!(
+            payouts_fingerprint(REWARD, &empty),
+            payouts_fingerprint(REWARD + 1, &empty)
+        );
     }
 
     /// Coinbase output order is part of what was mined, so it is part of the
@@ -643,7 +669,10 @@ mod fingerprint_tests {
     fn order_changes_the_fingerprint() {
         let a = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
         let b = vec![entry("bc1qbob", 40_000), entry("bc1qalice", 60_000)];
-        assert_ne!(payouts_fingerprint(&a), payouts_fingerprint(&b));
+        assert_ne!(
+            payouts_fingerprint(REWARD, &a),
+            payouts_fingerprint(REWARD, &b)
+        );
     }
 
     /// A single satoshi of drift is a different distribution — this is the
@@ -652,7 +681,10 @@ mod fingerprint_tests {
     fn one_sat_difference_changes_the_fingerprint() {
         let a = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
         let b = vec![entry("bc1qalice", 60_001), entry("bc1qbob", 39_999)];
-        assert_ne!(payouts_fingerprint(&a), payouts_fingerprint(&b));
+        assert_ne!(
+            payouts_fingerprint(REWARD, &a),
+            payouts_fingerprint(REWARD, &b)
+        );
     }
 
     /// The length prefix is what stops two adjacent addresses from aliasing
@@ -661,16 +693,22 @@ mod fingerprint_tests {
     fn address_boundaries_cannot_alias() {
         let a = vec![entry("ab", 1), entry("c", 1)];
         let b = vec![entry("a", 1), entry("bc", 1)];
-        assert_ne!(payouts_fingerprint(&a), payouts_fingerprint(&b));
+        assert_ne!(
+            payouts_fingerprint(REWARD, &a),
+            payouts_fingerprint(REWARD, &b)
+        );
     }
 
     #[test]
     fn empty_list_is_stable_and_distinct_from_a_zero_payout() {
         let empty: Vec<PayoutEntry> = Vec::new();
-        assert_eq!(payouts_fingerprint(&empty), payouts_fingerprint(&[]));
+        assert_eq!(
+            payouts_fingerprint(REWARD, &empty),
+            payouts_fingerprint(REWARD, &[])
+        );
         assert_ne!(
-            payouts_fingerprint(&empty),
-            payouts_fingerprint(&[entry("", 0)])
+            payouts_fingerprint(REWARD, &empty),
+            payouts_fingerprint(REWARD, &[entry("", 0)])
         );
     }
 
@@ -680,9 +718,10 @@ mod fingerprint_tests {
     fn parts_entry_point_matches_the_slice_entry_point() {
         let payouts = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
         let from_parts = bp_share::payouts_fingerprint_from_parts(
+            REWARD,
             payouts.iter().map(|p| (p.address.as_str(), p.sats)),
         );
-        assert_eq!(payouts_fingerprint(&payouts), from_parts);
+        assert_eq!(payouts_fingerprint(REWARD, &payouts), from_parts);
     }
 }
 

@@ -529,7 +529,7 @@ impl MiningJobCache {
                     extranonce_slot_size,
                     // Only on a cache miss — a job hit never reaches this
                     // closure, so the hash runs once per distinct job.
-                    crate::coinbase::payouts_fingerprint(payouts),
+                    crate::coinbase::payouts_fingerprint(reward, payouts),
                 )))
             },
         )?;
