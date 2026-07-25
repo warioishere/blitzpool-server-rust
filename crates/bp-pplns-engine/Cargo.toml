@@ -23,11 +23,10 @@ bp-coinbase-snapshot = { workspace = true }
 # view via per-protocol adapters; we implement the shared trait once.
 bp-share-hook = { workspace = true }
 bp-inflight-cache = { workspace = true }
-# `payouts_fingerprint` — the identity that binds a stored distribution
-# snapshot to the coinbase payout list it was built for. Defined next to
-# `PayoutEntry` so the snapshot write side and the Stratum job build sides
-# derive the exact same bytes.
-bp-mining-job = { workspace = true }
+# `payouts_fingerprint_from_parts` — the identity binding a stored snapshot
+# to the coinbase payout list it was built for. Lives in the hashing leaf so
+# the accounting side does not depend on job assembly.
+bp-share = { workspace = true }
 bp-cron-utils = { workspace = true }
 
 # Async runtime

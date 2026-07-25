@@ -5,7 +5,6 @@
 
 use bitcoin::Network;
 use bp_share::sha256d_from_parts;
-use sha2::{Digest, Sha256};
 
 use crate::address;
 
@@ -49,43 +48,11 @@ impl PayoutEntry {
     }
 }
 
-/// Identity of the exact payout list a coinbase was built from.
-///
-/// This is the binding between a mined block and the payout accounting that
-/// must be booked for it. The PPLNS distribution snapshot is stored under
-/// this fingerprint, and the block-found path recovers it from the job the
-/// winning share was built on — so the ledger always replays the
-/// distribution that is actually in the block's coinbase.
-///
-/// Without it the snapshot lives under one shared key that every later
-/// distribution build overwrites, including the ext-0x0003 payout requests
-/// Job-Declaration clients make with their own payout value.
-///
-/// Canonical, length-prefixed encoding so no two payout lists can alias:
-/// per entry, in list order, `sats` as 8 LE bytes, the address byte length
-/// as 4 LE bytes, then the address bytes. Order is part of the identity —
-/// coinbase output order is.
+/// Identity of the payout list a coinbase was built from — the
+/// [`PayoutEntry`] form of [`bp_share::payouts_fingerprint_from_parts`],
+/// where the encoding and the rationale live.
 pub fn payouts_fingerprint(payouts: &[PayoutEntry]) -> [u8; 32] {
-    payouts_fingerprint_from_parts(payouts.iter().map(|p| (p.address.as_str(), p.sats)))
-}
-
-/// [`payouts_fingerprint`] for callers holding the (address, sats) pairs in
-/// another shape — the PPLNS distributor's entries become [`PayoutEntry`]
-/// only further downstream, but both sides must agree byte-for-byte, so
-/// they share this one encoding.
-pub fn payouts_fingerprint_from_parts<'a>(
-    payouts: impl IntoIterator<Item = (&'a str, u64)>,
-) -> [u8; 32] {
-    // Streamed straight into the hasher — no joined buffer, so this stays
-    // allocation-free however many payouts a distribution has.
-    let mut hasher = Sha256::new();
-    for (address, sats) in payouts {
-        hasher.update(sats.to_le_bytes());
-        hasher.update((address.len() as u32).to_le_bytes());
-        hasher.update(address.as_bytes());
-    }
-    let first = hasher.finalize();
-    Sha256::digest(first).into()
+    bp_share::payouts_fingerprint_from_parts(payouts.iter().map(|p| (p.address.as_str(), p.sats)))
 }
 
 /// The block-template fields needed for coinbase construction.
@@ -712,8 +679,9 @@ mod fingerprint_tests {
     #[test]
     fn parts_entry_point_matches_the_slice_entry_point() {
         let payouts = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
-        let from_parts =
-            payouts_fingerprint_from_parts(payouts.iter().map(|p| (p.address.as_str(), p.sats)));
+        let from_parts = bp_share::payouts_fingerprint_from_parts(
+            payouts.iter().map(|p| (p.address.as_str(), p.sats)),
+        );
         assert_eq!(payouts_fingerprint(&payouts), from_parts);
     }
 }

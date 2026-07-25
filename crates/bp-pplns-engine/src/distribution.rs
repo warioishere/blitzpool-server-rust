@@ -33,11 +33,11 @@ use std::time::Duration;
 
 use bp_common::{AddressId, Sats};
 use bp_db::{find_pplns_balances_with_open_balance, DbError, PplnsBalanceRow};
-use bp_mining_job::payouts_fingerprint_from_parts;
 use bp_pplns::{
     build_coinbase_distribution, is_valid_payout_address, CoinbaseDistributionEntry,
     CoinbaseDistributionInput,
 };
+use bp_share::payouts_fingerprint_from_parts;
 use sqlx::PgPool;
 use thiserror::Error;
 use tracing::warn;
@@ -122,7 +122,7 @@ pub struct DistributionResult {
     /// `ledger_books_exactly_what_the_accepted_coinbase_paid` pins it.
     ///
     /// Exposed so callers (and tests) can name the key this distribution
-    /// landed under. See [`bp_mining_job::payouts_fingerprint`].
+    /// landed under. See [`bp_share::payouts_fingerprint_from_parts`].
     pub payouts_fingerprint: [u8; 32],
 }
 
