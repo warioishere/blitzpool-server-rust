@@ -330,11 +330,15 @@ async fn build_from_inputs(
     }
 
     // 5. Persist snapshot so on-block-found can replay deterministically.
-    let snapshot = StoredSnapshot::from_math(
+    // Records the ledger state this distribution was computed against, so the
+    // apply can write a delta instead of an absolute — see
+    // `StoredSnapshot::balance_before`.
+    let snapshot = StoredSnapshot::from_math_with_before(
         &math.payouts,
         block_reward_sats,
         &math.considered_addresses,
         &math.balance_after,
+        &inputs.balances,
     );
     // Keyed by the payout list it distributes — the only snapshot written.
     // Nothing else writes this key, so it still holds THIS distribution when

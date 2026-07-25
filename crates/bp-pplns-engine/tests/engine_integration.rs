@@ -892,91 +892,100 @@ async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() 
     drop_harness(h).await;
 }
 
-// ── Applying a block invalidates snapshots built before it ──────────
+// ── A block frozen before another was applied still books correctly ──
 //
-// `balance_after` is an ABSOLUTE ledger state, valid only against the ledger
-// it was computed from. Two blocks can be in flight inside the confirmation
-// window: applying the earlier one moves the ledger, so the later one's
-// snapshot — frozen when its job was built, necessarily before that apply —
-// would write absolutes that undo the pay-down the earlier coinbase just
-// made. It must fail loudly instead.
+// Two blocks can be in flight inside the confirmation window. The later one's
+// snapshot was written when its job was built — necessarily before the
+// earlier one was applied. Booking it must not undo the pay-down the earlier
+// coinbase just made: the snapshot's balances are applied as a DELTA against
+// the ledger as it stands at prepare time, not as the absolute it computed
+// against a ledger that has since moved.
 
 #[tokio::test]
-async fn applying_a_block_invalidates_snapshots_built_before_it() {
+async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
     let _guard = balance_table_lock().lock().await;
     let h = match spawn_or_skip(5, "test_engine_stale_").await {
         Some(h) => h,
         None => return,
     };
-    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
-    for a in [ADDR_A, ADDR_B] {
-        let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
-            .bind(a)
-            .execute(&h.pool)
-            .await;
-    }
+    // A dominant miner soaks the reward; the tiny one's share stays under
+    // min_payout, so it ACCRUES a pending credit each block. That accrual is
+    // what distinguishes a delta from an absolute: two blocks must leave it
+    // with two blocks' worth, not one.
+    const BIG: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+    const TINY: &str = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
+    const REWARD_FIRST: u64 = 3_000_000_000;
+    const REWARD_SECOND: u64 = 2_999_999_137;
+    let h1: i32 = 9_997_401;
+    let h2: i32 = 9_997_402;
+    cleanup_addr(&h.pool, BIG, &[h1, h2]).await;
+    cleanup_addr(&h.pool, TINY, &[h1, h2]).await;
+
     h.engine
-        .record_share(None, ADDR_A, 60.0, 1_700_000_000_001)
+        .record_share(None, BIG, 1_000_000.0, 1_700_000_000_001)
         .await
         .unwrap();
     h.engine
-        .record_share(None, ADDR_B, 40.0, 1_700_000_000_002)
+        .record_share(None, TINY, 1.0, 1_700_000_000_002)
         .await
         .unwrap();
 
-    // Two blocks in flight, both frozen against the same ledger.
-    let dist_first = h.engine.build_distribution(312_500_000).await.expect("ok");
-    let dist_second = h.engine.build_distribution(312_499_137).await.expect("ok");
+    // Two blocks in flight, BOTH frozen against the same (empty) ledger.
+    let dist_first = h.engine.build_distribution(REWARD_FIRST).await.expect("ok");
+    let dist_second = h
+        .engine
+        .build_distribution(REWARD_SECOND)
+        .await
+        .expect("ok");
     let fp_second = dist_second.payouts_fingerprint;
     assert_ne!(dist_first.payouts_fingerprint, fp_second);
 
-    let height_first = 9_997_401;
     let prepared_first = h
         .engine
-        .prepare_block_found_for(
-            height_first,
-            312_500_000,
-            Some(dist_first.payouts_fingerprint),
-        )
+        .prepare_block_found_for(h1, REWARD_FIRST, Some(dist_first.payouts_fingerprint))
         .await
         .expect("prepare first");
     h.engine
         .apply_prepared(&prepared_first)
         .await
         .expect("apply first");
+    let (accrued_once, _) = miner_balance_and_paid(&h.pool, TINY).await;
+    assert!(
+        accrued_once > 0,
+        "the tiny miner must accrue a sub-threshold credit from the first block"
+    );
 
-    // The second block's snapshot was computed against the pre-apply ledger.
+    // The second block's snapshot was computed against the PRE-apply ledger
+    // and must survive — the delta is what makes it safe to book.
     assert!(
         h.engine
             .window()
             .read_snapshot_for(&fp_second)
             .await
             .expect("read ok")
-            .is_none(),
-        "the apply must invalidate snapshots built against the ledger it moved"
+            .is_some(),
+        "only the applied block's own snapshot is consumed"
     );
-    let second = h
+    let prepared_second = h
         .engine
-        .prepare_block_found_for(9_997_402, 312_499_137, Some(fp_second))
-        .await;
+        .prepare_block_found_for(h2, REWARD_SECOND, Some(fp_second))
+        .await
+        .expect("a block frozen before the apply must still be bookable");
+    h.engine
+        .apply_prepared(&prepared_second)
+        .await
+        .expect("apply second");
+
+    // Writing the snapshot's ABSOLUTE would leave the credit at one block's
+    // worth — the second block's accrual silently lost.
+    let (accrued_twice, _) = miner_balance_and_paid(&h.pool, TINY).await;
     assert!(
-        second.is_err(),
-        "a block frozen before the apply must refuse, not write absolute \
-         balances that undo the applied block's pay-down"
+        accrued_twice > accrued_once,
+        "the second block's accrual must ADD to the first, not overwrite it \
+         (after first={accrued_once}, after second={accrued_twice})"
     );
 
-    for height in [height_first, 9_997_402] {
-        let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
-            .bind(height)
-            .execute(&h.pool)
-            .await;
-    }
-    for a in [ADDR_A, ADDR_B] {
-        let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
-            .bind(a)
-            .execute(&h.pool)
-            .await;
-    }
+    cleanup_addr(&h.pool, BIG, &[h1, h2]).await;
+    cleanup_addr(&h.pool, TINY, &[h1, h2]).await;
     drop_harness(h).await;
 }

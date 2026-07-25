@@ -43,7 +43,7 @@ use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::config::{ConfigError, PplnsEngineConfig};
 use crate::distribution::{
@@ -536,26 +536,21 @@ impl PplnsEngine {
         )
         .await?;
 
-        // Applying moved the ledger, so EVERY snapshot built against the old
-        // one is now stale — their `balance_after` is an absolute state that
-        // would undo the pay-down this block's coinbase just made. Dropping
-        // them is the persisted counterpart of the distribution-cache
-        // invalidation below, and it is what reclaims the keyspace. A later
-        // block whose snapshot is gone fails loudly, which is what the
-        // pre-fingerprint code did; booking it from a stale absolute would be
-        // silent and wrong.
-        match self.inner.window.delete_all_fingerprinted_snapshots().await {
-            Ok(n) => debug!(
-                dropped = n,
-                block_height = prepared.block_height,
-                "dropped fingerprinted PPLNS snapshots invalidated by the apply"
-            ),
-            Err(e) => warn!(
-                error = %e,
-                block_height = prepared.block_height,
-                "failed to drop fingerprinted PPLNS snapshots after apply_prepared \
-                 — non-fatal, they TTL out"
-            ),
+        // Consume only this block's snapshot. Others stay usable: their
+        // balances are applied as a DELTA against the ledger at prepare time,
+        // so a block frozen before this apply still books correctly against
+        // the ledger this apply produced. Keeping the snapshot would let a
+        // redelivered event for THIS block re-prepare, which is why its own
+        // key goes. The rest are bounded by the snapshot TTL.
+        if let Some(fp) = prepared.payouts_fingerprint {
+            if let Err(e) = self.inner.window.delete_snapshot_for(&fp).await {
+                warn!(
+                    error = %e,
+                    block_height = prepared.block_height,
+                    "failed to delete the applied block's PPLNS snapshot \
+                     — non-fatal, it TTLs out"
+                );
+            }
         }
         self.inner.distribution_builder.invalidate_all();
 
@@ -626,19 +621,8 @@ impl PplnsEngine {
             audit_rows.push(coinbase_row(entry));
             emitted.insert(entry.address.as_str().to_string());
 
-            // New absolute balance: from the snapshot's balance_after,
-            // falling back to the address's current balance (the snapshot
-            // can omit addresses whose balance is unchanged).
-            let new_balance = snapshot
-                .balance_after
-                .get(entry.address.as_str())
-                .copied()
-                .or_else(|| {
-                    existing
-                        .get(entry.address.as_str())
-                        .map(|r| r.balance_sats.0)
-                })
-                .unwrap_or(0);
+            let new_balance =
+                Self::resolve_new_balance(snapshot, &existing, entry.address.as_str());
             let prev_total_paid = existing
                 .get(entry.address.as_str())
                 .map(|r| r.total_paid_sats.0)
@@ -652,7 +636,7 @@ impl PplnsEngine {
 
         // 2. Pending rows for addresses in balance_after that DIDN'T get
         //    an on-chain output (sub-dust credit accruals + matching debits).
-        for (addr_str, new_balance) in &snapshot.balance_after {
+        for addr_str in snapshot.balance_after.keys() {
             if emitted.contains(addr_str) {
                 continue;
             }
@@ -661,7 +645,8 @@ impl PplnsEngine {
                 .get(addr_str)
                 .map(|r| r.balance_sats.0)
                 .unwrap_or(0);
-            let delta = new_balance - prev_balance;
+            let resolved = Self::resolve_new_balance(snapshot, &existing, addr_str);
+            let delta = resolved - prev_balance;
             audit_rows.push(pending_row(addr_id.clone(), Sats(delta)));
             emitted.insert(addr_str.clone());
 
@@ -671,7 +656,7 @@ impl PplnsEngine {
                 .unwrap_or(0);
             balance_writes.push(BalanceWrite {
                 address: addr_id,
-                balance_sats: Sats(*new_balance),
+                balance_sats: Sats(resolved),
                 // No on-chain delta for pending rows.
                 total_paid_sats: Sats(prev_total_paid),
             });
@@ -696,6 +681,33 @@ impl PplnsEngine {
         }
 
         Ok((audit_rows, balance_writes))
+    }
+
+    /// The balance to write for `address`.
+    ///
+    /// When the snapshot recorded the ledger state it was computed against,
+    /// this applies the DELTA the distribution intends to the CURRENT ledger.
+    /// That is what lets a block be booked correctly after another one moved
+    /// the ledger: writing the snapshot's absolute would silently undo the
+    /// other block's pay-down (the hazard the flush-before-prepare in the
+    /// block sink exists to work around).
+    ///
+    /// Falls back to the absolute for snapshots written before
+    /// `balance_before` existed — same behaviour as before, no worse.
+    fn resolve_new_balance(
+        snapshot: &ParsedSnapshot,
+        existing: &HashMap<String, PplnsBalanceRow>,
+        address: &str,
+    ) -> i64 {
+        let current = existing.get(address).map(|r| r.balance_sats.0).unwrap_or(0);
+        let Some(after) = snapshot.balance_after.get(address).copied() else {
+            // Not in balance_after → this distribution does not change it.
+            return current;
+        };
+        match snapshot.balance_before.get(address).copied() {
+            Some(before) => current + (after - before),
+            None => after,
+        }
     }
 
     /// Run one manual dust-sweep tick. Exposes the sweep runner for
@@ -810,6 +822,7 @@ mod tests {
 
         // Snapshot built before this miner submitted their first share.
         let snapshot = ParsedSnapshot {
+            balance_before: HashMap::new(),
             distribution: vec![],
             block_reward_sats: 312_500_000,
             considered_addresses: HashSet::new(), // nobody was in the snapshot
@@ -857,6 +870,7 @@ mod tests {
         considered.insert(addr.clone());
 
         let snapshot = ParsedSnapshot {
+            balance_before: HashMap::new(),
             distribution: vec![],
             block_reward_sats: 312_500_000,
             considered_addresses: considered,

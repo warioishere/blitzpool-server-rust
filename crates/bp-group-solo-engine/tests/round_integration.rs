@@ -347,6 +347,7 @@ async fn snapshot_roundtrip_per_group_and_finder() {
     let group = "g_snap1";
     let finder = "bc1qfinder";
     let snap = snapshot::StoredSnapshot {
+        balance_before: Vec::new(),
         distribution: vec![CoinbaseDistributionEntry {
             address: AddressId::new("bc1qminer").unwrap(),
             percent: 100.0,
@@ -386,6 +387,7 @@ async fn delete_all_snapshots_for_group_scans_and_deletes() {
     };
     let group = "g_snap_del";
     let snap = snapshot::StoredSnapshot {
+        balance_before: Vec::new(),
         distribution: vec![],
         block_reward_sats: 100,
         considered_addresses: vec![],

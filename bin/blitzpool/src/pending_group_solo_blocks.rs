@@ -91,6 +91,7 @@ mod tests {
             block_height: 840_000,
             block_reward_sats: 312_500_000,
             snapshot: StoredSnapshot {
+                balance_before: Vec::new(),
                 distribution: vec![CoinbaseDistributionEntry {
                     address: bp_common::AddressId::new("bcrt1qfinder".to_string()).unwrap(),
                     percent: 100.0,

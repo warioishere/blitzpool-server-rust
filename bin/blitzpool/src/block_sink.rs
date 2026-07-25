@@ -1317,6 +1317,7 @@ mod tests {
             group_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
             height: 870_123,
             groupsolo_snapshot: Some(StoredSnapshot {
+                balance_before: Vec::new(),
                 distribution: vec![bp_pplns::CoinbaseDistributionEntry {
                     address: AddressId::new(
                         "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
