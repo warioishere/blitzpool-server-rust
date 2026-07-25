@@ -117,9 +117,10 @@ impl BudgetTelemetry {
 struct MinerComputation {
     address: AddressId,
     shares: f64,
-    /// Kept for algorithm documentation — `target` is what's actually
-    /// consulted downstream.
-    #[allow(dead_code)]
+    /// This block's fair share alone, before the signed ledger balance is
+    /// folded in. `target` is what most phases consult; `raw_fair` is the
+    /// portion the Phase-5a trim redistribution may hand to other miners,
+    /// since anything above it is a past-block claim.
     raw_fair: i64,
     balance_old: i64,
     target: i64,
@@ -291,11 +292,20 @@ pub fn build_coinbase_distribution(
     // ── Phase 5a: redistribute trimmed amount to kept active miners ──
     // Only the "this-block" portion of trimmed targets gets redistributed
     // (pending-only trimmed miners have past-block claims, not redistributable).
+    //
+    // That portion is `raw_fair`, NOT `target`: `target = raw_fair +
+    // balance_old`, and `balance_old` is a past-block claim that the
+    // trimmed miner also keeps as carry-forward (`balance_new = target`).
+    // Redistributing it would pay the same sats out twice — once on-chain
+    // to the kept miners, once carried in the trimmed miner's ledger — and
+    // the resulting overshoot is unrecoverable: the Phase-5a.5 solvency cap
+    // only claws back from *kept* credit holders, while the excess came
+    // from *trimmed* ones. That shortfall trips the fee-100% fallback.
     let trimmed_total: i64 = trimmed
         .iter()
         .filter_map(|a| computations.get(a))
         .filter(|c| c.shares > 0.0)
-        .map(|c| c.target)
+        .map(|c| c.raw_fair)
         .sum();
 
     let mut fee_bonus_sats: i64 = 0;
@@ -359,8 +369,18 @@ pub fn build_coinbase_distribution(
     }
 
     // ── Phase 5a.5: Solvency cap ─────────────────────────────────────
+    //
+    // `fee_bonus_sats` counts towards the overshoot: under
+    // `suppress_matching_debits` the trimmed miners' this-block share is
+    // donated to the fee output rather than redistributed into kept
+    // miners' `on_chain`, but it is still paid out of
+    // `reward_for_miners`. Leaving it out hides the credit that kept
+    // miners carry — the cap then sees an undershoot and does nothing,
+    // and the same credit resurfaces as a negative Phase-5b residuum,
+    // which bails to the fee-100% fallback. On the PPLNS path
+    // `fee_bonus_sats` is still 0 here, so this is a no-op there.
     let preliminary_on_chain: i64 = computations.values().map(|c| c.on_chain).sum();
-    let overshoot = preliminary_on_chain - reward_for_miners;
+    let overshoot = preliminary_on_chain + fee_bonus_sats - reward_for_miners;
     if overshoot > 0 {
         let mut credit_claimers: Vec<AddressId> = kept
             .iter()
@@ -1285,6 +1305,180 @@ mod tests {
             alice_after.to_i64(),
             bob_after.to_i64(),
         );
+    }
+
+    struct TrimmedCreditScenario {
+        alice: AddressId,
+        bob: AddressId,
+        /// Tiny miners carrying prior-round credit; most get trimmed.
+        tail: Vec<AddressId>,
+        shares: HashMap<AddressId, f64>,
+        balances: HashMap<AddressId, Sats>,
+    }
+
+    /// Builds a trim scenario where the *trimmed* miners are the ones
+    /// carrying open credit: two big miners with no balance stay kept,
+    /// a tail of tiny miners with a prior balance gets trimmed.
+    ///
+    /// This is the shape the trim itself produces round over round —
+    /// trimming is what writes carry-forward balances, and the trimmer
+    /// keeps largest-target-first, so the small carry-forward holders are
+    /// exactly the ones trimmed again next round.
+    fn trimmed_credit_holder_scenario() -> TrimmedCreditScenario {
+        let alice = miner("bc1qalicepplnstrimcredit000000000000000000aaa");
+        let bob = miner("bc1qbob000pplnstrimcredit0000000000000000bbb");
+        let mut shares: HashMap<AddressId, f64> = HashMap::new();
+        shares.insert(alice.clone(), 1_000_000.0);
+        shares.insert(bob.clone(), 500_000.0);
+        let tail: Vec<AddressId> = (0..20)
+            .map(|i| miner(&format!("bc1qtailcredit{i:038x}")))
+            .collect();
+        let mut balances: HashMap<AddressId, Sats> = HashMap::new();
+        for a in &tail {
+            shares.insert(a.clone(), 10_000.0);
+            // Prior-round carry-forward credit. Small, but it is the
+            // *trimmed* miners that hold it — the case the solvency cap
+            // cannot claw back from.
+            balances.insert(a.clone(), Sats(50_000));
+        }
+        TrimmedCreditScenario {
+            alice,
+            bob,
+            tail,
+            shares,
+            balances,
+        }
+    }
+
+    /// Regression: the weight-budget trim must redistribute only the
+    /// trimmed miners' *this-block* share (`raw_fair`), never their
+    /// `target` (which folds in `balance_old`, a past-block claim).
+    ///
+    /// Redistributing `target` pays out old debt that this block has no
+    /// room for AND leaves it carried forward — the same sats twice. The
+    /// resulting overshoot cannot be clawed back, because the solvency
+    /// cap only draws from *kept* credit holders while the excess came
+    /// from *trimmed* ones. That tripped the catastrophic fee-100%
+    /// fallback: whole block to the pool fee, every miner dropped and
+    /// their ledger claims erased.
+    #[test]
+    fn trim_redistributes_only_this_block_share_not_carried_credit() {
+        let fa = fee_addr();
+        let s = trimmed_credit_holder_scenario();
+        let (alice, bob, tail, shares, balances) = (s.alice, s.bob, s.tail, s.shares, s.balances);
+        let block_reward = 5_000_000_000i64;
+        let input = CoinbaseDistributionInput {
+            coinbase_weight_budget: 1500, // tight → trims the tail
+            ..make_input(&shares, &balances, Some(&fa), block_reward)
+        };
+        let r = build_coinbase_distribution(input);
+
+        // Not the fee-100% fallback.
+        assert!(
+            r.payouts.len() > 1,
+            "expected a real distribution, got fee-100 fallback: {:?}",
+            r.payouts
+        );
+        let fee_paid = r
+            .payouts
+            .iter()
+            .filter(|p| p.address == fa)
+            .map(|p| p.sats.to_i64())
+            .sum::<i64>();
+        assert!(
+            fee_paid < block_reward,
+            "fee output took the whole block ({fee_paid} of {block_reward})"
+        );
+        assert!(r.budget_telemetry.is_some(), "trim telemetry must survive");
+
+        // The kept miners get paid.
+        assert!(r.payouts.iter().any(|p| p.address == alice));
+        assert!(r.payouts.iter().any(|p| p.address == bob));
+
+        // Coinbase never pays out more than the block reward.
+        let total: i64 = r.payouts.iter().map(|p| p.sats.to_i64()).sum();
+        assert!(
+            total <= block_reward,
+            "coinbase overpays: {total} > {block_reward}"
+        );
+
+        // Trimmed credit holders keep their claim. (The budget fits a
+        // couple of tail miners, so not every one of them is trimmed —
+        // the ones that were paid legitimately clear their ledger.)
+        let mut trimmed_holders = 0;
+        for a in &tail {
+            if r.payouts.iter().any(|p| p.address == *a) {
+                continue;
+            }
+            trimmed_holders += 1;
+            let after = r.balance_after.get(a).copied().unwrap_or(Sats(0));
+            assert!(
+                after.to_i64() >= 50_000,
+                "trimmed credit holder {a:?} lost carried credit: {after:?}"
+            );
+        }
+        assert!(
+            trimmed_holders >= 10,
+            "scenario must actually trim most of the tail, trimmed only {trimmed_holders}"
+        );
+    }
+
+    /// Same shape under Group-Solo (`suppress_matching_debits`), where the
+    /// trimmed amount is donated to the fee output instead of being
+    /// redistributed to kept miners. That path reaches the fee-100%
+    /// fallback too — via a different branch, but with the same outcome:
+    /// every kept miner dropped and the trimmed miners' carried credit
+    /// wiped.
+    #[test]
+    fn group_solo_trim_with_trimmed_credit_holders_still_pays_miners() {
+        let fa = fee_addr();
+        let s = trimmed_credit_holder_scenario();
+        let (alice, bob, tail, shares, balances) = (s.alice, s.bob, s.tail, s.shares, s.balances);
+        let block_reward = 5_000_000_000i64;
+        let input = CoinbaseDistributionInput {
+            coinbase_weight_budget: 1500,
+            suppress_matching_debits: true,
+            ..make_input(&shares, &balances, Some(&fa), block_reward)
+        };
+        let r = build_coinbase_distribution(input);
+
+        assert!(
+            r.payouts.len() > 1,
+            "expected a real distribution, got fee-100 fallback: {:?}",
+            r.payouts
+        );
+        assert!(r.payouts.iter().any(|p| p.address == alice));
+        assert!(r.payouts.iter().any(|p| p.address == bob));
+
+        let fee_paid = r
+            .payouts
+            .iter()
+            .filter(|p| p.address == fa)
+            .map(|p| p.sats.to_i64())
+            .sum::<i64>();
+        assert!(
+            fee_paid < block_reward,
+            "fee output took the whole block ({fee_paid} of {block_reward})"
+        );
+
+        let total: i64 = r.payouts.iter().map(|p| p.sats.to_i64()).sum();
+        assert!(
+            total <= block_reward,
+            "group-solo coinbase overpays: {total} > {block_reward} (excess {})",
+            total - block_reward
+        );
+
+        // Trimmed credit holders keep their carried claim.
+        for a in &tail {
+            if r.payouts.iter().any(|p| p.address == *a) {
+                continue;
+            }
+            let after = r.balance_after.get(a).copied().unwrap_or(Sats(0));
+            assert!(
+                after.to_i64() >= 50_000,
+                "trimmed credit holder {a:?} lost carried credit: {after:?}"
+            );
+        }
     }
 
     /// Trimmed miners' target stays as positive `balance_after` (carry-forward
