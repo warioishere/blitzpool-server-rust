@@ -528,3 +528,211 @@ fn test_engine_config(fee_addr: &str) -> PplnsEngineConfig {
 // need it don't have to re-add.
 #[allow(dead_code)]
 fn _force_addr_id(_: AddressId) {}
+
+/// Separate logical DB for the coinbase↔ledger equality variant.
+const REDIS_TEST_DB_LEDGER: u8 = 11;
+
+/// E2E: the ledger books exactly what the block's coinbase paid — even
+/// after a later distribution build displaced the shared snapshot key.
+///
+/// This is the end-to-end form of the bug the fingerprint keying exists for.
+/// The pool builds the job a block is mined on; some other build (here a
+/// JD-client-style request for its own payout value, in production also a
+/// plain template refresh) then overwrites `pplns:snapshot`. Reading that key
+/// at block-found yields a distribution belonging to no block, and the reward
+/// check refuses — the found block's payout is never applied.
+///
+/// Asserted here against a real accepted block: every `coinbase` audit row
+/// the ledger wrote corresponds byte-for-byte to an output of the coinbase
+/// transaction bitcoin-core accepted — same scriptPubKey, same satoshis.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
+    use bitcoin::consensus::Decodable;
+
+    let regtest_cfg = RegtestConfig::default();
+    if !regtest_cfg.is_available() {
+        eprintln!("skipping PPLNS ledger-equality regtest — bitcoin-node not found");
+        return;
+    }
+    let Some(redis_conn) = connect_redis_or_skip(REDIS_TEST_DB_LEDGER).await else {
+        return;
+    };
+    let Some(pg) = connect_pg_or_skip().await else {
+        return;
+    };
+
+    let addr_alice = deterministic_p2wpkh_regtest([0x41; 32]);
+    let addr_bob = deterministic_p2wpkh_regtest([0x42; 32]);
+    let addr_charlie = deterministic_p2wpkh_regtest([0x43; 32]);
+    let addr_fee = deterministic_p2wpkh_regtest([0x4f; 32]);
+    let engine = PplnsEngine::spawn(
+        test_engine_config(&addr_fee),
+        redis_conn,
+        pg.clone(),
+        NetworkDifficulty::new(1_000.0),
+    )
+    .await
+    .expect("PplnsEngine::spawn");
+    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    for (addr, weight) in [
+        (&addr_alice, 100.0),
+        (&addr_bob, 200.0),
+        (&addr_charlie, 300.0),
+    ] {
+        engine
+            .record_share(None, addr, weight, now_ms)
+            .await
+            .expect("seed share");
+    }
+
+    let node = RegtestNode::start_with(regtest_cfg)
+        .await
+        .expect("regtest start");
+    node.generate_to_self(101)
+        .await
+        .expect("mine 101 for IBD-exit + coinbase maturity");
+    let tdp = TdpHandle::spawn(TdpConfig::new(node.ipc_socket_path()).with_fee_threshold(1))
+        .expect("TdpHandle::spawn against regtest IPC");
+    let mut rx = tdp.subscribe();
+    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if rx.recv().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+    node.generate_to_self(1)
+        .await
+        .expect("mine 1 more to force fresh NewTemplate");
+    let (template, prev_hash) = wait_for_paired_template(&mut rx).await;
+
+    // ── The build this block's coinbase is made from ──────────────
+    let reward_sats = template.coinbase_tx_value_remaining;
+    let dist = engine
+        .build_distribution(reward_sats)
+        .await
+        .expect("build_distribution");
+    let fingerprint = dist.payouts_fingerprint;
+    let payouts: Vec<PayoutEntry> = dist
+        .payouts
+        .iter()
+        .map(|p| PayoutEntry {
+            address: p.address.as_str().to_string(),
+            sats: p.sats.0 as u64,
+        })
+        .collect();
+
+    let coinbase_template = TdpCoinbaseTemplate {
+        coinbase_prefix: &template.coinbase_prefix,
+        coinbase_tx_version: template.coinbase_tx_version,
+        coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,
+        coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
+        coinbase_tx_outputs: &template.coinbase_tx_outputs,
+        coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
+        coinbase_tx_locktime: template.coinbase_tx_locktime,
+    };
+    let job = build_mining_job_from_tdp(
+        Network::Regtest,
+        &payouts,
+        &coinbase_template,
+        "pplns-ledger-regtest",
+        EXTRANONCE_SLOT_LEN,
+    )
+    .expect("build_mining_job_from_tdp");
+
+    // The engine and the job must agree on the identity of the payout list,
+    // otherwise the block-found lookup would miss and silently fall back.
+    assert_eq!(
+        job.payouts_fingerprint(),
+        &fingerprint,
+        "engine-side and job-side fingerprints must be byte-identical"
+    );
+
+    // ── A later build displaces the shared snapshot key ───────────
+    let _jdc = engine
+        .build_distribution(reward_sats - 997)
+        .await
+        .expect("jdc-style build");
+
+    // ── Mine + submit ────────────────────────────────────────────
+    let en1 = [0u8; 4];
+    let en2 = [0u8; 8];
+    let coinbase_txid = job.coinbase_txid_with_extranonce(&en1, &en2);
+    let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &template.merkle_path);
+    let target = Target::from_le_bytes(prev_hash.target);
+    let nonce = brute_force_nonce(
+        template.version,
+        &prev_hash.prev_hash,
+        &merkle_root,
+        prev_hash.header_timestamp,
+        prev_hash.n_bits,
+        &target,
+    )
+    .expect("must find a regtest-target-matching nonce");
+
+    let witness_coinbase = job.witness_coinbase_with_extranonce(&en1, &en2);
+    let before_height = node.current_height().await.expect("current_height");
+    tdp.submit_solution(
+        template.template_id,
+        template.version,
+        prev_hash.header_timestamp,
+        nonce,
+        witness_coinbase.clone(),
+    )
+    .await
+    .expect("submit_solution");
+    let height = poll_for_height(&node, before_height + 1, Duration::from_secs(20))
+        .await
+        .expect("bitcoin-core must accept the block");
+    assert_eq!(height, before_height + 1);
+
+    // ── Book it, using the fingerprint the job carried ───────────
+    let prepared = engine
+        .prepare_block_found_for(height as i32, reward_sats, Some(fingerprint))
+        .await
+        .expect(
+            "the mined job's own distribution must still resolve — the later \
+             build displaced only the shared key",
+        );
+    engine
+        .apply_prepared(&prepared)
+        .await
+        .expect("apply_prepared");
+
+    // ── The ledger must match the coinbase the chain accepted ────
+    let coinbase_tx = bitcoin::Transaction::consensus_decode(&mut witness_coinbase.as_slice())
+        .expect("submitted coinbase must decode");
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT address, "paidSats" FROM pplns_payout_history
+           WHERE "blockHeight" = $1 AND "rowType" = 'coinbase'"#,
+    )
+    .bind(height as i32)
+    .fetch_all(&pg)
+    .await
+    .expect("read audit rows");
+    assert!(!rows.is_empty(), "coinbase audit rows must exist");
+
+    for (address, paid_sats) in &rows {
+        let script = bp_mining_job::address_to_script(Network::Regtest, address)
+            .expect("audit-row address must be a payable script");
+        let matched = coinbase_tx.output.iter().any(|o| {
+            o.script_pubkey.as_bytes() == script.as_bytes() && o.value.to_sat() == *paid_sats as u64
+        });
+        assert!(
+            matched,
+            "ledger claims {address} was paid {paid_sats} sat on-chain, but the \
+             accepted coinbase has no such output — the booked distribution is \
+             not the one this block paid"
+        );
+    }
+
+    engine.shutdown();
+    tdp.shutdown().expect("TDP clean shutdown");
+    node.shutdown().await.expect("regtest clean shutdown");
+    let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
+        .bind(height as i32)
+        .execute(&pg)
+        .await;
+    cleanup_pplns_state(&pg, &payouts).await;
+}
