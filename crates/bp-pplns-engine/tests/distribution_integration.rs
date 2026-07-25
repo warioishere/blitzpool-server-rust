@@ -169,7 +169,10 @@ async fn build_with_shares_only_returns_payouts_and_writes_snapshot() {
     assert!(result.considered_addresses.contains(&addr_b_id));
 
     // Snapshot must be readable from Redis.
-    let snapshot = window.read_snapshot().await.expect("read snapshot ok");
+    let snapshot = window
+        .read_snapshot_for(&result.payouts_fingerprint)
+        .await
+        .expect("read snapshot ok");
     let parsed = snapshot.expect("snapshot persisted");
     assert_eq!(parsed.block_reward_sats, 312_500_000);
     assert_eq!(parsed.distribution.len(), result.payouts.len());
@@ -424,16 +427,12 @@ async fn distinct_rewards_keep_their_own_fingerprinted_snapshot() {
         .expect("jdc snapshot present");
     assert_eq!(jdc_snap.block_reward_sats, 312_499_137);
 
-    // The shared key meanwhile holds only the last writer — the exact
-    // behaviour the fingerprint key exists to sidestep.
-    let shared = window
-        .read_snapshot()
-        .await
-        .expect("read ok")
-        .expect("shared snapshot present");
-    assert_eq!(
-        shared.block_reward_sats, 312_499_137,
-        "shared key is last-writer-wins; that is why block-found must not rely on it"
+    // The shared last-writer-wins key is no longer written at all — the
+    // fingerprinted keys are the only snapshots, so there is nothing left for
+    // a block-found to accidentally read.
+    assert!(
+        window.read_snapshot().await.expect("read ok").is_none(),
+        "the shared snapshot key must no longer be written"
     );
 
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
@@ -455,9 +454,13 @@ async fn empty_state_returns_fee_only_distribution() {
     assert_eq!(result.block_reward_sats, 312_500_000);
 
     // Snapshot still written (pre-condition for on-block-found
-    // replay; even an "empty" pool block needs the snapshot).
+    // replay; even an "empty" pool block needs the snapshot) — under the
+    // fingerprint of its payout list, the only key builds write.
     let window = build_window(&h).await;
-    let snapshot = window.read_snapshot().await.expect("ok");
+    let snapshot = window
+        .read_snapshot_for(&result.payouts_fingerprint)
+        .await
+        .expect("ok");
     assert!(snapshot.is_some());
 
     cleanup(&h.pool, &h.address_prefix).await;

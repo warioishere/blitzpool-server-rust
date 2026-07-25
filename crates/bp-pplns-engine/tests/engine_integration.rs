@@ -220,11 +220,11 @@ async fn on_block_found_applies_distribution_from_snapshot() {
         .record_share(None, &a, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    let _result = h.engine.build_distribution(312_500_000).await.expect("ok");
+    let result = h.engine.build_distribution(312_500_000).await.expect("ok");
     let block_height = 9_997_001;
     let outcome = h
         .engine
-        .on_block_found(block_height, 312_500_000)
+        .on_block_found_for(block_height, 312_500_000, Some(result.payouts_fingerprint))
         .await
         .expect("ok");
     assert!(outcome.history_inserted >= 1, "at least one audit row");
@@ -547,7 +547,10 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         !d1.payouts.iter().any(|p| p.address.as_str() == TINY),
         "sub-threshold miner must NOT get a block-1 coinbase output"
     );
-    h.engine.on_block_found(h1, REWARD).await.expect("apply 1");
+    h.engine
+        .on_block_found_for(h1, REWARD, Some(d1.payouts_fingerprint))
+        .await
+        .expect("apply 1");
 
     let (bal1, paid1) = miner_balance_and_paid(&h.pool, TINY).await;
     assert!(
@@ -572,7 +575,10 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         d2.payouts.iter().any(|p| p.address.as_str() == TINY),
         "accrued credit must push the tiny miner over min_payout into a block-2 output"
     );
-    h.engine.on_block_found(h2, REWARD).await.expect("apply 2");
+    h.engine
+        .on_block_found_for(h2, REWARD, Some(d2.payouts_fingerprint))
+        .await
+        .expect("apply 2");
 
     let (bal2, paid2) = miner_balance_and_paid(&h.pool, TINY).await;
     assert_eq!(bal2, 0, "pending credit clears once paid (got {bal2})");
@@ -610,10 +616,10 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         .record_share(None, MINER, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    h.engine.build_distribution(REWARD).await.expect("build 1");
+    let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
     let p1 = h
         .engine
-        .prepare_block_found(h1, REWARD)
+        .prepare_block_found_for(h1, REWARD, Some(d1.payouts_fingerprint))
         .await
         .expect("prepare 1");
     h.engine.apply_prepared(&p1).await.expect("apply 1");
@@ -625,10 +631,10 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         .record_share(None, MINER, 100.0, 1_700_000_060_001)
         .await
         .unwrap();
-    h.engine.build_distribution(REWARD).await.expect("build 2");
+    let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
     let p2 = h
         .engine
-        .prepare_block_found(h2, REWARD)
+        .prepare_block_found_for(h2, REWARD, Some(d2.payouts_fingerprint))
         .await
         .expect("prepare 2");
     h.engine.apply_prepared(&p2).await.expect("apply 2");
@@ -667,10 +673,10 @@ async fn gated_two_prepares_against_same_ledger_clobber_without_flush() {
         .record_share(None, MINER, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    h.engine.build_distribution(REWARD).await.expect("build 1");
+    let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
     let p1 = h
         .engine
-        .prepare_block_found(h1, REWARD)
+        .prepare_block_found_for(h1, REWARD, Some(d1.payouts_fingerprint))
         .await
         .expect("prepare 1");
 
@@ -679,10 +685,10 @@ async fn gated_two_prepares_against_same_ledger_clobber_without_flush() {
         .record_share(None, MINER, 100.0, 1_700_000_060_001)
         .await
         .unwrap();
-    h.engine.build_distribution(REWARD).await.expect("build 2");
+    let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
     let p2 = h
         .engine
-        .prepare_block_found(h2, REWARD)
+        .prepare_block_found_for(h2, REWARD, Some(d2.payouts_fingerprint))
         .await
         .expect("prepare 2");
 

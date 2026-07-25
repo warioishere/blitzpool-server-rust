@@ -275,7 +275,7 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
 
     // ── Satellite applies the block-found ledger ──────────────────
     let outcome = engine
-        .on_block_found(after as i32, reward_sats)
+        .on_block_found_for(after as i32, reward_sats, Some(dist.payouts_fingerprint))
         .await
         .expect("on_block_found");
     assert!(

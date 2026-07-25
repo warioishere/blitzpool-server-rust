@@ -77,6 +77,12 @@ pub enum EngineError {
     #[error("snapshot missing for block {block_height} — pool restart or expired TTL?")]
     SnapshotMissing { block_height: i32 },
     #[error(
+        "block {block_height} carried no payout fingerprint — the pool did not \
+         build this coinbase (JD-client custom job), so there is no pool-side \
+         distribution to book"
+    )]
+    NoPayoutFingerprint { block_height: i32 },
+    #[error(
         "snapshot reward mismatch for block {block_height}: \
          snapshot={snapshot_reward} sats, block={actual_reward} sats — \
          stale snapshot deleted; operator must trigger reprocessing"
@@ -466,21 +472,15 @@ impl PplnsEngine {
         // A zeroed fingerprint means the pool did not build this coinbase
         // (`SetCustomMiningJob`) — there is no pool-side distribution to bind,
         // so it is treated as "none carried", not as a lookup that failed.
-        let fingerprint = payouts_fingerprint.filter(|fp| fp != &[0u8; 32]);
-        let snapshot = match fingerprint {
-            Some(fp) => self
-                .inner
-                .window
-                .read_snapshot_for(&fp)
-                .await?
-                .ok_or(EngineError::SnapshotMissing { block_height })?,
-            None => self
-                .inner
-                .window
-                .read_snapshot()
-                .await?
-                .ok_or(EngineError::SnapshotMissing { block_height })?,
-        };
+        let fingerprint = payouts_fingerprint
+            .filter(|fp| fp != &[0u8; 32])
+            .ok_or(EngineError::NoPayoutFingerprint { block_height })?;
+        let snapshot = self
+            .inner
+            .window
+            .read_snapshot_for(&fingerprint)
+            .await?
+            .ok_or(EngineError::SnapshotMissing { block_height })?;
 
         if snapshot.block_reward_sats != block_reward_sats {
             warn!(
@@ -489,14 +489,7 @@ impl PplnsEngine {
                 block_height,
                 "PPLNS snapshot reward mismatch — deleting stale snapshot, operator must reprocess block"
             );
-            // Delete the key we actually read, not the shared one — wiping an
-            // innocent key would leave the offending entry to mislead the next
-            // attempt.
-            let deleted = match fingerprint {
-                Some(fp) => self.inner.window.delete_snapshot_for(&fp).await,
-                None => self.inner.window.delete_snapshot().await,
-            };
-            if let Err(e) = deleted {
+            if let Err(e) = self.inner.window.delete_snapshot_for(&fingerprint).await {
                 warn!(error = %e, "failed to delete mismatched snapshot — will TTL out");
             }
             return Err(EngineError::SnapshotRewardMismatch {
@@ -518,7 +511,7 @@ impl PplnsEngine {
             now_ms,
             &audit_rows,
             &balance_writes,
-            fingerprint,
+            Some(fingerprint),
         ))
     }
 
@@ -563,13 +556,6 @@ impl PplnsEngine {
                 "failed to drop fingerprinted PPLNS snapshots after apply_prepared \
                  — non-fatal, they TTL out"
             ),
-        }
-        if let Err(e) = self.inner.window.delete_snapshot().await {
-            warn!(
-                error = %e,
-                block_height = prepared.block_height,
-                "failed to delete PPLNS snapshot after apply_prepared — non-fatal, will TTL out"
-            );
         }
         self.inner.distribution_builder.invalidate_all();
 

@@ -336,10 +336,11 @@ async fn build_from_inputs(
         &math.considered_addresses,
         &math.balance_after,
     );
-    // Under the payout-list fingerprint: this is the copy a block-found looks
-    // up, and it is the one that stays correct. Nothing else writes this key,
-    // so it still holds THIS distribution when the block that mined it is
-    // found — however many other builds ran in between.
+    // Keyed by the payout list it distributes — the only snapshot written.
+    // Nothing else writes this key, so it still holds THIS distribution when
+    // the block that mined it is found, however many other builds ran in
+    // between. A block-found that cannot name a key gets no distribution
+    // rather than a stranger's.
     let payouts_fingerprint = payouts_fingerprint_from_parts(
         math.payouts
             .iter()
@@ -347,14 +348,6 @@ async fn build_from_inputs(
     );
     window
         .write_snapshot_for(&payouts_fingerprint, &snapshot, config.snapshot_ttl_secs)
-        .await
-        .map_err(DistributionError::Snapshot)?;
-    // Under the shared key as well, for the block-found paths that cannot
-    // supply a fingerprint yet. That copy keeps exactly today's semantics —
-    // last writer wins, guarded by the reward check at apply time — so no
-    // path regresses while the fingerprint is threaded through them.
-    window
-        .write_snapshot(&snapshot, config.snapshot_ttl_secs)
         .await
         .map_err(DistributionError::Snapshot)?;
 
