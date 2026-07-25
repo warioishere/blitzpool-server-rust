@@ -104,6 +104,14 @@ pub(crate) struct BlockFoundEvent {
     /// `None` on a build failure → the apply falls back to the Redis read.
     #[serde(default)]
     pub groupsolo_snapshot: Option<StoredSnapshot>,
+    /// Identity of the payout list this block's coinbase pays, taken off the
+    /// job the winning share was built on. The PPLNS apply looks the
+    /// distribution up under it, so the ledger books what the coinbase
+    /// actually paid instead of whatever the shared snapshot key holds by
+    /// then. `None`/zero when the pool did not build the coinbase
+    /// (`SetCustomMiningJob`) or the job path carries no fingerprint.
+    #[serde(default)]
+    pub pplns_payouts_fingerprint: Option<[u8; 32]>,
 }
 
 /// `BlockSubmissionSink` for both SV1 + SV2. Forwards every
@@ -331,6 +339,7 @@ impl TdpBlockSubmissionSink {
         reward_sats: Option<u64>,
         block_hash: Option<String>,
         block_data: String,
+        pplns_payouts_fingerprint: Option<[u8; 32]>,
     ) {
         // Resolve the payout mode on the Core (the only side with the gate)
         // and stamp it onto the event so the apply side needs no gate.
@@ -424,6 +433,7 @@ impl TdpBlockSubmissionSink {
             address,
             worker,
             session_id,
+            pplns_payouts_fingerprint,
             reward_sats,
             block_hash,
             block_data,
@@ -495,6 +505,7 @@ impl BlockFoundApplier {
         height: i32,
         reward: u64,
         block_hash_hex: Option<&str>,
+        payouts_fingerprint: Option<[u8; 32]>,
     ) {
         match (self.redis.as_ref(), block_hash_hex) {
             (Some(redis), Some(block_hash)) => {
@@ -540,7 +551,10 @@ impl BlockFoundApplier {
                          proceeding (watcher reconciles)"),
                 }
 
-                let prepared = match engine.prepare_block_found(height, reward).await {
+                let prepared = match engine
+                    .prepare_block_found_for(height, reward, payouts_fingerprint)
+                    .await
+                {
                     Ok(p) => p,
                     Err(err) => {
                         warn!(%err, address = address_str, height,
@@ -761,6 +775,7 @@ impl BlockFoundApplier {
                         height,
                         reward,
                         block_hash_hex.as_deref(),
+                        event.pplns_payouts_fingerprint,
                     )
                     .await
                 }
@@ -1030,6 +1045,9 @@ impl Sv1BlockSubmissionSink for TdpBlockSubmissionSink {
             Some(accept.template.coinbase_tx_value_remaining),
             Some(block_hash_display(&accept.header)),
             hex::encode(accept.header),
+            // The job the winning share was built on — so the PPLNS apply
+            // books the distribution this coinbase actually pays.
+            Some(*accept.mining_job.payouts_fingerprint()),
         )
         .await;
     }
@@ -1119,6 +1137,7 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
             Some(accept.coinbase_tx_value_remaining),
             Some(block_hash_display(&accept.header)),
             hex::encode(accept.header),
+            Some(accept.payouts_fingerprint),
         )
         .await;
     }
@@ -1281,6 +1300,7 @@ mod tests {
     #[test]
     fn block_found_event_json_round_trips_with_stamped_fields() {
         let event = BlockFoundEvent {
+            pplns_payouts_fingerprint: None,
             address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
             worker: "rig1".to_string(),
             session_id: "sess1".to_string(),

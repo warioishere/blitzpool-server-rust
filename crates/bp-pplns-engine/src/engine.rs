@@ -422,12 +422,46 @@ impl PplnsEngine {
         block_height: i32,
         block_reward_sats: u64,
     ) -> Result<PreparedBlockFound, EngineError> {
-        let snapshot = self
-            .inner
-            .window
-            .read_snapshot()
-            .await?
-            .ok_or(EngineError::SnapshotMissing { block_height })?;
+        self.prepare_block_found_for(block_height, block_reward_sats, None)
+            .await
+    }
+
+    /// [`Self::prepare_block_found`] for a block whose job carried the
+    /// fingerprint of the payout list its coinbase pays.
+    ///
+    /// With it, the distribution is looked up under that fingerprint — the
+    /// key nothing else writes — so it is still the one this block's coinbase
+    /// was built from however many other builds ran since. Without it (a job
+    /// path that does not carry one, or a JD client's own coinbase) this
+    /// falls back to the shared key, which is last-writer-wins and guarded
+    /// only by the reward check below.
+    pub async fn prepare_block_found_for(
+        &self,
+        block_height: i32,
+        block_reward_sats: u64,
+        payouts_fingerprint: Option<[u8; 32]>,
+    ) -> Result<PreparedBlockFound, EngineError> {
+        let exact = match payouts_fingerprint {
+            Some(fp) if fp != [0u8; 32] => self.inner.window.read_snapshot_for(&fp).await?,
+            _ => None,
+        };
+        let snapshot = match exact {
+            Some(s) => s,
+            None => {
+                if payouts_fingerprint.is_some_and(|fp| fp != [0u8; 32]) {
+                    warn!(
+                        block_height,
+                        "PPLNS: no snapshot under the job's payout fingerprint \
+                         (expired?) — falling back to the shared key"
+                    );
+                }
+                self.inner
+                    .window
+                    .read_snapshot()
+                    .await?
+                    .ok_or(EngineError::SnapshotMissing { block_height })?
+            }
+        };
 
         if snapshot.block_reward_sats != block_reward_sats {
             warn!(

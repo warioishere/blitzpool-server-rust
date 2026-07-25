@@ -131,6 +131,7 @@ mod tests {
 
     fn solo_event() -> BlockFoundEvent {
         BlockFoundEvent {
+            pplns_payouts_fingerprint: None,
             address: ADDR.to_string(),
             worker: "rig1".to_string(),
             session_id: "sid".to_string(),
