@@ -590,7 +590,13 @@ impl BlockFoundApplier {
                     warn!(address = address_str, height,
                         "block-found: PPLNS confirmation-gating unavailable (no block hash); applying immediately");
                 }
-                match engine.on_block_found(height, reward).await {
+                // Same fingerprint the gated arm uses — without it this arm
+                // reads the shared last-writer-wins key, which is exactly the
+                // failure the fingerprint exists to remove.
+                match engine
+                    .on_block_found_for(height, reward, payouts_fingerprint)
+                    .await
+                {
                     Ok(outcome) => info!(
                         address = address_str,
                         height,

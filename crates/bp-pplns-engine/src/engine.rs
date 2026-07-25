@@ -112,6 +112,12 @@ pub struct PreparedBlockFound {
     pub now_ms: i64,
     pub rows: Vec<PreparedAuditRow>,
     pub balances: Vec<PreparedBalanceWrite>,
+    /// The payout-list fingerprint whose snapshot this was frozen from, if
+    /// it came from one. Carried so the apply consumes exactly that key: a
+    /// snapshot outliving its own block is what lets a redelivered event
+    /// re-prepare against an already-credited ledger.
+    #[serde(default)]
+    pub payouts_fingerprint: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -137,11 +143,13 @@ impl PreparedBlockFound {
         now_ms: i64,
         rows: &[AuditRow],
         balances: &[BalanceWrite],
+        payouts_fingerprint: Option<[u8; 32]>,
     ) -> Self {
         Self {
             block_height,
             block_reward_sats,
             now_ms,
+            payouts_fingerprint,
             rows: rows
                 .iter()
                 .map(|r| PreparedAuditRow {
@@ -388,6 +396,19 @@ impl PplnsEngine {
         block_height: i32,
         block_reward_sats: u64,
     ) -> Result<ApplyDistributionResult, EngineError> {
+        self.on_block_found_for(block_height, block_reward_sats, None)
+            .await
+    }
+
+    /// [`Self::on_block_found`] for a block whose job carried the fingerprint
+    /// of the payout list its coinbase pays. Used by the immediate-apply arm,
+    /// which has the same fingerprint available as the gated one.
+    pub async fn on_block_found_for(
+        &self,
+        block_height: i32,
+        block_reward_sats: u64,
+        payouts_fingerprint: Option<[u8; 32]>,
+    ) -> Result<ApplyDistributionResult, EngineError> {
         if self
             .inner
             .block_found_in_progress
@@ -397,7 +418,7 @@ impl PplnsEngine {
         }
         let result = async {
             let prepared = self
-                .prepare_block_found(block_height, block_reward_sats)
+                .prepare_block_found_for(block_height, block_reward_sats, payouts_fingerprint)
                 .await?;
             self.apply_prepared(&prepared).await
         }
@@ -429,38 +450,36 @@ impl PplnsEngine {
     /// [`Self::prepare_block_found`] for a block whose job carried the
     /// fingerprint of the payout list its coinbase pays.
     ///
-    /// With it, the distribution is looked up under that fingerprint — the
-    /// key nothing else writes — so it is still the one this block's coinbase
-    /// was built from however many other builds ran since. Without it (a job
-    /// path that does not carry one, or a JD client's own coinbase) this
-    /// falls back to the shared key, which is last-writer-wins and guarded
-    /// only by the reward check below.
+    /// The fingerprint is an assertion about WHICH distribution this block's
+    /// coinbase pays. If it resolves to nothing the assertion cannot be
+    /// honoured, and this refuses — falling back to the shared key would book
+    /// a distribution the coinbase demonstrably did not pay. Only a job that
+    /// carries no fingerprint at all (a JD client's own coinbase, or a path
+    /// not yet threaded) reads the shared key, with the reward check below as
+    /// its only guard.
     pub async fn prepare_block_found_for(
         &self,
         block_height: i32,
         block_reward_sats: u64,
         payouts_fingerprint: Option<[u8; 32]>,
     ) -> Result<PreparedBlockFound, EngineError> {
-        let exact = match payouts_fingerprint {
-            Some(fp) if fp != [0u8; 32] => self.inner.window.read_snapshot_for(&fp).await?,
-            _ => None,
-        };
-        let snapshot = match exact {
-            Some(s) => s,
-            None => {
-                if payouts_fingerprint.is_some_and(|fp| fp != [0u8; 32]) {
-                    warn!(
-                        block_height,
-                        "PPLNS: no snapshot under the job's payout fingerprint \
-                         (expired?) — falling back to the shared key"
-                    );
-                }
-                self.inner
-                    .window
-                    .read_snapshot()
-                    .await?
-                    .ok_or(EngineError::SnapshotMissing { block_height })?
-            }
+        // A zeroed fingerprint means the pool did not build this coinbase
+        // (`SetCustomMiningJob`) — there is no pool-side distribution to bind,
+        // so it is treated as "none carried", not as a lookup that failed.
+        let fingerprint = payouts_fingerprint.filter(|fp| fp != &[0u8; 32]);
+        let snapshot = match fingerprint {
+            Some(fp) => self
+                .inner
+                .window
+                .read_snapshot_for(&fp)
+                .await?
+                .ok_or(EngineError::SnapshotMissing { block_height })?,
+            None => self
+                .inner
+                .window
+                .read_snapshot()
+                .await?
+                .ok_or(EngineError::SnapshotMissing { block_height })?,
         };
 
         if snapshot.block_reward_sats != block_reward_sats {
@@ -470,7 +489,14 @@ impl PplnsEngine {
                 block_height,
                 "PPLNS snapshot reward mismatch — deleting stale snapshot, operator must reprocess block"
             );
-            if let Err(e) = self.inner.window.delete_snapshot().await {
+            // Delete the key we actually read, not the shared one — wiping an
+            // innocent key would leave the offending entry to mislead the next
+            // attempt.
+            let deleted = match fingerprint {
+                Some(fp) => self.inner.window.delete_snapshot_for(&fp).await,
+                None => self.inner.window.delete_snapshot().await,
+            };
+            if let Err(e) = deleted {
                 warn!(error = %e, "failed to delete mismatched snapshot — will TTL out");
             }
             return Err(EngineError::SnapshotRewardMismatch {
@@ -492,6 +518,7 @@ impl PplnsEngine {
             now_ms,
             &audit_rows,
             &balance_writes,
+            fingerprint,
         ))
     }
 
@@ -516,6 +543,21 @@ impl PplnsEngine {
         )
         .await?;
 
+        // Consume the snapshot this block was frozen from. Without this the
+        // fingerprinted copy outlives its own block, and a redelivered
+        // block-found event re-prepares against the ledger it already
+        // credited. The shared key is cleared too — it is stale either way
+        // once a block has been booked.
+        if let Some(fp) = prepared.payouts_fingerprint {
+            if let Err(e) = self.inner.window.delete_snapshot_for(&fp).await {
+                warn!(
+                    error = %e,
+                    block_height = prepared.block_height,
+                    "failed to delete fingerprinted PPLNS snapshot after apply_prepared \
+                     — non-fatal, will TTL out"
+                );
+            }
+        }
         if let Err(e) = self.inner.window.delete_snapshot().await {
             warn!(
                 error = %e,

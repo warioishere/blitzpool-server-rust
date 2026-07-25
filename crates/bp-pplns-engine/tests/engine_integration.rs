@@ -773,3 +773,115 @@ async fn spawn_core_skips_crons_but_build_distribution_works() {
 // Silence "unused: AddressId" if a future test wants it directly.
 #[allow(dead_code)]
 fn _force_use(_: AddressId) {}
+
+// ── An unresolvable fingerprint must refuse, never fall back ────────
+//
+// The fingerprint asserts WHICH distribution the coinbase pays. If it
+// resolves to nothing that assertion cannot be honoured, and reading the
+// shared last-writer-wins key instead would book a distribution the coinbase
+// demonstrably did not pay — silently, since the shared copy carries the
+// right reward and passes the reward check.
+
+#[tokio::test]
+async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
+    let _guard = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(3, "test_engine_unk_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    h.engine
+        .record_share(None, ADDR_A, 100.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+
+    const REWARD: u64 = 312_500_000;
+    // A perfectly good shared snapshot for exactly this reward exists — so a
+    // fallback would succeed and pass the reward check.
+    let _ = h.engine.build_distribution(REWARD).await.expect("build ok");
+
+    let never_written = [0x5au8; 32];
+    let err = h
+        .engine
+        .prepare_block_found_for(9_997_201, REWARD, Some(never_written))
+        .await
+        .expect_err("an unresolvable fingerprint must not be booked from the shared key");
+    eprintln!("refused with: {err}");
+
+    let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
+        .bind(ADDR_A)
+        .execute(&h.pool)
+        .await;
+    drop_harness(h).await;
+}
+
+// ── Apply consumes the snapshot the block was frozen from ───────────
+//
+// The block-found stream is at-least-once. If the fingerprinted snapshot
+// outlives its own block, a redelivered event re-prepares against the ledger
+// it already credited and double-credits `totalPaidSats`. Deleting on apply
+// is what makes the redelivery fail closed, exactly as it did before the
+// fingerprint key existed.
+
+#[tokio::test]
+async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() {
+    let _guard = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(4, "test_engine_consume_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    h.engine
+        .record_share(None, ADDR_A, 60.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, ADDR_B, 40.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+
+    const REWARD: u64 = 312_500_000;
+    let dist = h.engine.build_distribution(REWARD).await.expect("build ok");
+    let fp = dist.payouts_fingerprint;
+    let height = 9_997_301;
+
+    let prepared = h
+        .engine
+        .prepare_block_found_for(height, REWARD, Some(fp))
+        .await
+        .expect("prepare ok");
+    h.engine.apply_prepared(&prepared).await.expect("apply ok");
+
+    // The snapshot is gone, so the redelivery cannot re-prepare.
+    assert!(
+        h.engine
+            .window()
+            .read_snapshot_for(&fp)
+            .await
+            .expect("read ok")
+            .is_none(),
+        "apply must consume the snapshot its block was frozen from"
+    );
+    let redelivered = h
+        .engine
+        .prepare_block_found_for(height, REWARD, Some(fp))
+        .await;
+    assert!(
+        redelivered.is_err(),
+        "a redelivered block-found must fail closed, not re-prepare against the \
+         ledger it already credited"
+    );
+
+    let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
+        .bind(height)
+        .execute(&h.pool)
+        .await;
+    for addr in [ADDR_A, ADDR_B] {
+        let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
+            .bind(addr)
+            .execute(&h.pool)
+            .await;
+    }
+    drop_harness(h).await;
+}
