@@ -13,6 +13,9 @@ workspace = true
 [dependencies]
 bp-common = { workspace = true }
 bp-share = { workspace = true }
+# Streaming SHA-256 for `payouts_fingerprint` — same crate bp-share hashes
+# with, so no new transitive weight.
+sha2 = { workspace = true }
 bitcoin = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }

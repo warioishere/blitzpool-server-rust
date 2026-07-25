@@ -373,6 +373,73 @@ async fn concurrent_distinct_rewards_share_one_inputs_load() {
     cleanup(&h.pool, &h.address_prefix).await;
 }
 
+// ── Test 8 — distinct rewards keep their own snapshot ───────────────
+//
+// The ext-0x0003 collision case. Every JDC reports its own payout value, so
+// its build overwrites the shared `pplns:snapshot` key with a distribution
+// that belongs to nobody's block. A block-found then finds a snapshot whose
+// reward disagrees with the coinbase and refuses to apply.
+//
+// Under the payout-list fingerprint each build keeps its own copy, so the
+// distribution a block was mined from is still there when the block is found.
+
+#[tokio::test]
+async fn distinct_rewards_keep_their_own_fingerprinted_snapshot() {
+    let h = match connect_or_skip(15, "test_dist_fp_").await {
+        Some(h) => h,
+        None => return,
+    };
+
+    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
+
+    let window = build_window(&h).await;
+    seed_share(&window, ADDR_A, 70.0, 1_700_000_000_001).await;
+    seed_share(&window, ADDR_B, 30.0, 1_700_000_000_002).await;
+
+    // The pool's own template build...
+    let pool_build = h.builder.build(312_500_000).await.expect("pool build ok");
+    // ...then a JDC asking for its own payout value, which is what overwrites
+    // the shared key today.
+    let jdc_build = h.builder.build(312_499_137).await.expect("jdc build ok");
+
+    assert_ne!(
+        pool_build.payouts_fingerprint, jdc_build.payouts_fingerprint,
+        "different payout values must produce different payout lists"
+    );
+
+    // Both snapshots survive, each under its own fingerprint.
+    let pool_snap = window
+        .read_snapshot_for(&pool_build.payouts_fingerprint)
+        .await
+        .expect("read ok")
+        .expect("pool snapshot must survive the later build");
+    assert_eq!(pool_snap.block_reward_sats, 312_500_000);
+
+    let jdc_snap = window
+        .read_snapshot_for(&jdc_build.payouts_fingerprint)
+        .await
+        .expect("read ok")
+        .expect("jdc snapshot present");
+    assert_eq!(jdc_snap.block_reward_sats, 312_499_137);
+
+    // The shared key meanwhile holds only the last writer — the exact
+    // behaviour the fingerprint key exists to sidestep.
+    let shared = window
+        .read_snapshot()
+        .await
+        .expect("read ok")
+        .expect("shared snapshot present");
+    assert_eq!(
+        shared.block_reward_sats, 312_499_137,
+        "shared key is last-writer-wins; that is why block-found must not rely on it"
+    );
+
+    cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
+    cleanup(&h.pool, &h.address_prefix).await;
+}
+
 // ── Test 6 — empty window with no balances → empty distribution ─────
 
 #[tokio::test]
@@ -430,6 +497,7 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
         "test_dist_rew_" => 12,
         "test_dist_empty_" => 13,
         "test_dist_inputs_" => 14,
+        "test_dist_fp_" => 15,
         other => panic!("unknown test prefix: {other}"),
     }
 }

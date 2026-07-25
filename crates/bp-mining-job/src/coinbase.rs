@@ -5,6 +5,7 @@
 
 use bitcoin::Network;
 use bp_share::sha256d_from_parts;
+use sha2::{Digest, Sha256};
 
 use crate::address;
 
@@ -48,6 +49,45 @@ impl PayoutEntry {
     }
 }
 
+/// Identity of the exact payout list a coinbase was built from.
+///
+/// This is the binding between a mined block and the payout accounting that
+/// must be booked for it. The PPLNS distribution snapshot is stored under
+/// this fingerprint, and the block-found path recovers it from the job the
+/// winning share was built on — so the ledger always replays the
+/// distribution that is actually in the block's coinbase.
+///
+/// Without it the snapshot lives under one shared key that every later
+/// distribution build overwrites, including the ext-0x0003 payout requests
+/// Job-Declaration clients make with their own payout value.
+///
+/// Canonical, length-prefixed encoding so no two payout lists can alias:
+/// per entry, in list order, `sats` as 8 LE bytes, the address byte length
+/// as 4 LE bytes, then the address bytes. Order is part of the identity —
+/// coinbase output order is.
+pub fn payouts_fingerprint(payouts: &[PayoutEntry]) -> [u8; 32] {
+    payouts_fingerprint_from_parts(payouts.iter().map(|p| (p.address.as_str(), p.sats)))
+}
+
+/// [`payouts_fingerprint`] for callers holding the (address, sats) pairs in
+/// another shape — the PPLNS distributor's entries become [`PayoutEntry`]
+/// only further downstream, but both sides must agree byte-for-byte, so
+/// they share this one encoding.
+pub fn payouts_fingerprint_from_parts<'a>(
+    payouts: impl IntoIterator<Item = (&'a str, u64)>,
+) -> [u8; 32] {
+    // Streamed straight into the hasher — no joined buffer, so this stays
+    // allocation-free however many payouts a distribution has.
+    let mut hasher = Sha256::new();
+    for (address, sats) in payouts {
+        hasher.update(sats.to_le_bytes());
+        hasher.update((address.len() as u32).to_le_bytes());
+        hasher.update(address.as_bytes());
+    }
+    let first = hasher.finalize();
+    Sha256::digest(first).into()
+}
+
 /// The block-template fields needed for coinbase construction.
 #[derive(Clone, Debug)]
 pub struct CoinbaseTemplate {
@@ -75,6 +115,12 @@ pub struct MiningJob {
     /// encoding the coinbase for every per-client build.
     coinbase_prefix_hex: String,
     coinbase_suffix_hex: String,
+    /// Identity of the payout list this coinbase pays — see
+    /// [`payouts_fingerprint`]. Carried on the job so a block found on it
+    /// can look up the exact distribution the pool must book, instead of
+    /// whatever the shared snapshot key holds by then. 32 inline bytes, no
+    /// allocation, computed once per job build.
+    payouts_fingerprint: [u8; 32],
 }
 
 impl MiningJob {
@@ -84,6 +130,11 @@ impl MiningJob {
 
     pub fn coinbase_suffix(&self) -> &[u8] {
         &self.coinbase_suffix
+    }
+
+    /// Identity of the payout list this job's coinbase pays.
+    pub fn payouts_fingerprint(&self) -> &[u8; 32] {
+        &self.payouts_fingerprint
     }
 
     /// Precomputed lowercase-hex of the coinbase prefix — the `coinb1` slot of
@@ -253,6 +304,7 @@ pub fn build_mining_job(
         coinbase_suffix,
         coinbase_prefix_hex,
         coinbase_suffix_hex,
+        payouts_fingerprint: payouts_fingerprint(payouts),
     })
 }
 
@@ -342,6 +394,7 @@ pub fn build_mining_job_from_tdp(
         &payout_outputs,
         template,
         extranonce_slot_size,
+        payouts_fingerprint(payouts),
     ))
 }
 
@@ -378,6 +431,10 @@ pub(crate) fn assemble_tdp_job(
     payout_outputs: &[(u64, Vec<u8>)],
     template: &TdpCoinbaseTemplate<'_>,
     extranonce_slot_size: usize,
+    // Taken as a parameter rather than derived here: `payout_outputs` is
+    // already reduced to (sats, script), and the fingerprint is defined over
+    // the addresses. Callers hold the `PayoutEntry` slice and pass it in.
+    payouts_fingerprint: [u8; 32],
 ) -> MiningJob {
     let total_output_count =
         payout_outputs.len() as u64 + u64::from(template.coinbase_tx_outputs_count);
@@ -405,6 +462,7 @@ pub(crate) fn assemble_tdp_job(
         coinbase_suffix,
         coinbase_prefix_hex,
         coinbase_suffix_hex,
+        payouts_fingerprint,
     }
 }
 
@@ -590,6 +648,73 @@ fn encode_varint(buf: &mut Vec<u8>, n: u64) {
     } else {
         buf.push(0xff);
         buf.extend_from_slice(&n.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    fn entry(address: &str, sats: u64) -> PayoutEntry {
+        PayoutEntry {
+            address: address.to_string(),
+            sats,
+        }
+    }
+
+    #[test]
+    fn same_payout_list_yields_same_fingerprint() {
+        let a = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
+        let b = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
+        assert_eq!(payouts_fingerprint(&a), payouts_fingerprint(&b));
+    }
+
+    /// Coinbase output order is part of what was mined, so it is part of the
+    /// identity — the same amounts in a different order are a different
+    /// coinbase and must not share a snapshot.
+    #[test]
+    fn order_changes_the_fingerprint() {
+        let a = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
+        let b = vec![entry("bc1qbob", 40_000), entry("bc1qalice", 60_000)];
+        assert_ne!(payouts_fingerprint(&a), payouts_fingerprint(&b));
+    }
+
+    /// A single satoshi of drift is a different distribution — this is the
+    /// case that separates a stale snapshot from the live one.
+    #[test]
+    fn one_sat_difference_changes_the_fingerprint() {
+        let a = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
+        let b = vec![entry("bc1qalice", 60_001), entry("bc1qbob", 39_999)];
+        assert_ne!(payouts_fingerprint(&a), payouts_fingerprint(&b));
+    }
+
+    /// The length prefix is what stops two adjacent addresses from aliasing
+    /// against a differently-split pair with the same concatenation.
+    #[test]
+    fn address_boundaries_cannot_alias() {
+        let a = vec![entry("ab", 1), entry("c", 1)];
+        let b = vec![entry("a", 1), entry("bc", 1)];
+        assert_ne!(payouts_fingerprint(&a), payouts_fingerprint(&b));
+    }
+
+    #[test]
+    fn empty_list_is_stable_and_distinct_from_a_zero_payout() {
+        let empty: Vec<PayoutEntry> = Vec::new();
+        assert_eq!(payouts_fingerprint(&empty), payouts_fingerprint(&[]));
+        assert_ne!(
+            payouts_fingerprint(&empty),
+            payouts_fingerprint(&[entry("", 0)])
+        );
+    }
+
+    /// The two entry points must agree byte-for-byte — the write side hashes
+    /// the distributor's entries, the job side hashes `PayoutEntry`s.
+    #[test]
+    fn parts_entry_point_matches_the_slice_entry_point() {
+        let payouts = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
+        let from_parts =
+            payouts_fingerprint_from_parts(payouts.iter().map(|p| (p.address.as_str(), p.sats)));
+        assert_eq!(payouts_fingerprint(&payouts), from_parts);
     }
 }
 

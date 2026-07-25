@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use bp_common::{AddressId, Sats};
 use bp_db::{find_pplns_balances_with_open_balance, DbError, PplnsBalanceRow};
+use bp_mining_job::payouts_fingerprint_from_parts;
 use bp_pplns::{
     build_coinbase_distribution, is_valid_payout_address, CoinbaseDistributionEntry,
     CoinbaseDistributionInput,
@@ -110,6 +111,13 @@ pub struct DistributionResult {
     /// snapshot pins this so on-block-found can refuse to apply a
     /// stale snapshot whose reward disagrees with the actual coinbase.
     pub block_reward_sats: u64,
+    /// Identity of `payouts` — the key this build's snapshot is stored
+    /// under. Callers hand it down to whatever consumes the payout list
+    /// (the Stratum job build), so a block-found can later ask for the
+    /// distribution its own coinbase was built from instead of whatever
+    /// the shared snapshot key happens to hold. See
+    /// [`bp_mining_job::payouts_fingerprint`].
+    pub payouts_fingerprint: [u8; 32],
 }
 
 /// Knobs for the distribution path. Built from
@@ -328,6 +336,23 @@ async fn build_from_inputs(
         &math.considered_addresses,
         &math.balance_after,
     );
+    // Under the payout-list fingerprint: this is the copy a block-found looks
+    // up, and it is the one that stays correct. Nothing else writes this key,
+    // so it still holds THIS distribution when the block that mined it is
+    // found — however many other builds ran in between.
+    let payouts_fingerprint = payouts_fingerprint_from_parts(
+        math.payouts
+            .iter()
+            .map(|p| (p.address.as_str(), p.sats.to_i64().max(0) as u64)),
+    );
+    window
+        .write_snapshot_for(&payouts_fingerprint, &snapshot, config.snapshot_ttl_secs)
+        .await
+        .map_err(DistributionError::Snapshot)?;
+    // Under the shared key as well, for the block-found paths that cannot
+    // supply a fingerprint yet. That copy keeps exactly today's semantics —
+    // last writer wins, guarded by the reward check at apply time — so no
+    // path regresses while the fingerprint is threaded through them.
     window
         .write_snapshot(&snapshot, config.snapshot_ttl_secs)
         .await
@@ -338,6 +363,7 @@ async fn build_from_inputs(
         considered_addresses: math.considered_addresses,
         balance_after: math.balance_after,
         block_reward_sats,
+        payouts_fingerprint,
     })
 }
 
@@ -411,6 +437,7 @@ mod tests {
             considered_addresses: HashSet::new(),
             balance_after: HashMap::new(),
             block_reward_sats: 312_500_000,
+            payouts_fingerprint: [0u8; 32],
         };
         let cloned = result.clone();
         assert_eq!(cloned.block_reward_sats, 312_500_000);
