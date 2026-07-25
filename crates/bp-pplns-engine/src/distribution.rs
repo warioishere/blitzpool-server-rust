@@ -10,11 +10,24 @@
 //! replay the same distribution deterministically when the block is
 //! found.
 //!
-//! Concurrent callers for the same `block_reward_sats` share one
-//! computation via `bp_inflight_cache::InflightResultCache` (30s TTL
-//! by default).
+//! Two layers of `bp_inflight_cache::InflightResultCache` (30s TTL by
+//! default):
+//!
+//! - **Built distributions**, keyed by `block_reward_sats` — concurrent
+//!   callers for the same reward share one computation.
+//! - **Window+ledger inputs**, keyed by `()` — concurrent callers for
+//!   *different* rewards still share the Redis window read and the
+//!   Postgres ledger query, since neither depends on the reward.
+//!
+//! The second layer is what keeps a burst of unrelated callers cheap.
+//! The per-reward layer alone never dedups them: ext-0x0003 has every
+//! JDC report its own `available_payout_value`, so N simultaneous
+//! requests at a chain-tip change mean N distinct keys and, without the
+//! inputs layer, N window reads plus N ledger queries in the same few
+//! milliseconds.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,6 +70,28 @@ pub enum DistributionError {
     Snapshot(#[source] redis::RedisError),
     #[error("db: {0}")]
     Db(#[from] DbError),
+    /// The shared window+ledger load failed. Carries the underlying
+    /// error's message rather than the error itself: the inputs cache
+    /// hands back an `Arc<DistributionError>` shared across all waiters,
+    /// which can't be unwrapped back into an owned error.
+    #[error("distribution inputs: {0}")]
+    Inputs(String),
+}
+
+/// The part of a distribution build that does NOT depend on
+/// `block_reward_sats`: the current payout window and the open-balance
+/// ledger, both already sanitized to parseable payout addresses.
+///
+/// Every concurrent build shares these — the weights are a property of
+/// the window, not of the reward. Only the scaling to a concrete reward
+/// (and the dust/trim decisions that follow from it) is per-build, which
+/// is why this is cached separately: N concurrent builds for N distinct
+/// rewards cost one Redis window read and one Postgres ledger query, not
+/// N of each.
+#[derive(Clone, Debug, Default)]
+pub struct DistributionInputs {
+    pub address_shares: HashMap<AddressId, f64>,
+    pub balances: HashMap<AddressId, Sats>,
 }
 
 /// Result of one distribution build. Cheap to clone-via-Arc because
@@ -111,6 +146,14 @@ pub struct DistributionBuilder {
     window: WindowStore,
     config: DistributionConfig,
     cache: InflightResultCache<u64, DistributionResult, DistributionError>,
+    /// Reward-independent window+ledger inputs, shared across every
+    /// concurrent build. Keyed by `()` — there is exactly one payout
+    /// window — so the cache degenerates to "one load per invalidation
+    /// epoch, deduped across all in-flight builds".
+    inputs_cache: InflightResultCache<(), DistributionInputs, DistributionError>,
+    /// How often the window+ledger load actually ran. Observability, and
+    /// the assertion hook for the dedup tests.
+    inputs_loads: Arc<AtomicU64>,
 }
 
 impl DistributionBuilder {
@@ -129,21 +172,41 @@ impl DistributionBuilder {
             window,
             config,
             cache: InflightResultCache::new(cache_ttl),
+            inputs_cache: InflightResultCache::new(cache_ttl),
+            inputs_loads: Arc::new(AtomicU64::new(0)),
         }
     }
 
+    /// Number of window+ledger loads performed so far. Under a burst of
+    /// concurrent builds this stays far below the build count — that is
+    /// the whole point of the inputs cache.
+    pub fn inputs_loads(&self) -> u64 {
+        self.inputs_loads.load(Ordering::Relaxed)
+    }
+
     /// Build the current PPLNS distribution for `block_reward_sats`.
-    /// Concurrent callers for the same reward share one compute.
+    /// Concurrent callers for the same reward share one compute; callers
+    /// for *different* rewards still share the window+ledger read.
     pub async fn build(
         &self,
         block_reward_sats: u64,
     ) -> Result<Arc<DistributionResult>, Arc<DistributionError>> {
         let pool = self.pool.clone();
         let window = self.window.clone();
+        let window_for_inputs = self.window.clone();
         let config = self.config.clone();
+        let inputs_cache = self.inputs_cache.clone();
+        let inputs_loads = self.inputs_loads.clone();
         self.cache
             .get_or_compute(block_reward_sats, || async move {
-                compute_distribution(&pool, &window, &config, block_reward_sats).await
+                let inputs = inputs_cache
+                    .get_or_compute((), || async move {
+                        inputs_loads.fetch_add(1, Ordering::Relaxed);
+                        load_inputs(&pool, &window_for_inputs).await
+                    })
+                    .await
+                    .map_err(|e| DistributionError::Inputs(e.to_string()))?;
+                build_from_inputs(&inputs, &window, &config, block_reward_sats).await
             })
             .await
     }
@@ -158,8 +221,13 @@ impl DistributionBuilder {
         self.cache.invalidate(&block_reward_sats);
     }
 
+    /// Drops the built distributions AND the shared window+ledger
+    /// inputs. Both must go: the callers are state-change events (a
+    /// share landed, the budget moved), and keeping stale inputs would
+    /// just rebuild the same stale distribution.
     pub fn invalidate_all(&self) {
         self.cache.clear();
+        self.inputs_cache.clear();
     }
 
     /// The live coinbase-weight-budget handle this builder reads per build.
@@ -171,12 +239,13 @@ impl DistributionBuilder {
 
 // ── Internals ────────────────────────────────────────────────────────
 
-async fn compute_distribution(
+/// Steps 1-3: the reward-independent half of a build — read the window
+/// and the ledger, sanitize both. Shared by every concurrent build via
+/// [`DistributionBuilder::inputs_cache`].
+async fn load_inputs(
     pool: &PgPool,
     window: &WindowStore,
-    config: &DistributionConfig,
-    block_reward_sats: u64,
-) -> Result<DistributionResult, DistributionError> {
+) -> Result<DistributionInputs, DistributionError> {
     // 1. Read window aggregate from Redis (HashMap<String, f64>).
     let window_raw = window.read_window_by_address().await?;
 
@@ -216,11 +285,25 @@ async fn compute_distribution(
         );
     }
 
+    Ok(DistributionInputs {
+        address_shares,
+        balances,
+    })
+}
+
+/// Steps 4-5: scale the shared inputs to one concrete
+/// `block_reward_sats`, run the pure math, persist the snapshot.
+async fn build_from_inputs(
+    inputs: &DistributionInputs,
+    window: &WindowStore,
+    config: &DistributionConfig,
+    block_reward_sats: u64,
+) -> Result<DistributionResult, DistributionError> {
     // 4. Build inputs + call pure math. Read the *live* budget here so a
     //    runtime autoscaler change takes effect on the next build.
     let input = CoinbaseDistributionInput {
-        address_shares: &address_shares,
-        balances: &balances,
+        address_shares: &inputs.address_shares,
+        balances: &inputs.balances,
         block_reward_sats: Sats(block_reward_sats as i64),
         fee_percent: config.fee_percent,
         fee_address: config.fee_address.as_ref(),

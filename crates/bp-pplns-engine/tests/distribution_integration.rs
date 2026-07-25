@@ -313,6 +313,66 @@ async fn distinct_rewards_each_get_their_own_compute() {
     cleanup(&h.pool, &h.address_prefix).await;
 }
 
+// ── Test 7 — distinct rewards share ONE window+ledger load ──────────
+//
+// The ext-0x0003 burst shape: every JDC reports its own
+// `available_payout_value`, so the reward differs per caller and the
+// per-reward cache never hits. The reward-independent half — the Redis
+// window read and the Postgres ledger query — is identical for all of
+// them and must be loaded once, not once per caller.
+
+#[tokio::test]
+async fn concurrent_distinct_rewards_share_one_inputs_load() {
+    let h = match connect_or_skip(14, "test_dist_inputs_").await {
+        Some(h) => h,
+        None => return,
+    };
+
+    // Valid Bitcoin addresses so they survive payout-address sanitisation.
+    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
+
+    let window = build_window(&h).await;
+    seed_share(&window, ADDR_A, 100.0, 1_700_000_000_001).await;
+    seed_share(&window, ADDR_B, 50.0, 1_700_000_000_002).await;
+
+    let before = h.builder.inputs_loads();
+    let builder = Arc::new(h.builder.clone());
+    let mut handles = Vec::new();
+    // 16 callers, 16 distinct rewards — no per-reward cache hit possible.
+    for i in 0..16u64 {
+        let b = builder.clone();
+        handles.push(tokio::spawn(
+            async move { b.build(312_500_000 + i * 137).await },
+        ));
+    }
+    for (i, handle) in handles.into_iter().enumerate() {
+        let r = handle.await.unwrap().expect("build ok");
+        assert_eq!(r.block_reward_sats, 312_500_000 + i as u64 * 137);
+        assert!(!r.payouts.is_empty());
+    }
+
+    let loads = h.builder.inputs_loads() - before;
+    assert!(
+        loads <= 2,
+        "16 concurrent builds for distinct rewards should share the window+ledger \
+         load (allowing one straggler that arrives after the leader published); \
+         got {loads} loads"
+    );
+
+    // Sanity: a build after an invalidation must load fresh again.
+    h.builder.invalidate_all();
+    let _ = h.builder.build(999_000_000).await.expect("ok");
+    assert!(
+        h.builder.inputs_loads() - before > loads,
+        "invalidate_all must force the next build to reload the inputs"
+    );
+
+    cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
+    cleanup(&h.pool, &h.address_prefix).await;
+}
+
 // ── Test 6 — empty window with no balances → empty distribution ─────
 
 #[tokio::test]
@@ -369,6 +429,7 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
         "test_dist_inval_" => 11,
         "test_dist_rew_" => 12,
         "test_dist_empty_" => 13,
+        "test_dist_inputs_" => 14,
         other => panic!("unknown test prefix: {other}"),
     }
 }
