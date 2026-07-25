@@ -501,6 +501,97 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
         "test_dist_empty_" => 13,
         "test_dist_inputs_" => 14,
         "test_dist_fp_" => 15,
+        "test_dist_oom_" => 6,
         other => panic!("unknown test prefix: {other}"),
     }
+}
+
+// ── A failed snapshot write must not collapse the distribution ──────
+//
+// `pplns_payouts` turns any `build_distribution` error into `solo_payouts`,
+// so a build that returns `Err` hands that miner a job whose coinbase pays
+// 100 % of the block to itself. A Redis blip on the snapshot write must
+// therefore not fail the build: the distribution is correct and is about to
+// become a coinbase. Losing the snapshot costs a reprocess; losing the
+// distribution costs the pool's miners the block, on-chain and irreversibly.
+//
+// Redis is made to reject writes for real (`maxmemory`), not mocked — reads
+// still succeed under it, which is exactly the shape needed here.
+
+/// Restores `maxmemory` even if the test panics — it is server-global, so
+/// leaking it would break every later test against this Redis.
+struct MaxMemoryGuard(redis::aio::ConnectionManager);
+
+impl Drop for MaxMemoryGuard {
+    fn drop(&mut self) {
+        let mut conn = self.0.clone();
+        // Best-effort: a blocking handle inside Drop is not available, so
+        // spawn onto the current runtime.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let _ = redis::cmd("CONFIG")
+                    .arg("SET")
+                    .arg("maxmemory")
+                    .arg("0")
+                    .query_async::<()>(&mut conn)
+                    .await;
+            })
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
+    let h = match connect_or_skip(6, "test_dist_oom_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
+
+    let window = build_window(&h).await;
+    // Seed while writes still work.
+    seed_share(&window, ADDR_A, 60.0, 1_700_000_000_001).await;
+    seed_share(&window, ADDR_B, 40.0, 1_700_000_000_002).await;
+
+    let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
+    let client = Client::open(format!("{redis_base}/6")).expect("client");
+    let mut admin = ConnectionManager::new(client).await.expect("admin conn");
+    redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory-policy")
+        .arg("noeviction")
+        .query_async::<()>(&mut admin)
+        .await
+        .expect("policy");
+    let _guard = MaxMemoryGuard(admin.clone());
+    redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory")
+        .arg("1")
+        .query_async::<()>(&mut admin)
+        .await
+        .expect("maxmemory");
+
+    // Window read + ledger read still work; only the snapshot write is
+    // rejected. The build must survive it.
+    let result = h
+        .builder
+        .build(312_500_000)
+        .await
+        .expect("a rejected snapshot write must not fail the distribution build");
+    assert!(
+        result.payouts.len() >= 2,
+        "the real PPLNS distribution must come back, not a solo fallback: {:?}",
+        result.payouts
+    );
+    assert!(
+        result.payouts.iter().any(|p| p.address.as_str() == ADDR_B),
+        "every miner in the window must still be paid — a solo fallback would \
+         leave only the requesting address"
+    );
+
+    drop(_guard);
+    cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
 }
