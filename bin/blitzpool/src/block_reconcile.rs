@@ -33,6 +33,11 @@ use tracing::{debug, error, info, warn};
 /// hour later, and each pass costs two RPCs per unseen block.
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// How many blocks every pass re-walks. A height whose block a reorg replaced
+/// needs a second look, and six is past the depth at which that stops
+/// happening in practice.
+const REORG_OVERLAP: u64 = 6;
+
 /// How far back the first pass after a restart looks. ~1 day of blocks — far
 /// enough to cover a deploy or an outage, short enough to stay cheap.
 pub(crate) const DEFAULT_LOOKBACK: u64 = 144;
@@ -210,10 +215,7 @@ pub(crate) async fn run_once(
     lookback: u64,
 ) -> Result<ReconcilePass, bp_bitcoin::RpcError> {
     let tip = rpc.get_block_count().await?;
-    let from_height = match checked_through {
-        Some(h) => h.saturating_add(1),
-        None => tip.saturating_sub(lookback),
-    };
+    let from_height = scan_start(checked_through, tip, lookback);
     let mut unbooked = Vec::new();
     if from_height > tip {
         return Ok(ReconcilePass {
@@ -223,6 +225,7 @@ pub(crate) async fn run_once(
         });
     }
 
+    let mut first_error: Option<u64> = None;
     for height in from_height..=tip {
         match inspect_block(rpc, pool, markers, modes, height).await {
             Ok(Some(block)) => {
@@ -245,14 +248,42 @@ pub(crate) async fn run_once(
                 unbooked.push(block);
             }
             Ok(None) => {}
-            Err(err) => warn!(%err, height, "block-reconcile: could not check block"),
+            Err(err) => {
+                warn!(%err, height, "block-reconcile: could not check block; will retry");
+                first_error.get_or_insert(height);
+            }
         }
     }
     Ok(ReconcilePass {
         from_height,
-        checked_through: tip,
+        checked_through: next_watermark(tip, first_error),
         unbooked,
     })
+}
+
+/// Where the next pass starts.
+///
+/// Always re-walks the last [`REORG_OVERLAP`] blocks: a height checked while
+/// one block sat there, then replaced by a reorg, would otherwise never be
+/// looked at again — and the replacement is the block that actually pays.
+fn scan_start(checked_through: Option<u64>, tip: u64, lookback: u64) -> u64 {
+    match checked_through {
+        Some(h) => h.saturating_add(1).min(tip.saturating_sub(REORG_OVERLAP)),
+        None => tip.saturating_sub(lookback),
+    }
+}
+
+/// How far this pass may claim to have checked.
+///
+/// Stops below the first height it could not read. A transient RPC failure
+/// must cost a retry, not the block: advancing past it would leave a height
+/// nothing ever looks at again, which is the failure this whole check exists
+/// to catch.
+fn next_watermark(tip: u64, first_error: Option<u64>) -> u64 {
+    match first_error {
+        Some(h) => h.saturating_sub(1),
+        None => tip,
+    }
 }
 
 /// `Some` when the block at `height` pays the pool and the ledger has no
@@ -346,6 +377,40 @@ mod tests {
     /// A zero-fee deployment has no marker output, so the check cannot
     /// recognise its blocks. Refusing to construct is what makes that visible
     /// instead of a task that quietly reports nothing forever.
+    /// A height that could not be read must be walked again, not skipped for
+    /// good — the whole point of the check is that nothing goes unlooked-at.
+    #[test]
+    fn a_height_that_errored_is_not_marked_checked() {
+        assert_eq!(
+            next_watermark(120, None),
+            120,
+            "a clean pass covers the tip"
+        );
+        assert_eq!(
+            next_watermark(120, Some(115)),
+            114,
+            "the watermark must stop below the first unreadable height"
+        );
+        // Two errors: the earliest one bounds the pass.
+        assert_eq!(next_watermark(120, Some(0)), 0);
+    }
+
+    /// A reorg replaces the block at a height already checked. Without the
+    /// overlap the replacement — the block that actually pays — is never seen.
+    #[test]
+    fn every_pass_re_walks_the_reorg_window() {
+        // Caught up: still steps back over the last few blocks.
+        assert_eq!(scan_start(Some(120), 120, DEFAULT_LOOKBACK), 114);
+        // Behind: resumes where it stopped, no jumping ahead.
+        assert_eq!(scan_start(Some(50), 120, DEFAULT_LOOKBACK), 51);
+        // First pass after a restart: the lookback window.
+        assert_eq!(scan_start(None, 500, DEFAULT_LOOKBACK), 356);
+        // A chain shorter than the window starts at genesis rather than
+        // underflowing.
+        assert_eq!(scan_start(Some(3), 3, DEFAULT_LOOKBACK), 0);
+        assert_eq!(scan_start(None, 10, DEFAULT_LOOKBACK), 0);
+    }
+
     #[test]
     fn pool_markers_refuses_an_empty_configuration() {
         assert!(PoolMarkers::new(Vec::<String>::new()).is_none());
