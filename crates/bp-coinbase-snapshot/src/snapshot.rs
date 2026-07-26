@@ -142,6 +142,22 @@ impl From<StoredSnapshot> for ParsedSnapshot {
     }
 }
 
+impl From<ParsedSnapshot> for StoredSnapshot {
+    /// Back to the wire form, so a snapshot read from Redis can be carried in
+    /// a block-found event. `distribution` keeps its coinbase order; the two
+    /// collections are semantically a set and a map, so their order carries no
+    /// meaning to lose.
+    fn from(s: ParsedSnapshot) -> Self {
+        Self {
+            distribution: s.distribution,
+            block_reward_sats: s.block_reward_sats,
+            considered_addresses: s.considered_addresses.into_iter().collect(),
+            balance_after: s.balance_after.into_iter().collect(),
+            balance_before: s.balance_before.into_iter().collect(),
+        }
+    }
+}
+
 /// Persist a snapshot under `key` with `ttl_seconds`.
 ///
 /// `DEL` before `HSET` guarantees the key has Hash type even if a

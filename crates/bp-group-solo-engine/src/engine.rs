@@ -53,7 +53,11 @@ use crate::ledger::{
     LedgerError,
 };
 use crate::reset::{spawn_per_group_task, GroupResetRunner, ResetError, ResetSchedule};
-use crate::round::snapshot::{delete_all_for_group, ParsedSnapshot, StoredSnapshot};
+use bp_share::payouts_fingerprint_from_parts;
+
+use crate::round::snapshot::{
+    delete_all_for_group, delete_snapshot_for, ParsedSnapshot, StoredSnapshot,
+};
 use crate::round::{GroupRoundStore, RoundError, WINDOW_BUCKET_MS};
 use crate::sweep::{spawn_daily_task, GroupDustSweepRunner, SweepError, SweepStats};
 
@@ -80,6 +84,14 @@ pub enum EngineError {
         group_id: Uuid,
         finder_address: String,
         block_height: i32,
+    },
+    #[error(
+        "no snapshot for group {group_id} finder {finder_address} under the winning job's payout \
+         list — the block needs an operator reprocess"
+    )]
+    SnapshotMissingForPayouts {
+        group_id: Uuid,
+        finder_address: String,
     },
     #[error(
         "snapshot reward mismatch for group {group_id}: snapshot={snapshot_reward} block={actual_reward}"
@@ -145,6 +157,14 @@ struct CachedGroupMode {
 /// effect within a minute (and the mode never changes), cheap enough that the
 /// hot share path almost always hits the cache.
 const MODE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// How often the block-found snapshot read is retried before the block is given
+/// up on. That read is the only thing standing between a found block and its
+/// booking, and the caller does not retry — a connection reset mid-reconnect
+/// would otherwise cost the block.
+const SNAPSHOT_READ_RETRIES: u32 = 3;
+/// Backoff between those attempts, multiplied by the attempt number.
+const SNAPSHOT_READ_BACKOFF: Duration = Duration::from_millis(80);
 
 /// Decide whether a windowed share in `bucket_id` should trigger a trim, given
 /// the highest bucket already trimmed (`watermark`, `None` if never). Trim on
@@ -548,39 +568,88 @@ impl GroupSoloEngine {
             .map_err(EngineError::Distribution)
     }
 
-    /// Freeze the exact distribution for `(group_id, reward, finder)` into a
-    /// [`StoredSnapshot`] so the Core can stamp it into the block-found event.
+    /// Look up the distribution the found block's coinbase actually pays and
+    /// return it as a [`StoredSnapshot`], so the Core can stamp it into the
+    /// block-found event.
     ///
-    /// In the Core/Satellite split the per-(group, finder) Redis snapshot is
-    /// overwritten by continuous template rebuilds before the async apply runs
-    /// on the Satellite. Carrying the snapshot in the event makes Group-Solo
-    /// self-contained (like PPLNS/Blockparty): the Core builds it at the
-    /// block-found instant — freshest round, exact reward — and the apply
-    /// consumes it via [`Self::on_block_found_with_snapshot`] instead of a
-    /// second, raceable Redis read. Hits the in-flight cache, so a warm entry
-    /// returns the exact template-time distribution without a recompute.
+    /// `payouts_fingerprint` is the identity of the winning job's payout list,
+    /// carried on the job the share was built on. The build that produced that
+    /// list stored its snapshot under it, and nothing else writes that key.
+    ///
+    /// It must NOT rebuild the distribution here. `record_share` invalidates
+    /// the in-flight cache, so a single share landing between job issue and
+    /// block-found makes a rebuild run against a moved round — measured on a
+    /// two-member group as 187.5 M/125 M at job time versus 31.25 M/281.25 M at
+    /// block-found. The coinbase pays the first pair, and because a fresh build
+    /// carries the correct reward by construction, no reward check would ever
+    /// catch the second being booked. Missing snapshot → typed error, so the
+    /// block is booked by an operator rather than booked wrong.
     pub async fn snapshot_for_block_found(
         &self,
         group_id: Uuid,
         block_reward_sats: u64,
         finder_address: &AddressId,
+        payouts_fingerprint: &[u8; 32],
     ) -> Result<StoredSnapshot, EngineError> {
-        let dist = self
-            .build_distribution(group_id, block_reward_sats, finder_address)
-            .await?;
-        Ok(StoredSnapshot::from_math(
-            &dist.payouts,
-            dist.block_reward_sats,
-            &dist.considered_addresses,
-            &dist.balance_after,
-        ))
+        let mut conn = self.inner.round.connection_for_snapshot();
+        let group_key = group_id.to_string();
+        // Retry a transient Redis failure rather than discarding the block.
+        // This read is now the only thing standing between a found block and
+        // its booking, and the caller has no retry of its own. A genuinely
+        // missing snapshot (Ok(None)) is NOT retried — it will not appear.
+        let mut attempt = 0;
+        let snapshot = loop {
+            match crate::round::snapshot::read_snapshot_for(
+                &mut conn,
+                &group_key,
+                payouts_fingerprint,
+            )
+            .await
+            {
+                Ok(Some(s)) => break s,
+                Ok(None) => {
+                    return Err(EngineError::SnapshotMissingForPayouts {
+                        group_id,
+                        finder_address: finder_address.as_str().to_string(),
+                    })
+                }
+                Err(e) if attempt < SNAPSHOT_READ_RETRIES => {
+                    warn!(
+                        error = %e,
+                        %group_id,
+                        attempt,
+                        "group-solo snapshot read failed — retrying before giving up on the block"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(SNAPSHOT_READ_BACKOFF * attempt).await;
+                }
+                Err(e) => return Err(EngineError::Redis(e)),
+            }
+        };
+        if snapshot.block_reward_sats != block_reward_sats {
+            return Err(EngineError::SnapshotRewardMismatch {
+                group_id,
+                snapshot_reward: snapshot.block_reward_sats,
+                actual_reward: block_reward_sats,
+            });
+        }
+        Ok(snapshot.into())
     }
 
     /// Apply a Group-Solo found block, reading the distribution snapshot from
-    /// Redis (per-(group, finder) key). This is the fallback path: prefer
-    /// [`Self::on_block_found_with_snapshot`] with the event-carried snapshot
-    /// the front froze at block-found — the Redis key races with
-    /// template-rebuild overwrites by the time the async apply runs. Per-group
+    /// the per-(group, finder) Redis key.
+    ///
+    /// **Not on the automatic path, and NOT the way to reprocess a block.**
+    /// That key is last-writer-wins: by the time an apply runs it holds
+    /// whichever template rebuild wrote last, which is a split against the
+    /// round as it is *now*, not the one the block's coinbase paid. Booking it
+    /// is silent — the reward matches, so the mismatch check passes — and that
+    /// is the exact drift the fingerprint lookup exists to remove. A block
+    /// whose payout-list snapshot is gone has to be reprocessed from its own
+    /// coinbase, which is the only surviving record of what it paid.
+    ///
+    /// What it is still good for: applying the current distribution when that
+    /// IS what the coinbase pays, which is what the tests exercise. Per-group
     /// re-entrancy guard; idempotent across restarts via the
     /// `(groupId, blockHeight, address)` UNIQUE constraint.
     pub async fn on_block_found(
@@ -776,13 +845,31 @@ impl GroupSoloEngine {
                  round accumulates until calendar/manual reset");
         }
 
-        // 5. Drop all per-finder snapshots for this group.
+        // 5. Drop the per-finder snapshots (all stale once the round resets)
+        //    and the ONE payout-list key this block consumed, so a redelivered
+        //    event books nothing instead of booking twice. Every other live
+        //    job keeps its key: a second block found before the next template
+        //    rebuild must still resolve. The rest are bounded by their TTL.
         let mut conn = self.inner.round.connection_for_snapshot();
         if let Err(e) = delete_all_for_group(&mut conn, &group_key).await {
             warn!(
                 %group_id,
                 error = %e,
                 "delete_all_snapshots_for_group failed — non-fatal, TTL fallback"
+            );
+        }
+        let applied_fingerprint = payouts_fingerprint_from_parts(
+            snapshot.block_reward_sats,
+            snapshot
+                .distribution
+                .iter()
+                .map(|p| (p.address.as_str(), p.sats.to_i64().max(0) as u64)),
+        );
+        if let Err(e) = delete_snapshot_for(&mut conn, &group_key, &applied_fingerprint).await {
+            warn!(
+                %group_id,
+                error = %e,
+                "delete_snapshot_for failed — non-fatal, TTL fallback"
             );
         }
 
@@ -857,12 +944,7 @@ impl GroupSoloEngine {
             audit_rows.push(coinbase_row(entry, shares_in_round, total_shares_in_round));
             coinbase_addresses.insert(addr_str.clone());
 
-            let new_balance = snapshot
-                .balance_after
-                .get(addr_str)
-                .copied()
-                .or_else(|| existing.get(addr_str).map(|r| r.pending_sats.0))
-                .unwrap_or(0);
+            let new_balance = Self::resolve_new_balance(group_id, snapshot, &existing, addr_str);
             let prev_total_paid = existing
                 .get(addr_str)
                 .map(|r| r.total_paid_sats.0)
@@ -876,7 +958,7 @@ impl GroupSoloEngine {
 
         // Pending rows: balance_after entries that didn't get a
         // coinbase output (sub-dust accumulators).
-        for (addr_str, new_balance) in &snapshot.balance_after {
+        for addr_str in snapshot.balance_after.keys() {
             if coinbase_addresses.contains(addr_str) {
                 continue;
             }
@@ -885,8 +967,8 @@ impl GroupSoloEngine {
                 .get(addr_str)
                 .map(|r| r.pending_sats.0)
                 .unwrap_or(0);
-            let delta = new_balance - prev_balance;
-            audit_rows.push(pending_row(addr_id.clone(), Sats(delta)));
+            let resolved = Self::resolve_new_balance(group_id, snapshot, &existing, addr_str);
+            audit_rows.push(pending_row(addr_id.clone(), Sats(resolved - prev_balance)));
 
             let prev_total_paid = existing
                 .get(addr_str)
@@ -894,12 +976,66 @@ impl GroupSoloEngine {
                 .unwrap_or(0);
             balance_writes.push(BalanceWrite {
                 address: addr_id,
-                pending_sats: Sats(*new_balance),
+                pending_sats: Sats(resolved),
                 total_paid_sats: Sats(prev_total_paid),
             });
         }
 
         Ok((audit_rows, balance_writes))
+    }
+
+    /// The `pendingSats` this distribution intends for `address`.
+    ///
+    /// The snapshot is built when the job is issued and applied when a block is
+    /// found on it — under the confirmation gate that is hours later. Anything
+    /// that moved the ledger in between (a kick redistribution, a dust sweep,
+    /// another block of the same group) must survive, so when the snapshot
+    /// recorded the state it was computed against, apply the DELTA it intends
+    /// to the CURRENT row rather than its absolute.
+    ///
+    /// **Clamped at zero.** Group-Solo is the unsigned model — the distributor
+    /// runs with `suppress_matching_debits`, `balance_after` is documented as
+    /// never negative, and the column carries no constraint that would stop a
+    /// negative from being stored. A member whose credit was absorbed by the
+    /// dust sweep, or redistributed away by a kick, after the job was built has
+    /// `current < before`, and the raw delta would push them below zero. That
+    /// would be a debit, which the next build would fold into
+    /// `target = raw_fair + balance_old` and quietly reduce their next payout —
+    /// signed-ledger behaviour in the one payout mode designed without it. The
+    /// chain paid them more than the books can express; the books say zero and
+    /// the log says why.
+    ///
+    /// Falls back to the absolute for snapshots written before `balance_before`
+    /// existed — same behaviour as before, no worse.
+    fn resolve_new_balance(
+        group_id: Uuid,
+        snapshot: &ParsedSnapshot,
+        existing: &HashMap<String, PplnsGroupBalanceRow>,
+        address: &str,
+    ) -> i64 {
+        let current = existing.get(address).map(|r| r.pending_sats.0).unwrap_or(0);
+        let Some(after) = snapshot.balance_after.get(address).copied() else {
+            // Not in balance_after → this distribution does not change it.
+            return current;
+        };
+        let Some(before) = snapshot.balance_before.get(address).copied() else {
+            return after;
+        };
+        let resolved = current + (after - before);
+        if resolved < 0 {
+            warn!(
+                %group_id,
+                address,
+                current,
+                snapshot_before = before,
+                snapshot_after = after,
+                "group-solo: this block's coinbase paid an address more credit than it still \
+                 holds (swept or redistributed since the job was built) — booking 0 rather than \
+                 a debit the unsigned model cannot carry"
+            );
+            return 0;
+        }
+        resolved
     }
 
     /// Run one manual dust-sweep tick.
@@ -1014,6 +1150,88 @@ const _SHUTDOWN_HOOK_DOC: Duration = Duration::from_secs(0);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_with(after: &[(&str, i64)], before: &[(&str, i64)]) -> ParsedSnapshot {
+        ParsedSnapshot {
+            distribution: vec![],
+            block_reward_sats: 312_500_000,
+            considered_addresses: HashSet::new(),
+            balance_after: after.iter().map(|(a, v)| ((*a).to_string(), *v)).collect(),
+            balance_before: before.iter().map(|(a, v)| ((*a).to_string(), *v)).collect(),
+        }
+    }
+
+    fn existing_with(rows: &[(&str, i64)]) -> HashMap<String, PplnsGroupBalanceRow> {
+        rows.iter()
+            .map(|(a, v)| {
+                (
+                    (*a).to_string(),
+                    PplnsGroupBalanceRow {
+                        group_id: Uuid::nil(),
+                        address: AddressId::new((*a).to_string()).unwrap(),
+                        pending_sats: Sats(*v),
+                        total_paid_sats: Sats(0),
+                        updated_at: 0,
+                        last_accepted_share_at: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The whole point of `balance_before`: a credit that moved between job
+    /// build and apply must survive, so the block contributes its own movement
+    /// rather than restoring the ledger it was computed against.
+    #[test]
+    fn resolve_new_balance_applies_the_delta_to_the_current_row() {
+        let snap = snapshot_with(&[("bc1qa", 7_000)], &[("bc1qa", 4_000)]);
+        let existing = existing_with(&[("bc1qa", 5_000)]);
+        // +3_000 intended, current is 5_000 → 8_000, NOT the snapshot's 7_000.
+        assert_eq!(
+            GroupSoloEngine::resolve_new_balance(Uuid::nil(), &snap, &existing, "bc1qa"),
+            8_000
+        );
+    }
+
+    /// Group-Solo is the unsigned model. A member whose credit the dust sweep
+    /// absorbed (or a kick redistributed) after the job was built has
+    /// `current < before`, and the raw delta would leave them holding a debit
+    /// the next distribution would silently deduct from.
+    #[test]
+    fn resolve_new_balance_never_goes_negative() {
+        let snap = snapshot_with(&[("bc1qa", 0)], &[("bc1qa", 5_000)]);
+        // The sweep took the 5_000 before this block was applied.
+        let existing = existing_with(&[("bc1qa", 0)]);
+        assert_eq!(
+            GroupSoloEngine::resolve_new_balance(Uuid::nil(), &snap, &existing, "bc1qa"),
+            0,
+            "raw delta would be -5_000"
+        );
+    }
+
+    /// Snapshots written before `balance_before` existed carry none, and must
+    /// keep behaving exactly as they did — absolute.
+    #[test]
+    fn resolve_new_balance_falls_back_to_the_absolute_without_a_before() {
+        let snap = snapshot_with(&[("bc1qa", 7_000)], &[]);
+        let existing = existing_with(&[("bc1qa", 5_000)]);
+        assert_eq!(
+            GroupSoloEngine::resolve_new_balance(Uuid::nil(), &snap, &existing, "bc1qa"),
+            7_000
+        );
+    }
+
+    /// An address the distribution does not touch keeps what it has — the apply
+    /// must not zero a row just because it read it.
+    #[test]
+    fn resolve_new_balance_leaves_untouched_addresses_alone() {
+        let snap = snapshot_with(&[("bc1qa", 7_000)], &[("bc1qa", 4_000)]);
+        let existing = existing_with(&[("bc1qb", 2_500)]);
+        assert_eq!(
+            GroupSoloEngine::resolve_new_balance(Uuid::nil(), &snap, &existing, "bc1qb"),
+            2_500
+        );
+    }
 
     #[test]
     fn engine_error_carries_source_variants() {

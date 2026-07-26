@@ -55,7 +55,7 @@ use bp_stratum_v2::mining::submit::ShareAccept as Sv2ShareAccept;
 use bp_template_distribution::TdpHandle;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::engines::BlitzpoolModeGate;
 use crate::pending_blocks::{
@@ -105,11 +105,15 @@ pub(crate) struct BlockFoundEvent {
     #[serde(default)]
     pub groupsolo_snapshot: Option<StoredSnapshot>,
     /// Identity of the payout list this block's coinbase pays, taken off the
-    /// job the winning share was built on. The PPLNS apply looks the
-    /// distribution up under it, so the ledger books what the coinbase
-    /// actually paid instead of whatever the shared snapshot key holds by
-    /// then. `None`/zero when the pool did not build the coinbase
-    /// (`SetCustomMiningJob`) or the job path carries no fingerprint.
+    /// job the winning share was built on. Both group-ledger paths look the
+    /// distribution up under it, so what gets booked is what the coinbase
+    /// actually paid instead of whatever a shared snapshot key holds by then —
+    /// PPLNS on the apply side, Group-Solo when the Core stamps
+    /// `groupsolo_snapshot`. `None`/zero when the pool did not build the
+    /// coinbase (`SetCustomMiningJob`) or the job path carries no fingerprint.
+    ///
+    /// Named for PPLNS because that is where it started; the name is on the
+    /// wire format of a stream other processes replay, so it stays.
     #[serde(default)]
     pub pplns_payouts_fingerprint: Option<[u8; 32]>,
 }
@@ -390,43 +394,28 @@ impl TdpBlockSubmissionSink {
             }
         }
 
-        // Group-Solo: freeze the exact distribution into the event so the
-        // apply side (an async Satellite under the split) applies what the
-        // coinbase paid instead of reading the per-(group, finder) Redis
-        // snapshot, which continuous template rebuilds overwrite before the
-        // apply runs. Built here on the Core at the block-found instant —
-        // exact reward, freshest round. Best-effort: a build failure leaves it
-        // `None` and the apply falls back to the Redis read.
-        let groupsolo_snapshot = match (resolved.mode, reward_sats, resolved.group_id.as_deref()) {
-            (MiningMode::GroupSolo, Some(reward), Some(gid_str)) => {
-                match (
-                    self.applier.group_solo.as_ref(),
-                    AddressId::new(address.clone()),
-                    uuid::Uuid::parse_str(gid_str),
-                ) {
-                    (Some(engine), Ok(finder), Ok(group_uuid)) => {
-                        match engine
-                            .snapshot_for_block_found(group_uuid, reward, &finder)
-                            .await
-                        {
-                            Ok(snap) => Some(snap),
-                            Err(err) => {
-                                warn!(
-                                    %err,
-                                    address = %address,
-                                    group_id = gid_str,
-                                    height,
-                                    "block-found: Group-Solo snapshot freeze failed — apply falls \
-                                     back to the Redis snapshot"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
+        // Group-Solo: stamp the distribution the winning job's coinbase pays
+        // into the event, looked up by that job's payout-list fingerprint, so
+        // the apply side (an async Satellite under the split) books exactly
+        // that. Neither of the two things it replaces is safe: the
+        // per-(group, finder) Redis key is overwritten by continuous template
+        // rebuilds before the apply runs, and rebuilding the distribution here
+        // runs against a round that any share since job-issue has moved.
+        // `None` here means the block is NOT booked automatically.
+        // A zeroed fingerprint means the pool did not build this coinbase
+        // (`SetCustomMiningJob`) — there is no distribution of ours to find.
+        let job_payouts_fingerprint = pplns_payouts_fingerprint.filter(|fp| fp != &[0u8; 32]);
+        let groupsolo_snapshot = if resolved.mode == MiningMode::GroupSolo {
+            self.resolve_group_solo_distribution(
+                &address,
+                resolved.group_id.as_deref(),
+                reward_sats,
+                job_payouts_fingerprint,
+                height,
+            )
+            .await
+        } else {
+            None
         };
 
         let event = BlockFoundEvent {
@@ -466,6 +455,86 @@ impl TdpBlockSubmissionSink {
                 }
             },
             None => self.applier.apply_block_found(&event).await,
+        }
+    }
+
+    /// Resolve the distribution a Group-Solo block's coinbase pays, for the
+    /// event the apply side consumes.
+    ///
+    /// `None` means the block will not be booked, so every way of getting there
+    /// says which one it was — the operator's next step differs sharply between
+    /// them. A JD-client coinbase (zero fingerprint) must NOT be reprocessed at
+    /// all: the pool did not build it. A Redis miss must be reprocessed from the
+    /// block's own coinbase. A config or parse fault is a pool bug.
+    async fn resolve_group_solo_distribution(
+        &self,
+        address: &str,
+        group_id: Option<&str>,
+        reward_sats: Option<u64>,
+        payouts_fingerprint: Option<[u8; 32]>,
+        height: i32,
+    ) -> Option<StoredSnapshot> {
+        let Some(engine) = self.applier.group_solo.as_ref() else {
+            warn!(
+                address,
+                height, "block-found: Group-Solo mode but the engine is not configured"
+            );
+            return None;
+        };
+        let Some(reward) = reward_sats else {
+            warn!(
+                address,
+                height, "block-found: Group-Solo block carries no reward — cannot resolve"
+            );
+            return None;
+        };
+        let Some(group_id_str) = group_id else {
+            warn!(
+                address,
+                height, "block-found: Group-Solo mode but the mode-gate returned no group_id"
+            );
+            return None;
+        };
+        let Some(fingerprint) = payouts_fingerprint else {
+            warn!(
+                address,
+                group_id = group_id_str,
+                height,
+                "block-found: Group-Solo job carries no payout fingerprint — the pool did not \
+                 build this coinbase (JD-client custom job), so there is no pool-side \
+                 distribution to book. Do NOT reprocess."
+            );
+            return None;
+        };
+        let (Ok(finder), Ok(group_uuid)) = (
+            AddressId::new(address.to_string()),
+            uuid::Uuid::parse_str(group_id_str),
+        ) else {
+            warn!(
+                address,
+                group_id = group_id_str,
+                height,
+                "block-found: Group-Solo finder address or group_id failed to parse"
+            );
+            return None;
+        };
+        match engine
+            .snapshot_for_block_found(group_uuid, reward, &finder, &fingerprint)
+            .await
+        {
+            Ok(snap) => Some(snap),
+            Err(err) => {
+                error!(
+                    %err,
+                    address,
+                    group_id = group_id_str,
+                    height,
+                    fingerprint = %hex::encode(fingerprint),
+                    "block-found: Group-Solo distribution lookup failed — the block is NOT booked \
+                     and must be reprocessed from its own coinbase"
+                );
+                None
+            }
         }
     }
 }
@@ -613,12 +682,19 @@ impl BlockFoundApplier {
     }
 
     /// Group-Solo block-found: confirmation-gate (park the frozen snapshot until
-    /// the block reaches `confirmation_depth`) when a Redis store, a block hash,
-    /// AND the event-carried snapshot are all present — the watcher applies it on
-    /// confirmation and discards it on orphan, so an orphan / non-chain-extending
-    /// candidate never books a phantom into the group ledger. Falls back to an
-    /// immediate apply when gating isn't possible (no Redis / no hash / no
-    /// snapshot), so a block's distribution is never silently lost.
+    /// the block reaches `confirmation_depth`) when a Redis store and a block
+    /// hash are both present — the watcher applies it on confirmation and
+    /// discards it on orphan, so an orphan / non-chain-extending candidate never
+    /// books a phantom into the group ledger. Falls back to an immediate apply
+    /// when gating isn't possible (no Redis / no hash), so a block's
+    /// distribution is never silently lost.
+    ///
+    /// The `snapshot` is the distribution the block's coinbase pays, resolved
+    /// from the winning job's payout list. Nothing here may substitute another
+    /// one: the alternatives (the last-writer-wins per-(group, finder) Redis
+    /// key, or a rebuild against a round that has since moved) both book a
+    /// distribution the chain did not pay, and unlike PPLNS nothing downstream
+    /// would catch it. Unresolved → the caller does not book at all.
     #[allow(clippy::too_many_arguments)]
     async fn gate_or_apply_group_solo(
         &self,
@@ -629,10 +705,10 @@ impl BlockFoundApplier {
         height: i32,
         reward: u64,
         block_hash_hex: Option<&str>,
-        snapshot: Option<StoredSnapshot>,
+        snapshot: StoredSnapshot,
     ) {
-        match (self.redis.as_ref(), block_hash_hex, snapshot) {
-            (Some(redis), Some(block_hash), Some(snap)) => {
+        match (self.redis.as_ref(), block_hash_hex) {
+            (Some(redis), Some(block_hash)) => {
                 let pending = PendingGroupSoloBlock {
                     block_hash: block_hash.to_string(),
                     found_at_ms: chrono::Utc::now().timestamp_millis(),
@@ -640,7 +716,7 @@ impl BlockFoundApplier {
                     finder: address.as_str().to_string(),
                     block_height: height,
                     block_reward_sats: reward,
-                    snapshot: snap.clone(),
+                    snapshot: snapshot.clone(),
                 };
                 let mut conn = redis.clone();
                 if let Err(err) = put_pending_group_solo_block(&mut conn, &pending).await {
@@ -653,7 +729,7 @@ impl BlockFoundApplier {
                         address,
                         height,
                         reward,
-                        Some(snap),
+                        snapshot,
                     )
                     .await;
                     return;
@@ -664,7 +740,7 @@ impl BlockFoundApplier {
                     "block-found: Group-Solo distribution frozen, awaiting confirmations before ledger apply"
                 );
             }
-            (_, _, snap) => {
+            _ => {
                 if self.redis.is_none() {
                     warn!(group_id = group_id_str, height,
                         "block-found: Group-Solo confirmation-gating unavailable (no Redis); applying immediately");
@@ -679,15 +755,15 @@ impl BlockFoundApplier {
                     address,
                     height,
                     reward,
-                    snap,
+                    snapshot,
                 )
                 .await;
             }
         }
     }
 
-    /// Immediate (non-gated) Group-Solo apply: the event-carried snapshot when
-    /// present (race-free), else the engine's Redis-snapshot read (fallback).
+    /// Immediate (non-gated) Group-Solo apply of the distribution the block's
+    /// coinbase pays.
     #[allow(clippy::too_many_arguments)]
     async fn apply_group_solo_now(
         &self,
@@ -697,22 +773,11 @@ impl BlockFoundApplier {
         address: &AddressId,
         height: i32,
         reward: u64,
-        snapshot: Option<StoredSnapshot>,
+        snapshot: StoredSnapshot,
     ) {
-        let applied = match snapshot {
-            Some(snap) => {
-                engine
-                    .on_block_found_with_snapshot(group_uuid, height, reward, address, snap.into())
-                    .await
-            }
-            None => {
-                warn!(group_id = group_id_str, height,
-                    "block-found: Group-Solo event carried no snapshot — falling back to the raceable Redis snapshot read");
-                engine
-                    .on_block_found(group_uuid, height, reward, address)
-                    .await
-            }
-        };
+        let applied = engine
+            .on_block_found_with_snapshot(group_uuid, height, reward, address, snapshot.into())
+            .await;
         match applied {
             Ok(outcome) => info!(
                 group_id = group_id_str,
@@ -913,21 +978,42 @@ impl BlockFoundApplier {
                                 return;
                             }
                         };
-                        // Confirmation-gate (park until confirmed) when possible,
-                        // else apply immediately — mirrors the PPLNS arm so an
-                        // orphan / non-chain-extending candidate never books a
-                        // phantom into the group ledger.
-                        self.gate_or_apply_group_solo(
-                            engine,
-                            group_uuid,
-                            group_id_str,
-                            &address,
-                            height,
-                            reward,
-                            block_hash_hex.as_deref(),
-                            event.groupsolo_snapshot.clone(),
-                        )
-                        .await;
+                        // Without the distribution the block's coinbase pays
+                        // there is nothing safe to book: the substitutes all
+                        // claim on-chain payments the chain did not make, and
+                        // Group-Solo has no reward check that would notice.
+                        match event.groupsolo_snapshot.clone() {
+                            // Confirmation-gate (park until confirmed) when
+                            // possible, else apply immediately — mirrors the
+                            // PPLNS arm so an orphan / non-chain-extending
+                            // candidate never books a phantom into the group
+                            // ledger.
+                            Some(snapshot) => {
+                                self.gate_or_apply_group_solo(
+                                    engine,
+                                    group_uuid,
+                                    group_id_str,
+                                    &address,
+                                    height,
+                                    reward,
+                                    block_hash_hex.as_deref(),
+                                    snapshot,
+                                )
+                                .await;
+                            }
+                            // Deliberately falls through to the notification
+                            // below rather than returning: a block nobody can
+                            // book is exactly the one the operator has to hear
+                            // about. The Core logged which of the reasons it
+                            // was; see `resolve_group_solo_distribution`.
+                            None => error!(
+                                address = address_str,
+                                group_id = group_id_str,
+                                height,
+                                "block-found: Group-Solo event carried no distribution — NOT \
+                                 booked, needs an operator reprocess"
+                            ),
+                        }
                     }
                     (None, _) => warn!(
                         address = address_str,
