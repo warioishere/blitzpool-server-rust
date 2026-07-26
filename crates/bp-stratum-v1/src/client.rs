@@ -133,7 +133,10 @@ impl<C: Clock> SessionState<C> {
             port_config.target_shares_per_minute,
             port_config.minimum_difficulty,
         )
-        .with_silence_easing(server_config.vardiff_silence_easing);
+        .with_silence_easing(server_config.vardiff_silence_easing)
+        // The engine needs to know what the session is quiet AT before its
+        // first share, and on SV1 that is purely the configured start.
+        .with_initial_difficulty(initial);
 
         Self {
             session_id_hex,
@@ -419,6 +422,7 @@ fn flush_init<C: Clock>(
             state.diff_change_job_id = Some(registry.peek_next_job_id());
             state.session_difficulty = new_diff;
             state.pending_session_difficulty = Some(new_diff);
+            state.vardiff.note_difficulty_assigned(new_diff);
             out.push_event(SessionEvent::DifficultyChanged {
                 old: state.old_session_difficulty,
                 new: new_diff,
@@ -558,6 +562,7 @@ pub fn handle_suggest_difficulty<C: Clock>(
     }
     state.session_difficulty = new_diff;
     state.pending_session_difficulty = Some(new_diff);
+    state.vardiff.note_difficulty_assigned(new_diff);
     state.used_suggested_difficulty = true;
     out.push_frame(write_set_difficulty(new_diff));
     out
@@ -687,6 +692,7 @@ pub fn apply_vardiff_check<C: Clock>(
     state.diff_change_job_id = Some(registry.peek_next_job_id());
     state.session_difficulty = target;
     state.pending_session_difficulty = Some(target);
+    state.vardiff.note_difficulty_assigned(target);
     out.push_event(SessionEvent::DifficultyChanged {
         old: previous,
         new: target,
@@ -1350,6 +1356,64 @@ mod tests {
             clock.advance_ms(10_000);
         }
         (state, sc, port)
+    }
+
+    /// SV1 has no hashrate advertisement, so an over-assigned session is
+    /// simply one that connected to a port whose start difficulty it cannot
+    /// reach. Before the descent it hung there forever; now the same switch
+    /// walks it down, and the reduction reaches the wire.
+    #[test]
+    fn a_session_with_no_share_ever_is_eased_down_on_the_wire() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut sc = server_config();
+        sc.vardiff_silence_easing = true;
+        let port = solo_port(1_000_000.0); // a high-diff port
+        let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
+        // No update_hash_rate call anywhere: not one share was ever accepted.
+        clock.advance_ms(61_000);
+        let out = apply_vardiff_check(
+            &mut state,
+            &sc,
+            &port,
+            &empty_registry(),
+            &MiningJobCache::new(),
+            None,
+            &[],
+            clock.now_ms(),
+        );
+        let frame = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        assert!(
+            frame.contains("mining.set_difficulty"),
+            "expected a set_difficulty frame, got {frame}"
+        );
+        assert!(
+            state.session_difficulty < 1_000_000.0,
+            "session stayed at {}",
+            state.session_difficulty
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_share_ever_holds_when_the_switch_is_off() {
+        let clock = Arc::new(TestClock::new(0));
+        let sc = server_config(); // easing off
+        let port = solo_port(1_000_000.0);
+        let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
+        for _ in 0..15 {
+            clock.advance_ms(60_000);
+            let out = apply_vardiff_check(
+                &mut state,
+                &sc,
+                &port,
+                &empty_registry(),
+                &MiningJobCache::new(),
+                None,
+                &[],
+                clock.now_ms(),
+            );
+            assert!(out.outbound_frames.is_empty());
+        }
+        assert_eq!(state.session_difficulty, 1_000_000.0);
     }
 
     #[test]

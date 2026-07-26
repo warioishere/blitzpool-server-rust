@@ -681,14 +681,18 @@ impl<C: Clock + Clone> MiningSessionState<C> {
 
     /// A fresh classic vardiff engine for a newly opened channel, seeded
     /// from the connection's configured target shares/min and difficulty
-    /// floor.
-    fn new_channel_vardiff(&self) -> VarDiffEngine<C> {
+    /// floor, plus the difficulty the channel is actually opening at — the
+    /// engine needs the latter to reason about a channel that has not yet
+    /// produced a share, since that difficulty is the only thing its
+    /// silence can be measured against.
+    fn new_channel_vardiff(&self, assigned_difficulty: Difficulty) -> VarDiffEngine<C> {
         VarDiffEngine::new(
             self.clock.clone(),
             self.target_shares_per_minute,
             self.min_difficulty.as_f64(),
         )
         .with_silence_easing(self.vardiff_silence_easing)
+        .with_initial_difficulty(assigned_difficulty.as_f64())
     }
 }
 
@@ -887,7 +891,7 @@ pub fn handle_open_standard_mining_channel<C: Clock + Clone>(
         input.max_target,
     );
     state.channels.insert(channel_id, channel);
-    let engine = state.new_channel_vardiff();
+    let engine = state.new_channel_vardiff(ctx.assigned_difficulty);
     state.vardiff.insert(channel_id, engine);
     if state.primary_channel.is_none() {
         state.primary_channel = Some(channel_id);
@@ -1014,7 +1018,7 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
         input.max_target,
     );
     state.channels.insert(channel_id, channel);
-    let engine = state.new_channel_vardiff();
+    let engine = state.new_channel_vardiff(ctx.assigned_difficulty);
     state.vardiff.insert(channel_id, engine);
     if state.primary_channel.is_none() {
         state.primary_channel = Some(channel_id);
@@ -1506,6 +1510,17 @@ pub fn handle_update_channel<C: Clock>(
 ) -> HandlerOutcome {
     let target_shares_per_minute = state.target_shares_per_minute;
     let min_difficulty = state.min_difficulty;
+    let silence_easing = state.vardiff_silence_easing;
+
+    // A channel that has never had a share accepted has told us nothing we
+    // could verify — its assigned difficulty rests entirely on a declared
+    // `nominal_hash_rate`, and the vardiff may already have walked it down
+    // precisely because that declaration looks wrong.
+    let unproven = silence_easing
+        && state
+            .vardiff
+            .get(&input.channel_id)
+            .is_some_and(|e| !e.has_accepted_share());
 
     let Some(channel) = state.channels.get_mut(&input.channel_id) else {
         return HandlerOutcome::with_frame(OutboundFrame::UpdateChannelError {
@@ -1516,7 +1531,20 @@ pub fn handle_update_channel<C: Clock>(
 
     channel.declared_max_target = input.maximum_target;
 
-    let raw = hash_rate_to_difficulty(input.nominal_hash_rate as f64, target_shares_per_minute);
+    let mut raw = hash_rate_to_difficulty(input.nominal_hash_rate as f64, target_shares_per_minute);
+    if unproven && raw > channel.session_difficulty {
+        // Do not let the same unverified claim raise the difficulty back.
+        // A translator re-sends `UpdateChannel` every 60 s, so without this
+        // it overwrites the descent once a minute and a miner behind a
+        // proxy is never rescued — the descent would only ever help the one
+        // kind of miner that never sends this message.
+        //
+        // Only raises are refused; a LOWER declaration is always honoured,
+        // and this sits before `clamp_difficulty_to_max_target` so the
+        // spec MUST on `maximum_target` (§5.3.7) still wins, with the
+        // power-of-two rounding still last.
+        raw = channel.session_difficulty;
+    }
     let clamped = clamp_difficulty_to_max_target(raw, &Target::from_le_bytes(input.maximum_target));
     let new_diff = if clamped.as_f64() > MAX_REASONABLE_DIFFICULTY {
         // Keep the existing difficulty rather than accepting an
@@ -1544,6 +1572,9 @@ pub fn handle_update_channel<C: Clock>(
     }
     let old = channel.session_difficulty;
     channel.session_difficulty = new_diff;
+    if let Some(engine) = state.vardiff.get_mut(&input.channel_id) {
+        engine.note_difficulty_assigned(new_diff.as_f64());
+    }
     HandlerOutcome {
         outbound: vec![OutboundFrame::SetTarget {
             channel_id: input.channel_id,
@@ -1666,6 +1697,11 @@ pub fn apply_vardiff_check<C: Clock>(state: &mut MiningSessionState<C>) -> Handl
         if (clamped.as_f64() - channel.session_difficulty.as_f64()).abs() >= f64::EPSILON {
             let old = channel.session_difficulty;
             channel.session_difficulty = clamped;
+            // Tell the engine what was actually assigned, not what it
+            // suggested: the max_target clamp and the rounding both sit
+            // between the two, and a channel with no share yet measures
+            // its own silence against this value.
+            engine.note_difficulty_assigned(clamped.as_f64());
             outcome.push_frame(OutboundFrame::SetTarget {
                 channel_id: channel.channel_id,
                 maximum_target: difficulty_to_target(clamped).to_le_bytes(),
@@ -4203,6 +4239,176 @@ mod tests {
                 .any(|f| matches!(f, OutboundFrame::SetTarget { .. })),
             "an invalid-job reject must stamp the heartbeat and hold, not ease"
         );
+    }
+
+    // ── no-share descent (sv2-apps#647) ───────────────────────────
+
+    /// An eased session whose channel has NEVER submitted anything. Opens
+    /// at the fixture's 1024.
+    fn unproven_session(
+        clock: &Arc<TestClock>,
+        easing: bool,
+    ) -> MiningSessionState<Arc<TestClock>> {
+        let mut cfg = port_cfg();
+        cfg.vardiff_silence_easing = easing;
+        let mut s = MiningSessionState::new(clock.clone(), 1, cfg);
+        handle_setup_connection(&mut s, &good_setup());
+        let _ = handle_open_standard_mining_channel(
+            &mut s,
+            &open_std(1, &format!("{}.w", REGTEST_ADDR)),
+            vec![0; 4],
+        );
+        s
+    }
+
+    #[test]
+    fn a_channel_with_no_share_ever_is_eased_down_on_the_wire() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = unproven_session(&clock, true);
+        let cid = s.primary_channel.unwrap();
+        assert_eq!(s.channels[&cid].session_difficulty, Difficulty(1024.0));
+
+        clock.advance_ms(61_000); // past warmup, ~6 missed share gaps
+        let out = apply_vardiff_check(&mut s);
+        assert!(
+            out.outbound
+                .iter()
+                .any(|f| matches!(f, OutboundFrame::SetTarget { .. })),
+            "an unreachable difficulty must be walked down before the first share"
+        );
+        assert!(
+            s.channels[&cid].session_difficulty < Difficulty(1024.0),
+            "difficulty did not drop: {:?}",
+            s.channels[&cid].session_difficulty
+        );
+    }
+
+    #[test]
+    fn a_channel_with_no_share_ever_holds_when_the_switch_is_off() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = unproven_session(&clock, false);
+        let cid = s.primary_channel.unwrap();
+        for _ in 0..15 {
+            clock.advance_ms(60_000);
+            let out = apply_vardiff_check(&mut s);
+            assert!(
+                out.outbound.is_empty(),
+                "default-off must be byte-identical to the pre-descent behaviour"
+            );
+        }
+        assert_eq!(s.channels[&cid].session_difficulty, Difficulty(1024.0));
+    }
+
+    /// The reason the descent needs a guard at all: a translator re-sends
+    /// `UpdateChannel` every 60 s. Without this it overwrites the descent
+    /// once a minute and the miner behind the proxy is never rescued.
+    #[test]
+    fn update_channel_cannot_raise_an_unproven_channel_back_up() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = unproven_session(&clock, true);
+        let cid = s.primary_channel.unwrap();
+        clock.advance_ms(61_000);
+        let _ = apply_vardiff_check(&mut s);
+        let descended = s.channels[&cid].session_difficulty;
+        assert!(
+            descended < Difficulty(1024.0),
+            "precondition: descent moved"
+        );
+
+        // The same unverified claim, re-asserted. 1e12 H/s would derive
+        // ~4096 — well above where the descent has landed.
+        let out = handle_update_channel(
+            &mut s,
+            &UpdateChannelInput {
+                channel_id: cid,
+                nominal_hash_rate: 1e12,
+                maximum_target: [0xFF; 32],
+            },
+        );
+        assert!(
+            out.outbound.is_empty(),
+            "an unproven channel must not be raised back by its own declaration"
+        );
+        assert_eq!(s.channels[&cid].session_difficulty, descended);
+    }
+
+    #[test]
+    fn update_channel_may_still_lower_an_unproven_channel() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = unproven_session(&clock, true);
+        let cid = s.primary_channel.unwrap();
+        clock.advance_ms(61_000);
+        let _ = apply_vardiff_check(&mut s);
+        let descended = s.channels[&cid].session_difficulty;
+
+        // A proxy that now declares LESS is telling us something new, and
+        // it points the same way the evidence does. Always honoured.
+        let _ = handle_update_channel(
+            &mut s,
+            &UpdateChannelInput {
+                channel_id: cid,
+                nominal_hash_rate: 1_000.0,
+                maximum_target: [0xFF; 32],
+            },
+        );
+        assert!(
+            s.channels[&cid].session_difficulty < descended,
+            "a lower declaration must still be honoured"
+        );
+    }
+
+    /// The guard sits BEFORE the max_target clamp, so the spec MUST in
+    /// §5.3.7 still wins: a downstream that requests a harder target gets
+    /// it even while the channel is unproven.
+    #[test]
+    fn update_channel_max_target_still_overrides_the_guard() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = unproven_session(&clock, true);
+        let cid = s.primary_channel.unwrap();
+        clock.advance_ms(61_000);
+        let _ = apply_vardiff_check(&mut s);
+        let descended = s.channels[&cid].session_difficulty;
+
+        let _ = handle_update_channel(
+            &mut s,
+            &UpdateChannelInput {
+                channel_id: cid,
+                nominal_hash_rate: 1e12,
+                maximum_target: difficulty_to_target(Difficulty(8192.0)).to_le_bytes(),
+            },
+        );
+        assert!(
+            s.channels[&cid].session_difficulty > descended,
+            "maximum_target is a MUST and must survive the no-raise guard"
+        );
+    }
+
+    /// Once a share IS accepted the channel is proven and the ordinary
+    /// `UpdateChannel` behaviour returns — the guard must not become a
+    /// permanent ceiling.
+    #[test]
+    fn update_channel_raises_freely_once_a_share_was_accepted() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = unproven_session(&clock, true);
+        let cid = s.primary_channel.unwrap();
+        s.vardiff
+            .get_mut(&cid)
+            .unwrap()
+            .update_hash_rate(1024.0, true);
+
+        let out = handle_update_channel(
+            &mut s,
+            &UpdateChannelInput {
+                channel_id: cid,
+                nominal_hash_rate: 1e12,
+                maximum_target: [0xFF; 32],
+            },
+        );
+        assert!(
+            !out.outbound.is_empty(),
+            "a proven channel must follow its declaration again"
+        );
+        assert!(s.channels[&cid].session_difficulty > Difficulty(1024.0));
     }
 
     // ── inline vardiff cooldown ───────────────────────────────────
