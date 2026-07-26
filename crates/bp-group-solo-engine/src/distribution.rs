@@ -88,6 +88,15 @@ pub struct DistributionResult {
     /// own coinbase pays instead of building a fresh one against a round that
     /// has moved. See [`bp_share::payouts_fingerprint_from_parts`].
     pub payouts_fingerprint: [u8; 32],
+    /// Did the snapshot under `payouts_fingerprint` actually get written?
+    ///
+    /// `false` means the build succeeded but its snapshot did not land (after
+    /// retries), so the fingerprint names a key that does not exist. The
+    /// distribution still becomes a coinbase — failing the build would hand the
+    /// finder a solo job paying itself the group's block. But a caller that
+    /// promises a found block will be booked automatically MUST NOT promise on a
+    /// `false`; the booking would resolve to nothing.
+    pub snapshot_written: bool,
 }
 
 /// Engine-wide knobs for the distribution path. Per-group settings
@@ -303,17 +312,23 @@ async fn compute_distribution(
             config.snapshot_ttl_secs,
         ),
     );
-    if let Err(err) = by_fingerprint {
-        error!(
-            %err,
-            %group_id,
-            block_reward_sats,
-            fingerprint = %hex::encode(payouts_fingerprint),
-            "group-solo snapshot write failed after retries — the coinbase distribution stands, \
-             but a block found on this job cannot be booked automatically and needs operator \
-             reprocessing from the block's own coinbase"
-        );
-    }
+    // The by-fingerprint write is the one a booking resolves, so it alone
+    // decides whether this build may be vouched for.
+    let snapshot_written = match by_fingerprint {
+        Ok(()) => true,
+        Err(err) => {
+            error!(
+                %err,
+                %group_id,
+                block_reward_sats,
+                fingerprint = %hex::encode(payouts_fingerprint),
+                "group-solo snapshot write failed after retries — the coinbase distribution \
+                 stands, but a block found on this job cannot be booked automatically and needs \
+                 operator reprocessing from the block's own coinbase"
+            );
+            false
+        }
+    };
     if let Err(err) = by_finder {
         warn!(%err, %group_id, "group-solo per-finder snapshot write failed");
     }
@@ -326,6 +341,7 @@ async fn compute_distribution(
         balance_after: math.balance_after,
         block_reward_sats,
         payouts_fingerprint,
+        snapshot_written,
     })
 }
 
@@ -418,6 +434,7 @@ mod tests {
             balance_after: HashMap::new(),
             block_reward_sats: 312_500_000,
             payouts_fingerprint: [0u8; 32],
+            snapshot_written: true,
         };
         let cloned = r.clone();
         assert_eq!(cloned.block_reward_sats, 312_500_000);

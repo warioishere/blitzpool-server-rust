@@ -126,6 +126,17 @@ pub struct DistributionResult {
     /// Exposed so callers (and tests) can name the key this distribution
     /// landed under. See [`bp_share::payouts_fingerprint_from_parts`].
     pub payouts_fingerprint: [u8; 32],
+    /// Did the snapshot under `payouts_fingerprint` actually get written?
+    ///
+    /// `false` means this build succeeded but its snapshot did not land, so
+    /// `payouts_fingerprint` names a key that does not exist. The distribution
+    /// is still correct and still becomes a coinbase — failing the build over a
+    /// lost snapshot would hand the miner a solo job paying itself the whole
+    /// block, which is far worse. But a caller that promises a found block will
+    /// be booked automatically MUST NOT make that promise on a `false`: the
+    /// booking would resolve a fingerprint to nothing and need an operator
+    /// reprocess anyway, after the pool already said it was covered.
+    pub snapshot_written: bool,
 }
 
 /// Knobs for the distribution path. Built from
@@ -365,18 +376,22 @@ async fn build_from_inputs(
     // handed a job paying 100 % of the block to itself. Losing the snapshot
     // costs a manual reprocess if a block lands on this job — losing the
     // distribution costs the pool's miners the whole block, irreversibly.
-    if let Err(err) = window
+    let snapshot_written = match window
         .write_snapshot_for(&payouts_fingerprint, &snapshot, config.snapshot_ttl_secs)
         .await
     {
-        warn!(
-            %err,
-            block_reward_sats,
-            "PPLNS snapshot write failed — the coinbase distribution stands, but a \
-             block found on this job cannot be booked automatically and needs \
-             operator reprocessing"
-        );
-    }
+        Ok(()) => true,
+        Err(err) => {
+            warn!(
+                %err,
+                block_reward_sats,
+                "PPLNS snapshot write failed — the coinbase distribution stands, but a \
+                 block found on this job cannot be booked automatically and needs \
+                 operator reprocessing"
+            );
+            false
+        }
+    };
 
     Ok(DistributionResult {
         payouts: math.payouts,
@@ -384,6 +399,7 @@ async fn build_from_inputs(
         balance_after: math.balance_after,
         block_reward_sats,
         payouts_fingerprint,
+        snapshot_written,
     })
 }
 
@@ -458,6 +474,7 @@ mod tests {
             balance_after: HashMap::new(),
             block_reward_sats: 312_500_000,
             payouts_fingerprint: [0u8; 32],
+            snapshot_written: true,
         };
         let cloned = result.clone();
         assert_eq!(cloned.block_reward_sats, 312_500_000);

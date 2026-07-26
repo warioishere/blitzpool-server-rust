@@ -250,14 +250,24 @@ async fn sv1_solo_connection_routes_to_solo_stream_and_block_accepted() {
         .get("params")
         .and_then(|v| v.as_array())
         .expect("params");
-    let job_id_hex = params[0].as_str().expect("jobId").to_string();
-    let ntime_hex = params[7].as_str().expect("ntime").to_string();
+    let mut job_id_hex = params[0].as_str().expect("jobId").to_string();
+    let mut ntime_hex = params[7].as_str().expect("ntime").to_string();
 
     // Submit nonces until the chain advances (a block landed via the Solo
     // handle) or we exhaust the budget. ~50% of nonces are block candidates on
     // regtest, so this lands within a few iterations.
+    //
+    // The submit responses are classified rather than dropped, and a
+    // `mining.notify` arriving mid-run replaces the job being mined. Both matter
+    // under load: a run that takes long enough to cross a template change was
+    // otherwise still submitting against the first job, every submit came back
+    // `job not found`, and the failure surfaced only as "height did not rise"
+    // with no indication why.
     let before = node.current_height().await.expect("height");
     let mut landed = None;
+    let mut accepted = 0usize;
+    let mut rejected: Vec<String> = Vec::new();
+    let mut renotified = 0usize;
     for nonce in 0u32..64 {
         let line = format!(
             "{{\"id\":{},\"method\":\"mining.submit\",\"params\":[\"{REGTEST_ADDR}.x\",\"{job_id_hex}\",\"0000000000000000\",\"{ntime_hex}\",\"{nonce:08x}\",\"00000000\"]}}\n",
@@ -267,8 +277,35 @@ async fn sv1_solo_connection_routes_to_solo_stream_and_block_accepted() {
             .write_all(line.as_bytes())
             .await
             .expect("write submit");
-        // Drain the submit response (id 100+nonce). Best-effort.
-        let _ = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut reader)).await;
+        // Read until this submit's own response shows up, taking any job
+        // refresh that overtakes it on the way.
+        let want_id = 100 + nonce as u64;
+        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let f = read_frame(&mut reader).await;
+                if f.get("method").and_then(|m| m.as_str()) == Some("mining.notify") {
+                    if let Some(p) = f.get("params").and_then(|v| v.as_array()) {
+                        if let (Some(j), Some(t)) = (p[0].as_str(), p[7].as_str()) {
+                            job_id_hex = j.to_string();
+                            ntime_hex = t.to_string();
+                            renotified += 1;
+                        }
+                    }
+                    continue;
+                }
+                if f.get("id").and_then(|i| i.as_u64()) == Some(want_id) {
+                    if f.get("result").and_then(|r| r.as_bool()) == Some(true) {
+                        accepted += 1;
+                    } else {
+                        rejected.push(f.get("error").map(|e| e.to_string()).unwrap_or_else(|| {
+                            format!("result={}", f.get("result").unwrap_or(&Value::Null))
+                        }));
+                    }
+                    return;
+                }
+            }
+        })
+        .await;
         if let Some(h) = poll_for_height(&node, before + 1, Duration::from_secs(2)).await {
             landed = Some(h);
             break;
@@ -284,7 +321,14 @@ async fn sv1_solo_connection_routes_to_solo_stream_and_block_accepted() {
     let recorded = recorded.lock().unwrap().clone();
     node.shutdown().await.ok();
 
-    eprintln!("[solo-stream] recorded streams = {recorded:?}, height {before} → {after}");
+    eprintln!(
+        "[solo-stream] recorded streams = {recorded:?}, height {before} → {after}, \
+         submits accepted={accepted} rejected={} job-refreshes={renotified}",
+        rejected.len()
+    );
+    if !rejected.is_empty() {
+        eprintln!("[solo-stream] rejection reasons = {rejected:?}");
+    }
     assert!(
         recorded.contains(&StreamKind::Solo),
         "block-submit must be routed via the Solo stream (run_connection swap); recorded {recorded:?}"
@@ -295,7 +339,10 @@ async fn sv1_solo_connection_routes_to_solo_stream_and_block_accepted() {
     );
     assert!(
         after > before,
-        "bitcoin-core must accept the Solo-stream block via the Solo handle (height {before} → {after})"
+        "bitcoin-core must accept the Solo-stream block via the Solo handle \
+         (height {before} → {after}; submits accepted={accepted} rejected={} \
+         job-refreshes={renotified}; rejections={rejected:?})",
+        rejected.len()
     );
 }
 

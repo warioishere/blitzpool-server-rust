@@ -57,7 +57,9 @@ use crate::extensions::{RequestExtensions, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYO
 use crate::tokens::{Token, TokenAllocError, TokenStore};
 
 use super::declarations::{DeclaredJob, DeclaredJobStore};
-use super::dynamic_outputs::{DeclareOutputsCheck, EmittedPayoutOutputs, PayoutOutputsTracker};
+use super::dynamic_outputs::{
+    DeclareOutputsCheck, EmittedPayoutOutputs, PayoutBooking, PayoutOutputsTracker,
+};
 use super::tx_validation::{
     merge_provided_with_known, partition_against_template, PendingDeclaration,
 };
@@ -227,8 +229,18 @@ pub struct AllocateTokenContext {
 /// layer.
 #[derive(Clone, Debug)]
 pub enum PayoutOutputsResolution {
-    Success { request_id: u32, outputs: Vec<u8> },
-    Error { request_id: u32, error_code: String },
+    Success {
+        request_id: u32,
+        outputs: Vec<u8>,
+        /// How to book a block found on this set, when the resolver can
+        /// vouch for one. `None` means the block will not be booked
+        /// automatically — see [`PayoutBooking`].
+        booking: Option<PayoutBooking>,
+    },
+    Error {
+        request_id: u32,
+        error_code: String,
+    },
 }
 
 // ── OutboundFrame ───────────────────────────────────────────────────
@@ -361,6 +373,10 @@ pub enum JdpSessionEvent {
         nonce: u32,
         /// Block-header `n_bits` field.
         n_bits: u32,
+        /// How to book this block, carried from the declare-time proof that
+        /// the JDC's coinbase pays the pool's issued payout set. `None` →
+        /// report the block, book nothing.
+        booking: Option<PayoutBooking>,
     },
     /// The connection should be closed. Emitted on protocol /
     /// version mismatch in `SetupConnection`. IO layer closes the
@@ -711,6 +727,7 @@ pub fn handle_request_payout_outputs(
         PayoutOutputsResolution::Success {
             request_id: _,
             outputs,
+            booking,
         } => {
             // Stamp the current epoch BEFORE recording so the fresh set
             // isn't immediately flagged stale; a later chain-tip advance
@@ -728,6 +745,7 @@ pub fn handle_request_payout_outputs(
                     emitted_at_ms: now_ms,
                     used: false,
                     stale: false,
+                    booking,
                 },
             );
             // Surface the issued set so the IO layer records it in the
@@ -935,6 +953,10 @@ fn accept_declaration(
     // coinbase-output backstop, so falling through would let a JDC keep
     // the full reward. When 0x0003 wasn't negotiated at all, this is a
     // plain base-protocol declaration and the block below is skipped.
+    // How a block found on this job gets booked. Only ever `Some` once the
+    // declared coinbase has been shown to carry the pool's issued outputs
+    // verbatim — the JDC owns its coinbase, so nothing else is proof.
+    let mut declared_booking: Option<PayoutBooking> = None;
     if state
         .negotiated_extensions
         .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
@@ -948,7 +970,7 @@ fn accept_declaration(
             .payout_outputs_tracker
             .validate_and_consume_for_declare(&original_token, &input.coinbase_tx_suffix);
         match check {
-            DeclareOutputsCheck::Ok => {}
+            DeclareOutputsCheck::Ok { booking } => declared_booking = booking,
             DeclareOutputsCheck::NoneIssued => {
                 // 0x0003 is negotiated, so every declared job MUST carry a
                 // freshly-requested payout set (spec §4: the JDC "MUST
@@ -1021,6 +1043,7 @@ fn accept_declaration(
         raw_transactions,
         prev_hash: current_prev_hash,
         declared_at_ms: now_ms,
+        booking: declared_booking,
     });
 
     JdpHandlerOutcome {
@@ -1085,6 +1108,7 @@ pub fn handle_push_solution(
     // copy out the bytes we need so the borrow can drop before
     // building the outcome.
     let new_token = job.new_token;
+    let booking = job.booking;
     let coinbase_prefix = job.coinbase_tx_prefix.clone();
     let coinbase_suffix = job.coinbase_tx_suffix.clone();
     let wtxid_count = job.wtxid_list.len();
@@ -1115,6 +1139,7 @@ pub fn handle_push_solution(
         events: vec![JdpSessionEvent::BlockSubmissionCandidate {
             miner_address,
             new_token,
+            booking,
             coinbase_raw,
             transactions,
             prev_hash: input.prev_hash,
@@ -1456,6 +1481,7 @@ mod tests {
         let resolution = PayoutOutputsResolution::Success {
             request_id: 1,
             outputs: vec![0u8; 32],
+            booking: None,
         };
         let out =
             handle_request_payout_outputs(&mut s, &input, resolution, Some([0xAB; 32]), 2_000);
@@ -1493,6 +1519,7 @@ mod tests {
         let resolution = PayoutOutputsResolution::Success {
             request_id: 2,
             outputs: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            booking: None,
         };
         let out =
             handle_request_payout_outputs(&mut s, &input, resolution, Some([0xAB; 32]), 2_000);
@@ -1550,6 +1577,7 @@ mod tests {
         let resolution = PayoutOutputsResolution::Success {
             request_id: 999,
             outputs: vec![0xAB; 4],
+            booking: None,
         };
         let out =
             handle_request_payout_outputs(&mut s, &input, resolution, Some([0xAB; 32]), 2_000);
@@ -1581,6 +1609,7 @@ mod tests {
         let resolution = PayoutOutputsResolution::Success {
             request_id: 5,
             outputs: vec![],
+            booking: None,
         };
         let out = handle_request_payout_outputs(&mut s, &input, resolution, None, 0);
         match &out.outbound[0] {
@@ -1698,6 +1727,7 @@ mod tests {
             PayoutOutputsResolution::Success {
                 request_id: 2,
                 outputs: pool_outputs.clone(),
+                booking: None,
             },
             Some(prev_hash),
             2_000,
@@ -1778,6 +1808,7 @@ mod tests {
             PayoutOutputsResolution::Success {
                 request_id: 2,
                 outputs: pool_outputs.clone(),
+                booking: None,
             },
             Some([0xAA; 32]),
             2_000,

@@ -107,6 +107,10 @@ pub(crate) async fn spawn(
     bitcoin_rpc: BitcoinRpc,
     payout_resolver: Arc<ProductionPayoutResolver>,
     template_tx_cache: Option<Arc<TemplateTxCache>>,
+    // Books a JDC-found block against the distribution its coinbase was
+    // proven to pay. `None` on a deployment with no ledger fan-out wired —
+    // such a block is then reported but not booked.
+    ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
 ) -> Result<JdpHandles, JdpSpawnError> {
     if !cfg.sv2.jdp_enabled {
         info!("jdp: disabled (sv2.jdp_enabled = false)");
@@ -129,6 +133,7 @@ pub(crate) async fn spawn(
         template_tx_cache,
         network,
         cfg.sv2.jdp_orphan_submitblock,
+        ledger_booker,
     );
 
     let server = StratumV2JdpServer::spawn(server_cfg, noise, hooks, bridge);

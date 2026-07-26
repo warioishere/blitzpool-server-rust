@@ -277,6 +277,34 @@ impl TdpBlockSubmissionSink {
         self
     }
 
+    /// Book a block whose coinbase the pool did NOT build — a JDC declared the
+    /// job and owns its coinbase; the pool only issued the payout set, and the
+    /// ext-0x0003 declare-time check proved the coinbase carries it verbatim.
+    /// That proof is what `payouts_fingerprint` names, so the ledger books the
+    /// distribution the block actually paid rather than a rebuilt guess.
+    ///
+    /// `worker` is fixed to `jdp` — a declared job has no Stratum worker name.
+    pub(crate) async fn book_declared_block_found(
+        &self,
+        miner_address: String,
+        session_id: String,
+        reward_sats: u64,
+        block_hash: String,
+        block_data: String,
+        payouts_fingerprint: [u8; 32],
+    ) -> bool {
+        self.emit_block_found(
+            miner_address,
+            "jdp".to_string(),
+            session_id,
+            Some(reward_sats),
+            Some(block_hash),
+            block_data,
+            Some(payouts_fingerprint),
+        )
+        .await
+    }
+
     /// Convenience: wrap in `Arc<dyn BlockSubmissionSink>` so the
     /// caller can drop it directly into `bp_stratum_v1::ServerHooks
     /// { block_sink, … }`.
@@ -335,6 +363,16 @@ impl TdpBlockSubmissionSink {
     /// the payout Satellite to apply (falling back to an in-process
     /// [`BlockFoundApplier`] apply if the publish fails).
     #[allow(clippy::too_many_arguments)]
+    /// Returns whether the block-found reached the fan-out — i.e. an event was
+    /// built and either published or applied in-process. `false` means one of
+    /// the preconditions below was missing and **nothing at all was written**,
+    /// which a caller that dedups repeats has to be able to tell apart from a
+    /// completed emission: marking a block as handled on a `false` makes the
+    /// miner's payout unrecoverable in-process.
+    ///
+    /// It does not promise the ledger row itself landed. Past the fan-out every
+    /// step is best-effort and PG-idempotent, so a redelivery finishes the job;
+    /// before it, there is nothing to redeliver.
     async fn emit_block_found(
         &self,
         address: String,
@@ -344,7 +382,7 @@ impl TdpBlockSubmissionSink {
         block_hash: Option<String>,
         block_data: String,
         pplns_payouts_fingerprint: Option<[u8; 32]>,
-    ) {
+    ) -> bool {
         // Resolve the payout mode on the Core (the only side with the gate)
         // and stamp it onto the event so the apply side needs no gate.
         let Some(mode_gate) = self.mode_gate.as_ref() else {
@@ -352,7 +390,7 @@ impl TdpBlockSubmissionSink {
                 address = %address,
                 "block-found: SKIPPED (no mode-gate wired — Phase 7.4 transitional path)"
             );
-            return;
+            return false;
         };
         let resolved = mode_gate.lookup_mode(&address);
 
@@ -364,7 +402,7 @@ impl TdpBlockSubmissionSink {
                         address = %address,
                         "block-found: could not derive block height — skipping fan-out"
                     );
-                    return;
+                    return false;
                 }
             },
             None => {
@@ -372,7 +410,7 @@ impl TdpBlockSubmissionSink {
                     address = %address,
                     "block-found: no BitcoinRpc — skipping (engines need block_height)"
                 );
-                return;
+                return false;
             }
         };
 
@@ -456,6 +494,7 @@ impl TdpBlockSubmissionSink {
             },
             None => self.applier.apply_block_found(&event).await,
         }
+        true
     }
 
     /// Resolve the distribution a Group-Solo block's coinbase pays, for the

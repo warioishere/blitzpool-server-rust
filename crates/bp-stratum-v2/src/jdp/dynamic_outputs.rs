@@ -226,6 +226,28 @@ pub struct EmittedPayoutOutputs {
     /// issued under (its payout window is superseded). Marked by
     /// [`PayoutOutputsTracker::observe_epoch`].
     pub stale: bool,
+    /// What the pool needs to book a block found on this set, or `None`
+    /// when it cannot vouch for one (see [`PayoutBooking`]).
+    pub booking: Option<PayoutBooking>,
+}
+
+/// The pool-side accounting identity of an issued payout set.
+///
+/// A JDC builds and owns its own coinbase; the pool only hands it an output
+/// set. So a found block may only be booked once the declared coinbase has
+/// been shown to carry that set verbatim — which is exactly what
+/// [`PayoutOutputsTracker::validate_and_consume_for_declare`] establishes.
+/// This rides along on that proof so the block-found path can name the
+/// distribution instead of guessing at one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PayoutBooking {
+    /// Identity of the distribution these outputs pay — the key its snapshot
+    /// is stored under.
+    pub payouts_fingerprint: [u8; 32],
+    /// The reward the distribution was built over (the JDC's
+    /// `available_payout_value`), not the block's total coinbase value: the
+    /// JDC's own outputs are none of the pool's business.
+    pub block_reward_sats: u64,
 }
 
 // ── Declare-time validation outcome ─────────────────────────────────
@@ -239,8 +261,10 @@ pub enum DeclareOutputsCheck {
     /// neutral so a non-negotiated caller can fall through.
     NoneIssued,
     /// The pending set's outputs all appear in the declared coinbase;
-    /// the set has been marked used.
-    Ok,
+    /// the set has been marked used. Carries the issued set's
+    /// [`PayoutBooking`] — the declared coinbase has just been proven to
+    /// pay it, so a block found on this job can be booked against it.
+    Ok { booking: Option<PayoutBooking> },
     /// A pending set existed but the declared coinbase is missing /
     /// modifies / reduces the output at `index`.
     MissingOutput { index: usize },
@@ -370,21 +394,35 @@ impl PayoutOutputsTracker {
         token: &Token,
         coinbase_tx_suffix: &[u8],
     ) -> DeclareOutputsCheck {
-        let list = match self.by_token.get_mut(token) {
-            Some(l) if !l.is_empty() => l,
+        // Locate the entry to consume without holding a mutable borrow — the
+        // second-distribution check below has to read every token.
+        let idx = match self.by_token.get(token) {
+            Some(l) if !l.is_empty() => match l.iter().rposition(|e| !e.used) {
+                Some(i) => i,
+                None => return DeclareOutputsCheck::AlreadyUsed,
+            },
             _ => return DeclareOutputsCheck::NoneIssued,
         };
-        let entry = match list.iter_mut().rev().find(|e| !e.used) {
-            Some(e) => e,
-            None => return DeclareOutputsCheck::AlreadyUsed,
-        };
-        if entry.stale {
+        if self.by_token[token][idx].stale {
             return DeclareOutputsCheck::Stale;
         }
-        match declared_coinbase_contains_pool_outputs(coinbase_tx_suffix, &entry.outputs) {
+        match declared_coinbase_contains_pool_outputs(
+            coinbase_tx_suffix,
+            &self.by_token[token][idx].outputs,
+        ) {
             CoinbaseOutputCheck::Ok => {
+                let pays_a_second_distribution =
+                    self.coinbase_pays_a_second_distribution(coinbase_tx_suffix, token, idx);
+                let entry = &mut self.by_token.get_mut(token).expect("located above")[idx];
+                let booking = entry.booking;
                 entry.used = true;
-                DeclareOutputsCheck::Ok
+                DeclareOutputsCheck::Ok {
+                    booking: if pays_a_second_distribution {
+                        None
+                    } else {
+                        booking
+                    },
+                }
             }
             CoinbaseOutputCheck::MissingOutput { index } => {
                 DeclareOutputsCheck::MissingOutput { index }
@@ -397,6 +435,110 @@ impl PayoutOutputsTracker {
             }
         }
     }
+
+    /// Does this coinbase pay more pool-issued outputs than the set being
+    /// consumed accounts for?
+    ///
+    /// The containment check is a superset test, and rightly so — the JDC owns
+    /// the rest of its coinbase. But that means a coinbase can carry TWO sets
+    /// the pool issued while only one is consumed here: it would pay both
+    /// distributions and the pool would book one, leaving the other's recipients
+    /// credited nowhere.
+    ///
+    /// So the question is asked as a subtraction rather than a search. Take the
+    /// declared outputs as a multiset, remove the set being consumed, and see
+    /// whether any other issued set is STILL fully covered by what remains.
+    /// Asking it the other way round — "is another set contained in the
+    /// coinbase" — reports a false positive whenever two issued sets share
+    /// outputs, which is routine: re-request the same distribution, or a
+    /// single-recipient payout where the encoded bytes are simply identical.
+    /// The older set is then trivially "contained" in a coinbase that pays the
+    /// newer one exactly once, and a perfectly correct block goes unbooked.
+    ///
+    /// Every token is scanned, not just this one. A JDC can request payout
+    /// outputs under two tokens and declare one job whose coinbase carries both;
+    /// a per-token scan never sees the second one. Consumed and stale entries
+    /// count too — a coinbase paying a set that was already used, or one the
+    /// chain moved past, is still paying two distributions.
+    fn coinbase_pays_a_second_distribution(
+        &self,
+        coinbase_tx_suffix: &[u8],
+        consumed_token: &Token,
+        consumed_idx: usize,
+    ) -> bool {
+        // Parsed once here, then only multiset arithmetic per candidate.
+        let Some(declared) = parse_coinbase_suffix_outputs(coinbase_tx_suffix) else {
+            return true; // fail closed: cannot read it, cannot vouch for it
+        };
+        let Some(consumed) = decode_outputs(&self.by_token[consumed_token][consumed_idx].outputs)
+        else {
+            return true;
+        };
+        let mut remaining = output_multiset(&declared);
+        if !take_outputs(&mut remaining, &consumed) {
+            // The caller just verified containment, so this cannot happen —
+            // if it somehow does, withhold rather than guess.
+            return true;
+        }
+        for (tok, entries) in &self.by_token {
+            for (i, other) in entries.iter().enumerate() {
+                if tok == consumed_token && i == consumed_idx {
+                    continue;
+                }
+                let Some(outs) = decode_outputs(&other.outputs) else {
+                    continue;
+                };
+                // An empty set is vacuously contained in anything and would
+                // veto every booking.
+                if outs.is_empty() {
+                    continue;
+                }
+                if covers_outputs(&remaining, &outs) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Consensus-decode a tracked `Vec<TxOut>` blob.
+fn decode_outputs(consensus: &[u8]) -> Option<Vec<TxOut>> {
+    bitcoin::consensus::deserialize::<Vec<TxOut>>(consensus).ok()
+}
+
+/// Multiset of outputs keyed by consensus serialisation — the same key
+/// [`first_uncovered_committed_output`] uses, so ordering is irrelevant and
+/// multiplicity is honoured.
+fn output_multiset(outs: &[TxOut]) -> HashMap<Vec<u8>, usize> {
+    let mut m: HashMap<Vec<u8>, usize> = HashMap::with_capacity(outs.len());
+    for o in outs {
+        *m.entry(bitcoin::consensus::serialize(o)).or_insert(0) += 1;
+    }
+    m
+}
+
+/// Remove one occurrence of each of `outs` from `pool`. `false` (and a partially
+/// drained `pool`) when one was not available.
+fn take_outputs(pool: &mut HashMap<Vec<u8>, usize>, outs: &[TxOut]) -> bool {
+    for o in outs {
+        let key = bitcoin::consensus::serialize(o);
+        match pool.get_mut(&key) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Is every output of `outs` still available in `pool`, counting multiplicity?
+fn covers_outputs(pool: &HashMap<Vec<u8>, usize>, outs: &[TxOut]) -> bool {
+    let mut need: HashMap<Vec<u8>, usize> = HashMap::with_capacity(outs.len());
+    for o in outs {
+        *need.entry(bitcoin::consensus::serialize(o)).or_insert(0) += 1;
+    }
+    need.iter()
+        .all(|(key, count)| pool.get(key).copied().unwrap_or(0) >= *count)
 }
 
 // ── Declared-coinbase output validation (SV2 §6.4.3 / ext 0x0003) ─────
@@ -535,6 +677,7 @@ mod tests {
             emitted_at_ms: 0,
             used: false,
             stale: false,
+            booking: None,
         }
     }
 
@@ -698,13 +841,109 @@ mod tests {
         let decl = suffix(&outputs);
         assert_eq!(
             c.validate_and_consume_for_declare(&token, &decl),
-            DeclareOutputsCheck::Ok
+            DeclareOutputsCheck::Ok { booking: None }
         );
         // Single-use: the same token's set is now spent.
         assert_eq!(
             c.validate_and_consume_for_declare(&token, &decl),
             DeclareOutputsCheck::AlreadyUsed
         );
+    }
+
+    /// Helper: an issued set the pool WOULD vouch for, so the tests below can
+    /// tell "withheld" from "never promised".
+    fn vouched(request_id: u32, outputs: Vec<u8>) -> EmittedPayoutOutputs {
+        EmittedPayoutOutputs {
+            booking: Some(PayoutBooking {
+                payouts_fingerprint: [0x11; 32],
+                block_reward_sats: 5_000_000_000,
+            }),
+            ..resp(request_id, outputs)
+        }
+    }
+
+    /// Two issued sets that happen to be byte-identical — routine when a JDC
+    /// re-requests the same distribution, or when a single recipient takes the
+    /// whole payout. A coinbase paying that distribution ONCE is correct and
+    /// must stay bookable.
+    ///
+    /// The earlier shape of this guard asked "is another issued set contained in
+    /// this coinbase", which the identical older set answers yes to for free —
+    /// so a perfectly good block silently lost its booking.
+    #[test]
+    fn an_identical_reissued_set_does_not_withhold_the_booking() {
+        let mut c = PayoutOutputsTracker::new();
+        let token = tok(0x01);
+        let outputs = pool_set(600);
+        c.record(token, vouched(1, outputs.clone()));
+        c.record(token, vouched(2, outputs.clone()));
+
+        // The coinbase pays the distribution exactly once.
+        let decl = suffix(&outputs);
+        match c.validate_and_consume_for_declare(&token, &decl) {
+            DeclareOutputsCheck::Ok { booking } => assert!(
+                booking.is_some(),
+                "one distribution paid once is bookable, however many times it was issued"
+            ),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// A coinbase that really does pay two distributions must not be vouched
+    /// for: it pays both and the pool would book one, leaving the other's
+    /// recipients credited nowhere.
+    #[test]
+    fn a_coinbase_paying_two_distributions_is_not_vouched_for() {
+        let mut c = PayoutOutputsTracker::new();
+        let token = tok(0x01);
+        let first = pool_set(600);
+        let second = pool_set(700);
+        c.record(token, vouched(1, first.clone()));
+        c.record(token, vouched(2, second.clone()));
+
+        // Coinbase carries BOTH sets.
+        let mut both = Vec::new();
+        let a: Vec<TxOut> = bitcoin::consensus::deserialize(&first).unwrap();
+        let b: Vec<TxOut> = bitcoin::consensus::deserialize(&second).unwrap();
+        let mut all = a;
+        all.extend(b);
+        both.extend_from_slice(&bitcoin::consensus::serialize(&all));
+        let decl = suffix(&both);
+
+        match c.validate_and_consume_for_declare(&token, &decl) {
+            DeclareOutputsCheck::Ok { booking } => assert!(
+                booking.is_none(),
+                "paying two distributions while booking one credits nobody for the other"
+            ),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// The second distribution may have been issued under a DIFFERENT token. A
+    /// per-token scan never sees it, and the double-payment the guard exists to
+    /// catch escapes one token over.
+    #[test]
+    fn a_second_distribution_under_another_token_is_seen() {
+        let mut c = PayoutOutputsTracker::new();
+        let token_a = tok(0x0A);
+        let token_b = tok(0x0B);
+        let set_a = pool_set(600);
+        let set_b = pool_set(700);
+        c.record(token_a, vouched(1, set_a.clone()));
+        c.record(token_b, vouched(2, set_b.clone()));
+
+        // One job declared under token A, coinbase carrying A's set AND B's.
+        let mut all: Vec<TxOut> = bitcoin::consensus::deserialize(&set_a).unwrap();
+        all.extend(bitcoin::consensus::deserialize::<Vec<TxOut>>(&set_b).unwrap());
+        let decl = suffix(&bitcoin::consensus::serialize(&all));
+
+        match c.validate_and_consume_for_declare(&token_a, &decl) {
+            DeclareOutputsCheck::Ok { booking } => assert!(
+                booking.is_none(),
+                "a set issued under another token is still a second distribution"
+            ),
+            other => panic!("expected Ok, got {other:?}"),
+        }
     }
 
     /// A failed match does NOT consume the set — a corrected
@@ -727,7 +966,7 @@ mod tests {
         let good = suffix(&outputs);
         assert_eq!(
             c.validate_and_consume_for_declare(&token, &good),
-            DeclareOutputsCheck::Ok
+            DeclareOutputsCheck::Ok { booking: None }
         );
     }
 
@@ -766,7 +1005,7 @@ mod tests {
         let decl = suffix(&outputs);
         assert_eq!(
             c.validate_and_consume_for_declare(&token, &decl),
-            DeclareOutputsCheck::Ok
+            DeclareOutputsCheck::Ok { booking: None }
         );
         // Tip advances: the used entry is dropped; token entry vanishes.
         assert_eq!(c.observe_epoch([0xBB; 32]), 0, "no unused entries to stale");
@@ -971,6 +1210,62 @@ mod tests {
         assert_eq!(
             declared_coinbase_contains_pool_outputs(&suffix(&declared), &committed_blob),
             CoinbaseOutputCheck::MissingOutput { index: 0 }
+        );
+    }
+
+    /// A coinbase may legally carry more than one set this token was issued —
+    /// the JDC owns the rest of its coinbase, so the containment check cannot
+    /// reject it. But the block then pays two distributions and the pool would
+    /// book one, so it must not vouch for either.
+    #[test]
+    fn a_coinbase_carrying_two_issued_sets_is_not_vouched_for() {
+        let token = tok(7);
+        let a = out(5_000);
+        let b = out(7_000);
+        let bytes_a = encode_coinbase_outputs(Network::Regtest, std::slice::from_ref(&a)).unwrap();
+        let bytes_b = encode_coinbase_outputs(Network::Regtest, std::slice::from_ref(&b)).unwrap();
+        let booking = PayoutBooking {
+            payouts_fingerprint: [0xAB; 32],
+            block_reward_sats: 12_000,
+        };
+
+        let mut c = PayoutOutputsTracker::new();
+        let mut first = resp(1, bytes_a);
+        first.booking = Some(booking);
+        c.record(token, first);
+        let mut second = resp(2, bytes_b);
+        second.booking = Some(booking);
+        c.record(token, second);
+
+        // A coinbase carrying both.
+        let both = suffix(&encode_coinbase_outputs(Network::Regtest, &[a, b]).unwrap());
+        assert_eq!(
+            c.validate_and_consume_for_declare(&token, &both),
+            DeclareOutputsCheck::Ok { booking: None },
+            "paying two issued sets must consume the newest but vouch for neither"
+        );
+    }
+
+    /// The ordinary case still carries its booking through — otherwise the
+    /// guard above would have silently disabled booking altogether.
+    #[test]
+    fn a_coinbase_carrying_one_issued_set_is_vouched_for() {
+        let token = tok(8);
+        let only = out(5_000);
+        let bytes = encode_coinbase_outputs(Network::Regtest, std::slice::from_ref(&only)).unwrap();
+        let booking = PayoutBooking {
+            payouts_fingerprint: [0xCD; 32],
+            block_reward_sats: 5_000,
+        };
+        let mut c = PayoutOutputsTracker::new();
+        let mut entry = resp(1, bytes.clone());
+        entry.booking = Some(booking);
+        c.record(token, entry);
+        assert_eq!(
+            c.validate_and_consume_for_declare(&token, &suffix(&bytes)),
+            DeclareOutputsCheck::Ok {
+                booking: Some(booking)
+            }
         );
     }
 }
