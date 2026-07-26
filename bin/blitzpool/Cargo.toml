@@ -110,6 +110,11 @@ clap = { workspace = true, features = ["env"] }
 # variant carries through to the operator-friendly stderr hint.
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# Real bitcoin-node for the chain-reconciliation regtest: the RPC shapes it
+# decodes (`getblock`, `getrawtransaction`) can only be verified against Core.
+bp-regtest-harness = { workspace = true }
+
 # Process-wide allocator (Linux only). Wired into `main.rs` via
 # `#[global_allocator]`. See workspace Cargo.toml for rationale.
 [target.'cfg(target_os = "linux")'.dependencies]

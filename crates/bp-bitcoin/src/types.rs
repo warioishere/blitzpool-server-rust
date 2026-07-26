@@ -329,3 +329,42 @@ mod tests {
         assert_eq!(peers[0].connection_type, None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// getblock (verbosity 1) / getrawtransaction (verbose)
+// ---------------------------------------------------------------------------
+
+/// `getblock <hash> 1` — the fields the pool reads. Verbosity 1 lists txids
+/// only, so a caller after the coinbase does not pull the whole block.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlockTxids {
+    pub hash: String,
+    pub height: u64,
+    /// Txids in block order; `[0]` is the coinbase.
+    pub tx: Vec<String>,
+}
+
+/// `getrawtransaction <txid> true <blockhash>` — the fields the pool reads.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecodedTransaction {
+    pub txid: String,
+    #[serde(default)]
+    pub vout: Vec<TransactionOutput>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TransactionOutput {
+    /// Value in BTC, as Core reports it.
+    #[serde(default)]
+    pub value: f64,
+    #[serde(rename = "scriptPubKey", default)]
+    pub script_pub_key: ScriptPubKey,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScriptPubKey {
+    /// Present for outputs Core can express as an address. Absent for
+    /// OP_RETURN (the witness commitment) and other non-address scripts.
+    #[serde(default)]
+    pub address: Option<String>,
+}

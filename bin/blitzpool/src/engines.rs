@@ -473,6 +473,15 @@ impl BlitzpoolModeGate {
             .unwrap_or_else(MiningModeResult::solo)
     }
 
+    /// Does this address's payout mode keep a ledger the pool books into?
+    ///
+    /// Solo does not: it pays straight into the coinbase and records no
+    /// payout rows, so a Solo block without them is normal. Every other mode
+    /// books, and a missing row there is a real miss.
+    pub(crate) fn keeps_a_payout_ledger(&self, address: &str) -> bool {
+        !matches!(self.lookup(address).mode, MiningMode::Solo)
+    }
+
     /// Public alias of [`Self::lookup`] for the
     /// [`crate::payout_resolver::ProductionPayoutResolver`] — needs
     /// full `MiningModeResult` (mode + optional group_id), not just
