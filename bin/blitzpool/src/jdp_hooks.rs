@@ -95,6 +95,7 @@ pub(crate) fn build_jdp_hooks(
     template_tx_cache: Option<Arc<TemplateTxCache>>,
     network: BitcoinNetwork,
     orphan_submitblock_enabled: bool,
+    ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
 ) -> JdpServerHooks {
     let block_sink: Arc<dyn JdpBlockSubmissionSink> = if orphan_submitblock_enabled {
         info!(
@@ -109,6 +110,21 @@ pub(crate) fn build_jdp_hooks(
              pool-side resubmit for commercial JDC deployments)"
         );
         Arc::new(LogOnlyBlockSubmissionSink)
+    };
+    // Booking sits in front of whichever sink is configured: the block was
+    // found either way, so it must not hinge on the resubmit switch.
+    let block_sink: Arc<dyn JdpBlockSubmissionSink> = match ledger_booker {
+        Some(booker) => Arc::new(LedgerBookingJdpSink {
+            inner: block_sink,
+            booker,
+        }),
+        None => {
+            info!(
+                "jdp: ledger fan-out not wired — a JDC-found block will be reported but \
+                 not booked"
+            );
+            block_sink
+        }
     };
     JdpServerHooks {
         allocate_resolver: Arc::new(ProductionJdpAllocateResolver {
@@ -358,53 +374,18 @@ impl JdpBlockSubmissionSink for JdpRpcBlockSubmissionSink {
         );
         log_booking_status(&miner_address, booking);
 
-        // 1. Convert non-witness coinbase to witness form (BIP-141
-        //    marker + flag + reserved witness value). Required for
-        //    bitcoin-core to accept a SegWit block.
-        let coinbase_witness_bytes = assemble_witness_coinbase(&coinbase_raw);
-        let coinbase_tx: Transaction =
-            match Transaction::consensus_decode(&mut coinbase_witness_bytes.as_slice()) {
-                Ok(t) => t,
-                Err(err) => {
-                    warn!(%err, "JDP submit: coinbase tx parse failed; skipping submit");
-                    return;
-                }
-            };
-
-        // 2. Parse every JDC-provided non-coinbase tx. Per the SV2
-        //    spec, `transactions` from `ProvideMissingTransactions.Success`
-        //    + cached entries come in witness-serialised form.
-        let mut txdata: Vec<Transaction> = Vec::with_capacity(1 + transactions.len());
-        txdata.push(coinbase_tx);
-        for (i, raw) in transactions.iter().enumerate() {
-            match Transaction::consensus_decode(&mut raw.as_slice()) {
-                Ok(tx) => txdata.push(tx),
-                Err(err) => {
-                    warn!(%err, idx = i, "JDP submit: tx parse failed; skipping submit");
-                    return;
-                }
-            }
-        }
-
-        // 3. Build a block with a placeholder merkle root, then
-        //    compute the real root from the assembled tx list and
-        //    patch the header.
-        let mut header = Header {
-            version: BlockVersion::from_consensus(version as i32),
-            prev_blockhash: BlockHash::from_byte_array(prev_hash),
-            merkle_root: TxMerkleNode::all_zeros(),
-            time: ntime,
-            bits: CompactTarget::from_consensus(n_bits),
+        let Some(block) = assemble_declared_block(
+            &coinbase_raw,
+            &transactions,
+            prev_hash,
+            version,
+            ntime,
             nonce,
+            n_bits,
+        ) else {
+            warn!("JDP submit: block reassembly failed; skipping submit");
+            return;
         };
-        let mut block = Block { header, txdata };
-        let merkle_root = block.compute_merkle_root().unwrap_or_else(|| {
-            warn!("JDP submit: merkle root compute returned None (empty block?); using zero");
-            TxMerkleNode::all_zeros()
-        });
-        header = block.header;
-        header.merkle_root = merkle_root;
-        block.header = header;
 
         // 4. Serialise + submit.
         let block_hex = serialize_hex(&block);
@@ -429,6 +410,152 @@ impl JdpBlockSubmissionSink for JdpRpcBlockSubmissionSink {
                 "JDP submitblock RPC failed (best-effort; JDC also submits via TDP)"
             ),
         }
+    }
+}
+
+/// Shortest byte count that can hold a transaction's version + locktime, which
+/// is what the witness-form assembly indexes against.
+const MIN_COINBASE_LEN: usize = 8;
+
+/// Reassemble the block a `PushSolution` describes: the JDC's coinbase plus
+/// the transactions it declared, with the merkle root computed over them.
+///
+/// Shared by the two things that need it — the orphan-protection resubmit and
+/// the ledger booking, which needs the header to name the block. Returns
+/// `None` when the JDC's bytes don't parse; the caller logs and moves on,
+/// because the JDC submits through its own node regardless.
+#[allow(clippy::too_many_arguments)]
+fn assemble_declared_block(
+    coinbase_raw: &[u8],
+    transactions: &[Vec<u8>],
+    prev_hash: [u8; 32],
+    version: u32,
+    ntime: u32,
+    nonce: u32,
+    n_bits: u32,
+) -> Option<Block> {
+    // These bytes come off the wire from the JDC. `assemble_witness_coinbase`
+    // indexes from the tail (version + locktime), so anything shorter than
+    // that would panic the connection task rather than be rejected.
+    if coinbase_raw.len() < MIN_COINBASE_LEN {
+        warn!(
+            len = coinbase_raw.len(),
+            "JDP block: declared coinbase is too short to be a transaction"
+        );
+        return None;
+    }
+    // Non-witness coinbase → witness form (BIP-141 marker + flag + reserved
+    // witness value). Required for bitcoin-core to accept a SegWit block.
+    let coinbase_witness_bytes = assemble_witness_coinbase(coinbase_raw);
+    let coinbase_tx: Transaction =
+        match Transaction::consensus_decode(&mut coinbase_witness_bytes.as_slice()) {
+            Ok(t) => t,
+            Err(err) => {
+                warn!(%err, "JDP block: coinbase tx parse failed");
+                return None;
+            }
+        };
+    let mut txdata: Vec<Transaction> = Vec::with_capacity(1 + transactions.len());
+    txdata.push(coinbase_tx);
+    for (i, raw) in transactions.iter().enumerate() {
+        match Transaction::consensus_decode(&mut raw.as_slice()) {
+            Ok(tx) => txdata.push(tx),
+            Err(err) => {
+                warn!(%err, idx = i, "JDP block: tx parse failed");
+                return None;
+            }
+        }
+    }
+    let mut header = Header {
+        version: BlockVersion::from_consensus(version as i32),
+        prev_blockhash: BlockHash::from_byte_array(prev_hash),
+        merkle_root: TxMerkleNode::all_zeros(),
+        time: ntime,
+        bits: CompactTarget::from_consensus(n_bits),
+        nonce,
+    };
+    let mut block = Block { header, txdata };
+    let merkle_root = block.compute_merkle_root().unwrap_or_else(|| {
+        warn!("JDP block: merkle root compute returned None (empty block?); using zero");
+        TxMerkleNode::all_zeros()
+    });
+    header = block.header;
+    header.merkle_root = merkle_root;
+    block.header = header;
+    Some(block)
+}
+
+/// Fan a JDC-found block out to the per-mode ledger, then hand it to the
+/// wrapped sink.
+///
+/// Sits in front of BOTH sinks on purpose: the block was found whether or not
+/// the pool resubmits it, so the booking must not depend on
+/// `[sv2].jdp_orphan_submitblock`.
+pub(crate) struct LedgerBookingJdpSink {
+    inner: Arc<dyn JdpBlockSubmissionSink>,
+    booker: Arc<crate::block_sink::TdpBlockSubmissionSink>,
+}
+
+#[async_trait]
+impl JdpBlockSubmissionSink for LedgerBookingJdpSink {
+    async fn submit_block_candidate(
+        &self,
+        miner_address: AddressId,
+        new_token: Token,
+        booking: Option<PayoutBooking>,
+        coinbase_raw: Vec<u8>,
+        transactions: Vec<Vec<u8>>,
+        prev_hash: [u8; 32],
+        version: u32,
+        ntime: u32,
+        nonce: u32,
+        n_bits: u32,
+    ) {
+        if let Some(booking) = booking {
+            match assemble_declared_block(
+                &coinbase_raw,
+                &transactions,
+                prev_hash,
+                version,
+                ntime,
+                nonce,
+                n_bits,
+            ) {
+                Some(block) => {
+                    let block_hash = block.header.block_hash().to_string();
+                    let block_data = serialize_hex(&block.header);
+                    self.booker
+                        .book_declared_block_found(
+                            miner_address.as_str().to_string(),
+                            hex::encode(new_token.0),
+                            booking.block_reward_sats,
+                            block_hash,
+                            block_data,
+                            booking.payouts_fingerprint,
+                        )
+                        .await;
+                }
+                None => warn!(
+                    miner = miner_address.as_str(),
+                    "JDP block-found: could not reassemble the block, so it cannot be booked \
+                     — needs an operator reprocess from the block's own coinbase"
+                ),
+            }
+        }
+        self.inner
+            .submit_block_candidate(
+                miner_address,
+                new_token,
+                booking,
+                coinbase_raw,
+                transactions,
+                prev_hash,
+                version,
+                ntime,
+                nonce,
+                n_bits,
+            )
+            .await;
     }
 }
 
@@ -659,6 +786,69 @@ fn outputs_match_payouts(outputs: &[DynamicOutput], payouts: &[PayoutEntry]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The JDC's bytes are untrusted input; garbage must not panic or produce
+    /// a block, it must decline so the caller reports instead of booking.
+    #[test]
+    fn assemble_declared_block_declines_unparsable_bytes() {
+        assert!(assemble_declared_block(
+            &[0xFF, 0xFF, 0xFF],
+            &[],
+            [0u8; 32],
+            0x2000_0000,
+            1_700_000_000,
+            42,
+            0x1d00_ffff,
+        )
+        .is_none());
+    }
+
+    /// A well-formed coinbase reassembles, and the header it yields is what
+    /// names the block for the ledger — so the merkle root has to be computed,
+    /// not left at zero.
+    #[test]
+    fn assemble_declared_block_computes_the_merkle_root() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::Encodable;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        let coinbase = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x51, 0x00, 0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut raw = Vec::new();
+        coinbase
+            .consensus_encode(&mut raw)
+            .expect("encode coinbase");
+
+        let block = assemble_declared_block(
+            &raw,
+            &[],
+            [0xABu8; 32],
+            0x2000_0000,
+            1_700_000_000,
+            42,
+            0x1d00_ffff,
+        )
+        .expect("a well-formed coinbase must reassemble");
+        assert_ne!(
+            block.header.merkle_root,
+            TxMerkleNode::all_zeros(),
+            "an uncomputed merkle root would name the wrong block"
+        );
+        assert_eq!(block.txdata.len(), 1);
+    }
 
     fn entry(address: &str, sats: u64) -> PayoutEntry {
         PayoutEntry {

@@ -281,6 +281,34 @@ impl TdpBlockSubmissionSink {
     /// caller can drop it directly into `bp_stratum_v1::ServerHooks
     /// { block_sink, … }`.
     #[allow(dead_code)]
+    /// Book a block whose coinbase the pool did NOT build — a JDC declared the
+    /// job and owns its coinbase; the pool only issued the payout set, and the
+    /// ext-0x0003 declare-time check proved the coinbase carries it verbatim.
+    /// That proof is what `payouts_fingerprint` names, so the ledger books the
+    /// distribution the block actually paid rather than a rebuilt guess.
+    ///
+    /// `worker` is fixed to `jdp` — a declared job has no Stratum worker name.
+    pub(crate) async fn book_declared_block_found(
+        &self,
+        miner_address: String,
+        session_id: String,
+        reward_sats: u64,
+        block_hash: String,
+        block_data: String,
+        payouts_fingerprint: [u8; 32],
+    ) {
+        self.emit_block_found(
+            miner_address,
+            "jdp".to_string(),
+            session_id,
+            Some(reward_sats),
+            Some(block_hash),
+            block_data,
+            Some(payouts_fingerprint),
+        )
+        .await;
+    }
+
     pub(crate) fn into_sv1_arc(self) -> Arc<dyn Sv1BlockSubmissionSink> {
         Arc::new(self)
     }
