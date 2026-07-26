@@ -4411,6 +4411,60 @@ mod tests {
         assert!(s.channels[&cid].session_difficulty > Difficulty(1024.0));
     }
 
+    /// The guard clamps `raw` to the session difficulty, but TWO more
+    /// steps run after it: the `min_difficulty` floor and the power-of-two
+    /// round-up. Either could in principle lift the result back above the
+    /// value the guard just pinned — which is exactly how a clamp has been
+    /// destroyed by a later rounding twice before in this crate.
+    ///
+    /// Swept across crooked floors and both sides of the sub-1.0 boundary
+    /// (`power_of_two_difficulty` deliberately leaves values below 1.0
+    /// alone, so the rounding is not even uniform).
+    #[test]
+    fn the_no_raise_guard_survives_the_floor_and_the_rounding() {
+        for min_diff in [0.00001, 0.3, 1.0, 500.0, 3000.0, 5000.0] {
+            let clock = Arc::new(TestClock::new(0));
+            let mut cfg = port_cfg();
+            cfg.vardiff_silence_easing = true;
+            cfg.min_difficulty = Difficulty(min_diff);
+            let mut s = MiningSessionState::new(clock.clone(), 1, cfg);
+            handle_setup_connection(&mut s, &good_setup());
+            let _ = handle_open_standard_mining_channel(
+                &mut s,
+                &open_std(1, &format!("{}.w", REGTEST_ADDR)),
+                vec![0; 4],
+            );
+            let cid = s.primary_channel.unwrap();
+
+            // Let the descent run so the channel sits below where its own
+            // declaration would put it, still with no share ever accepted.
+            for _ in 0..6 {
+                clock.advance_ms(60_000);
+                let _ = apply_vardiff_check(&mut s);
+            }
+            let before = s.channels[&cid].session_difficulty.as_f64();
+
+            // Now re-assert a huge claim, repeatedly — a translator does
+            // this every 60 s.
+            for _ in 0..3 {
+                let _ = handle_update_channel(
+                    &mut s,
+                    &UpdateChannelInput {
+                        channel_id: cid,
+                        nominal_hash_rate: 1e15,
+                        maximum_target: [0xFF; 32],
+                    },
+                );
+                let after = s.channels[&cid].session_difficulty.as_f64();
+                assert!(
+                    after <= before,
+                    "min_difficulty={min_diff}: unproven channel raised {before} -> {after} \
+                     (the floor or the round-up stepped over the guard)"
+                );
+            }
+        }
+    }
+
     // ── inline vardiff cooldown ───────────────────────────────────
 
     /// The inline (post-share) check must not run more often than

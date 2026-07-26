@@ -1997,6 +1997,69 @@ mod tests {
         );
     }
 
+    /// The bootstrap anchor may only move while nothing has been accepted.
+    /// Once a share exists, a later assignment must NOT reset it — that
+    /// would divide the accumulated work by a shorter span and read the
+    /// miner as faster than it is, the mirror image of the dilution the
+    /// anchor exists to prevent.
+    #[test]
+    fn the_bootstrap_anchor_freezes_once_a_share_is_accepted() {
+        let clock = TestClock::new(0);
+        let mut e = eased_engine(&clock).with_initial_difficulty(1024.0);
+        e.update_hash_rate(1024.0, true); // one share at t=0
+        clock.advance_ms(80_000);
+        // Anchored at engine start: 1024 * 10 / 80 = 128.
+        let before = e.suggested_difficulty(16_384.0);
+        assert_eq!(before, Some(128.0), "precondition");
+
+        // A later assignment must not move the anchor any more.
+        e.note_difficulty_assigned(4096.0);
+        assert_eq!(
+            e.suggested_difficulty(16_384.0),
+            before,
+            "anchor moved after a share: the same work is now divided by a \
+             shorter span and the miner reads as faster than it is"
+        );
+    }
+
+    /// A missed `note_difficulty_assigned` must fail SAFE. The stored
+    /// segment difficulty then disagrees with reality, and the direction of
+    /// the error decides whether that is harmless:
+    ///
+    /// - missed LOWERING → stored is too HIGH → `S` grows too slowly →
+    ///   descends too little. Harmless.
+    /// - missed RAISE → stored is too LOW → `S` grows too fast → descends
+    ///   too MUCH. NOT harmless.
+    ///
+    /// This pins both directions so the asymmetry is visible, and it is why
+    /// every raising path (`handle_update_channel`, SV1
+    /// `mining.suggest_difficulty`, the cpuminer fallback, the vardiff
+    /// retarget) must call the hook — the no-share branch itself can only
+    /// ever propose a decrease, so it cannot create this case on its own.
+    #[test]
+    fn a_missed_assignment_hook_errs_toward_descending_too_little() {
+        // Missed LOWERING: engine still believes 1024, caller is at 64.
+        let clock = TestClock::new(0);
+        let stale_high = eased_engine(&clock).with_initial_difficulty(1024.0);
+        // Truthful reference: the engine was told about the same lowering.
+        let clock2 = TestClock::new(0);
+        let mut truthful = eased_engine(&clock2).with_initial_difficulty(1024.0);
+        truthful.note_difficulty_assigned(64.0);
+
+        clock.advance_ms(300_000);
+        clock2.advance_ms(300_000);
+        let missed = stale_high.suggested_difficulty(64.0);
+        let told = truthful.suggested_difficulty(64.0);
+        match (missed, told) {
+            (Some(m), Some(t)) => assert!(
+                m >= t,
+                "a missed lowering must descend LESS, not more: {m} vs {t}"
+            ),
+            (None, _) => {} // held entirely — even more conservative
+            (Some(m), None) => panic!("missed hook proposed {m} where the truth held"),
+        }
+    }
+
     /// The engine must be told what the session is quiet AT. Without a
     /// seeded difficulty it has nothing to bound and holds — the
     /// conservative failure mode for a missed wiring site.
