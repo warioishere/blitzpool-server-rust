@@ -9,7 +9,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::config::{BitcoinRpcConfig, RpcAuth};
 use crate::error::{RpcError, RpcErrorDetail};
-use crate::types::{BlockHeaderInfo, MiningInfo, NetworkInfo, PeerInfo};
+use crate::types::{
+    BlockHeaderInfo, BlockTxids, DecodedTransaction, MiningInfo, NetworkInfo, PeerInfo,
+};
 
 /// Async JSON-RPC client to a Bitcoin Core node. Cheap to clone — shares
 /// an underlying `reqwest::Client` connection pool.
@@ -87,6 +89,39 @@ impl BitcoinRpc {
     pub async fn get_block_header(&self, block_hash: &str) -> Result<BlockHeaderInfo, RpcError> {
         self.call("getblockheader", serde_json::json!([block_hash, true]))
             .await
+    }
+
+    /// Block hash at `height` on the node's active chain
+    /// (`getblockhash <height>`).
+    pub async fn get_block_hash(&self, height: u64) -> Result<String, RpcError> {
+        self.call("getblockhash", serde_json::json!([height])).await
+    }
+
+    /// Txids of a block in order (`getblock <hash> 1`); `txids[0]` is the
+    /// coinbase. Verbosity 1 deliberately — verbosity 2 would pull every
+    /// transaction's full JSON, megabytes per block, when the caller only
+    /// wants the first one.
+    pub async fn get_block_txids(&self, block_hash: &str) -> Result<BlockTxids, RpcError> {
+        self.call("getblock", serde_json::json!([block_hash, 1]))
+            .await
+    }
+
+    /// Decode one transaction of a known block
+    /// (`getrawtransaction <txid> true <blockhash>`).
+    ///
+    /// Passing the block hash is what makes this work on a node without
+    /// `txindex`: Core reads the transaction out of that block rather than
+    /// searching an index the pool cannot assume exists.
+    pub async fn get_raw_transaction_in_block(
+        &self,
+        txid: &str,
+        block_hash: &str,
+    ) -> Result<DecodedTransaction, RpcError> {
+        self.call(
+            "getrawtransaction",
+            serde_json::json!([txid, true, block_hash]),
+        )
+        .await
     }
 
     /// Submit a raw block hex to bitcoin-core via the `submitblock` RPC.

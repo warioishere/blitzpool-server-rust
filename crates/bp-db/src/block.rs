@@ -73,6 +73,26 @@ where
     Ok(())
 }
 
+/// `true` when the pool has a `blocks_entity` record at `height`.
+///
+/// The chain→ledger reconciliation asks this about a block whose coinbase
+/// pays the pool: a `false` means the pool mined it and never recorded it.
+/// Dev-seed rows are excluded for the same reason `find_found_blocks`
+/// excludes them — a bootstrap fixture is not evidence of a real block.
+pub async fn block_recorded_at_height(pool: &PgPool, height: i64) -> Result<bool, DbError> {
+    let found = sqlx::query_scalar!(
+        r#"SELECT EXISTS (
+             SELECT 1 FROM blocks_entity
+             WHERE height = $1 AND "minerAddress" NOT LIKE 'synthseed%'
+           ) AS "exists!""#,
+        height,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(found)
+}
+
 /// All rows from `blocks_entity` projected down to
 /// `{height, minerAddress, worker, sessionId}`. No WHERE, no ORDER BY —
 /// Uses `query_as` (no `.sqlx` metadata required for the untyped

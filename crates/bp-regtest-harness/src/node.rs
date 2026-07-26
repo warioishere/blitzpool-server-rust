@@ -389,6 +389,19 @@ impl RegtestNode {
         self.current_height().await
     }
 
+    /// Mine `n` blocks whose coinbase pays `address`. Returns the tip height.
+    ///
+    /// Distinct from [`Self::generate_to_self`]: a test that cares *who* the
+    /// coinbase paid needs to choose the recipient, not take a fresh wallet
+    /// address it never sees.
+    pub async fn generate_to_address(&self, n: u32, address: &str) -> Result<u32, RegtestError> {
+        self.ensure_wallet().await?;
+        let _hashes = self
+            .wallet_rpc("generatetoaddress", json!([n, address]))
+            .await?;
+        self.current_height().await
+    }
+
     /// Current tip height via `getblockchaininfo`.
     pub async fn current_height(&self) -> Result<u32, RegtestError> {
         let info = self.rpc.call("getblockchaininfo", json!([])).await?;

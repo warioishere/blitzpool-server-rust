@@ -494,6 +494,7 @@ dependencies = [
  "bp-pplns",
  "bp-pplns-engine",
  "bp-protocol-detect",
+ "bp-regtest-harness",
  "bp-session-persistence",
  "bp-share",
  "bp-share-hook",

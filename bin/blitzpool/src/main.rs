@@ -39,6 +39,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod api_server;
 mod block_confirmation;
 mod block_found_consumer;
+mod block_reconcile;
 mod block_sink;
 mod blockparty_reservation;
 mod blockparty_service;
@@ -640,6 +641,41 @@ async fn main() -> ExitCode {
             crate::redis_backup::DEFAULT_INTERVAL,
             crate::redis_backup::DEFAULT_RETENTION,
         ))
+    } else {
+        None
+    };
+
+    // Chain → ledger check. Every other block-found path starts from something
+    // the pool was told; this one reads the coinbase of every block that
+    // actually landed and reports the ones the ledger has no record of. Payout
+    // role, because that is where the ledger it checks is written. Reports
+    // only — the chain does not carry the distribution behind a coinbase, so
+    // it cannot book, and the operator's list is the point.
+    let _block_reconcile = if cfg.has_role(Role::Payout) {
+        let markers = crate::block_reconcile::PoolMarkers::new([
+            cfg.pplns
+                .as_ref()
+                .map(|p| p.fee_address.clone())
+                .unwrap_or_default(),
+            cfg.solo.dev_fee_address.clone().unwrap_or_default(),
+        ]);
+        match markers {
+            Some(markers) => Some(crate::block_reconcile::spawn_reconcile_task(
+                handles.bitcoin_rpc.clone(),
+                handles.db.pool().clone(),
+                markers,
+                crate::block_reconcile::DEFAULT_INTERVAL,
+                crate::block_reconcile::DEFAULT_LOOKBACK,
+            )),
+            None => {
+                tracing::warn!(
+                    "block-reconcile: SKIPPED — no pool fee address configured, so a coinbase \
+                     carries no marker identifying it as this pool's. A block the ledger misses \
+                     would go unnoticed."
+                );
+                None
+            }
+        }
     } else {
         None
     };
