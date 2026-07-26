@@ -25,8 +25,14 @@ bp-coinbase-snapshot = { workspace = true }
 # docs. Same trait used for SV1 + SV2 servers.
 bp-share-hook = { workspace = true }
 bp-inflight-cache = { workspace = true }
+# `payouts_fingerprint_from_parts` — the identity binding a stored snapshot
+# to the coinbase payout list it was built for. Lives in the hashing leaf so
+# the accounting side does not depend on job assembly.
+bp-share = { workspace = true }
 bp-cron-utils = { workspace = true }
 uuid = { workspace = true }
+# Snapshot key encoding (payout-list fingerprint → hex).
+hex = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

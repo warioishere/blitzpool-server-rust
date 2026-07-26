@@ -35,6 +35,13 @@ const SCOPES: &[(&str, &str)] = &[("pplns", "pplns:*"), ("groupsolo", "groupsolo
 /// `RENAME`; never worth backing up (and confusing on restore).
 const SKIP_SUFFIX: &str = ":by-address:rebuild";
 
+/// Per-job Group-Solo distribution snapshots. One per (finder, payout list) for
+/// their TTL, so a busy group holds far more of these than it does round state.
+/// They belong to jobs that live in the pool's memory: a Redis loss takes the
+/// jobs with it, so restoring the snapshots would restore nothing usable. Skip
+/// them rather than DUMP thousands of them into Postgres every 10 minutes.
+const SKIP_INFIX: &str = ":jobsnapshot:";
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BackupError {
     #[error("redis: {0}")]
@@ -120,7 +127,7 @@ pub(crate) async fn run_backup_once(
 
     for (scope, pattern) in SCOPES {
         for key in scan_keys(redis, pattern).await? {
-            if key.ends_with(SKIP_SUFFIX) {
+            if key.ends_with(SKIP_SUFFIX) || key.contains(SKIP_INFIX) {
                 continue;
             }
             // `Option`: the key may vanish between SCAN and DUMP (trim/reset).

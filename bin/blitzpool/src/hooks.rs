@@ -575,9 +575,12 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
                 );
             }
         }
-        // Redis: delete all per-finder snapshots for this group.
+        // Redis: delete every snapshot of this group, per-finder and per-job.
+        // The per-job keys are spared by every other wipe because they back
+        // live jobs; here the group is gone, so no block of it can be booked
+        // and leaving them would just burn a TTL's worth of memory.
         let mut snap_conn = self.group_solo.round().connection_for_snapshot();
-        if let Err(err) = bp_group_solo_engine::round::snapshot::delete_all_for_group(
+        if let Err(err) = bp_group_solo_engine::round::snapshot::delete_everything_for_group(
             &mut snap_conn,
             &group_id_str,
         )

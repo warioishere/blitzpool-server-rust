@@ -261,10 +261,18 @@ async fn on_block_found_with_snapshot_survives_redis_overwrite() {
         .await
         .unwrap();
 
-    // Core freezes the snapshot at the block-found instant.
+    // The build the winning job's coinbase came from, and the identity the job
+    // carries for it.
+    let job = h
+        .engine
+        .build_distribution(h.group_id, reward, &finder)
+        .await
+        .expect("job-time build ok");
+
+    // Core stamps that exact distribution into the event.
     let frozen = h
         .engine
-        .snapshot_for_block_found(h.group_id, reward, &finder)
+        .snapshot_for_block_found(h.group_id, reward, &finder, &job.payouts_fingerprint)
         .await
         .expect("freeze snapshot ok");
     assert_eq!(frozen.block_reward_sats, reward);
@@ -304,6 +312,273 @@ async fn on_block_found_with_snapshot_survives_redis_overwrite() {
 
     let stats = h.engine.reader().round_stats(h.group_id).await.expect("ok");
     assert_eq!(stats.total_shares, 0.0, "round wiped on block-found");
+
+    drop_harness(h).await;
+}
+
+// ── Test 3b2 — block-found resolves the job's distribution, never a rebuild ──
+//
+// `record_share` invalidates the in-flight cache, so rebuilding the
+// distribution at block-found runs against a round that has moved since the
+// job was issued: the coinbase pays one split and the ledger would book
+// another. Nothing catches it — a fresh build carries the correct reward by
+// construction, so the reward check passes on wrong numbers. The lookup by the
+// winning job's payout-list identity has to answer with the job-time
+// distribution.
+//
+// Shares Redis db 11 with the test above; the suite runs serially
+// (`--test-threads=1`), which the shared PG/Redis already requires.
+#[tokio::test]
+async fn block_found_resolves_the_job_time_distribution_not_a_rebuild() {
+    let h = match spawn_or_skip(11, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let a = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let b = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
+    let reward = 312_500_000;
+
+    // Job time: A holds three quarters of the round.
+    h.engine
+        .record_share(None, h.group_id, a.as_str(), 300.0, 1)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, h.group_id, b.as_str(), 100.0, 2)
+        .await
+        .unwrap();
+    let job = h
+        .engine
+        .build_distribution(h.group_id, reward, &a)
+        .await
+        .expect("job-time build ok");
+
+    // One share lands between job issue and block-found — B overtakes A.
+    h.engine
+        .record_share(None, h.group_id, b.as_str(), 900.0, 3)
+        .await
+        .unwrap();
+
+    // What a rebuild answers with now. If this matched the job-time split the
+    // test would prove nothing, so pin that the round really moved.
+    let rebuilt = h
+        .engine
+        .build_distribution(h.group_id, reward, &a)
+        .await
+        .expect("rebuild ok");
+    assert_ne!(
+        rebuilt.payouts, job.payouts,
+        "the share must have moved the round, else this test proves nothing"
+    );
+
+    let snap = h
+        .engine
+        .snapshot_for_block_found(h.group_id, reward, &a, &job.payouts_fingerprint)
+        .await
+        .expect("the job's own distribution must resolve");
+    assert_eq!(
+        snap.distribution, job.payouts,
+        "block-found must book what the winning job's coinbase pays"
+    );
+
+    drop_harness(h).await;
+}
+
+// ── Test 3b2b — an unknown payout list resolves to nothing ───────────
+//
+// The lookup must fail rather than substitute something: the per-(group,
+// finder) key and a fresh build both answer with a split the block's coinbase
+// did not pay, and Group-Solo has no reward check that would notice. The caller
+// turns this into "not booked, needs an operator" — wrong numbers on-chain
+// cannot be undone, a missing booking can.
+//
+// Shares Redis db 11; the suite runs serially (`--test-threads=1`).
+#[tokio::test]
+async fn an_unknown_payout_list_resolves_to_nothing() {
+    let h = match spawn_or_skip(11, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let reward = 312_500_000;
+
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
+        .await
+        .unwrap();
+    // A real distribution exists — but not under this fingerprint.
+    h.engine
+        .build_distribution(h.group_id, reward, &finder)
+        .await
+        .expect("build ok");
+
+    let err = h
+        .engine
+        .snapshot_for_block_found(h.group_id, reward, &finder, &[0x11u8; 32])
+        .await
+        .expect_err("an unknown payout list must not resolve to some other distribution");
+    assert!(
+        matches!(err, EngineError::SnapshotMissingForPayouts { .. }),
+        "expected SnapshotMissingForPayouts, got {err:?}"
+    );
+
+    drop_harness(h).await;
+}
+
+// ── Test 3b3 — a ledger change between job and apply survives ────────
+//
+// The snapshot is now built when the job is issued and applied when a block is
+// found on it — under the confirmation gate that is hours later. Writing its
+// `balance_after` as an absolute would roll back whatever moved `pendingSats`
+// in between (a kick redistribution, a dust sweep, another block). The snapshot
+// records the state it was computed against, so the apply writes the DELTA.
+//
+// Shares Redis db 11; the suite runs serially (`--test-threads=1`).
+#[tokio::test]
+async fn apply_preserves_a_ledger_change_made_after_the_job_was_built() {
+    let h = match spawn_or_skip(11, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
+    let reward = 312_500_000;
+
+    // A member with a pending balance that this block will not pay out (no
+    // shares this round → no coinbase output, carried forward instead).
+    sqlx::query(
+        r#"INSERT INTO pplns_group_balance
+             ("groupId", address, "pendingSats", "totalPaidSats", "updatedAt")
+           VALUES ($1, $2, 4_000, 0, 0)"#,
+    )
+    .bind(h.group_id)
+    .bind(other.as_str())
+    .execute(&h.pool)
+    .await
+    .expect("seed pending balance");
+
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
+        .await
+        .unwrap();
+    let job = h
+        .engine
+        .build_distribution(h.group_id, reward, &finder)
+        .await
+        .expect("job-time build ok");
+    let snap = h
+        .engine
+        .snapshot_for_block_found(h.group_id, reward, &finder, &job.payouts_fingerprint)
+        .await
+        .expect("lookup ok");
+
+    // Between job issue and apply, something else moves the ledger — a kick
+    // redistribution, a sweep, an admin adjustment. Here: +1_000 sats.
+    sqlx::query(
+        r#"UPDATE pplns_group_balance SET "pendingSats" = "pendingSats" + 1_000
+           WHERE "groupId" = $1 AND address = $2"#,
+    )
+    .bind(h.group_id)
+    .bind(other.as_str())
+    .execute(&h.pool)
+    .await
+    .expect("move the ledger");
+
+    h.engine
+        .on_block_found_with_snapshot(h.group_id, 9_995_020, reward, &finder, snap.into())
+        .await
+        .expect("apply ok");
+
+    let after = h
+        .engine
+        .reader()
+        .balance(h.group_id, other.as_str())
+        .await
+        .expect("ok")
+        .expect("row")
+        .pending_sats;
+    assert_eq!(
+        after, 5_000,
+        "the +1_000 made after the job was built must survive the apply \
+         (absolute write would have restored 4_000)"
+    );
+
+    drop_harness(h).await;
+}
+
+// ── Test 3b4 — the apply consumes only its own payout-list snapshot ──
+//
+// Every member of a group mines a different job, and each job's distribution
+// lives under its own key. Booking one block must not strip the others: a
+// second block found before the next template rebuild has to resolve too, and
+// under the confirmation gate this cleanup runs hours after the fact.
+//
+// Shares Redis db 11; the suite runs serially (`--test-threads=1`).
+#[tokio::test]
+async fn apply_deletes_only_the_payout_list_it_booked() {
+    let h = match spawn_or_skip(11, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
+    let reward = 312_500_000;
+
+    // Two members, so the payout list actually moves with the round — with a
+    // single member every build is 100 % to the same address.
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, h.group_id, other.as_str(), 100.0, 2)
+        .await
+        .unwrap();
+    let booked = h
+        .engine
+        .build_distribution(h.group_id, reward, &finder)
+        .await
+        .expect("build A");
+
+    // A second, still-live job: another share moves the round, so the next
+    // build lands under a different payout list.
+    h.engine
+        .record_share(None, h.group_id, other.as_str(), 900.0, 3)
+        .await
+        .unwrap();
+    let still_live = h
+        .engine
+        .build_distribution(h.group_id, reward, &finder)
+        .await
+        .expect("build B");
+    assert_ne!(
+        booked.payouts_fingerprint, still_live.payouts_fingerprint,
+        "the two jobs must carry different payout lists, else this proves nothing"
+    );
+
+    let snap = h
+        .engine
+        .snapshot_for_block_found(h.group_id, reward, &finder, &booked.payouts_fingerprint)
+        .await
+        .expect("lookup ok");
+    h.engine
+        .on_block_found_with_snapshot(h.group_id, 9_995_021, reward, &finder, snap.into())
+        .await
+        .expect("apply ok");
+
+    // The booked one is gone — a redelivered event must not book it twice.
+    assert!(
+        h.engine
+            .snapshot_for_block_found(h.group_id, reward, &finder, &booked.payouts_fingerprint)
+            .await
+            .is_err(),
+        "the applied block's own payout list must be consumed"
+    );
+    // The other live job is untouched.
+    h.engine
+        .snapshot_for_block_found(h.group_id, reward, &finder, &still_live.payouts_fingerprint)
+        .await
+        .expect("a live job's distribution must survive another block's apply");
 
     drop_harness(h).await;
 }
@@ -381,9 +656,14 @@ async fn duplicate_block_found_does_not_double_balance() {
         .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
         .await
         .unwrap();
+    let job = h
+        .engine
+        .build_distribution(h.group_id, reward, &finder)
+        .await
+        .expect("job-time build ok");
     let snap = h
         .engine
-        .snapshot_for_block_found(h.group_id, reward, &finder)
+        .snapshot_for_block_found(h.group_id, reward, &finder, &job.payouts_fingerprint)
         .await
         .expect("snapshot");
 

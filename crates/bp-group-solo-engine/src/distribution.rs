@@ -30,16 +30,24 @@ use bp_pplns::{
     build_coinbase_distribution, is_valid_payout_address, CoinbaseDistributionEntry,
     CoinbaseDistributionInput,
 };
+use bp_share::payouts_fingerprint_from_parts;
 use sqlx::PgPool;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::round::snapshot::{write_snapshot, StoredSnapshot};
+use crate::round::snapshot::{write_snapshot, write_snapshot_for, StoredSnapshot};
 use crate::round::{GroupRoundStore, RoundError};
 
 /// Default cache TTL for `DistributionBuilder::build` (30 s).
 pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// How often the payout-list snapshot write is retried before the job goes out
+/// without one. Kept small — this sits on the path that gates the first job
+/// after a template change.
+const SNAPSHOT_WRITE_RETRIES: u32 = 2;
+/// Backoff between those attempts, multiplied by the attempt number.
+const SNAPSHOT_WRITE_BACKOFF: Duration = Duration::from_millis(40);
 
 #[derive(Debug, Default, Error)]
 pub enum DistributionError {
@@ -71,6 +79,15 @@ pub struct DistributionResult {
     /// Always `≥ 0` for Group-Solo.
     pub balance_after: HashMap<AddressId, Sats>,
     pub block_reward_sats: u64,
+    /// Identity of `payouts` + the reward it was built over — the key this
+    /// build's snapshot is stored under.
+    ///
+    /// The Stratum job build derives the same value independently from the
+    /// `PayoutEntry` list it turns into the coinbase, and a found block carries
+    /// it. That is what lets the block-found path ask for the distribution its
+    /// own coinbase pays instead of building a fresh one against a round that
+    /// has moved. See [`bp_share::payouts_fingerprint_from_parts`].
+    pub payouts_fingerprint: [u8; 32],
 }
 
 /// Engine-wide knobs for the distribution path. Per-group settings
@@ -237,22 +254,69 @@ async fn compute_distribution(
     };
     let math = build_coinbase_distribution(input);
 
-    // 5. Persist per-(group, finder) snapshot.
-    let snapshot = StoredSnapshot::from_math(
+    // 5. Persist the snapshot under the identity of the payout list it
+    //    distributes. Nothing else writes that key, so it still holds THIS
+    //    distribution when the block that mined it is found, however many
+    //    rebuilds ran in between. The per-(group, finder) key is written
+    //    alongside it for the manual reprocess path — it is last-writer-wins
+    //    by design and no automatic apply reads it.
+    // Records the ledger state this distribution was computed against, so the
+    // apply can write a delta instead of an absolute. The snapshot is resolved
+    // at block-found from the job that mined the block, which may be many
+    // minutes old — an absolute write would silently roll back whatever moved
+    // `pendingSats` since (a kick redistribution, a dust sweep, another block).
+    let snapshot = StoredSnapshot::from_math_with_before(
         &math.payouts,
         block_reward_sats,
         &math.considered_addresses,
         &math.balance_after,
+        &balances,
     );
-    let mut conn = round.connection_for_snapshot();
-    write_snapshot(
-        &mut conn,
-        &group_id.to_string(),
-        finder_address.as_str(),
-        &snapshot,
-        config.snapshot_ttl_secs,
-    )
-    .await?;
+    let payouts_fingerprint = payouts_fingerprint_from_parts(
+        block_reward_sats,
+        math.payouts
+            .iter()
+            .map(|p| (p.address.as_str(), p.sats.to_i64().max(0) as u64)),
+    );
+    let group_key = group_id.to_string();
+    // Neither write may fail the build. The distribution itself is correct and
+    // is about to become a coinbase; returning `Err` here sends
+    // `group_solo_payouts` into its solo fallback, and that miner is handed a
+    // job paying 100 % of the block to itself. Losing the snapshot costs a
+    // manual reprocess if a block lands on this job — losing the distribution
+    // costs the group the whole block.
+    let mut conn_fp = round.connection_for_snapshot();
+    let mut conn_finder = round.connection_for_snapshot();
+    let (by_fingerprint, by_finder) = tokio::join!(
+        write_snapshot_for_with_retry(
+            &mut conn_fp,
+            &group_key,
+            &payouts_fingerprint,
+            &snapshot,
+            config.snapshot_ttl_secs,
+        ),
+        write_snapshot(
+            &mut conn_finder,
+            &group_key,
+            finder_address.as_str(),
+            &snapshot,
+            config.snapshot_ttl_secs,
+        ),
+    );
+    if let Err(err) = by_fingerprint {
+        error!(
+            %err,
+            %group_id,
+            block_reward_sats,
+            fingerprint = %hex::encode(payouts_fingerprint),
+            "group-solo snapshot write failed after retries — the coinbase distribution stands, \
+             but a block found on this job cannot be booked automatically and needs operator \
+             reprocessing from the block's own coinbase"
+        );
+    }
+    if let Err(err) = by_finder {
+        warn!(%err, %group_id, "group-solo per-finder snapshot write failed");
+    }
 
     Ok(DistributionResult {
         group_id,
@@ -261,7 +325,42 @@ async fn compute_distribution(
         considered_addresses: math.considered_addresses,
         balance_after: math.balance_after,
         block_reward_sats,
+        payouts_fingerprint,
     })
+}
+
+/// Write the payout-list snapshot, retrying a transient Redis failure.
+///
+/// Two reasons this is worth retrying rather than logging once. The job it
+/// belongs to is about to go out to a miner, and a block found on it can only
+/// be booked from this key. And the write is `DEL` + `HSET` + `EXPIRE`: a
+/// failure in the middle leaves the key *deleted*, so a build that would have
+/// been a harmless no-op rewrite of an existing snapshot can destroy it. A
+/// re-run repairs exactly that.
+async fn write_snapshot_for_with_retry(
+    conn: &mut redis::aio::ConnectionManager,
+    group_key: &str,
+    payouts_fingerprint: &[u8; 32],
+    snapshot: &StoredSnapshot,
+    ttl_secs: u32,
+) -> Result<(), redis::RedisError> {
+    let mut attempt = 0;
+    loop {
+        match write_snapshot_for(conn, group_key, payouts_fingerprint, snapshot, ttl_secs).await {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < SNAPSHOT_WRITE_RETRIES => {
+                warn!(
+                    %err,
+                    group_id = group_key,
+                    attempt,
+                    "group-solo snapshot write failed — retrying"
+                );
+                attempt += 1;
+                tokio::time::sleep(SNAPSHOT_WRITE_BACKOFF * attempt).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn balance_rows_to_balance_map(rows: &[PplnsGroupBalanceRow]) -> HashMap<AddressId, Sats> {
@@ -318,6 +417,7 @@ mod tests {
             considered_addresses: HashSet::new(),
             balance_after: HashMap::new(),
             block_reward_sats: 312_500_000,
+            payouts_fingerprint: [0u8; 32],
         };
         let cloned = r.clone();
         assert_eq!(cloned.block_reward_sats, 312_500_000);
