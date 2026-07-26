@@ -652,13 +652,24 @@ impl<C: Clock> VarDiffEngine<C> {
     /// current difficulty. No-op when silence easing is disabled (the
     /// default stays byte-identical) or when `client_difficulty` is not a
     /// usable number.
+    ///
+    /// The cap is lowered to a power of two before it is applied, because
+    /// [`Self::nearest_difficulty_step`] rounds UP afterwards: capping at a raw
+    /// `8 × current` and then stepping to the next rung lands ABOVE the cap and
+    /// the guarantee is gone (measured: cap 384, assigned 512). Snapping the cap
+    /// down to a rung makes it survive the rounding, at the price of an
+    /// effective ceiling between 4× and 8× rather than exactly 8×. A bound that
+    /// holds loosely beats one that reads 8× and does not hold.
     fn cap_up_step(&self, target: f64, client_difficulty: f64) -> f64 {
         if !self.silence_easing {
             return target;
         }
         let cap = client_difficulty * VARDIFF_MAX_UP_STEP_FACTOR;
         if cap.is_finite() && cap > 0.0 {
-            target.min(cap)
+            // Largest rung not exceeding the cap; `nearest_difficulty_step`
+            // leaves an exact power of two alone, so the result stays capped.
+            let capped_rung = 2_f64.powf(cap.log2().floor());
+            target.min(capped_rung)
         } else {
             target
         }
@@ -1358,9 +1369,11 @@ mod tests {
         clock.advance_ms(48 * 3_600_000); // two days of silence
 
         // Floored estimate: (30720/290)/16 = 6.62 d/s → target 66.2.
-        // From an externally-raised 65536 the proposal is still the
-        // rate-derived 64 — the raise cannot stretch the bound.
-        assert_eq!(e.suggested_difficulty(65_536.0), Some(64.0));
+        // From an externally-raised 65536 the proposal is still derived from
+        // the rate, not from the raise — the ladder rounds 66.2 up to its rung.
+        // The bound is a FLOOR, so rounding up cannot violate it; it only makes
+        // the descent coarser than the raw 66.2.
+        assert_eq!(e.suggested_difficulty(65_536.0), Some(128.0));
         // And from 100, the floored target (66.2) sits inside the
         // deadband — no proposal, no creep below the bound.
         assert_eq!(e.suggested_difficulty(100.0), None);
@@ -1390,6 +1403,63 @@ mod tests {
         assert_eq!(off.suggested_difficulty(64.0), Some(1024.0));
     }
 
+    /// The cap must survive the ladder. Rounding happens AFTER the cap, so a
+    /// cap that is not itself a rung gets stepped over and the "at most 8×"
+    /// guarantee silently disappears.
+    ///
+    /// Regression for exactly that: with `client_difficulty = 48` the raw cap is
+    /// 384, which is not a power of two. Capping at 384 and then rounding up
+    /// yields 512 — 10.7× the current difficulty, past the bound the constant
+    /// promises.
+    /// Reproduces the declining-miner test from sv2-apps#647: a miner that
+    /// advertises 10x its real hashrate opens a channel, gets a difficulty
+    /// derived from that inflated figure, and therefore lands no share at all.
+    /// Timed there as "OpenChannel -> first SubmitShares": SRI main 3m30
+    /// (3 vardiff cycles WITH SetTarget), ckpool-vardiff 14m45 (14 cycles, none).
+    ///
+    /// This asks the same question of our engine: with no share ever accepted,
+    /// does any vardiff cycle propose a reduction?
+    #[test]
+    fn declining_miner_before_first_share_sv2_apps_647() {
+        let clock = TestClock::new(1_000);
+        for easing in [false, true] {
+            let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001).with_silence_easing(easing);
+            // Miner advertised 10x, so the pool assigned a difficulty it cannot
+            // reach. No share is ever accepted -> no update_hash_rate call.
+            let assigned = 100_000.0;
+            let mut proposals = 0;
+            for _ in 0..15 {
+                clock.advance_ms(60_000); // one vardiff cycle
+                if e.suggested_difficulty(assigned).is_some() {
+                    proposals += 1;
+                }
+            }
+            eprintln!("easing={easing}: {proposals} of 15 cycles proposed a retarget");
+        }
+    }
+
+    #[test]
+    fn up_step_cap_survives_the_power_of_two_ladder() {
+        let clock = TestClock::new(1_000);
+        let mut on = eased_engine(&clock);
+        for _ in 0..30 {
+            on.update_hash_rate(4.0, true);
+            clock.advance_ms(100);
+        }
+        let proposed = on
+            .suggested_difficulty(48.0)
+            .expect("burst window must propose a retarget");
+        assert!(
+            proposed <= 48.0 * VARDIFF_MAX_UP_STEP_FACTOR,
+            "{proposed} exceeds the {VARDIFF_MAX_UP_STEP_FACTOR}x cap over 48"
+        );
+        assert_eq!(
+            proposed,
+            2_f64.powf(proposed.log2().round()),
+            "{proposed} must still be a power of two"
+        );
+    }
+
     #[test]
     fn up_step_cap_bounds_burst_inflated_windows() {
         // A window whose samples all arrive in one bundle (a JDC draining
@@ -1406,7 +1476,8 @@ mod tests {
         }
         // closed span 2.9 s, sum 120 → 41.4 d/s → target 414.
         assert_eq!(on.suggested_difficulty(4.0), Some(32.0), "capped at 8×4");
-        assert_eq!(off.suggested_difficulty(4.0), Some(384.0), "uncapped leap");
+        // Uncapped, the raw 414 rounds up to the next rung.
+        assert_eq!(off.suggested_difficulty(4.0), Some(512.0), "uncapped leap");
     }
 
     #[test]

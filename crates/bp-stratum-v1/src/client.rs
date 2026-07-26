@@ -1379,7 +1379,9 @@ mod tests {
         let clock = Arc::new(TestClock::new(0));
         let (mut state, sc, port) = eased_session(true, &clock);
         // 400 s of silence: total window 690 s → target ≈ 7124 < 8192
-        // (= client/2) → retarget → step ≈ 6144.
+        // (= client/2) → retarget. The ladder is powers of two rounded UP, so
+        // 7124 lands on 8192 — still an eased step down from 16384, one rung
+        // coarser than the old lower/1.5x/upper ladder would have given.
         clock.advance_ms(400_000);
         let out = apply_vardiff_check(
             &mut state,
@@ -1396,7 +1398,7 @@ mod tests {
             frame.contains("mining.set_difficulty"),
             "expected a set_difficulty frame, got {frame}"
         );
-        assert_eq!(state.session_difficulty, 6144.0, "one eased step down");
+        assert_eq!(state.session_difficulty, 8192.0, "one eased step down");
         assert!(out
             .events
             .iter()
