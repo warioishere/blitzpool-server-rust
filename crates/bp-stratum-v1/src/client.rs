@@ -638,7 +638,6 @@ pub fn handle_submit<C: Clock>(
             state
                 .vardiff
                 .update_hash_rate(accept.effective_difficulty, is_current);
-            state.vardiff.note_target_reached();
             state.hash_rate = state.vardiff.hash_rate();
             // The caller drives per-mode share-stats + block-found fan-
             // out via the event; pass the full ShareAccept through.

@@ -647,8 +647,18 @@ impl<C: Clock> VarDiffEngine<C> {
         // Liveness sensor: an accepted share is a submission. Gated like
         // `note_submission` so the default (easing-off) path leaves the
         // field — which nothing else reads — untouched.
+        //
+        // An accepted share is also the strongest possible proof that the
+        // miner reaches the assigned target, so it spends the no-share
+        // evidence too. Folded in here rather than left to a second
+        // `note_target_reached()` call at the caller: `now` is already in
+        // hand, so this costs nothing, whereas the separate call added a
+        // second clock read per accepted share on the hot path — and an
+        // accepted share can no longer forget to do it.
         if self.silence_easing {
             self.last_submission_ms = Some(now);
+            self.no_share_accum_s_per_diff = 0.0;
+            self.no_share_segment_start_ms = now;
         }
 
         // Lifetime diff-work accumulator: every accepted share counts

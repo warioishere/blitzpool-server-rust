@@ -1334,8 +1334,9 @@ pub fn handle_submit_shares_standard<C: Clock>(
     match validation {
         ShareValidation::Accepted(ref accept) => {
             if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
+                // `update_hash_rate` folds in the target-reached reset —
+                // it already holds the clock read.
                 engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
-                engine.note_target_reached();
             }
         }
         ShareValidation::Rejected(reject)
@@ -1452,8 +1453,9 @@ pub fn handle_submit_shares_extended<C: Clock>(
     match validation {
         ShareValidation::Accepted(ref accept) => {
             if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
+                // `update_hash_rate` folds in the target-reached reset —
+                // it already holds the clock read.
                 engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
-                engine.note_target_reached();
             }
         }
         ShareValidation::Rejected(reject)
