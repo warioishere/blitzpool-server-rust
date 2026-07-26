@@ -35,18 +35,22 @@
 //!    `TdpHandle::current_snapshot().set_new_prev_hash.prev_hash`.
 //!    Trivial.
 //!
-//! 4. **[`JdpRpcBlockSubmissionSink`]** — on a JDC `PushSolution`,
+//! 4. **[`ProductionJdpBlockSink`]** — on a JDC `PushSolution`,
 //!    reconstructs the full SegWit block from (a) the declared
 //!    coinbase prefix+suffix + JDC extranonce (witness-formed via
 //!    [`bp_stratum_v2::mining::submit::assemble_witness_coinbase`]),
 //!    (b) the JDC-supplied raw transactions from
 //!    `JdpSessionEvent::BlockSubmissionCandidate.transactions`, and
-//!    (c) the header fields. Computes the merkle root,
-//!    consensus-serialises the block, and submits via
-//!    [`BitcoinRpc::submit_block`]. This is the **orphan-protection
-//!    redundancy** path: the JDC also submits via its own TDP
-//!    connection; the pool-side submit is a hot-path Anti-Orphan
-//!    measure consistent with the SV2 spec §6.4.9 "JDS SHOULD propagate".
+//!    (c) the header fields — **once** — then hands that one block to
+//!    both things that want it. First the **orphan-protection
+//!    redundancy** resubmit via [`BitcoinRpc::submit_block`]: the JDC
+//!    also submits via its own TDP connection, so the pool-side submit
+//!    is a hot-path Anti-Orphan measure consistent with the SV2 spec
+//!    §6.4.9 "JDS SHOULD propagate". Then the payout ledger, which
+//!    books the block only once its header proves work against the
+//!    pool's OWN target and tip. Either half can be switched off
+//!    (`[sv2].jdp_orphan_submitblock`, no ledger fan-out wired) without
+//!    touching the other.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -84,11 +88,12 @@ use crate::payout_resolver::ProductionPayoutResolver;
 /// share clones of the long-lived foundation handles — cheap to
 /// construct, cheap to clone per-connection.
 ///
-/// `orphan_submitblock_enabled` controls the block-submission sink:
-/// `true` → real RPC resubmit (full anti-orphan redundancy);
-/// `false` → log-only NoOp (SRI behaviour, JDC
-/// is the sole propagator). Source: `[sv2].jdp_orphan_submitblock`
-/// in the TOML.
+/// `orphan_submitblock_enabled` controls the resubmit half of the
+/// block-submission sink: `true` → real RPC resubmit (full anti-orphan
+/// redundancy); `false` → the JDC is the sole propagator via its own
+/// TDP connection and the pool only reports the block. Source:
+/// `[sv2].jdp_orphan_submitblock` in the TOML. `ledger_booker` switches
+/// the other half, independently.
 pub(crate) fn build_jdp_hooks(
     tdp: TdpHandle,
     bitcoin_rpc: BitcoinRpc,
@@ -98,37 +103,31 @@ pub(crate) fn build_jdp_hooks(
     orphan_submitblock_enabled: bool,
     ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
 ) -> JdpServerHooks {
-    let block_sink: Arc<dyn JdpBlockSubmissionSink> = if orphan_submitblock_enabled {
+    let propagator: Option<Arc<dyn BlockPropagator>> = if orphan_submitblock_enabled {
         info!(
             "jdp: orphan-protection submitblock RPC ENABLED \
              (`[sv2].jdp_orphan_submitblock = true`)"
         );
-        Arc::new(JdpRpcBlockSubmissionSink { bitcoin_rpc })
+        Some(Arc::new(bitcoin_rpc))
     } else {
         info!(
             "jdp: orphan-protection submitblock RPC DISABLED — JDC is sole \
              block propagator (set `[sv2].jdp_orphan_submitblock = true` to enable \
              pool-side resubmit for commercial JDC deployments)"
         );
-        Arc::new(LogOnlyBlockSubmissionSink)
+        None
     };
-    // Booking sits in front of whichever sink is configured: the block was
-    // found either way, so it must not hinge on the resubmit switch.
-    let block_sink: Arc<dyn JdpBlockSubmissionSink> = match ledger_booker {
-        Some(booker) => Arc::new(LedgerBookingJdpSink {
-            inner: block_sink,
-            booker,
-            chain: Arc::new(tdp.clone()),
-            booked: StdMutex::new(VecDeque::new()),
-        }),
-        None => {
-            info!(
-                "jdp: ledger fan-out not wired — a JDC-found block will be reported but \
-                 not booked"
-            );
-            block_sink
-        }
-    };
+    if ledger_booker.is_none() {
+        info!("jdp: ledger fan-out not wired — a JDC-found block will be reported but not booked");
+    }
+    // One sink for both halves. The block was found whether or not the pool
+    // resubmits it, so booking hangs off its own switch, not the resubmit one.
+    let block_sink: Arc<dyn JdpBlockSubmissionSink> = Arc::new(ProductionJdpBlockSink {
+        propagator,
+        booker: ledger_booker.map(|b| b as Arc<dyn DeclaredBlockBooker>),
+        chain: Arc::new(tdp.clone()),
+        booked: StdMutex::new(VecDeque::new()),
+    });
     JdpServerHooks {
         allocate_resolver: Arc::new(ProductionJdpAllocateResolver {
             payout_resolver: payout_resolver.clone(),
@@ -145,41 +144,6 @@ pub(crate) fn build_jdp_hooks(
             tdp,
             network,
         }),
-    }
-}
-
-// ─── LogOnlyBlockSubmissionSink (orphan-resubmit off) ────────────
-
-/// [`JdpBlockSubmissionSink`] impl that logs the block-found event
-/// at INFO and returns. Matches SRI's reference pool behaviour: JDC
-/// is the sole block propagator via its own `TdpHandle::submit_solution`.
-pub(crate) struct LogOnlyBlockSubmissionSink;
-
-#[async_trait]
-impl JdpBlockSubmissionSink for LogOnlyBlockSubmissionSink {
-    async fn submit_block_candidate(
-        &self,
-        miner_address: AddressId,
-        new_token: Token,
-        booking: Option<PayoutBooking>,
-        coinbase_raw: Vec<u8>,
-        transactions: Vec<Vec<u8>>,
-        prev_hash: [u8; 32],
-        version: u32,
-        ntime: u32,
-        nonce: u32,
-        _n_bits: u32,
-    ) {
-        let _ = (coinbase_raw, transactions, prev_hash, version, ntime, nonce);
-        info!(
-            miner = miner_address.as_str(),
-            token = ?new_token,
-            bookable = booking.is_some(),
-            "JDP block-candidate received; pool-side resubmit disabled — JDC \
-             propagates via its own TDP submit_solution. Enable \
-             `[sv2].jdp_orphan_submitblock` for anti-orphan redundancy."
-        );
-        log_booking_status(&miner_address, booking);
     }
 }
 
@@ -346,59 +310,29 @@ impl CurrentPrevHashProvider for TdpCurrentPrevHashProvider {
     }
 }
 
-// ─── 4. JdpRpcBlockSubmissionSink ────────────────────────────────
+// ─── 4. ProductionJdpBlockSink ───────────────────────────────────
 
-pub(crate) struct JdpRpcBlockSubmissionSink {
-    bitcoin_rpc: BitcoinRpc,
+/// Where a found block goes for the pool's own anti-orphan resubmit.
+///
+/// A seam, so the tests can pin that a candidate reaches propagation whatever
+/// the ledger decides about it — the failure this guards against is a change
+/// to the booking half quietly taking block propagation down with it.
+#[async_trait]
+pub(crate) trait BlockPropagator: Send + Sync {
+    async fn propagate(&self, miner_address: &AddressId, block: &Block);
 }
 
 #[async_trait]
-impl JdpBlockSubmissionSink for JdpRpcBlockSubmissionSink {
-    async fn submit_block_candidate(
-        &self,
-        miner_address: AddressId,
-        new_token: Token,
-        booking: Option<PayoutBooking>,
-        coinbase_raw: Vec<u8>,
-        transactions: Vec<Vec<u8>>,
-        prev_hash: [u8; 32],
-        version: u32,
-        ntime: u32,
-        nonce: u32,
-        n_bits: u32,
-    ) {
-        info!(
-            miner = miner_address.as_str(),
-            token = ?new_token,
-            tx_count = transactions.len(),
-            coinbase_len = coinbase_raw.len(),
-            bookable = booking.is_some(),
-            "JDP block-candidate received; reconstructing for submitblock"
-        );
-        log_booking_status(&miner_address, booking);
-
-        let Some(block) = assemble_declared_block(
-            &coinbase_raw,
-            &transactions,
-            prev_hash,
-            version,
-            ntime,
-            nonce,
-            n_bits,
-        ) else {
-            warn!("JDP submit: block reassembly failed; skipping submit");
-            return;
-        };
-
-        // 4. Serialise + submit.
-        let block_hex = serialize_hex(&block);
+impl BlockPropagator for BitcoinRpc {
+    async fn propagate(&self, miner_address: &AddressId, block: &Block) {
+        let block_hex = serialize_hex(block);
         let block_bytes = block_hex.len() / 2;
         info!(
             block_bytes,
             tx_count = block.txdata.len(),
             "JDP submit: dispatching submitblock RPC"
         );
-        match self.bitcoin_rpc.submit_block(block_hex).await {
+        match self.submit_block(block_hex).await {
             Ok(None) => info!(
                 miner = miner_address.as_str(),
                 "JDP block accepted by bitcoin-core (orphan-protection redundancy)"
@@ -444,7 +378,9 @@ pub(crate) struct ChainDemands {
     /// The tip a new block must build on.
     pub prev_hash: [u8; 32],
     /// The target that block's header hash must not exceed, as bitcoin-core
-    /// reported it in `SetNewPrevHash` (big-endian).
+    /// reported it in `SetNewPrevHash`: an SV2 U256, so **little-endian** —
+    /// the same form [`bp_share::Target::from_le_bytes`] takes and every other
+    /// reader of this field in the tree assumes.
     pub target: [u8; 32],
 }
 
@@ -483,13 +419,19 @@ pub(crate) fn solution_is_evidence(
     if header.prev_blockhash.to_byte_array() != demands.prev_hash {
         return Err(NotEvidence::WrongTip);
     }
-    // Compare as big-endian byte strings: `block_hash()` is little-endian
-    // internally, the target from `SetNewPrevHash` is big-endian, and a
-    // lexicographic compare of equal-length big-endian bytes is the numeric
-    // compare the consensus rule asks for.
-    let mut hash_be = header.block_hash().to_byte_array();
-    hash_be.reverse();
-    if hash_be > demands.target {
+    // Both operands are little-endian U256: the target is copied verbatim out
+    // of the `SetNewPrevHash` wire field, and `block_hash().to_byte_array()` is
+    // rust-bitcoin's internal little-endian form. So they go into the numeric
+    // compare unreversed.
+    //
+    // Reading either as big-endian is not a near-miss, it inverts the test. A
+    // real target is small, so its little-endian bytes START with the zero
+    // bytes; a winning hash reversed to big-endian starts with fewer. Compared
+    // the wrong way round, every genuine block looks like insufficient work and
+    // nothing is ever booked.
+    if !bp_share::Target::from_le_bytes(demands.target)
+        .is_met_by_le(&header.block_hash().to_byte_array())
+    {
         return Err(NotEvidence::InsufficientWork);
     }
     Ok(())
@@ -514,6 +456,11 @@ impl ChainView for TdpHandle {
 }
 
 /// Books a block the pool did not build the coinbase for.
+///
+/// Returns whether the booking got as far as the ledger fan-out. A `false` means
+/// nothing was written and the caller must not record the block as handled —
+/// otherwise the JD-client's retry, which is the only remaining chance to book
+/// it in-process, gets discarded as a duplicate.
 #[async_trait]
 pub(crate) trait DeclaredBlockBooker: Send + Sync {
     async fn book(
@@ -524,7 +471,7 @@ pub(crate) trait DeclaredBlockBooker: Send + Sync {
         block_hash: String,
         block_data: String,
         payouts_fingerprint: [u8; 32],
-    );
+    ) -> bool;
 }
 
 #[async_trait]
@@ -537,7 +484,7 @@ impl DeclaredBlockBooker for crate::block_sink::TdpBlockSubmissionSink {
         block_hash: String,
         block_data: String,
         payouts_fingerprint: [u8; 32],
-    ) {
+    ) -> bool {
         self.book_declared_block_found(
             miner_address,
             session_id,
@@ -546,17 +493,19 @@ impl DeclaredBlockBooker for crate::block_sink::TdpBlockSubmissionSink {
             block_data,
             payouts_fingerprint,
         )
-        .await;
+        .await
     }
 }
 
 /// Reassemble the block a `PushSolution` describes: the JDC's coinbase plus
 /// the transactions it declared, with the merkle root computed over them.
 ///
-/// Shared by the two things that need it — the orphan-protection resubmit and
-/// the ledger booking, which needs the header to name the block. Returns
-/// `None` when the JDC's bytes don't parse; the caller logs and moves on,
-/// because the JDC submits through its own node regardless.
+/// The expensive step on the block-found path: every declared transaction is
+/// consensus-decoded and the merkle root computed over the whole set. Both
+/// things that want the block — the orphan-protection resubmit and the ledger
+/// booking, which needs the header to name the block — are served from one
+/// call. Returns `None` when the JDC's bytes don't parse; the caller logs and
+/// moves on, because the JDC submits through its own node regardless.
 #[allow(clippy::too_many_arguments)]
 fn assemble_declared_block(
     coinbase_raw: &[u8],
@@ -618,15 +567,21 @@ fn assemble_declared_block(
     Some(block)
 }
 
-/// Fan a JDC-found block out to the per-mode ledger, then hand it to the
-/// wrapped sink.
+/// The pool's end of a JDC-found block: reassemble it once, propagate it, book
+/// it.
 ///
-/// Sits in front of BOTH sinks on purpose: the block was found whether or not
-/// the pool resubmits it, so the booking must not depend on
-/// `[sv2].jdp_orphan_submitblock`.
-pub(crate) struct LedgerBookingJdpSink {
-    inner: Arc<dyn JdpBlockSubmissionSink>,
-    booker: Arc<dyn DeclaredBlockBooker>,
+/// One sink rather than a chain of them, because both halves want the same
+/// reassembled block and reassembly is the only expensive step. Each half has
+/// its own switch and neither answers to the other's: the resubmit is
+/// `[sv2].jdp_orphan_submitblock`, the booking is whether a ledger fan-out was
+/// wired. The block was found either way.
+pub(crate) struct ProductionJdpBlockSink {
+    /// `Some` → the pool resubmits the block to its own node as anti-orphan
+    /// redundancy. `None` → the JDC is the sole propagator.
+    propagator: Option<Arc<dyn BlockPropagator>>,
+    /// `Some` → a proven block is booked against the distribution its coinbase
+    /// paid. `None` → no ledger fan-out on this deployment; report only.
+    booker: Option<Arc<dyn DeclaredBlockBooker>>,
     /// The pool's own chain view. Booking is checked against this, never
     /// against anything the JD-client sent.
     chain: Arc<dyn ChainView>,
@@ -640,34 +595,72 @@ pub(crate) struct LedgerBookingJdpSink {
 /// How many recently-booked block hashes are remembered for the repeat check.
 const BOOKED_MEMORY: usize = 16;
 
-impl LedgerBookingJdpSink {
+impl ProductionJdpBlockSink {
+    /// Has this block already been booked? Read-only on purpose — see
+    /// [`Self::remember_booked`].
     fn already_booked(&self, hash: &[u8; 32]) -> bool {
+        self.booked
+            .lock()
+            .expect("booked-hash mutex")
+            .contains(hash)
+    }
+
+    /// Record a block as booked. Called only once the booking actually reached
+    /// the ledger fan-out, never on first sight of the hash: a booking can fail
+    /// before writing anything (no height derivable, RPC down — most likely
+    /// right after a block was found, when the node is busiest), and the
+    /// JD-client's re-send is then the only chance left to get the row written.
+    /// Marking on sight would answer that re-send with "already booked" and lose
+    /// the payout to a manual reprocess.
+    fn remember_booked(&self, hash: [u8; 32]) {
         let mut booked = self.booked.lock().expect("booked-hash mutex");
-        if booked.contains(hash) {
-            return true;
+        if booked.contains(&hash) {
+            return;
         }
-        booked.push_back(*hash);
+        booked.push_back(hash);
         while booked.len() > BOOKED_MEMORY {
             booked.pop_front();
         }
-        false
     }
 
-    fn chain_demands(&self) -> Option<ChainDemands> {
-        self.chain.demands()
+    /// Is this block proven, given what the chain demanded when the solution
+    /// arrived?
+    ///
+    /// `WrongTip` gets a second look, because by now the pool's own node may
+    /// have connected this very block — from the resubmit a few lines up, or
+    /// from p2p because the JD-client's own node published it first. A block
+    /// its own node holds as the tip has passed every consensus rule there is,
+    /// which is a stronger proof than the target compare, not a weaker one. On
+    /// a busy tip that is the ordinary case, so treating it as the wrong tip
+    /// would refuse to book almost every real block.
+    fn block_is_proven(
+        &self,
+        block: &Block,
+        demands_on_arrival: Option<ChainDemands>,
+    ) -> Result<(), NotEvidence> {
+        match solution_is_evidence(&block.header, demands_on_arrival) {
+            Err(NotEvidence::WrongTip) => {
+                let our_tip = self.chain.demands().map(|d| d.prev_hash);
+                if our_tip == Some(block.header.block_hash().to_byte_array()) {
+                    return Ok(());
+                }
+                Err(NotEvidence::WrongTip)
+            }
+            other => other,
+        }
     }
-}
 
-impl LedgerBookingJdpSink {
     /// Book only what the chain can vouch for.
     async fn book_if_evidence(
         &self,
+        booker: &dyn DeclaredBlockBooker,
         miner_address: &AddressId,
         new_token: Token,
         block: &Block,
         booking: PayoutBooking,
+        demands_on_arrival: Option<ChainDemands>,
     ) {
-        if let Err(reason) = solution_is_evidence(&block.header, self.chain_demands()) {
+        if let Err(reason) = self.block_is_proven(block, demands_on_arrival) {
             warn!(
                 miner = miner_address.as_str(),
                 ?reason,
@@ -685,7 +678,7 @@ impl LedgerBookingJdpSink {
             );
             return;
         }
-        self.booker
+        let booked = booker
             .book(
                 miner_address.as_str().to_string(),
                 hex::encode(new_token.0),
@@ -695,11 +688,21 @@ impl LedgerBookingJdpSink {
                 booking.payouts_fingerprint,
             )
             .await;
+        if booked {
+            self.remember_booked(hash.to_byte_array());
+        } else {
+            warn!(
+                miner = miner_address.as_str(),
+                block_hash = %hash,
+                "JDP block-found: the booking wrote nothing — leaving the block un-recorded so a \
+                 re-sent solution can still book it"
+            );
+        }
     }
 }
 
 #[async_trait]
-impl JdpBlockSubmissionSink for LedgerBookingJdpSink {
+impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
     async fn submit_block_candidate(
         &self,
         miner_address: AddressId,
@@ -713,32 +716,24 @@ impl JdpBlockSubmissionSink for LedgerBookingJdpSink {
         nonce: u32,
         n_bits: u32,
     ) {
-        // Propagate first, and do no work of our own before it. The resubmit
-        // exists to shrink the orphan window; reassembling a multi-megabyte
-        // block to satisfy the ledger would widen it again for no gain, since
-        // nothing about the booking changes how fast the block travels.
-        let (coinbase_raw, transactions) = {
-            let coinbase_for_booking = coinbase_raw.clone();
-            let txs_for_booking = transactions.clone();
-            self.inner
-                .submit_block_candidate(
-                    miner_address.clone(),
-                    new_token,
-                    booking,
-                    coinbase_raw,
-                    transactions,
-                    prev_hash,
-                    version,
-                    ntime,
-                    nonce,
-                    n_bits,
-                )
-                .await;
-            (coinbase_for_booking, txs_for_booking)
-        };
-        let Some(booking) = booking else {
+        info!(
+            miner = miner_address.as_str(),
+            token = ?new_token,
+            tx_count = transactions.len(),
+            coinbase_len = coinbase_raw.len(),
+            bookable = booking.is_some(),
+            pool_resubmit = self.propagator.is_some(),
+            "JDP block-candidate received"
+        );
+        log_booking_status(&miner_address, booking);
+
+        // Nothing downstream wants the block, so don't pay to build it: a
+        // deployment with the resubmit off and no ledger wired is the JDC
+        // propagating alone, and reassembly would be work for a log line.
+        let to_book = booking.zip(self.booker.as_ref());
+        if self.propagator.is_none() && to_book.is_none() {
             return;
-        };
+        }
         let Some(block) = assemble_declared_block(
             &coinbase_raw,
             &transactions,
@@ -750,13 +745,34 @@ impl JdpBlockSubmissionSink for LedgerBookingJdpSink {
         ) else {
             warn!(
                 miner = miner_address.as_str(),
-                "JDP block-found: could not reassemble the block, so nothing can be booked \
-                 against it"
+                "JDP block: reassembly failed — the block can be neither resubmitted nor booked"
             );
             return;
         };
-        self.book_if_evidence(&miner_address, new_token, &block, booking)
+        // What the chain demanded when this solution arrived. Read BEFORE
+        // propagating, because the resubmit below advances our own node's tip
+        // and the booking would then be judged against the block it is about
+        // to book — a reading in which every found block is on the wrong tip.
+        // Costs one mutex-guarded clone, and only when there is a booking.
+        let demands_on_arrival = to_book.is_some().then(|| self.chain.demands()).flatten();
+
+        // Propagation first, and nothing that only the ledger needs before it.
+        // The resubmit exists to shrink the orphan window; the booking changes
+        // nothing about how fast the block travels, so it waits.
+        if let Some(propagator) = &self.propagator {
+            propagator.propagate(&miner_address, &block).await;
+        }
+        if let Some((booking, booker)) = to_book {
+            self.book_if_evidence(
+                booker.as_ref(),
+                &miner_address,
+                new_token,
+                &block,
+                booking,
+                demands_on_arrival,
+            )
             .await;
+        }
     }
 }
 
@@ -842,7 +858,7 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
         // job from current pool state and the JDC-reported
         // `available_payout_value` — recipients AND amounts both reflect
         // the moment of the request, not the token-time estimate.
-        let (payouts, engine_backed) = self
+        let (payouts, pool_can_book) = self
             .payout_resolver
             .resolve_payouts_reporting_source(miner_address, available_payout_value)
             .await;
@@ -916,16 +932,17 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
                  booked automatically"
             );
         }
-        if !engine_backed {
+        if !pool_can_book {
             warn!(
                 request_id,
                 address = miner_address.as_str(),
-                "ext 0x0003: payout set did not come from a payout engine (fallback or a mode \
-                 that keeps no ledger) — a block found on it will be reported but not booked"
+                "ext 0x0003: this payout set is not one the pool could book against — the engine \
+                 that would have to resolve it did not produce the list (fallback) — a block \
+                 found on it will be reported but not booked"
             );
         }
         let booking =
-            if engine_backed && value_is_bookable && outputs_match_payouts(&outputs, &payouts) {
+            if pool_can_book && value_is_bookable && outputs_match_payouts(&outputs, &payouts) {
                 Some(PayoutBooking {
                     payouts_fingerprint,
                     block_reward_sats: available_payout_value,
@@ -1197,36 +1214,37 @@ mod tests {
         assert!(bookable_ceiling(u64::MAX) >= u64::MAX / 2);
     }
 
-    // ── LedgerBookingJdpSink ────────────────────────────────────────
+    // ── ProductionJdpBlockSink ──────────────────────────────────────
 
     #[derive(Default)]
-    struct RecordingSink {
-        calls: StdMutex<Vec<[u8; 32]>>,
+    struct RecordingPropagator {
+        propagated: StdMutex<Vec<BlockHash>>,
     }
     #[async_trait]
-    impl JdpBlockSubmissionSink for RecordingSink {
-        async fn submit_block_candidate(
-            &self,
-            _: AddressId,
-            _: Token,
-            _: Option<PayoutBooking>,
-            coinbase_raw: Vec<u8>,
-            _: Vec<Vec<u8>>,
-            _: [u8; 32],
-            _: u32,
-            _: u32,
-            _: u32,
-            _: u32,
-        ) {
-            let mut h = [0u8; 32];
-            h[0] = coinbase_raw.first().copied().unwrap_or(0);
-            self.calls.lock().unwrap().push(h);
+    impl BlockPropagator for RecordingPropagator {
+        async fn propagate(&self, _: &AddressId, block: &Block) {
+            self.propagated
+                .lock()
+                .unwrap()
+                .push(block.header.block_hash());
         }
     }
 
     #[derive(Default)]
     struct RecordingBooker {
         booked: StdMutex<Vec<(u64, [u8; 32])>>,
+        hashes: StdMutex<Vec<String>>,
+        /// What the ledger reports back. `false` stands for the real booking
+        /// paths that return without writing anything.
+        wrote_nothing: bool,
+    }
+    impl RecordingBooker {
+        fn that_writes_nothing() -> Self {
+            RecordingBooker {
+                wrote_nothing: true,
+                ..Default::default()
+            }
+        }
     }
     #[async_trait]
     impl DeclaredBlockBooker for RecordingBooker {
@@ -1235,11 +1253,13 @@ mod tests {
             _: String,
             _: String,
             reward: u64,
-            _: String,
+            block_hash: String,
             _: String,
             fp: [u8; 32],
-        ) {
+        ) -> bool {
             self.booked.lock().unwrap().push((reward, fp));
+            self.hashes.lock().unwrap().push(block_hash);
+            !self.wrote_nothing
         }
     }
 
@@ -1248,6 +1268,51 @@ mod tests {
         fn demands(&self) -> Option<ChainDemands> {
             self.0
         }
+    }
+
+    /// A chain whose tip can move, the way the real one does when a block is
+    /// connected.
+    #[derive(Clone)]
+    struct MovingChain(Arc<StdMutex<Option<ChainDemands>>>);
+    impl MovingChain {
+        fn at(demands: ChainDemands) -> Self {
+            MovingChain(Arc::new(StdMutex::new(Some(demands))))
+        }
+        fn move_to(&self, demands: ChainDemands) {
+            *self.0.lock().unwrap() = Some(demands);
+        }
+    }
+    impl ChainView for MovingChain {
+        fn demands(&self) -> Option<ChainDemands> {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// Stands in for the real resubmit, which advances our own node's tip as a
+    /// side effect of connecting the block.
+    struct PropagatorThatMovesTheTip {
+        chain: MovingChain,
+        to: ChainDemands,
+    }
+    #[async_trait]
+    impl BlockPropagator for PropagatorThatMovesTheTip {
+        async fn propagate(&self, _: &AddressId, _: &Block) {
+            self.chain.move_to(self.to);
+        }
+    }
+
+    /// The block `push` below reassembles, so a test can name it.
+    fn pushed_block(nonce: u32) -> Block {
+        assemble_declared_block(
+            &coinbase_bytes(),
+            &[],
+            [0u8; 32],
+            0x2000_0000,
+            1_700_000_000,
+            nonce,
+            0x1d00_ffff,
+        )
+        .expect("fixture coinbase reassembles")
     }
 
     fn coinbase_bytes() -> Vec<u8> {
@@ -1274,28 +1339,39 @@ mod tests {
         raw
     }
 
+    /// A sink with whichever halves the test cares about wired up. Both are
+    /// independently switchable in production, so both are here.
+    fn sink_with_halves(
+        propagator: Option<Arc<RecordingPropagator>>,
+        booker: Option<Arc<RecordingBooker>>,
+        chain: Option<ChainDemands>,
+    ) -> ProductionJdpBlockSink {
+        ProductionJdpBlockSink {
+            propagator: propagator.map(|p| p as Arc<dyn BlockPropagator>),
+            booker: booker.map(|b| b as Arc<dyn DeclaredBlockBooker>),
+            chain: Arc::new(FixedChain(chain)),
+            booked: StdMutex::new(VecDeque::new()),
+        }
+    }
+
+    /// The fully-wired production shape: resubmit on, ledger wired.
     fn sink_with(
         chain: Option<ChainDemands>,
     ) -> (
-        LedgerBookingJdpSink,
-        Arc<RecordingSink>,
+        ProductionJdpBlockSink,
+        Arc<RecordingPropagator>,
         Arc<RecordingBooker>,
     ) {
-        let inner = Arc::new(RecordingSink::default());
+        let propagator = Arc::new(RecordingPropagator::default());
         let booker = Arc::new(RecordingBooker::default());
         (
-            LedgerBookingJdpSink {
-                inner: inner.clone(),
-                booker: booker.clone(),
-                chain: Arc::new(FixedChain(chain)),
-                booked: StdMutex::new(VecDeque::new()),
-            },
-            inner,
+            sink_with_halves(Some(propagator.clone()), Some(booker.clone()), chain),
+            propagator,
             booker,
         )
     }
 
-    async fn push(sink: &LedgerBookingJdpSink, booking: Option<PayoutBooking>, nonce: u32) {
+    async fn push(sink: &ProductionJdpBlockSink, booking: Option<PayoutBooking>, nonce: u32) {
         sink.submit_block_candidate(
             AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap(),
             Token([9u8; 16]),
@@ -1332,10 +1408,136 @@ mod tests {
             (Some(easy), None),
             (None, Some(a_booking())),
         ] {
-            let (sink, inner, _) = sink_with(chain);
+            let (sink, propagator, _) = sink_with(chain);
             push(&sink, booking, 1).await;
-            assert_eq!(inner.calls.lock().unwrap().len(), 1);
+            assert_eq!(propagator.propagated.lock().unwrap().len(), 1);
         }
+    }
+
+    /// The two halves share one reassembly but not one switch. A deployment
+    /// with the resubmit off still books: the block was found either way, and
+    /// `[sv2].jdp_orphan_submitblock` only says who propagates it.
+    #[tokio::test]
+    async fn booking_does_not_hinge_on_the_resubmit_switch() {
+        let booker = Arc::new(RecordingBooker::default());
+        let sink = sink_with_halves(
+            None,
+            Some(booker.clone()),
+            Some(ChainDemands {
+                prev_hash: [0u8; 32],
+                target: [0xFFu8; 32],
+            }),
+        );
+        push(&sink, Some(a_booking()), 1).await;
+        assert_eq!(
+            *booker.booked.lock().unwrap(),
+            vec![(5_000_000_000, [0x11; 32])]
+        );
+    }
+
+    /// And the reverse: with no ledger wired the block still gets propagated.
+    /// The resubmit answers to nothing the ledger does.
+    #[tokio::test]
+    async fn propagation_does_not_hinge_on_a_wired_ledger() {
+        let propagator = Arc::new(RecordingPropagator::default());
+        let sink = sink_with_halves(
+            Some(propagator.clone()),
+            None,
+            Some(ChainDemands {
+                prev_hash: [0u8; 32],
+                target: [0xFFu8; 32],
+            }),
+        );
+        push(&sink, Some(a_booking()), 1).await;
+        assert_eq!(propagator.propagated.lock().unwrap().len(), 1);
+    }
+
+    /// The pool's own resubmit advances the pool's own tip. Judging the booking
+    /// against the tip read afterwards means judging it against the block it is
+    /// about to book — under which no found block is ever on the right tip. The
+    /// decision must rest on what the chain demanded when the solution arrived.
+    #[tokio::test]
+    async fn the_tip_is_judged_as_of_the_solutions_arrival() {
+        let easy = ChainDemands {
+            prev_hash: [0u8; 32],
+            target: [0xFFu8; 32],
+        };
+        // Where the tip lands after our submit: some other block entirely, so
+        // re-reading it cannot rescue the check by the already-our-tip route.
+        let moved_on = ChainDemands {
+            prev_hash: [0x77u8; 32],
+            target: [0xFFu8; 32],
+        };
+        let chain = MovingChain::at(easy);
+        let booker = Arc::new(RecordingBooker::default());
+        let sink = ProductionJdpBlockSink {
+            propagator: Some(Arc::new(PropagatorThatMovesTheTip {
+                chain: chain.clone(),
+                to: moved_on,
+            })),
+            booker: Some(booker.clone()),
+            chain: Arc::new(chain),
+            booked: StdMutex::new(VecDeque::new()),
+        };
+        push(&sink, Some(a_booking()), 1).await;
+        assert_eq!(
+            booker.booked.lock().unwrap().len(),
+            1,
+            "the tip moved because we submitted the block — that must not un-book it"
+        );
+    }
+
+    /// By booking time the pool's own node may already hold the found block as
+    /// its tip: our resubmit connected it, or the JD-client's node published it
+    /// first and we got it over p2p. A block our own node accepted has passed
+    /// every consensus rule, which outranks our target compare — so it books.
+    #[tokio::test]
+    async fn a_block_our_node_already_holds_as_its_tip_is_proven() {
+        // Hard enough that no target compare could pass: the proof can only
+        // come from our node having accepted the block.
+        let mut unreachable_target = [0u8; 32];
+        unreachable_target[0] = 0x01;
+        let booker = Arc::new(RecordingBooker::default());
+        let sink = sink_with_halves(
+            None,
+            Some(booker.clone()),
+            Some(ChainDemands {
+                prev_hash: pushed_block(1).header.block_hash().to_byte_array(),
+                target: unreachable_target,
+            }),
+        );
+        push(&sink, Some(a_booking()), 1).await;
+        assert_eq!(booker.booked.lock().unwrap().len(), 1);
+    }
+
+    /// A tip that is neither the one mined on nor the found block itself stays
+    /// refused — the second look must not turn into a blanket pass.
+    #[tokio::test]
+    async fn a_foreign_tip_is_still_refused() {
+        let booker = Arc::new(RecordingBooker::default());
+        let sink = sink_with_halves(
+            None,
+            Some(booker.clone()),
+            Some(ChainDemands {
+                prev_hash: [0x99u8; 32],
+                target: [0xFFu8; 32],
+            }),
+        );
+        push(&sink, Some(a_booking()), 1).await;
+        assert!(booker.booked.lock().unwrap().is_empty());
+    }
+
+    /// The block the ledger names must be the block that was propagated —
+    /// one reassembly feeding both is what guarantees they cannot diverge.
+    #[tokio::test]
+    async fn the_booked_block_is_the_propagated_block() {
+        let (sink, propagator, booker) = sink_with(Some(ChainDemands {
+            prev_hash: [0u8; 32],
+            target: [0xFFu8; 32],
+        }));
+        push(&sink, Some(a_booking()), 1).await;
+        let propagated = propagator.propagated.lock().unwrap()[0];
+        assert_eq!(booker.hashes.lock().unwrap()[0], propagated.to_string());
     }
 
     /// Work on the pool's own tip is evidence, and gets booked with the
@@ -1356,16 +1558,18 @@ mod tests {
     /// A claim that did no work must not move money, however well-formed.
     #[tokio::test]
     async fn a_claim_without_work_books_nothing() {
+        // Little-endian: index 0 is the least-significant byte, so this is the
+        // number 1 — the hardest target there is.
         let mut hard = [0u8; 32];
-        hard[31] = 0x01;
-        let (sink, inner, booker) = sink_with(Some(ChainDemands {
+        hard[0] = 0x01;
+        let (sink, propagator, booker) = sink_with(Some(ChainDemands {
             prev_hash: [0u8; 32],
             target: hard,
         }));
         push(&sink, Some(a_booking()), 42).await;
         assert!(booker.booked.lock().unwrap().is_empty());
         assert_eq!(
-            inner.calls.lock().unwrap().len(),
+            propagator.propagated.lock().unwrap().len(),
             1,
             "still propagated — bitcoin-core is the one to reject it"
         );
@@ -1383,11 +1587,53 @@ mod tests {
         assert!(booker.booked.lock().unwrap().is_empty());
     }
 
+    /// A booking can return without writing anything — no height derivable, RPC
+    /// down, which is likeliest in the seconds after a block was found. The
+    /// JD-client's re-send is then the last chance to get the row written, so
+    /// the block must not already be marked as handled.
+    #[tokio::test]
+    async fn a_booking_that_wrote_nothing_leaves_the_retry_open() {
+        let booker = Arc::new(RecordingBooker::that_writes_nothing());
+        let sink = sink_with_halves(
+            None,
+            Some(booker.clone()),
+            Some(ChainDemands {
+                prev_hash: [0u8; 32],
+                target: [0xFFu8; 32],
+            }),
+        );
+        push(&sink, Some(a_booking()), 1).await;
+        push(&sink, Some(a_booking()), 1).await;
+        assert_eq!(
+            booker.booked.lock().unwrap().len(),
+            2,
+            "the re-send must reach the ledger again — the first attempt wrote nothing"
+        );
+    }
+
+    /// The flip side: once a booking really did write, the repeat is dropped.
+    /// Both properties come from the same bookkeeping, so both are pinned.
+    #[tokio::test]
+    async fn a_booking_that_wrote_suppresses_the_repeat() {
+        let booker = Arc::new(RecordingBooker::default());
+        let sink = sink_with_halves(
+            None,
+            Some(booker.clone()),
+            Some(ChainDemands {
+                prev_hash: [0u8; 32],
+                target: [0xFFu8; 32],
+            }),
+        );
+        push(&sink, Some(a_booking()), 1).await;
+        push(&sink, Some(a_booking()), 1).await;
+        assert_eq!(booker.booked.lock().unwrap().len(), 1);
+    }
+
     /// A re-sent solution is the same block; booking it twice would credit
     /// the same payout twice.
     #[tokio::test]
     async fn the_same_block_pushed_twice_books_once() {
-        let (sink, inner, booker) = sink_with(Some(ChainDemands {
+        let (sink, propagator, booker) = sink_with(Some(ChainDemands {
             prev_hash: [0u8; 32],
             target: [0xFFu8; 32],
         }));
@@ -1395,7 +1641,7 @@ mod tests {
         push(&sink, Some(a_booking()), 1).await;
         assert_eq!(booker.booked.lock().unwrap().len(), 1);
         assert_eq!(
-            inner.calls.lock().unwrap().len(),
+            propagator.propagated.lock().unwrap().len(),
             2,
             "propagation is not deduped — only the ledger write is"
         );
@@ -1443,10 +1689,11 @@ mod tests {
     fn a_header_that_did_no_work_is_not_evidence() {
         let demands = ChainDemands {
             prev_hash: [0u8; 32],
-            // Only a hash starting with 31 zero bytes would pass.
+            // Little-endian, so the least-significant byte is index 0: this is
+            // the number 1, the hardest target expressible. Nothing passes.
             target: {
                 let mut t = [0u8; 32];
-                t[31] = 0x01;
+                t[0] = 0x01;
                 t
             },
         };
@@ -1465,9 +1712,10 @@ mod tests {
         header.bits = CompactTarget::from_consensus(0x207f_ffff);
         let demands = ChainDemands {
             prev_hash: [0u8; 32],
+            // The number 1 in little-endian form — see above.
             target: {
                 let mut t = [0u8; 32];
-                t[31] = 0x01;
+                t[0] = 0x01;
                 t
             },
         };
@@ -1475,6 +1723,49 @@ mod tests {
             solution_is_evidence(&header, Some(demands)),
             Err(NotEvidence::InsufficientWork),
             "a self-declared easy target must not make a claim into evidence"
+        );
+    }
+
+    /// The target is a little-endian U256, and this test refuses to pass under
+    /// any other reading.
+    ///
+    /// Both earlier work tests used `[0xFF; 32]` and `0x…01`, which mean the
+    /// same thing whichever end you start from — so they held while the compare
+    /// was reversed and every real block was being rejected as workless. The
+    /// fixture here is deliberately lopsided: read little-endian it is nearly
+    /// the easiest target expressible, read big-endian it is 31 leading zero
+    /// bytes and nearly the hardest. The assertions below prove both halves of
+    /// that before checking the outcome, so the test cannot silently degrade
+    /// into a byte-order-blind one again.
+    #[test]
+    fn the_target_is_read_little_endian() {
+        let mut target = [0u8; 32];
+        target[31] = 0xFF; // little-endian: the most-significant byte
+        let header = header_with([0u8; 32], 7);
+        let hash_le = header.block_hash().to_byte_array();
+
+        assert!(
+            hash_le[31] < 0xFF,
+            "fixture must sit under the target when read little-endian"
+        );
+        let mut hash_be = hash_le;
+        hash_be.reverse();
+        assert!(
+            hash_be > target,
+            "and must fail when the same bytes are read big-endian — otherwise \
+             this test proves nothing about the byte order"
+        );
+
+        assert_eq!(
+            solution_is_evidence(
+                &header,
+                Some(ChainDemands {
+                    prev_hash: [0u8; 32],
+                    target,
+                })
+            ),
+            Ok(()),
+            "work below a little-endian target is evidence"
         );
     }
 

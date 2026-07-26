@@ -156,8 +156,30 @@ impl ProductionPayoutResolver {
             }
         }
     }
+}
 
-    /// Resolve payouts and say whether a payout **engine** produced them.
+/// Can a block found on this mode's payout set be booked without resolving a
+/// distribution snapshot?
+///
+/// Solo writes no engine ledger row at all — its coinbase is a single payout,
+/// nothing to reconstruct. Blockparty recomputes the splits from the live engine
+/// and writes its history row idempotently on the block hash, so it never reads
+/// a fingerprint either. For both, whether the list came from an engine or from
+/// a fallback changes nothing about what gets written, so the pool can book.
+///
+/// PPLNS and Group-Solo are the opposite: booking means resolving the snapshot
+/// this exact list was stored under, and a fallback list names one that was
+/// never written.
+fn books_without_a_snapshot(mode: MiningMode) -> bool {
+    match mode {
+        MiningMode::Solo | MiningMode::Blockparty => true,
+        MiningMode::Pplns | MiningMode::GroupSolo => false,
+    }
+}
+
+impl ProductionPayoutResolver {
+    /// Resolve payouts and say whether the pool could book a block found on
+    /// them.
     ///
     /// The plain resolver hides its fallbacks by design: when an engine is
     /// unreachable it hands back a solo split so the miner still gets a
@@ -165,13 +187,23 @@ impl ProductionPayoutResolver {
     /// accounting — a fallback list has no distribution snapshot behind it, so
     /// nothing could ever be booked against it. The ext-0x0003 path needs to
     /// tell the two apart before it promises a JD-client's block is bookable.
+    ///
+    /// The question is per mode, because only two modes resolve a snapshot at
+    /// all. Answering it as "did an engine build this" would withhold the
+    /// promise from the two modes that need no snapshot — and the promise gates
+    /// far more than the snapshot lookup: without it no block-found is emitted
+    /// at all, so the durable `blocks_entity` row, the notification and the
+    /// Blockparty history row would all go missing for a block the pool served.
     pub(crate) async fn resolve_payouts_reporting_source(
         &self,
         miner_address: &AddressId,
         reward_sats: u64,
     ) -> (Vec<PayoutEntry>, bool) {
         let resolved = self.mode_gate.lookup_mode(miner_address.as_str());
-        let engine_backed = match resolved.mode {
+        let pool_can_book = match resolved.mode {
+            // These two book by resolving the snapshot this list was stored
+            // under, so the list has to have come from the engine that stored
+            // it — a fallback would name a snapshot that does not exist.
             MiningMode::Pplns => match self.pplns.as_ref() {
                 Some(pplns) => pplns.build_distribution(reward_sats).await.is_ok(),
                 None => false,
@@ -188,14 +220,17 @@ impl ProductionPayoutResolver {
                     .is_ok(),
                 None => false,
             },
-            // Solo and Blockparty keep no distribution snapshot to book
-            // against, so nothing here is ever engine-backed for this purpose.
-            _ => false,
+            // The remaining modes never look a snapshot up, so nothing a
+            // fallback list could invalidate is at stake — see
+            // `books_without_a_snapshot`, which is total over `MiningMode` so a
+            // fifth mode has to answer this question rather than defaulting to
+            // "never book" here.
+            other => books_without_a_snapshot(other),
         };
         (
             bp_stratum_v2::hooks::PayoutResolver::resolve_payouts(self, miner_address, reward_sats)
                 .await,
-            engine_backed,
+            pool_can_book,
         )
     }
 
@@ -445,6 +480,31 @@ mod tests {
     use super::*;
 
     const TEST_REWARD: u64 = 5_000_000_000;
+
+    /// The promise this flag carries gates the whole block-found emission, not
+    /// just a snapshot lookup: without it nothing is emitted, so the durable
+    /// `blocks_entity` row, the notification and the Blockparty history row all
+    /// go missing for a block the pool served. Solo and Blockparty resolve no
+    /// snapshot at all, so withholding it from them buys nothing and costs that.
+    ///
+    /// Only the mode→answer decision is pinned here. That the emission really
+    /// follows from it is a property of the block-found fan-out and needs the
+    /// full-stack regtest that is still missing.
+    #[test]
+    fn the_modes_that_resolve_no_snapshot_can_always_be_booked() {
+        assert!(
+            books_without_a_snapshot(MiningMode::Solo),
+            "solo writes no engine ledger row — nothing a fallback could invalidate"
+        );
+        assert!(
+            books_without_a_snapshot(MiningMode::Blockparty),
+            "blockparty recomputes its splits and keys on the block hash"
+        );
+        // And the two that DO resolve one must keep needing an engine behind
+        // the list, or booking would name a snapshot nobody wrote.
+        assert!(!books_without_a_snapshot(MiningMode::Pplns));
+        assert!(!books_without_a_snapshot(MiningMode::GroupSolo));
+    }
 
     #[test]
     fn solo_payouts_empty_address_yields_empty() {
