@@ -1565,8 +1565,17 @@ pub fn handle_update_channel<C: Clock>(
 
     channel.declared_max_target = input.maximum_target;
 
+    // Is this news, or the same claim on a timer? A translator re-sends
+    // `UpdateChannel` unprompted every 60 s; a proxy whose workers just
+    // attached sends a DIFFERENT number. Silence is evidence about what
+    // this channel did in the past and cannot refute a statement about
+    // what it is now — only the re-assertion of a claim we have already
+    // outlived stays subject to it.
+    let repeated_claim = channel.last_declared_hash_rate == Some(input.nominal_hash_rate);
+    channel.last_declared_hash_rate = Some(input.nominal_hash_rate);
+
     let mut raw = hash_rate_to_difficulty(input.nominal_hash_rate as f64, target_shares_per_minute);
-    if let Some(ceiling) = silence_ceiling {
+    if let Some(ceiling) = silence_ceiling.filter(|_| repeated_claim) {
         if raw.as_f64() > ceiling {
             // The declaration contradicts what we have observed: this
             // channel has been quiet long enough at a known difficulty that
@@ -1575,10 +1584,12 @@ pub fn handle_update_channel<C: Clock>(
             // the descent once a minute and a miner behind a proxy would
             // never be rescued.
             //
-            // Keyed on the evidence, not on "no share yet" — the latter is
-            // the normal state of a proxy that has only just gained
-            // workers, and refusing its first honest declaration on that
-            // basis pins a whole farm at the opening difficulty.
+            // Two conditions, and both are needed. Keyed on "no share yet"
+            // alone it fired on the normal state of a proxy that had only
+            // just gained workers. Keyed on the silence alone it still
+            // fired ~60 s after channel open, because by then the quiet IS
+            // statistically loud — and a proxy whose rigs take a minute to
+            // attach would have had its first honest declaration capped.
             //
             // Sits before `clamp_difficulty_to_max_target` so the §5.3.7
             // MUST on `maximum_target` still wins, with the power-of-two
@@ -4345,31 +4356,33 @@ mod tests {
     /// `UpdateChannel` every 60 s. Without this it overwrites the descent
     /// once a minute and the miner behind the proxy is never rescued.
     #[test]
-    fn update_channel_cannot_raise_an_unproven_channel_back_up() {
+    fn update_channel_cannot_raise_a_silent_channel_back_up_on_repeat() {
         let clock = Arc::new(TestClock::new(0));
         let mut s = unproven_session(&clock, true);
         let cid = s.primary_channel.unwrap();
+        let claim = UpdateChannelInput {
+            channel_id: cid,
+            nominal_hash_rate: 1e12, // derives ~4096
+            maximum_target: [0xFF; 32],
+        };
+        // First time it is news, and news is honoured.
+        let _ = handle_update_channel(&mut s, &claim);
+
+        // Then total silence, and the descent walks it down.
         clock.advance_ms(61_000);
         let _ = apply_vardiff_check(&mut s);
         let descended = s.channels[&cid].session_difficulty;
         assert!(
-            descended < Difficulty(1024.0),
+            descended < Difficulty(4096.0),
             "precondition: descent moved"
         );
 
-        // The same unverified claim, re-asserted. 1e12 H/s would derive
-        // ~4096 — well above where the descent has landed.
-        let out = handle_update_channel(
-            &mut s,
-            &UpdateChannelInput {
-                channel_id: cid,
-                nominal_hash_rate: 1e12,
-                maximum_target: [0xFF; 32],
-            },
-        );
+        // The very same claim, re-asserted on the translator's 60 s timer.
+        // It carries nothing we have not already outlived.
+        let out = handle_update_channel(&mut s, &claim);
         assert!(
             out.outbound.is_empty(),
-            "an unproven channel must not be raised back by its own declaration"
+            "a repeated claim must not undo the descent"
         );
         assert_eq!(s.channels[&cid].session_difficulty, descended);
     }
@@ -4453,6 +4466,72 @@ mod tests {
         assert!(s.channels[&cid].session_difficulty > Difficulty(1024.0));
     }
 
+    /// Characterisation of the `UpdateChannel` cap across the WHOLE silence
+    /// range, not just the two ends. The unit tests covered "fresh channel"
+    /// and "long silence"; the interesting behaviour is in between, and it
+    /// is decided by a number nobody had looked at.
+    ///
+    /// Written to document the boundary, it found a live defect: keyed on
+    /// the silence alone, the cap starts biting ~60 s after channel open
+    /// (at difficulty 1024 and 6 shares/min the ceiling is already 504 by
+    /// then), so a proxy whose rigs take a minute to attach would have had
+    /// its first honest declaration capped — finding 2 in a milder form.
+    /// Hence the second condition: only a REPEATED declaration is subject
+    /// to it.
+    #[test]
+    fn the_update_channel_cap_only_bites_on_a_repeated_declaration() {
+        // Sample the whole range. A NEW declaration is honoured at every
+        // silence duration, including the ones where the ceiling is low.
+        for quiet_s in [10u64, 61, 120, 300, 600, 3_600] {
+            let clock = Arc::new(TestClock::new(0));
+            let mut s = unproven_session(&clock, true);
+            let cid = s.primary_channel.unwrap();
+            clock.advance_ms(quiet_s * 1_000);
+            let before = s.channels[&cid].session_difficulty;
+            let _ = handle_update_channel(
+                &mut s,
+                &UpdateChannelInput {
+                    channel_id: cid,
+                    nominal_hash_rate: 100e12, // news: rigs just attached
+                    maximum_target: [0xFF; 32],
+                },
+            );
+            assert!(
+                s.channels[&cid].session_difficulty > before,
+                "{quiet_s}s quiet: a NEW declaration must be honoured, \
+                 stayed at {:?}",
+                s.channels[&cid].session_difficulty
+            );
+        }
+
+        // The same claim re-sent on a timer is not news. Once the silence
+        // has outlived it, it stops being able to hold the difficulty up.
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = unproven_session(&clock, true);
+        let cid = s.primary_channel.unwrap();
+        let claim = UpdateChannelInput {
+            channel_id: cid,
+            nominal_hash_rate: 100e12,
+            maximum_target: [0xFF; 32],
+        };
+        clock.advance_ms(10_000);
+        let _ = handle_update_channel(&mut s, &claim); // honoured
+        let peak = s.channels[&cid].session_difficulty;
+        assert!(peak > Difficulty(1024.0));
+
+        // Now it repeats it every 60 s while producing nothing at all.
+        for _ in 0..10 {
+            clock.advance_ms(60_000);
+            let _ = handle_update_channel(&mut s, &claim);
+        }
+        assert!(
+            s.channels[&cid].session_difficulty < peak,
+            "a claim re-sent on a timer through total silence must stop \
+             holding the difficulty up (still at {:?})",
+            s.channels[&cid].session_difficulty
+        );
+    }
+
     /// Review regression (finding 2): a proxy opens its extended channel
     /// BEFORE any downstream rig has connected, so it declares little or
     /// nothing and gets the port's initial difficulty. Rigs then attach and
@@ -4513,26 +4592,24 @@ mod tests {
                 vec![0; 4],
             );
             let cid = s.primary_channel.unwrap();
-
-            // Let the descent run so the channel sits below where its own
-            // declaration would put it, still with no share ever accepted.
+            let claim = UpdateChannelInput {
+                channel_id: cid,
+                nominal_hash_rate: 1e15,
+                maximum_target: [0xFF; 32],
+            };
+            // State the claim once so later sends are repeats, then let
+            // the descent run through total silence.
+            let _ = handle_update_channel(&mut s, &claim);
             for _ in 0..6 {
                 clock.advance_ms(60_000);
                 let _ = apply_vardiff_check(&mut s);
             }
             let before = s.channels[&cid].session_difficulty.as_f64();
 
-            // Now re-assert a huge claim, repeatedly — a translator does
-            // this every 60 s.
+            // Now re-assert it, repeatedly — a translator does this every
+            // 60 s.
             for _ in 0..3 {
-                let _ = handle_update_channel(
-                    &mut s,
-                    &UpdateChannelInput {
-                        channel_id: cid,
-                        nominal_hash_rate: 1e15,
-                        maximum_target: [0xFF; 32],
-                    },
-                );
+                let _ = handle_update_channel(&mut s, &claim);
                 let after = s.channels[&cid].session_difficulty.as_f64();
                 assert!(
                     after <= before,
