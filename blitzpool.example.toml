@@ -170,10 +170,34 @@ difficulty_check_interval_ms = 240000
 #
 # Built-in bounds (not configurable): descent stops 16x below the rate
 # measured before the silence began (a rig that is GONE parks there
-# instead of sinking to the floor and flooding on return); no single
-# upward retarget exceeds 8x (burst-proof recovery). Rejected shares
-# count as alive: a miner in a duplicate/stale storm is hashing against
-# a stale job, so its difficulty is held, not eased.
+# instead of sinking to the floor and flooding on return); the first
+# upward retarget after that is capped at 8x, and once a raise has
+# survived a full interval of fresh shares the cap lifts so a genuine
+# hashrate jump is not rationed. Rejected shares count as alive: a miner
+# in a duplicate/stale storm is hashing against a stale job, so its
+# difficulty is held, not eased.
+#
+# THE SAME SWITCH also enables a second, separate intervention: sessions
+# that have never landed a single share. Their difficulty rests purely on
+# a declared hashrate (or the port's start value), and until now nothing
+# could lower it — the classic estimators have no sensor before the first
+# share, so a miner assigned a target it cannot reach hung there
+# indefinitely. With this on, elapsed silence at a known difficulty bounds
+# the hashrate from above and the difficulty is walked down until the
+# session can be heard. What that adds, on top of the above:
+#
+#   - a session with no share yet descends at most 256x below the highest
+#     difficulty it has ever been assigned (a different, wider bound than
+#     the 16x above — it only has to get the miner from never to
+#     occasionally; the first share hands over to the normal estimator);
+#   - a below-target reject does NOT count as reaching the target, so a
+#     miner that submits but cannot clear the bar is still rescued;
+#   - the descent only runs for sessions that completed the handshake AND
+#     were sent a job, so a template outage does not walk everyone down;
+#   - on SV2, an `UpdateChannel` whose declared hashrate contradicts a long
+#     observed silence is capped to what the silence allows. A channel that
+#     has simply not mined yet is NOT affected — its first declaration is
+#     honoured in full.
 #
 # Off by default — switch it on deliberately (staging first) and watch
 # stratum_difficulty_adjustments_total for the retarget cadence.

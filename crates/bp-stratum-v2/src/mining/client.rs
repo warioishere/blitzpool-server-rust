@@ -1324,12 +1324,28 @@ pub fn handle_submit_shares_standard<C: Clock>(
     // target the moment vardiff moves), starving the sample cache — vardiff
     // then fell into its under-sampled fallback and drifted the difficulty
     // toward the floor. Extended never hit this because it always fed `true`.
-    // (Rejects stamp the liveness heartbeat at the top of the handler, so no
-    // arm for them here.)
-    if let ShareValidation::Accepted(ref accept) = validation {
-        if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
-            engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
+    // Rejects stamped the liveness heartbeat at the top of the handler,
+    // before the reason was known. Now that it IS known, a reject that
+    // still cleared the assigned target also spends the no-share descent's
+    // evidence — but `DifficultyTooLow` must not, because that reject IS
+    // the over-assignment the descent has to correct, and letting it reset
+    // the accumulator would pin the difficulty exactly where the miner
+    // cannot reach it.
+    match validation {
+        ShareValidation::Accepted(ref accept) => {
+            if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
+                engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
+                engine.note_target_reached();
+            }
         }
+        ShareValidation::Rejected(reject)
+            if !matches!(reject.reason, RejectReason::DifficultyTooLow) =>
+        {
+            if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
+                engine.note_target_reached();
+            }
+        }
+        ShareValidation::Rejected(_) => {}
     }
     let channel = state
         .channels
@@ -1429,12 +1445,25 @@ pub fn handle_submit_shares_extended<C: Clock>(
     // Feed classic vardiff with the accepted share so its submission
     // cache fills + `suggested_difficulty` can produce real retargets.
     // Drop the channel borrow first because state.vardiff is a sibling
-    // field; re-borrow the channel below for finalize. (Rejects stamp the
-    // liveness heartbeat at the top of the handler.)
-    if let ShareValidation::Accepted(ref accept) = validation {
-        if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
-            engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
+    // field; re-borrow the channel below for finalize. Rejects stamped the
+    // liveness heartbeat at the top of the handler; the target-reached
+    // split below is the Standard path's rationale verbatim — a
+    // `DifficultyTooLow` reject must not spend the no-share evidence.
+    match validation {
+        ShareValidation::Accepted(ref accept) => {
+            if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
+                engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
+                engine.note_target_reached();
+            }
         }
+        ShareValidation::Rejected(reject)
+            if !matches!(reject.reason, RejectReason::DifficultyTooLow) =>
+        {
+            if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
+                engine.note_target_reached();
+            }
+        }
+        ShareValidation::Rejected(_) => {}
     }
     let channel = state
         .channels
@@ -1512,15 +1541,18 @@ pub fn handle_update_channel<C: Clock>(
     let min_difficulty = state.min_difficulty;
     let silence_easing = state.vardiff_silence_easing;
 
-    // A channel that has never had a share accepted has told us nothing we
-    // could verify — its assigned difficulty rests entirely on a declared
-    // `nominal_hash_rate`, and the vardiff may already have walked it down
-    // precisely because that declaration looks wrong.
-    let unproven = silence_easing
-        && state
+    // What the accumulated silence rules out, if anything. `None` unless
+    // this channel has genuinely been quiet at a known difficulty for long
+    // enough to say something — which a freshly opened proxy channel has
+    // NOT, so its first real declaration passes untouched.
+    let silence_ceiling = if silence_easing {
+        state
             .vardiff
             .get(&input.channel_id)
-            .is_some_and(|e| !e.has_accepted_share());
+            .and_then(|e| e.silence_implied_max_difficulty())
+    } else {
+        None
+    };
 
     let Some(channel) = state.channels.get_mut(&input.channel_id) else {
         return HandlerOutcome::with_frame(OutboundFrame::UpdateChannelError {
@@ -1532,18 +1564,26 @@ pub fn handle_update_channel<C: Clock>(
     channel.declared_max_target = input.maximum_target;
 
     let mut raw = hash_rate_to_difficulty(input.nominal_hash_rate as f64, target_shares_per_minute);
-    if unproven && raw > channel.session_difficulty {
-        // Do not let the same unverified claim raise the difficulty back.
-        // A translator re-sends `UpdateChannel` every 60 s, so without this
-        // it overwrites the descent once a minute and a miner behind a
-        // proxy is never rescued — the descent would only ever help the one
-        // kind of miner that never sends this message.
-        //
-        // Only raises are refused; a LOWER declaration is always honoured,
-        // and this sits before `clamp_difficulty_to_max_target` so the
-        // spec MUST on `maximum_target` (§5.3.7) still wins, with the
-        // power-of-two rounding still last.
-        raw = channel.session_difficulty;
+    if let Some(ceiling) = silence_ceiling {
+        if raw.as_f64() > ceiling {
+            // The declaration contradicts what we have observed: this
+            // channel has been quiet long enough at a known difficulty that
+            // the claimed rate is ruled out. A translator re-sends
+            // `UpdateChannel` every 60 s, so without this it would overwrite
+            // the descent once a minute and a miner behind a proxy would
+            // never be rescued.
+            //
+            // Keyed on the evidence, not on "no share yet" — the latter is
+            // the normal state of a proxy that has only just gained
+            // workers, and refusing its first honest declaration on that
+            // basis pins a whole farm at the opening difficulty.
+            //
+            // Sits before `clamp_difficulty_to_max_target` so the §5.3.7
+            // MUST on `maximum_target` still wins, with the power-of-two
+            // rounding still last. The ceiling is itself a floored,
+            // rounding-safe value.
+            raw = Difficulty(ceiling);
+        }
     }
     let clamped = clamp_difficulty_to_max_target(raw, &Target::from_le_bytes(input.maximum_target));
     let new_diff = if clamped.as_f64() > MAX_REASONABLE_DIFFICULTY {
@@ -4241,7 +4281,7 @@ mod tests {
         );
     }
 
-    // ── no-share descent (sv2-apps#647) ───────────────────────────
+    // ── no-share descent ──────────────────────────────────────────
 
     /// An eased session whose channel has NEVER submitted anything. Opens
     /// at the fixture's 1024.
@@ -4409,6 +4449,42 @@ mod tests {
             "a proven channel must follow its declaration again"
         );
         assert!(s.channels[&cid].session_difficulty > Difficulty(1024.0));
+    }
+
+    /// Review regression (finding 2): a proxy opens its extended channel
+    /// BEFORE any downstream rig has connected, so it declares little or
+    /// nothing and gets the port's initial difficulty. Rigs then attach and
+    /// it declares the real aggregate. "No accepted share yet" is the
+    /// normal state at that moment — refusing the declaration on that basis
+    /// pinned a whole farm at the opening difficulty and produced a
+    /// multi-minute share flood.
+    #[test]
+    fn update_channel_honours_a_fresh_channels_first_real_declaration() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut s = unproven_session(&clock, true);
+        let cid = s.primary_channel.unwrap();
+        assert_eq!(s.channels[&cid].session_difficulty, Difficulty(1024.0));
+
+        // Rigs attach seconds later; the proxy declares 100 TH/s. No share
+        // has been accepted and none could have been.
+        clock.advance_ms(5_000);
+        let out = handle_update_channel(
+            &mut s,
+            &UpdateChannelInput {
+                channel_id: cid,
+                nominal_hash_rate: 100e12,
+                maximum_target: [0xFF; 32],
+            },
+        );
+        assert!(
+            !out.outbound.is_empty(),
+            "a fresh channel's first honest declaration must be honoured"
+        );
+        assert!(
+            s.channels[&cid].session_difficulty > Difficulty(1024.0),
+            "farm pinned at the opening difficulty: {:?}",
+            s.channels[&cid].session_difficulty
+        );
     }
 
     /// The guard clamps `raw` to the session difficulty, but TWO more
