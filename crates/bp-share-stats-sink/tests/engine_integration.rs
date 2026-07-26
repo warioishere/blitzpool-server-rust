@@ -76,6 +76,32 @@ async fn cleanup(pool: &PgPool, slot_time_ms: i64, prefix: &str) {
     }
 }
 
+/// Read the flushed `accepted` for one slot, retrying until the engine's
+/// background flush has committed it or `timeout` elapses. Returns `None` on
+/// timeout so the caller can fail with its own message.
+///
+/// The flush is asynchronous, so any fixed sleep is a bet on how fast the
+/// runner is. CI lost that bet.
+async fn poll_accepted(pool: &PgPool, slot_ms: i64, timeout: Duration) -> Option<f32> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let row: Option<f32> = sqlx::query_scalar(
+            r#"SELECT accepted FROM pool_share_statistics_entity WHERE "time" = $1"#,
+        )
+        .bind(slot_ms)
+        .fetch_optional(pool)
+        .await
+        .expect("query pool_share row");
+        if let Some(accepted) = row {
+            return Some(accepted);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
     let _guard = ENGINE_TEST_LOCK.lock().await;
@@ -127,20 +153,16 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
         50.0,
     );
 
-    // Wait for at least 2 ticks to give the loop time to flush.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-
-    // Verify PG has the accepted-share row.
-    let accepted: f32 = sqlx::query_scalar(
-        r#"SELECT accepted FROM pool_share_statistics_entity WHERE "time" = $1"#,
-    )
-    .bind(slot.as_millis())
-    .fetch_one(&pool)
-    .await
-    .expect("read pool_share row");
+    // Wait for the flush to land, rather than for a fixed number of tick
+    // durations: a loaded runner can take far longer than two 80 ms ticks to
+    // get the write committed, and a plain sleep turns that into a false
+    // failure.
+    let accepted = poll_accepted(&pool, slot.as_millis(), Duration::from_secs(10))
+        .await
+        .expect("engine tick should have flushed within 10s");
     assert!(
         (accepted - 50.0).abs() < 0.01,
-        "engine tick should have flushed: {accepted}"
+        "engine tick should have flushed 50.0: {accepted}"
     );
 
     // Drop more data, then signal shutdown — final-drain should commit it.
