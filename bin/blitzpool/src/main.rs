@@ -664,6 +664,7 @@ async fn main() -> ExitCode {
                 handles.bitcoin_rpc.clone(),
                 handles.db.pool().clone(),
                 markers,
+                engines.mode_gate.clone(),
                 crate::block_reconcile::DEFAULT_INTERVAL,
                 crate::block_reconcile::DEFAULT_LOOKBACK,
             )),

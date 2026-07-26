@@ -20,6 +20,7 @@
 //! are working.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bp_bitcoin::BitcoinRpc;
@@ -36,7 +37,8 @@ pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(3600);
 /// enough to cover a deploy or an outage, short enough to stay cheap.
 pub(crate) const DEFAULT_LOOKBACK: u64 = 144;
 
-/// One block the chain says is the pool's, with no ledger record of it.
+/// One block the chain says is the pool's, that the pool's books do not
+/// account for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UnbookedBlock {
     pub height: u64,
@@ -45,6 +47,24 @@ pub(crate) struct UnbookedBlock {
     /// what the block actually paid — the only surviving record of it once a
     /// distribution snapshot has expired.
     pub pool_outputs: Vec<(String, u64)>,
+    pub gap: Gap,
+}
+
+/// Which of the two ways a block goes unaccounted for.
+///
+/// They are different failures with different fixes, so the report names
+/// which one it is rather than lumping them together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Gap {
+    /// No `blocks_entity` row: the pool never registered the block at all. A
+    /// JD-client block nothing told the pool about, or a found-block fan-out
+    /// that never ran.
+    NeverRegistered,
+    /// Registered but no payout rows: the pool saw the block and the ledger
+    /// apply did not happen — an unresolvable distribution, a dropped stream
+    /// event. This is the one `blocks_entity` alone cannot see, because the
+    /// front writes that row before any ledger applies.
+    RegisteredButUnbooked,
 }
 
 /// The addresses whose presence in a coinbase marks a block as the pool's.
@@ -76,6 +96,21 @@ impl PoolMarkers {
 
     fn matches(&self, address: &str) -> bool {
         self.addresses.contains(address)
+    }
+}
+
+/// Does an address's payout mode keep a ledger the pool has to book into?
+///
+/// Solo does not — it pays in the coinbase and records nothing, so a Solo
+/// block with no payout row is normal, not a miss. Without this distinction
+/// the check would flag every Solo block and be ignored within a week.
+pub(crate) trait ModeLedger: Send + Sync {
+    fn keeps_a_ledger(&self, miner_address: &str) -> bool;
+}
+
+impl ModeLedger for crate::engines::BlitzpoolModeGate {
+    fn keeps_a_ledger(&self, miner_address: &str) -> bool {
+        self.keeps_a_payout_ledger(miner_address)
     }
 }
 
@@ -113,6 +148,7 @@ pub(crate) fn spawn_reconcile_task(
     rpc: BitcoinRpc,
     pool: PgPool,
     markers: PoolMarkers,
+    modes: Arc<dyn ModeLedger>,
     interval: Duration,
     lookback: u64,
 ) -> JoinHandle<()> {
@@ -130,7 +166,16 @@ pub(crate) fn spawn_reconcile_task(
         );
         loop {
             tick.tick().await;
-            match run_once(&rpc, &pool, &markers, checked_through, lookback).await {
+            match run_once(
+                &rpc,
+                &pool,
+                &markers,
+                modes.as_ref(),
+                checked_through,
+                lookback,
+            )
+            .await
+            {
                 Ok(pass) => {
                     checked_through = Some(pass.checked_through);
                     if pass.unbooked.is_empty() {
@@ -160,6 +205,7 @@ pub(crate) async fn run_once(
     rpc: &BitcoinRpc,
     pool: &PgPool,
     markers: &PoolMarkers,
+    modes: &dyn ModeLedger,
     checked_through: Option<u64>,
     lookback: u64,
 ) -> Result<ReconcilePass, bp_bitcoin::RpcError> {
@@ -178,15 +224,24 @@ pub(crate) async fn run_once(
     }
 
     for height in from_height..=tip {
-        match inspect_block(rpc, pool, markers, height).await {
+        match inspect_block(rpc, pool, markers, modes, height).await {
             Ok(Some(block)) => {
-                error!(
-                    height = block.height,
-                    hash = %block.hash,
-                    outputs = ?block.pool_outputs,
-                    "block-reconcile: this block's coinbase pays the pool but nothing booked \
-                     it — the miners it paid are still owed their ledger entry"
-                );
+                match block.gap {
+                    Gap::NeverRegistered => error!(
+                        height = block.height,
+                        hash = %block.hash,
+                        outputs = ?block.pool_outputs,
+                        "block-reconcile: this block's coinbase pays the pool and the pool has \
+                         no record of it at all — the miners it paid are owed their ledger entry"
+                    ),
+                    Gap::RegisteredButUnbooked => error!(
+                        height = block.height,
+                        hash = %block.hash,
+                        outputs = ?block.pool_outputs,
+                        "block-reconcile: the pool registered this block but no payout was ever \
+                         booked for it — the miners it paid are owed their ledger entry"
+                    ),
+                }
                 unbooked.push(block);
             }
             Ok(None) => {}
@@ -206,6 +261,7 @@ async fn inspect_block(
     rpc: &BitcoinRpc,
     pool: &PgPool,
     markers: &PoolMarkers,
+    modes: &dyn ModeLedger,
     height: u64,
 ) -> Result<Option<UnbookedBlock>, bp_bitcoin::RpcError> {
     let hash = rpc.get_block_hash(height).await?;
@@ -220,17 +276,43 @@ async fn inspect_block(
     if pool_outputs.is_empty() {
         return Ok(None);
     }
-    match bp_db::block_recorded_at_height(pool, height as i64).await {
+    // Two questions, not one. `blocks_entity` says the pool registered the
+    // block; the payout tables say miners were credited for it. The front
+    // writes the first the moment a block is found, before any ledger runs,
+    // so only the second is evidence of a booking.
+    let registered_miner = match bp_db::found_block_miner_at_height(pool, height as i64).await {
+        Ok(v) => v,
+        Err(err) => {
+            // A DB error is not evidence of a gap — reporting on one would
+            // send an operator to reprocess something already booked.
+            warn!(%err, height, "block-reconcile: blocks_entity lookup failed; skipping");
+            return Ok(None);
+        }
+    };
+    let Some(miner) = registered_miner else {
+        return Ok(Some(UnbookedBlock {
+            height,
+            hash,
+            pool_outputs,
+            gap: Gap::NeverRegistered,
+        }));
+    };
+    // Registered. Whether a missing payout row is a fault depends on the
+    // mode: Solo pays in the coinbase and keeps no ledger, so it has none by
+    // design. Only a mode that books can be missing a booking.
+    if !modes.keeps_a_ledger(&miner) {
+        return Ok(None);
+    }
+    match bp_db::payout_recorded_at_height(pool, height as i32).await {
         Ok(true) => Ok(None),
         Ok(false) => Ok(Some(UnbookedBlock {
             height,
             hash,
             pool_outputs,
+            gap: Gap::RegisteredButUnbooked,
         })),
         Err(err) => {
-            // A DB error is not evidence the block is unbooked — saying so
-            // would send an operator to reprocess something already booked.
-            warn!(%err, height, "block-reconcile: ledger lookup failed; skipping this block");
+            warn!(%err, height, "block-reconcile: payout lookup failed; skipping");
             Ok(None)
         }
     }
@@ -340,8 +422,34 @@ mod regtest {
         }
     }
 
+    /// Remove any rows another suite (or an aborted run) left at this height.
+    /// The test database is shared and regtest heights are small, so the test
+    /// establishes its own precondition rather than assuming a clean slate.
+    async fn clear_height(pg: &PgPool, height: u64) {
+        let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
+            .bind(height as i32)
+            .execute(pg)
+            .await;
+        let _ = sqlx::query("DELETE FROM blocks_entity WHERE height = $1")
+            .bind(height as i64)
+            .execute(pg)
+            .await;
+    }
+
+    /// A payout mode that keeps a ledger, and one that does not.
+    struct Modes(bool);
+    impl ModeLedger for Modes {
+        fn keeps_a_ledger(&self, _miner_address: &str) -> bool {
+            self.0
+        }
+    }
+
+    /// Drives both gaps against a real chain. The second one is the reason
+    /// this check cannot key on `blocks_entity` alone: the front writes that
+    /// row the moment a block is found, so a block whose distribution never
+    /// booked has one and would otherwise look accounted for.
     #[tokio::test]
-    async fn a_mined_pool_block_is_reported_until_the_ledger_records_it() {
+    async fn both_ways_a_pool_block_goes_unaccounted_for_are_reported() {
         let Some(pg) = pg_or_skip().await else {
             return;
         };
@@ -353,28 +461,33 @@ mod regtest {
             }
         };
         let rpc = node.bitcoin_rpc().expect("rpc handle");
-
-        // A coinbase paying this address is, by definition, this pool's.
         let fee_address = node.new_address("bech32").await.expect("address");
         let markers = PoolMarkers::new([fee_address.clone()]).expect("one address");
+        let ledger_mode = Modes(true);
 
-        // Coinbases only mature into spendable outputs after 100 blocks, but
-        // the scan reads them straight from the chain, so one block is enough.
         let before = node.current_height().await.expect("height") as u64;
-        let _ = node
-            .generate_to_address(1, &fee_address)
+        node.generate_to_address(1, &fee_address)
             .await
             .expect("mine to the fee address");
-
-        let pass = run_once(&rpc, &pg, &markers, Some(before), DEFAULT_LOOKBACK)
-            .await
-            .expect("reconcile pass");
-        let mined_height = before + 1;
+        let mined = before + 1;
+        clear_height(&pg, mined).await;
+        // 1. The pool has no record of it at all.
+        let pass = run_once(
+            &rpc,
+            &pg,
+            &markers,
+            &ledger_mode,
+            Some(before),
+            DEFAULT_LOOKBACK,
+        )
+        .await
+        .expect("pass 1");
         let found = pass
             .unbooked
             .iter()
-            .find(|b| b.height == mined_height)
-            .expect("the block we just mined pays the pool and nothing booked it");
+            .find(|b| b.height == mined)
+            .expect("a pool block the pool never registered must be reported");
+        assert_eq!(found.gap, Gap::NeverRegistered);
         assert!(
             found
                 .pool_outputs
@@ -384,30 +497,80 @@ mod regtest {
             found.pool_outputs
         );
 
-        // Record it the way a booked block would be, and it stops being
-        // reported — otherwise the check would cry wolf on every pass.
+        // 2. Registered by the front — but nothing booked a payout. This is
+        //    the gap a `blocks_entity` check cannot see.
         bp_db::insert_found_block(
             &pg,
-            mined_height as i64,
+            mined as i64,
             &fee_address,
             "reconcile-regtest",
             "sid",
             &"00".repeat(80),
         )
         .await
-        .expect("record the block");
-        let pass = run_once(&rpc, &pg, &markers, Some(before), DEFAULT_LOOKBACK)
-            .await
-            .expect("second pass");
-        assert!(
-            !pass.unbooked.iter().any(|b| b.height == mined_height),
-            "a recorded block must not be reported"
+        .expect("register the block");
+        let pass = run_once(
+            &rpc,
+            &pg,
+            &markers,
+            &ledger_mode,
+            Some(before),
+            DEFAULT_LOOKBACK,
+        )
+        .await
+        .expect("pass 2");
+        assert_eq!(
+            pass.unbooked
+                .iter()
+                .find(|b| b.height == mined)
+                .map(|b| b.gap),
+            Some(Gap::RegisteredButUnbooked),
+            "registered but never booked must still be reported"
         );
 
-        let _ = sqlx::query("DELETE FROM blocks_entity WHERE height = $1")
-            .bind(mined_height as i64)
-            .execute(&pg)
-            .await;
+        // 3. A mode that keeps no ledger (Solo pays in the coinbase) has no
+        //    payout row by design and must not be flagged.
+        let pass = run_once(
+            &rpc,
+            &pg,
+            &markers,
+            &Modes(false),
+            Some(before),
+            DEFAULT_LOOKBACK,
+        )
+        .await
+        .expect("pass 3");
+        assert!(
+            !pass.unbooked.iter().any(|b| b.height == mined),
+            "a Solo block keeps no ledger — flagging it would make the check noise"
+        );
+
+        // 4. Once the payout is booked, it stops being reported.
+        sqlx::query(
+            r#"INSERT INTO pplns_payout_history ("blockHeight", address, "paidSats", percent)
+               VALUES ($1, $2, 1000, 100.0)"#,
+        )
+        .bind(mined as i32)
+        .bind(&fee_address)
+        .execute(&pg)
+        .await
+        .expect("book a payout");
+        let pass = run_once(
+            &rpc,
+            &pg,
+            &markers,
+            &ledger_mode,
+            Some(before),
+            DEFAULT_LOOKBACK,
+        )
+        .await
+        .expect("pass 4");
+        assert!(
+            !pass.unbooked.iter().any(|b| b.height == mined),
+            "a booked block must not be reported"
+        );
+
+        clear_height(&pg, mined).await;
         node.shutdown().await.ok();
     }
 }

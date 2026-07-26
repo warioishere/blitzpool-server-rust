@@ -73,17 +73,48 @@ where
     Ok(())
 }
 
-/// `true` when the pool has a `blocks_entity` record at `height`.
+/// The miner address the pool recorded for the block at `height`, or `None`
+/// when it has no record of one.
 ///
 /// The chain→ledger reconciliation asks this about a block whose coinbase
-/// pays the pool: a `false` means the pool mined it and never recorded it.
+/// pays the pool: `None` means the pool mined it and never registered it, and
+/// the address it returns resolves the payout mode, which decides whether a
+/// missing payout row is a fault or normal (Solo keeps no ledger).
 /// Dev-seed rows are excluded for the same reason `find_found_blocks`
 /// excludes them — a bootstrap fixture is not evidence of a real block.
-pub async fn block_recorded_at_height(pool: &PgPool, height: i64) -> Result<bool, DbError> {
+pub async fn found_block_miner_at_height(
+    pool: &PgPool,
+    height: i64,
+) -> Result<Option<String>, DbError> {
+    sqlx::query_scalar!(
+        r#"SELECT "minerAddress" AS "miner_address!"
+           FROM blocks_entity
+           WHERE height = $1 AND "minerAddress" NOT LIKE 'synthseed%'
+           LIMIT 1"#,
+        height,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::from)
+}
+
+/// `true` when some payout ledger recorded a distribution for `height`.
+///
+/// Distinct from [`block_recorded_at_height`], and the distinction is the
+/// point: `blocks_entity` is written by the front the moment a block is
+/// found, *before* any ledger applies. A block whose distribution then fails
+/// to book has the `blocks_entity` row and no payout rows — the exact shape of
+/// a miss. Only the payout tables are evidence that miners were credited.
+///
+/// Solo blocks legitimately have no row here: they pay directly in the
+/// coinbase and keep no ledger. Callers must not treat their absence as a
+/// miss without first checking the mode.
+pub async fn payout_recorded_at_height(pool: &PgPool, height: i32) -> Result<bool, DbError> {
     let found = sqlx::query_scalar!(
-        r#"SELECT EXISTS (
-             SELECT 1 FROM blocks_entity
-             WHERE height = $1 AND "minerAddress" NOT LIKE 'synthseed%'
+        r#"SELECT (
+             EXISTS (SELECT 1 FROM pplns_payout_history WHERE "blockHeight" = $1)
+             OR EXISTS (SELECT 1 FROM pplns_group_block_history WHERE "blockHeight" = $1)
+             OR EXISTS (SELECT 1 FROM blockparty_block_history WHERE "blockHeight" = $1)
            ) AS "exists!""#,
         height,
     )

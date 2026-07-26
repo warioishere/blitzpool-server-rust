@@ -69,8 +69,9 @@ pub use address_ownership::{
     OwnershipChallengeRow,
 };
 pub use block::{
-    block_recorded_at_height, delete_old_rpc_blocks, find_block, find_found_blocks, find_rpc_block,
-    insert_found_block, BlocksRow, FoundBlockRow, RpcBlockRow,
+    delete_old_rpc_blocks, find_block, find_found_blocks, find_rpc_block,
+    found_block_miner_at_height, insert_found_block, payout_recorded_at_height, BlocksRow,
+    FoundBlockRow, RpcBlockRow,
 };
 pub use blockparty::{
     delete_blockparty_join_link, delete_blockparty_member, find_blockparty_group,
