@@ -1486,9 +1486,7 @@ pub fn handle_update_channel<C: Clock>(
 
     let raw = hash_rate_to_difficulty(input.nominal_hash_rate as f64, target_shares_per_minute);
     let clamped = clamp_difficulty_to_max_target(raw, &Target::from_le_bytes(input.maximum_target));
-    let new_diff = if clamped < min_difficulty {
-        min_difficulty
-    } else if clamped.as_f64() > MAX_REASONABLE_DIFFICULTY {
+    let new_diff = if clamped.as_f64() > MAX_REASONABLE_DIFFICULTY {
         // Keep the existing difficulty rather than accepting an
         // unreasonable value. Miner can retry with a larger max_target.
         return HandlerOutcome::default();
@@ -1496,7 +1494,17 @@ pub fn handle_update_channel<C: Clock>(
         // Power of two — same rationale as the channel-open path. This is the
         // path that mattered in practice: a translator sends `UpdateChannel`
         // every 60 s, so it kept overwriting whatever the vardiff had rounded.
-        power_of_two_difficulty(clamped)
+        //
+        // The configured floor goes through the same rounding: an operator who
+        // sets a crooked `min_difficulty` would otherwise hand a translating
+        // proxy something to round up, which is the whole failure this rounding
+        // exists to prevent. Rounding up can only raise it further above the
+        // floor, so the floor still holds.
+        power_of_two_difficulty(if clamped < min_difficulty {
+            min_difficulty
+        } else {
+            clamped
+        })
     };
 
     if (new_diff.as_f64() - channel.session_difficulty.as_f64()).abs() < f64::EPSILON {
@@ -3531,6 +3539,53 @@ mod tests {
             out.events[0],
             SessionEvent::DifficultyChanged { .. }
         ));
+    }
+
+    /// Everything `UpdateChannel` can assign is a power of two — including the
+    /// value that comes out of the configured floor.
+    ///
+    /// A crooked `min_difficulty` would otherwise reach a translating proxy
+    /// unrounded, which is exactly the case this rounding exists to prevent, and
+    /// this is the path that matters in practice: a translator sends
+    /// `UpdateChannel` every 60 s.
+    #[test]
+    fn update_channel_assigns_a_power_of_two_even_through_the_floor() {
+        let crooked_floor = Difficulty(3000.0);
+        let mut s = MiningSessionState::new(
+            Arc::new(TestClock::new(0)),
+            1,
+            PortConfig {
+                min_difficulty: crooked_floor,
+                ..port_cfg()
+            },
+        );
+        handle_setup_connection(&mut s, &good_setup());
+        let _ = handle_open_standard_mining_channel(
+            &mut s,
+            &open_std(1, &format!("{}.w", REGTEST_ADDR)),
+            vec![0; 4],
+        );
+        let channel_id = s.primary_channel.unwrap();
+        // A tiny reported hashrate drives the raw difficulty under the floor,
+        // so the floor decides the outcome.
+        let _ = handle_update_channel(
+            &mut s,
+            &UpdateChannelInput {
+                channel_id,
+                nominal_hash_rate: 1.0,
+                maximum_target: [0xFF; 32],
+            },
+        );
+        let assigned = s.channels[&channel_id].session_difficulty.as_f64();
+        assert_eq!(
+            assigned,
+            2_f64.powf(assigned.log2().round()),
+            "assigned {assigned} is not a power of two"
+        );
+        assert!(
+            assigned >= crooked_floor.as_f64(),
+            "assigned {assigned} fell below the configured floor"
+        );
     }
 
     // ── CloseChannel ───────────────────────────────────────────────
