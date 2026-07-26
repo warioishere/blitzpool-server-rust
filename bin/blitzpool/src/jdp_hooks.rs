@@ -354,8 +354,8 @@ impl BlockPropagator for BitcoinRpc {
 /// is what the witness-form assembly indexes against.
 const MIN_COINBASE_LEN: usize = 8;
 
-/// The most a JD-client may claim the block pays and still have the pool book
-/// it automatically.
+/// How far a JD-client's reported payout value may sit from what the pool's own
+/// template says, in either direction, and still be booked automatically.
 ///
 /// Separate from the `revenue-too-large` ceiling on purpose. That one decides
 /// whether a coinbase gets built at all and is generous, because a client
@@ -368,8 +368,31 @@ const MIN_COINBASE_LEN: usize = 8;
 /// The margin covers ordinary mempool divergence between two nodes; anything
 /// beyond it is served but not vouched for, and the chain→ledger check reports
 /// the block if it turns out to have been real.
+const BOOKABLE_DIVERGENCE_DIVISOR: u64 = 4;
+
+/// The most a client may report and still be booked.
 fn bookable_ceiling(pool_template_value: u64) -> u64 {
-    pool_template_value.saturating_add(pool_template_value / 4)
+    pool_template_value.saturating_add(pool_template_value / BOOKABLE_DIVERGENCE_DIVISOR)
+}
+
+/// The least it may report and still be booked.
+///
+/// A ceiling alone leaves the gate open in the direction that costs the most.
+/// `available_payout_value` is what the client hands the pool to distribute, and
+/// it is free to keep the rest — so an understated value is not malformed, it is
+/// a client keeping more. But booking one settles the whole PPLNS window or group
+/// round against it: report a few thousand sats for a block paying 3.125 BTC and
+/// the round is closed out, balances written and reset, for pocket change. The
+/// coinbase is still served; only the promise is withheld.
+fn bookable_floor(pool_template_value: u64) -> u64 {
+    pool_template_value.saturating_sub(pool_template_value / BOOKABLE_DIVERGENCE_DIVISOR)
+}
+
+/// Is the client's reported payout value close enough to the pool's own template
+/// to be written into the ledger?
+fn reported_value_is_bookable(available_payout_value: u64, pool_template_value: u64) -> bool {
+    available_payout_value >= bookable_floor(pool_template_value)
+        && available_payout_value <= bookable_ceiling(pool_template_value)
 }
 
 /// What the pool's own node says the next block must satisfy.
@@ -827,16 +850,21 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
         use bp_stratum_v2::extensions::payout_outputs_error_codes;
 
         // ── Revenue plausibility (internal guard) ───────────────────
+        //
+        // ONE snapshot for both gates below. TDP rotates it continuously (every
+        // tip, and on mempool growth), so two reads can hand the serve gate and
+        // the bookable band different templates — and then a request can pass
+        // the first against a template the second no longer holds.
         let pool_template_value = self
             .tdp
             .current_snapshot()
             .new_template
             .as_ref()
             .map(|t| t.coinbase_tx_value_remaining);
-        if let Some(t) = self.tdp.current_snapshot().new_template {
+        if let Some(template_value) = pool_template_value {
             // 2× tolerance for mempool fee variance; rejects clearly
             // implausible (>2× current template value).
-            let ceiling = t.coinbase_tx_value_remaining.saturating_mul(2);
+            let ceiling = template_value.saturating_mul(2);
             if available_payout_value > ceiling {
                 warn!(
                     request_id,
@@ -917,46 +945,71 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
         // So the promise is withheld outside a narrow band even where the
         // coinbase is still served.
         let value_is_bookable = match pool_template_value {
-            Some(pool_value) => available_payout_value <= bookable_ceiling(pool_value),
+            Some(pool_value) => {
+                let ok = reported_value_is_bookable(available_payout_value, pool_value);
+                if !ok {
+                    warn!(
+                        request_id,
+                        address = miner_address.as_str(),
+                        available_payout_value,
+                        pool_template_value = pool_value,
+                        bookable_floor = bookable_floor(pool_value),
+                        bookable_ceiling = bookable_ceiling(pool_value),
+                        "ext 0x0003: reported payout value sits outside the band the pool's own \
+                         template can account for — the coinbase still goes out, but a block \
+                         found on it will not be booked automatically"
+                    );
+                }
+                ok
+            }
             // No template of our own to compare against — no basis to promise.
-            None => false,
+            // Said as its own case: claiming the value was out of band would
+            // name a comparison that never happened, and `tracing` drops a
+            // `None` field entirely, so the line would not even show that the
+            // template was what was missing.
+            None => {
+                warn!(
+                    request_id,
+                    address = miner_address.as_str(),
+                    available_payout_value,
+                    "ext 0x0003: the pool has no template of its own yet, so the reported payout \
+                     value cannot be checked against anything — the coinbase still goes out, but \
+                     a block found on it will not be booked automatically"
+                );
+                false
+            }
         };
-        if !value_is_bookable {
-            warn!(
-                request_id,
-                address = miner_address.as_str(),
-                available_payout_value,
-                pool_template_value,
-                "ext 0x0003: reported payout value is above what the pool's own template can \
-                 account for — the coinbase still goes out, but a block found on it will not be \
-                 booked automatically"
-            );
-        }
         if !pool_can_book {
             warn!(
                 request_id,
                 address = miner_address.as_str(),
-                "ext 0x0003: this payout set is not one the pool could book against — the engine \
-                 that would have to resolve it did not produce the list (fallback) — a block \
-                 found on it will be reported but not booked"
+                "ext 0x0003: this payout set is not one the pool could book against — the list \
+                 did not come from the engine that would have to resolve it, or that engine's \
+                 snapshot did not land — a block found on it will be reported but not booked"
             );
         }
-        let booking =
-            if pool_can_book && value_is_bookable && outputs_match_payouts(&outputs, &payouts) {
-                Some(PayoutBooking {
-                    payouts_fingerprint,
-                    block_reward_sats: available_payout_value,
-                })
-            } else {
-                warn!(
-                    request_id,
-                    address = miner_address.as_str(),
-                    "ext 0x0003: issued output set differs from the distribution it came from \
+        // Each reason warns for itself above, so this arm speaks only for the
+        // one that has no other voice. Blaming the lowering for all three sent
+        // an operator to the dust floor and the residual fold when the actual
+        // cause was the value band or a missing engine.
+        let outputs_still_match = outputs_match_payouts(&outputs, &payouts);
+        if !outputs_still_match {
+            warn!(
+                request_id,
+                address = miner_address.as_str(),
+                "ext 0x0003: issued output set differs from the distribution it came from \
                  (sub-dust drop or residual fold) — a block found on it will be reported \
                  but not booked"
-                );
-                None
-            };
+            );
+        }
+        let booking = if pool_can_book && value_is_bookable && outputs_still_match {
+            Some(PayoutBooking {
+                payouts_fingerprint,
+                block_reward_sats: available_payout_value,
+            })
+        } else {
+            None
+        };
         let bytes = match encode_coinbase_outputs(self.network, &outputs) {
             Ok(b) => b,
             Err(err) => {
@@ -1111,31 +1164,29 @@ mod tests {
     /// A JD-client may re-send a solution (reconnect, an ack it never saw).
     /// The same block must be booked once — the ledger it writes into is not
     /// idempotent across differing heights.
-    #[test]
-    fn a_repeated_block_is_booked_only_once() {
-        let seen = StdMutex::new(VecDeque::new());
-        let remember = |hash: [u8; 32]| -> bool {
-            let mut booked = seen.lock().unwrap();
-            if booked.contains(&hash) {
-                return true;
-            }
-            booked.push_back(hash);
-            while booked.len() > BOOKED_MEMORY {
-                booked.pop_front();
-            }
-            false
-        };
-        assert!(!remember([1u8; 32]), "first sighting is not a repeat");
-        assert!(remember([1u8; 32]), "the same block again is");
-        assert!(!remember([2u8; 32]), "a different block is not");
+    ///
+    /// Driven through the real sink's own bookkeeping. An earlier version of
+    /// this test re-implemented that bookkeeping as a local closure, so deleting
+    /// the production code left it green.
+    #[tokio::test]
+    async fn a_repeated_block_is_booked_only_once() {
+        let sink = sink_with_halves(None, Some(Arc::new(RecordingBooker::default())), None);
+        assert!(!sink.already_booked(&[1u8; 32]), "first sighting");
+        sink.remember_booked([1u8; 32]);
+        assert!(sink.already_booked(&[1u8; 32]), "the same block again");
+        assert!(!sink.already_booked(&[2u8; 32]), "a different block");
+
+        // Recording the same hash twice must not consume two slots, or the
+        // bound would evict on repeats instead of on new blocks.
+        sink.remember_booked([1u8; 32]);
 
         // The memory is bounded, so an old hash eventually ages out rather
         // than growing without limit on a long-lived connection.
         for i in 0..BOOKED_MEMORY as u8 {
-            remember([100 + i; 32]);
+            sink.remember_booked([100 + i; 32]);
         }
         assert!(
-            !remember([1u8; 32]),
+            !sink.already_booked(&[1u8; 32]),
             "past the bound the oldest is forgotten — bounded memory is the trade"
         );
     }
@@ -1203,15 +1254,51 @@ mod tests {
     fn the_bookable_band_is_tighter_than_the_serve_ceiling() {
         let template = 312_500_000u64;
         // Ordinary mempool divergence between two nodes stays bookable.
-        assert!(template + template / 10 <= bookable_ceiling(template));
+        assert!(reported_value_is_bookable(
+            template + template / 10,
+            template
+        ));
+        assert!(reported_value_is_bookable(
+            template - template / 10,
+            template
+        ));
         assert_eq!(bookable_ceiling(template), 390_625_000);
         // The serve ceiling is 2x; that is far outside what may be booked.
         assert!(
             template * 2 > bookable_ceiling(template),
             "a claim the coinbase path still tolerates must not be bookable"
         );
-        // No overflow at absurd inputs.
+        // No overflow / underflow at absurd inputs.
         assert!(bookable_ceiling(u64::MAX) >= u64::MAX / 2);
+        assert_eq!(bookable_floor(0), 0);
+    }
+
+    /// The band has to close in BOTH directions. An understated value is not a
+    /// malformed one — the client keeps the rest — but booking it settles the
+    /// whole PPLNS window or group round against that number. A few thousand
+    /// sats reported for a block paying 3.125 BTC would close the round out for
+    /// pocket change.
+    #[test]
+    fn an_understated_payout_value_is_not_bookable() {
+        let template = 312_500_000u64;
+        assert!(
+            !reported_value_is_bookable(10_000, template),
+            "a tip-sized report must not settle a whole round"
+        );
+        assert!(!reported_value_is_bookable(0, template));
+        assert!(
+            !reported_value_is_bookable(template / 2, template),
+            "keeping half the block is legal, but it is not what the pool books"
+        );
+        // Just inside the floor stays bookable, so honest divergence is unaffected.
+        assert!(reported_value_is_bookable(
+            bookable_floor(template),
+            template
+        ));
+        assert!(!reported_value_is_bookable(
+            bookable_floor(template) - 1,
+            template
+        ));
     }
 
     // ── ProductionJdpBlockSink ──────────────────────────────────────
