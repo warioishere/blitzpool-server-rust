@@ -49,7 +49,8 @@
 //!    measure consistent with the SV2 spec §6.4.9 "JDS SHOULD propagate".
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use bitcoin::block::{Block, Header, Version as BlockVersion};
@@ -117,6 +118,8 @@ pub(crate) fn build_jdp_hooks(
         Some(booker) => Arc::new(LedgerBookingJdpSink {
             inner: block_sink,
             booker,
+            tdp: tdp.clone(),
+            booked: StdMutex::new(VecDeque::new()),
         }),
         None => {
             info!(
@@ -417,6 +420,63 @@ impl JdpBlockSubmissionSink for JdpRpcBlockSubmissionSink {
 /// is what the witness-form assembly indexes against.
 const MIN_COINBASE_LEN: usize = 8;
 
+/// What the pool's own node says the next block must satisfy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChainDemands {
+    /// The tip a new block must build on.
+    pub prev_hash: [u8; 32],
+    /// The target that block's header hash must not exceed, as bitcoin-core
+    /// reported it in `SetNewPrevHash` (big-endian).
+    pub target: [u8; 32],
+}
+
+/// Why a pushed solution may not be booked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NotEvidence {
+    /// The pool has no tip of its own to check against yet.
+    NoChainView,
+    /// Built on a different tip than the pool's. Either the JDC is on another
+    /// chain or the solution is stale — in both cases the declared job this
+    /// was matched against is not the job that was solved.
+    WrongTip,
+    /// The header does not meet the network target: no work was done.
+    InsufficientWork,
+}
+
+/// Is this pushed solution *evidence* that a block was found, or merely the
+/// JD-client's claim that one was?
+///
+/// The distinction decides whether the pool may write to its payout ledger. A
+/// JDC owns its coinbase and sends whatever bytes it likes; the only thing it
+/// cannot fabricate is a header that hashes below the network target. So that
+/// is what gets checked — against the target the pool's OWN node published for
+/// the next block, never the `n_bits` the sender supplied, which it chooses.
+///
+/// The tip must match too. A solution for a different tip cannot have been
+/// mined on the job it was matched to, and booking that job's distribution
+/// would credit the wrong miners.
+pub(crate) fn solution_is_evidence(
+    header: &Header,
+    demands: Option<ChainDemands>,
+) -> Result<(), NotEvidence> {
+    let Some(demands) = demands else {
+        return Err(NotEvidence::NoChainView);
+    };
+    if header.prev_blockhash.to_byte_array() != demands.prev_hash {
+        return Err(NotEvidence::WrongTip);
+    }
+    // Compare as big-endian byte strings: `block_hash()` is little-endian
+    // internally, the target from `SetNewPrevHash` is big-endian, and a
+    // lexicographic compare of equal-length big-endian bytes is the numeric
+    // compare the consensus rule asks for.
+    let mut hash_be = header.block_hash().to_byte_array();
+    hash_be.reverse();
+    if hash_be > demands.target {
+        return Err(NotEvidence::InsufficientWork);
+    }
+    Ok(())
+}
+
 /// Reassemble the block a `PushSolution` describes: the JDC's coinbase plus
 /// the transactions it declared, with the merkle root computed over them.
 ///
@@ -494,6 +554,80 @@ fn assemble_declared_block(
 pub(crate) struct LedgerBookingJdpSink {
     inner: Arc<dyn JdpBlockSubmissionSink>,
     booker: Arc<crate::block_sink::TdpBlockSubmissionSink>,
+    /// The pool's own chain view. Booking is checked against this, never
+    /// against anything the JD-client sent.
+    tdp: TdpHandle,
+    /// Block hashes already booked by this process. A JDC may re-send a
+    /// solution (reconnect, unseen ack) and the same block must not be booked
+    /// twice. Bounded — only the newest few matter, a repeat arrives right
+    /// after the original.
+    booked: StdMutex<VecDeque<[u8; 32]>>,
+}
+
+/// How many recently-booked block hashes are remembered for the repeat check.
+const BOOKED_MEMORY: usize = 16;
+
+impl LedgerBookingJdpSink {
+    fn already_booked(&self, hash: &[u8; 32]) -> bool {
+        let mut booked = self.booked.lock().expect("booked-hash mutex");
+        if booked.contains(hash) {
+            return true;
+        }
+        booked.push_back(*hash);
+        while booked.len() > BOOKED_MEMORY {
+            booked.pop_front();
+        }
+        false
+    }
+
+    fn chain_demands(&self) -> Option<ChainDemands> {
+        let snapshot = self.tdp.current_snapshot();
+        let prev = snapshot.set_new_prev_hash?;
+        Some(ChainDemands {
+            prev_hash: prev.prev_hash,
+            target: prev.target,
+        })
+    }
+}
+
+impl LedgerBookingJdpSink {
+    /// Book only what the chain can vouch for.
+    async fn book_if_evidence(
+        &self,
+        miner_address: &AddressId,
+        new_token: Token,
+        block: &Block,
+        booking: PayoutBooking,
+    ) {
+        if let Err(reason) = solution_is_evidence(&block.header, self.chain_demands()) {
+            warn!(
+                miner = miner_address.as_str(),
+                ?reason,
+                "JDP block-found: not booked — the pushed solution is the client's claim, not \
+                 proof a block was found"
+            );
+            return;
+        }
+        let hash = block.header.block_hash();
+        if self.already_booked(&hash.to_byte_array()) {
+            info!(
+                miner = miner_address.as_str(),
+                block_hash = %hash,
+                "JDP block-found: already booked; ignoring the repeat"
+            );
+            return;
+        }
+        self.booker
+            .book_declared_block_found(
+                miner_address.as_str().to_string(),
+                hex::encode(new_token.0),
+                booking.block_reward_sats,
+                hash.to_string(),
+                serialize_hex(&block.header),
+                booking.payouts_fingerprint,
+            )
+            .await;
+    }
 }
 
 #[async_trait]
@@ -511,40 +645,20 @@ impl JdpBlockSubmissionSink for LedgerBookingJdpSink {
         nonce: u32,
         n_bits: u32,
     ) {
-        if let Some(booking) = booking {
-            match assemble_declared_block(
-                &coinbase_raw,
-                &transactions,
-                prev_hash,
-                version,
-                ntime,
-                nonce,
-                n_bits,
-            ) {
-                Some(block) => {
-                    let block_hash = block.header.block_hash().to_string();
-                    let block_data = serialize_hex(&block.header);
-                    self.booker
-                        .book_declared_block_found(
-                            miner_address.as_str().to_string(),
-                            hex::encode(new_token.0),
-                            booking.block_reward_sats,
-                            block_hash,
-                            block_data,
-                            booking.payouts_fingerprint,
-                        )
-                        .await;
-                }
-                None => warn!(
-                    miner = miner_address.as_str(),
-                    "JDP block-found: could not reassemble the block, so it cannot be booked \
-                     — needs an operator reprocess from the block's own coinbase"
-                ),
-            }
-        }
+        let assembled = assemble_declared_block(
+            &coinbase_raw,
+            &transactions,
+            prev_hash,
+            version,
+            ntime,
+            nonce,
+            n_bits,
+        );
+        // Propagate first. The resubmit exists to shrink the orphan window,
+        // and no ledger write is worth widening it again.
         self.inner
             .submit_block_candidate(
-                miner_address,
+                miner_address.clone(),
                 new_token,
                 booking,
                 coinbase_raw,
@@ -556,6 +670,10 @@ impl JdpBlockSubmissionSink for LedgerBookingJdpSink {
                 n_bits,
             )
             .await;
+        if let (Some(booking), Some(block)) = (booking, assembled.as_ref()) {
+            self.book_if_evidence(&miner_address, new_token, block, booking)
+                .await;
+        }
     }
 }
 
@@ -748,19 +866,17 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
 
 /// Report what the pool can say about a JDC-found block's payouts.
 ///
-/// The ledger fan-out itself is not wired yet, so this is the operator's only
-/// signal today — and the distinction it draws is the one that matters: a
-/// block whose declared coinbase was proven to pay the pool's issued set can
-/// be booked from its snapshot, while one without that proof must not be
-/// booked from anything.
+/// The distinction it draws is the one that decides whether anything is
+/// booked: a block whose declared coinbase was proven to pay the pool's issued
+/// set can be booked from that distribution, while one without that proof must
+/// not be booked from anything.
 fn log_booking_status(miner_address: &AddressId, booking: Option<PayoutBooking>) {
     match booking {
         Some(b) => info!(
             miner = miner_address.as_str(),
             block_reward_sats = b.block_reward_sats,
             fingerprint = %hex::encode(b.payouts_fingerprint),
-            "JDP block-found: coinbase proven to pay the pool's issued payout set \
-             (ledger fan-out not wired yet — book by this fingerprint)"
+            "JDP block-found: coinbase proven to pay the pool's issued payout set"
         ),
         None => warn!(
             miner = miner_address.as_str(),
@@ -848,6 +964,97 @@ mod tests {
             "an uncomputed merkle root would name the wrong block"
         );
         assert_eq!(block.txdata.len(), 1);
+    }
+
+    fn header_with(prev: [u8; 32], nonce: u32) -> Header {
+        Header {
+            version: BlockVersion::from_consensus(0x2000_0000),
+            prev_blockhash: BlockHash::from_byte_array(prev),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1_700_000_000,
+            bits: CompactTarget::from_consensus(0x1d00_ffff),
+            nonce,
+        }
+    }
+
+    /// Without a chain view of its own the pool has nothing to check against,
+    /// so it must not book — an unverified claim is not evidence.
+    #[test]
+    fn no_chain_view_is_not_evidence() {
+        assert_eq!(
+            solution_is_evidence(&header_with([0u8; 32], 0), None),
+            Err(NotEvidence::NoChainView)
+        );
+    }
+
+    /// A solution for another tip cannot have been mined on the job it was
+    /// matched to; booking that job's distribution would credit the wrong
+    /// miners.
+    #[test]
+    fn a_solution_for_another_tip_is_not_evidence() {
+        let demands = ChainDemands {
+            prev_hash: [0xAAu8; 32],
+            target: [0xFFu8; 32],
+        };
+        assert_eq!(
+            solution_is_evidence(&header_with([0xBBu8; 32], 0), Some(demands)),
+            Err(NotEvidence::WrongTip)
+        );
+    }
+
+    /// The whole point: a header that did not meet the network target is a
+    /// claim anybody can send at no cost.
+    #[test]
+    fn a_header_that_did_no_work_is_not_evidence() {
+        let demands = ChainDemands {
+            prev_hash: [0u8; 32],
+            // Only a hash starting with 31 zero bytes would pass.
+            target: {
+                let mut t = [0u8; 32];
+                t[31] = 0x01;
+                t
+            },
+        };
+        assert_eq!(
+            solution_is_evidence(&header_with([0u8; 32], 12345), Some(demands)),
+            Err(NotEvidence::InsufficientWork)
+        );
+    }
+
+    /// The target the pool checks against is its own node's, never the
+    /// `n_bits` in the message — the sender picks that one.
+    #[test]
+    fn the_senders_own_n_bits_cannot_lower_the_bar() {
+        let mut header = header_with([0u8; 32], 999);
+        // Claim the easiest possible difficulty.
+        header.bits = CompactTarget::from_consensus(0x207f_ffff);
+        let demands = ChainDemands {
+            prev_hash: [0u8; 32],
+            target: {
+                let mut t = [0u8; 32];
+                t[31] = 0x01;
+                t
+            },
+        };
+        assert_eq!(
+            solution_is_evidence(&header, Some(demands)),
+            Err(NotEvidence::InsufficientWork),
+            "a self-declared easy target must not make a claim into evidence"
+        );
+    }
+
+    /// A header on the right tip that meets the target is real work, and the
+    /// one thing a client cannot fabricate.
+    #[test]
+    fn work_on_the_current_tip_is_evidence() {
+        let demands = ChainDemands {
+            prev_hash: [0u8; 32],
+            target: [0xFFu8; 32],
+        };
+        assert_eq!(
+            solution_is_evidence(&header_with([0u8; 32], 7), Some(demands)),
+            Ok(())
+        );
     }
 
     fn entry(address: &str, sats: u64) -> PayoutEntry {

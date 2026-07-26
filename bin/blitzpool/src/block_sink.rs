@@ -277,10 +277,6 @@ impl TdpBlockSubmissionSink {
         self
     }
 
-    /// Convenience: wrap in `Arc<dyn BlockSubmissionSink>` so the
-    /// caller can drop it directly into `bp_stratum_v1::ServerHooks
-    /// { block_sink, … }`.
-    #[allow(dead_code)]
     /// Book a block whose coinbase the pool did NOT build — a JDC declared the
     /// job and owns its coinbase; the pool only issued the payout set, and the
     /// ext-0x0003 declare-time check proved the coinbase carries it verbatim.
@@ -309,6 +305,10 @@ impl TdpBlockSubmissionSink {
         .await;
     }
 
+    /// Convenience: wrap in `Arc<dyn BlockSubmissionSink>` so the
+    /// caller can drop it directly into `bp_stratum_v1::ServerHooks
+    /// { block_sink, … }`.
+    #[allow(dead_code)]
     pub(crate) fn into_sv1_arc(self) -> Arc<dyn Sv1BlockSubmissionSink> {
         Arc::new(self)
     }
