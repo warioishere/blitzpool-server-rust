@@ -1061,17 +1061,39 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
 /// target, not this value) — so flooring can never affect found blocks.
 /// Non-finite / non-positive inputs are returned unchanged for the
 /// caller's existing min/ceiling guards to handle.
-fn floor_assigned_difficulty(diff: Difficulty) -> Difficulty {
+/// Round a difficulty we are about to ASSIGN to a downstream to a power of two.
+///
+/// Nothing in SV2 asks for this, and a miner handles a crooked target fine — the
+/// firmware filters in software against the exact value it was given. A
+/// translating proxy does not. The SRI translator rounds our target UP to a
+/// power of two when it lowers it into an SV1 `mining.set_difficulty`
+/// (`build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding`),
+/// so the miner then works against a HIGHER difficulty than the one we keep
+/// booking its shares at. Measured on a live pair: we assigned 2887, the miner
+/// was given 4096, and 29.5 % of its work was never credited. The size of the
+/// loss is just the distance to the next power of two — up to nearly half.
+///
+/// Assigning a power of two leaves such a proxy nothing to round, so both sides
+/// account for the same number. The price is a coarser ladder than the vardiff
+/// engine's own 1.5x steps; the estimator absorbs that, and a difficulty that is
+/// slightly off target costs nothing, while one the miner does not share with us
+/// costs real work.
+fn power_of_two_difficulty(diff: Difficulty) -> Difficulty {
     let v = diff.as_f64();
     if !v.is_finite() || v < 1.0 {
-        // Non-finite, or an intentionally sub-1 difficulty (a tiny
-        // configured min/initial, e.g. on regtest): leave it untouched.
-        // Flooring would zero it; forcing it up to 1.0 would override the
-        // operator's configured difficulty. The integer floor below only
-        // applies once there is a whole share's worth to round.
+        // Same reasoning as the integer floor above: leave a deliberately
+        // sub-1 configured difficulty alone.
         return diff;
     }
-    Difficulty(v.floor())
+    let lower = 2_f64.powf(v.log2().floor());
+    let upper = lower * 2.0;
+    // Nearest, ties going to the lower rung: more shares is the safer error —
+    // it feeds the estimator rather than starving it.
+    if v - lower <= upper - v {
+        Difficulty(lower)
+    } else {
+        Difficulty(upper)
+    }
 }
 
 /// Captured context the kind-specific closure needs.
@@ -1158,9 +1180,9 @@ fn resolve_open_context<C: Clock>(
     let assigned_difficulty = if clamped.as_f64() > MAX_REASONABLE_DIFFICULTY {
         return Err(err(ERR_MAX_TARGET_OUT_OF_RANGE));
     } else {
-        // Whole-integer floor so decimal-truncating miners (SV1 via
-        // translator) don't undershoot a fractional target.
-        floor_assigned_difficulty(clamped)
+        // Power of two, so a translating proxy has nothing to round on the way
+        // to the miner and both sides account for the same number.
+        power_of_two_difficulty(clamped)
     };
 
     // Address-lock first time → store. The caller's ChannelOpened
@@ -1466,8 +1488,10 @@ pub fn handle_update_channel<C: Clock>(
         // unreasonable value. Miner can retry with a larger max_target.
         return HandlerOutcome::default();
     } else {
-        // Whole-integer floor — same rationale as the channel-open path.
-        floor_assigned_difficulty(clamped)
+        // Power of two — same rationale as the channel-open path. This is the
+        // path that mattered in practice: a translator sends `UpdateChannel`
+        // every 60 s, so it kept overwriting whatever the vardiff had rounded.
+        power_of_two_difficulty(clamped)
     };
 
     if (new_diff.as_f64() - channel.session_difficulty.as_f64()).abs() < f64::EPSILON {
@@ -1588,10 +1612,12 @@ pub fn apply_vardiff_check<C: Clock>(state: &mut MiningSessionState<C>) -> Handl
         else {
             continue;
         };
-        let clamped = clamp_difficulty_to_max_target(
+        // The engine already rounds to a power of two, but the clamp against a
+        // declared max_target can land anywhere, so round again after it.
+        let clamped = power_of_two_difficulty(clamp_difficulty_to_max_target(
             Difficulty(suggested),
             &Target::from_le_bytes(channel.declared_max_target),
-        );
+        ));
         if (clamped.as_f64() - channel.session_difficulty.as_f64()).abs() >= f64::EPSILON {
             let old = channel.session_difficulty;
             channel.session_difficulty = clamped;
@@ -2925,13 +2951,17 @@ mod tests {
         );
     }
 
-    /// `hash_rate_to_difficulty` produces fractional diffs (e.g.
-    /// 931.31); the channel must store the integer floor so a
-    /// decimal-truncating miner can't undershoot the target. Once the
-    /// stored diff is a whole integer, the `[931, 931.31)` rejection
-    /// band cannot exist at all.
+    /// `hash_rate_to_difficulty` produces fractional diffs (e.g. 931.31); the
+    /// channel must store a power of two.
+    ///
+    /// A whole integer was the old requirement, so a decimal-truncating miner
+    /// could not undershoot the target and the `[931, 931.31)` rejection band
+    /// could not exist. A power of two keeps that property and adds the one a
+    /// translating proxy needs: it rounds an assigned difficulty UP to a power
+    /// of two on the way to the miner, so anything else arrives changed and
+    /// every share booked against our value under-counts the work.
     #[test]
-    fn open_channel_assigns_integer_difficulty() {
+    fn open_channel_assigns_a_power_of_two_difficulty() {
         let mut s = fresh_session();
         handle_setup_connection(&mut s, &good_setup());
         // 1.234 TH/s at the port's 6 spm yields a fractional raw diff.
@@ -2959,29 +2989,55 @@ mod tests {
             0.0,
             "assigned diff must be a whole integer"
         );
-        assert_eq!(assigned, raw.floor());
+        assert_eq!(
+            assigned,
+            2_f64.powf(assigned.log2().round()),
+            "assigned diff {assigned} (raw {raw}) must be a power of two"
+        );
+        // And it must be one of the two rungs bracketing the raw value, not
+        // some unrelated rung.
+        let lower = 2_f64.powf(raw.log2().floor());
+        assert!(
+            assigned == lower || assigned == lower * 2.0,
+            "assigned {assigned} must bracket raw {raw}"
+        );
     }
 
     #[test]
-    fn floor_assigned_difficulty_floors_and_bounds() {
-        // Typical fractional case from hash_rate_to_difficulty.
+    fn assigned_difficulty_is_always_a_power_of_two() {
+        // The two values measured against a live translator: it rounded each
+        // one UP to the next power of two on the way to the miner while the
+        // pool kept booking shares at the crooked value, losing 29.5 % and
+        // 7.2 % of the work respectively. Assigning the rung directly leaves
+        // nothing to round.
         assert_eq!(
-            floor_assigned_difficulty(Difficulty(931.31)).as_f64(),
-            931.0
+            power_of_two_difficulty(Difficulty(2887.8)).as_f64(),
+            2048.0,
+            "nearer 2048 than 4096"
         );
-        // Already-integer values pass through.
-        assert_eq!(
-            floor_assigned_difficulty(Difficulty(1024.0)).as_f64(),
-            1024.0
-        );
-        // Sub-1 diffs pass through unchanged — neither floored to 0 nor
+        assert_eq!(power_of_two_difficulty(Difficulty(950.3)).as_f64(), 1024.0);
+        // Already a power of two: unchanged.
+        assert_eq!(power_of_two_difficulty(Difficulty(1024.0)).as_f64(), 1024.0);
+        // Ties go to the lower rung — more shares feeds the estimator.
+        assert_eq!(power_of_two_difficulty(Difficulty(1536.0)).as_f64(), 1024.0);
+        // Sub-1 diffs pass through unchanged — neither rounded to 0 nor
         // forced up to 1.0 (an intentionally low configured difficulty).
-        assert_eq!(floor_assigned_difficulty(Difficulty(0.7)).as_f64(), 0.7);
+        assert_eq!(power_of_two_difficulty(Difficulty(0.7)).as_f64(), 0.7);
         // Non-positive / non-finite pass through for the caller's guards.
-        assert_eq!(floor_assigned_difficulty(Difficulty(0.0)).as_f64(), 0.0);
-        assert!(floor_assigned_difficulty(Difficulty(f64::NAN))
+        assert_eq!(power_of_two_difficulty(Difficulty(0.0)).as_f64(), 0.0);
+        assert!(power_of_two_difficulty(Difficulty(f64::NAN))
             .as_f64()
             .is_nan());
+
+        // Nothing above 1 may leave this function as a non-power-of-two.
+        for probe in [1.0, 3.7, 100.0, 5000.0, 1e6, 1e9] {
+            let d = power_of_two_difficulty(Difficulty(probe)).as_f64();
+            assert_eq!(
+                d,
+                2_f64.powf(d.log2().round()),
+                "{d} (from {probe}) is not a power of two"
+            );
+        }
     }
 
     /// Vardiff grace: validate against the LOWER of the job's frozen diff
