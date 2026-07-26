@@ -944,7 +944,7 @@ impl GroupSoloEngine {
             audit_rows.push(coinbase_row(entry, shares_in_round, total_shares_in_round));
             coinbase_addresses.insert(addr_str.clone());
 
-            let new_balance = Self::resolve_new_balance(snapshot, &existing, addr_str);
+            let new_balance = Self::resolve_new_balance(group_id, snapshot, &existing, addr_str);
             let prev_total_paid = existing
                 .get(addr_str)
                 .map(|r| r.total_paid_sats.0)
@@ -967,7 +967,7 @@ impl GroupSoloEngine {
                 .get(addr_str)
                 .map(|r| r.pending_sats.0)
                 .unwrap_or(0);
-            let resolved = Self::resolve_new_balance(snapshot, &existing, addr_str);
+            let resolved = Self::resolve_new_balance(group_id, snapshot, &existing, addr_str);
             audit_rows.push(pending_row(addr_id.clone(), Sats(resolved - prev_balance)));
 
             let prev_total_paid = existing
@@ -993,9 +993,22 @@ impl GroupSoloEngine {
     /// recorded the state it was computed against, apply the DELTA it intends
     /// to the CURRENT row rather than its absolute.
     ///
+    /// **Clamped at zero.** Group-Solo is the unsigned model — the distributor
+    /// runs with `suppress_matching_debits`, `balance_after` is documented as
+    /// never negative, and the column carries no constraint that would stop a
+    /// negative from being stored. A member whose credit was absorbed by the
+    /// dust sweep, or redistributed away by a kick, after the job was built has
+    /// `current < before`, and the raw delta would push them below zero. That
+    /// would be a debit, which the next build would fold into
+    /// `target = raw_fair + balance_old` and quietly reduce their next payout —
+    /// signed-ledger behaviour in the one payout mode designed without it. The
+    /// chain paid them more than the books can express; the books say zero and
+    /// the log says why.
+    ///
     /// Falls back to the absolute for snapshots written before `balance_before`
     /// existed — same behaviour as before, no worse.
     fn resolve_new_balance(
+        group_id: Uuid,
         snapshot: &ParsedSnapshot,
         existing: &HashMap<String, PplnsGroupBalanceRow>,
         address: &str,
@@ -1005,10 +1018,24 @@ impl GroupSoloEngine {
             // Not in balance_after → this distribution does not change it.
             return current;
         };
-        match snapshot.balance_before.get(address).copied() {
-            Some(before) => current + (after - before),
-            None => after,
+        let Some(before) = snapshot.balance_before.get(address).copied() else {
+            return after;
+        };
+        let resolved = current + (after - before);
+        if resolved < 0 {
+            warn!(
+                %group_id,
+                address,
+                current,
+                snapshot_before = before,
+                snapshot_after = after,
+                "group-solo: this block's coinbase paid an address more credit than it still \
+                 holds (swept or redistributed since the job was built) — booking 0 rather than \
+                 a debit the unsigned model cannot carry"
+            );
+            return 0;
         }
+        resolved
     }
 
     /// Run one manual dust-sweep tick.
@@ -1123,6 +1150,88 @@ const _SHUTDOWN_HOOK_DOC: Duration = Duration::from_secs(0);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_with(after: &[(&str, i64)], before: &[(&str, i64)]) -> ParsedSnapshot {
+        ParsedSnapshot {
+            distribution: vec![],
+            block_reward_sats: 312_500_000,
+            considered_addresses: HashSet::new(),
+            balance_after: after.iter().map(|(a, v)| ((*a).to_string(), *v)).collect(),
+            balance_before: before.iter().map(|(a, v)| ((*a).to_string(), *v)).collect(),
+        }
+    }
+
+    fn existing_with(rows: &[(&str, i64)]) -> HashMap<String, PplnsGroupBalanceRow> {
+        rows.iter()
+            .map(|(a, v)| {
+                (
+                    (*a).to_string(),
+                    PplnsGroupBalanceRow {
+                        group_id: Uuid::nil(),
+                        address: AddressId::new((*a).to_string()).unwrap(),
+                        pending_sats: Sats(*v),
+                        total_paid_sats: Sats(0),
+                        updated_at: 0,
+                        last_accepted_share_at: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The whole point of `balance_before`: a credit that moved between job
+    /// build and apply must survive, so the block contributes its own movement
+    /// rather than restoring the ledger it was computed against.
+    #[test]
+    fn resolve_new_balance_applies_the_delta_to_the_current_row() {
+        let snap = snapshot_with(&[("bc1qa", 7_000)], &[("bc1qa", 4_000)]);
+        let existing = existing_with(&[("bc1qa", 5_000)]);
+        // +3_000 intended, current is 5_000 → 8_000, NOT the snapshot's 7_000.
+        assert_eq!(
+            GroupSoloEngine::resolve_new_balance(Uuid::nil(), &snap, &existing, "bc1qa"),
+            8_000
+        );
+    }
+
+    /// Group-Solo is the unsigned model. A member whose credit the dust sweep
+    /// absorbed (or a kick redistributed) after the job was built has
+    /// `current < before`, and the raw delta would leave them holding a debit
+    /// the next distribution would silently deduct from.
+    #[test]
+    fn resolve_new_balance_never_goes_negative() {
+        let snap = snapshot_with(&[("bc1qa", 0)], &[("bc1qa", 5_000)]);
+        // The sweep took the 5_000 before this block was applied.
+        let existing = existing_with(&[("bc1qa", 0)]);
+        assert_eq!(
+            GroupSoloEngine::resolve_new_balance(Uuid::nil(), &snap, &existing, "bc1qa"),
+            0,
+            "raw delta would be -5_000"
+        );
+    }
+
+    /// Snapshots written before `balance_before` existed carry none, and must
+    /// keep behaving exactly as they did — absolute.
+    #[test]
+    fn resolve_new_balance_falls_back_to_the_absolute_without_a_before() {
+        let snap = snapshot_with(&[("bc1qa", 7_000)], &[]);
+        let existing = existing_with(&[("bc1qa", 5_000)]);
+        assert_eq!(
+            GroupSoloEngine::resolve_new_balance(Uuid::nil(), &snap, &existing, "bc1qa"),
+            7_000
+        );
+    }
+
+    /// An address the distribution does not touch keeps what it has — the apply
+    /// must not zero a row just because it read it.
+    #[test]
+    fn resolve_new_balance_leaves_untouched_addresses_alone() {
+        let snap = snapshot_with(&[("bc1qa", 7_000)], &[("bc1qa", 4_000)]);
+        let existing = existing_with(&[("bc1qb", 2_500)]);
+        assert_eq!(
+            GroupSoloEngine::resolve_new_balance(Uuid::nil(), &snap, &existing, "bc1qb"),
+            2_500
+        );
+    }
 
     #[test]
     fn engine_error_carries_source_variants() {
