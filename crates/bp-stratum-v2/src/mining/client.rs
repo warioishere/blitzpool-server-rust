@@ -1074,25 +1074,30 @@ pub fn handle_open_extended_mining_channel<C: Clock + Clone>(
 /// loss is just the distance to the next power of two — up to nearly half.
 ///
 /// Assigning a power of two leaves such a proxy nothing to round, so both sides
-/// account for the same number. The price is a coarser ladder than the vardiff
-/// engine's own 1.5x steps; the estimator absorbs that, and a difficulty that is
-/// slightly off target costs nothing, while one the miner does not share with us
-/// costs real work.
+/// account for the same number.
+///
+/// **Always UP, never to the nearest rung.** Rounding to the nearest goes down
+/// as often as up, and a downstream that requested a difficulty via
+/// `UpdateChannel` rejects a lower one as a protocol error: the translator logs
+/// "SetTarget response has target which is higher than requested target …
+/// Ignoring this pending update" and the miner keeps its previous difficulty
+/// while we book against the new one. Rounding down therefore does not merely
+/// mis-size the target, it throws the assignment away — measured, and worse than
+/// the under-counting this function exists to fix. Rounding up is always
+/// accepted and costs at most a factor of two in share rate.
 fn power_of_two_difficulty(diff: Difficulty) -> Difficulty {
     let v = diff.as_f64();
     if !v.is_finite() || v < 1.0 {
-        // Same reasoning as the integer floor above: leave a deliberately
-        // sub-1 configured difficulty alone.
+        // Leave a deliberately sub-1 configured difficulty alone.
         return diff;
     }
     let lower = 2_f64.powf(v.log2().floor());
-    let upper = lower * 2.0;
-    // Nearest, ties going to the lower rung: more shares is the safer error —
-    // it feeds the estimator rather than starving it.
-    if v - lower <= upper - v {
+    // The tolerance matters: a value that is a power of two apart from
+    // floating-point dust must stay on its rung rather than double.
+    if v <= lower * (1.0 + 1e-9) {
         Difficulty(lower)
     } else {
-        Difficulty(upper)
+        Difficulty(lower * 2.0)
     }
 }
 
@@ -3010,16 +3015,26 @@ mod tests {
         // pool kept booking shares at the crooked value, losing 29.5 % and
         // 7.2 % of the work respectively. Assigning the rung directly leaves
         // nothing to round.
-        assert_eq!(
-            power_of_two_difficulty(Difficulty(2887.8)).as_f64(),
-            2048.0,
-            "nearer 2048 than 4096"
-        );
+        // NEVER below the input. A downstream that requested a difficulty via
+        // `UpdateChannel` rejects a lower one as a protocol error and discards
+        // the assignment entirely, leaving the miner on its old difficulty —
+        // observed live, and worse than the under-counting this fixes.
+        for probe in [2887.8_f64, 950.3, 1536.0, 1025.0, 1.5, 3.0, 12345.6] {
+            let d = power_of_two_difficulty(Difficulty(probe)).as_f64();
+            assert!(
+                d >= probe,
+                "{d} is BELOW the requested {probe} — the downstream would discard it"
+            );
+            assert!(
+                d < probe * 2.0,
+                "{d} overshoots {probe} by more than one rung"
+            );
+        }
+        assert_eq!(power_of_two_difficulty(Difficulty(2887.8)).as_f64(), 4096.0);
         assert_eq!(power_of_two_difficulty(Difficulty(950.3)).as_f64(), 1024.0);
-        // Already a power of two: unchanged.
+        // Already a power of two: unchanged, never bumped to the next rung.
         assert_eq!(power_of_two_difficulty(Difficulty(1024.0)).as_f64(), 1024.0);
-        // Ties go to the lower rung — more shares feeds the estimator.
-        assert_eq!(power_of_two_difficulty(Difficulty(1536.0)).as_f64(), 1024.0);
+        assert_eq!(power_of_two_difficulty(Difficulty(4096.0)).as_f64(), 4096.0);
         // Sub-1 diffs pass through unchanged — neither rounded to 0 nor
         // forced up to 1.0 (an intentionally low configured difficulty).
         assert_eq!(power_of_two_difficulty(Difficulty(0.7)).as_f64(), 0.7);

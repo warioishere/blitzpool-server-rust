@@ -435,18 +435,28 @@ impl<C: Clock> VarDiffEngine<C> {
         None
     }
 
-    /// Round to the nearest power of two. Floors at [`min_difficulty`].
+    /// Round UP to a power of two. Floors at [`min_difficulty`].
     /// Returns `None` for `val == 0`, guarding against `log2(0) = -Infinity`.
     ///
-    /// Powers of two ONLY — the ladder used to carry a `lower * 1.5` rung
-    /// between them, and that rung is what a translating proxy destroys. The
-    /// SRI translator rounds an assigned difficulty UP to a power of two when
-    /// it lowers it into an SV1 `mining.set_difficulty`, so a 1.5x rung like
-    /// 3072 reaches the miner as 4096 while the pool keeps booking shares at
-    /// 3072. Measured on a live pair: 29.5 % of a miner's work went uncredited
-    /// that way. A rung the downstream will not honour is worse than no rung —
-    /// a difficulty slightly off target costs nothing, one the miner does not
-    /// share with us costs real work.
+    /// **Powers of two only, and always upward.** Both halves were measured on
+    /// a live translating proxy, and each half fixes a different failure:
+    ///
+    /// - *Powers of two:* the ladder used to carry a `lower * 1.5` rung. The SRI
+    ///   translator rounds an assigned difficulty UP to a power of two when it
+    ///   lowers it into an SV1 `mining.set_difficulty`, so a rung like 3072
+    ///   reached the miner as 4096 while the pool kept booking shares at 3072 —
+    ///   29.5 % of a miner's work went uncredited.
+    /// - *Upward:* rounding to the NEAREST rung goes down as often as up, and a
+    ///   downstream that requested a difficulty via `UpdateChannel` rejects a
+    ///   lower one as a protocol error — the translator logs "SetTarget response
+    ///   has target which is higher than requested target … Ignoring this
+    ///   pending update" and the miner simply keeps its old difficulty. Rounding
+    ///   down therefore does not mis-size the target, it discards the
+    ///   assignment. Up is always accepted.
+    ///
+    /// The cost of rounding up is at most a factor of two in share rate, which
+    /// the estimator absorbs; the cost of the other two is real work nobody is
+    /// paid for.
     fn nearest_difficulty_step(&self, val: f64) -> Option<f64> {
         if val == 0.0 {
             return None;
@@ -454,15 +464,14 @@ impl<C: Clock> VarDiffEngine<C> {
         if val < self.min_difficulty {
             return Some(self.min_difficulty);
         }
-        let exponent = val.log2().floor();
-        let lower = 2_f64.powf(exponent);
-        let upper = lower * 2.0;
-        // Nearest, ties to the lower rung: more shares is the safer error,
-        // since it feeds the estimator rather than starving it.
-        if (val - lower).abs() <= (upper - val).abs() {
+        let lower = 2_f64.powf(val.log2().floor());
+        // The tolerance matters: a value that is a power of two apart from
+        // floating-point dust (0.5 arriving as 0.500000000001) must stay on its
+        // rung, not double. Only a genuine gap rounds up.
+        if val <= lower * (1.0 + 1e-9) {
             Some(lower)
         } else {
-            Some(upper)
+            Some(lower * 2.0)
         }
     }
 }
@@ -545,18 +554,14 @@ mod tests {
         // Exact powers of two are returned unchanged.
         assert_eq!(e.nearest_difficulty_step(1024.0), Some(1024.0));
         assert_eq!(e.nearest_difficulty_step(2048.0), Some(2048.0));
-        // The old 1.5x rung is gone: 1536 now resolves to a neighbour.
-        assert_eq!(
-            e.nearest_difficulty_step(1536.0),
-            Some(1024.0),
-            "equidistant from 1024 and 2048 — ties go to the lower rung"
-        );
-        // Values in between land on whichever power of two is nearer.
+        // The old 1.5x rung is gone, and rounding is always UP: a downstream
+        // that requested a difficulty discards a lower one as a protocol error,
+        // so the assignment would be lost rather than merely mis-sized.
+        assert_eq!(e.nearest_difficulty_step(1536.0), Some(2048.0));
+        assert_eq!(e.nearest_difficulty_step(1100.0), Some(2048.0));
         assert_eq!(e.nearest_difficulty_step(2000.0), Some(2048.0));
-        assert_eq!(e.nearest_difficulty_step(1600.0), Some(2048.0));
-        assert_eq!(e.nearest_difficulty_step(1100.0), Some(1024.0));
 
-        // Nothing the ladder can emit may be a non-power-of-two.
+        // Every rung is a power of two, and never below what was asked for.
         for probe in [3.0, 100.0, 950.3, 2887.8, 5000.0, 1e6] {
             let step = e.nearest_difficulty_step(probe).expect("a rung");
             assert_eq!(
@@ -564,6 +569,8 @@ mod tests {
                 2_f64.powf(step.log2().round()),
                 "step {step} for {probe} is not a power of two"
             );
+            assert!(step >= probe, "step {step} is below the requested {probe}");
+            assert!(step < probe * 2.0, "step {step} overshoots {probe}");
         }
     }
 
@@ -833,9 +840,12 @@ mod tests {
         let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
         populate_cache(&mut e, &clock, 30, 0.1);
         let suggested = e.suggested_difficulty(16384.0).expect("must retarget");
-        // step(0.5) — between 0.5 and 1.0 — bracket: lower=0.5, middle=0.75,
-        // upper=1.0. Distance to 0.5 = 0, → 0.5.
-        assert_eq!(suggested, 0.5);
+        // The raw target sits between the 0.5 and 1.0 rungs, and the ladder
+        // rounds UP — a downstream discards an assignment below what it asked
+        // for, so landing on 0.5 would risk losing it entirely.
+        assert_eq!(suggested, 1.0);
+        // Still a huge retarget down from 16384 — that is the point of the test.
+        assert!(suggested < 16384.0 / 2.0);
     }
 
     #[test]
@@ -852,13 +862,14 @@ mod tests {
 
     #[test]
     fn suggested_diff_without_floor_can_drop_below_one() {
-        // Without a configured floor, suggestion can drop well below 500.
-        // With min=default (0.00001), target=0.5 → returns 0.5.
+        // Without a configured floor the suggestion drops far below the 500
+        // floor the sibling test sets — that is the property under test. (It
+        // lands on 1.0 rather than 0.5 because the ladder rounds up.)
         let clock = TestClock::new(1_000);
         let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
         populate_cache(&mut e, &clock, 30, 0.1);
         let suggested = e.suggested_difficulty(16384.0).expect("must retarget");
-        assert!(suggested < 1.0, "got {}", suggested);
+        assert!(suggested < 500.0, "got {}", suggested);
     }
 
     #[test]
@@ -868,7 +879,7 @@ mod tests {
         let mut e = VarDiffEngine::new(&clock, 6.0, 0.0);
         populate_cache(&mut e, &clock, 30, 0.1);
         let suggested = e.suggested_difficulty(16384.0).expect("must retarget");
-        assert!(suggested < 1.0, "got {}", suggested);
+        assert!(suggested < 500.0, "got {}", suggested);
     }
 
     #[test]
@@ -878,7 +889,7 @@ mod tests {
         let mut e = VarDiffEngine::new(&clock, 6.0, f64::NAN);
         populate_cache(&mut e, &clock, 30, 0.1);
         let suggested = e.suggested_difficulty(16384.0).expect("must retarget");
-        assert!(suggested < 1.0, "got {}", suggested);
+        assert!(suggested < 500.0, "got {}", suggested);
     }
 
     // ── hashrate accumulation ─────────────────────────────────────────
