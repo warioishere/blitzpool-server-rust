@@ -645,7 +645,33 @@ impl JdpBlockSubmissionSink for LedgerBookingJdpSink {
         nonce: u32,
         n_bits: u32,
     ) {
-        let assembled = assemble_declared_block(
+        // Propagate first, and do no work of our own before it. The resubmit
+        // exists to shrink the orphan window; reassembling a multi-megabyte
+        // block to satisfy the ledger would widen it again for no gain, since
+        // nothing about the booking changes how fast the block travels.
+        let (coinbase_raw, transactions) = {
+            let coinbase_for_booking = coinbase_raw.clone();
+            let txs_for_booking = transactions.clone();
+            self.inner
+                .submit_block_candidate(
+                    miner_address.clone(),
+                    new_token,
+                    booking,
+                    coinbase_raw,
+                    transactions,
+                    prev_hash,
+                    version,
+                    ntime,
+                    nonce,
+                    n_bits,
+                )
+                .await;
+            (coinbase_for_booking, txs_for_booking)
+        };
+        let Some(booking) = booking else {
+            return;
+        };
+        let Some(block) = assemble_declared_block(
             &coinbase_raw,
             &transactions,
             prev_hash,
@@ -653,27 +679,16 @@ impl JdpBlockSubmissionSink for LedgerBookingJdpSink {
             ntime,
             nonce,
             n_bits,
-        );
-        // Propagate first. The resubmit exists to shrink the orphan window,
-        // and no ledger write is worth widening it again.
-        self.inner
-            .submit_block_candidate(
-                miner_address.clone(),
-                new_token,
-                booking,
-                coinbase_raw,
-                transactions,
-                prev_hash,
-                version,
-                ntime,
-                nonce,
-                n_bits,
-            )
+        ) else {
+            warn!(
+                miner = miner_address.as_str(),
+                "JDP block-found: could not reassemble the block, so nothing can be booked \
+                 against it"
+            );
+            return;
+        };
+        self.book_if_evidence(&miner_address, new_token, &block, booking)
             .await;
-        if let (Some(booking), Some(block)) = (booking, assembled.as_ref()) {
-            self.book_if_evidence(&miner_address, new_token, block, booking)
-                .await;
-        }
     }
 }
 
@@ -974,6 +989,94 @@ mod tests {
             "an uncomputed merkle root would name the wrong block"
         );
         assert_eq!(block.txdata.len(), 1);
+    }
+
+    /// A JD-client may re-send a solution (reconnect, an ack it never saw).
+    /// The same block must be booked once — the ledger it writes into is not
+    /// idempotent across differing heights.
+    #[test]
+    fn a_repeated_block_is_booked_only_once() {
+        let seen = StdMutex::new(VecDeque::new());
+        let remember = |hash: [u8; 32]| -> bool {
+            let mut booked = seen.lock().unwrap();
+            if booked.contains(&hash) {
+                return true;
+            }
+            booked.push_back(hash);
+            while booked.len() > BOOKED_MEMORY {
+                booked.pop_front();
+            }
+            false
+        };
+        assert!(!remember([1u8; 32]), "first sighting is not a repeat");
+        assert!(remember([1u8; 32]), "the same block again is");
+        assert!(!remember([2u8; 32]), "a different block is not");
+
+        // The memory is bounded, so an old hash eventually ages out rather
+        // than growing without limit on a long-lived connection.
+        for i in 0..BOOKED_MEMORY as u8 {
+            remember([100 + i; 32]);
+        }
+        assert!(
+            !remember([1u8; 32]),
+            "past the bound the oldest is forgotten — bounded memory is the trade"
+        );
+    }
+
+    /// The one job of this function is surviving bytes a JD-client chose. A
+    /// coinbase long enough to pass the length guard but malformed must be
+    /// declined, not indexed into.
+    #[test]
+    fn assemble_declared_block_declines_a_malformed_but_long_coinbase() {
+        let garbage = vec![0xFFu8; 64];
+        assert!(assemble_declared_block(
+            &garbage,
+            &[],
+            [0u8; 32],
+            0x2000_0000,
+            1_700_000_000,
+            42,
+            0x1d00_ffff,
+        )
+        .is_none());
+    }
+
+    /// A corrupt entry among the declared transactions must decline the whole
+    /// block rather than assemble a partial one whose merkle root would name
+    /// a block that does not exist.
+    #[test]
+    fn assemble_declared_block_declines_a_corrupt_transaction() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::Encodable;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        let coinbase = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x51, 0x00, 0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut raw = Vec::new();
+        coinbase.consensus_encode(&mut raw).expect("encode");
+        assert!(assemble_declared_block(
+            &raw,
+            &[vec![0xFFu8; 40]],
+            [0u8; 32],
+            0x2000_0000,
+            1_700_000_000,
+            42,
+            0x1d00_ffff,
+        )
+        .is_none());
     }
 
     fn header_with(prev: [u8; 32], nonce: u32) -> Header {
