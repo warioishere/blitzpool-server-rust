@@ -226,6 +226,28 @@ pub struct EmittedPayoutOutputs {
     /// issued under (its payout window is superseded). Marked by
     /// [`PayoutOutputsTracker::observe_epoch`].
     pub stale: bool,
+    /// What the pool needs to book a block found on this set, or `None`
+    /// when it cannot vouch for one (see [`PayoutBooking`]).
+    pub booking: Option<PayoutBooking>,
+}
+
+/// The pool-side accounting identity of an issued payout set.
+///
+/// A JDC builds and owns its own coinbase; the pool only hands it an output
+/// set. So a found block may only be booked once the declared coinbase has
+/// been shown to carry that set verbatim — which is exactly what
+/// [`PayoutOutputsTracker::validate_and_consume_for_declare`] establishes.
+/// This rides along on that proof so the block-found path can name the
+/// distribution instead of guessing at one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PayoutBooking {
+    /// Identity of the distribution these outputs pay — the key its snapshot
+    /// is stored under.
+    pub payouts_fingerprint: [u8; 32],
+    /// The reward the distribution was built over (the JDC's
+    /// `available_payout_value`), not the block's total coinbase value: the
+    /// JDC's own outputs are none of the pool's business.
+    pub block_reward_sats: u64,
 }
 
 // ── Declare-time validation outcome ─────────────────────────────────
@@ -239,8 +261,10 @@ pub enum DeclareOutputsCheck {
     /// neutral so a non-negotiated caller can fall through.
     NoneIssued,
     /// The pending set's outputs all appear in the declared coinbase;
-    /// the set has been marked used.
-    Ok,
+    /// the set has been marked used. Carries the issued set's
+    /// [`PayoutBooking`] — the declared coinbase has just been proven to
+    /// pay it, so a block found on this job can be booked against it.
+    Ok { booking: Option<PayoutBooking> },
     /// A pending set existed but the declared coinbase is missing /
     /// modifies / reduces the output at `index`.
     MissingOutput { index: usize },
@@ -384,7 +408,9 @@ impl PayoutOutputsTracker {
         match declared_coinbase_contains_pool_outputs(coinbase_tx_suffix, &entry.outputs) {
             CoinbaseOutputCheck::Ok => {
                 entry.used = true;
-                DeclareOutputsCheck::Ok
+                DeclareOutputsCheck::Ok {
+                    booking: entry.booking,
+                }
             }
             CoinbaseOutputCheck::MissingOutput { index } => {
                 DeclareOutputsCheck::MissingOutput { index }
@@ -535,6 +561,7 @@ mod tests {
             emitted_at_ms: 0,
             used: false,
             stale: false,
+            booking: None,
         }
     }
 
@@ -698,7 +725,7 @@ mod tests {
         let decl = suffix(&outputs);
         assert_eq!(
             c.validate_and_consume_for_declare(&token, &decl),
-            DeclareOutputsCheck::Ok
+            DeclareOutputsCheck::Ok { booking: None }
         );
         // Single-use: the same token's set is now spent.
         assert_eq!(
@@ -727,7 +754,7 @@ mod tests {
         let good = suffix(&outputs);
         assert_eq!(
             c.validate_and_consume_for_declare(&token, &good),
-            DeclareOutputsCheck::Ok
+            DeclareOutputsCheck::Ok { booking: None }
         );
     }
 
@@ -766,7 +793,7 @@ mod tests {
         let decl = suffix(&outputs);
         assert_eq!(
             c.validate_and_consume_for_declare(&token, &decl),
-            DeclareOutputsCheck::Ok
+            DeclareOutputsCheck::Ok { booking: None }
         );
         // Tip advances: the used entry is dropped; token entry vanishes.
         assert_eq!(c.observe_epoch([0xBB; 32]), 0, "no unused entries to stale");

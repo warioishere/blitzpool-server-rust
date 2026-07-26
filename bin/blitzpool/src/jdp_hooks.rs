@@ -66,7 +66,7 @@ use bp_stratum_v2::jdp::client::{
 };
 use bp_stratum_v2::jdp::dynamic_outputs::{
     coinbase_outputs_fit_reservation, encode_coinbase_outputs, fold_residual_to_exact_sum,
-    DynamicOutput,
+    DynamicOutput, PayoutBooking,
 };
 use bp_stratum_v2::jdp_server::{
     CurrentPrevHashProvider, JdpAllocateResolver, JdpBlockSubmissionSink, JdpServerHooks,
@@ -142,6 +142,7 @@ impl JdpBlockSubmissionSink for LogOnlyBlockSubmissionSink {
         &self,
         miner_address: AddressId,
         new_token: Token,
+        booking: Option<PayoutBooking>,
         coinbase_raw: Vec<u8>,
         transactions: Vec<Vec<u8>>,
         prev_hash: [u8; 32],
@@ -154,10 +155,12 @@ impl JdpBlockSubmissionSink for LogOnlyBlockSubmissionSink {
         info!(
             miner = miner_address.as_str(),
             token = ?new_token,
+            bookable = booking.is_some(),
             "JDP block-candidate received; pool-side resubmit disabled — JDC \
              propagates via its own TDP submit_solution. Enable \
              `[sv2].jdp_orphan_submitblock` for anti-orphan redundancy."
         );
+        log_booking_status(&miner_address, booking);
     }
 }
 
@@ -336,6 +339,7 @@ impl JdpBlockSubmissionSink for JdpRpcBlockSubmissionSink {
         &self,
         miner_address: AddressId,
         new_token: Token,
+        booking: Option<PayoutBooking>,
         coinbase_raw: Vec<u8>,
         transactions: Vec<Vec<u8>>,
         prev_hash: [u8; 32],
@@ -349,8 +353,10 @@ impl JdpBlockSubmissionSink for JdpRpcBlockSubmissionSink {
             token = ?new_token,
             tx_count = transactions.len(),
             coinbase_len = coinbase_raw.len(),
+            bookable = booking.is_some(),
             "JDP block-candidate received; reconstructing for submitblock"
         );
+        log_booking_status(&miner_address, booking);
 
         // 1. Convert non-witness coinbase to witness form (BIP-141
         //    marker + flag + reserved witness value). Required for
@@ -523,6 +529,11 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
         // floor-rounding + dropped-sub-dust residual into the largest
         // kept output. An empty result means everything was sub-dust —
         // we can't build a set summing to a positive value.
+        // The pool's own accounting identity for this distribution — the key
+        // its snapshot was just stored under. Computed from the resolver's
+        // list, before the wire lowering below can touch it.
+        let payouts_fingerprint =
+            bp_mining_job::payouts_fingerprint(available_payout_value, &payouts);
         let mut outputs = payouts_to_dynamic_outputs(&payouts);
         if outputs.is_empty() {
             warn!(
@@ -536,6 +547,29 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
             };
         }
         fold_residual_to_exact_sum(&mut outputs, available_payout_value as i64);
+        // Only vouch for booking when the set going out is the distribution
+        // that was snapshotted. The lowering drops sub-dust entries and the
+        // fold moves the residual onto the largest output; either would make
+        // the block pay something other than what the snapshot records, and
+        // booking that would be the drift this whole mechanism exists to
+        // remove. Both are no-ops while the distributor consumes the whole
+        // reward and its floor is the dust limit — if that ever stops holding,
+        // the block is reported and left for an operator instead.
+        let booking = if outputs_match_payouts(&outputs, &payouts) {
+            Some(PayoutBooking {
+                payouts_fingerprint,
+                block_reward_sats: available_payout_value,
+            })
+        } else {
+            warn!(
+                request_id,
+                address = miner_address.as_str(),
+                "ext 0x0003: issued output set differs from the distribution it came from \
+                 (sub-dust drop or residual fold) — a block found on it will be reported \
+                 but not booked"
+            );
+            None
+        };
         let bytes = match encode_coinbase_outputs(self.network, &outputs) {
             Ok(b) => b,
             Err(err) => {
@@ -580,13 +614,99 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
         PayoutOutputsResolution::Success {
             request_id,
             outputs: bytes,
+            booking,
         }
     }
+}
+
+/// Report what the pool can say about a JDC-found block's payouts.
+///
+/// The ledger fan-out itself is not wired yet, so this is the operator's only
+/// signal today — and the distinction it draws is the one that matters: a
+/// block whose declared coinbase was proven to pay the pool's issued set can
+/// be booked from its snapshot, while one without that proof must not be
+/// booked from anything.
+fn log_booking_status(miner_address: &AddressId, booking: Option<PayoutBooking>) {
+    match booking {
+        Some(b) => info!(
+            miner = miner_address.as_str(),
+            block_reward_sats = b.block_reward_sats,
+            fingerprint = %hex::encode(b.payouts_fingerprint),
+            "JDP block-found: coinbase proven to pay the pool's issued payout set \
+             (ledger fan-out not wired yet — book by this fingerprint)"
+        ),
+        None => warn!(
+            miner = miner_address.as_str(),
+            "JDP block-found: no proof this coinbase pays a pool distribution \
+             (base-protocol declaration, or the issued set was altered) — NOT bookable"
+        ),
+    }
+}
+
+/// `true` when the wire output set is entry-for-entry the distribution it was
+/// lowered from — same order, same addresses, same sats.
+///
+/// The lowering may drop sub-dust entries and the residual fold may move sats
+/// onto the largest output. Either makes the block pay something the pool's
+/// snapshot does not record, so it must not be booked.
+fn outputs_match_payouts(outputs: &[DynamicOutput], payouts: &[PayoutEntry]) -> bool {
+    outputs.len() == payouts.len()
+        && outputs.iter().zip(payouts).all(|(out, p)| {
+            out.address.as_str() == p.address && out.sats.to_i64().max(0) as u64 == p.sats
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(address: &str, sats: u64) -> PayoutEntry {
+        PayoutEntry {
+            address: address.to_string(),
+            sats,
+        }
+    }
+
+    /// The pool only vouches for a block when the set it hands the JDC IS the
+    /// distribution its snapshot records.
+    #[test]
+    fn outputs_match_payouts_accepts_an_untouched_lowering() {
+        let payouts = vec![
+            entry("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 5_000),
+            entry("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 7_000),
+        ];
+        let outputs = payouts_to_dynamic_outputs(&payouts);
+        assert!(outputs_match_payouts(&outputs, &payouts));
+    }
+
+    /// A dropped sub-dust entry means the block pays fewer recipients than the
+    /// snapshot books — no vouching.
+    #[test]
+    fn outputs_match_payouts_rejects_a_dropped_sub_dust_entry() {
+        let payouts = vec![
+            entry("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 5_000),
+            entry("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 100),
+        ];
+        let outputs = payouts_to_dynamic_outputs(&payouts);
+        assert!(
+            !outputs_match_payouts(&outputs, &payouts),
+            "the 100-sat entry is below the dust floor and gets dropped"
+        );
+    }
+
+    /// A folded residual means the block pays one recipient more than the
+    /// snapshot books — no vouching.
+    #[test]
+    fn outputs_match_payouts_rejects_a_folded_residual() {
+        let payouts = vec![
+            entry("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 5_000),
+            entry("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 7_000),
+        ];
+        let mut outputs = payouts_to_dynamic_outputs(&payouts);
+        // Distribution summed to 12_000; the JDC asked to pay out 12_500.
+        fold_residual_to_exact_sum(&mut outputs, 12_500);
+        assert!(!outputs_match_payouts(&outputs, &payouts));
+    }
 
     #[test]
     fn payouts_to_dynamic_outputs_drops_sub_dust() {

@@ -4899,6 +4899,7 @@ mod tests {
                 raw_transactions: Map::new(),
                 prev_hash: Some([0xAB; 32]),
                 declared_at_ms: 1_000,
+                booking: None,
             },
             miner_address: AddressId::new(address.to_string()).unwrap(),
             jdp_session_id: session_id,

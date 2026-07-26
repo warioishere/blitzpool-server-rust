@@ -28,6 +28,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use super::dynamic_outputs::PayoutBooking;
 use crate::tokens::Token;
 
 /// FIFO cap on stored declarations.
@@ -76,6 +77,12 @@ pub struct DeclaredJob {
     pub prev_hash: Option<[u8; 32]>,
     /// Wall-clock ms when this declaration was stored.
     pub declared_at_ms: u64,
+    /// How a block found on this job is booked, carried from the ext-0x0003
+    /// declare-time check that proved this coinbase pays the pool's issued
+    /// payout set. `None` when nothing proved it — a base-protocol
+    /// declaration, or a connection that never negotiated 0x0003 — and then
+    /// a found block is reported but not booked.
+    pub booking: Option<PayoutBooking>,
 }
 
 // ── DeclaredJobStore ─────────────────────────────────────────────────
@@ -226,6 +233,7 @@ mod tests {
             raw_transactions: HashMap::new(),
             prev_hash,
             declared_at_ms: declared_at,
+            booking: None,
         }
     }
 

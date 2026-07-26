@@ -61,6 +61,7 @@ use crate::jdp::client::{
     handle_setup_connection, parse_user_identifier_as_address, AllocateTokenContext,
     JdpHandlerOutcome, JdpOutboundFrame, JdpSessionEvent, JdpSessionState,
 };
+use crate::jdp::dynamic_outputs::PayoutBooking;
 use crate::jdp_server_codec::{
     decode_jdp_inbound, decode_jdp_inbound_ext_0x0003, encode_jdp_outbound,
     encode_jdp_outbound_ext_0x0003, InboundJdpFrame, EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS,
@@ -143,6 +144,10 @@ pub trait PayoutOutputsResolver: Send + Sync {
 /// Block-submission sink for `PushSolution` candidates. Production
 /// wiring reconstructs the block via rust-bitcoin's `Block` + calls
 /// `TdpHandle::submit_solution`; tests use a recording sink.
+///
+/// `booking` is `Some` only when the declared coinbase was proven to pay the
+/// pool's issued payout set (ext 0x0003 declare-time check). `None` means the
+/// pool cannot say what this block paid it — report it, book nothing.
 #[async_trait]
 pub trait JdpBlockSubmissionSink: Send + Sync {
     #[allow(clippy::too_many_arguments)]
@@ -150,6 +155,7 @@ pub trait JdpBlockSubmissionSink: Send + Sync {
         &self,
         miner_address: AddressId,
         new_token: Token,
+        booking: Option<PayoutBooking>,
         coinbase_raw: Vec<u8>,
         transactions: Vec<Vec<u8>>,
         prev_hash: [u8; 32],
@@ -225,6 +231,7 @@ impl JdpBlockSubmissionSink for NoOpJdpHooks {
         &self,
         _: AddressId,
         _: Token,
+        _: Option<PayoutBooking>,
         _: Vec<u8>,
         _: Vec<Vec<u8>>,
         _: [u8; 32],
@@ -253,6 +260,9 @@ impl PayoutOutputsResolver for NoOpJdpHooks {
         crate::jdp::client::PayoutOutputsResolution::Success {
             request_id,
             outputs: committed_outputs.to_vec(),
+            // A test double has no distribution behind these bytes, so it
+            // vouches for nothing.
+            booking: None,
         }
     }
 }
@@ -630,6 +640,7 @@ async fn fan_out_events(
             JdpSessionEvent::BlockSubmissionCandidate {
                 miner_address,
                 new_token,
+                booking,
                 coinbase_raw,
                 transactions,
                 prev_hash,
@@ -643,6 +654,7 @@ async fn fan_out_events(
                     .submit_block_candidate(
                         miner_address,
                         new_token,
+                        booking,
                         coinbase_raw,
                         transactions,
                         prev_hash,
@@ -986,6 +998,7 @@ mod tests {
             raw_transactions: HashMap::new(),
             prev_hash: Some([0xCC; 32]),
             declared_at_ms: 500,
+            booking: None,
         };
         state.declared_jobs.insert(job);
         let bridge = fresh_bridge();
@@ -1041,6 +1054,7 @@ mod tests {
             raw_transactions: HashMap::new(),
             prev_hash: Some([0xCC; 32]),
             declared_at_ms: 500,
+            booking: None,
         });
         let declared = vec![JdpSessionEvent::JobDeclared {
             new_token,
