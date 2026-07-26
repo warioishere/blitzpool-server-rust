@@ -407,9 +407,27 @@ impl PayoutOutputsTracker {
         }
         match declared_coinbase_contains_pool_outputs(coinbase_tx_suffix, &entry.outputs) {
             CoinbaseOutputCheck::Ok => {
+                let booking = entry.booking;
                 entry.used = true;
+                // The containment check is a superset test — the JDC owns the
+                // rest of its coinbase, so extra outputs are legal. That means
+                // a coinbase can carry TWO sets this token was issued, and
+                // only the newest is consumed here. It pays both distributions
+                // but the pool would book one, leaving the other's recipients
+                // credited nowhere. The declaration still stands; it just
+                // cannot be vouched for.
+                let also_present = list
+                    .iter()
+                    .filter(|e| !e.used)
+                    .filter(|e| {
+                        matches!(
+                            declared_coinbase_contains_pool_outputs(coinbase_tx_suffix, &e.outputs),
+                            CoinbaseOutputCheck::Ok
+                        )
+                    })
+                    .count();
                 DeclareOutputsCheck::Ok {
-                    booking: entry.booking,
+                    booking: if also_present == 0 { booking } else { None },
                 }
             }
             CoinbaseOutputCheck::MissingOutput { index } => {
@@ -998,6 +1016,62 @@ mod tests {
         assert_eq!(
             declared_coinbase_contains_pool_outputs(&suffix(&declared), &committed_blob),
             CoinbaseOutputCheck::MissingOutput { index: 0 }
+        );
+    }
+
+    /// A coinbase may legally carry more than one set this token was issued —
+    /// the JDC owns the rest of its coinbase, so the containment check cannot
+    /// reject it. But the block then pays two distributions and the pool would
+    /// book one, so it must not vouch for either.
+    #[test]
+    fn a_coinbase_carrying_two_issued_sets_is_not_vouched_for() {
+        let token = tok(7);
+        let a = out(5_000);
+        let b = out(7_000);
+        let bytes_a = encode_coinbase_outputs(Network::Regtest, std::slice::from_ref(&a)).unwrap();
+        let bytes_b = encode_coinbase_outputs(Network::Regtest, std::slice::from_ref(&b)).unwrap();
+        let booking = PayoutBooking {
+            payouts_fingerprint: [0xAB; 32],
+            block_reward_sats: 12_000,
+        };
+
+        let mut c = PayoutOutputsTracker::new();
+        let mut first = resp(1, bytes_a);
+        first.booking = Some(booking);
+        c.record(token, first);
+        let mut second = resp(2, bytes_b);
+        second.booking = Some(booking);
+        c.record(token, second);
+
+        // A coinbase carrying both.
+        let both = suffix(&encode_coinbase_outputs(Network::Regtest, &[a, b]).unwrap());
+        assert_eq!(
+            c.validate_and_consume_for_declare(&token, &both),
+            DeclareOutputsCheck::Ok { booking: None },
+            "paying two issued sets must consume the newest but vouch for neither"
+        );
+    }
+
+    /// The ordinary case still carries its booking through — otherwise the
+    /// guard above would have silently disabled booking altogether.
+    #[test]
+    fn a_coinbase_carrying_one_issued_set_is_vouched_for() {
+        let token = tok(8);
+        let only = out(5_000);
+        let bytes = encode_coinbase_outputs(Network::Regtest, std::slice::from_ref(&only)).unwrap();
+        let booking = PayoutBooking {
+            payouts_fingerprint: [0xCD; 32],
+            block_reward_sats: 5_000,
+        };
+        let mut c = PayoutOutputsTracker::new();
+        let mut entry = resp(1, bytes.clone());
+        entry.booking = Some(booking);
+        c.record(token, entry);
+        assert_eq!(
+            c.validate_and_consume_for_declare(&token, &suffix(&bytes)),
+            DeclareOutputsCheck::Ok {
+                booking: Some(booking)
+            }
         );
     }
 }

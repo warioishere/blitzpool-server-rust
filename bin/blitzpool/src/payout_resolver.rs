@@ -157,6 +157,48 @@ impl ProductionPayoutResolver {
         }
     }
 
+    /// Resolve payouts and say whether a payout **engine** produced them.
+    ///
+    /// The plain resolver hides its fallbacks by design: when an engine is
+    /// unreachable it hands back a solo split so the miner still gets a
+    /// spendable coinbase. That is right for building a job and wrong for
+    /// accounting — a fallback list has no distribution snapshot behind it, so
+    /// nothing could ever be booked against it. The ext-0x0003 path needs to
+    /// tell the two apart before it promises a JD-client's block is bookable.
+    pub(crate) async fn resolve_payouts_reporting_source(
+        &self,
+        miner_address: &AddressId,
+        reward_sats: u64,
+    ) -> (Vec<PayoutEntry>, bool) {
+        let resolved = self.mode_gate.lookup_mode(miner_address.as_str());
+        let engine_backed = match resolved.mode {
+            MiningMode::Pplns => match self.pplns.as_ref() {
+                Some(pplns) => pplns.build_distribution(reward_sats).await.is_ok(),
+                None => false,
+            },
+            MiningMode::GroupSolo => match resolved
+                .group_id
+                .as_deref()
+                .and_then(|g| Uuid::parse_str(g).ok())
+            {
+                Some(group_id) => self
+                    .group_solo
+                    .build_distribution(group_id, reward_sats, miner_address)
+                    .await
+                    .is_ok(),
+                None => false,
+            },
+            // Solo and Blockparty keep no distribution snapshot to book
+            // against, so nothing here is ever engine-backed for this purpose.
+            _ => false,
+        };
+        (
+            bp_stratum_v2::hooks::PayoutResolver::resolve_payouts(self, miner_address, reward_sats)
+                .await,
+            engine_backed,
+        )
+    }
+
     async fn pplns_payouts(&self, miner_address: &str, reward_sats: u64) -> Vec<PayoutEntry> {
         let Some(pplns) = self.pplns.as_ref() else {
             // PPLNS mode was published into the gate but the engine

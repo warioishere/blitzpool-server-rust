@@ -753,12 +753,10 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
         // job from current pool state and the JDC-reported
         // `available_payout_value` — recipients AND amounts both reflect
         // the moment of the request, not the token-time estimate.
-        let payouts = bp_stratum_v2::hooks::PayoutResolver::resolve_payouts(
-            &*self.payout_resolver,
-            miner_address,
-            available_payout_value,
-        )
-        .await;
+        let (payouts, engine_backed) = self
+            .payout_resolver
+            .resolve_payouts_reporting_source(miner_address, available_payout_value)
+            .await;
         if payouts.is_empty() {
             warn!(
                 request_id,
@@ -800,7 +798,19 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
         // remove. Both are no-ops while the distributor consumes the whole
         // reward and its floor is the dust limit — if that ever stops holding,
         // the block is reported and left for an operator instead.
-        let booking = if outputs_match_payouts(&outputs, &payouts) {
+        // A fallback list has no distribution snapshot behind it — vouching for
+        // one would send an operator chasing a fingerprint that resolves to
+        // nothing. The coinbase is still correct and still goes out; it just
+        // cannot be booked automatically.
+        if !engine_backed {
+            warn!(
+                request_id,
+                address = miner_address.as_str(),
+                "ext 0x0003: payout set did not come from a payout engine (fallback or a mode \
+                 that keeps no ledger) — a block found on it will be reported but not booked"
+            );
+        }
+        let booking = if engine_backed && outputs_match_payouts(&outputs, &payouts) {
             Some(PayoutBooking {
                 payouts_fingerprint,
                 block_reward_sats: available_payout_value,
