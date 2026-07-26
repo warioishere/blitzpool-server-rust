@@ -1856,6 +1856,33 @@ mod tests {
         );
     }
 
+    /// Closes the last gap between this check and the proof that it agrees with
+    /// bitcoin-core.
+    ///
+    /// The regtests that establish the target reading empirically — take a real
+    /// `SetNewPrevHash.target`, read it with `Target::from_le_bytes`, brute-force
+    /// a nonce until `is_met_by_le` accepts, submit, assert the tip rises — feed
+    /// that comparison `bp_share::sha256d(&header_bytes)`. This check feeds it
+    /// `header.block_hash().to_byte_array()` instead. Both are meant to be the
+    /// same little-endian digest, and everything above rests on that, so it is
+    /// asserted here rather than assumed. If the two ever diverge, the work check
+    /// silently stops meaning what those regtests proved.
+    #[test]
+    fn our_hash_bytes_are_the_form_the_regtests_prove_against_core() {
+        use bitcoin::consensus::Encodable;
+
+        let header = header_with([0xABu8; 32], 42);
+        let mut raw = Vec::new();
+        header.consensus_encode(&mut raw).expect("encode header");
+        assert_eq!(raw.len(), 80, "a block header is 80 consensus bytes");
+        assert_eq!(
+            header.block_hash().to_byte_array(),
+            bp_share::sha256d(&raw),
+            "rust-bitcoin's block_hash bytes must be the same little-endian digest the \
+             regtests brute-force against, or this check no longer inherits their proof"
+        );
+    }
+
     /// A header on the right tip that meets the target is real work, and the
     /// one thing a client cannot fabricate.
     #[test]
