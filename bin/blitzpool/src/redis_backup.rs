@@ -35,12 +35,22 @@ const SCOPES: &[(&str, &str)] = &[("pplns", "pplns:*"), ("groupsolo", "groupsolo
 /// `RENAME`; never worth backing up (and confusing on restore).
 const SKIP_SUFFIX: &str = ":by-address:rebuild";
 
-/// Per-job Group-Solo distribution snapshots. One per (finder, payout list) for
-/// their TTL, so a busy group holds far more of these than it does round state.
-/// They belong to jobs that live in the pool's memory: a Redis loss takes the
-/// jobs with it, so restoring the snapshots would restore nothing usable. Skip
-/// them rather than DUMP thousands of them into Postgres every 10 minutes.
-const SKIP_INFIX: &str = ":jobsnapshot:";
+/// Per-job coinbase-distribution snapshots: `pplns:snapshot:{hex}` and
+/// `groupsolo:{group}:jobsnapshot:{hex}`.
+///
+/// Skipped because they are neither restorable nor few. Each belongs to one
+/// issued mining job, and jobs live in the pool's memory — a Redis loss takes
+/// them with it, so a restored snapshot is one nothing can ever look up again.
+/// And there is one per distinct payout list for its whole TTL, not one per
+/// miner: a busy pool holds orders of magnitude more of these than it does
+/// window or round state, and every one of them would be `DUMP`ed into Postgres
+/// on every backup run and kept for the retention window.
+///
+/// What the backup is actually for — `pplns:window:*`, the group round state,
+/// pending blocks — is untouched by this.
+fn is_per_job_snapshot(key: &str) -> bool {
+    key.starts_with("pplns:snapshot:") || key.contains(":jobsnapshot:")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BackupError {
@@ -127,7 +137,7 @@ pub(crate) async fn run_backup_once(
 
     for (scope, pattern) in SCOPES {
         for key in scan_keys(redis, pattern).await? {
-            if key.ends_with(SKIP_SUFFIX) || key.contains(SKIP_INFIX) {
+            if key.ends_with(SKIP_SUFFIX) || is_per_job_snapshot(&key) {
                 continue;
             }
             // `Option`: the key may vanish between SCAN and DUMP (trim/reset).
@@ -279,6 +289,27 @@ mod tests {
     const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
     const RETENTION_MS: i64 = 48 * 3600 * 1000;
 
+    /// The classification the backup filter turns on — pure, so it is checked
+    /// without Redis. What must NOT be skipped matters as much as what must:
+    /// the window and round state are the whole point of the backup.
+    #[test]
+    fn per_job_snapshots_are_classified_apart_from_restorable_state() {
+        let fp = "ab".repeat(32);
+        assert!(is_per_job_snapshot(&format!("pplns:snapshot:{fp}")));
+        assert!(is_per_job_snapshot(&format!(
+            "groupsolo:g1:jobsnapshot:{fp}"
+        )));
+
+        assert!(!is_per_job_snapshot("pplns:window:by-address"));
+        assert!(!is_per_job_snapshot("pplns:window:total"));
+        assert!(!is_per_job_snapshot("pplns:buckets"));
+        assert!(!is_per_job_snapshot("groupsolo:g1:shares"));
+        assert!(!is_per_job_snapshot("groupsolo:g1:by-address"));
+        // The per-finder Group-Solo snapshot is one row per member, not per
+        // job — small, and left in the backup as it was.
+        assert!(!is_per_job_snapshot("groupsolo:g1:snapshot:bc1qfoo"));
+    }
+
     async fn redis_or_skip(db: u8) -> Option<ConnectionManager> {
         let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
         let client = redis::Client::open(format!("{base}/{db}")).ok()?;
@@ -337,11 +368,28 @@ mod tests {
             .hset("pplns:window:by-address:rebuild", "x", "1")
             .await
             .unwrap();
+        // Per-job coinbase snapshots. A busy pool holds thousands of these and
+        // none of them survives its job, so the backup must leave them alone.
+        let _: () = redis
+            .hset(format!("pplns:snapshot:{}", "ab".repeat(32)), "reward", "1")
+            .await
+            .unwrap();
+        let _: () = redis
+            .hset(
+                format!("groupsolo:test-g:jobsnapshot:{}", "cd".repeat(32)),
+                "reward",
+                "1",
+            )
+            .await
+            .unwrap();
 
         let n = run_backup_once(&mut redis, &pool, RETENTION_MS)
             .await
             .expect("backup");
-        assert_eq!(n, 4, "4 keys backed up (rebuild temp skipped)");
+        assert_eq!(
+            n, 4,
+            "4 keys backed up (rebuild temp + both per-job snapshots skipped)"
+        );
 
         let captured = bp_db::latest_redis_backup_captured_at(&pool)
             .await
