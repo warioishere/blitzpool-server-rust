@@ -435,9 +435,18 @@ impl<C: Clock> VarDiffEngine<C> {
         None
     }
 
-    /// Round to the nearest power-of-2 step (lower / lower * 1.5 /
-    /// upper). Floors at [`min_difficulty`]. Returns `None` for `val == 0`
-    /// Guards against `log2(0) = -Infinity`.
+    /// Round to the nearest power of two. Floors at [`min_difficulty`].
+    /// Returns `None` for `val == 0`, guarding against `log2(0) = -Infinity`.
+    ///
+    /// Powers of two ONLY — the ladder used to carry a `lower * 1.5` rung
+    /// between them, and that rung is what a translating proxy destroys. The
+    /// SRI translator rounds an assigned difficulty UP to a power of two when
+    /// it lowers it into an SV1 `mining.set_difficulty`, so a 1.5x rung like
+    /// 3072 reaches the miner as 4096 while the pool keeps booking shares at
+    /// 3072. Measured on a live pair: 29.5 % of a miner's work went uncredited
+    /// that way. A rung the downstream will not honour is worse than no rung —
+    /// a difficulty slightly off target costs nothing, one the miner does not
+    /// share with us costs real work.
     fn nearest_difficulty_step(&self, val: f64) -> Option<f64> {
         if val == 0.0 {
             return None;
@@ -447,23 +456,14 @@ impl<C: Clock> VarDiffEngine<C> {
         }
         let exponent = val.log2().floor();
         let lower = 2_f64.powf(exponent);
-        let middle = lower + lower / 2.0;
         let upper = lower * 2.0;
-
-        let dl = (val - lower).abs();
-        let dm = (val - middle).abs();
-        let du = (val - upper).abs();
-        // Pick the nearest. Equal distances tie-break in declaration order
-        // [lower, middle, upper].
-        let (mut best_val, mut best_d) = (lower, dl);
-        if dm < best_d {
-            best_val = middle;
-            best_d = dm;
+        // Nearest, ties to the lower rung: more shares is the safer error,
+        // since it feeds the estimator rather than starving it.
+        if (val - lower).abs() <= (upper - val).abs() {
+            Some(lower)
+        } else {
+            Some(upper)
         }
-        if du < best_d {
-            best_val = upper;
-        }
-        Some(best_val)
     }
 }
 
@@ -533,17 +533,38 @@ mod tests {
         VarDiffEngine::new(clock, target, min)
     }
 
+    /// Every rung is a power of two, with nothing in between.
+    ///
+    /// The ladder used to carry a `lower * 1.5` rung. It was removed because a
+    /// translating proxy rounds an assigned difficulty UP to a power of two on
+    /// the way to the miner, so a 1.5x rung arrives as something the pool never
+    /// assigned and every share booked against it under-counts the miner's work.
     #[test]
-    fn nearest_step_returns_power_of_two_bracket() {
+    fn nearest_step_returns_only_powers_of_two() {
         let e = engine_with_clock(TestClock::new(0), 6.0, 0.00001);
-        // val = 1024 is exactly a power of 2 → that exact value.
+        // Exact powers of two are returned unchanged.
         assert_eq!(e.nearest_difficulty_step(1024.0), Some(1024.0));
-        // val = 1536 (= 1024 + 512) is the "middle" point → 1536.
-        assert_eq!(e.nearest_difficulty_step(1536.0), Some(1536.0));
-        // val = 2000 → between 1536 and 2048; closer to 2048.
+        assert_eq!(e.nearest_difficulty_step(2048.0), Some(2048.0));
+        // The old 1.5x rung is gone: 1536 now resolves to a neighbour.
+        assert_eq!(
+            e.nearest_difficulty_step(1536.0),
+            Some(1024.0),
+            "equidistant from 1024 and 2048 — ties go to the lower rung"
+        );
+        // Values in between land on whichever power of two is nearer.
         assert_eq!(e.nearest_difficulty_step(2000.0), Some(2048.0));
-        // val = 1600 → between 1536 and 2048; closer to 1536.
-        assert_eq!(e.nearest_difficulty_step(1600.0), Some(1536.0));
+        assert_eq!(e.nearest_difficulty_step(1600.0), Some(2048.0));
+        assert_eq!(e.nearest_difficulty_step(1100.0), Some(1024.0));
+
+        // Nothing the ladder can emit may be a non-power-of-two.
+        for probe in [3.0, 100.0, 950.3, 2887.8, 5000.0, 1e6] {
+            let step = e.nearest_difficulty_step(probe).expect("a rung");
+            assert_eq!(
+                step,
+                2_f64.powf(step.log2().round()),
+                "step {step} for {probe} is not a power of two"
+            );
+        }
     }
 
     #[test]
