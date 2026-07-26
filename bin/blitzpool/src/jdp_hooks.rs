@@ -118,7 +118,7 @@ pub(crate) fn build_jdp_hooks(
         Some(booker) => Arc::new(LedgerBookingJdpSink {
             inner: block_sink,
             booker,
-            tdp: tdp.clone(),
+            chain: Arc::new(tdp.clone()),
             booked: StdMutex::new(VecDeque::new()),
         }),
         None => {
@@ -420,6 +420,24 @@ impl JdpBlockSubmissionSink for JdpRpcBlockSubmissionSink {
 /// is what the witness-form assembly indexes against.
 const MIN_COINBASE_LEN: usize = 8;
 
+/// The most a JD-client may claim the block pays and still have the pool book
+/// it automatically.
+///
+/// Separate from the `revenue-too-large` ceiling on purpose. That one decides
+/// whether a coinbase gets built at all and is generous, because a client
+/// whose mempool is fuller than the pool's really does pay more and refusing
+/// it would break honest mining. This one decides whether the pool writes a
+/// number into its ledger, where being generous means crediting miners for
+/// money the block never paid — and in a non-custodial pool that credit is
+/// what the next block's coinbase pays out.
+///
+/// The margin covers ordinary mempool divergence between two nodes; anything
+/// beyond it is served but not vouched for, and the chain→ledger check reports
+/// the block if it turns out to have been real.
+fn bookable_ceiling(pool_template_value: u64) -> u64 {
+    pool_template_value.saturating_add(pool_template_value / 4)
+}
+
 /// What the pool's own node says the next block must satisfy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ChainDemands {
@@ -475,6 +493,61 @@ pub(crate) fn solution_is_evidence(
         return Err(NotEvidence::InsufficientWork);
     }
     Ok(())
+}
+
+/// The pool's view of what the next block must satisfy.
+///
+/// A seam, so the decision below can be tested without a live template feed —
+/// the logic that decides whether money moves is worth exercising directly.
+pub(crate) trait ChainView: Send + Sync {
+    fn demands(&self) -> Option<ChainDemands>;
+}
+
+impl ChainView for TdpHandle {
+    fn demands(&self) -> Option<ChainDemands> {
+        let prev = self.current_snapshot().set_new_prev_hash?;
+        Some(ChainDemands {
+            prev_hash: prev.prev_hash,
+            target: prev.target,
+        })
+    }
+}
+
+/// Books a block the pool did not build the coinbase for.
+#[async_trait]
+pub(crate) trait DeclaredBlockBooker: Send + Sync {
+    async fn book(
+        &self,
+        miner_address: String,
+        session_id: String,
+        reward_sats: u64,
+        block_hash: String,
+        block_data: String,
+        payouts_fingerprint: [u8; 32],
+    );
+}
+
+#[async_trait]
+impl DeclaredBlockBooker for crate::block_sink::TdpBlockSubmissionSink {
+    async fn book(
+        &self,
+        miner_address: String,
+        session_id: String,
+        reward_sats: u64,
+        block_hash: String,
+        block_data: String,
+        payouts_fingerprint: [u8; 32],
+    ) {
+        self.book_declared_block_found(
+            miner_address,
+            session_id,
+            reward_sats,
+            block_hash,
+            block_data,
+            payouts_fingerprint,
+        )
+        .await;
+    }
 }
 
 /// Reassemble the block a `PushSolution` describes: the JDC's coinbase plus
@@ -553,10 +626,10 @@ fn assemble_declared_block(
 /// `[sv2].jdp_orphan_submitblock`.
 pub(crate) struct LedgerBookingJdpSink {
     inner: Arc<dyn JdpBlockSubmissionSink>,
-    booker: Arc<crate::block_sink::TdpBlockSubmissionSink>,
+    booker: Arc<dyn DeclaredBlockBooker>,
     /// The pool's own chain view. Booking is checked against this, never
     /// against anything the JD-client sent.
-    tdp: TdpHandle,
+    chain: Arc<dyn ChainView>,
     /// Block hashes already booked by this process. A JDC may re-send a
     /// solution (reconnect, unseen ack) and the same block must not be booked
     /// twice. Bounded — only the newest few matter, a repeat arrives right
@@ -581,12 +654,7 @@ impl LedgerBookingJdpSink {
     }
 
     fn chain_demands(&self) -> Option<ChainDemands> {
-        let snapshot = self.tdp.current_snapshot();
-        let prev = snapshot.set_new_prev_hash?;
-        Some(ChainDemands {
-            prev_hash: prev.prev_hash,
-            target: prev.target,
-        })
+        self.chain.demands()
     }
 }
 
@@ -618,7 +686,7 @@ impl LedgerBookingJdpSink {
             return;
         }
         self.booker
-            .book_declared_block_found(
+            .book(
                 miner_address.as_str().to_string(),
                 hex::encode(new_token.0),
                 booking.block_reward_sats,
@@ -743,6 +811,12 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
         use bp_stratum_v2::extensions::payout_outputs_error_codes;
 
         // ── Revenue plausibility (internal guard) ───────────────────
+        let pool_template_value = self
+            .tdp
+            .current_snapshot()
+            .new_template
+            .as_ref()
+            .map(|t| t.coinbase_tx_value_remaining);
         if let Some(t) = self.tdp.current_snapshot().new_template {
             // 2× tolerance for mempool fee variance; rejects clearly
             // implausible (>2× current template value).
@@ -817,6 +891,31 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
         // one would send an operator chasing a fingerprint that resolves to
         // nothing. The coinbase is still correct and still goes out; it just
         // cannot be booked automatically.
+        // The reward that goes into the ledger is a number the JD-client
+        // reported. The guard above keeps a wildly wrong one from producing a
+        // coinbase at all, but its tolerance is deliberately generous — a
+        // client with a fuller mempool legitimately pays more than the pool's
+        // own template says. Booking cannot be that generous: an overstated
+        // value makes the pool credit miners for money the block never paid,
+        // and they are paid that credit out of the NEXT block, which is real.
+        // So the promise is withheld outside a narrow band even where the
+        // coinbase is still served.
+        let value_is_bookable = match pool_template_value {
+            Some(pool_value) => available_payout_value <= bookable_ceiling(pool_value),
+            // No template of our own to compare against — no basis to promise.
+            None => false,
+        };
+        if !value_is_bookable {
+            warn!(
+                request_id,
+                address = miner_address.as_str(),
+                available_payout_value,
+                pool_template_value,
+                "ext 0x0003: reported payout value is above what the pool's own template can \
+                 account for — the coinbase still goes out, but a block found on it will not be \
+                 booked automatically"
+            );
+        }
         if !engine_backed {
             warn!(
                 request_id,
@@ -825,21 +924,22 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
                  that keeps no ledger) — a block found on it will be reported but not booked"
             );
         }
-        let booking = if engine_backed && outputs_match_payouts(&outputs, &payouts) {
-            Some(PayoutBooking {
-                payouts_fingerprint,
-                block_reward_sats: available_payout_value,
-            })
-        } else {
-            warn!(
-                request_id,
-                address = miner_address.as_str(),
-                "ext 0x0003: issued output set differs from the distribution it came from \
+        let booking =
+            if engine_backed && value_is_bookable && outputs_match_payouts(&outputs, &payouts) {
+                Some(PayoutBooking {
+                    payouts_fingerprint,
+                    block_reward_sats: available_payout_value,
+                })
+            } else {
+                warn!(
+                    request_id,
+                    address = miner_address.as_str(),
+                    "ext 0x0003: issued output set differs from the distribution it came from \
                  (sub-dust drop or residual fold) — a block found on it will be reported \
                  but not booked"
-            );
-            None
-        };
+                );
+                None
+            };
         let bytes = match encode_coinbase_outputs(self.network, &outputs) {
             Ok(b) => b,
             Err(err) => {
@@ -1077,6 +1177,228 @@ mod tests {
             0x1d00_ffff,
         )
         .is_none());
+    }
+
+    /// The value the pool books is a number the client reported. Serving a
+    /// coinbase may be generous about it; crediting miners may not, because
+    /// that credit is paid out of the next real block.
+    #[test]
+    fn the_bookable_band_is_tighter_than_the_serve_ceiling() {
+        let template = 312_500_000u64;
+        // Ordinary mempool divergence between two nodes stays bookable.
+        assert!(template + template / 10 <= bookable_ceiling(template));
+        assert_eq!(bookable_ceiling(template), 390_625_000);
+        // The serve ceiling is 2x; that is far outside what may be booked.
+        assert!(
+            template * 2 > bookable_ceiling(template),
+            "a claim the coinbase path still tolerates must not be bookable"
+        );
+        // No overflow at absurd inputs.
+        assert!(bookable_ceiling(u64::MAX) >= u64::MAX / 2);
+    }
+
+    // ── LedgerBookingJdpSink ────────────────────────────────────────
+
+    #[derive(Default)]
+    struct RecordingSink {
+        calls: StdMutex<Vec<[u8; 32]>>,
+    }
+    #[async_trait]
+    impl JdpBlockSubmissionSink for RecordingSink {
+        async fn submit_block_candidate(
+            &self,
+            _: AddressId,
+            _: Token,
+            _: Option<PayoutBooking>,
+            coinbase_raw: Vec<u8>,
+            _: Vec<Vec<u8>>,
+            _: [u8; 32],
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+        ) {
+            let mut h = [0u8; 32];
+            h[0] = coinbase_raw.first().copied().unwrap_or(0);
+            self.calls.lock().unwrap().push(h);
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingBooker {
+        booked: StdMutex<Vec<(u64, [u8; 32])>>,
+    }
+    #[async_trait]
+    impl DeclaredBlockBooker for RecordingBooker {
+        async fn book(
+            &self,
+            _: String,
+            _: String,
+            reward: u64,
+            _: String,
+            _: String,
+            fp: [u8; 32],
+        ) {
+            self.booked.lock().unwrap().push((reward, fp));
+        }
+    }
+
+    struct FixedChain(Option<ChainDemands>);
+    impl ChainView for FixedChain {
+        fn demands(&self) -> Option<ChainDemands> {
+            self.0
+        }
+    }
+
+    fn coinbase_bytes() -> Vec<u8> {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::Encodable;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x51, 0x00, 0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut raw = Vec::new();
+        tx.consensus_encode(&mut raw).expect("encode");
+        raw
+    }
+
+    fn sink_with(
+        chain: Option<ChainDemands>,
+    ) -> (
+        LedgerBookingJdpSink,
+        Arc<RecordingSink>,
+        Arc<RecordingBooker>,
+    ) {
+        let inner = Arc::new(RecordingSink::default());
+        let booker = Arc::new(RecordingBooker::default());
+        (
+            LedgerBookingJdpSink {
+                inner: inner.clone(),
+                booker: booker.clone(),
+                chain: Arc::new(FixedChain(chain)),
+                booked: StdMutex::new(VecDeque::new()),
+            },
+            inner,
+            booker,
+        )
+    }
+
+    async fn push(sink: &LedgerBookingJdpSink, booking: Option<PayoutBooking>, nonce: u32) {
+        sink.submit_block_candidate(
+            AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap(),
+            Token([9u8; 16]),
+            booking,
+            coinbase_bytes(),
+            vec![],
+            [0u8; 32],
+            0x2000_0000,
+            1_700_000_000,
+            nonce,
+            0x1d00_ffff,
+        )
+        .await;
+    }
+
+    fn a_booking() -> PayoutBooking {
+        PayoutBooking {
+            payouts_fingerprint: [0x11; 32],
+            block_reward_sats: 5_000_000_000,
+        }
+    }
+
+    /// The resubmit is the pool's anti-orphan redundancy. It must happen for
+    /// every candidate, whatever the ledger decides — dropping it would
+    /// silently disable block propagation while bookings kept working.
+    #[tokio::test]
+    async fn the_block_always_reaches_the_resubmit_sink() {
+        let easy = ChainDemands {
+            prev_hash: [0u8; 32],
+            target: [0xFFu8; 32],
+        };
+        for (chain, booking) in [
+            (Some(easy), Some(a_booking())),
+            (Some(easy), None),
+            (None, Some(a_booking())),
+        ] {
+            let (sink, inner, _) = sink_with(chain);
+            push(&sink, booking, 1).await;
+            assert_eq!(inner.calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    /// Work on the pool's own tip is evidence, and gets booked with the
+    /// distribution the declaration vouched for.
+    #[tokio::test]
+    async fn evidence_books_the_vouched_distribution() {
+        let (sink, _, booker) = sink_with(Some(ChainDemands {
+            prev_hash: [0u8; 32],
+            target: [0xFFu8; 32],
+        }));
+        push(&sink, Some(a_booking()), 1).await;
+        assert_eq!(
+            *booker.booked.lock().unwrap(),
+            vec![(5_000_000_000, [0x11; 32])]
+        );
+    }
+
+    /// A claim that did no work must not move money, however well-formed.
+    #[tokio::test]
+    async fn a_claim_without_work_books_nothing() {
+        let mut hard = [0u8; 32];
+        hard[31] = 0x01;
+        let (sink, inner, booker) = sink_with(Some(ChainDemands {
+            prev_hash: [0u8; 32],
+            target: hard,
+        }));
+        push(&sink, Some(a_booking()), 42).await;
+        assert!(booker.booked.lock().unwrap().is_empty());
+        assert_eq!(
+            inner.calls.lock().unwrap().len(),
+            1,
+            "still propagated — bitcoin-core is the one to reject it"
+        );
+    }
+
+    /// Nothing vouched for the distribution, so there is nothing to book even
+    /// though the work is real.
+    #[tokio::test]
+    async fn work_without_a_vouched_distribution_books_nothing() {
+        let (sink, _, booker) = sink_with(Some(ChainDemands {
+            prev_hash: [0u8; 32],
+            target: [0xFFu8; 32],
+        }));
+        push(&sink, None, 1).await;
+        assert!(booker.booked.lock().unwrap().is_empty());
+    }
+
+    /// A re-sent solution is the same block; booking it twice would credit
+    /// the same payout twice.
+    #[tokio::test]
+    async fn the_same_block_pushed_twice_books_once() {
+        let (sink, inner, booker) = sink_with(Some(ChainDemands {
+            prev_hash: [0u8; 32],
+            target: [0xFFu8; 32],
+        }));
+        push(&sink, Some(a_booking()), 1).await;
+        push(&sink, Some(a_booking()), 1).await;
+        assert_eq!(booker.booked.lock().unwrap().len(), 1);
+        assert_eq!(
+            inner.calls.lock().unwrap().len(),
+            2,
+            "propagation is not deduped — only the ledger write is"
+        );
     }
 
     fn header_with(prev: [u8; 32], nonce: u32) -> Header {
