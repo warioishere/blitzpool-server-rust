@@ -1174,24 +1174,36 @@ fn resolve_open_context<C: Clock>(
         worker_part.to_string()
     };
 
-    // Initial difficulty. SV2 miners advertise `nominal_hash_rate`; derive
-    // from it when present, but never start below the operator-configured
-    // initial difficulty. Some firmware under-reports (or reports 0) its
-    // rate — without the floor that pins the channel to a trivial target
-    // that wastes share bandwidth (and, on strict firmware, can stall)
-    // until vardiff catches up. `nominal_hash_rate <= 0` starts at the
-    // configured initial difficulty; an honest higher rate starts above it.
-    let derived = if nominal_hash_rate > 0.0 {
-        hash_rate_to_difficulty(nominal_hash_rate as f64, state.target_shares_per_minute)
+    // Initial difficulty. A positive `nominal_hash_rate` is the miner
+    // telling us what it can do, and the difficulty derived from it is
+    // therefore what it is asking to be given — the SV2 counterpart of
+    // SV1 `mining.suggest_difficulty`, which this pool has always honoured
+    // with no operator-side floor at all. Honour it the same way, bounded
+    // only by `min_difficulty`.
+    //
+    // The configured start difficulty is chosen for the devices a port
+    // expects, so flooring a declaration at it discarded every declaration
+    // below that value — which is most of them: a 1 TH/s device derives
+    // ~930 against a 2500 start and was pinned ~4× above its own rate until
+    // vardiff walked it back. `handle_update_channel` already bounds a
+    // declaration at `min_difficulty` only; channel-open was the outlier.
+    //
+    // `nominal_hash_rate <= 0` declares nothing, so the configured start
+    // remains the only signal and still applies.
+    let floored = if nominal_hash_rate > 0.0 {
+        Difficulty(
+            hash_rate_to_difficulty(nominal_hash_rate as f64, state.target_shares_per_minute)
+                .as_f64()
+                .max(state.min_difficulty.as_f64()),
+        )
     } else {
-        state.initial_difficulty
+        Difficulty(
+            state
+                .initial_difficulty
+                .as_f64()
+                .max(state.min_difficulty.as_f64()),
+        )
     };
-    let floored = Difficulty(
-        derived
-            .as_f64()
-            .max(state.initial_difficulty.as_f64())
-            .max(state.min_difficulty.as_f64()),
-    );
     // Clamp against the miner's declared max_target (raises the floor to
     // the miner's minimum acceptable difficulty if it declared one).
     let clamped = clamp_difficulty_to_max_target(floored, &Target::from_le_bytes(max_target_bytes));
@@ -2767,7 +2779,10 @@ mod tests {
         OpenStandardMiningChannelInput {
             request_id: req_id,
             user_identity: user.to_string(),
-            nominal_hash_rate: 1_000.0,
+            // ~1000 derived at the fixture's 6 shares/min, rounding up to the
+            // 1024 the surrounding tests expect. A declaration is honoured
+            // as-is now, so it has to be a realistic one.
+            nominal_hash_rate: 429_496_729_600.0,
             max_target: [0xFF; 32],
         }
     }
@@ -2776,7 +2791,7 @@ mod tests {
         OpenExtendedMiningChannelInput {
             request_id: req_id,
             user_identity: user.to_string(),
-            nominal_hash_rate: 1_000_000.0,
+            nominal_hash_rate: 429_496_729_600.0,
             max_target: [0xFF; 32],
             min_extranonce_size: 8,
         }
@@ -2931,19 +2946,20 @@ mod tests {
     /// must start at the configured initial difficulty (1024 in the test
     /// port), never a trivial 1 / min — an honest higher rate starts above.
     #[test]
-    fn open_standard_floors_initial_difficulty_at_configured_start() {
-        // Tiny nominal (1000 H/s → sub-1 derived) → floored to initial 1024.
+    fn open_standard_honours_a_declaration_and_falls_back_without_one() {
+        // A tiny declaration is the miner asking for a tiny difficulty — the
+        // SV2 counterpart of SV1 `mining.suggest_difficulty`, honoured and
+        // bounded only by min_difficulty. Flooring it at the configured start
+        // pinned every device below that start above its own rate.
         let mut s = fresh_session();
         handle_setup_connection(&mut s, &good_setup());
-        let _ = handle_open_standard_mining_channel(
-            &mut s,
-            &open_std(7, &format!("{REGTEST_ADDR}.w")),
-            vec![0x01, 0x02, 0x03, 0x04],
-        );
+        let mut tiny = open_std(7, &format!("{REGTEST_ADDR}.w"));
+        tiny.nominal_hash_rate = 1_000.0; // → ~2.3e-6 derived
+        let _ = handle_open_standard_mining_channel(&mut s, &tiny, vec![0x01, 0x02, 0x03, 0x04]);
         assert_eq!(
             s.channels[&1].session_difficulty.as_f64(),
-            1024.0,
-            "tiny nominal must floor to the configured initial difficulty"
+            port_cfg().min_difficulty.as_f64(),
+            "a declaration below min_difficulty is bounded there, not at the start value"
         );
 
         // nominal_hash_rate = 0 → also the configured initial difficulty.
@@ -2954,7 +2970,7 @@ mod tests {
         let _ = handle_open_standard_mining_channel(&mut s0, &zero, vec![0x01, 0x02, 0x03, 0x04]);
         assert_eq!(s0.channels[&1].session_difficulty.as_f64(), 1024.0);
 
-        // An honest high nominal (~5 PH/s) starts ABOVE the floor.
+        // An honest high nominal (~5 PH/s) starts ABOVE the configured start.
         let mut sh = fresh_session();
         handle_setup_connection(&mut sh, &good_setup());
         let mut big = open_std(9, &format!("{REGTEST_ADDR}.w"));
@@ -2962,7 +2978,22 @@ mod tests {
         let _ = handle_open_standard_mining_channel(&mut sh, &big, vec![0x01, 0x02, 0x03, 0x04]);
         assert!(
             sh.channels[&1].session_difficulty.as_f64() > 1024.0,
-            "an honest high nominal must start above the configured floor"
+            "an honest high nominal must start above the configured start"
+        );
+
+        // The case the change is for: a device that declares BELOW the
+        // configured start gets its own rate, not the start value. At the
+        // fixture's 6 shares/min, 100 GH/s derives ~233 — previously pinned
+        // to 1024, roughly 4x above what the device can sustain.
+        let mut sl = fresh_session();
+        handle_setup_connection(&mut sl, &good_setup());
+        let mut small = open_std(10, &format!("{REGTEST_ADDR}.w"));
+        small.nominal_hash_rate = 1.0e11;
+        let _ = handle_open_standard_mining_channel(&mut sl, &small, vec![0x01, 0x02, 0x03, 0x04]);
+        let got = sl.channels[&1].session_difficulty.as_f64();
+        assert!(
+            (233.0..1024.0).contains(&got),
+            "a small honest declaration must be honoured, got {got}"
         );
     }
 
