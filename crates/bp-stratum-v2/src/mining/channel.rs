@@ -72,6 +72,17 @@ pub struct ChannelState {
     /// to/from `Difficulty` during the clamp check.
     pub declared_max_target: [u8; 32],
 
+    /// The `nominal_hash_rate` this channel last declared, if any.
+    ///
+    /// Only the silence-easing path reads it, to tell a NEW declaration
+    /// apart from the same one being re-sent. Silence is evidence about
+    /// what the channel did in the past; a changed declaration is
+    /// information about what it is now, and the two do not contradict
+    /// each other — a proxy whose workers just attached is not lying, it
+    /// has news. An unchanged value re-sent on a timer carries no news,
+    /// so there the observation still rules.
+    pub last_declared_hash_rate: Option<f32>,
+
     /// Standard-channel job bookkeeping
     /// (`job_id_to_difficulty` + `job_id_to_merkle_root`). Empty for
     /// Extended channels.
@@ -146,6 +157,7 @@ impl ChannelState {
             extranonce_size: 0,
             session_difficulty,
             declared_max_target,
+            last_declared_hash_rate: None,
             standard_jobs: StandardJobMaps::new(),
             extended_jobs: HashMap::new(),
             latest_extended_prev_hash: None,
@@ -176,6 +188,7 @@ impl ChannelState {
             extranonce_size,
             session_difficulty,
             declared_max_target,
+            last_declared_hash_rate: None,
             standard_jobs: StandardJobMaps::new(),
             extended_jobs: HashMap::new(),
             latest_extended_prev_hash: None,

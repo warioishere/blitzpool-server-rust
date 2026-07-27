@@ -132,7 +132,11 @@ impl<C: Clock> SessionState<C> {
             clock,
             port_config.target_shares_per_minute,
             port_config.minimum_difficulty,
-        );
+        )
+        .with_silence_easing(server_config.vardiff_silence_easing)
+        // The engine needs to know what the session is quiet AT before its
+        // first share, and on SV1 that is purely the configured start.
+        .with_initial_difficulty(initial);
 
         Self {
             session_id_hex,
@@ -418,6 +422,7 @@ fn flush_init<C: Clock>(
             state.diff_change_job_id = Some(registry.peek_next_job_id());
             state.session_difficulty = new_diff;
             state.pending_session_difficulty = Some(new_diff);
+            state.vardiff.note_difficulty_assigned(new_diff);
             out.push_event(SessionEvent::DifficultyChanged {
                 old: state.old_session_difficulty,
                 new: new_diff,
@@ -557,6 +562,7 @@ pub fn handle_suggest_difficulty<C: Clock>(
     }
     state.session_difficulty = new_diff;
     state.pending_session_difficulty = Some(new_diff);
+    state.vardiff.note_difficulty_assigned(new_diff);
     state.used_suggested_difficulty = true;
     out.push_frame(write_set_difficulty(new_diff));
     out
@@ -591,6 +597,16 @@ pub fn handle_submit<C: Clock>(
         ));
         return out;
     }
+
+    // Liveness heartbeat, ONCE, before anything below can return early —
+    // the single choke point for the "rejected shares count as alive"
+    // rule, matching the SV2 handlers. It used to sit in the `Rejected`
+    // match arm at the bottom, so any early return added above it (a rate
+    // limiter, an extranonce check, an aged-out-job fast path) would have
+    // silently skipped it and let a hashing miner be eased down mid-storm.
+    // It goes AFTER the two guards above on purpose: an unauthorized or
+    // not-yet-subscribed peer is not a miner we have heard from.
+    state.vardiff.note_submission();
 
     // Snapshot the read-only inputs to release the borrow on `state`
     // before we hand `state.share_cache` out as `&mut`. Borrow-checker:
@@ -631,6 +647,16 @@ pub fn handle_submit<C: Clock>(
             out.push_event(SessionEvent::ShareAccepted(accept));
         }
         ShareValidation::Rejected(reject) => {
+            // Liveness was stamped at the top of the handler. Whether this
+            // reject also SPENDS the no-share evidence depends on the
+            // reason: a duplicate, a stale job or an unknown job all mean
+            // the work cleared the bar we set and merely arrived wrong;
+            // `LowDifficulty` means the opposite — the miner is hashing and
+            // cannot reach the difficulty at all, which is the very state
+            // the descent has to act on rather than be silenced by.
+            if !matches!(reject.reason, RejectReason::LowDifficulty) {
+                state.vardiff.note_target_reached();
+            }
             out.push_frame(write_error(&id, reject.wire_code, reject.wire_message));
             out.push_event(SessionEvent::ShareRejected {
                 reason: reject.reason,
@@ -667,6 +693,23 @@ pub fn apply_vardiff_check<C: Clock>(
     let mut out = HandlerOutcome::default();
     state.last_difficulty_check_ms = now_ms;
 
+    // A session can only be judged on shares it had a chance to produce.
+    // Before the no-share descent existed this was implicit: with nothing
+    // accepted the engine always returned `None`, so the tick was a no-op
+    // until a miner actually mined. Now silence is evidence, so the two
+    // preconditions have to be stated:
+    //
+    // - the handshake completed, or we would push `mining.set_difficulty`
+    //   at a peer that has not even subscribed (a health probe, a scanner,
+    //   a miner stuck mid-handshake) and count it as a retarget;
+    // - a template exists, or the session was never sent a
+    //   `mining.notify` and its silence says nothing about its hashrate.
+    //   A template outage would otherwise walk every connected session
+    //   down to the descent floor and make them all flood on recovery.
+    if !state.stratum_initialized || current_template.is_none() {
+        return out;
+    }
+
     let Some(target) = state.vardiff.suggested_difficulty(state.session_difficulty) else {
         return out;
     };
@@ -681,6 +724,7 @@ pub fn apply_vardiff_check<C: Clock>(
     state.diff_change_job_id = Some(registry.peek_next_job_id());
     state.session_difficulty = target;
     state.pending_session_difficulty = Some(target);
+    state.vardiff.note_difficulty_assigned(target);
     out.push_event(SessionEvent::DifficultyChanged {
         old: previous,
         new: target,
@@ -855,6 +899,36 @@ mod tests {
 
     fn empty_registry() -> Arc<JobRegistry> {
         Arc::new(JobRegistry::from_server_config(&server_config()))
+    }
+
+    /// The vardiff tick now refuses to judge a session that could not have
+    /// mined — no handshake, or no template ever issued. Tests that want a
+    /// retarget have to satisfy both.
+    fn mineable_template() -> Arc<ActiveSV1Template> {
+        let mut t = ActiveSV1Template {
+            template_id: 1,
+            version: 0x2000_0000,
+            prev_hash: [0xAB; 32],
+            n_bits: 0x1d00_ffff,
+            header_timestamp: 0x65a1_b2c3,
+            network_target: [0xFF; 32],
+            network_difficulty: 1.0,
+            coinbase_prefix: vec![0x03, 0x40, 0x0d, 0x03],
+            coinbase_tx_version: 2,
+            coinbase_tx_input_sequence: 0xffff_ffff,
+            coinbase_tx_value_remaining: 5_000_000_000,
+            coinbase_tx_outputs: vec![0u8; 8],
+            coinbase_tx_outputs_count: 0,
+            coinbase_tx_locktime: 0,
+            merkle_path: vec![],
+            merkle_branch_hex: vec![],
+            prev_hash_hex: String::new(),
+            version_hex: String::new(),
+            n_bits_hex: String::new(),
+            header_timestamp_hex: String::new(),
+        };
+        t.recompute_notify_header_hex();
+        Arc::new(t)
     }
 
     fn fresh_state(clock: TestClock, port: &PortConfig) -> SessionState<Arc<TestClock>> {
@@ -1318,6 +1392,185 @@ mod tests {
         assert!(out.outbound_frames.is_empty());
         // last_difficulty_check_ms is still updated.
         assert_eq!(state.last_difficulty_check_ms, 1_000);
+    }
+
+    // ── silence easing wiring ────────────────────────────────────────
+    //
+    // The engine math is unit-tested in bp-vardiff; these prove the
+    // operator switch survives ServerConfig → SessionState → engine and
+    // produces (or withholds) a real `mining.set_difficulty` frame.
+    //
+    // Setup: 30 accepted shares at the session's own 16384, 10 s apart —
+    // equilibrium for the default 6/min target (closed-window target
+    // ≈ 16949, inside the 2× deadband), so the share-driven math alone
+    // never retargets and anything observed is the silence path.
+
+    fn eased_session(
+        easing: bool,
+        clock: &Arc<TestClock>,
+    ) -> (SessionState<Arc<TestClock>>, ServerConfig, PortConfig) {
+        let mut sc = server_config();
+        sc.vardiff_silence_easing = easing;
+        let port = solo_port(16384.0);
+        let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
+        state.stratum_initialized = true;
+        for _ in 0..30 {
+            state.vardiff.update_hash_rate(16384.0, true);
+            clock.advance_ms(10_000);
+        }
+        (state, sc, port)
+    }
+
+    /// SV1 has no hashrate advertisement, so an over-assigned session is
+    /// simply one that connected to a port whose start difficulty it cannot
+    /// reach. Before the descent it hung there forever; now the same switch
+    /// walks it down, and the reduction reaches the wire.
+    #[test]
+    fn a_session_with_no_share_ever_is_eased_down_on_the_wire() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut sc = server_config();
+        sc.vardiff_silence_easing = true;
+        let port = solo_port(1_000_000.0); // a high-diff port
+        let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
+        state.stratum_initialized = true;
+        // No update_hash_rate call anywhere: not one share was ever accepted.
+        clock.advance_ms(61_000);
+        let out = apply_vardiff_check(
+            &mut state,
+            &sc,
+            &port,
+            &empty_registry(),
+            &MiningJobCache::new(),
+            Some(&mineable_template()),
+            &[],
+            clock.now_ms(),
+        );
+        let frame = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        assert!(
+            frame.contains("mining.set_difficulty"),
+            "expected a set_difficulty frame, got {frame}"
+        );
+        assert!(
+            state.session_difficulty < 1_000_000.0,
+            "session stayed at {}",
+            state.session_difficulty
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_share_ever_holds_when_the_switch_is_off() {
+        let clock = Arc::new(TestClock::new(0));
+        let sc = server_config(); // easing off
+        let port = solo_port(1_000_000.0);
+        let mut state = SessionState::new(clock.clone(), &sc, &port, "abcd1234".to_string());
+        state.stratum_initialized = true;
+        for _ in 0..15 {
+            clock.advance_ms(60_000);
+            let out = apply_vardiff_check(
+                &mut state,
+                &sc,
+                &port,
+                &empty_registry(),
+                &MiningJobCache::new(),
+                None,
+                &[],
+                clock.now_ms(),
+            );
+            assert!(out.outbound_frames.is_empty());
+        }
+        assert_eq!(state.session_difficulty, 1_000_000.0);
+    }
+
+    #[test]
+    fn silence_easing_stays_off_by_default() {
+        let clock = Arc::new(TestClock::new(0));
+        let (mut state, sc, port) = eased_session(false, &clock); // easing off
+        clock.advance_ms(3_600_000); // an hour of total silence
+        let out = apply_vardiff_check(
+            &mut state,
+            &sc,
+            &port,
+            &empty_registry(),
+            &MiningJobCache::new(),
+            Some(&mineable_template()),
+            &[],
+            clock.now_ms(),
+        );
+        assert!(
+            out.outbound_frames.is_empty(),
+            "default config must hold through any silence"
+        );
+        assert_eq!(state.session_difficulty, 16384.0);
+    }
+
+    #[test]
+    fn silence_easing_config_reaches_the_wire() {
+        let clock = Arc::new(TestClock::new(0));
+        let (mut state, sc, port) = eased_session(true, &clock);
+        // 400 s of silence: total window 690 s → target ≈ 7124 < 8192
+        // (= client/2) → retarget. The ladder is powers of two rounded UP, so
+        // 7124 lands on 8192 — still an eased step down from 16384, one rung
+        // coarser than the old lower/1.5x/upper ladder would have given.
+        clock.advance_ms(400_000);
+        let out = apply_vardiff_check(
+            &mut state,
+            &sc,
+            &port,
+            &empty_registry(),
+            &MiningJobCache::new(),
+            Some(&mineable_template()),
+            &[],
+            clock.now_ms(),
+        );
+        let frame = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        assert!(
+            frame.contains("mining.set_difficulty"),
+            "expected a set_difficulty frame, got {frame}"
+        );
+        assert_eq!(state.session_difficulty, 8192.0, "one eased step down");
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::DifficultyChanged { .. })));
+    }
+
+    #[test]
+    fn a_rejected_share_holds_the_easing_back() {
+        // Sensor rule end-to-end: a VALIDATION reject (unknown job id from
+        // a fully set-up session — the shape a stale-job burst produces)
+        // flows through the Rejected arm, stamps the liveness heartbeat,
+        // and the silence clock restarts — the same check that would have
+        // eased now holds. Pre-handshake errors (not subscribed /
+        // unauthorized) deliberately do NOT stamp: they are protocol
+        // noise, not evidence of a hashing miner.
+        let clock = Arc::new(TestClock::new(0));
+        let (mut state, sc, port) = eased_session(true, &clock);
+        state.stratum_initialized = true;
+        state.authorization = Some(authorize_req(REGTEST_ADDR));
+        clock.advance_ms(390_000);
+        // Rejected share at t+390 s — unknown job → validation reject.
+        let reg = empty_registry();
+        let out = handle_submit(&mut state, &port, &reg, submit_req("1"), clock.now_ms());
+        let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        assert!(s.contains("error"), "expected a reject frame, got {s}");
+        clock.advance_ms(10_000);
+        // t+400 s: without the reject this eased (see the wire test);
+        // with it, the tail is 10 s and the difficulty holds.
+        let out = apply_vardiff_check(
+            &mut state,
+            &sc,
+            &port,
+            &empty_registry(),
+            &MiningJobCache::new(),
+            Some(&mineable_template()),
+            &[],
+            clock.now_ms(),
+        );
+        assert!(
+            out.outbound_frames.is_empty(),
+            "a rejecting miner must be held, not eased"
+        );
+        assert_eq!(state.session_difficulty, 16384.0);
     }
 
     // ── apply_new_template ────────────────────────────────────────────
