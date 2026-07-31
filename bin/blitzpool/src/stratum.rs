@@ -118,7 +118,10 @@ pub(crate) async fn spawn(
     engines: &EngineHandles,
     group_service: &SharedGroupService,
     dispatcher: Option<Arc<NotificationDispatcher>>,
-    gate: Option<Arc<crate::device_status_gate::Gate>>,
+    gate: Option<(
+        Arc<crate::device_status_gate::Gate>,
+        crate::device_status_gate::SubscribedAddresses,
+    )>,
 ) -> Result<StratumHandles, StratumSpawnError> {
     if foundation.tdp.is_none() {
         warn!("stratum: TDP missing (--skip-tdp); skipping unified SV1+SV2 listener bind");

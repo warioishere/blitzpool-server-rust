@@ -103,7 +103,10 @@ pub(crate) fn build_per_port_servers(
     group_service: &SharedGroupService,
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
-    gate: Option<Arc<crate::device_status_gate::Gate>>,
+    gate: Option<(
+        Arc<crate::device_status_gate::Gate>,
+        crate::device_status_gate::SubscribedAddresses,
+    )>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
 ) -> Result<Vec<Sv1PortServer>, StratumV1SpawnError> {
     let Some(tdp) = foundation.tdp.as_ref() else {
@@ -161,8 +164,9 @@ pub(crate) fn build_per_port_servers(
     // only spawns on the front, so `None` here means "no co-located dispatcher",
     // not "notifications off".)
     let device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink> = match gate {
-        Some(g) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
+        Some((g, subs)) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
             g,
+            subs,
             foundation.db.pool().clone(),
         )),
         None => Arc::new(crate::device_status::ProducingDeviceStatusSink::new(

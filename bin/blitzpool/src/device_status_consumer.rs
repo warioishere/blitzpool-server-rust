@@ -35,12 +35,18 @@ const CONSUMER: &str = "c1";
 /// reconstruct into a notify payload (`into_event` → `None`) are dropped.
 struct DeviceStatusHandler {
     gate: Arc<crate::device_status_gate::Gate>,
+    /// Same subscriber filter the in-process sink applies — a split
+    /// front cannot know who is subscribed, so the drop happens here.
+    subscribers: crate::device_status_gate::SubscribedAddresses,
 }
 
 #[async_trait]
 impl StreamEntryHandler<DeviceStatusStreamEvent> for DeviceStatusHandler {
     async fn handle(&self, value: DeviceStatusStreamEvent) {
         if let Some(event) = value.into_event() {
+            if !self.subscribers.contains(event.address.as_str()) {
+                return;
+            }
             self.gate.observe(&event);
         }
     }
@@ -53,13 +59,14 @@ impl StreamEntryHandler<DeviceStatusStreamEvent> for DeviceStatusHandler {
 pub(crate) fn spawn(
     redis: ConnectionManager,
     gate: Arc<crate::device_status_gate::Gate>,
+    subscribers: crate::device_status_gate::SubscribedAddresses,
 ) -> StreamConsumerHandle {
     let consumer: StreamConsumer<DeviceStatusStreamEvent> =
         StreamConsumer::new(redis, DEVICE_STATUS_STREAM_KEY, GROUP, CONSUMER);
     consumer.spawn(
         EnsureMode::FromTail,
         ConsumerLoopConfig::new(BATCH, "device-status"),
-        DeviceStatusHandler { gate },
+        DeviceStatusHandler { gate, subscribers },
     )
 }
 

@@ -382,6 +382,8 @@ submit_latency = false
 # online_dwell_secs = 90       # must look present this long before "back online"
 # coalesce_window_secs = 300   # min spacing between two messages for one address;
 #                              # transitions inside it leave together as one summary
+# recheck_interval_secs = 300  # how often a settled device is re-checked, so a
+#                              # wrong answer corrects itself instead of standing
 
 # ───────────────────────────────────────────────────────────────
 # SMTP (transactional email — invitations + verification)

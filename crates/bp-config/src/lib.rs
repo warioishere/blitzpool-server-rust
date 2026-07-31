@@ -907,6 +907,14 @@ pub struct DeviceStatusConfig {
     /// together as a single summary.
     #[serde(default = "default_coalesce_window_secs")]
     pub coalesce_window_secs: u64,
+    /// How often a device that has already settled is re-checked. A
+    /// device is judged against the database rather than against the
+    /// events it happened to send, so a wrong answer — most plausibly
+    /// the dead-client sweep retiring a connected but share-quiet
+    /// session — corrects itself on the next pass instead of standing
+    /// until the miner next reconnects.
+    #[serde(default = "default_recheck_interval_secs")]
+    pub recheck_interval_secs: u64,
 }
 
 fn default_offline_grace_secs() -> u64 {
@@ -921,12 +929,17 @@ fn default_coalesce_window_secs() -> u64 {
     300
 }
 
+fn default_recheck_interval_secs() -> u64 {
+    300
+}
+
 impl Default for DeviceStatusConfig {
     fn default() -> Self {
         Self {
             offline_grace_secs: default_offline_grace_secs(),
             online_dwell_secs: default_online_dwell_secs(),
             coalesce_window_secs: default_coalesce_window_secs(),
+            recheck_interval_secs: default_recheck_interval_secs(),
         }
     }
 }
@@ -1227,6 +1240,7 @@ mod tests {
         assert_eq!(ds.offline_grace_secs, 300);
         assert_eq!(ds.online_dwell_secs, 90);
         assert_eq!(ds.coalesce_window_secs, 300);
+        assert_eq!(ds.recheck_interval_secs, 300);
 
         // A partial block keeps the defaults for the keys it omits.
         let cfg: AppConfig = toml::from_str(&format!(
@@ -1239,6 +1253,7 @@ mod tests {
         assert_eq!(ds.offline_grace_secs, 120);
         assert_eq!(ds.online_dwell_secs, 90);
         assert_eq!(ds.coalesce_window_secs, 300);
+        assert_eq!(ds.recheck_interval_secs, 300);
     }
 
     #[test]

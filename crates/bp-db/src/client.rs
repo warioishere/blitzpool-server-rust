@@ -816,32 +816,53 @@ where
     Ok(result.rows_affected())
 }
 
-/// One `(address, clientName, live_sessions)` row per requested pair
-/// that still has at least one **live** session — `deletedAt IS NULL`.
-/// Pairs with no live session are simply absent from the result, so the
-/// caller treats "missing" as zero.
+/// What the device-status debounce needs to know about one
+/// `(address, clientName)` pair — see [`device_liveness`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceLivenessRow {
+    pub address: String,
+    pub client_name: String,
+    /// Sessions currently connected (`deletedAt IS NULL`).
+    pub live_sessions: i64,
+    /// Earliest `startTime` across **all** rows for the pair, including
+    /// soft-deleted ones. This is when the pool first saw this worker —
+    /// the only honest way to tell a genuinely new device from one that
+    /// merely reconnected.
+    pub first_start_ms: i64,
+}
+
+/// Liveness + first-seen for each requested `(address, clientName)`.
+/// Pairs with no row at all are absent from the result.
 ///
 /// This is the authoritative connectivity answer for the device-status
 /// debounce: `deletedAt` is cleared by [`upsert_client`] on register,
 /// stamped by [`delete_client_for_session`] on disconnect, and swept by
 /// [`kill_dead_clients`] when a session dies without a clean FIN. Asking
-/// it at notification time — rather than counting connect/disconnect
-/// events in memory — is what makes the debounce survive a process
-/// restart and stay correct across several Stratum fronts.
+/// the table at notification time — rather than counting connect and
+/// disconnect events in memory — is what makes the debounce survive a
+/// process restart and stay correct across several Stratum fronts.
+///
+/// `first_start_ms` deliberately spans soft-deleted rows: a reconnect
+/// gets a fresh `sessionId` and therefore a fresh row, so the previous
+/// row survives with its original `startTime` and the pair keeps looking
+/// as old as it really is. It ages out with the 24 h hard-delete, after
+/// which a returning device is treated as new again — which is the right
+/// answer for a device that has been gone a day.
 ///
 /// Batched over both key columns so one sweep costs one round-trip
-/// regardless of how many devices are due.
-pub async fn live_session_counts(
+/// regardless of how many devices are due. The `(address, clientName)`
+/// prefix of the primary key carries the scan.
+pub async fn device_liveness(
     pool: &PgPool,
     addresses: &[String],
     client_names: &[String],
-) -> Result<Vec<(String, String, i64)>, DbError> {
+) -> Result<Vec<DeviceLivenessRow>, DbError> {
     let rows = sqlx::query!(
         r#"SELECT address AS "address!", "clientName" AS "client_name!",
-                  COUNT(*) AS "live!"
+                  COUNT(*) FILTER (WHERE "deletedAt" IS NULL) AS "live_sessions!",
+                  MIN("startTime") AS "first_start_ms!"
            FROM client_entity
-           WHERE "deletedAt" IS NULL
-             AND (address, "clientName") IN (
+           WHERE (address, "clientName") IN (
                    SELECT * FROM UNNEST($1::text[], $2::text[])
                  )
            GROUP BY address, "clientName""#,
@@ -853,7 +874,45 @@ pub async fn live_session_counts(
     .map_err(DbError::from)?;
     Ok(rows
         .into_iter()
-        .map(|r| (r.address, r.client_name, r.live))
+        .map(|r| DeviceLivenessRow {
+            address: r.address,
+            client_name: r.client_name,
+            live_sessions: r.live_sessions,
+            first_start_ms: r.first_start_ms,
+        })
+        .collect())
+}
+
+/// Every `(address, clientName, userAgent)` under `addresses` whose state
+/// could still be in flight: either a session is connected right now, or
+/// its most recent session was soft-deleted no longer ago than
+/// `deleted_since_ms`.
+///
+/// This is what the device-status gate seeds its watch list from after a
+/// restart. Without it the gate would only ever learn about a device from
+/// a Stratum event, so a miner that died just before the restart — and
+/// will therefore never emit another event — could never be reported.
+pub async fn device_watch_seed(
+    pool: &PgPool,
+    addresses: &[String],
+    deleted_since_ms: i64,
+) -> Result<Vec<(String, String, Option<String>)>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT address AS "address!", "clientName" AS "client_name!",
+                  (ARRAY_AGG("userAgent" ORDER BY "updatedAt" DESC))[1] AS user_agent
+           FROM client_entity
+           WHERE address = ANY($1::text[])
+             AND ("deletedAt" IS NULL OR "deletedAt" >= $2)
+           GROUP BY address, "clientName""#,
+        addresses,
+        deleted_since_ms,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.address, r.client_name, r.user_agent))
         .collect())
 }
 

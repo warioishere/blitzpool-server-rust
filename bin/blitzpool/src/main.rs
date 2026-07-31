@@ -462,6 +462,7 @@ async fn main() -> ExitCode {
                 offline_grace: Duration::from_secs(ds.offline_grace_secs),
                 online_dwell: Duration::from_secs(ds.online_dwell_secs),
                 coalesce_window: Duration::from_secs(ds.coalesce_window_secs),
+                recheck_interval: Duration::from_secs(ds.recheck_interval_secs),
             },
             handles.db.pool().clone(),
         )
@@ -798,9 +799,9 @@ async fn main() -> ExitCode {
     // and the stream just trims at MAXLEN.
     let device_status_consumer = if consumes_notify_streams {
         match device_status_gate.clone() {
-            Some(g) => {
+            Some((g, subs)) => {
                 let ds_redis = handles.dedicated_redis(&cfg.redis, "device-status").await;
-                Some(crate::device_status_consumer::spawn(ds_redis, g))
+                Some(crate::device_status_consumer::spawn(ds_redis, g, subs))
             }
             None => None,
         }
@@ -812,7 +813,12 @@ async fn main() -> ExitCode {
     // must run one — otherwise every debounced transition would be
     // recorded and never released.
     let device_status_sweeper = match (device_status_gate.clone(), dispatcher.clone()) {
-        (Some(g), Some(d)) => Some(crate::device_status_gate::spawn(g, d)),
+        (Some((g, subs)), Some(d)) => Some(crate::device_status_gate::spawn(
+            g,
+            subs,
+            d,
+            handles.db.pool().clone(),
+        )),
         _ => None,
     };
 

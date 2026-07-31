@@ -3,29 +3,38 @@
 //! Production wiring for the device-status debounce.
 //!
 //! [`bp_notifications::dispatcher::DeviceStatusGate`] is transport- and
-//! storage-agnostic; this module supplies the two concrete pieces it
-//! needs and the task that drives it:
+//! storage-agnostic; this module supplies the concrete pieces it needs
+//! and the task that drives it:
 //!
-//! - [`PgLiveSessions`] — the live-session answer, read from
-//!   `client_entity` (`deletedAt IS NULL`).
-//! - [`spawn`] — a ticker that resolves due devices and hands whatever
-//!   the gate releases to the [`NotificationDispatcher`].
+//! - [`PgDeviceLiveness`] — the liveness + first-seen answer, read from
+//!   `client_entity`.
+//! - [`SubscribedAddresses`] — which addresses have a device-status
+//!   subscriber at all. Everything else is dropped before it reaches the
+//!   gate, so the state machine, the seed and the sweep all scale with
+//!   the number of *subscribers* rather than with the number of miners.
+//! - [`spawn`] — seeds the watch list, then ticks: resolve what is due,
+//!   dispatch what the gate releases.
 //!
 //! Both the in-process sink and the Satellite's stream consumer feed the
 //! *same* gate instance, so a process that runs the front and the notify
 //! role together debounces exactly like a split deployment.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bp_common::AddressId;
 use bp_cron_utils::SystemClock;
 use bp_notifications::dispatcher::{
-    DeviceGateConfig, DeviceStatusGate, LiveSessionLookup, NotificationDispatcher,
+    DeviceGateConfig, DeviceKey, DeviceLiveness, DeviceLivenessLookup, DeviceStatusGate,
+    NotificationDispatcher,
 };
+use chrono::Utc;
 use sqlx::PgPool;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -34,43 +43,118 @@ use tracing::{debug, info, warn};
 /// cheap: a tick with nothing due costs one map scan and no query.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 
-/// The concrete gate the binary uses.
-pub(crate) type Gate = DeviceStatusGate<SystemClock, PgLiveSessions>;
+/// How often the subscribed-address set is refreshed. A new subscriber
+/// is picked up within this long; until then their devices are simply
+/// not tracked, which costs at most one missed transition.
+const SUBSCRIBER_REFRESH: Duration = Duration::from_secs(60);
 
-/// Live-session lookup backed by `client_entity`.
-pub(crate) struct PgLiveSessions {
+/// How far back the startup seed looks for recently-disconnected
+/// devices. Anything soft-deleted longer ago than this has either
+/// already been reported or is long settled.
+const SEED_LOOKBACK: Duration = Duration::from_secs(60 * 60);
+
+/// Concurrency for the dispatch of released messages. Bounded so a large
+/// batch cannot open an unbounded number of HTTP requests, but not
+/// serial — a serial loop would block the next sweep behind a full
+/// transport fan-out per address.
+const DISPATCH_CONCURRENCY: usize = 8;
+
+/// The concrete gate the binary uses.
+pub(crate) type Gate = DeviceStatusGate<SystemClock, PgDeviceLiveness>;
+
+/// Liveness lookup backed by `client_entity`.
+pub(crate) struct PgDeviceLiveness {
     pool: PgPool,
 }
 
 #[async_trait]
-impl LiveSessionLookup for PgLiveSessions {
-    async fn live_counts(
-        &self,
-        keys: &[(String, String)],
-    ) -> Option<HashMap<(String, String), i64>> {
+impl DeviceLivenessLookup for PgDeviceLiveness {
+    async fn liveness(&self, keys: &[DeviceKey]) -> Option<HashMap<DeviceKey, DeviceLiveness>> {
         let addresses: Vec<String> = keys.iter().map(|(a, _)| a.clone()).collect();
         let workers: Vec<String> = keys.iter().map(|(_, w)| w.clone()).collect();
-        match bp_db::live_session_counts(&self.pool, &addresses, &workers).await {
-            Ok(rows) => Some(rows.into_iter().map(|(a, w, n)| ((a, w), n)).collect()),
+        match bp_db::device_liveness(&self.pool, &addresses, &workers).await {
+            Ok(rows) => Some(
+                rows.into_iter()
+                    .map(|r| {
+                        (
+                            (r.address, r.client_name),
+                            DeviceLiveness {
+                                live: r.live_sessions > 0,
+                                first_start_ms: r.first_start_ms,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
             Err(err) => {
                 // Deliberately `None`, not an empty map: an empty map
                 // reads as "nothing is connected" and would fire an
                 // offline notification for every due device.
-                warn!(%err, "device-status gate: live-session lookup failed — holding deadlines");
+                warn!(%err, "device-status gate: liveness lookup failed — holding deadlines");
                 None
             }
         }
     }
 }
 
-/// Build the gate. One instance per process; clone the `Arc` into every
-/// producer.
-pub(crate) fn build(cfg: DeviceGateConfig, pool: PgPool) -> Arc<Gate> {
-    Arc::new(DeviceStatusGate::new(
+/// Addresses with at least one device-status subscriber, refreshed
+/// periodically. Cheap to clone; readers take the read lock only.
+#[derive(Clone)]
+pub(crate) struct SubscribedAddresses {
+    inner: Arc<RwLock<HashSet<String>>>,
+}
+
+impl SubscribedAddresses {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
+    pub(crate) fn contains(&self, address: &str) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(address)
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    async fn refresh(&self, pool: &PgPool) {
+        match bp_db::find_device_notification_addresses(pool).await {
+            Ok(addresses) => {
+                let set: HashSet<String> = addresses
+                    .into_iter()
+                    .map(|a| a.as_str().to_string())
+                    .collect();
+                let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+                *guard = set;
+            }
+            Err(err) => {
+                // Keep the previous set rather than dropping to empty —
+                // an empty set silently disables every notification.
+                warn!(%err, "device-status gate: subscriber refresh failed — keeping previous set");
+            }
+        }
+    }
+}
+
+/// Build the gate plus the subscriber filter. One of each per process;
+/// clone the handles into every producer.
+pub(crate) fn build(cfg: DeviceGateConfig, pool: PgPool) -> (Arc<Gate>, SubscribedAddresses) {
+    let gate = Arc::new(DeviceStatusGate::new(
         cfg,
         SystemClock,
-        PgLiveSessions { pool },
-    ))
+        PgDeviceLiveness { pool },
+    ));
+    (gate, SubscribedAddresses::new())
 }
 
 /// Handle for the sweeper task.
@@ -88,17 +172,30 @@ impl DeviceStatusGateHandle {
     }
 }
 
-/// Drive the gate. Every tick resolves whatever is due and dispatches
-/// the released messages.
+/// Drive the gate: load the subscriber set, seed the watch list from the
+/// database, then resolve and dispatch on a fixed tick.
+///
+/// The seed is what makes a restart survivable. Deadlines live only in
+/// memory, so a miner that died during a deploy would otherwise never be
+/// reported — it will not send another Stratum event to re-arm anything.
 pub(crate) fn spawn(
     gate: Arc<Gate>,
+    subscribers: SubscribedAddresses,
     dispatcher: Arc<NotificationDispatcher>,
+    pool: PgPool,
 ) -> DeviceStatusGateHandle {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let task = tokio::spawn(async move {
+        subscribers.refresh(&pool).await;
+        seed_watch_list(&gate, &subscribers, &pool).await;
+
         let mut tick = tokio::time::interval(SWEEP_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut refresh = tokio::time::interval(SUBSCRIBER_REFRESH);
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        refresh.tick().await; // the immediate first tick; already refreshed above
+
         info!(
             interval_s = SWEEP_INTERVAL.as_secs(),
             "device-status gate: sweeper started"
@@ -107,13 +204,31 @@ pub(crate) fn spawn(
             tokio::select! {
                 biased;
                 _ = task_cancel.cancelled() => break,
+                _ = refresh.tick() => subscribers.refresh(&pool).await,
                 _ = tick.tick() => {
                     let notices = gate.poll_due().await;
-                    if !notices.is_empty() {
-                        debug!(count = notices.len(), "device-status gate: releasing");
+                    if notices.is_empty() {
+                        continue;
                     }
-                    for notice in &notices {
-                        dispatcher.notify_device_notice(notice).await;
+                    debug!(count = notices.len(), "device-status gate: releasing");
+                    // Bounded concurrency rather than a serial await: one
+                    // sweep after a restart can carry a notice per
+                    // subscribed address, and each is a subscription
+                    // lookup plus a transport fan-out. Serial, that burst
+                    // blocks every following sweep behind it.
+                    let mut pending = JoinSet::new();
+                    let mut queue = notices.into_iter();
+                    loop {
+                        while pending.len() < DISPATCH_CONCURRENCY {
+                            let Some(notice) = queue.next() else { break };
+                            let dispatcher = Arc::clone(&dispatcher);
+                            pending.spawn(async move {
+                                dispatcher.notify_device_notice(&notice).await;
+                            });
+                        }
+                        if pending.join_next().await.is_none() {
+                            break;
+                        }
                     }
                 }
             }
@@ -121,4 +236,42 @@ pub(crate) fn spawn(
         info!("device-status gate: sweeper stopped");
     });
     DeviceStatusGateHandle { cancel, task }
+}
+
+/// Rebuild the watch list from `client_entity`: every device under a
+/// subscribed address that is connected now, or was disconnected within
+/// [`SEED_LOOKBACK`].
+async fn seed_watch_list(gate: &Gate, subscribers: &SubscribedAddresses, pool: &PgPool) {
+    let addresses = subscribers.snapshot();
+    if addresses.is_empty() {
+        info!("device-status gate: no device subscribers — nothing to seed");
+        return;
+    }
+    let since = Utc::now().timestamp_millis() - SEED_LOOKBACK.as_millis() as i64;
+    match bp_db::device_watch_seed(pool, &addresses, since).await {
+        Ok(rows) => {
+            let seeded = rows.len();
+            gate.seed(rows.into_iter().filter_map(|(address, worker, ua)| {
+                match AddressId::new(address) {
+                    Ok(a) => Some((a, worker, ua)),
+                    Err(err) => {
+                        warn!(%err, "device-status gate: seed row has unparseable address");
+                        None
+                    }
+                }
+            }));
+            info!(
+                seeded,
+                addresses = addresses.len(),
+                "device-status gate: watch list seeded"
+            );
+        }
+        Err(err) => {
+            // Not fatal: the gate still learns about every device that
+            // sends an event from here on. Only devices that died just
+            // before this start are lost, which is the pre-seed
+            // behaviour.
+            warn!(%err, "device-status gate: seeding failed — starting with an empty watch list");
+        }
+    }
 }

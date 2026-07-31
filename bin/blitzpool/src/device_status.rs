@@ -164,6 +164,11 @@ async fn build_event(
 #[derive(Clone)]
 pub(crate) struct DispatcherDeviceStatusSink {
     gate: Arc<crate::device_status_gate::Gate>,
+    /// Addresses with a device-status subscriber. Events for anything
+    /// else are dropped here, before the `is_returning` lookup and
+    /// before the gate allocates any state — nobody would ever receive
+    /// the resulting message.
+    subscribers: crate::device_status_gate::SubscribedAddresses,
     /// Pool handle for the `client_entity` `firstSeen`/`updatedAt` lookup
     /// that drives the `is_returning` flag. Best-effort: a DB error logs
     /// at WARN and the event still fires with `is_returning = false`.
@@ -171,8 +176,16 @@ pub(crate) struct DispatcherDeviceStatusSink {
 }
 
 impl DispatcherDeviceStatusSink {
-    pub(crate) fn new(gate: Arc<crate::device_status_gate::Gate>, pool: PgPool) -> Self {
-        Self { gate, pool }
+    pub(crate) fn new(
+        gate: Arc<crate::device_status_gate::Gate>,
+        subscribers: crate::device_status_gate::SubscribedAddresses,
+        pool: PgPool,
+    ) -> Self {
+        Self {
+            gate,
+            subscribers,
+            pool,
+        }
     }
 
     async fn forward(
@@ -182,6 +195,9 @@ impl DispatcherDeviceStatusSink {
         user_agent: Option<&str>,
         is_online: bool,
     ) {
+        if !self.subscribers.contains(address) {
+            return;
+        }
         if let Some(event) = build_event(&self.pool, address, worker, user_agent, is_online).await {
             self.gate.observe(&event);
         }

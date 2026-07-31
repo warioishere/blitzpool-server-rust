@@ -223,7 +223,11 @@ impl NotificationDispatcher {
             }
         }
 
-        let payload = device_aggregate_payload(agg);
+        // The two push transports do NOT share a payload: FCM turns
+        // `tag` into `data.status` and merges `extras`, while UnifiedPush
+        // flattens to `title|body|tag`. The single-event path builds them
+        // separately for exactly that reason, so the aggregate does too —
+        // one payload for both would change the UnifiedPush wire shape.
         let fcm_dev: Vec<_> = push_subs
             .iter()
             .filter(|s| {
@@ -232,6 +236,15 @@ impl NotificationDispatcher {
             })
             .cloned()
             .collect();
+        if !fcm_dev.is_empty() {
+            tasks.push(Box::pin(fan_push(
+                self.clone_push_handles(),
+                self.pool.clone(),
+                agg.address.clone(),
+                fcm_dev,
+                device_aggregate_fcm_payload(agg),
+            )) as TaskFuture);
+        }
         let unified_dev: Vec<_> = push_subs
             .iter()
             .filter(|s| {
@@ -240,15 +253,13 @@ impl NotificationDispatcher {
             })
             .cloned()
             .collect();
-        let mut push_dev = fcm_dev;
-        push_dev.extend(unified_dev);
-        if !push_dev.is_empty() {
+        if !unified_dev.is_empty() {
             tasks.push(Box::pin(fan_push(
                 self.clone_push_handles(),
                 self.pool.clone(),
                 agg.address.clone(),
-                push_dev,
-                payload,
+                unified_dev,
+                device_aggregate_unified_payload(agg),
             )) as TaskFuture);
         }
 
@@ -538,10 +549,62 @@ async fn send_telegram_device_aggregate(
     join_all(tasks).await;
 }
 
-/// Push payload for an aggregate. Uses the same UTC en-US timestamp and
-/// the same `title|body|` shape the single device-status payload uses,
-/// so existing clients render it without a change.
-fn device_aggregate_payload(agg: &DeviceAggregate) -> PushPayload {
+/// Push payload for an aggregate.
+///
+/// Deliberately carries the **same** key set as the single device-status
+/// payload, because the FCM adapter turns `tag` into `data.status` and
+/// merges `extras` verbatim: a client that branches on `data["status"]`
+/// or reads `data["workerName"]` must not get an empty string or a
+/// missing key just because several workers moved at once.
+///
+/// `status` is `online` / `offline` when the batch moved one way and
+/// `mixed` when it moved both, so a client that only knows the two
+/// original values still lands in a defined branch. `workerName` lists
+/// the workers involved; the aggregate-only counts are additive.
+fn device_aggregate_fcm_payload(agg: &DeviceAggregate) -> PushPayload {
+    let time_str = agg.timestamp.format("%m/%d/%y, %-I:%M %p").to_string();
+    let text = DeviceAggregateText::build(&DeviceAggregateArgs {
+        language: Language::En,
+        time_formatted: &time_str,
+        went_offline: &agg.went_offline,
+        came_online: &agg.came_online,
+        address_suffix: None,
+    });
+    let status = match (agg.went_offline.is_empty(), agg.came_online.is_empty()) {
+        (false, true) => "offline",
+        (true, false) => "online",
+        _ => "mixed",
+    };
+    let workers: Vec<&str> = agg
+        .went_offline
+        .iter()
+        .chain(agg.came_online.iter())
+        .map(String::as_str)
+        .collect();
+    PushPayload {
+        kind: PushKind::DeviceStatus,
+        title: "Device Status".to_string(),
+        body: text.en,
+        tag: status.to_string(),
+        extras: vec![
+            ("isReturning".into(), "false".to_string()),
+            ("workerName".into(), workers.join(", ")),
+            ("userAgent".into(), "Multiple".to_string()),
+            ("wentOffline".into(), agg.went_offline.len().to_string()),
+            ("cameOnline".into(), agg.came_online.len().to_string()),
+            (
+                "timestamp".into(),
+                agg.timestamp.timestamp_millis().to_string(),
+            ),
+        ],
+    }
+}
+
+/// UnifiedPush counterpart. That transport flattens the payload to
+/// `title|body|tag`, and the single-event path deliberately leaves the
+/// trailing field empty — matching it keeps the shape existing clients
+/// already parse.
+fn device_aggregate_unified_payload(agg: &DeviceAggregate) -> PushPayload {
     let time_str = agg.timestamp.format("%m/%d/%y, %-I:%M %p").to_string();
     let text = DeviceAggregateText::build(&DeviceAggregateArgs {
         language: Language::En,
@@ -555,14 +618,7 @@ fn device_aggregate_payload(agg: &DeviceAggregate) -> PushPayload {
         title: "Device Status".to_string(),
         body: text.en,
         tag: String::new(),
-        extras: vec![
-            ("wentOffline".into(), agg.went_offline.len().to_string()),
-            ("cameOnline".into(), agg.came_online.len().to_string()),
-            (
-                "timestamp".into(),
-                agg.timestamp.timestamp_millis().to_string(),
-            ),
-        ],
+        extras: Vec::new(),
     }
 }
 
@@ -954,6 +1010,59 @@ mod tests {
             is_returning,
             timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("timestamp"),
         }
+    }
+
+    fn aggregate(offline: &[&str], online: &[&str]) -> DeviceAggregate {
+        DeviceAggregate {
+            address: AddressId::new("bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l".to_string())
+                .expect("valid address"),
+            went_offline: offline.iter().map(|s| (*s).to_string()).collect(),
+            came_online: online.iter().map(|s| (*s).to_string()).collect(),
+            timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+        }
+    }
+
+    /// The FCM adapter turns `tag` into `data.status` and merges
+    /// `extras`, so an aggregate that omits a key the single form sends
+    /// hands existing clients a missing field. Assert key parity rather
+    /// than the exact values.
+    #[test]
+    fn aggregate_fcm_payload_keeps_the_single_events_data_keys() {
+        let single = {
+            let event = device_event(false, false);
+            let (_, body) = device_status_title_body(&event);
+            let _ = body;
+            // Mirror of `send_fcm_device_status`'s extras.
+            vec!["isReturning", "workerName", "userAgent", "timestamp"]
+        };
+        let agg = device_aggregate_fcm_payload(&aggregate(&["a", "b"], &[]));
+        for key in single {
+            assert!(
+                agg.extras.iter().any(|(k, _)| k == key),
+                "aggregate payload dropped `{key}`, which shipped clients read"
+            );
+        }
+        assert_eq!(agg.tag, "offline", "one-way batch keeps a known status");
+        assert_eq!(
+            device_aggregate_fcm_payload(&aggregate(&["a"], &["b"])).tag,
+            "mixed",
+            "a two-way batch is explicitly neither"
+        );
+        assert_eq!(
+            device_aggregate_fcm_payload(&aggregate(&[], &["b"])).tag,
+            "online"
+        );
+    }
+
+    /// UnifiedPush flattens to `title|body|tag` and the single-event path
+    /// leaves the trailing field empty. The aggregate must not change
+    /// that shape.
+    #[test]
+    fn aggregate_unified_payload_keeps_the_empty_trailing_field() {
+        let p = device_aggregate_unified_payload(&aggregate(&["a", "b"], &[]));
+        assert!(p.tag.is_empty());
+        assert!(p.extras.is_empty());
+        assert!(p.body.contains("2 workers offline"), "body was: {}", p.body);
     }
 
     #[test]
