@@ -13,9 +13,14 @@
 //!   `notify` role).
 //! - [`ProducingDeviceStatusSink`] — `XADD`s the event to the Core→Satellite
 //!   `device:status` stream. Used by a split **front** (Core), which has no
-//!   dispatcher; the Satellite drains the stream and fans the event out. This
+//!   dispatcher; the Satellite drains the stream and feeds the gate. This
 //!   is the cross-process route, mirroring the block-found stream — without it
 //!   a split front would silently drop device-status notifications.
+//!
+//!   It publishes unfiltered, deliberately: the front holds no subscription
+//!   state, so the "does anyone want this?" question is answered on the
+//!   Satellite. Device events fire on connect/disconnect rather than per
+//!   share, so the stream traffic that buys is small.
 //!
 //! The bin-side adapter fills the metadata fields the rendered message uses:
 //! `user_agent` (threaded through `on_device_event` from the SV1 subscribe UA /

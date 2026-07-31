@@ -127,7 +127,11 @@ impl SubscribedAddresses {
             .collect()
     }
 
-    async fn refresh(&self, pool: &PgPool) {
+    /// `true` when the set was actually reloaded. A failure keeps the
+    /// previous set rather than dropping to empty — an empty set
+    /// silently disables every notification — and the `false` tells the
+    /// caller the seed cannot be trusted to have run yet.
+    async fn refresh(&self, pool: &PgPool) -> bool {
         match bp_db::find_device_notification_addresses(pool).await {
             Ok(addresses) => {
                 let set: HashSet<String> = addresses
@@ -136,11 +140,11 @@ impl SubscribedAddresses {
                     .collect();
                 let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
                 *guard = set;
+                true
             }
             Err(err) => {
-                // Keep the previous set rather than dropping to empty —
-                // an empty set silently disables every notification.
                 warn!(%err, "device-status gate: subscriber refresh failed — keeping previous set");
+                false
             }
         }
     }
@@ -187,8 +191,16 @@ pub(crate) fn spawn(
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let task = tokio::spawn(async move {
-        subscribers.refresh(&pool).await;
-        seed_watch_list(&gate, &subscribers, &pool).await;
+        // Seeding is deferred until the subscriber set is both loaded and
+        // non-empty. Doing it once, eagerly, would silently skip the seed
+        // whenever the database is briefly unavailable at startup (the
+        // set stays empty, the seed finds nothing, and nothing ever runs
+        // it again) — and equally whenever the pool has no device
+        // subscriber yet and gains one later.
+        let mut seeded = false;
+        if subscribers.refresh(&pool).await {
+            seeded = seed_watch_list(&gate, &subscribers, &pool).await;
+        }
 
         let mut tick = tokio::time::interval(SWEEP_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -204,7 +216,12 @@ pub(crate) fn spawn(
             tokio::select! {
                 biased;
                 _ = task_cancel.cancelled() => break,
-                _ = refresh.tick() => subscribers.refresh(&pool).await,
+                _ = refresh.tick() => {
+                    let loaded = subscribers.refresh(&pool).await;
+                    if loaded && !seeded {
+                        seeded = seed_watch_list(&gate, &subscribers, &pool).await;
+                    }
+                }
                 _ = tick.tick() => {
                     let notices = gate.poll_due().await;
                     if notices.is_empty() {
@@ -241,11 +258,15 @@ pub(crate) fn spawn(
 /// Rebuild the watch list from `client_entity`: every device under a
 /// subscribed address that is connected now, or was disconnected within
 /// [`SEED_LOOKBACK`].
-async fn seed_watch_list(gate: &Gate, subscribers: &SubscribedAddresses, pool: &PgPool) {
+///
+/// Returns `true` once the seed has actually happened, so the caller
+/// stops retrying. An empty subscriber set is deliberately *not* a
+/// success — there is nothing to seed yet, and the first subscriber to
+/// appear should still get one.
+async fn seed_watch_list(gate: &Gate, subscribers: &SubscribedAddresses, pool: &PgPool) -> bool {
     let addresses = subscribers.snapshot();
     if addresses.is_empty() {
-        info!("device-status gate: no device subscribers — nothing to seed");
-        return;
+        return false;
     }
     let since = Utc::now().timestamp_millis() - SEED_LOOKBACK.as_millis() as i64;
     match bp_db::device_watch_seed(pool, &addresses, since).await {
@@ -265,13 +286,15 @@ async fn seed_watch_list(gate: &Gate, subscribers: &SubscribedAddresses, pool: &
                 addresses = addresses.len(),
                 "device-status gate: watch list seeded"
             );
+            true
         }
         Err(err) => {
-            // Not fatal: the gate still learns about every device that
-            // sends an event from here on. Only devices that died just
-            // before this start are lost, which is the pre-seed
-            // behaviour.
-            warn!(%err, "device-status gate: seeding failed — starting with an empty watch list");
+            // Not fatal, and retried on the next subscriber refresh. Until
+            // it succeeds the gate still learns about every device that
+            // sends an event; only devices that died just before this
+            // start would be missed.
+            warn!(%err, "device-status gate: seeding failed — will retry");
+            false
         }
     }
 }

@@ -228,6 +228,22 @@ struct Inner {
 /// Debounce + coalescing stage. Feed every raw device event through
 /// [`observe`](Self::observe); drive [`poll_due`](Self::poll_due) from a
 /// periodic task and hand whatever it returns to the dispatcher.
+///
+/// [`observe`](Self::observe) is safe from any number of tasks.
+/// [`poll_due`](Self::poll_due) expects a **single** driver: it marks the
+/// keys it hands to the lookup and clears them on resolution, so two
+/// concurrent calls would evaluate the same device twice and could emit
+/// the same transition twice. The binary runs exactly one sweeper.
+///
+/// Two things it deliberately does not do. A device whose address later
+/// loses its last subscriber keeps being re-checked until it settles
+/// offline — the resulting message is then dropped at fan-out, so this
+/// costs a map entry and a row in a batched query, not a wrong
+/// notification. And a key that never matches a `client_entity` row
+/// would read as permanently offline; both protocols substitute a
+/// literal (`worker` on SV1, `default` on SV2) when the miner sends no
+/// worker suffix, and the same string is what the session row is written
+/// with, so the two cannot drift apart.
 pub struct DeviceStatusGate<C, L> {
     cfg: DeviceGateConfig,
     clock: C,
@@ -372,11 +388,17 @@ impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
 
     /// Lookup failed — drop the in-flight marks without drawing any
     /// conclusion. Deadlines stay as they were, so the next tick retries.
+    ///
+    /// `dirty` is cleared too: it exists to stop a *stale answer* from
+    /// being applied, and no answer arrived. Leaving it set would make
+    /// the next attempt discard a perfectly fresh answer and wait another
+    /// full dwell for nothing.
     fn abandon(&self, due: &[DeviceKey]) {
         let mut inner = self.lock();
         for key in due {
             if let Some(state) = inner.devices.get_mut(key) {
                 state.in_flight = false;
+                state.dirty = false;
             }
         }
     }
@@ -428,6 +450,7 @@ impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
             };
             state.armed_by = None;
 
+            let previous = state.notified;
             if target != state.notified {
                 // A device we have never reported on is only announced as
                 // online when the pool first saw it after this gate
@@ -440,6 +463,14 @@ impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
                 if announce {
                     let mut event = state.meta.clone();
                     event.is_online = live;
+                    // A device we already told the subscriber was gone is
+                    // "back online", not a first sighting. The raw event's
+                    // flag cannot say this: a re-check-driven correction
+                    // has no online event behind it at all, and the last
+                    // one it does have is the disconnect.
+                    if live {
+                        event.is_returning = previous == Notified::Offline;
+                    }
                     // Keep the event's own timestamp when it agreed with
                     // the database — "offline since <disconnect>" is more
                     // useful than "offline since <we checked>".
@@ -609,25 +640,28 @@ mod tests {
     #[async_trait]
     impl DeviceLivenessLookup for Arc<FakeDb> {
         async fn liveness(&self, keys: &[DeviceKey]) -> Option<HashMap<DeviceKey, DeviceLiveness>> {
-            if *self.fail.lock().expect("lock") {
-                return None;
-            }
             // Snapshot FIRST, then let the hook mutate the world. That
             // ordering is the whole point: the answer handed back has to
             // be genuinely stale, the way a real round-trip's would be.
             // Running the hook before the read would quietly hand back a
             // fresh answer and the staleness guard would never be tested.
-            let answer: HashMap<DeviceKey, DeviceLiveness> = {
+            let answer = if *self.fail.lock().expect("lock") {
+                None
+            } else {
                 let rows = self.rows.lock().expect("lock");
-                keys.iter()
-                    .filter_map(|k| rows.get(k).map(|l| (k.clone(), *l)))
-                    .collect()
+                Some(
+                    keys.iter()
+                        .filter_map(|k| rows.get(k).map(|l| (k.clone(), *l)))
+                        .collect(),
+                )
             };
+            // Runs on the failure path too — an event can land during a
+            // lookup that then fails.
             let hook = self.on_lookup.lock().expect("lock").take();
             if let Some(hook) = hook {
                 hook();
             }
-            Some(answer)
+            answer
         }
     }
 
@@ -1028,6 +1062,50 @@ mod tests {
         );
     }
 
+    /// A device the subscriber was already told about is "back online",
+    /// not a fresh sighting. The raw event cannot carry that: a
+    /// re-check-driven correction has no online event behind it at all.
+    #[tokio::test]
+    async fn a_return_after_a_reported_offline_renders_as_back_online() {
+        let h = harness();
+        // The first announcement is a first sighting, not a return.
+        h.db.set("axe01", true, 10);
+        h.advance(10);
+        h.gate.observe(&event("axe01", true, h.clock.now()));
+        h.advance(100);
+        match &h.gate.poll_due().await[0] {
+            DeviceNotice::Single(e) => {
+                assert!(e.is_online);
+                assert!(!e.is_returning, "a first sighting is not a return");
+            }
+            DeviceNotice::Aggregate(_) => panic!("expected a single notice"),
+        }
+        h.open_window();
+
+        h.db.set_live("axe01", false);
+        h.gate.observe(&event("axe01", false, h.clock.now()));
+        h.advance(301);
+        assert_eq!(
+            singles(&h.gate.poll_due().await),
+            vec![("axe01".into(), false)]
+        );
+        h.open_window();
+
+        // Comes back with no Stratum event — only the re-check sees it.
+        h.db.set_live("axe01", true);
+        h.advance(301);
+        match &h.gate.poll_due().await[0] {
+            DeviceNotice::Single(e) => {
+                assert!(e.is_online);
+                assert!(
+                    e.is_returning,
+                    "we told them it went offline, so this is a return"
+                );
+            }
+            DeviceNotice::Aggregate(_) => panic!("expected a single notice"),
+        }
+    }
+
     // ── Failure handling, coalescing, memory ────────────────────────
 
     /// A database blip must not be read as "everyone is offline".
@@ -1049,6 +1127,39 @@ mod tests {
             singles(&h.gate.poll_due().await),
             vec![("axe01".into(), false)],
             "the deadline stayed armed and resolves once the lookup works"
+        );
+    }
+
+    /// An event landing during a lookup that then FAILS must not cost an
+    /// extra dwell. The staleness mark exists to reject a stale answer,
+    /// and a failed lookup produced none — leaving it set would make the
+    /// next, perfectly fresh answer be thrown away too.
+    #[tokio::test]
+    async fn an_event_during_a_failed_lookup_does_not_delay_the_next_answer() {
+        let h = harness();
+        h.bring_online("axe01").await;
+        h.open_window();
+
+        h.db.set_live("axe01", false);
+        h.gate.observe(&event("axe01", false, h.clock.now()));
+        h.advance(301);
+
+        // The lookup fails, and a further disconnect lands while it is out.
+        let gate = Arc::clone(&h.gate);
+        let at = h.clock.now();
+        *h.db.on_lookup.lock().expect("lock") = Some(Box::new(move || {
+            gate.observe(&event("axe01", false, at));
+        }));
+        h.db.fail(true);
+        assert!(h.gate.poll_due().await.is_empty(), "no guess while blind");
+
+        // The very next successful sweep must decide it.
+        h.db.fail(false);
+        h.advance(1);
+        assert_eq!(
+            singles(&h.gate.poll_due().await),
+            vec![("axe01".into(), false)],
+            "a failed lookup must not cost another full grace"
         );
     }
 
