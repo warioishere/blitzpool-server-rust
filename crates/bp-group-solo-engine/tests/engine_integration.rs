@@ -1113,13 +1113,20 @@ async fn reschedule_group_arms_and_tears_down_reset_cron() {
     };
     let id = h.group_id;
 
-    // Seeded group has no preset → startup arms nothing.
-    assert_eq!(h.engine.reset_task_count(), 0);
+    // The startup scan reads EVERY group in `pplns_group`, and this
+    // suite shares one database across concurrently-running tests —
+    // `spawn_core_skips_startup_reset_crons` seeds a group carrying a
+    // daily preset. Asserting an absolute count therefore races that
+    // seed and fails depending on thread interleaving. Measure this
+    // test's own effect as a delta from whatever the engine armed at
+    // startup; `reschedule_group` is the only thing that moves it
+    // afterwards, so the baseline is stable for the rest of the test.
+    let base = h.engine.reset_task_count();
 
     // A valid preset arms exactly one cron.
     h.engine
         .reschedule_group(&reset_row(id, true, None, Some("daily"), None, Some("UTC")));
-    assert_eq!(h.engine.reset_task_count(), 1);
+    assert_eq!(h.engine.reset_task_count(), base + 1);
 
     // A second valid config re-arms in place (old task torn down, one remains).
     h.engine.reschedule_group(&reset_row(
@@ -1130,17 +1137,17 @@ async fn reschedule_group_arms_and_tears_down_reset_cron() {
         Some(7),
         Some("UTC"),
     ));
-    assert_eq!(h.engine.reset_task_count(), 1);
+    assert_eq!(h.engine.reset_task_count(), base + 1);
 
     // Clearing the preset leaves the group unscheduled.
     h.engine
         .reschedule_group(&reset_row(id, true, None, None, None, None));
-    assert_eq!(h.engine.reset_task_count(), 0);
+    assert_eq!(h.engine.reset_task_count(), base);
 
     // Re-arm, then dissolve → torn down again.
     h.engine
         .reschedule_group(&reset_row(id, true, None, Some("daily"), None, Some("UTC")));
-    assert_eq!(h.engine.reset_task_count(), 1);
+    assert_eq!(h.engine.reset_task_count(), base + 1);
     h.engine.reschedule_group(&reset_row(
         id,
         true,
@@ -1149,12 +1156,12 @@ async fn reschedule_group_arms_and_tears_down_reset_cron() {
         None,
         Some("UTC"),
     ));
-    assert_eq!(h.engine.reset_task_count(), 0);
+    assert_eq!(h.engine.reset_task_count(), base);
 
     // Re-arm, then deactivate → torn down.
     h.engine
         .reschedule_group(&reset_row(id, true, None, Some("daily"), None, Some("UTC")));
-    assert_eq!(h.engine.reset_task_count(), 1);
+    assert_eq!(h.engine.reset_task_count(), base + 1);
     h.engine.reschedule_group(&reset_row(
         id,
         false,
@@ -1163,7 +1170,7 @@ async fn reschedule_group_arms_and_tears_down_reset_cron() {
         None,
         Some("UTC"),
     ));
-    assert_eq!(h.engine.reset_task_count(), 0);
+    assert_eq!(h.engine.reset_task_count(), base);
 
     drop_harness(h).await;
 }
