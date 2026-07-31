@@ -876,6 +876,59 @@ pub struct NotificationsConfig {
     pub web_push: Option<WebPushConfig>,
     #[serde(default)]
     pub fcm: Option<FcmConfig>,
+    #[serde(default)]
+    pub device_status: DeviceStatusConfig,
+}
+
+/// Debounce + coalescing for miner online/offline notifications.
+///
+/// The Stratum servers report every connect and disconnect. Sent
+/// verbatim, a miner on an unstable link produces one push pair per
+/// reconnect, and a rental source whose rigs rotate individually
+/// produces one per rig. These three knobs decide how long a change has
+/// to hold before a subscriber hears about it, and how closely two
+/// messages for the same address may follow one another.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceStatusConfig {
+    /// How long a device must look gone before "offline" is sent. Long
+    /// enough to swallow a WiFi hiccup, a firmware watchdog reboot or a
+    /// pool restart; short enough that a dead miner is still reported
+    /// promptly.
+    #[serde(default = "default_offline_grace_secs")]
+    pub offline_grace_secs: u64,
+    /// How long a device must look present before "back online" is sent.
+    /// Keeps a device that flaps on a slow cycle from producing a
+    /// message every time it briefly reappears.
+    #[serde(default = "default_online_dwell_secs")]
+    pub online_dwell_secs: u64,
+    /// Hard floor on the spacing between two device messages for one
+    /// address. Transitions inside the window are collected and sent
+    /// together as a single summary.
+    #[serde(default = "default_coalesce_window_secs")]
+    pub coalesce_window_secs: u64,
+}
+
+fn default_offline_grace_secs() -> u64 {
+    300
+}
+
+fn default_online_dwell_secs() -> u64 {
+    90
+}
+
+fn default_coalesce_window_secs() -> u64 {
+    300
+}
+
+impl Default for DeviceStatusConfig {
+    fn default() -> Self {
+        Self {
+            offline_grace_secs: default_offline_grace_secs(),
+            online_dwell_secs: default_online_dwell_secs(),
+            coalesce_window_secs: default_coalesce_window_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1162,6 +1215,31 @@ mod tests {
         high_diff_target_shares_per_minute = 6
         difficulty_check_interval_ms = 60000
     "#;
+
+    /// The debounce must arrive on every existing deployment without a
+    /// config edit — a `[notifications]` block that predates it (or no
+    /// block at all) has to yield the documented defaults.
+    #[test]
+    fn device_status_debounce_defaults_without_a_config_block() {
+        let cfg: AppConfig = toml::from_str(&format!("roles = [\"notify\"]\n{MINIMAL_CFG}"))
+            .expect("parse without a notifications block");
+        let ds = cfg.notifications.device_status;
+        assert_eq!(ds.offline_grace_secs, 300);
+        assert_eq!(ds.online_dwell_secs, 90);
+        assert_eq!(ds.coalesce_window_secs, 300);
+
+        // A partial block keeps the defaults for the keys it omits.
+        let cfg: AppConfig = toml::from_str(&format!(
+            "roles = [\"notify\"]\n{MINIMAL_CFG}\n\
+             [notifications.device_status]\n\
+             offline_grace_secs = 120\n"
+        ))
+        .expect("parse with a partial device_status block");
+        let ds = cfg.notifications.device_status;
+        assert_eq!(ds.offline_grace_secs, 120);
+        assert_eq!(ds.online_dwell_secs, 90);
+        assert_eq!(ds.coalesce_window_secs, 300);
+    }
 
     #[test]
     fn roles_select_topology() {

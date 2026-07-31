@@ -95,7 +95,7 @@ pub use client::{
     find_client_rejected_statistics, find_client_rejected_statistics_since_for_address,
     find_client_statistics, find_client_statistics_since, find_client_statistics_since_for_address,
     find_clients_by_address, find_pool_worker_rows_since, find_user_agents, find_worker_shares,
-    kill_dead_clients, reset_all_client_hashrate, sum_active_pool_hashrate,
+    kill_dead_clients, live_session_counts, reset_all_client_hashrate, sum_active_pool_hashrate,
     sum_hashrate_for_addresses, touch_client_for_share, update_sv2_user_agent_by_address,
     upsert_client, upsert_client_difficulty_statistic, ClientDifficultyStatisticsRow,
     ClientRejectedStatisticsRow, ClientRow, ClientStatisticsRow, ClientUpsert, PoolWorkerRow,

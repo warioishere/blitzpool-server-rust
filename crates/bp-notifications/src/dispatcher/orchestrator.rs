@@ -21,8 +21,11 @@ use crate::adapter::{
     AdapterError, FcmAdapter, NtfyAdapter, PushKind, PushPayload, TelegramAdapter, WebPushAdapter,
 };
 use crate::format::{
-    format_device_time, format_number_suffix, DeviceStatusArgs, DeviceStatusText, Language,
+    format_device_time, format_number_suffix, DeviceAggregateArgs, DeviceAggregateText,
+    DeviceStatusArgs, DeviceStatusText, Language,
 };
+
+use super::device_gate::{DeviceAggregate, DeviceNotice};
 
 // Canonical stored `subscriptionType` values (lowercase, as written by
 // the `/api/push/*` register endpoints). Comparisons below are
@@ -176,6 +179,76 @@ impl NotificationDispatcher {
                 push_best,
                 difficulty,
                 formatted,
+            )) as TaskFuture);
+        }
+
+        join_all(tasks).await;
+    }
+
+    /// Send a device-status message that [`DeviceStatusGate`] has already
+    /// confirmed. This is the entry point production uses; the raw
+    /// per-event [`notify_device_status`](Self::notify_device_status)
+    /// stays public for the single-transition path and the tests.
+    ///
+    /// [`DeviceStatusGate`]: super::DeviceStatusGate
+    pub async fn notify_device_notice(&self, notice: &DeviceNotice) {
+        match notice {
+            DeviceNotice::Single(event) => self.notify_device_status(event).await,
+            DeviceNotice::Aggregate(agg) => self.notify_device_aggregate(agg).await,
+        }
+    }
+
+    /// Several transitions on one address, collapsed into one message.
+    /// Same transports and same per-subscriber filtering as the single
+    /// form — only the rendered text differs.
+    pub async fn notify_device_aggregate(&self, agg: &DeviceAggregate) {
+        let (telegram_subs, _ntfy_sub, push_subs) = self.load_subs(&agg.address).await;
+
+        let mut tasks = Vec::new();
+        let telegram_dev: Vec<_> = telegram_subs
+            .iter()
+            .filter(|s| s.device_notifications_enabled)
+            .cloned()
+            .collect();
+        if !telegram_dev.is_empty() {
+            if let Some(adapter) = &self.telegram {
+                tasks.push(Box::pin(send_telegram_device_aggregate(
+                    Arc::clone(adapter),
+                    self.pool.clone(),
+                    self.chat_languages.clone(),
+                    agg.clone(),
+                    telegram_dev,
+                    self.config.timezone,
+                )) as TaskFuture);
+            }
+        }
+
+        let payload = device_aggregate_payload(agg);
+        let fcm_dev: Vec<_> = push_subs
+            .iter()
+            .filter(|s| {
+                s.subscription_type.eq_ignore_ascii_case(PUSH_TYPE_FCM)
+                    && s.device_notifications_enabled
+            })
+            .cloned()
+            .collect();
+        let unified_dev: Vec<_> = push_subs
+            .iter()
+            .filter(|s| {
+                s.subscription_type.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED)
+                    && s.device_notifications_enabled
+            })
+            .cloned()
+            .collect();
+        let mut push_dev = fcm_dev;
+        push_dev.extend(unified_dev);
+        if !push_dev.is_empty() {
+            tasks.push(Box::pin(fan_push(
+                self.clone_push_handles(),
+                self.pool.clone(),
+                agg.address.clone(),
+                push_dev,
+                payload,
             )) as TaskFuture);
         }
 
@@ -422,6 +495,75 @@ async fn send_telegram_device_status(
         }
     });
     join_all(tasks).await;
+}
+
+async fn send_telegram_device_aggregate(
+    adapter: Arc<TelegramAdapter>,
+    pool: PgPool,
+    chat_languages: ChatLanguageMap,
+    agg: DeviceAggregate,
+    subs: Vec<TelegramSubscriptionRow>,
+    tz: chrono_tz::Tz,
+) {
+    let fmt_addr = format_address_short(agg.address.as_str());
+    let tasks = subs.into_iter().map(|sub| {
+        let adapter = Arc::clone(&adapter);
+        let pool = pool.clone();
+        let chat_languages = chat_languages.clone();
+        let agg = agg.clone();
+        let fmt_addr = fmt_addr.clone();
+        async move {
+            let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
+            let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
+            let time_str = format_device_time(tz, agg.timestamp, lang);
+            let suffix = (chat_count > 1).then(|| match lang {
+                Language::De => format!(" – Adresse {fmt_addr}"),
+                Language::En => format!(" – address {fmt_addr}"),
+            });
+            let text = DeviceAggregateText::build(&DeviceAggregateArgs {
+                language: lang,
+                time_formatted: &time_str,
+                went_offline: &agg.went_offline,
+                came_online: &agg.came_online,
+                address_suffix: suffix.as_deref(),
+            });
+            log_adapter_send(
+                "telegram-device-agg",
+                adapter
+                    .send_text(sub.telegram_chat_id, text.pick(lang))
+                    .await,
+            );
+        }
+    });
+    join_all(tasks).await;
+}
+
+/// Push payload for an aggregate. Uses the same UTC en-US timestamp and
+/// the same `title|body|` shape the single device-status payload uses,
+/// so existing clients render it without a change.
+fn device_aggregate_payload(agg: &DeviceAggregate) -> PushPayload {
+    let time_str = agg.timestamp.format("%m/%d/%y, %-I:%M %p").to_string();
+    let text = DeviceAggregateText::build(&DeviceAggregateArgs {
+        language: Language::En,
+        time_formatted: &time_str,
+        went_offline: &agg.went_offline,
+        came_online: &agg.came_online,
+        address_suffix: None,
+    });
+    PushPayload {
+        kind: PushKind::DeviceStatus,
+        title: "Device Status".to_string(),
+        body: text.en,
+        tag: String::new(),
+        extras: vec![
+            ("wentOffline".into(), agg.went_offline.len().to_string()),
+            ("cameOnline".into(), agg.came_online.len().to_string()),
+            (
+                "timestamp".into(),
+                agg.timestamp.timestamp_millis().to_string(),
+            ),
+        ],
+    }
 }
 
 async fn send_ntfy_block_found(

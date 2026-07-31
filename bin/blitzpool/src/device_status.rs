@@ -6,9 +6,11 @@
 //! (`bp_stratum_v2::hooks::DeviceStatusSink`) define a small fire-on-
 //! online/offline trait. The bin builds one of two concrete impls:
 //!
-//! - [`DispatcherDeviceStatusSink`] — forwards directly to the in-process
-//!   `NotificationDispatcher`. Used by any process that holds the dispatcher
-//!   (e.g. a front co-located with the `notify` role).
+//! - [`DispatcherDeviceStatusSink`] — feeds the in-process
+//!   [`crate::device_status_gate::Gate`], which debounces and later hands
+//!   the confirmed message to the `NotificationDispatcher`. Used by any
+//!   process that holds the dispatcher (e.g. a front co-located with the
+//!   `notify` role).
 //! - [`ProducingDeviceStatusSink`] — `XADD`s the event to the Core→Satellite
 //!   `device:status` stream. Used by a split **front** (Core), which has no
 //!   dispatcher; the Satellite drains the stream and fans the event out. This
@@ -25,7 +27,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bp_common::AddressId;
-use bp_notifications::dispatcher::{DeviceStatusEvent, NotificationDispatcher};
+use bp_notifications::dispatcher::DeviceStatusEvent;
 use bp_share_stream::{StreamProducer, DEVICE_STATUS_STREAM_KEY};
 use bp_stratum_v1::DeviceStatusSink as Sv1DeviceStatusSink;
 use bp_stratum_v2::hooks::DeviceStatusSink as Sv2DeviceStatusSink;
@@ -152,11 +154,16 @@ async fn build_event(
     })
 }
 
-/// Forwards both SV1 + SV2 device-status events to the shared
-/// [`NotificationDispatcher`]. Cheap to clone (`Arc`-internal).
+/// Feeds both SV1 + SV2 device-status events into the shared
+/// [`Gate`](crate::device_status_gate::Gate). Cheap to clone
+/// (`Arc`-internal).
+///
+/// Nothing is sent here — the gate's sweeper decides when a transition is
+/// real and dispatches it. That indirection is what stops a flapping
+/// connection from producing one push per TCP event.
 #[derive(Clone)]
 pub(crate) struct DispatcherDeviceStatusSink {
-    dispatcher: Arc<NotificationDispatcher>,
+    gate: Arc<crate::device_status_gate::Gate>,
     /// Pool handle for the `client_entity` `firstSeen`/`updatedAt` lookup
     /// that drives the `is_returning` flag. Best-effort: a DB error logs
     /// at WARN and the event still fires with `is_returning = false`.
@@ -164,8 +171,8 @@ pub(crate) struct DispatcherDeviceStatusSink {
 }
 
 impl DispatcherDeviceStatusSink {
-    pub(crate) fn new(dispatcher: Arc<NotificationDispatcher>, pool: PgPool) -> Self {
-        Self { dispatcher, pool }
+    pub(crate) fn new(gate: Arc<crate::device_status_gate::Gate>, pool: PgPool) -> Self {
+        Self { gate, pool }
     }
 
     async fn forward(
@@ -176,7 +183,7 @@ impl DispatcherDeviceStatusSink {
         is_online: bool,
     ) {
         if let Some(event) = build_event(&self.pool, address, worker, user_agent, is_online).await {
-            self.dispatcher.notify_device_status(&event).await;
+            self.gate.observe(&event);
         }
     }
 }

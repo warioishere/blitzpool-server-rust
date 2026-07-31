@@ -95,6 +95,7 @@ pub(crate) enum StratumV1SpawnError {
 /// The actual TCP-accept loop lives in [`crate::stratum::spawn`]; this
 /// function only constructs the servers + threads them back so the
 /// caller can build a per-port unified-protocol accept loop on top.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_per_port_servers(
     cfg: &AppConfig,
     foundation: &FoundationHandles,
@@ -102,6 +103,7 @@ pub(crate) fn build_per_port_servers(
     group_service: &SharedGroupService,
     payout_resolver: Arc<dyn bp_stratum_v1::PayoutResolver>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
+    gate: Option<Arc<crate::device_status_gate::Gate>>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
 ) -> Result<Vec<Sv1PortServer>, StratumV1SpawnError> {
     let Some(tdp) = foundation.tdp.as_ref() else {
@@ -158,9 +160,9 @@ pub(crate) fn build_per_port_servers(
     // stream so the Satellite can fan it out — never a silent drop. (Stratum
     // only spawns on the front, so `None` here means "no co-located dispatcher",
     // not "notifications off".)
-    let device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink> = match dispatcher.clone() {
-        Some(d) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
-            d,
+    let device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink> = match gate {
+        Some(g) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
+            g,
             foundation.db.pool().clone(),
         )),
         None => Arc::new(crate::device_status::ProducingDeviceStatusSink::new(

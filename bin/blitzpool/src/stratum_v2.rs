@@ -177,6 +177,7 @@ pub(crate) fn build_per_port_servers(
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     payout_resolver: Arc<dyn PayoutResolver>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
+    gate: Option<Arc<crate::device_status_gate::Gate>>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
 ) -> Vec<Sv2PortServer> {
     let Some(tdp) = foundation.tdp.as_ref() else {
@@ -226,9 +227,9 @@ pub(crate) fn build_per_port_servers(
     // stream so the Satellite fans it out — never a silent drop. (Stratum only
     // spawns on the front, so `None` here means "no co-located dispatcher", not
     // "notifications off".)
-    let device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink> = match dispatcher {
-        Some(d) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
-            d,
+    let device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink> = match gate {
+        Some(g) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
+            g,
             foundation.db.pool().clone(),
         )),
         None => Arc::new(crate::device_status::ProducingDeviceStatusSink::new(

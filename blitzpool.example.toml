@@ -364,6 +364,25 @@ submit_latency = false
 # [notifications.fcm]
 # service_account_path = ".local/firebase-service-account.json"
 
+# Debounce for miner online/offline notifications. Stratum reports every
+# connect and disconnect; sent verbatim that is one push pair per WiFi
+# hiccup, per rotating rental rig and per pool restart. Nothing is sent
+# on an event — it only schedules a re-check, and at that moment the
+# pool asks the database how many sessions the (address, worker) really
+# has. So a device that returns inside the grace produces no message at
+# all, and a source with many rigs under one worker name is only
+# reported offline once its last rig is gone.
+#
+# Consequence worth knowing: a genuine outage is reported
+# `offline_grace_secs` late. The defaults below are also the built-in
+# values — the whole block can stay commented out.
+#
+# [notifications.device_status]
+# offline_grace_secs = 300     # must look gone this long before "offline"
+# online_dwell_secs = 90       # must look present this long before "back online"
+# coalesce_window_secs = 300   # min spacing between two messages for one address;
+#                              # transitions inside it leave together as one summary
+
 # ───────────────────────────────────────────────────────────────
 # SMTP (transactional email — invitations + verification)
 # ───────────────────────────────────────────────────────────────

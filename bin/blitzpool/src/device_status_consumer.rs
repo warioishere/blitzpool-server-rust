@@ -6,8 +6,9 @@
 //! **front**, but the `NotificationDispatcher` lives on the Satellite. A split
 //! front therefore publishes each event to the `device:status` stream (see
 //! [`crate::device_status::ProducingDeviceStatusSink`]); this task drains that
-//! stream and calls [`NotificationDispatcher::notify_device_status`] — the same
-//! fan-out a dispatcher-holding process runs in-process.
+//! stream and feeds each event into the same
+//! [`Gate`](crate::device_status_gate::Gate) a dispatcher-holding process
+//! feeds directly. The gate's sweeper — not this task — is what sends.
 //!
 //! Notify-only (no ledger), so at-least-once delivery is harmless: a redelivery
 //! after a crash-before-`XACK` just re-sends one online/offline push, which is
@@ -18,7 +19,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bp_notifications::dispatcher::NotificationDispatcher;
 use bp_share_stream::{
     ConsumerLoopConfig, EnsureMode, StreamConsumer, StreamConsumerHandle, StreamEntryHandler,
     DEVICE_STATUS_STREAM_KEY,
@@ -31,35 +31,35 @@ const BATCH: usize = 64;
 const GROUP: &str = "device-status";
 const CONSUMER: &str = "c1";
 
-/// Fans each device-status event out via the dispatcher. Events that don't
+/// Feeds each device-status event into the gate. Events that don't
 /// reconstruct into a notify payload (`into_event` → `None`) are dropped.
 struct DeviceStatusHandler {
-    dispatcher: Arc<NotificationDispatcher>,
+    gate: Arc<crate::device_status_gate::Gate>,
 }
 
 #[async_trait]
 impl StreamEntryHandler<DeviceStatusStreamEvent> for DeviceStatusHandler {
     async fn handle(&self, value: DeviceStatusStreamEvent) {
         if let Some(event) = value.into_event() {
-            self.dispatcher.notify_device_status(&event).await;
+            self.gate.observe(&event);
         }
     }
 }
 
-/// Spawn the device-status stream consumer. Owns the dispatcher + a Redis
+/// Spawn the device-status stream consumer. Owns the gate + a Redis
 /// handle. Tail-start ($): a freshly-created group must not replay history (it
 /// would re-fire every buffered online/offline push); existing groups keep
 /// their offset.
 pub(crate) fn spawn(
     redis: ConnectionManager,
-    dispatcher: Arc<NotificationDispatcher>,
+    gate: Arc<crate::device_status_gate::Gate>,
 ) -> StreamConsumerHandle {
     let consumer: StreamConsumer<DeviceStatusStreamEvent> =
         StreamConsumer::new(redis, DEVICE_STATUS_STREAM_KEY, GROUP, CONSUMER);
     consumer.spawn(
         EnsureMode::FromTail,
         ConsumerLoopConfig::new(BATCH, "device-status"),
-        DeviceStatusHandler { dispatcher },
+        DeviceStatusHandler { gate },
     )
 }
 

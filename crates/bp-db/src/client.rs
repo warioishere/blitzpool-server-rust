@@ -816,6 +816,47 @@ where
     Ok(result.rows_affected())
 }
 
+/// One `(address, clientName, live_sessions)` row per requested pair
+/// that still has at least one **live** session — `deletedAt IS NULL`.
+/// Pairs with no live session are simply absent from the result, so the
+/// caller treats "missing" as zero.
+///
+/// This is the authoritative connectivity answer for the device-status
+/// debounce: `deletedAt` is cleared by [`upsert_client`] on register,
+/// stamped by [`delete_client_for_session`] on disconnect, and swept by
+/// [`kill_dead_clients`] when a session dies without a clean FIN. Asking
+/// it at notification time — rather than counting connect/disconnect
+/// events in memory — is what makes the debounce survive a process
+/// restart and stay correct across several Stratum fronts.
+///
+/// Batched over both key columns so one sweep costs one round-trip
+/// regardless of how many devices are due.
+pub async fn live_session_counts(
+    pool: &PgPool,
+    addresses: &[String],
+    client_names: &[String],
+) -> Result<Vec<(String, String, i64)>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT address AS "address!", "clientName" AS "client_name!",
+                  COUNT(*) AS "live!"
+           FROM client_entity
+           WHERE "deletedAt" IS NULL
+             AND (address, "clientName") IN (
+                   SELECT * FROM UNNEST($1::text[], $2::text[])
+                 )
+           GROUP BY address, "clientName""#,
+        addresses,
+        client_names,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.address, r.client_name, r.live))
+        .collect())
+}
+
 /// Latest known `firstSeen` (falling back to `startTime`) for an
 /// `(address, clientName)` pair, but only when the row's `lastActive`
 /// (defined as `deletedAt ?? updatedAt`) is no older than `cutoff_ms`.

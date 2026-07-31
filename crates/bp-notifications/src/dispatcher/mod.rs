@@ -10,8 +10,16 @@
 //! every adapter that the address has subscribed for. Failures are
 //! per-subscriber: a single bad token doesn't break the fan-out.
 
+//! Device-status events additionally pass through [`device_gate`], which
+//! debounces flapping connections and collapses bursts, before they
+//! reach the fan-out.
+
 mod config;
+mod device_gate;
 mod orchestrator;
 
 pub use config::DispatcherConfig;
+pub use device_gate::{
+    DeviceAggregate, DeviceGateConfig, DeviceNotice, DeviceStatusGate, LiveSessionLookup,
+};
 pub use orchestrator::{DeviceStatusEvent, NotificationDispatcher};

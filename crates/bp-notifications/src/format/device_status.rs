@@ -88,6 +88,122 @@ impl DeviceStatusText {
     }
 }
 
+/// At most this many worker names are spelled out; the rest are
+/// summarised as a count. Keeps a farm-sized batch inside one readable
+/// notification instead of a wall of names.
+const MAX_NAMES: usize = 6;
+
+/// Inputs for [`DeviceAggregateText::build`] — the collapsed form used
+/// when one address settles several transitions inside the coalescing
+/// window.
+#[derive(Debug, Clone)]
+pub struct DeviceAggregateArgs<'a> {
+    pub language: Language,
+    /// Pre-formatted local timestamp, as for [`DeviceStatusArgs`].
+    pub time_formatted: &'a str,
+    pub went_offline: &'a [String],
+    pub came_online: &'a [String],
+    pub address_suffix: Option<&'a str>,
+}
+
+/// Aggregate counterpart to [`DeviceStatusText`], same de/en shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceAggregateText {
+    pub de: String,
+    pub en: String,
+}
+
+impl DeviceAggregateText {
+    pub fn build(args: &DeviceAggregateArgs<'_>) -> Self {
+        let suffix = args.address_suffix.unwrap_or("");
+
+        let mut de_parts = Vec::new();
+        let mut en_parts = Vec::new();
+        if !args.went_offline.is_empty() {
+            let n = args.went_offline.len();
+            de_parts.push(format!(
+                "\u{1f4f4} {n} Worker offline ({})",
+                join_names(args.went_offline, Language::De)
+            ));
+            en_parts.push(format!(
+                "\u{1f4f4} {n} {} offline ({})",
+                plural_worker_en(n),
+                join_names(args.went_offline, Language::En)
+            ));
+        }
+        if !args.came_online.is_empty() {
+            let n = args.came_online.len();
+            de_parts.push(format!(
+                "\u{1f4f6} {n} Worker wieder online ({})",
+                join_names(args.came_online, Language::De)
+            ));
+            en_parts.push(format!(
+                "\u{1f4f6} {n} {} back online ({})",
+                plural_worker_en(n),
+                join_names(args.came_online, Language::En)
+            ));
+        }
+
+        DeviceAggregateText {
+            de: format!(
+                "{} – Stand {}{}.",
+                de_parts.join(" \u{b7} "),
+                args.time_formatted,
+                suffix
+            ),
+            en: format!(
+                "{} – as of {}{}.",
+                en_parts.join(" \u{b7} "),
+                args.time_formatted,
+                suffix
+            ),
+        }
+    }
+
+    pub fn pick(&self, lang: Language) -> &str {
+        match lang {
+            Language::De => &self.de,
+            Language::En => &self.en,
+        }
+    }
+}
+
+fn plural_worker_en(n: usize) -> &'static str {
+    if n == 1 {
+        "worker"
+    } else {
+        "workers"
+    }
+}
+
+/// Comma-join up to [`MAX_NAMES`] names, then summarise the remainder.
+fn join_names(names: &[String], language: Language) -> String {
+    let shown: Vec<&str> = names
+        .iter()
+        .take(MAX_NAMES)
+        .map(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                match language {
+                    Language::De => "unbekannt",
+                    Language::En => "unknown",
+                }
+            } else {
+                t
+            }
+        })
+        .collect();
+    let joined = shown.join(", ");
+    let rest = names.len().saturating_sub(MAX_NAMES);
+    if rest == 0 {
+        return joined;
+    }
+    match language {
+        Language::De => format!("{joined} … +{rest} weitere"),
+        Language::En => format!("{joined} … +{rest} more"),
+    }
+}
+
 /// Format a UTC instant in the per-deployment timezone (e.g.
 /// `Europe/Zurich`) as a short date + short time.
 ///
@@ -202,5 +318,84 @@ mod tests {
             format_device_time(zurich, utc, Language::En),
             "5/1/26, 2:30 PM"
         );
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn agg_args<'a>(time: &'a str, off: &'a [String], on: &'a [String]) -> DeviceAggregateArgs<'a> {
+        DeviceAggregateArgs {
+            language: Language::De,
+            time_formatted: time,
+            went_offline: off,
+            came_online: on,
+            address_suffix: None,
+        }
+    }
+
+    #[test]
+    fn aggregate_offline_only_names_every_worker() {
+        let off = names(&["axe01", "axe02", "axe03"]);
+        let t = DeviceAggregateText::build(&agg_args("01.05.26, 14:30", &off, &[]));
+        assert_eq!(
+            t.de,
+            "\u{1f4f4} 3 Worker offline (axe01, axe02, axe03) – Stand 01.05.26, 14:30."
+        );
+        assert_eq!(
+            t.en,
+            "\u{1f4f4} 3 workers offline (axe01, axe02, axe03) – as of 01.05.26, 14:30."
+        );
+    }
+
+    /// A batch that moves in both directions must say so in one message —
+    /// that is the whole point of collapsing.
+    #[test]
+    fn aggregate_reports_both_directions_in_one_line() {
+        let off = names(&["a", "b"]);
+        let on = names(&["c"]);
+        let t = DeviceAggregateText::build(&agg_args("01.05.26, 14:30", &off, &on));
+        assert_eq!(
+            t.de,
+            "\u{1f4f4} 2 Worker offline (a, b) \u{b7} \u{1f4f6} 1 Worker wieder online (c) \
+             – Stand 01.05.26, 14:30."
+        );
+        // English singular must not read "1 workers".
+        assert!(t.en.contains("1 worker back online (c)"), "{}", t.en);
+    }
+
+    /// A farm-sized batch must stay readable: names are capped and the
+    /// remainder is counted, never silently dropped.
+    #[test]
+    fn aggregate_caps_the_name_list_and_counts_the_rest() {
+        let off = names(&["w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9"]);
+        let t = DeviceAggregateText::build(&agg_args("01.05.26, 14:30", &off, &[]));
+        assert!(t
+            .de
+            .starts_with("\u{1f4f4} 9 Worker offline (w1, w2, w3, w4, w5, w6 … +3 weitere)"));
+        assert!(t.en.contains("… +3 more"), "{}", t.en);
+        assert!(
+            !t.de.contains("w7"),
+            "capped names must not leak into the list"
+        );
+    }
+
+    #[test]
+    fn aggregate_appends_the_address_suffix() {
+        let off = names(&["a", "b"]);
+        let mut args = agg_args("01.05.26, 14:30", &off, &[]);
+        args.address_suffix = Some(" – Adresse bc1q...xyz");
+        let t = DeviceAggregateText::build(&args);
+        assert!(t.de.ends_with(" – Adresse bc1q...xyz."), "{}", t.de);
+    }
+
+    /// A worker name is optional on the wire; an empty one must render as
+    /// a placeholder rather than an empty pair of commas.
+    #[test]
+    fn aggregate_renders_a_blank_worker_name_as_a_placeholder() {
+        let off = names(&["", "b"]);
+        let t = DeviceAggregateText::build(&agg_args("01.05.26, 14:30", &off, &[]));
+        assert!(t.de.contains("(unbekannt, b)"), "{}", t.de);
+        assert!(t.en.contains("(unknown, b)"), "{}", t.en);
     }
 }

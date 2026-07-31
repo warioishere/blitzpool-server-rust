@@ -118,6 +118,7 @@ pub(crate) async fn spawn(
     engines: &EngineHandles,
     group_service: &SharedGroupService,
     dispatcher: Option<Arc<NotificationDispatcher>>,
+    gate: Option<Arc<crate::device_status_gate::Gate>>,
 ) -> Result<StratumHandles, StratumSpawnError> {
     if foundation.tdp.is_none() {
         warn!("stratum: TDP missing (--skip-tdp); skipping unified SV1+SV2 listener bind");
@@ -155,6 +156,7 @@ pub(crate) async fn spawn(
         group_service,
         sv1_resolver,
         dispatcher.clone(),
+        gate.clone(),
         job_cache.clone(),
     )?;
     let noise_config = stratum_v2::build_noise_config(cfg)?;
@@ -168,6 +170,7 @@ pub(crate) async fn spawn(
         bridge,
         sv2_resolver,
         dispatcher,
+        gate,
         job_cache,
     );
 
