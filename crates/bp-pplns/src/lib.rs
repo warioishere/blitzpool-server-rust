@@ -10,10 +10,15 @@
 
 mod distribution;
 mod weight;
+mod weights;
 
 pub use distribution::{
     build_coinbase_distribution, BudgetTelemetry, CoinbaseDistributionEntry,
     CoinbaseDistributionInput, CoinbaseDistributionResult,
+};
+pub use weights::{
+    build_weight_distribution, WeightBuildError, WeightDistribution, WeightDistributionInput,
+    WeightEntry, SCORE_PRECISION,
 };
 pub use weight::{
     is_valid_payout_address, max_coinbase_outputs, output_weight_for_address,

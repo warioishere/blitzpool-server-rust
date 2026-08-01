@@ -234,6 +234,142 @@ pub fn payouts_fingerprint_from_parts<'a>(
 }
 
 // ============================================================================
+// Weight-proportional payouts (SV2 ext 0x0003 §4)
+// ============================================================================
+
+/// `floor(weight · t / w_total)` with 128-bit intermediates.
+///
+/// SV2 ext 0x0003 §4 mandates ≥128-bit intermediate arithmetic:
+/// `weight · t` reaches `(2^64−1)²  < 2^128`, so the product cannot
+/// overflow, and the quotient is `≤ t`, so the `u64` cast is lossless.
+/// `w_total` MUST be non-zero (§3.1: weight fields are non-0, so any
+/// well-formed distribution has `W ≥ 1`).
+pub fn mul_div_floor(weight: u64, t: u64, w_total: u128) -> u64 {
+    debug_assert!(w_total > 0, "mul_div_floor: zero weight sum");
+    ((weight as u128 * t as u128) / w_total) as u64
+}
+
+/// Why a payout-amount computation could not run.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WeightPayoutError {
+    /// `weight_p + Σ weights == 0` — a distribution with no weight at
+    /// all is malformed (§3.1 requires non-0 weight fields).
+    #[error("zero weight sum")]
+    ZeroWeightSum,
+    /// `dust_limits` must parallel `weights` 1:1 (§3.1).
+    #[error("dust_limits length {dust_limits} != payouts length {weights}")]
+    DustLimitsLengthMismatch { weights: usize, dust_limits: usize },
+}
+
+/// The §4 payout amounts for one template revenue `t`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayoutAmounts {
+    /// Per input weight, in order: `Some(sats)` for a kept output,
+    /// `None` where `floor(weight·t/W) < dust_limit` (dust-pruned, the
+    /// output is omitted from the coinbase).
+    pub pays: Vec<Option<u64>>,
+    /// `pay_P = t − Σ pays` — the pool output's amount. Absorbs every
+    /// integer-rounding remainder and all dust-pruned value; never
+    /// dust-pruned itself (§4).
+    pub pool_pay: u64,
+}
+
+/// Evaluate the SV2 ext 0x0003 §4 formulae:
+///
+/// ```text
+/// W         = weight_p + Σ weights[i]
+/// amount[i] = floor(weights[i] · t / W)
+/// pay[i]    = amount[i]  if amount[i] ≥ dust_limits[i], else pruned
+/// pay_P     = t − Σ pay[i]
+/// ```
+///
+/// This single implementation serves every party we control: the
+/// pool's own coinbase build (with the pool's template revenue), the
+/// job-declaration validator (with the declared coinbase's total), and
+/// tests standing in for a JDC.
+pub fn compute_payout_amounts(
+    weight_p: u64,
+    weights: &[u64],
+    dust_limits: &[u32],
+    t: u64,
+) -> Result<PayoutAmounts, WeightPayoutError> {
+    if weights.len() != dust_limits.len() {
+        return Err(WeightPayoutError::DustLimitsLengthMismatch {
+            weights: weights.len(),
+            dust_limits: dust_limits.len(),
+        });
+    }
+    let w_total = weight_p as u128 + weights.iter().map(|w| *w as u128).sum::<u128>();
+    if w_total == 0 {
+        return Err(WeightPayoutError::ZeroWeightSum);
+    }
+    let mut paid_sum: u64 = 0;
+    let pays = weights
+        .iter()
+        .zip(dust_limits)
+        .map(|(w, dust)| {
+            let amount = mul_div_floor(*w, t, w_total);
+            (amount >= *dust as u64).then(|| {
+                paid_sum += amount;
+                amount
+            })
+        })
+        .collect();
+    Ok(PayoutAmounts {
+        pays,
+        pool_pay: t - paid_sum,
+    })
+}
+
+/// Identity of a weight distribution: the settlement INPUTS, not any
+/// concrete satoshi outcome.
+///
+/// The v1 [`payouts_fingerprint_from_parts`] hashes `(reward, sats)` —
+/// an identity that only works when the coinbase pays those exact
+/// sats. Under the weight model the same distribution legitimately
+/// yields different satoshi vectors for different template revenues
+/// (`floor(weight·T/W)`), so the identity must be the thing every
+/// outcome is derived FROM: per address its integer score weight, its
+/// ledger balance at build time, and its dust limit, plus the fee (in
+/// parts-per-million) and an optional finder bonus. Settlement re-reads
+/// exactly these inputs from the snapshot stored under this hash and
+/// books `earned(T_actual) − actually_paid` per address.
+///
+/// Deliberately NOT in the preimage: the published wire weights and
+/// the reference revenue behind their balance boosts — distributions
+/// that differ only there settle identically and may share a snapshot.
+///
+/// Canonical, domain-tagged, length-prefixed; entry order is part of
+/// the identity (it is the coinbase output order).
+pub fn weights_fingerprint_from_parts<'a>(
+    fee_ppm: u32,
+    finder_bonus: Option<(&'a str, u64)>,
+    entries: impl IntoIterator<Item = (&'a str, u64, i64, u32)>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bp-weights-v2");
+    hasher.update(fee_ppm.to_le_bytes());
+    match finder_bonus {
+        Some((address, sats)) => {
+            hasher.update([1u8]);
+            hasher.update((address.len() as u32).to_le_bytes());
+            hasher.update(address.as_bytes());
+            hasher.update(sats.to_le_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
+    for (address, score_weight, balance_sats, dust_limit) in entries {
+        hasher.update((address.len() as u32).to_le_bytes());
+        hasher.update(address.as_bytes());
+        hasher.update(score_weight.to_le_bytes());
+        hasher.update(balance_sats.to_le_bytes());
+        hasher.update(dust_limit.to_le_bytes());
+    }
+    let first = hasher.finalize();
+    Sha256::digest(first).into()
+}
+
+// ============================================================================
 // Share validation
 // ============================================================================
 
@@ -791,5 +927,141 @@ mod tests {
             let m = le_bytes_to_biguint(&max_target.0);
             prop_assert!(a <= m, "assigned_target > max_target");
         }
+    }
+
+    // ---- Weight-proportional payouts (SV2 ext 0x0003 §4) ----
+
+    /// `splits proportionally, remainder lands in pool_pay`
+    #[test]
+    fn payout_amounts_proportional_with_remainder_to_pool() {
+        // weights 3:1, weight_p 1 → W = 5, t = 1000 → 600 / 200 / pool 200.
+        let r = compute_payout_amounts(1, &[3, 1], &[546, 546], 1000).unwrap();
+        assert_eq!(r.pays, vec![Some(600), None]); // 200 < 546 → pruned
+        assert_eq!(r.pool_pay, 400); // pool weight share + pruned 200
+    }
+
+    /// `exact division leaves the pool exactly its own share`
+    #[test]
+    fn payout_amounts_exact_division() {
+        let r = compute_payout_amounts(1, &[6, 3], &[1, 1], 1000).unwrap();
+        assert_eq!(r.pays, vec![Some(600), Some(300)]);
+        assert_eq!(r.pool_pay, 100);
+    }
+
+    /// `dust-prunes below the per-output limit, value flows to pool_pay`
+    #[test]
+    fn payout_amounts_dust_prune_all() {
+        let r = compute_payout_amounts(1, &[1, 1, 1], &[600, 600, 600], 1000).unwrap();
+        assert_eq!(r.pays, vec![None, None, None]); // each 250 < 600
+        assert_eq!(r.pool_pay, 1000);
+    }
+
+    /// `t = 0 → every output pruned (or 0), pool_pay 0`
+    #[test]
+    fn payout_amounts_zero_revenue() {
+        let r = compute_payout_amounts(1, &[5, 5], &[546, 546], 0).unwrap();
+        assert_eq!(r.pays, vec![None, None]);
+        assert_eq!(r.pool_pay, 0);
+    }
+
+    /// `u64::MAX weights and revenue do not overflow (u128 intermediates)`
+    #[test]
+    fn payout_amounts_max_bounds_no_overflow() {
+        let w = u64::MAX;
+        let r = compute_payout_amounts(w, &[w, w], &[1, 1], u64::MAX).unwrap();
+        // Each weight is exactly 1/3 of W.
+        assert_eq!(r.pays, vec![Some(u64::MAX / 3), Some(u64::MAX / 3)]);
+        assert_eq!(
+            r.pool_pay,
+            u64::MAX - 2 * (u64::MAX / 3),
+            "pool absorbs the rounding remainder"
+        );
+    }
+
+    /// `zero weight sum is malformed (§3.1 non-0 weights)`
+    #[test]
+    fn payout_amounts_rejects_zero_weight_sum() {
+        assert_eq!(
+            compute_payout_amounts(0, &[], &[], 1000),
+            Err(WeightPayoutError::ZeroWeightSum)
+        );
+    }
+
+    /// `dust_limits must parallel weights`
+    #[test]
+    fn payout_amounts_rejects_length_mismatch() {
+        assert_eq!(
+            compute_payout_amounts(1, &[1, 2], &[546], 1000),
+            Err(WeightPayoutError::DustLimitsLengthMismatch {
+                weights: 2,
+                dust_limits: 1
+            })
+        );
+    }
+
+    /// `Σ pays + pool_pay == t for arbitrary inputs`
+    #[test]
+    fn payout_amounts_always_consume_exactly_t() {
+        for (wp, ws, t) in [
+            (1u64, vec![7u64, 13, 29], 312_500_000u64),
+            (999, vec![1], 1),
+            (1, vec![u64::MAX], u64::MAX),
+        ] {
+            let dusts = vec![546u32; ws.len()];
+            let r = compute_payout_amounts(wp, &ws, &dusts, t).unwrap();
+            let paid: u64 = r.pays.iter().flatten().sum();
+            assert_eq!(paid + r.pool_pay, t);
+        }
+    }
+
+    // ---- weights fingerprint (v2) ----
+
+    /// `identical inputs agree, any input change disagrees`
+    #[test]
+    fn weights_fingerprint_binds_every_input() {
+        let base = || {
+            weights_fingerprint_from_parts(
+                15_000,
+                Some(("bc1qfinder", 50_000)),
+                [("bc1qa", 10, 5i64, 546u32), ("bc1qb", 20, -3, 546)],
+            )
+        };
+        assert_eq!(base(), base());
+        let fee = weights_fingerprint_from_parts(
+            15_001,
+            Some(("bc1qfinder", 50_000)),
+            [("bc1qa", 10, 5, 546), ("bc1qb", 20, -3, 546)],
+        );
+        let bonus = weights_fingerprint_from_parts(
+            15_000,
+            None,
+            [("bc1qa", 10, 5, 546), ("bc1qb", 20, -3, 546)],
+        );
+        let weight = weights_fingerprint_from_parts(
+            15_000,
+            Some(("bc1qfinder", 50_000)),
+            [("bc1qa", 11, 5, 546), ("bc1qb", 20, -3, 546)],
+        );
+        let balance = weights_fingerprint_from_parts(
+            15_000,
+            Some(("bc1qfinder", 50_000)),
+            [("bc1qa", 10, 6, 546), ("bc1qb", 20, -3, 546)],
+        );
+        let order = weights_fingerprint_from_parts(
+            15_000,
+            Some(("bc1qfinder", 50_000)),
+            [("bc1qb", 20, -3, 546), ("bc1qa", 10, 5, 546)],
+        );
+        for other in [fee, bonus, weight, balance, order] {
+            assert_ne!(base(), other);
+        }
+    }
+
+    /// `v2 never collides with v1 for byte-similar inputs (domain tag)`
+    #[test]
+    fn weights_fingerprint_is_domain_separated_from_v1() {
+        let v1 = payouts_fingerprint_from_parts(1000, [("bc1qa", 600u64)]);
+        let v2 = weights_fingerprint_from_parts(0, None, [("bc1qa", 600, 0i64, 0u32)]);
+        assert_ne!(v1, v2);
     }
 }

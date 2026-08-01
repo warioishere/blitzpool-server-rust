@@ -12,8 +12,10 @@ workspace = true
 
 [dependencies]
 bp-common = { workspace = true }
+bp-share = { workspace = true }
 bitcoin = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 bp-test-support = { workspace = true }
@@ -26,7 +28,6 @@ proptest = { workspace = true }
 bp-regtest-harness = { workspace = true }
 bp-mining-job = { workspace = true }
 bp-template-distribution = { workspace = true }
-bp-share = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 # Mempool-fill RPC params for the autoscaler coupling regtest.
 serde_json = { workspace = true }
