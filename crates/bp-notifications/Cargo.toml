@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 bp-common = { workspace = true }
+bp-cron-utils = { workspace = true }
 bp-db = { workspace = true }
 bp-pplns-engine = { workspace = true }
 bp-group-solo-engine = { workspace = true }

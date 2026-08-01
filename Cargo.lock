@@ -845,6 +845,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bp-common",
+ "bp-cron-utils",
  "bp-db",
  "bp-group-solo-engine",
  "bp-pplns-engine",

@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address AS \"address!\", \"clientName\" AS \"client_name!\",\n                  MIN(COALESCE(\"firstSeen\", \"startTime\")) AS \"first_seen_ms!\"\n           FROM client_entity\n           WHERE (address, \"clientName\") IN (\n                   SELECT * FROM UNNEST($1::text[], $2::text[])\n                 )\n           GROUP BY address, \"clientName\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "client_name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "first_seen_ms!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "c5382a8a6cef84693bb81e8aed013ae86a645b43692826b272e9de832125cf1c"
+}

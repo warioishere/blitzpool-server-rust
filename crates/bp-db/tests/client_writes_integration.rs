@@ -10,9 +10,9 @@
 use bp_common::AddressId;
 use bp_db::{
     bulk_set_client_hashrate, bulk_touch_clients_for_share, delete_client_for_session,
-    find_addresses_for_ntfy_listener, find_client_recent_first_seen, kill_dead_clients,
-    reset_all_client_hashrate, touch_client_for_share, update_sv2_user_agent_by_address,
-    upsert_client, upsert_ntfy_subscription, ClientUpsert,
+    find_addresses_for_ntfy_listener, kill_dead_clients, reset_all_client_hashrate,
+    touch_client_for_share, update_sv2_user_agent_by_address, upsert_client,
+    upsert_ntfy_subscription, ClientUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
@@ -847,103 +847,6 @@ async fn reset_all_client_hashrate_zeroes_active_only() {
     assert_eq!(again, 0, "no non-zero active rows left to clear");
 
     for sid in [ACTIVE_A, ACTIVE_B, DELETED] {
-        sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
-            .bind(sid)
-            .execute(&pool)
-            .await
-            .expect("cleanup");
-    }
-}
-
-// ── find_client_recent_first_seen ─────────────────────────────────
-
-#[tokio::test]
-async fn find_client_recent_first_seen_honours_30min_window() {
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-
-    const SESSIONS: &[&str] = &["tFRfs1", "tFRfs2"];
-    for sid in SESSIONS {
-        let _ = sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
-            .bind(sid)
-            .execute(&pool)
-            .await;
-    }
-
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let recent_updated = now_ms - 5 * 60 * 1000; // 5 min ago
-    let stale_updated = now_ms - 90 * 60 * 1000; // 90 min ago
-    let cutoff_ms = now_ms - 30 * 60 * 1000;
-
-    // Seed two distinct (address, clientName) pairs with the same
-    // startTime but distinct "lastActive" (updatedAt) timestamps.
-    upsert_client(
-        &pool,
-        &ClientUpsert {
-            address: "tFRfsR".to_string(), // returning case
-            client_name: "wkr".to_string(),
-            session_id: "tFRfs1".to_string(),
-            user_agent: Some("bitaxe".to_string()),
-            start_time_ms: now_ms - 7 * 24 * 60 * 60 * 1000, // 7 days ago
-            current_difficulty: None,
-        },
-    )
-    .await
-    .expect("seed returning");
-    sqlx::query(r#"UPDATE client_entity SET "updatedAt" = $1 WHERE "sessionId" = $2"#)
-        .bind(recent_updated)
-        .bind("tFRfs1")
-        .execute(&pool)
-        .await
-        .expect("set recent updatedAt");
-
-    upsert_client(
-        &pool,
-        &ClientUpsert {
-            address: "tFRfsS".to_string(), // stale case
-            client_name: "wkr".to_string(),
-            session_id: "tFRfs2".to_string(),
-            user_agent: Some("bitaxe".to_string()),
-            start_time_ms: now_ms - 7 * 24 * 60 * 60 * 1000,
-            current_difficulty: None,
-        },
-    )
-    .await
-    .expect("seed stale");
-    sqlx::query(r#"UPDATE client_entity SET "updatedAt" = $1 WHERE "sessionId" = $2"#)
-        .bind(stale_updated)
-        .bind("tFRfs2")
-        .execute(&pool)
-        .await
-        .expect("set stale updatedAt");
-
-    // Returning case: lastActive 5 min ago → within 30 min window → Some(firstSeen|startTime).
-    let returning = find_client_recent_first_seen(&pool, "tFRfsR", "wkr", cutoff_ms)
-        .await
-        .expect("lookup returning");
-    assert!(
-        returning.is_some(),
-        "5-min-ago lastActive must read as returning, got {returning:?}"
-    );
-
-    // Stale case: lastActive 90 min ago → outside 30 min window → None.
-    let stale = find_client_recent_first_seen(&pool, "tFRfsS", "wkr", cutoff_ms)
-        .await
-        .expect("lookup stale");
-    assert!(
-        stale.is_none(),
-        "90-min-ago lastActive must read as NOT returning, got {stale:?}"
-    );
-
-    // Unknown (address, worker) → None.
-    let unknown = find_client_recent_first_seen(&pool, "tFRfsX", "nope", cutoff_ms)
-        .await
-        .expect("lookup unknown");
-    assert!(unknown.is_none(), "unknown pair must read as None");
-
-    // Cleanup.
-    for sid in SESSIONS {
         sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
             .bind(sid)
             .execute(&pool)

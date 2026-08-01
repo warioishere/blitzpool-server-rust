@@ -991,3 +991,29 @@ pub async fn find_addresses_for_ntfy_listener(pool: &PgPool) -> Result<Vec<Addre
     .map_err(DbError::from)?;
     Ok(rows.into_iter().map(|r| r.address).collect())
 }
+
+/// Every address that has at least one **device-status** subscriber, on
+/// either transport that carries the notification (Telegram and push;
+/// ntfy is deliberately not routed for device status).
+///
+/// The device-status gate uses this to decide which devices are worth
+/// tracking at all. On a pool where almost no address has a device
+/// subscription that turns a per-device state machine over every miner
+/// into one over a handful — and, more importantly, keeps the sweeper
+/// from doing a subscription lookup per address for messages nobody
+/// would receive.
+pub async fn find_device_notification_addresses(pool: &PgPool) -> Result<Vec<AddressId>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT address AS "address!: AddressId"
+           FROM telegram_subscriptions_entity
+           WHERE "deviceNotificationsEnabled" AND "deletedAt" IS NULL
+           UNION
+           SELECT address AS "address!: AddressId"
+           FROM push_subscription_entity
+           WHERE "deviceNotificationsEnabled" AND "deletedAt" IS NULL"#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows.into_iter().map(|r| r.address).collect())
+}

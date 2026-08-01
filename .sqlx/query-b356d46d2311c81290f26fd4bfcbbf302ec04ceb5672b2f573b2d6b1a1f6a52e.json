@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address AS \"address!\", \"clientName\" AS \"client_name!\",\n                  (ARRAY_AGG(\"userAgent\" ORDER BY \"updatedAt\" DESC))[1] AS user_agent\n           FROM client_entity\n           WHERE address = ANY($1::text[])\n             AND (\"deletedAt\" IS NULL OR \"deletedAt\" >= $2)\n           GROUP BY address, \"clientName\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "client_name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_agent",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "b356d46d2311c81290f26fd4bfcbbf302ec04ceb5672b2f573b2d6b1a1f6a52e"
+}

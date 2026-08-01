@@ -49,6 +49,7 @@ mod coinbase_autoscaler;
 mod crons;
 mod device_status;
 mod device_status_consumer;
+mod device_status_gate;
 mod dispatcher;
 mod engines;
 mod group_service;
@@ -57,6 +58,7 @@ mod jdp;
 mod jdp_hooks;
 mod listeners;
 mod live_mode_marker;
+mod live_sessions;
 mod payout_resolver;
 mod pending_blocks;
 mod pending_group_solo_blocks;
@@ -73,6 +75,7 @@ mod stream_monitor;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bp_config::{AppConfig, ConfigError, Role};
 use bp_pplns::DEFAULT_COINBASE_WEIGHT_BUDGET;
@@ -449,6 +452,24 @@ async fn main() -> ExitCode {
         None
     };
 
+    // Device-status debounce. Lives wherever the dispatcher lives, so both
+    // the in-process sink (combined front+notify) and the stream consumer
+    // (split deployment) feed the same instance and a device is judged
+    // once, not once per producer.
+    let device_status_gate = dispatcher.as_ref().map(|_| {
+        let ds = &cfg.notifications.device_status;
+        crate::device_status_gate::build(
+            bp_notifications::dispatcher::DeviceGateConfig {
+                offline_grace: Duration::from_secs(ds.offline_grace_secs),
+                online_dwell: Duration::from_secs(ds.online_dwell_secs),
+                coalesce_window: Duration::from_secs(ds.coalesce_window_secs),
+                recheck_interval: Duration::from_secs(ds.recheck_interval_secs),
+            },
+            handles.db.pool().clone(),
+            handles.redis.clone(),
+        )
+    });
+
     let group_service = match group_service::spawn(&handles, &production_hooks).await {
         Ok(g) => g,
         Err(err) => {
@@ -536,7 +557,16 @@ async fn main() -> ExitCode {
 
     // Stratum listeners + share producer are the always-on front — front-only.
     let stratum = if is_front {
-        match stratum::spawn(&cfg, &handles, &engines, &group_service, dispatcher.clone()).await {
+        match stratum::spawn(
+            &cfg,
+            &handles,
+            &engines,
+            &group_service,
+            dispatcher.clone(),
+            device_status_gate.clone(),
+        )
+        .await
+        {
             Ok(h) => Some(h),
             Err(err) => {
                 tracing::error!(%err, "stratum spawn failed");
@@ -770,15 +800,28 @@ async fn main() -> ExitCode {
     // dispatcher exists — with no transport configured there's nothing to send
     // and the stream just trims at MAXLEN.
     let device_status_consumer = if consumes_notify_streams {
-        match dispatcher.clone() {
-            Some(d) => {
+        match device_status_gate.clone() {
+            Some((g, subs)) => {
                 let ds_redis = handles.dedicated_redis(&cfg.redis, "device-status").await;
-                Some(crate::device_status_consumer::spawn(ds_redis, d))
+                Some(crate::device_status_consumer::spawn(ds_redis, g, subs))
             }
             None => None,
         }
     } else {
         None
+    };
+
+    // The gate only sends from its sweeper, so a process holding the gate
+    // must run one — otherwise every debounced transition would be
+    // recorded and never released.
+    let device_status_sweeper = match (device_status_gate.clone(), dispatcher.clone()) {
+        (Some((g, subs)), Some(d)) => Some(crate::device_status_gate::spawn(
+            g,
+            subs,
+            d,
+            handles.db.pool().clone(),
+        )),
+        _ => None,
     };
 
     // Core: watch the Core→Satellite streams' consumer lag (the always-on
@@ -996,6 +1039,7 @@ async fn main() -> ExitCode {
         block_found_notify_consumer,
         rejected_consumer,
         device_status_consumer,
+        device_status_sweeper,
         stream_monitor,
         cache_sync,
         autoscaler,
@@ -1037,6 +1081,7 @@ async fn wait_for_shutdown(
     block_found_notify_consumer: Option<bp_share_stream::StreamConsumerHandle>,
     rejected_consumer: Option<bp_share_stream::StreamConsumerHandle>,
     device_status_consumer: Option<bp_share_stream::StreamConsumerHandle>,
+    device_status_sweeper: Option<crate::device_status_gate::DeviceStatusGateHandle>,
     stream_monitor: Option<stream_monitor::StreamMonitorHandle>,
     cache_sync: Option<cache_sync::CacheSyncHandle>,
     autoscaler: Option<coinbase_autoscaler::AutoscalerHandle>,
@@ -1099,6 +1144,9 @@ async fn wait_for_shutdown(
     }
     if let Some(dsc) = device_status_consumer {
         dsc.shutdown().await;
+    }
+    if let Some(dsg) = device_status_sweeper {
+        dsg.shutdown().await;
     }
     if let Some(sm) = stream_monitor {
         sm.shutdown().await;

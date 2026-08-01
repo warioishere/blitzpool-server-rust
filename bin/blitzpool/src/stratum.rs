@@ -65,6 +65,8 @@ pub(crate) struct StratumHandles {
     sv1_servers: Vec<StratumV1Server>,
     sv2_servers: Vec<StratumV2MiningServer>,
     cancel: CancellationToken,
+    /// Republishes this front's live-session set. Only the front has one.
+    live_sessions: Option<crate::live_sessions::LiveSessionPublisherHandle>,
 }
 
 impl StratumHandles {
@@ -75,6 +77,7 @@ impl StratumHandles {
             sv1_servers: vec![],
             sv2_servers: vec![],
             cancel: CancellationToken::new(),
+            live_sessions: None,
         }
     }
 
@@ -83,6 +86,9 @@ impl StratumHandles {
     /// completion. Idempotent — second call is a no-op.
     pub(crate) async fn shutdown(self) {
         self.cancel.cancel();
+        if let Some(live) = self.live_sessions {
+            live.shutdown().await;
+        }
         for server in &self.sv1_servers {
             server.shutdown().await;
         }
@@ -118,6 +124,10 @@ pub(crate) async fn spawn(
     engines: &EngineHandles,
     group_service: &SharedGroupService,
     dispatcher: Option<Arc<NotificationDispatcher>>,
+    gate: Option<(
+        Arc<crate::device_status_gate::Gate>,
+        crate::device_status_gate::SubscribedAddresses,
+    )>,
 ) -> Result<StratumHandles, StratumSpawnError> {
     if foundation.tdp.is_none() {
         warn!("stratum: TDP missing (--skip-tdp); skipping unified SV1+SV2 listener bind");
@@ -148,6 +158,18 @@ pub(crate) async fn spawn(
     // same entry.
     let job_cache = Arc::new(bp_mining_job::MiningJobCache::new());
 
+    // The front is the only process that knows, first-hand, which
+    // devices are connected: it holds the sockets. Publish that set so
+    // the notify side can answer "is this miner online?" without having
+    // to infer it from share activity. One registry per process, wrapping
+    // the shared persistence hook so both protocols feed it.
+    let live_sessions = Arc::new(crate::live_sessions::LiveSessionRegistry::new(
+        Arc::new(engines.session_persistence_hook.clone()),
+        foundation.redis.clone(),
+        &uuid::Uuid::new_v4().to_string(),
+    ));
+    let live_publisher = crate::live_sessions::spawn_publisher(Arc::clone(&live_sessions));
+
     let sv1_servers = stratum_v1::build_per_port_servers(
         cfg,
         foundation,
@@ -155,6 +177,8 @@ pub(crate) async fn spawn(
         group_service,
         sv1_resolver,
         dispatcher.clone(),
+        gate.clone(),
+        Arc::clone(&live_sessions),
         job_cache.clone(),
     )?;
     let noise_config = stratum_v2::build_noise_config(cfg)?;
@@ -168,6 +192,8 @@ pub(crate) async fn spawn(
         bridge,
         sv2_resolver,
         dispatcher,
+        gate,
+        Arc::clone(&live_sessions),
         job_cache,
     );
 
@@ -226,6 +252,7 @@ pub(crate) async fn spawn(
         sv1_servers: sv1_server_handles,
         sv2_servers: sv2_server_handles,
         cancel,
+        live_sessions: Some(live_publisher),
     })
 }
 

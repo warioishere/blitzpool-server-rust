@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address AS \"address!: AddressId\"\n           FROM telegram_subscriptions_entity\n           WHERE \"deviceNotificationsEnabled\" AND \"deletedAt\" IS NULL\n           UNION\n           SELECT address AS \"address!: AddressId\"\n           FROM push_subscription_entity\n           WHERE \"deviceNotificationsEnabled\" AND \"deletedAt\" IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "185b7080db772902a22261284a46724bf11db825b6d037b6be7743edac58cc53"
+}

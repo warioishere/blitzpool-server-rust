@@ -6,44 +6,50 @@
 //! (`bp_stratum_v2::hooks::DeviceStatusSink`) define a small fire-on-
 //! online/offline trait. The bin builds one of two concrete impls:
 //!
-//! - [`DispatcherDeviceStatusSink`] — forwards directly to the in-process
-//!   `NotificationDispatcher`. Used by any process that holds the dispatcher
-//!   (e.g. a front co-located with the `notify` role).
+//! - [`DispatcherDeviceStatusSink`] — feeds the in-process
+//!   [`crate::device_status_gate::Gate`], which debounces and later hands
+//!   the confirmed message to the `NotificationDispatcher`. Used by any
+//!   process that holds the dispatcher (e.g. a front co-located with the
+//!   `notify` role).
 //! - [`ProducingDeviceStatusSink`] — `XADD`s the event to the Core→Satellite
 //!   `device:status` stream. Used by a split **front** (Core), which has no
-//!   dispatcher; the Satellite drains the stream and fans the event out. This
+//!   dispatcher; the Satellite drains the stream and feeds the gate. This
 //!   is the cross-process route, mirroring the block-found stream — without it
 //!   a split front would silently drop device-status notifications.
 //!
-//! The bin-side adapter fills the metadata fields the rendered message uses:
-//! `user_agent` (threaded through `on_device_event` from the SV1 subscribe UA /
-//! SV2 vendor) and `is_returning` (a `client_entity` lookup — a device that
-//! comes back online within the window renders "back online").
+//!   It publishes unfiltered, deliberately: the front holds no subscription
+//!   state, so the "does anyone want this?" question is answered on the
+//!   Satellite. Device events fire on connect/disconnect rather than per
+//!   share, so the stream traffic that buys is small.
+//!
+//! The bin-side adapter fills the metadata the rendered message uses:
+//! `user_agent`, threaded through `on_device_event` from the SV1 subscribe UA /
+//! SV2 vendor.
+//!
+//! `is_returning` is deliberately NOT resolved here. It used to be a
+//! `client_entity` lookup per event, but the gate decides it now — it is the
+//! only place that knows whether the subscriber was actually told the device
+//! was gone, which is what the word means. The flag is only ever read for an
+//! online message, and the gate overwrites it on exactly that path, so
+//! computing it here cost one query per connect and was discarded every time.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use bp_common::AddressId;
-use bp_notifications::dispatcher::{DeviceStatusEvent, NotificationDispatcher};
+use bp_notifications::dispatcher::DeviceStatusEvent;
 use bp_share_stream::{StreamProducer, DEVICE_STATUS_STREAM_KEY};
 use bp_stratum_v1::DeviceStatusSink as Sv1DeviceStatusSink;
 use bp_stratum_v2::hooks::DeviceStatusSink as Sv2DeviceStatusSink;
 use chrono::{TimeZone, Utc};
 use redis::aio::ConnectionManager;
-use sqlx::PgPool;
 use tracing::warn;
-
-/// Sliding window during which a re-connecting device is considered
-/// "returning" rather than "first time". Survives pool restarts (the
-/// in-memory variant didn't, which made every device read as fresh
-/// after a restart).
-const RETURNING_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// Wire form of a [`DeviceStatusEvent`] for the Core→Satellite `device:status`
 /// stream. Plain serde types — the bin owns the wire format, same as
-/// `BlockFoundEvent`. The Core stamps `is_returning` (it holds the DB) so the
-/// Satellite renders without re-deriving it.
+/// `BlockFoundEvent`. `is_returning` stays on the wire (the field is part of
+/// the shape a Satellite may already be reading) but is always `false`: the
+/// gate on the receiving side sets it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DeviceStatusStreamEvent {
     pub address: String,
@@ -95,11 +101,13 @@ impl DeviceStatusStreamEvent {
 }
 
 /// Build the [`DeviceStatusEvent`] from the raw Stratum hook fields: parse the
-/// address, resolve the `is_returning` flag via a `client_entity` lookup, and
-/// assemble the event. Shared by both sink impls. Returns `None` when the
-/// address shape is invalid (the event is dropped — nothing to notify).
-async fn build_event(
-    pool: &PgPool,
+/// address and assemble the event. Shared by both sink impls. Returns `None`
+/// when the address shape is invalid (the event is dropped — nothing to
+/// notify).
+///
+/// `is_returning` is left `false`; see the module header for why this is not
+/// the layer that can answer it.
+fn build_event(
     address: &str,
     worker: &str,
     user_agent: Option<&str>,
@@ -117,28 +125,6 @@ async fn build_event(
             return None;
         }
     };
-    // "Returning" = the most-recent client_entity row for this
-    // (address, worker) was active within RETURNING_WINDOW. Only
-    // meaningful on the online event; offline template ignores it.
-    let is_returning = if is_online {
-        let cutoff_ms = Utc::now().timestamp_millis()
-            - i64::try_from(RETURNING_WINDOW.as_millis()).unwrap_or(i64::MAX);
-        match bp_db::find_client_recent_first_seen(pool, address, worker, cutoff_ms).await {
-            Ok(seen) => seen.is_some(),
-            Err(err) => {
-                warn!(
-                    %err,
-                    address,
-                    worker,
-                    "device-status: returning-window lookup failed; \
-                     defaulting to is_returning=false"
-                );
-                false
-            }
-        }
-    } else {
-        false
-    };
     Some(DeviceStatusEvent {
         address: address_id,
         worker_name: (!worker.is_empty()).then(|| worker.to_string()),
@@ -147,36 +133,41 @@ async fn build_event(
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         is_online,
-        is_returning,
+        is_returning: false,
         timestamp: Utc::now(),
     })
 }
 
-/// Forwards both SV1 + SV2 device-status events to the shared
-/// [`NotificationDispatcher`]. Cheap to clone (`Arc`-internal).
+/// Feeds both SV1 + SV2 device-status events into the shared
+/// [`Gate`](crate::device_status_gate::Gate). Cheap to clone
+/// (`Arc`-internal).
+///
+/// Nothing is sent here — the gate's sweeper decides when a transition is
+/// real and dispatches it. That indirection is what stops a flapping
+/// connection from producing one push per TCP event.
 #[derive(Clone)]
 pub(crate) struct DispatcherDeviceStatusSink {
-    dispatcher: Arc<NotificationDispatcher>,
-    /// Pool handle for the `client_entity` `firstSeen`/`updatedAt` lookup
-    /// that drives the `is_returning` flag. Best-effort: a DB error logs
-    /// at WARN and the event still fires with `is_returning = false`.
-    pool: PgPool,
+    gate: Arc<crate::device_status_gate::Gate>,
+    /// Addresses with a device-status subscriber. Events for anything
+    /// else are dropped here, before the gate allocates any state —
+    /// nobody would ever receive the resulting message.
+    subscribers: crate::device_status_gate::SubscribedAddresses,
 }
 
 impl DispatcherDeviceStatusSink {
-    pub(crate) fn new(dispatcher: Arc<NotificationDispatcher>, pool: PgPool) -> Self {
-        Self { dispatcher, pool }
+    pub(crate) fn new(
+        gate: Arc<crate::device_status_gate::Gate>,
+        subscribers: crate::device_status_gate::SubscribedAddresses,
+    ) -> Self {
+        Self { gate, subscribers }
     }
 
-    async fn forward(
-        &self,
-        address: &str,
-        worker: &str,
-        user_agent: Option<&str>,
-        is_online: bool,
-    ) {
-        if let Some(event) = build_event(&self.pool, address, worker, user_agent, is_online).await {
-            self.dispatcher.notify_device_status(&event).await;
+    fn forward(&self, address: &str, worker: &str, user_agent: Option<&str>, is_online: bool) {
+        if !self.subscribers.contains(address) {
+            return;
+        }
+        if let Some(event) = build_event(address, worker, user_agent, is_online) {
+            self.gate.observe(&event);
         }
     }
 }
@@ -191,7 +182,7 @@ impl Sv1DeviceStatusSink for DispatcherDeviceStatusSink {
         user_agent: Option<&str>,
         is_online: bool,
     ) {
-        self.forward(address, worker, user_agent, is_online).await;
+        self.forward(address, worker, user_agent, is_online);
     }
 }
 
@@ -205,28 +196,24 @@ impl Sv2DeviceStatusSink for DispatcherDeviceStatusSink {
         user_agent: Option<&str>,
         is_online: bool,
     ) {
-        self.forward(address, worker, user_agent, is_online).await;
+        self.forward(address, worker, user_agent, is_online);
     }
 }
 
 /// Publishes both SV1 + SV2 device-status events to the Core→Satellite
 /// `device:status` stream. Used by a split front (Core) that has no in-process
 /// dispatcher; the Satellite's [`crate::device_status_consumer`] drains the
-/// stream and fans the event out. Cheap to clone (`StreamProducer` + `PgPool`
-/// are both `Arc`-internal).
+/// stream and fans the event out. Cheap to clone (`StreamProducer` is
+/// `Arc`-internal).
 #[derive(Clone)]
 pub(crate) struct ProducingDeviceStatusSink {
     producer: StreamProducer<DeviceStatusStreamEvent>,
-    /// Same `is_returning` lookup as the dispatcher sink — the Core stamps the
-    /// flag so the Satellite needn't re-derive it.
-    pool: PgPool,
 }
 
 impl ProducingDeviceStatusSink {
-    pub(crate) fn new(redis: ConnectionManager, pool: PgPool) -> Self {
+    pub(crate) fn new(redis: ConnectionManager) -> Self {
         Self {
             producer: StreamProducer::new(redis, DEVICE_STATUS_STREAM_KEY),
-            pool,
         }
     }
 
@@ -237,8 +224,7 @@ impl ProducingDeviceStatusSink {
         user_agent: Option<&str>,
         is_online: bool,
     ) {
-        let Some(event) = build_event(&self.pool, address, worker, user_agent, is_online).await
-        else {
+        let Some(event) = build_event(address, worker, user_agent, is_online) else {
             return;
         };
         let wire = DeviceStatusStreamEvent::from(&event);
