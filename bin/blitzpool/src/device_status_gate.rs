@@ -27,6 +27,7 @@
 //! role together debounces exactly like a split deployment.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -198,16 +199,30 @@ impl ReportedStateStore for RedisReportedState {
         out
     }
 
-    async fn store(&self, key: &DeviceKey, online: bool) {
+    async fn store(&self, updates: &[(DeviceKey, bool)]) {
+        if updates.is_empty() {
+            return;
+        }
         let mut conn = self.redis.clone();
-        let value = if online { "online" } else { "offline" };
-        if let Err(err) = conn
-            .set_ex::<_, _, ()>(redis_key(key), value, REPORTED_TTL_SECS)
-            .await
-        {
+        // Pipelined, not one call per device: a front restart resolves
+        // every supervised device at once, and nothing is released until
+        // this returns. Deliberately NOT a MULTI — these writes are
+        // independent and best-effort, so all-or-nothing would buy
+        // nothing and only widen the failure.
+        let mut pipe = redis::pipe();
+        for (key, online) in updates {
+            let value = if *online { "online" } else { "offline" };
+            pipe.set_ex(redis_key(key), value, REPORTED_TTL_SECS)
+                .ignore();
+        }
+        if let Err(err) = pipe.query_async::<()>(&mut conn).await {
             // Best-effort: losing this costs one duplicated or missing
             // message after a restart, not a wrong live decision.
-            warn!(%err, "device-status gate: persisting reported state failed");
+            warn!(
+                %err,
+                count = updates.len(),
+                "device-status gate: persisting reported state failed"
+            );
         }
     }
 }
@@ -313,47 +328,106 @@ pub(crate) fn spawn(
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let task = tokio::spawn(async move {
-        gate.restore_reported_state().await;
-        // Seeding waits for a subscriber set that actually loaded, and
-        // any address that gains its first subscriber later is seeded
-        // then — otherwise its devices would only ever be learned from a
-        // future Stratum event.
-        if let Some(added) = subscribers.refresh(&pool).await {
-            seed_addresses(&gate, &pool, &added).await;
-        }
-
-        let mut tick = tokio::time::interval(SWEEP_INTERVAL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut refresh = tokio::time::interval(SUBSCRIBER_REFRESH);
-        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        refresh.tick().await; // the immediate first tick; already refreshed above
-
-        info!(
-            interval_s = SWEEP_INTERVAL.as_secs(),
-            "device-status gate: sweeper started"
-        );
-        loop {
-            tokio::select! {
-                biased;
-                _ = task_cancel.cancelled() => break,
-                _ = refresh.tick() => {
-                    if let Some(added) = subscribers.refresh(&pool).await {
-                        seed_addresses(&gate, &pool, &added).await;
-                    }
-                }
-                _ = tick.tick() => {
-                    let notices = gate.poll_due().await;
-                    if notices.is_empty() {
-                        continue;
-                    }
-                    debug!(count = notices.len(), "device-status gate: releasing");
-                    dispatch(&dispatcher, notices, &task_cancel).await;
-                }
-            }
-        }
+        run_sweeper(gate, subscribers, dispatcher, pool, task_cancel).await;
         info!("device-status gate: sweeper stopped");
     });
     DeviceStatusGateHandle { cancel, task }
+}
+
+/// Await `fut` unless shutdown starts first; `None` means stop.
+///
+/// Every await the sweeper performs goes through this. [`dispatch`] was
+/// already cancellable, but the Redis + Postgres round-trips in front of
+/// it were not — so an unreachable dependency still parked the whole
+/// deploy behind `task.await` with no timeout, and a process that gets
+/// SIGKILLed for taking too long cannot run its own cleanup either. That
+/// is exactly what making the drain cancellable was meant to avoid, so
+/// the rest of the tick has to hold the same property.
+///
+/// Dropping a lookup or a store mid-flight is safe here: no lock is held
+/// across an await, and the in-memory schedule dies with the process
+/// anyway — it is rebuilt from the seed, and the reported state that
+/// makes a transition a transition is persisted.
+async fn until_cancelled<T>(cancel: &CancellationToken, fut: impl Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        value = fut => Some(value),
+    }
+}
+
+async fn run_sweeper(
+    gate: Arc<Gate>,
+    subscribers: SubscribedAddresses,
+    dispatcher: Arc<NotificationDispatcher>,
+    pool: PgPool,
+    cancel: CancellationToken,
+) {
+    // Startup is cancellable too: a process told to stop while a slow
+    // restore is still in flight must not hold the deploy either.
+    if until_cancelled(&cancel, gate.restore_reported_state())
+        .await
+        .is_none()
+    {
+        return;
+    }
+    // Seeding waits for a subscriber set that actually loaded, and any
+    // address that gains its first subscriber later is seeded then —
+    // otherwise its devices would only ever be learned from a future
+    // Stratum event.
+    match until_cancelled(&cancel, subscribers.refresh(&pool)).await {
+        None => return,
+        Some(Some(added)) => {
+            if until_cancelled(&cancel, seed_addresses(&gate, &pool, &added))
+                .await
+                .is_none()
+            {
+                return;
+            }
+        }
+        Some(None) => {}
+    }
+
+    let mut tick = tokio::time::interval(SWEEP_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut refresh = tokio::time::interval(SUBSCRIBER_REFRESH);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    refresh.tick().await; // the immediate first tick; already refreshed above
+
+    info!(
+        interval_s = SWEEP_INTERVAL.as_secs(),
+        "device-status gate: sweeper started"
+    );
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = refresh.tick() => {
+                let Some(refreshed) = until_cancelled(&cancel, subscribers.refresh(&pool)).await
+                else {
+                    break;
+                };
+                if let Some(added) = refreshed {
+                    if until_cancelled(&cancel, seed_addresses(&gate, &pool, &added))
+                        .await
+                        .is_none()
+                    {
+                        break;
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                let Some(notices) = until_cancelled(&cancel, gate.poll_due()).await else {
+                    break;
+                };
+                if notices.is_empty() {
+                    continue;
+                }
+                debug!(count = notices.len(), "device-status gate: releasing");
+                dispatch(&dispatcher, notices, &cancel).await;
+            }
+        }
+    }
 }
 
 /// Fan out released notices with bounded concurrency.
@@ -468,6 +542,43 @@ mod tests {
         subs.inner.write().expect("lock").insert(ADDR.to_string());
         assert!(subs.contains(ADDR));
         assert!(!subs.contains("some-other-address"));
+    }
+
+    /// Shutdown must not wait on a dependency that never answers. The
+    /// sweep is a Redis SCAN plus a Postgres query before the (already
+    /// cancellable) dispatch, and `shutdown` joins the task with no
+    /// timeout — so a hung Redis parked the deploy until the supervisor
+    /// SIGKILLed it, and a killed process cannot run its own cleanup.
+    ///
+    /// This covers the primitive every await in the sweeper now goes
+    /// through, not the wiring: that each call site uses it is verified by
+    /// reading `run_sweeper`, because making the loop drivable from a test
+    /// would mean threading a fake dispatcher through production types.
+    #[tokio::test]
+    async fn a_hung_dependency_does_not_hold_shutdown() {
+        let cancel = CancellationToken::new();
+        let never = std::future::pending::<()>();
+
+        let cancelling = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                cancel.cancel();
+            })
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(5), until_cancelled(&cancel, never))
+            .await
+            .expect("cancellation must win against a future that never resolves");
+        assert!(outcome.is_none(), "cancelled means stop, not a value");
+        let _ = cancelling.await;
+
+        // And it stays a pass-through when nothing is shutting down.
+        let live = CancellationToken::new();
+        assert_eq!(
+            until_cancelled(&live, std::future::ready(7)).await,
+            Some(7),
+            "a normal tick must still get its result"
+        );
     }
 
     /// The Redis key has to survive a round trip — an address and a

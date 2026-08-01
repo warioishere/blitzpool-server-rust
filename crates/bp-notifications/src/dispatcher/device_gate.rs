@@ -179,8 +179,15 @@ pub trait ReportedStateStore: Send + Sync {
     /// empty map rather than block the gate; the cost is one restart's
     /// worth of imprecision, not an outage.
     async fn load(&self) -> HashMap<DeviceKey, bool>;
-    /// Record `online` for `key`. Best-effort.
-    async fn store(&self, key: &DeviceKey, online: bool);
+    /// Record what changed in this sweep. Best-effort.
+    ///
+    /// Takes the whole batch rather than one device at a time because the
+    /// events that produce a large one — a front restarting, a rental
+    /// ending — produce it all at once, and the messages cannot go out
+    /// until this returns. One round-trip per device would put the
+    /// persistence of state nobody reads ahead of the notification
+    /// somebody is waiting for.
+    async fn store(&self, updates: &[(DeviceKey, bool)]);
 }
 
 /// A no-op store — the gate degrades to its pre-persistence behaviour.
@@ -191,7 +198,7 @@ impl ReportedStateStore for NoReportedStateStore {
     async fn load(&self) -> HashMap<DeviceKey, bool> {
         HashMap::new()
     }
-    async fn store(&self, _key: &DeviceKey, _online: bool) {}
+    async fn store(&self, _updates: &[(DeviceKey, bool)]) {}
 }
 
 /// A confirmed, ready-to-send device-status message.
@@ -238,6 +245,16 @@ struct DeviceState {
     /// An event landed while the lookup was in flight, so the answer
     /// coming back describes a state that has already moved on.
     dirty: bool,
+    /// Backfilled from the database with nothing ever reported for it, so
+    /// the first resolution only records where it stands — it does not
+    /// send. Cleared by that first resolution.
+    ///
+    /// Without this, taking a device under supervision is itself a
+    /// message: seeding reaches an hour back, so the first boot after
+    /// this feature ships, and every address that gains its first
+    /// subscriber, would announce disconnects that happened before anyone
+    /// was watching.
+    settle_silently: bool,
     /// Most recent raw event — supplies worker name, user agent and the
     /// timestamp the message renders.
     meta: DeviceStatusEvent,
@@ -346,6 +363,12 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
                 armed_by: None,
                 in_flight: false,
                 dirty: false,
+                // Only when nothing was ever reported for it. A device
+                // that HAS a reported state is a device the subscriber
+                // already heard about, so the deploy it just died during
+                // still produces its offline message — that case rides on
+                // the persisted state, not on this.
+                settle_silently: notified == Notified::Unknown,
                 meta: DeviceStatusEvent {
                     address,
                     worker_name: (!worker.is_empty()).then_some(worker),
@@ -384,6 +407,9 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
             armed_by: None,
             in_flight: false,
             dirty: false,
+            // An event is something we witnessed while watching, not a
+            // backfill of what happened before — it gets the normal rules.
+            settle_silently: false,
             meta: event.clone(),
             last_event_at: now,
         });
@@ -428,8 +454,8 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
             match self.lookup.liveness(&due).await {
                 Some(answer) => {
                     let writes = self.resolve(&due, &answer, now);
-                    for (key, online) in writes {
-                        self.store.store(&key, online).await;
+                    if !writes.is_empty() {
+                        self.store.store(&writes).await;
                     }
                 }
                 // Blind: keep every deadline and retry next tick. The
@@ -521,6 +547,11 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
                 Notified::Offline
             };
             state.armed_by = None;
+            // One-shot, and consumed whatever the answer turns out to be:
+            // a backfilled device settles into whichever state it is
+            // actually in, silently, and is supervised normally from then
+            // on.
+            let settling = std::mem::replace(&mut state.settle_silently, false);
 
             let previous = state.notified;
             if target != previous {
@@ -528,9 +559,10 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
                 // online when the pool first saw it after this gate
                 // started. Everything older predates our supervision —
                 // announcing it would turn a restart into a broadcast.
-                let announce = previous != Notified::Unknown
-                    || target == Notified::Offline
-                    || seen.is_some_and(|l| l.first_seen_ms >= self.started_at_ms);
+                let announce = !settling
+                    && (previous != Notified::Unknown
+                        || target == Notified::Offline
+                        || seen.is_some_and(|l| l.first_seen_ms >= self.started_at_ms));
                 state.notified = target;
                 writes.push((key.clone(), live));
                 if announce {
@@ -777,6 +809,10 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         state: Mutex<HashMap<DeviceKey, bool>>,
+        /// Size of each `store` call, in order. The gate must hand a
+        /// sweep's changes over in one go — see
+        /// `a_sweeps_writes_are_persisted_in_one_call`.
+        batches: Mutex<Vec<usize>>,
     }
 
     impl FakeStore {
@@ -793,6 +829,9 @@ mod tests {
                 .get(&FakeDb::key(worker))
                 .copied()
         }
+        fn batches(&self) -> Vec<usize> {
+            self.batches.lock().expect("lock").clone()
+        }
     }
 
     #[async_trait]
@@ -800,8 +839,12 @@ mod tests {
         async fn load(&self) -> HashMap<DeviceKey, bool> {
             self.state.lock().expect("lock").clone()
         }
-        async fn store(&self, key: &DeviceKey, online: bool) {
-            self.state.lock().expect("lock").insert(key.clone(), online);
+        async fn store(&self, updates: &[(DeviceKey, bool)]) {
+            self.batches.lock().expect("lock").push(updates.len());
+            let mut state = self.state.lock().expect("lock");
+            for (key, online) in updates {
+                state.insert(key.clone(), *online);
+            }
         }
     }
 
@@ -1126,9 +1169,19 @@ mod tests {
     /// A miner that dies just before a deploy will never emit another
     /// Stratum event. Seeding the watch list from the database is the
     /// only thing that still gets its owner the offline message.
+    ///
+    /// The store is preloaded because that is what a deploy actually
+    /// looks like: the subscriber had already been told this worker was
+    /// online, and that record outlives the process. Seeding against an
+    /// EMPTY store models a first-ever boot instead, where staying quiet
+    /// is the correct behaviour — see
+    /// `a_backfilled_device_settles_without_announcing_the_past`.
     #[tokio::test]
     async fn a_seeded_dead_device_is_reported_without_any_event() {
-        let h = harness();
+        let store = Arc::new(FakeStore::default());
+        store.preload("axe01", true);
+        let h = harness_with(store);
+        h.gate.restore_reported_state().await;
         h.db.set("axe01", false, -7200);
         h.gate
             .seed([(address(), "axe01".to_string(), Some("BitAxe".into()))]);
@@ -1138,6 +1191,64 @@ mod tests {
             singles(&h.gate.poll_due().await),
             vec![("axe01".into(), false)],
             "the restart no longer swallows it"
+        );
+    }
+
+    /// Taking a device under supervision must not itself be a message.
+    /// The seed reaches an hour back, so on the first boot after this
+    /// ships — and for every address that gains its first subscriber —
+    /// announcing what it finds would page people about disconnects that
+    /// happened before anyone was watching. A brand-new subscriber's very
+    /// first notification would be an hour-old outage.
+    ///
+    /// Settling is not forgetting: the state IS recorded, so the next
+    /// real change is still a transition.
+    #[tokio::test]
+    async fn a_backfilled_device_settles_without_announcing_the_past() {
+        let h = harness();
+        // Dead for half an hour, nothing ever reported for it.
+        h.db.set("axe01", false, -7200);
+        h.gate
+            .seed([(address(), "axe01".to_string(), Some("BitAxe".into()))]);
+
+        h.advance(20);
+        assert!(
+            h.gate.poll_due().await.is_empty(),
+            "an outage from before we were watching is not news"
+        );
+
+        // But it did settle at offline rather than staying unknown, so
+        // the recovery is a transition and does go out.
+        h.open_window();
+        h.db.set_live("axe01", true);
+        h.gate.observe(&event("axe01", true, h.clock.now()));
+        h.advance(100);
+        assert_eq!(
+            singles(&h.gate.poll_due().await),
+            vec![("axe01".into(), true)],
+            "settling silently must not swallow the return too"
+        );
+    }
+
+    /// The silence is one-shot. A device backfilled while it was still
+    /// running settles quietly, and the outage that follows is a normal
+    /// transition — otherwise seeding would blind the gate to the first
+    /// real thing that happens.
+    #[tokio::test]
+    async fn the_backfill_silence_covers_only_the_first_resolution() {
+        let h = harness();
+        h.db.set("axe01", true, -7200);
+        h.gate
+            .seed([(address(), "axe01".to_string(), Some("BitAxe".into()))]);
+        h.advance(20);
+        assert!(h.gate.poll_due().await.is_empty(), "settled quietly");
+
+        h.db.set_live("axe01", false);
+        h.advance(301);
+        assert_eq!(
+            singles(&h.gate.poll_due().await),
+            vec![("axe01".into(), false)],
+            "the next change is a real transition"
         );
     }
 
@@ -1373,6 +1484,44 @@ mod tests {
             vec![("axe01".into(), true)],
             "the owner was told it went down and must be told it is back"
         );
+    }
+
+    /// A front restart resolves every supervised device in one sweep, and
+    /// nothing is released until the reported state has been written. One
+    /// round-trip per device would put the persistence of state nobody
+    /// reads in front of the notification somebody is waiting for, so the
+    /// whole sweep goes over in a single call.
+    #[tokio::test]
+    async fn a_sweeps_writes_are_persisted_in_one_call() {
+        let store = Arc::new(FakeStore::default());
+        let h = harness_with(Arc::clone(&store));
+
+        // Twelve workers the pool has known for hours, all seeded and all
+        // gone — one sweep, twelve reported-state changes.
+        let workers: Vec<String> = (0..12).map(|i| format!("axe{i:02}")).collect();
+        for worker in &workers {
+            h.db.set(worker, false, -7200);
+            store.preload(worker, true);
+        }
+        h.gate.restore_reported_state().await;
+        h.gate.seed(
+            workers
+                .iter()
+                .map(|w| (address(), w.clone(), Some("BitAxe".into()))),
+        );
+
+        h.advance(20);
+        let out = h.gate.poll_due().await;
+        assert_eq!(out.len(), 1, "one address, one aggregate");
+
+        assert_eq!(
+            store.batches(),
+            vec![12],
+            "twelve changes must reach the store as one batch, not twelve calls"
+        );
+        for worker in &workers {
+            assert_eq!(store.get(worker), Some(false), "{worker} was persisted");
+        }
     }
 
     /// A miner that is merely share-quiet must not read as gone. The
