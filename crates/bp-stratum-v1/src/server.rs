@@ -390,25 +390,19 @@ impl StratumV1Server {
         let extranonce = self.inner.extranonce.clone();
         let job_cache = self.inner.job_cache.clone();
 
-        tokio::spawn(async move {
-            let result = run_connection(
-                server_config,
-                port_config,
-                registry,
-                template_rx,
-                initial_template,
-                alt_streams,
-                hooks,
-                socket,
-                cancel,
-                extranonce,
-                job_cache,
-            )
-            .await;
-            if let Err(err) = result {
-                debug!("sv1 connection ended: {err}");
-            }
-        })
+        tokio::spawn(run_connection(
+            server_config,
+            port_config,
+            registry,
+            template_rx,
+            initial_template,
+            alt_streams,
+            hooks,
+            socket,
+            cancel,
+            extranonce,
+            job_cache,
+        ))
     }
 
     /// Cancel the translator + every running connection. Idempotent.
@@ -565,6 +559,13 @@ async fn run_translator(
 /// Drive a single SV1 connection from accept-to-close. Uses
 /// [`SystemClock`] in production; tests drive the pure handlers
 /// directly via `client::dispatch`.
+///
+/// Returns nothing on purpose. Every route out of the loop below has to
+/// reach the teardown at the end — a session that exits without
+/// `deregister_session` stays in the front's live-session set for the
+/// life of the process, and the device can never be reported offline
+/// again. An `io::Result` invited a `?` to skip it (a reset connection
+/// did exactly that); with no error type, one no longer compiles.
 #[allow(clippy::too_many_arguments)]
 async fn run_connection(
     server_config: Arc<ServerConfig>,
@@ -578,7 +579,7 @@ async fn run_connection(
     cancel: CancellationToken,
     extranonce: SharedExtranonce,
     job_cache: Arc<MiningJobCache>,
-) -> std::io::Result<()> {
+) {
     let (read_half, mut write_half) = socket.into_split();
     // Length-capped line framing: a peer that never sends a newline can no
     // longer grow the read buffer without bound (see MAX_STRATUM_LINE_BYTES).
@@ -645,7 +646,23 @@ async fn run_connection(
                     Some(Err(LinesCodecError::Io(e))) => Err(e),
                     None => Ok(None),
                 };
-                match line? {
+                let line = match line {
+                    Ok(line) => line,
+                    // A miner that vanishes without closing — power cut,
+                    // yanked cable, NAT timeout — resets the connection,
+                    // and the read fails rather than reporting EOF. That
+                    // is a normal way for a session to end, not a reason
+                    // to skip the teardown below.
+                    Err(err) => {
+                        debug!(
+                            session_id = %state.session_id_hex,
+                            %err,
+                            "sv1: read failed; closing the connection"
+                        );
+                        break;
+                    }
+                };
+                match line {
                     None => break,                       // EOF
                     Some(line) => {
                         // Mark when the inbound line became available — used to
@@ -770,7 +787,7 @@ async fn run_connection(
                             &hooks,
                             &mut write_half,
                         )
-                        .await?
+                        .await
                         {
                             break;
                         }
@@ -811,7 +828,7 @@ async fn run_connection(
                                 &hooks,
                                 &mut write_half,
                             )
-                            .await?
+                            .await
                             {
                                 break;
                             }
@@ -874,7 +891,7 @@ async fn run_connection(
                     &hooks,
                     &mut write_half,
                 )
-                .await?
+                .await
                 {
                     break;
                 }
@@ -910,7 +927,7 @@ async fn run_connection(
                     &hooks,
                     &mut write_half,
                 )
-                .await?
+                .await
                 {
                     break;
                 }
@@ -926,11 +943,12 @@ async fn run_connection(
         .await;
     // Half-close the socket so the miner sees a FIN.
     let _ = write_half.shutdown().await;
-    Ok(())
 }
 
 /// Flush outbound frames + process events. Returns `false` when the
-/// session has signaled disconnect (caller breaks the loop).
+/// session has signaled disconnect **or** when the socket can no longer
+/// be written — both mean the connection is over, and the caller breaks
+/// the loop either way.
 ///
 /// On `SessionEvent::Authorized` this also async-resolves payouts
 /// for the freshly-authorized address against the current template
@@ -950,7 +968,7 @@ async fn apply_outcome(
     current_template: Option<&Arc<ActiveSV1Template>>,
     hooks: &ServerHooks,
     write_half: &mut tokio::net::tcp::OwnedWriteHalf,
-) -> std::io::Result<bool> {
+) -> bool {
     for frame in &outcome.outbound_frames {
         if server_config.protocol_debug {
             // Outbound JSON-RPC line dump (mining.notify,
@@ -963,7 +981,9 @@ async fn apply_outcome(
                 "📤 TX: {pretty}"
             );
         }
-        write_half.write_all(frame).await?;
+        if write_failed(write_half, frame, &state.session_id_hex).await {
+            return false;
+        }
     }
     let mut keep_alive = true;
     for event in outcome.events {
@@ -999,7 +1019,9 @@ async fn apply_outcome(
                             "📤 TX: {pretty}"
                         );
                     }
-                    write_half.write_all(frame).await?;
+                    if write_failed(write_half, frame, &state.session_id_hex).await {
+                        return false;
+                    }
                 }
                 // `apply_new_template` doesn't currently emit session
                 // events; if that changes, propagate them here.
@@ -1007,7 +1029,29 @@ async fn apply_outcome(
             }
         }
     }
-    Ok(keep_alive)
+    keep_alive
+}
+
+/// Write one frame, reporting `true` when the socket is gone.
+///
+/// A failed write means the peer is no longer reachable, which is the
+/// same thing as the session ending — so it is folded into
+/// [`apply_outcome`]'s "keep alive?" answer rather than propagated. The
+/// connection loop must reach its teardown on this path: a session that
+/// exits without deregistering stays in the live-session set forever,
+/// and the device can never be reported offline again.
+async fn write_failed(
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    frame: &[u8],
+    session_id: &str,
+) -> bool {
+    match write_half.write_all(frame).await {
+        Ok(()) => false,
+        Err(err) => {
+            debug!(session_id, %err, "sv1: write failed; closing the connection");
+            true
+        }
+    }
 }
 
 /// Async-resolve the coinbase payout list for the session's
