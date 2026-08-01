@@ -18,25 +18,24 @@
 //! `build_distribution` with their own address as the prospective
 //! finder.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bp_coinbase_snapshot::share_map_from_redis_hash;
+use bp_coinbase_snapshot::{share_map_from_redis_hash, StoredWeightSnapshot};
 use bp_common::{AddressId, Sats};
 use bp_db::{find_group, find_pplns_group_balances_for_group, DbError, PplnsGroupBalanceRow};
 use bp_inflight_cache::InflightResultCache;
 use bp_pplns::{
-    build_coinbase_distribution, is_valid_payout_address, CoinbaseDistributionEntry,
-    CoinbaseDistributionInput,
+    build_weight_distribution, is_valid_payout_address, WeightBuildError, WeightDistribution,
+    WeightDistributionInput,
 };
-use bp_share::payouts_fingerprint_from_parts;
 use sqlx::PgPool;
 use thiserror::Error;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::round::snapshot::{write_snapshot, write_snapshot_for, StoredSnapshot};
+use crate::round::snapshot::{write_weight_snapshot, write_weight_snapshot_for};
 use crate::round::{GroupRoundStore, RoundError};
 
 /// Default cache TTL for `DistributionBuilder::build` (30 s).
@@ -62,6 +61,12 @@ pub enum DistributionError {
     Db(#[from] DbError),
     #[error("group {group_id} not found in pplns_group")]
     GroupNotFound { group_id: Uuid },
+    /// The weight model has no distribution without a pool-output
+    /// recipient — `pay_P` is structural (SV2 ext 0x0003 §4).
+    #[error("no fee address configured — the weight model requires the pool-output recipient")]
+    NoFeeAddress,
+    #[error("weight build: {0}")]
+    WeightBuild(#[from] WeightBuildError),
 }
 
 /// Cache key — concurrent calls with the same triple share one compute.
@@ -73,30 +78,25 @@ type CacheKey = (Uuid, u64, String);
 pub struct DistributionResult {
     pub group_id: Uuid,
     pub finder_address: AddressId,
-    pub payouts: Vec<CoinbaseDistributionEntry>,
-    pub considered_addresses: HashSet<AddressId>,
-    /// Absolute new `pendingSats` per address whose state changed.
-    /// Always `≥ 0` for Group-Solo.
-    pub balance_after: HashMap<AddressId, Sats>,
-    pub block_reward_sats: u64,
-    /// Identity of `payouts` + the reward it was built over — the key this
-    /// build's snapshot is stored under.
-    ///
-    /// The Stratum job build derives the same value independently from the
-    /// `PayoutEntry` list it turns into the coinbase, and a found block carries
-    /// it. That is what lets the block-found path ask for the distribution its
-    /// own coinbase pays instead of building a fresh one against a round that
-    /// has moved. See [`bp_share::payouts_fingerprint_from_parts`].
-    pub payouts_fingerprint: [u8; 32],
-    /// Did the snapshot under `payouts_fingerprint` actually get written?
-    ///
-    /// `false` means the build succeeded but its snapshot did not land (after
-    /// retries), so the fingerprint names a key that does not exist. The
-    /// distribution still becomes a coinbase — failing the build would hand the
-    /// finder a solo job paying itself the group's block. But a caller that
-    /// promises a found block will be booked automatically MUST NOT promise on a
-    /// `false`; the booking would resolve to nothing.
+    /// The weight-native distribution (SV2 ext 0x0003 model): entries
+    /// with settlement inputs + published wire weights, `weight_P`, the
+    /// finder bonus recorded for settlement, and the weights
+    /// fingerprint. Concrete satoshis come from
+    /// [`WeightDistribution::payout_entries_at`] at the caller's
+    /// revenue.
+    pub distribution: WeightDistribution,
+    /// Did the schema-2 snapshot under the fingerprint actually get
+    /// written (after retries)? `false` → the distribution still
+    /// becomes a coinbase, but a block found on it cannot be booked
+    /// automatically — never promise a booking on `false`.
     pub snapshot_written: bool,
+}
+
+impl DistributionResult {
+    /// The snapshot key this build landed under.
+    pub fn payouts_fingerprint(&self) -> [u8; 32] {
+        self.distribution.fingerprint
+    }
 }
 
 /// Engine-wide knobs for the distribution path. Per-group settings
@@ -243,50 +243,35 @@ async fn compute_distribution(
     }
 
     // 4. Build inputs + call pure math. `bp_group_solo::build_group_solo_distribution`
-    //    is a thin wrapper over `bp_pplns::build_coinbase_distribution` that
-    //    flips `suppress_matching_debits = true` and forwards finder
-    //    fields, but it expects a `GroupRoundState` (in-process struct).
-    //    Since we hold the round state in Redis, we call the underlying
-    //    pure-math function directly with the same flag. Identical
-    //    behavior, skips the round-state-construction round-trip.
-    let input = CoinbaseDistributionInput {
+    //    Weight-native build (SV2 ext 0x0003 model): the round scores
+    //    project onto integer weights, `pendingSats` and the per-group
+    //    finder bonus become weight boosts on their entries, min_payout
+    //    is the per-output dust limit, and the blockspace cap folds into
+    //    `weight_P`. Group-Solo's `pendingSats` is unsigned (≥ 0), so
+    //    the balance boosts here are only ever positive.
+    let fee_address = config
+        .fee_address
+        .as_ref()
+        .ok_or(DistributionError::NoFeeAddress)?;
+    let distribution = build_weight_distribution(WeightDistributionInput {
         address_shares: &address_shares,
         balances: &balances,
-        block_reward_sats: Sats(block_reward_sats as i64),
         fee_percent: config.fee_percent,
-        fee_address: config.fee_address.as_ref(),
+        fee_address,
         coinbase_weight_budget: config.coinbase_weight_budget,
-        suppress_matching_debits: true, // Group-Solo invariant
         min_payout_sats: Some(config.min_payout_sats),
         finder_bonus_sats,
         finder_address: Some(finder_address),
-    };
-    let math = build_coinbase_distribution(input);
+        reference_revenue_sats: block_reward_sats,
+    })?;
 
-    // 5. Persist the snapshot under the identity of the payout list it
-    //    distributes. Nothing else writes that key, so it still holds THIS
-    //    distribution when the block that mined it is found, however many
-    //    rebuilds ran in between. The per-(group, finder) key is written
-    //    alongside it for the manual reprocess path — it is last-writer-wins
-    //    by design and no automatic apply reads it.
-    // Records the ledger state this distribution was computed against, so the
-    // apply can write a delta instead of an absolute. The snapshot is resolved
-    // at block-found from the job that mined the block, which may be many
-    // minutes old — an absolute write would silently roll back whatever moved
-    // `pendingSats` since (a kick redistribution, a dust sweep, another block).
-    let snapshot = StoredSnapshot::from_math_with_before(
-        &math.payouts,
-        block_reward_sats,
-        &math.considered_addresses,
-        &math.balance_after,
-        &balances,
-    );
-    let payouts_fingerprint = payouts_fingerprint_from_parts(
-        block_reward_sats,
-        math.payouts
-            .iter()
-            .map(|p| (p.address.as_str(), p.sats.to_i64().max(0) as u64)),
-    );
+    // 5. Persist the settlement inputs under the weights fingerprint.
+    //    Nothing else writes that key, and because settlement books
+    //    `claim(T_actual) − paid` from the REAL coinbase, one snapshot
+    //    serves every job built from this distribution. The per-(group,
+    //    finder) key is written alongside for the manual reprocess path.
+    let snapshot = StoredWeightSnapshot::from_distribution(&distribution);
+    let payouts_fingerprint = distribution.fingerprint;
     let group_key = group_id.to_string();
     // Neither write may fail the build. The distribution itself is correct and
     // is about to become a coinbase; returning `Err` here sends
@@ -297,14 +282,14 @@ async fn compute_distribution(
     let mut conn_fp = round.connection_for_snapshot();
     let mut conn_finder = round.connection_for_snapshot();
     let (by_fingerprint, by_finder) = tokio::join!(
-        write_snapshot_for_with_retry(
+        write_weight_snapshot_for_with_retry(
             &mut conn_fp,
             &group_key,
             &payouts_fingerprint,
             &snapshot,
             config.snapshot_ttl_secs,
         ),
-        write_snapshot(
+        write_weight_snapshot(
             &mut conn_finder,
             &group_key,
             finder_address.as_str(),
@@ -336,11 +321,7 @@ async fn compute_distribution(
     Ok(DistributionResult {
         group_id,
         finder_address: finder_address.clone(),
-        payouts: math.payouts,
-        considered_addresses: math.considered_addresses,
-        balance_after: math.balance_after,
-        block_reward_sats,
-        payouts_fingerprint,
+        distribution,
         snapshot_written,
     })
 }
@@ -353,16 +334,18 @@ async fn compute_distribution(
 /// failure in the middle leaves the key *deleted*, so a build that would have
 /// been a harmless no-op rewrite of an existing snapshot can destroy it. A
 /// re-run repairs exactly that.
-async fn write_snapshot_for_with_retry(
+async fn write_weight_snapshot_for_with_retry(
     conn: &mut redis::aio::ConnectionManager,
     group_key: &str,
-    payouts_fingerprint: &[u8; 32],
-    snapshot: &StoredSnapshot,
+    weights_fingerprint: &[u8; 32],
+    snapshot: &StoredWeightSnapshot,
     ttl_secs: u32,
 ) -> Result<(), redis::RedisError> {
     let mut attempt = 0;
     loop {
-        match write_snapshot_for(conn, group_key, payouts_fingerprint, snapshot, ttl_secs).await {
+        match write_weight_snapshot_for(conn, group_key, weights_fingerprint, snapshot, ttl_secs)
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(err) if attempt < SNAPSHOT_WRITE_RETRIES => {
                 warn!(
@@ -426,17 +409,30 @@ mod tests {
 
     #[test]
     fn distribution_result_is_cloneable() {
+        let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+        let fee = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap();
+        let shares = HashMap::from([(finder.clone(), 2.0)]);
+        let balances = HashMap::new();
+        let distribution = build_weight_distribution(WeightDistributionInput {
+            address_shares: &shares,
+            balances: &balances,
+            fee_percent: 1.0,
+            fee_address: &fee,
+            coinbase_weight_budget: 50_000,
+            min_payout_sats: Some(Sats(5_000)),
+            finder_bonus_sats: Some(Sats(50_000)),
+            finder_address: Some(&finder),
+            reference_revenue_sats: 312_500_000,
+        })
+        .unwrap();
         let r = DistributionResult {
             group_id: Uuid::new_v4(),
-            finder_address: AddressId::new("bc1qfinder").unwrap(),
-            payouts: vec![],
-            considered_addresses: HashSet::new(),
-            balance_after: HashMap::new(),
-            block_reward_sats: 312_500_000,
-            payouts_fingerprint: [0u8; 32],
+            finder_address: finder,
+            distribution,
             snapshot_written: true,
         };
         let cloned = r.clone();
-        assert_eq!(cloned.block_reward_sats, 312_500_000);
+        assert_eq!(cloned.payouts_fingerprint(), r.payouts_fingerprint());
+        assert_eq!(cloned.distribution.reference_revenue_sats, 312_500_000);
     }
 }

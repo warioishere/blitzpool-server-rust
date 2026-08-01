@@ -50,7 +50,7 @@ use crate::distribution::{
 };
 use crate::ledger::{
     apply_distribution, coinbase_row, pending_row, ApplyDistributionResult, AuditRow, BalanceWrite,
-    LedgerError,
+    GroupPayoutRowType, LedgerError,
 };
 use crate::reset::{spawn_per_group_task, GroupResetRunner, ResetError, ResetSchedule};
 use bp_share::payouts_fingerprint_from_parts;
@@ -636,6 +636,50 @@ impl GroupSoloEngine {
         Ok(snapshot.into())
     }
 
+    /// Look up the WEIGHT snapshot (schema 2) the found block's coinbase was
+    /// built from, for stamping into the block-found event. Same
+    /// no-rebuild rationale as [`Self::snapshot_for_block_found`]; the
+    /// settlement band is checked at apply time, where the actual
+    /// revenue is known.
+    pub async fn weight_snapshot_for_block_found(
+        &self,
+        group_id: Uuid,
+        finder_address: &AddressId,
+        weights_fingerprint: &[u8; 32],
+    ) -> Result<bp_coinbase_snapshot::StoredWeightSnapshot, EngineError> {
+        let mut conn = self.inner.round.connection_for_snapshot();
+        let group_key = group_id.to_string();
+        let mut attempt = 0;
+        loop {
+            match crate::round::snapshot::read_weight_snapshot_for(
+                &mut conn,
+                &group_key,
+                weights_fingerprint,
+            )
+            .await
+            {
+                Ok(Some(s)) => return Ok(s),
+                Ok(None) => {
+                    return Err(EngineError::SnapshotMissingForPayouts {
+                        group_id,
+                        finder_address: finder_address.as_str().to_string(),
+                    })
+                }
+                Err(e) if attempt < SNAPSHOT_READ_RETRIES => {
+                    warn!(
+                        error = %e,
+                        %group_id,
+                        attempt,
+                        "group-solo weight-snapshot read failed — retrying before giving up"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(SNAPSHOT_READ_BACKOFF * attempt).await;
+                }
+                Err(e) => return Err(EngineError::Redis(e)),
+            }
+        }
+    }
+
     /// Apply a Group-Solo found block, reading the distribution snapshot from
     /// the per-(group, finder) Redis key.
     ///
@@ -691,6 +735,341 @@ impl GroupSoloEngine {
             Some(snapshot),
         )
         .await
+    }
+
+    /// Weight-model block-found (SV2 ext 0x0003): settlement books
+    /// `claim(T_actual) − actually_paid` per address from the REAL
+    /// coinbase. Same per-group re-entrancy guard; same round-reset and
+    /// snapshot-cleanup semantics as the exact-match apply (the round
+    /// resets / moves on a found block, so deleting the group's
+    /// snapshots on apply stays correct here — unlike PPLNS).
+    pub async fn on_block_found_scaled(
+        &self,
+        group_id: Uuid,
+        block_height: i32,
+        actual: &bp_coinbase_snapshot::ActualCoinbase,
+        finder_address: &AddressId,
+        snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+        weights_fingerprint: Option<[u8; 32]>,
+    ) -> Result<ApplyDistributionResult, EngineError> {
+        {
+            let mut in_flight = self.inner.block_found_in_progress.lock().await;
+            if in_flight.contains(&group_id) {
+                return Err(EngineError::BlockFoundInProgress { group_id });
+            }
+            in_flight.insert(group_id);
+        }
+        let result = self
+            .on_block_found_scaled_inner(
+                group_id,
+                block_height,
+                actual,
+                finder_address,
+                snapshot,
+                weights_fingerprint,
+            )
+            .await;
+        self.inner
+            .block_found_in_progress
+            .lock()
+            .await
+            .remove(&group_id);
+        result
+    }
+
+    async fn on_block_found_scaled_inner(
+        &self,
+        group_id: Uuid,
+        block_height: i32,
+        actual: &bp_coinbase_snapshot::ActualCoinbase,
+        finder_address: &AddressId,
+        snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+        weights_fingerprint: Option<[u8; 32]>,
+    ) -> Result<ApplyDistributionResult, EngineError> {
+        let group_key = group_id.to_string();
+
+        // 1. Snapshot source: event-carried, else the fingerprint key,
+        //    else the per-(group, finder) key (tests / manual path).
+        let snapshot = match snapshot {
+            Some(s) => s,
+            None => {
+                let mut conn = self.inner.round.connection_for_snapshot();
+                let read = match weights_fingerprint.filter(|fp| fp != &[0u8; 32]) {
+                    Some(fp) => {
+                        crate::round::snapshot::read_weight_snapshot_for(&mut conn, &group_key, &fp)
+                            .await?
+                    }
+                    None => {
+                        crate::round::snapshot::read_weight_snapshot(
+                            &mut conn,
+                            &group_key,
+                            finder_address.as_str(),
+                        )
+                        .await?
+                    }
+                };
+                read.ok_or(EngineError::SnapshotMissing {
+                    group_id,
+                    finder_address: finder_address.as_str().to_string(),
+                    block_height,
+                })?
+            }
+        };
+
+        if !bp_share::reward_within_band(snapshot.reference_revenue_sats, actual.total_value_sats) {
+            warn!(
+                %group_id,
+                reference_reward = snapshot.reference_revenue_sats,
+                actual_reward = actual.total_value_sats,
+                block_height,
+                "group-solo block revenue outside the settlement band — refusing to book unattended"
+            );
+            return Err(EngineError::SnapshotRewardMismatch {
+                group_id,
+                snapshot_reward: snapshot.reference_revenue_sats,
+                actual_reward: actual.total_value_sats,
+            });
+        }
+
+        // 2. Mode + reset gate (one row read), round state for the
+        //    sharesInRound audit fields — identical to the exact apply.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let (mode, window_ms, reset_on_block) = match find_group(&self.inner.pool, group_id).await {
+            Ok(Some(g)) => {
+                let (mode, window_ms) = group_mode_from_row(&g);
+                (mode, window_ms, g.reset_round_on_block)
+            }
+            Ok(None) => (PayoutMode::Prop, 0, false),
+            Err(e) => {
+                warn!(%group_id, error = %e,
+                    "group row read failed in on_block_found — defaulting to PROP / no reset");
+                (PayoutMode::Prop, 0, false)
+            }
+        };
+        let round_by_addr = self
+            .inner
+            .round
+            .read_payout_shares(&group_key, mode, now_ms, window_ms)
+            .await?;
+        let total_shares_in_round: f64 = round_by_addr.values().sum();
+        let total_shares_i64 = total_shares_in_round.round() as i64;
+
+        let (audit_rows, balance_writes) = self
+            .build_writes_from_weight_snapshot(
+                group_id,
+                &snapshot,
+                actual,
+                &round_by_addr,
+                total_shares_i64,
+            )
+            .await?;
+
+        // 3. Apply, 4. reset, 5. cleanup, 6. cache drop — same as the
+        //    exact-match apply.
+        let outcome = apply_distribution(
+            &self.inner.pool,
+            group_id,
+            block_height,
+            &audit_rows,
+            &balance_writes,
+            now_ms,
+        )
+        .await?;
+
+        if mode == PayoutMode::Window {
+            info!(%group_id,
+                "group-solo: window mode — no per-block round reset (window self-trims by age)");
+        } else if reset_on_block {
+            if let Err(e) = self.inner.round.reset_for_block_found(&group_key).await {
+                warn!(%group_id, error = %e, "round.reset_for_block_found failed — non-fatal");
+            }
+        } else {
+            info!(%group_id,
+                "group-solo: per-block round reset disabled (resetRoundOnBlock=false) — \
+                 round accumulates until calendar/manual reset");
+        }
+
+        let mut conn = self.inner.round.connection_for_snapshot();
+        if let Err(e) = delete_all_for_group(&mut conn, &group_key).await {
+            warn!(
+                %group_id,
+                error = %e,
+                "delete_all_snapshots_for_group failed — non-fatal, TTL fallback"
+            );
+        }
+        if let Some(fp) = weights_fingerprint {
+            if let Err(e) = delete_snapshot_for(&mut conn, &group_key, &fp).await {
+                warn!(
+                    %group_id,
+                    error = %e,
+                    "delete_snapshot_for failed — non-fatal, TTL fallback"
+                );
+            }
+        }
+        self.inner.distribution_builder.invalidate_all();
+
+        info!(
+            %group_id,
+            block_height,
+            history_inserted = outcome.history_inserted,
+            balances_affected = outcome.balances_affected,
+            "group-solo on_block_found (weight model) applied"
+        );
+        Ok(outcome)
+    }
+
+    /// The weight-model settlement writes: per snapshot entry the claim
+    /// is recomputed from the raw inputs (`claim_sats` + the finder
+    /// bonus), the actually-paid amount comes from the real coinbase,
+    /// and the difference lands on `pendingSats` as a delta against the
+    /// CURRENT row — clamped at 0 (unsigned model, same rationale as
+    /// [`Self::resolve_new_balance`]). One entry per address by
+    /// construction: the finder's bonus is part of their single weight,
+    /// so the old duplicate-address merge has nothing left to merge.
+    async fn build_writes_from_weight_snapshot(
+        &self,
+        group_id: Uuid,
+        snapshot: &bp_coinbase_snapshot::StoredWeightSnapshot,
+        actual: &bp_coinbase_snapshot::ActualCoinbase,
+        round_by_addr: &HashMap<String, f64>,
+        total_shares_in_round: i64,
+    ) -> Result<(Vec<AuditRow>, Vec<BalanceWrite>), EngineError> {
+        let t = actual.total_value_sats;
+        let existing_rows: Vec<PplnsGroupBalanceRow> =
+            find_all_pplns_group_balances_for_group(&self.inner.pool, group_id).await?;
+        let existing: HashMap<String, PplnsGroupBalanceRow> = existing_rows
+            .into_iter()
+            .map(|r| (r.address.as_str().to_string(), r))
+            .collect();
+
+        let mut audit_rows: Vec<AuditRow> = Vec::new();
+        let mut balance_writes: Vec<BalanceWrite> = Vec::new();
+        let mut emitted: HashSet<String> = HashSet::new();
+
+        for entry in &snapshot.entries {
+            if entry.address == snapshot.fee_address {
+                warn!(
+                    %group_id,
+                    address = %entry.address,
+                    "group-solo weight settlement: fee address doubles as member entry — skipping"
+                );
+                continue;
+            }
+            let claim = bp_share::claim_sats(
+                entry.score_weight,
+                snapshot.score_total,
+                snapshot.fee_ppm,
+                t,
+            ) + match &snapshot.finder_bonus {
+                Some((finder, bonus)) if *finder == entry.address => *bonus,
+                _ => 0,
+            };
+            let paid = actual
+                .paid_by_address
+                .get(&entry.address)
+                .copied()
+                .unwrap_or(0);
+            let delta = claim as i64 - paid as i64;
+
+            let current = existing
+                .get(&entry.address)
+                .map(|r| r.pending_sats.0)
+                .unwrap_or(0);
+            let prev_total_paid = existing
+                .get(&entry.address)
+                .map(|r| r.total_paid_sats.0)
+                .unwrap_or(0);
+            let mut pending = current + delta;
+            if pending < 0 {
+                warn!(
+                    %group_id,
+                    address = %entry.address,
+                    current,
+                    claim,
+                    paid,
+                    "group-solo weight settlement: coinbase paid more than claim + held credit — \
+                     booking 0 rather than a debit the unsigned model cannot carry"
+                );
+                pending = 0;
+            }
+
+            let addr_id = AddressId::new(entry.address.clone())?;
+            let shares_in_round = round_by_addr
+                .get(&entry.address)
+                .map(|f| f.round() as i64)
+                .unwrap_or(0);
+            if paid > 0 {
+                audit_rows.push(AuditRow {
+                    address: addr_id.clone(),
+                    paid_sats: Sats(paid as i64),
+                    percent: if t > 0 {
+                        (paid as f64 / t as f64 * 100.0) as f32
+                    } else {
+                        0.0
+                    },
+                    shares_in_round,
+                    total_shares_in_round,
+                    row_type: GroupPayoutRowType::Coinbase,
+                });
+            } else if delta != 0 {
+                audit_rows.push(pending_row(addr_id.clone(), Sats(delta)));
+            } else {
+                continue;
+            }
+            emitted.insert(entry.address.clone());
+            balance_writes.push(BalanceWrite {
+                address: addr_id,
+                pending_sats: Sats(pending),
+                total_paid_sats: Sats(prev_total_paid + paid as i64),
+            });
+        }
+
+        // Paid addresses the snapshot does not know — cannot happen for
+        // value outputs under positional validation; surface loudly.
+        for (addr_str, paid) in &actual.paid_by_address {
+            if *paid == 0 || emitted.contains(addr_str) || *addr_str == snapshot.fee_address {
+                continue;
+            }
+            if !snapshot.entries.iter().any(|e| &e.address == addr_str) {
+                warn!(
+                    %group_id,
+                    address = %addr_str,
+                    paid,
+                    "group-solo weight settlement: coinbase paid an address outside the distribution"
+                );
+                let Ok(addr_id) = AddressId::new(addr_str.clone()) else {
+                    continue;
+                };
+                let prev_total_paid = existing
+                    .get(addr_str)
+                    .map(|r| r.total_paid_sats.0)
+                    .unwrap_or(0);
+                audit_rows.push(AuditRow {
+                    address: addr_id.clone(),
+                    paid_sats: Sats(*paid as i64),
+                    percent: if t > 0 {
+                        (*paid as f64 / t as f64 * 100.0) as f32
+                    } else {
+                        0.0
+                    },
+                    shares_in_round: 0,
+                    total_shares_in_round,
+                    row_type: GroupPayoutRowType::Coinbase,
+                });
+                emitted.insert(addr_str.clone());
+                let current = existing
+                    .get(addr_str)
+                    .map(|r| r.pending_sats.0)
+                    .unwrap_or(0);
+                balance_writes.push(BalanceWrite {
+                    address: addr_id,
+                    pending_sats: Sats((current - *paid as i64).max(0)),
+                    total_paid_sats: Sats(prev_total_paid + *paid as i64),
+                });
+            }
+        }
+
+        Ok((audit_rows, balance_writes))
     }
 
     /// Shared re-entrancy guard around the apply. `snapshot == None` reads it

@@ -4,24 +4,28 @@
 #![allow(clippy::needless_return)]
 
 //! E2E: `GroupSoloEngine::build_distribution()` → multi-output coinbase
-//! (incl. finder bonus) → `bitcoin-node` accepts the block.
+//! (incl. finder bonus) → `bitcoin-node` accepts the block → the
+//! weight-model settlement books exactly what that coinbase paid.
 //!
 //! Companion to the PPLNS e2e in `bp-pplns-engine`. Verifies that the
-//! group-solo distribution path — which has its own finder-bonus splice
-//! on top of the share-weighted per-member split — produces a coinbase
-//! whose outputs sum to the block reward and pass bitcoin-core's
-//! consensus checks.
+//! group-solo distribution path — which folds the per-group finder
+//! bonus into the finder's single §4 weight on top of the
+//! share-weighted per-member split — produces a coinbase whose outputs
+//! sum to the block reward and pass bitcoin-core's consensus checks.
 //!
-//! Two failure modes this test would catch that the PG-only group-solo
+//! Failure modes this test would catch that the PG-only group-solo
 //! integration tests cannot:
-//!   - finder bonus subtraction off-by-one (bonus_sats not removed from
-//!     the member pool before share-weighting → coinbase outputs sum to
-//!     `reward + bonus`, `bad-cb-amount`)
-//!   - finder address splice corrupted (e.g. wrong index, double-credit)
+//!   - §4 projection drift (the payout vector not consuming exactly the
+//!     template revenue → `bad-cb-amount`)
+//!   - finder-bonus fold drift (bonus double-counted or lost in the
+//!     finder's single weight)
+//!   - a settlement that books a split the accepted coinbase did not pay
 //!
 //! Sequence: boot regtest, seed group row + three members in PG, seed
 //! round shares in Redis, build distribution for the finder address,
-//! feed payouts into MiningJob, submit, assert tip advances.
+//! feed the §4 payout vector into MiningJob, submit, assert tip
+//! advances, then settle from the accepted coinbase via the scaled path
+//! and assert ledger == coinbase.
 
 use std::time::Duration;
 
@@ -148,67 +152,79 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
         .build_distribution(group_id, reward_sats, &finder)
         .await
         .expect("build_distribution");
-    // ── Exact-shape assertion ────────────────────────────────────
+    let fingerprint = dist.payouts_fingerprint();
+    // ── Exact-shape assertion (§4 evaluation at this revenue) ────
     //
     // For (group of 3 active members, fee_address set, finder bonus
-    // > min_payout), the production distribution emits:
-    //   1× fee output (fee_address)
-    //   1× bonus output (finder address, sats == configured bonus)
-    //   3× share outputs (one per kept active miner)
-    //   → 5 total entries, with the finder appearing in TWO entries
-    //     (the bonus output + its own share-weighted output).
+    // > min_payout), the §4 payout vector emits:
+    //   1× pool output first (fee_address)
+    //   3× share outputs (one per kept active member)
+    //   → 4 total entries. The finder bonus is FOLDED into Alice's
+    //     single weight — no dedicated bonus output exists under §4.
+    let entries = dist
+        .distribution
+        .payout_entries_at(reward_sats)
+        .expect("§4 payout vector");
     assert_eq!(
-        dist.payouts.len(),
-        5,
-        "expected 5 payouts (fee + finder-bonus + 3 member shares) — got {}: {:?}",
-        dist.payouts.len(),
-        dist.payouts
+        entries.len(),
+        4,
+        "expected 4 payouts (pool + 3 member shares) — got {}: {:?}",
+        entries.len(),
+        entries
             .iter()
-            .map(|p| (p.address.as_str(), p.sats.0))
+            .map(|(a, s)| (a.as_str(), *s))
             .collect::<Vec<_>>(),
     );
-    let finder_entries: Vec<&_> = dist
-        .payouts
-        .iter()
-        .filter(|p| p.address.as_str() == addr_alice)
-        .collect();
     assert_eq!(
-        finder_entries.len(),
-        2,
-        "finder must appear in EXACTLY 2 outputs (bonus + share) — got {}",
-        finder_entries.len()
+        entries[0].0.as_str(),
+        addr_fee,
+        "the pool output leads the §4 order"
     );
-    let bonus_entry = finder_entries
-        .iter()
-        .find(|p| p.sats.0 == finder_bonus_sats)
-        .copied()
-        .unwrap_or_else(|| {
-            panic!(
-                "one of the finder outputs must equal the configured \
-                 finder_bonus_sats ({finder_bonus_sats}); got {:?}",
-                finder_entries.iter().map(|p| p.sats.0).collect::<Vec<_>>()
-            )
-        });
-    assert_eq!(bonus_entry.sats.0, finder_bonus_sats);
+    for member in [&addr_alice, &addr_bob, &addr_charlie] {
+        let n = entries
+            .iter()
+            .filter(|(a, _)| a.as_str() == *member)
+            .count();
+        assert_eq!(
+            n, 1,
+            "member {member} must appear in exactly one output (got {n})"
+        );
+    }
+    // The folded 1M-sat bonus must lift Alice (100 of 600 shares)
+    // visibly above pro-rata: without it she'd sit at exactly half of
+    // Bob's (200-share) output.
+    let sats_of = |addr: &str| {
+        entries
+            .iter()
+            .find(|(a, _)| a.as_str() == addr)
+            .map(|(_, s)| *s)
+            .expect("member output present")
+    };
+    let alice_sats = sats_of(&addr_alice);
+    let bob_sats = sats_of(&addr_bob);
+    assert!(
+        alice_sats > bob_sats / 2,
+        "finder bonus folded into Alice's weight must exceed pro-rata \
+         (alice={alice_sats}, bob={bob_sats}, bonus={finder_bonus_sats})"
+    );
 
-    // Bit-exact: the distribution's sat sums must equal the reward.
-    // Anything less means the engine silently burns satoshi every
-    // block; anything more would be rejected by bitcoin-core as
-    // `bad-cb-amount`.
-    let total_payout_sats: i64 = dist.payouts.iter().map(|p| p.sats.0).sum();
+    // Bit-exact: the §4 vector must consume exactly the revenue
+    // (pay_P absorbs rounding). Anything less means the engine
+    // silently burns satoshi every block; anything more would be
+    // rejected by bitcoin-core as `bad-cb-amount`.
+    let total_payout_sats: u64 = entries.iter().map(|(_, s)| *s).sum();
     assert_eq!(
-        total_payout_sats as u64, reward_sats,
+        total_payout_sats, reward_sats,
         "distribution sat sum must EXACTLY equal reward — burning sats \
          per block is a production-code bug, not a test issue"
     );
 
     // ── Build the block + brute-force a regtest-target nonce ────
-    let payouts: Vec<PayoutEntry> = dist
-        .payouts
+    let payouts: Vec<PayoutEntry> = entries
         .iter()
-        .map(|p| PayoutEntry {
-            address: p.address.as_str().to_string(),
-            sats: p.sats.0 as u64,
+        .map(|(a, s)| PayoutEntry {
+            address: a.as_str().to_string(),
+            sats: *s,
         })
         .collect();
     let coinbase_template = TdpCoinbaseTemplate {
@@ -220,13 +236,15 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
         coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
         coinbase_tx_locktime: template.coinbase_tx_locktime,
     };
+    // The job carries the distribution's settlement identity — the
+    // fingerprint a block found on it books through.
     let job = build_mining_job_from_tdp(
         Network::Regtest,
         &payouts,
         &coinbase_template,
         "group-solo-e2e-regtest",
         EXTRANONCE_SLOT_LEN,
-        [0u8; 32],
+        fingerprint,
     )
     .expect("build_mining_job_from_tdp");
 
@@ -254,7 +272,7 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
         template.version,
         prev_hash.header_timestamp,
         nonce,
-        witness_coinbase,
+        witness_coinbase.clone(),
     )
     .await
     .expect("submit_solution");
@@ -267,6 +285,55 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
              rejected (finder-bonus math drift, dust output, ...)",
         );
     assert_eq!(after, before_height + 1);
+
+    // ── Settle from the REAL accepted coinbase (scaled path) ─────
+    //
+    // The weight-model settlement books `claim(T_actual) − paid` per
+    // address from the coinbase the chain accepted, resolved by the
+    // job's weights fingerprint.
+    use bitcoin::consensus::Decodable;
+    let coinbase_tx = bitcoin::Transaction::consensus_decode(&mut witness_coinbase.as_slice())
+        .expect("submitted coinbase must decode");
+    let actual =
+        bp_coinbase_snapshot::ActualCoinbase::from_coinbase(&coinbase_tx, Network::Regtest);
+    assert_eq!(actual.total_value_sats, reward_sats);
+    let outcome = engine
+        .on_block_found_scaled(
+            group_id,
+            after as i32,
+            &actual,
+            &finder,
+            None,
+            Some(fingerprint),
+        )
+        .await
+        .expect("the mined job's own distribution must settle from the accepted coinbase");
+    assert!(outcome.history_inserted >= 1, "audit rows written");
+
+    // ── The ledger must match the coinbase the chain accepted ────
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT address, "paidSats" FROM pplns_group_block_history
+           WHERE "groupId" = $1 AND "blockHeight" = $2 AND "rowType" = 'coinbase'"#,
+    )
+    .bind(group_id)
+    .bind(after as i32)
+    .fetch_all(&pg)
+    .await
+    .expect("read audit rows");
+    assert!(!rows.is_empty(), "coinbase audit rows must exist");
+    for (address, paid_sats) in &rows {
+        let script = bp_mining_job::address_to_script(Network::Regtest, address)
+            .expect("audit-row address must be a payable script");
+        let matched = coinbase_tx.output.iter().any(|o| {
+            o.script_pubkey.as_bytes() == script.as_bytes() && o.value.to_sat() == *paid_sats as u64
+        });
+        assert!(
+            matched,
+            "ledger claims {address} was paid {paid_sats} sat on-chain, but the \
+             accepted coinbase has no such output — the booked distribution is \
+             not the one this block paid"
+        );
+    }
 
     // ── Teardown ─────────────────────────────────────────────────
     engine.shutdown();

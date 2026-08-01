@@ -25,6 +25,11 @@ use uuid::Uuid;
 const REDIS_URL: &str = "redis://127.0.0.1:16379";
 const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
+/// Pool-output recipient. The weight model has no distribution without
+/// one (§4: `pay_P` is structural); distinct from every miner address
+/// these tests use.
+const FEE_ADDR: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
+
 struct Harness {
     pool: PgPool,
     builder: DistributionBuilder,
@@ -88,7 +93,12 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_sats: Option<i64>) -> Option<H
     seed_group(&pool, group_id, finder_bonus_sats).await;
 
     let round = GroupRoundStore::new(conn);
-    let dist_cfg = DistributionConfig::from_engine_config(&GroupSoloEngineConfig::default());
+    // The weight model requires the pool-output recipient (§4 pay_P is
+    // structural) — mirror the production requirement in the harness.
+    let dist_cfg = DistributionConfig::from_engine_config(&GroupSoloEngineConfig {
+        fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
+        ..GroupSoloEngineConfig::default()
+    });
     let builder = DistributionBuilder::new(pool.clone(), round.clone(), dist_cfg);
 
     Some(Harness {
@@ -155,23 +165,45 @@ async fn build_with_shares_returns_payouts_and_writes_snapshot() {
         .build(h.group_id, 312_500_000, &addr_a)
         .await
         .expect("ok");
-    assert_eq!(result.block_reward_sats, 312_500_000);
+    // Weight model: the build carries §4 weights + the reference
+    // revenue; concrete sats come from `payout_entries_at`.
+    assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
     assert_eq!(result.finder_address, addr_a);
-    assert!(!result.payouts.is_empty());
-    assert!(result.considered_addresses.contains(&addr_a));
-    assert!(result.considered_addresses.contains(&addr_b));
+    assert!(
+        result.distribution.published().count() > 0,
+        "expected published payout weights"
+    );
+    for id in [&addr_a, &addr_b] {
+        assert!(
+            result.distribution.entries.iter().any(|e| &e.address == id),
+            "share-holder must be in the distribution entries"
+        );
+    }
+    // 60/40 share split → 60/40 score weights.
+    let score_of = |id: &AddressId| {
+        result
+            .distribution
+            .entries
+            .iter()
+            .find(|e| &e.address == id)
+            .map(|e| e.score_weight)
+            .unwrap_or(0)
+    };
+    assert!(score_of(&addr_a) > score_of(&addr_b));
 
-    // Snapshot written keyed by (group_id, finder=addr_a).
+    // The schema-2 snapshot must be readable under the weights
+    // fingerprint — the key a block-found booking resolves.
     let mut conn = h.round.connection_for_snapshot();
-    let snap = bp_group_solo_engine::round::snapshot::read_snapshot(
+    let snap = bp_group_solo_engine::round::snapshot::read_weight_snapshot_for(
         &mut conn,
         &h.group_id.to_string(),
-        addr_a.as_str(),
+        &result.payouts_fingerprint(),
     )
     .await
     .expect("snapshot read ok")
     .expect("snapshot persisted");
-    assert_eq!(snap.block_reward_sats, 312_500_000);
+    assert_eq!(snap.reference_revenue_sats, 312_500_000);
+    assert_eq!(snap.entries.len(), result.distribution.entries.len());
 
     cleanup_group(&h.pool, h.group_id).await;
 }
@@ -245,31 +277,37 @@ async fn finder_bonus_from_db_row_is_applied() {
         .await
         .expect("ok");
 
-    // The bp_pplns math emits a dedicated bonus output AND a
-    // proportional share for the finder, so the finder can appear in
-    // `payouts` more than once. Sum across entries for each address
-    // and assert the finder's TOTAL receipt exceeds the equal
-    // share-holder by ~1M sats (the configured bonus).
-    let finder_total: i64 = result
-        .payouts
-        .iter()
-        .filter(|e| e.address == finder)
-        .map(|e| e.sats.0)
-        .sum();
-    let other_total: i64 = result
-        .payouts
-        .iter()
-        .filter(|e| e.address == other)
-        .map(|e| e.sats.0)
-        .sum();
+    // §4 folds the bonus into the finder's SINGLE weight — one output
+    // per address (the old dedicated bonus output no longer exists).
+    // With equal 50/50 shares the finder's one output must exceed the
+    // peer's by ~1M sats (the configured bonus).
+    let entries = result
+        .distribution
+        .payout_entries_at(312_500_000)
+        .expect("§4 payout vector");
+    let outputs_of = |id: &AddressId| -> Vec<i64> {
+        entries
+            .iter()
+            .filter(|(a, _)| a == id)
+            .map(|(_, s)| *s as i64)
+            .collect()
+    };
+    let finder_outputs = outputs_of(&finder);
+    assert_eq!(
+        finder_outputs.len(),
+        1,
+        "finder must appear in exactly one §4 output (bonus folded into the weight)"
+    );
+    let finder_total = finder_outputs[0];
+    let other_total = outputs_of(&other)[0];
     assert!(
         finder_total > other_total,
-        "finder total receipt exceeds peer's ({} vs {})",
+        "finder receipt exceeds peer's ({} vs {})",
         finder_total,
         other_total
     );
     // Configured bonus is 1M sats; tolerance is loose because the
-    // proportional split is on `block_reward - bonus`.
+    // share-proportional part is projected on the bonus-reduced pot.
     let diff = finder_total - other_total;
     assert!(
         diff >= 500_000,
@@ -308,15 +346,17 @@ async fn per_finder_snapshots_are_isolated() {
         .await
         .expect("ok");
 
+    // The per-(group, finder) key now carries the schema-2 WEIGHT
+    // snapshot; read it back through the weight parser.
     let mut conn = h.round.connection_for_snapshot();
-    let s1 = bp_group_solo_engine::round::snapshot::read_snapshot(
+    let s1 = bp_group_solo_engine::round::snapshot::read_weight_snapshot(
         &mut conn,
         &h.group_id.to_string(),
         finder1.as_str(),
     )
     .await
     .unwrap();
-    let s2 = bp_group_solo_engine::round::snapshot::read_snapshot(
+    let s2 = bp_group_solo_engine::round::snapshot::read_weight_snapshot(
         &mut conn,
         &h.group_id.to_string(),
         finder2.as_str(),
@@ -417,7 +457,9 @@ async fn empty_round_builds_without_panic() {
         .build(h.group_id, 312_500_000, &finder)
         .await
         .expect("ok");
-    assert_eq!(result.block_reward_sats, 312_500_000);
+    // Empty round → an empty entry list with the whole revenue on the
+    // §4 pool output (`weight_P` alone), not an error.
+    assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
 
     cleanup_group(&h.pool, h.group_id).await;
 }
@@ -445,8 +487,8 @@ async fn distinct_rewards_for_same_group_finder_run_independently() {
         .build(h.group_id, 312_500_000, &finder)
         .await
         .expect("ok");
-    assert_eq!(r1.block_reward_sats, 300_000_000);
-    assert_eq!(r2.block_reward_sats, 312_500_000);
+    assert_eq!(r1.distribution.reference_revenue_sats, 300_000_000);
+    assert_eq!(r2.distribution.reference_revenue_sats, 312_500_000);
     assert!(!Arc::ptr_eq(&r1, &r2));
 
     cleanup_group(&h.pool, h.group_id).await;

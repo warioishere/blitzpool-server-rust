@@ -1,50 +1,62 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Verifies the PPLNS **adaptive coinbase-weight trimmer** end-to-end against a real
-//! `bitcoin-node v31` regtest validator.
+//! Verifies the PPLNS **coinbase blockspace cut** (SV2 ext 0x0003 §4
+//! weight model) end-to-end against a real `bitcoin-node v31` regtest
+//! validator.
 //!
 //! Architecturally this closes the loop between three layers:
 //!
-//! 1. **Trimmer math** (`bp_pplns::distribution::build_coinbase_distribution`)
-//!    — sorts eligible miners by target, greedily fits outputs into
-//!    the configured `coinbase_weight_budget` using *actual per-address
-//!    output weights* (124 WU for P2WPKH, 172 WU for P2TR), and
-//!    redistributes the trimmed-total back to kept-active miners
-//!    proportional to shares.
-//! 2. **Bytes assembly** (`bp_mining_job::build_mining_job_from_tdp`)
-//!    — feeds the resulting `Vec<PayoutEntry>` into a real TDP
-//!    template + emits a SegWit-clean coinbase.
+//! 1. **Cut math** (`bp_pplns::build_weight_distribution`) — orders the
+//!    candidates in the §4 coinbase order (wire weight desc, address
+//!    asc), then greedily keeps outputs while the real serialized
+//!    coinbase weight (structural base + safety margin + witness
+//!    commitment + one worst-case pool output + *actual per-address
+//!    output weights*: 124 WU P2WPKH, 172 WU P2TR) fits the configured
+//!    `coinbase_weight_budget`. Folded miners' wire weights move into
+//!    `weight_P` (§3.1 blesses `weight_P` carrying value held on behalf
+//!    of unrepresented miners) — they get no on-chain output but keep
+//!    their settlement claim.
+//! 2. **§4 evaluation + bytes assembly** —
+//!    `WeightDistribution::payout_entries_at(T)` yields the concrete
+//!    `(address, sats)` vector (pool output first, `floor(weight·T/W)`
+//!    per kept miner, `pay_P` absorbing rounding + dust so Σ == T
+//!    exactly), which `bp_mining_job::build_mining_job_from_tdp` turns
+//!    into a SegWit-clean coinbase over a real TDP template.
 //! 3. **bitcoin-core acceptance** (`TdpHandle::submit_solution`) —
 //!    proves the assembled coinbase fits within the IPC-advertised
-//!    `CoinbaseOutputConstraints.max_additional_size` and core
-//!    relays the block.
+//!    `CoinbaseOutputConstraints.max_additional_size` and core relays
+//!    the block.
 //!
-//! ## Three scenarios:
+//! ## Three scenarios (budget 50 000 WU each):
 //!
-//! - **pure P2WPKH ~398/420 in budget 50 000** — adaptive logic uses
-//!   124 WU per output (the actual P2WPKH cost), not the conservative
-//!   172 WU upper bound. Available WU = `50000 - 200 (margin) - 328
-//!   (base) - 188 (commit) - 124 (fee) = 49160`; floor(49160 / 124) =
-//!   396 max miners. Push 420 → trim ≥ 24.
-//! - **pure P2TR ~286/320 in budget 50 000** — P2TR outputs cost
-//!   172 WU (= conservative constant). Available WU = `50000 - 200 -
-//!   328 - 188 - 172 = 49112`; floor(49112 / 172) = 285 max. Push 320
-//!   → trim ≥ 34.
-//! - **50/50 P2WPKH/P2TR mix lands between the extremes** — per-pair
-//!   cost ≈ 296 WU; max ~332 miners; push 350 → trim ~18.
+//! The fixed overhead the cut reserves is `328 (base) + 188 (witness
+//! commitment) + 172 (worst-case pool output)` = 688 WU, on top of the
+//! 200 WU safety margin subtracted from the budget → 49 112 WU are
+//! available for miner outputs.
+//!
+//! - **pure P2WPKH ~396/420** — 124 WU per output; floor(49112 / 124) =
+//!   396 max miners. Push 420 → cut 24.
+//! - **pure P2TR ~285/320** — 172 WU per output; floor(49112 / 172) =
+//!   285 max. Push 320 → cut 35.
+//! - **50/50 P2WPKH/P2TR mix lands between the extremes** — equal
+//!   shares → equal wire weights, so the §4 order falls back to address
+//!   asc and every `bc1p…` (P2TR) sorts before every `bc1q…` (P2WPKH):
+//!   175 P2TR (30 100 WU) are kept first, then floor((49112 − 30100) /
+//!   124) = 153 P2WPKH → 328 kept, cut 22.
 //!
 //! ## What this regtest guards that unit tests can't
 //!
 //! - **`max_additional_size` coupling** (bin/blitzpool's
 //!   `coinbase_constraints_from_pplns_budget`) — bitcoin-core was told
 //!   how much room to reserve based on `coinbase_weight_budget`; the
-//!   trimmer's output must actually fit, or core rejects.
+//!   cut's output must actually fit, or core rejects the found block
+//!   (an overweight coinbase = rejected block = lost money).
 //! - **End-to-end SegWit block weight**: `total_block_weight ≤ 4 M`
 //!   including the witness commitment + the coinbase witness.
 //! - **Bytes-acceptance per address type** under realistic mix — the
-//!   trimmer's per-address weight table (`output_weight_for_address`)
-//!   must match the *actual* serialised output size, or budget
-//!   accounting drifts from reality.
+//!   cut's per-address weight table (`output_weight_for_address`) must
+//!   match the *actual* serialised output size, or budget accounting
+//!   drifts from reality.
 //!
 //! Skipped (with a printed warning) when `bitcoin-node v31` isn't
 //! installed at the host's default location or via `BITCOIN_NODE_PATH`.
@@ -58,7 +70,7 @@ use bp_mining_job::{
     build_mining_job_from_tdp, merkle_root_from_coinbase, PayoutEntry, TdpCoinbaseTemplate,
     EXTRANONCE_SLOT_LEN,
 };
-use bp_pplns::{build_coinbase_distribution, CoinbaseDistributionInput};
+use bp_pplns::{build_weight_distribution, WeightDistributionInput};
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_share::Target;
 use bp_template_distribution::{TdpConfig, TdpHandle};
@@ -68,9 +80,11 @@ use bp_test_support::{brute_force_nonce, poll_for_height};
 /// Default coinbase weight budget used across all three scenarios (50 000 WU).
 const BUDGET: u32 = 50_000;
 
-/// Pool fee output address (P2WPKH). The trimmer always emits the fee
-/// output BEFORE the miner outputs, so it consumes one slot's worth of
-/// weight from the budget. Use a P2WPKH (124 WU) for the fee output.
+/// Pool output recipient (P2WPKH). The §4 order always emits the pool
+/// output BEFORE the miner outputs; the cut reserves a worst-case
+/// (172 WU) slot for it in the fixed overhead regardless of its actual
+/// type, so the real (124 WU P2WPKH) coinbase lands strictly under the
+/// budget.
 ///
 /// **Mainnet HRP** (not regtest): regtest P2TR addresses are 64 chars
 /// long, which exceeds `AddressId`'s 62-char DB-column limit. P2WPKH +
@@ -86,16 +100,19 @@ const FEE_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 /// [`FEE_ADDR`] for why mainnet (not regtest).
 const TEST_NETWORK: Network = Network::Bitcoin;
 
-/// Bitcoin-core regtest block reward (50 BTC at block 102 = 5_000_000_000 sats).
-const REGTEST_BLOCK_REWARD_SATS: i64 = 5_000_000_000;
+/// Bitcoin-core regtest block reward (50 BTC at block 102 = 5_000_000_000
+/// sats). Doubles as the §4 reference revenue the weight build projects
+/// balance/bonus boosts against (none in play here — no balances, no
+/// finder bonus — so it only has to be non-zero).
+const REGTEST_BLOCK_REWARD_SATS: u64 = 5_000_000_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
-async fn pplns_adaptive_trim_pure_p2wpkh_fits_about_398_in_budget_50000() {
+async fn pplns_blockspace_cut_pure_p2wpkh_fits_about_396_in_budget_50000() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping PPLNS trimmer regtest (pure P2WPKH) — bitcoin-node not found at {}",
+            "skipping PPLNS blockspace-cut regtest (pure P2WPKH) — bitcoin-node not found at {}",
             cfg.bitcoin_node_path.display()
         );
         return;
@@ -105,15 +122,15 @@ async fn pplns_adaptive_trim_pure_p2wpkh_fits_about_398_in_budget_50000() {
     let (kept_count, coinbase_weight_wu) =
         run_trim_scenario(miners, "pure-p2wpkh-pplns", 420).await;
 
-    // Deterministic outcome of the adaptive trim against a fixed
+    // Deterministic outcome of the blockspace cut against a fixed
     // 420-miner P2WPKH input with the production budget (50 000 WU)
-    // and safety margin. The conservative-only formula would cap
-    // around 286 — confirming the adaptive 124 WU/output path
-    // actually fires would show kept_count well above that.
+    // and safety margin. A worst-case-only accounting would cap around
+    // 285 — kept_count well above that proves the per-address
+    // 124 WU/output path actually fires.
     assert_eq!(
         kept_count, 396,
-        "pure P2WPKH adaptive trim count drifted (expected 396, got {kept_count}) — \
-         either the trim math changed or per-output weight constants changed"
+        "pure P2WPKH cut count drifted (expected 396, got {kept_count}) — \
+         either the cut math changed or per-output weight constants changed"
     );
     assert_eq!(
         coinbase_weight_wu, 49_788,
@@ -129,11 +146,11 @@ async fn pplns_adaptive_trim_pure_p2wpkh_fits_about_398_in_budget_50000() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
-async fn pplns_adaptive_trim_pure_p2tr_caps_at_about_286_in_budget_50000() {
+async fn pplns_blockspace_cut_pure_p2tr_caps_at_about_285_in_budget_50000() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping PPLNS trimmer regtest (pure P2TR) — bitcoin-node not found at {}",
+            "skipping PPLNS blockspace-cut regtest (pure P2TR) — bitcoin-node not found at {}",
             cfg.bitcoin_node_path.display()
         );
         return;
@@ -143,10 +160,10 @@ async fn pplns_adaptive_trim_pure_p2tr_caps_at_about_286_in_budget_50000() {
     let (kept_count, coinbase_weight_wu) = run_trim_scenario(miners, "pure-p2tr-pplns", 320).await;
 
     // Deterministic outcome — 320 P2TR miners (172 WU each), 50 000
-    // WU budget less fixed weight + safety margin.
+    // WU budget less fixed overhead + safety margin.
     assert_eq!(
         kept_count, 285,
-        "pure P2TR adaptive trim count drifted (expected 285, got {kept_count})"
+        "pure P2TR cut count drifted (expected 285, got {kept_count})"
     );
     assert_eq!(
         coinbase_weight_wu, 49_696,
@@ -160,11 +177,11 @@ async fn pplns_adaptive_trim_pure_p2tr_caps_at_about_286_in_budget_50000() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
-async fn pplns_adaptive_trim_mixed_5050_lands_between_extremes() {
+async fn pplns_blockspace_cut_mixed_5050_lands_between_extremes() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping PPLNS trimmer regtest (mixed P2WPKH/P2TR) — bitcoin-node not found at {}",
+            "skipping PPLNS blockspace-cut regtest (mixed P2WPKH/P2TR) — bitcoin-node not found at {}",
             cfg.bitcoin_node_path.display()
         );
         return;
@@ -173,12 +190,13 @@ async fn pplns_adaptive_trim_mixed_5050_lands_between_extremes() {
     let miners = generate_mixed_p2wpkh_p2tr_miners(350);
     let (kept_count, coinbase_weight_wu) = run_trim_scenario(miners, "mixed-pplns", 350).await;
 
-    // Deterministic outcome — 350 alternating P2WPKH/P2TR miners
-    // (avg 148 WU/output) fit between the pure-P2TR floor and the
-    // pure-P2WPKH ceiling.
+    // Deterministic outcome — 350 alternating P2WPKH/P2TR miners with
+    // equal shares: the §4 tie-break (address asc) keeps all 175 P2TR
+    // (`bc1p…` < `bc1q…`) plus 153 P2WPKH, between the pure-P2TR floor
+    // and the pure-P2WPKH ceiling.
     assert_eq!(
         kept_count, 328,
-        "mixed adaptive trim count drifted (expected 328, got {kept_count})"
+        "mixed cut count drifted (expected 328, got {kept_count})"
     );
     assert_eq!(
         coinbase_weight_wu, 49_732,
@@ -192,17 +210,19 @@ async fn pplns_adaptive_trim_mixed_5050_lands_between_extremes() {
 
 // ── Scenario runner ─────────────────────────────────────────────────────
 
-/// Drive one trimmer-scenario end-to-end:
+/// Drive one blockspace-cut scenario end-to-end:
 /// 1. Boot bitcoind regtest + mine past IBD.
-/// 2. Build PPLNS `CoinbaseDistributionInput` from the miner list with
+/// 2. Build the §4 `WeightDistributionInput` from the miner list with
 ///    1 share each + the configured budget.
-/// 3. Call `build_coinbase_distribution` → `Vec<CoinbaseDistributionEntry>`.
-/// 4. Convert to `Vec<PayoutEntry>` + feed through TDP+MiningJob.
+/// 3. Call `build_weight_distribution` → assert the cut fired and the
+///    folded miners kept their settlement entries (wire_weight == 0).
+/// 4. Evaluate `payout_entries_at(T)` for the template's revenue →
+///    `Vec<PayoutEntry>` → TDP+MiningJob.
 /// 5. Brute-force a nonce + submit_solution.
 /// 6. Assert chain advanced + coinbase weight respected the budget.
 ///
 /// Returns `(kept_count, coinbase_weight_wu)` for per-scenario assertions.
-/// `kept_count` excludes the fee output.
+/// `kept_count` excludes the pool output.
 #[allow(clippy::print_stderr)]
 async fn run_trim_scenario(
     miners: Vec<AddressId>,
@@ -216,7 +236,7 @@ async fn run_trim_scenario(
         .await
         .expect("mine 101 for IBD-exit + coinbase maturity");
 
-    // PPLNS trimmer input — 1 share per miner = even split before trim.
+    // Blockspace-cut input — 1 share per miner = even split before the cut.
     let mut address_shares: HashMap<AddressId, f64> = HashMap::with_capacity(miners.len());
     for miner in &miners {
         address_shares.insert(miner.clone(), 1.0);
@@ -224,40 +244,67 @@ async fn run_trim_scenario(
     let balances: HashMap<AddressId, Sats> = HashMap::new();
     let fee_addr = AddressId::new(FEE_ADDR.to_string()).expect("valid fee addr");
 
-    let dist = build_coinbase_distribution(CoinbaseDistributionInput {
+    let dist = build_weight_distribution(WeightDistributionInput {
         address_shares: &address_shares,
         balances: &balances,
-        block_reward_sats: Sats(REGTEST_BLOCK_REWARD_SATS),
         fee_percent: 1.5,
-        fee_address: Some(&fee_addr),
+        fee_address: &fee_addr,
         coinbase_weight_budget: BUDGET,
-        suppress_matching_debits: false,
         min_payout_sats: None,
         finder_bonus_sats: None,
         finder_address: None,
-    });
+        reference_revenue_sats: REGTEST_BLOCK_REWARD_SATS,
+    })
+    .expect("build_weight_distribution");
 
-    // Count miner outputs excluding the fee (which always sits at index 0).
-    let kept_miner_count = dist
-        .payouts
-        .iter()
-        .filter(|p| p.address.as_str() != FEE_ADDR)
-        .count();
+    // The cut must actually have fired — published < pushed, and the
+    // telemetry reports the same pressure the autoscaler would see.
+    let kept_miner_count = dist.published().count();
+    assert!(
+        kept_miner_count < pushed_count,
+        "cut did not fire: kept {kept_miner_count} of {pushed_count}"
+    );
+    assert!(
+        dist.budget_telemetry.trimmed_count > 0,
+        "telemetry must report the cut"
+    );
+    assert_eq!(
+        kept_miner_count + dist.budget_telemetry.trimmed_count as usize,
+        pushed_count,
+        "kept + trimmed must cover every pushed miner"
+    );
+    assert!(
+        dist.budget_telemetry.utilization() >= 1.0,
+        "a firing cut implies utilization ≥ 1.0 (got {})",
+        dist.budget_telemetry.utilization()
+    );
+    // §4-model replacement for the former trim-redistribution check:
+    // the old allocator debited trimmed miners and redistributed their
+    // sats to kept ones; the weight model instead folds their wire
+    // weight into `weight_P` (§3.1) — folded miners get NO output but
+    // remain in `entries` with `wire_weight == 0` and their settlement
+    // score intact.
+    assert_eq!(
+        dist.entries.len(),
+        pushed_count,
+        "every pushed miner must stay in the distribution for settlement"
+    );
+    let folded_count = dist.entries.iter().filter(|e| e.wire_weight == 0).count();
+    assert_eq!(
+        folded_count, dist.budget_telemetry.trimmed_count as usize,
+        "exactly the trimmed miners are folded to wire_weight 0"
+    );
+    assert!(
+        dist.entries
+            .iter()
+            .filter(|e| e.wire_weight == 0)
+            .all(|e| e.score_weight > 0),
+        "folded miners keep their settlement score"
+    );
     eprintln!(
         "[{pool_identifier}] pushed {pushed_count} miners → kept {kept_miner_count} \
-         on-chain (+ 1 fee output)"
+         on-chain (+ 1 pool output), folded {folded_count} into weight_P"
     );
-
-    // Translate distribution → PayoutEntry list (the shape
-    // `build_mining_job_from_tdp` consumes — address + percent).
-    let payouts: Vec<PayoutEntry> = dist
-        .payouts
-        .iter()
-        .map(|e| PayoutEntry {
-            address: e.address.as_str().to_string(),
-            sats: e.sats.0 as u64,
-        })
-        .collect();
 
     // ── Attach TDP, drain initial pair, mine 1 for fresh template ───────
     let tdp = TdpHandle::spawn(
@@ -280,6 +327,29 @@ async fn run_trim_scenario(
         .expect("mine 1 more for fresh template");
     let (template, prev_hash) = wait_for_paired_template(&mut rx).await;
 
+    // ── The §4 evaluation at this template's revenue ────────────────────
+    // Pool output first, `floor(weight·T/W)` per kept miner, `pay_P`
+    // absorbing rounding + dust so Σ == T exactly — anything else would
+    // be `bad-cb-amount` at core.
+    let reward = template.coinbase_tx_value_remaining;
+    let entries = dist.payout_entries_at(reward).expect("§4 payout vector");
+    assert_eq!(entries[0].0, fee_addr, "the pool output leads the §4 order");
+    assert_eq!(
+        entries.len(),
+        1 + kept_miner_count,
+        "no dust pruning at regtest reward scale — every kept miner pays out"
+    );
+    let total: u64 = entries.iter().map(|(_, s)| *s).sum();
+    assert_eq!(total, reward, "the §4 vector must consume exactly T");
+
+    let payouts: Vec<PayoutEntry> = entries
+        .iter()
+        .map(|(a, s)| PayoutEntry {
+            address: a.as_str().to_string(),
+            sats: *s,
+        })
+        .collect();
+
     // ── Build MiningJob ─────────────────────────────────────────────────
     let coinbase_template = TdpCoinbaseTemplate {
         coinbase_prefix: &template.coinbase_prefix,
@@ -296,9 +366,9 @@ async fn run_trim_scenario(
         &coinbase_template,
         pool_identifier,
         EXTRANONCE_SLOT_LEN,
-        [0u8; 32],
+        dist.fingerprint,
     )
-    .expect("build_mining_job_from_tdp must succeed with trimmed payouts");
+    .expect("build_mining_job_from_tdp must succeed with the cut payouts");
 
     // ── Measure the actual serialised coinbase weight ───────────────────
     //
@@ -349,8 +419,8 @@ async fn run_trim_scenario(
         .await
         .unwrap_or_else(|| {
             panic!(
-                "bitcoin-core must accept the trimmer's coinbase ({pool_identifier}) — \
-                 if this fails, the trimmer emitted bytes beyond `max_additional_size` \
+                "bitcoin-core must accept the cut coinbase ({pool_identifier}) — \
+                 if this fails, the cut emitted bytes beyond `max_additional_size` \
                  or beyond what core can validate"
             );
         });

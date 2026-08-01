@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! PPLNS engine — pure math for the 5-phase coinbase distribution algorithm
-//! with signed credit/debit ledger and abandoned-debtor solvency cap.
+//! PPLNS pure math — the weight-native distribution builder (SV2 ext
+//! 0x0003 §4 model) plus the shared record types and weight constants.
 //!
 //! No I/O. Window aggregation, Redis snapshots, DB writes, and dust-sweep
 //! cron belong to a higher-level service crate that consumes this one.
@@ -12,10 +12,7 @@ mod distribution;
 mod weight;
 mod weights;
 
-pub use distribution::{
-    build_coinbase_distribution, BudgetTelemetry, CoinbaseDistributionEntry,
-    CoinbaseDistributionInput, CoinbaseDistributionResult,
-};
+pub use distribution::{BudgetTelemetry, CoinbaseDistributionEntry};
 pub use weight::{
     is_valid_payout_address, max_coinbase_outputs, output_weight_for_address,
     resolve_min_payout_sats, validate_fee_payout_budget, FeePayoutBudgetError,

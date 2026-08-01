@@ -91,6 +91,62 @@ pub async fn write_snapshot_for(
     .await
 }
 
+/// Persist a schema-2 WEIGHT snapshot under the (group, finder) key.
+pub async fn write_weight_snapshot(
+    conn: &mut ConnectionManager,
+    group_id: &str,
+    finder_address: &str,
+    snapshot: &bp_coinbase_snapshot::StoredWeightSnapshot,
+    ttl_seconds: u32,
+) -> Result<(), RedisError> {
+    bp_coinbase_snapshot::snapshot::write_weight_snapshot(
+        conn,
+        &key(group_id, finder_address),
+        snapshot,
+        ttl_seconds,
+    )
+    .await
+}
+
+/// Persist a schema-2 WEIGHT snapshot under its weights fingerprint.
+pub async fn write_weight_snapshot_for(
+    conn: &mut ConnectionManager,
+    group_id: &str,
+    weights_fingerprint: &[u8; 32],
+    snapshot: &bp_coinbase_snapshot::StoredWeightSnapshot,
+    ttl_seconds: u32,
+) -> Result<(), RedisError> {
+    bp_coinbase_snapshot::snapshot::write_weight_snapshot(
+        conn,
+        &key_for_fingerprint(group_id, weights_fingerprint),
+        snapshot,
+        ttl_seconds,
+    )
+    .await
+}
+
+/// Load the schema-2 WEIGHT snapshot for one weights fingerprint.
+pub async fn read_weight_snapshot_for(
+    conn: &mut ConnectionManager,
+    group_id: &str,
+    weights_fingerprint: &[u8; 32],
+) -> Result<Option<bp_coinbase_snapshot::StoredWeightSnapshot>, RedisError> {
+    bp_coinbase_snapshot::snapshot::read_weight_snapshot(
+        conn,
+        &key_for_fingerprint(group_id, weights_fingerprint),
+    )
+    .await
+}
+
+/// Load the schema-2 WEIGHT snapshot from the (group, finder) key.
+pub async fn read_weight_snapshot(
+    conn: &mut ConnectionManager,
+    group_id: &str,
+    finder_address: &str,
+) -> Result<Option<bp_coinbase_snapshot::StoredWeightSnapshot>, RedisError> {
+    bp_coinbase_snapshot::snapshot::read_weight_snapshot(conn, &key(group_id, finder_address)).await
+}
+
 /// Load + hydrate the snapshot for one payout list, or `None` if missing /
 /// unparseable.
 pub async fn read_snapshot_for(

@@ -281,16 +281,47 @@ async fn reconcile(
                     continue;
                 }
             };
-            match group_solo
-                .on_block_found_with_snapshot(
-                    group_uuid,
-                    pb.block_height,
-                    pb.block_reward_sats,
-                    &finder,
-                    pb.snapshot.clone().into(),
-                )
-                .await
-            {
+            // Weight-model apply (claim − paid from the real coinbase)
+            // for blobs frozen under it; the legacy exact-match apply
+            // only remains for blobs frozen before.
+            let applied = match (&pb.weight_snapshot, &pb.actual_coinbase) {
+                (Some(ws), Some(actual)) => {
+                    group_solo
+                        .on_block_found_scaled(
+                            group_uuid,
+                            pb.block_height,
+                            actual,
+                            &finder,
+                            Some(ws.clone()),
+                            pb.payouts_fingerprint,
+                        )
+                        .await
+                }
+                _ => match &pb.snapshot {
+                    Some(snapshot) => {
+                        group_solo
+                            .on_block_found_with_snapshot(
+                                group_uuid,
+                                pb.block_height,
+                                pb.block_reward_sats,
+                                &finder,
+                                snapshot.clone().into(),
+                            )
+                            .await
+                    }
+                    None => {
+                        warn!(
+                            block_hash = %pb.block_hash,
+                            group_id = %pb.group_id,
+                            "block-confirmation: pending Group-Solo blob carries no snapshot \
+                             variant at all — discarding, reprocess from the block's coinbase"
+                        );
+                        let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
+                        continue;
+                    }
+                },
+            };
+            match applied {
                 Ok(outcome) => {
                     info!(
                         block_hash = %pb.block_hash,

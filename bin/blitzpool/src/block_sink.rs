@@ -105,6 +105,12 @@ pub(crate) struct BlockFoundEvent {
     /// `None` on a build failure → the apply falls back to the Redis read.
     #[serde(default)]
     pub groupsolo_snapshot: Option<StoredSnapshot>,
+    /// Weight-model (schema-2) variant of `groupsolo_snapshot`: the
+    /// settlement INPUTS of the distribution the winning job's coinbase
+    /// was built from. New events carry this; `groupsolo_snapshot`
+    /// stays for events produced before the weight model.
+    #[serde(default)]
+    pub groupsolo_weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
     /// Identity of the payout list this block's coinbase pays, taken off the
     /// job the winning share was built on. Both group-ledger paths look the
     /// distribution up under it, so what gets booked is what the coinbase
@@ -467,7 +473,7 @@ impl TdpBlockSubmissionSink {
         // A zeroed fingerprint means the pool did not build this coinbase
         // (`SetCustomMiningJob`) — there is no distribution of ours to find.
         let job_payouts_fingerprint = pplns_payouts_fingerprint.filter(|fp| fp != &[0u8; 32]);
-        let groupsolo_snapshot = if resolved.mode == MiningMode::GroupSolo {
+        let groupsolo_weight_snapshot = if resolved.mode == MiningMode::GroupSolo {
             self.resolve_group_solo_distribution(
                 &address,
                 resolved.group_id.as_deref(),
@@ -491,7 +497,8 @@ impl TdpBlockSubmissionSink {
             mode: resolved.mode,
             group_id: resolved.group_id,
             height,
-            groupsolo_snapshot,
+            groupsolo_snapshot: None,
+            groupsolo_weight_snapshot,
             actual_coinbase,
         };
 
@@ -537,7 +544,7 @@ impl TdpBlockSubmissionSink {
         reward_sats: Option<u64>,
         payouts_fingerprint: Option<[u8; 32]>,
         height: i32,
-    ) -> Option<StoredSnapshot> {
+    ) -> Option<bp_coinbase_snapshot::StoredWeightSnapshot> {
         let Some(engine) = self.applier.group_solo.as_ref() else {
             warn!(
                 address,
@@ -582,8 +589,12 @@ impl TdpBlockSubmissionSink {
             );
             return None;
         };
+        // Reward-band plausibility is checked at apply time, where the
+        // actual coinbase is at hand; `reward` names the job's pinned
+        // value for the log lines only.
+        let _ = reward;
         match engine
-            .snapshot_for_block_found(group_uuid, reward, &finder, &fingerprint)
+            .weight_snapshot_for_block_found(group_uuid, &finder, &fingerprint)
             .await
         {
             Ok(snap) => Some(snap),
@@ -788,6 +799,7 @@ impl BlockFoundApplier {
     /// distribution the chain did not pay, and unlike PPLNS nothing downstream
     /// would catch it. Unresolved → the caller does not book at all.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn gate_or_apply_group_solo(
         &self,
         engine: &GroupSoloEngine,
@@ -797,7 +809,10 @@ impl BlockFoundApplier {
         height: i32,
         reward: u64,
         block_hash_hex: Option<&str>,
-        snapshot: StoredSnapshot,
+        snapshot: Option<StoredSnapshot>,
+        weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+        actual: Option<&bp_coinbase_snapshot::ActualCoinbase>,
+        payouts_fingerprint: Option<[u8; 32]>,
     ) {
         match (self.redis.as_ref(), block_hash_hex) {
             (Some(redis), Some(block_hash)) => {
@@ -809,6 +824,9 @@ impl BlockFoundApplier {
                     block_height: height,
                     block_reward_sats: reward,
                     snapshot: snapshot.clone(),
+                    weight_snapshot: weight_snapshot.clone(),
+                    actual_coinbase: actual.cloned(),
+                    payouts_fingerprint,
                 };
                 let mut conn = redis.clone();
                 if let Err(err) = put_pending_group_solo_block(&mut conn, &pending).await {
@@ -822,6 +840,9 @@ impl BlockFoundApplier {
                         height,
                         reward,
                         snapshot,
+                        weight_snapshot,
+                        actual,
+                        payouts_fingerprint,
                     )
                     .await;
                     return;
@@ -848,6 +869,9 @@ impl BlockFoundApplier {
                     height,
                     reward,
                     snapshot,
+                    weight_snapshot,
+                    actual,
+                    payouts_fingerprint,
                 )
                 .await;
             }
@@ -855,7 +879,9 @@ impl BlockFoundApplier {
     }
 
     /// Immediate (non-gated) Group-Solo apply of the distribution the block's
-    /// coinbase pays.
+    /// coinbase pays. Weight-model settlement (claim − paid from the real
+    /// coinbase) when the event carries the weight snapshot + actuals; the
+    /// legacy exact-match apply only remains for events produced before.
     #[allow(clippy::too_many_arguments)]
     async fn apply_group_solo_now(
         &self,
@@ -865,11 +891,48 @@ impl BlockFoundApplier {
         address: &AddressId,
         height: i32,
         reward: u64,
-        snapshot: StoredSnapshot,
+        snapshot: Option<StoredSnapshot>,
+        weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+        actual: Option<&bp_coinbase_snapshot::ActualCoinbase>,
+        payouts_fingerprint: Option<[u8; 32]>,
     ) {
-        let applied = engine
-            .on_block_found_with_snapshot(group_uuid, height, reward, address, snapshot.into())
-            .await;
+        let applied = match (weight_snapshot, actual) {
+            (Some(ws), Some(actual)) => {
+                engine
+                    .on_block_found_scaled(
+                        group_uuid,
+                        height,
+                        actual,
+                        address,
+                        Some(ws),
+                        payouts_fingerprint,
+                    )
+                    .await
+            }
+            _ => match snapshot {
+                Some(snapshot) => {
+                    engine
+                        .on_block_found_with_snapshot(
+                            group_uuid,
+                            height,
+                            reward,
+                            address,
+                            snapshot.into(),
+                        )
+                        .await
+                }
+                None => {
+                    warn!(
+                        group_id = group_id_str,
+                        height,
+                        "block-found: Group-Solo event carries neither a weight snapshot (+ \
+                         actuals) nor a legacy snapshot — NOT booked, reprocess from the \
+                         block's own coinbase"
+                    );
+                    return;
+                }
+            },
+        };
         match applied {
             Ok(outcome) => info!(
                 group_id = group_id_str,
@@ -1073,39 +1136,41 @@ impl BlockFoundApplier {
                         };
                         // Without the distribution the block's coinbase pays
                         // there is nothing safe to book: the substitutes all
-                        // claim on-chain payments the chain did not make, and
-                        // Group-Solo has no reward check that would notice.
-                        match event.groupsolo_snapshot.clone() {
-                            // Confirmation-gate (park until confirmed) when
-                            // possible, else apply immediately — mirrors the
-                            // PPLNS arm so an orphan / non-chain-extending
-                            // candidate never books a phantom into the group
-                            // ledger.
-                            Some(snapshot) => {
-                                self.gate_or_apply_group_solo(
-                                    engine,
-                                    group_uuid,
-                                    group_id_str,
-                                    &address,
-                                    height,
-                                    reward,
-                                    block_hash_hex.as_deref(),
-                                    snapshot,
-                                )
-                                .await;
-                            }
+                        // claim on-chain payments the chain did not make.
+                        // Confirmation-gate (park until confirmed) when
+                        // possible, else apply immediately — mirrors the
+                        // PPLNS arm so an orphan / non-chain-extending
+                        // candidate never books a phantom into the group
+                        // ledger.
+                        let has_weight = event.groupsolo_weight_snapshot.is_some();
+                        if has_weight || event.groupsolo_snapshot.is_some() {
+                            self.gate_or_apply_group_solo(
+                                engine,
+                                group_uuid,
+                                group_id_str,
+                                &address,
+                                height,
+                                reward,
+                                block_hash_hex.as_deref(),
+                                event.groupsolo_snapshot.clone(),
+                                event.groupsolo_weight_snapshot.clone(),
+                                event.actual_coinbase.as_ref(),
+                                event.pplns_payouts_fingerprint,
+                            )
+                            .await;
+                        } else {
                             // Deliberately falls through to the notification
                             // below rather than returning: a block nobody can
                             // book is exactly the one the operator has to hear
                             // about. The Core logged which of the reasons it
                             // was; see `resolve_group_solo_distribution`.
-                            None => error!(
+                            error!(
                                 address = address_str,
                                 group_id = group_id_str,
                                 height,
                                 "block-found: Group-Solo event carried no distribution — NOT \
                                  booked, needs an operator reprocess"
-                            ),
+                            );
                         }
                     }
                     (None, _) => warn!(
@@ -1510,6 +1575,7 @@ mod tests {
     fn block_found_event_json_round_trips_with_stamped_fields() {
         let event = BlockFoundEvent {
             actual_coinbase: None,
+            groupsolo_weight_snapshot: None,
             pplns_payouts_fingerprint: None,
             address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
             worker: "rig1".to_string(),

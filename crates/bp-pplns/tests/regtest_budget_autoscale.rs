@@ -24,6 +24,12 @@
 //! The differential — identical coinbase, only the reservation changed — is
 //! the proof: raising core's reservation FIRST (what `apply_budget` does on an
 //! increase) is what keeps a found block valid.
+//!
+//! The autoscaler's control INPUT is asserted here too: the same demand
+//! built at the small budget reports `utilization ≥ 1.0` +
+//! `trimmed_count > 0` (the SV2 ext 0x0003 §4 blockspace cut fired), and
+//! at the generous budget reports `utilization < 1.0` with no cut — the
+//! signal pair the controller steers the reservation by.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -34,7 +40,7 @@ use bp_mining_job::{
     build_mining_job_from_tdp, merkle_root_from_coinbase, PayoutEntry, TdpCoinbaseTemplate,
     EXTRANONCE_SLOT_LEN,
 };
-use bp_pplns::{build_coinbase_distribution, CoinbaseDistributionInput};
+use bp_pplns::{build_weight_distribution, WeightDistribution, WeightDistributionInput};
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_share::Target;
 use bp_template_distribution::{
@@ -47,7 +53,10 @@ use tokio::sync::broadcast;
 
 const FEE_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 const TEST_NETWORK: Network = Network::Bitcoin;
-const REGTEST_BLOCK_REWARD_SATS: i64 = 5_000_000_000;
+/// Regtest subsidy at the test height (50 BTC). The §4 revenue the
+/// coinbase is evaluated at, and the reference revenue for the weight
+/// build (no balance/bonus boosts in play — it only has to be non-zero).
+const REGTEST_BLOCK_REWARD_SATS: u64 = 5_000_000_000;
 
 /// SMALL initial reservation — the coinbase below exceeds it by MORE than one
 /// filler-tx weight, so the granularity gap left below core's tx-selection cap
@@ -56,9 +65,10 @@ const REGTEST_BLOCK_REWARD_SATS: i64 = 5_000_000_000;
 const B0_BUDGET: u32 = 50_000;
 /// LARGER reservation the autoscaler steps up to — big enough for the coinbase.
 const B1_BUDGET: u32 = 280_000;
-/// Trimmer budget used to BUILD the coinbase distribution: generous so all
-/// `MINER_COUNT` outputs survive, yielding a ~249 kWU coinbase that lands
-/// strictly between core's `B0` (~51 kWU) and `B1` (~281 kWU) reservations.
+/// Budget used to BUILD the published distribution: generous so all
+/// `MINER_COUNT` outputs survive the §4 blockspace cut, yielding a ~249 kWU
+/// coinbase that lands strictly between core's `B0` (~51 kWU) and `B1`
+/// (~281 kWU) reservations.
 const DIST_BUDGET: u32 = 350_000;
 /// P2WPKH payout outputs in the coinbase (~124 WU each → ~249 kWU; ~62 kB,
 /// under the 64 kB `B064K` submit limit).
@@ -104,35 +114,74 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
         .await
         .expect("mine 140 for maturity + funding");
 
-    // ── Build the payout distribution (generous budget → all kept) ──────
+    // ── Telemetry: the same demand under pressure vs with headroom ──────
     let miners = generate_p2wpkh_miners(MINER_COUNT);
-    let mut address_shares: HashMap<AddressId, f64> = HashMap::with_capacity(miners.len());
-    for m in &miners {
-        address_shares.insert(m.clone(), 1.0);
-    }
-    let balances: HashMap<AddressId, Sats> = HashMap::new();
     let fee_addr = AddressId::new(FEE_ADDR.to_string()).expect("fee addr");
-    let dist = build_coinbase_distribution(CoinbaseDistributionInput {
-        address_shares: &address_shares,
-        balances: &balances,
-        block_reward_sats: Sats(REGTEST_BLOCK_REWARD_SATS),
-        fee_percent: 1.5,
-        fee_address: Some(&fee_addr),
-        coinbase_weight_budget: DIST_BUDGET,
-        suppress_matching_debits: false,
-        min_payout_sats: None,
-        finder_bonus_sats: None,
-        finder_address: None,
-    });
-    let payouts: Vec<PayoutEntry> = dist
-        .payouts
+
+    // Built at the SMALL budget the demand (~249 kWU desired for 2 000
+    // P2WPKH outputs) dwarfs the effective budget: the §4 cut fires and
+    // the telemetry reports it — the autoscaler's INCREASE signal.
+    let pressured = build_distribution(&miners, &fee_addr, B0_BUDGET);
+    assert!(
+        pressured.budget_telemetry.utilization() >= 1.0,
+        "under-budget build must report utilization ≥ 1.0 (got {})",
+        pressured.budget_telemetry.utilization()
+    );
+    assert!(
+        pressured.budget_telemetry.trimmed_count > 0,
+        "under-budget build must report a firing cut"
+    );
+
+    // Built at the generous budget every output survives and the same
+    // telemetry reports headroom — the autoscaler's steady-state signal.
+    let dist = build_distribution(&miners, &fee_addr, DIST_BUDGET);
+    assert!(
+        dist.budget_telemetry.utilization() < 1.0,
+        "generous build must report headroom (got {})",
+        dist.budget_telemetry.utilization()
+    );
+    assert_eq!(
+        dist.budget_telemetry.trimmed_count, 0,
+        "generous build must not cut"
+    );
+    assert_eq!(
+        dist.published().count(),
+        MINER_COUNT,
+        "all miners must survive the generous budget"
+    );
+    // Same demand, different budgets: desired_weight is budget-independent.
+    assert_eq!(
+        pressured.budget_telemetry.desired_weight, dist.budget_telemetry.desired_weight,
+        "desired_weight is a property of the demand, not the budget"
+    );
+
+    // ── The §4 payout vector the coinbase is built from ────────────────
+    // Evaluated once at the SUBSIDY, not per-template: the B0 and B1
+    // templates carry different mempool fee totals, and the differential
+    // proof needs the coinbase byte-identical across both submissions.
+    // Σ == subsidy ≤ each template's allowed value — consensus permits a
+    // coinbase claiming less than its due (unclaimed fees are burned),
+    // so the block stays valid on the amount axis and only the WEIGHT
+    // axis (the reservation) decides accept vs reject.
+    let entries = dist
+        .payout_entries_at(REGTEST_BLOCK_REWARD_SATS)
+        .expect("§4 payout vector");
+    let total: u64 = entries.iter().map(|(_, s)| *s).sum();
+    assert_eq!(
+        total, REGTEST_BLOCK_REWARD_SATS,
+        "the §4 vector must consume exactly T"
+    );
+    let payouts: Vec<PayoutEntry> = entries
         .iter()
-        .map(|e| PayoutEntry {
-            address: e.address.as_str().to_string(),
-            sats: e.sats.0 as u64,
+        .map(|(a, s)| PayoutEntry {
+            address: a.as_str().to_string(),
+            sats: *s,
         })
         .collect();
-    eprintln!("[autoscale] distribution kept {} outputs", payouts.len());
+    eprintln!(
+        "[autoscale] distribution published {} outputs (incl. pool output)",
+        payouts.len()
+    );
 
     // ── Attach TDP with the SMALL B0 reservation ───────────────────────
     let tdp = TdpHandle::spawn(
@@ -159,7 +208,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
     let mut rx0 = tdp.subscribe();
     nudge_template(&node).await;
     let tpl0 = wait_for_new_template(&mut rx0).await;
-    let (job0, cb_weight) = build_job(&payouts, &tpl0);
+    let (job0, cb_weight) = build_job(&payouts, &tpl0, dist.fingerprint);
     eprintln!(
         "[autoscale] coinbase weight {cb_weight} WU; B0 reserved ~{} WU, B1 reserved ~{} WU",
         reserved_weight(B0_BUDGET),
@@ -198,7 +247,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
     let mut rx1 = tdp.subscribe();
     nudge_template(&node).await;
     let tpl1 = wait_for_new_template(&mut rx1).await;
-    let (job1, _cb_weight1) = build_job(&payouts, &tpl1);
+    let (job1, _cb_weight1) = build_job(&payouts, &tpl1, dist.fingerprint);
 
     let before = node.current_height().await.expect("height");
     submit(&tdp, &tpl1, &prev, &job1).await;
@@ -221,6 +270,32 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
+/// Build the §4 weight distribution for `miners` (1 share each) at the
+/// given coinbase weight budget.
+fn build_distribution(
+    miners: &[AddressId],
+    fee_addr: &AddressId,
+    coinbase_weight_budget: u32,
+) -> WeightDistribution {
+    let mut address_shares: HashMap<AddressId, f64> = HashMap::with_capacity(miners.len());
+    for m in miners {
+        address_shares.insert(m.clone(), 1.0);
+    }
+    let balances: HashMap<AddressId, Sats> = HashMap::new();
+    build_weight_distribution(WeightDistributionInput {
+        address_shares: &address_shares,
+        balances: &balances,
+        fee_percent: 1.5,
+        fee_address: fee_addr,
+        coinbase_weight_budget,
+        min_payout_sats: None,
+        finder_bonus_sats: None,
+        finder_address: None,
+        reference_revenue_sats: REGTEST_BLOCK_REWARD_SATS,
+    })
+    .expect("build_weight_distribution")
+}
+
 /// core's `block_reserved_weight` for a given budget: `f(N).size * 4`.
 fn reserved_weight(budget: u32) -> u32 {
     tdp_constraint_for_budget(budget)
@@ -230,7 +305,11 @@ fn reserved_weight(budget: u32) -> u32 {
 
 /// Build the SV1 mining job from a TDP template + payout list; return
 /// `(job, coinbase_weight_wu)`.
-fn build_job(payouts: &[PayoutEntry], tpl: &NewTemplate) -> (bp_mining_job::MiningJob, u32) {
+fn build_job(
+    payouts: &[PayoutEntry],
+    tpl: &NewTemplate,
+    fingerprint: [u8; 32],
+) -> (bp_mining_job::MiningJob, u32) {
     let coinbase_template = TdpCoinbaseTemplate {
         coinbase_prefix: &tpl.coinbase_prefix,
         coinbase_tx_version: tpl.coinbase_tx_version,
@@ -246,7 +325,7 @@ fn build_job(payouts: &[PayoutEntry], tpl: &NewTemplate) -> (bp_mining_job::Mini
         &coinbase_template,
         "autoscale-rt",
         EXTRANONCE_SLOT_LEN,
-        [0u8; 32],
+        fingerprint,
     )
     .expect("build_mining_job_from_tdp");
     let en1 = [0u8; 4];

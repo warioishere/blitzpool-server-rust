@@ -434,13 +434,39 @@ impl ProductionPayoutResolver {
                          coinbase stands, a block found on it cannot be booked automatically"
                     );
                 }
-                (
-                    ResolvedPayouts {
-                        entries: entries_to_payouts(&result.payouts),
-                        payouts_fingerprint: result.payouts_fingerprint,
-                    },
-                    result.snapshot_written,
-                )
+                // The §4 evaluation at this template's revenue.
+                match result.distribution.payout_entries_at(reward_sats) {
+                    Ok(entries) => (
+                        ResolvedPayouts {
+                            entries: entries
+                                .into_iter()
+                                .map(|(address, sats)| PayoutEntry {
+                                    address: address.into_inner(),
+                                    sats,
+                                })
+                                .collect(),
+                            payouts_fingerprint: result.payouts_fingerprint(),
+                        },
+                        result.snapshot_written,
+                    ),
+                    Err(err) => {
+                        warn!(
+                            %err,
+                            miner_address,
+                            %group_id,
+                            reward_sats,
+                            "Group-Solo §4 evaluation failed; falling back to solo coinbase"
+                        );
+                        (
+                            ResolvedPayouts::unsnapshotted(solo_payouts(
+                                miner_address,
+                                &self.solo_fee,
+                                reward_sats,
+                            )),
+                            false,
+                        )
+                    }
+                }
             }
             Err(err) => {
                 warn!(

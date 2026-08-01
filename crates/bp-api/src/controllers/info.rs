@@ -460,15 +460,26 @@ where
                         match s.group_solo.as_ref() {
                             Some(engine) => {
                                 match engine.build_distribution(gid, reward_sats, &addr).await {
+                                    // The §4 evaluation at this template's
+                                    // revenue — what the real coinbase pays.
                                     Ok(dist) => dist
-                                        .payouts
-                                        .iter()
-                                        .map(|p| PayoutInfoEntry {
-                                            address: p.address.as_str().to_string(),
-                                            percent: p.percent,
-                                            sats: p.sats.0 as u64,
+                                        .distribution
+                                        .payout_entries_at(reward_sats)
+                                        .map(|entries| {
+                                            entries
+                                                .into_iter()
+                                                .map(|(address, sats)| PayoutInfoEntry {
+                                                    percent: if reward_sats == 0 {
+                                                        0.0
+                                                    } else {
+                                                        (sats as f64) * 100.0 / (reward_sats as f64)
+                                                    },
+                                                    address: address.as_str().to_string(),
+                                                    sats,
+                                                })
+                                                .collect()
                                         })
-                                        .collect(),
+                                        .unwrap_or_default(),
                                     Err(_) => Vec::new(),
                                 }
                             }

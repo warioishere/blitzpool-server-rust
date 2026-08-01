@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use bitcoin::Network;
 use bp_mining_job::{
-    address_to_script, normalize_btc_address, MiningJobCache, ResolvedPayouts,
-    TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
+    address_to_script, normalize_btc_address, MiningJobCache, ResolvedPayouts, TdpCoinbaseTemplate,
+    EXTRANONCE_SLOT_LEN,
 };
 
 use crate::config::{PortConfig, ServerConfig};

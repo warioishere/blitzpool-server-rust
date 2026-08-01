@@ -15,10 +15,10 @@
 //! - [`GroupRoundState`] — per-group accumulator: address-shares,
 //!   rejected-shares, last-accepted timestamps, best-share, total diff.
 //!   Plain data; no I/O.
-//! - [`build_group_solo_distribution`] — adapter on top of
-//!   [`bp_pplns::build_coinbase_distribution`] that locks in the
-//!   Group-Solo invariants (`suppress_matching_debits = true`, finder-
-//!   bonus carve-out).
+//!
+//! The distribution itself is the SV2 ext 0x0003 §4 weight model
+//! (`bp_pplns::build_weight_distribution` with the per-group finder
+//! bonus as a weight boost) — evaluated by the group engine.
 //!
 //! ## What's deferred (see `DEFERRED.md`)
 //!
@@ -38,12 +38,10 @@
 //! [`bp-group-mgmt`](../../bp-group-mgmt/index.html) — separate crate
 //! because the I/O boundaries and consumer paths are different.
 
-mod distribution;
 mod round;
 
-pub use distribution::{build_group_solo_distribution, GroupSoloDistributionInput};
 pub use round::{BestShare, GroupRoundState, ShareEffect};
 
 // Re-export the bp-pplns result type so callers don't need an explicit
 // `bp_pplns` import for Group-Solo work.
-pub use bp_pplns::{CoinbaseDistributionEntry, CoinbaseDistributionResult};
+pub use bp_pplns::CoinbaseDistributionEntry;

@@ -38,10 +38,24 @@ pub(crate) struct PendingGroupSoloBlock {
     pub block_height: i32,
     /// Block-reward portion this coinbase claims.
     pub block_reward_sats: u64,
-    /// The exact distribution the coinbase paid, frozen at find-time. Applied
-    /// verbatim via `GroupSoloEngine::on_block_found_with_snapshot` once the
-    /// block confirms.
-    pub snapshot: StoredSnapshot,
+    /// Legacy (schema-1) exact-match snapshot. `Some` only on blobs frozen
+    /// before the weight model; new blobs carry `weight_snapshot` instead.
+    /// `serde(default)` keeps old blobs readable in both directions.
+    #[serde(default)]
+    pub snapshot: Option<StoredSnapshot>,
+    /// Weight-model settlement inputs (schema 2), applied via
+    /// `GroupSoloEngine::on_block_found_scaled` together with
+    /// `actual_coinbase` once the block confirms.
+    #[serde(default)]
+    pub weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+    /// What the block's coinbase actually paid — the weight-model
+    /// settlement's ground truth.
+    #[serde(default)]
+    pub actual_coinbase: Option<bp_coinbase_snapshot::ActualCoinbase>,
+    /// The weights fingerprint the winning job carried (snapshot-key
+    /// cleanup at apply time).
+    #[serde(default)]
+    pub payouts_fingerprint: Option<[u8; 32]>,
 }
 
 impl PendingBlockRef for PendingGroupSoloBlock {
@@ -84,13 +98,16 @@ mod tests {
     #[test]
     fn pending_group_solo_block_json_round_trip() {
         let pb = PendingGroupSoloBlock {
+            weight_snapshot: None,
+            actual_coinbase: None,
+            payouts_fingerprint: None,
             block_hash: "00000000deadbeef".to_string(),
             found_at_ms: 1_779_000_000_000,
             group_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             finder: "bcrt1qfinder".to_string(),
             block_height: 840_000,
             block_reward_sats: 312_500_000,
-            snapshot: StoredSnapshot {
+            snapshot: Some(StoredSnapshot {
                 balance_before: Vec::new(),
                 distribution: vec![CoinbaseDistributionEntry {
                     address: bp_common::AddressId::new("bcrt1qfinder".to_string()).unwrap(),
@@ -100,7 +117,7 @@ mod tests {
                 block_reward_sats: 312_500_000,
                 considered_addresses: vec!["bcrt1qfinder".to_string()],
                 balance_after: vec![("bcrt1qfinder".to_string(), 0)],
-            },
+            }),
         };
         let json = serde_json::to_string(&pb).unwrap();
         let back: PendingGroupSoloBlock = serde_json::from_str(&json).unwrap();
