@@ -32,49 +32,55 @@
 //! reported offline" — cannot occur here, because the comparison is
 //! against what was sent, not against the previous event.
 //!
+//! ## The reported state is persisted; the schedule is not
+//!
+//! `notified` is the one piece of state that cannot be re-derived: it
+//! records what a *human* was last told, which no table knows. It is
+//! written through a [`ReportedStateStore`] on every change and loaded
+//! back at startup, and it deliberately outlives the in-memory
+//! supervision entry — a device retired after an hour of silence keeps
+//! its reported state, so its eventual return is still a transition.
+//!
+//! Everything else (deadlines, the coalescing buffer) is rebuilt rather
+//! than restored: the watch list is seeded from the database via
+//! [`seed`](DeviceStatusGate::seed), and because the persisted
+//! `notified` survives, a confirmed-but-unsent transition is simply
+//! re-derived on the next sweep instead of being lost.
+//!
 //! ## Level-triggered, not edge-triggered
 //!
 //! A resolution does **not** end a device's supervision: it re-arms a
-//! slow re-check. That is deliberate, and it is what keeps a single
-//! wrong answer from becoming permanently wrong — an edge-only design
-//! can only be corrected by another Stratum event, and a miner that is
-//! stably connected (or stably dead) will never send one.
+//! slow re-check. That is what keeps a single wrong answer from becoming
+//! permanently wrong — an edge-only design can only be corrected by
+//! another Stratum event, and a miner that is stably connected (or
+//! stably dead) will never send one.
 //!
-//! It also removes the need to persist anything. The watch list is
-//! rebuilt at startup from the database via
-//! [`seed`](DeviceStatusGate::seed) — every pair that is connected or was
-//! disconnected recently — so a deadline pending across a restart is
-//! re-derived rather than restored. A miner that died just before a
-//! deploy is still reported, only later.
+//! ## Why the database, and where it lies
 //!
-//! ## Why the database and not an in-memory refcount
+//! `client_entity` rows with `deletedAt IS NULL` are the only
+//! cross-process view of who is connected. But a soft-delete does not
+//! prove a disconnect: the dead-client cron stamps the same column purely
+//! because a session has not submitted an accepted share for five
+//! minutes, so a slow miner gets swept while it is still hashing. Trusting
+//! that directly produced a false "offline", and — because the re-check
+//! keeps asking — a false offline/online cycle every few minutes, forever.
 //!
-//! `client_entity` rows with `deletedAt IS NULL` are already the
-//! authoritative live-session view: cleared on register, stamped on
-//! disconnect, swept by the 60 s dead-client cron for unclean drops. A
-//! refcount kept in this process would have to be rebuilt after every
-//! restart — and could not be rebuilt correctly, since the gate never
-//! sees the connect events that happened before it started.
-//!
-//! Known limit of that source, stated because it is a real trade: the
-//! dead-client cron soft-deletes any session with no accepted share for
-//! five minutes, so a connected-but-share-quiet miner can read as
-//! offline. The periodic re-check makes that self-correcting (its next
-//! share revives the row and the gate reports it back online) rather
-//! than permanent, but it can still cost one spurious offline/online
-//! pair. Distinguishing a reaped row from a real disconnect needs a
-//! schema change and belongs in its own step.
+//! So "gone" is only believed when one of two things holds: a disconnect
+//! event was actually observed for the device, or the soft-delete has
+//! stood for [`DeviceGateConfig::reaper_confirm`], long enough that share
+//! inactivity is no longer a plausible explanation. The fast path stays
+//! fast (a real disconnect is an event) and inactivity alone can no
+//! longer fabricate an outage.
 //!
 //! ## Telling a new device from an old one
 //!
 //! A device the gate has never reported on is only worth an "online"
 //! message when it is genuinely new — otherwise restarting this process
 //! would announce every miner on the pool. The discriminator is the
-//! earliest `startTime` across all of the pair's rows, soft-deleted ones
-//! included: older than this gate's start means the pool already knew
-//! the device. A reconnect always writes a *new* row (fresh `sessionId`)
-//! and leaves the old one intact, so a reconnect storm after a pool
-//! restart stays silent while a genuinely fresh miner is announced.
+//! earliest `COALESCE(firstSeen, startTime)` across all of the pair's
+//! rows: older than this gate's start means the pool already knew the
+//! device. `startTime` alone would not do — it is refreshed on every
+//! re-register, so a long-connected device can look brand new.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -93,9 +99,9 @@ use super::orchestrator::DeviceStatusEvent;
 pub type DeviceKey = (String, String);
 
 /// A device that has settled at offline and seen no Stratum event for
-/// this long stops being supervised. Bounds the map on a pool whose
-/// worker names churn; anything still connected keeps being re-checked
-/// regardless of age.
+/// this long stops being *supervised*. Its reported state is kept (see
+/// [`ReportedStateStore`]) so a later return is still a transition; only
+/// the polling entry is dropped.
 const EVICT_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// Timing knobs. Defaults match [`bp_config`]'s serde defaults; the
@@ -113,6 +119,11 @@ pub struct DeviceGateConfig {
     /// How often a device is re-checked once it has settled. This is
     /// what makes a wrong answer temporary instead of permanent.
     pub recheck_interval: Duration,
+    /// How long a soft-deleted session must stay soft-deleted before
+    /// "gone" is believed **without** a disconnect event behind it.
+    /// Guards against the dead-client sweep, which retires a connected
+    /// session purely for share inactivity.
+    pub reaper_confirm: Duration,
 }
 
 impl Default for DeviceGateConfig {
@@ -122,14 +133,15 @@ impl Default for DeviceGateConfig {
             online_dwell: Duration::from_secs(90),
             coalesce_window: Duration::from_secs(300),
             recheck_interval: Duration::from_secs(300),
+            reaper_confirm: Duration::from_secs(1800),
         }
     }
 }
 
 /// What the subscriber was last told about a device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Notified {
-    /// Nothing has been sent for this device in this process.
+pub enum Notified {
+    /// Nothing has ever been sent for this device.
     Unknown,
     Online,
     Offline,
@@ -147,9 +159,11 @@ enum Direction {
 pub struct DeviceLiveness {
     /// At least one session is connected.
     pub live: bool,
-    /// Earliest `startTime` across every row for the pair, soft-deleted
-    /// rows included — when the pool first saw this worker.
-    pub first_start_ms: i64,
+    /// Earliest `COALESCE(firstSeen, startTime)` across every row for the
+    /// pair — when the pool first saw this worker.
+    pub first_seen_ms: i64,
+    /// Most recent `deletedAt` when nothing is live. `None` while live.
+    pub last_deleted_ms: Option<i64>,
 }
 
 /// Liveness lookup, abstracted so the gate is unit-testable without a
@@ -164,6 +178,33 @@ pub trait DeviceLivenessLookup: Send + Sync {
     async fn liveness(&self, keys: &[DeviceKey]) -> Option<HashMap<DeviceKey, DeviceLiveness>>;
 }
 
+/// Durable record of what each subscriber was last told.
+///
+/// This is the only gate state that cannot be reconstructed from the
+/// pool's own tables — no schema records "we sent this person a push".
+/// Without it a restart re-sends offline messages it already sent, and
+/// silently swallows the matching "back online".
+#[async_trait]
+pub trait ReportedStateStore: Send + Sync {
+    /// Everything remembered, at startup. A failure should return an
+    /// empty map rather than block the gate; the cost is one restart's
+    /// worth of imprecision, not an outage.
+    async fn load(&self) -> HashMap<DeviceKey, bool>;
+    /// Record `online` for `key`. Best-effort.
+    async fn store(&self, key: &DeviceKey, online: bool);
+}
+
+/// A no-op store — the gate degrades to its pre-persistence behaviour.
+pub struct NoReportedStateStore;
+
+#[async_trait]
+impl ReportedStateStore for NoReportedStateStore {
+    async fn load(&self) -> HashMap<DeviceKey, bool> {
+        HashMap::new()
+    }
+    async fn store(&self, _key: &DeviceKey, _online: bool) {}
+}
+
 /// A confirmed, ready-to-send device-status message.
 #[derive(Debug, Clone)]
 pub enum DeviceNotice {
@@ -175,13 +216,19 @@ pub enum DeviceNotice {
 }
 
 /// Collapsed form of two or more transitions on one address.
+///
+/// The two online lists are kept apart because they say different things
+/// to a subscriber: one device is coming back from an outage they were
+/// told about, the other has never been seen before.
 #[derive(Debug, Clone)]
 pub struct DeviceAggregate {
     pub address: AddressId,
-    /// Worker names that went offline, in resolution order.
+    /// Worker names that went offline.
     pub went_offline: Vec<String>,
-    /// Worker names that came online, in resolution order.
-    pub came_online: Vec<String>,
+    /// Worker names that returned after having been reported offline.
+    pub came_back: Vec<String>,
+    /// Worker names seen for the first time.
+    pub first_seen: Vec<String>,
     /// When the batch was released.
     pub timestamp: DateTime<Utc>,
 }
@@ -197,6 +244,10 @@ struct DeviceState {
     /// means the deadline is the periodic re-check, so the next event
     /// may claim it.
     armed_by: Option<Direction>,
+    /// A disconnect was actually observed since the device last resolved
+    /// to online. Without this, "no live rows" might only mean the
+    /// dead-client sweep retired a share-quiet session.
+    saw_offline_event: bool,
     /// Set while this device's key is out at the liveness lookup.
     in_flight: bool,
     /// An event landed while the lookup was in flight, so the answer
@@ -214,7 +265,7 @@ struct DeviceState {
 #[derive(Debug, Default)]
 struct AddressState {
     /// Confirmed transitions waiting for the window to open.
-    buffered: Vec<DeviceStatusEvent>,
+    buffered: Vec<(DeviceStatusEvent, bool)>,
     /// When this address last had a message released.
     last_emit: Option<DateTime<Utc>>,
 }
@@ -223,6 +274,9 @@ struct AddressState {
 struct Inner {
     devices: HashMap<DeviceKey, DeviceState>,
     addresses: HashMap<String, AddressState>,
+    /// What each device was last reported as, independent of whether it
+    /// is still supervised. Mirrors the [`ReportedStateStore`].
+    reported: HashMap<DeviceKey, Notified>,
 }
 
 /// Debounce + coalescing stage. Feed every raw device event through
@@ -235,34 +289,50 @@ struct Inner {
 /// concurrent calls would evaluate the same device twice and could emit
 /// the same transition twice. The binary runs exactly one sweeper.
 ///
-/// Two things it deliberately does not do. A device whose address later
+/// One thing it deliberately does not do: a device whose address later
 /// loses its last subscriber keeps being re-checked until it settles
 /// offline — the resulting message is then dropped at fan-out, so this
 /// costs a map entry and a row in a batched query, not a wrong
-/// notification. And a key that never matches a `client_entity` row
-/// would read as permanently offline; both protocols substitute a
-/// literal (`worker` on SV1, `default` on SV2) when the miner sends no
-/// worker suffix, and the same string is what the session row is written
-/// with, so the two cannot drift apart.
-pub struct DeviceStatusGate<C, L> {
+/// notification.
+pub struct DeviceStatusGate<C, L, S> {
     cfg: DeviceGateConfig,
     clock: C,
     lookup: L,
+    store: S,
     /// Anything the pool saw before this instant predates our
     /// supervision and must not be announced as new.
     started_at_ms: i64,
     inner: Mutex<Inner>,
 }
 
-impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
-    pub fn new(cfg: DeviceGateConfig, clock: C, lookup: L) -> Self {
+impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<C, L, S> {
+    pub fn new(cfg: DeviceGateConfig, clock: C, lookup: L, store: S) -> Self {
         let started_at_ms = clock.now().timestamp_millis();
         Self {
             cfg,
             clock,
             lookup,
+            store,
             started_at_ms,
             inner: Mutex::new(Inner::default()),
+        }
+    }
+
+    /// Load what previous processes already told subscribers. Call once,
+    /// before the first sweep.
+    pub async fn restore_reported_state(&self) {
+        let remembered = self.store.load().await;
+        let mut inner = self.lock();
+        for (key, online) in remembered {
+            let state = if online {
+                Notified::Online
+            } else {
+                Notified::Offline
+            };
+            inner.reported.insert(key.clone(), state);
+            if let Some(device) = inner.devices.get_mut(&key) {
+                device.notified = state;
+            }
         }
     }
 
@@ -272,19 +342,27 @@ impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
     /// enough that a pending deadline may have been lost with the
     /// previous process.
     ///
-    /// Seeded devices start as `Unknown` and are evaluated on the first
-    /// sweep: a live one settles silently (the pool knew it before we
-    /// started), a dead one produces the offline message the restart
-    /// would otherwise have swallowed.
+    /// Seeded devices inherit whatever was already reported for them, so
+    /// a restart neither re-sends an offline message nor swallows the
+    /// return that was still sitting in a coalescing buffer.
     pub fn seed(&self, entries: impl IntoIterator<Item = (AddressId, String, Option<String>)>) {
         let now = self.clock.now();
         let mut inner = self.lock();
         for (address, worker, user_agent) in entries {
             let key = (address.as_str().to_string(), worker.clone());
+            let notified = inner
+                .reported
+                .get(&key)
+                .copied()
+                .unwrap_or(Notified::Unknown);
             inner.devices.entry(key).or_insert_with(|| DeviceState {
-                notified: Notified::Unknown,
+                notified,
                 due_at: now,
                 armed_by: None,
+                // A seeded device brings no event with it. Its liveness
+                // is judged on the soft-delete age alone, which is
+                // exactly the conservative path.
+                saw_offline_event: false,
                 in_flight: false,
                 dirty: false,
                 meta: DeviceStatusEvent {
@@ -314,10 +392,16 @@ impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
         let offline_deadline = now + self.dwell(Direction::Offline);
 
         let mut inner = self.lock();
+        let notified = inner
+            .reported
+            .get(&key)
+            .copied()
+            .unwrap_or(Notified::Unknown);
         let state = inner.devices.entry(key).or_insert_with(|| DeviceState {
-            notified: Notified::Unknown,
+            notified,
             due_at: now,
             armed_by: None,
+            saw_offline_event: false,
             in_flight: false,
             dirty: false,
             meta: event.clone(),
@@ -330,6 +414,9 @@ impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
         }
         state.meta = event.clone();
         state.last_event_at = now;
+        if !event.is_online {
+            state.saw_offline_event = true;
+        }
 
         match state.armed_by {
             // The pending deadline is only the periodic re-check, so this
@@ -362,7 +449,12 @@ impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
         if !due.is_empty() {
             // No lock held across the await.
             match self.lookup.liveness(&due).await {
-                Some(answer) => self.resolve(&due, &answer, now),
+                Some(answer) => {
+                    let writes = self.resolve(&due, &answer, now);
+                    for (key, online) in writes {
+                        self.store.store(&key, online).await;
+                    }
+                }
                 // Blind: keep every deadline and retry next tick. The
                 // release below still runs — a message that was already
                 // confirmed does not need the database again.
@@ -405,20 +497,24 @@ impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
 
     /// Apply the liveness answer to every due device, pushing confirmed
     /// transitions into their address buffers, then re-arm or retire.
+    /// Returns the reported-state changes to persist.
     fn resolve(
         &self,
         due: &[DeviceKey],
         answer: &HashMap<DeviceKey, DeviceLiveness>,
         now: DateTime<Utc>,
-    ) {
+    ) -> Vec<(DeviceKey, bool)> {
         let evict_after = chrono_duration(EVICT_AFTER);
         let online_deadline = now + self.dwell(Direction::Online);
         let offline_deadline = now + self.dwell(Direction::Offline);
         let next_check = now + chrono_duration(self.cfg.recheck_interval);
+        let reaper_confirm_ms = self.cfg.reaper_confirm.as_millis() as i64;
+        let now_ms = now.timestamp_millis();
 
         let mut inner = self.lock();
         let mut retire = Vec::new();
-        let mut confirmed: Vec<DeviceStatusEvent> = Vec::new();
+        let mut confirmed: Vec<(DeviceStatusEvent, bool)> = Vec::new();
+        let mut writes = Vec::new();
 
         for key in due {
             let Some(state) = inner.devices.get_mut(key) else {
@@ -443,33 +539,62 @@ impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
 
             let seen = answer.get(key).copied();
             let live = seen.is_some_and(|l| l.live);
+
+            // "No live rows" is not proof of a disconnect — the
+            // dead-client sweep stamps the same column for a session that
+            // merely went quiet. Believe it only with an observed
+            // disconnect behind it, or once the stamp has stood long
+            // enough that inactivity cannot explain it.
+            if !live && !state.saw_offline_event {
+                // No row at all means the pool has no record of the pair
+                // — it aged out of `client_entity` entirely, which is as
+                // gone as it gets. Only a row that still exists but is
+                // soft-deleted is suspect, because that is what the
+                // dead-client sweep produces.
+                let credible = match seen {
+                    None => true,
+                    Some(l) => l
+                        .last_deleted_ms
+                        .is_some_and(|deleted| now_ms - deleted >= reaper_confirm_ms),
+                };
+                if !credible {
+                    state.armed_by = None;
+                    state.due_at = next_check;
+                    continue;
+                }
+            }
+
             let target = if live {
                 Notified::Online
             } else {
                 Notified::Offline
             };
             state.armed_by = None;
+            if live {
+                state.saw_offline_event = false;
+            }
 
             let previous = state.notified;
-            if target != state.notified {
+            if target != previous {
                 // A device we have never reported on is only announced as
                 // online when the pool first saw it after this gate
                 // started. Everything older predates our supervision —
                 // announcing it would turn a restart into a broadcast.
-                let announce = state.notified != Notified::Unknown
+                let announce = previous != Notified::Unknown
                     || target == Notified::Offline
-                    || seen.is_some_and(|l| l.first_start_ms >= self.started_at_ms);
+                    || seen.is_some_and(|l| l.first_seen_ms >= self.started_at_ms);
                 state.notified = target;
+                writes.push((key.clone(), live));
                 if announce {
                     let mut event = state.meta.clone();
                     event.is_online = live;
                     // A device we already told the subscriber was gone is
                     // "back online", not a first sighting. The raw event's
                     // flag cannot say this: a re-check-driven correction
-                    // has no online event behind it at all, and the last
-                    // one it does have is the disconnect.
+                    // has no online event behind it at all.
+                    let returning = live && previous == Notified::Offline;
                     if live {
-                        event.is_returning = previous == Notified::Offline;
+                        event.is_returning = returning;
                     }
                     // Keep the event's own timestamp when it agreed with
                     // the database — "offline since <disconnect>" is more
@@ -477,13 +602,13 @@ impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
                     if state.meta.is_online != live {
                         event.timestamp = now;
                     }
-                    confirmed.push(event);
+                    confirmed.push((event, returning));
                 }
             }
 
-            // Settled at offline with nothing happening: stop watching.
-            // Anything else stays supervised so a wrong answer stays
-            // temporary rather than becoming permanent.
+            // Settled at offline with nothing happening: stop polling.
+            // The reported state stays in `reported` (and in the store),
+            // so the device's eventual return is still a transition.
             if target == Notified::Offline && now - state.last_event_at >= evict_after {
                 retire.push(key.clone());
             } else {
@@ -491,14 +616,24 @@ impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
             }
         }
 
-        for event in confirmed {
+        for (key, online) in &writes {
+            inner.reported.insert(
+                key.clone(),
+                if *online {
+                    Notified::Online
+                } else {
+                    Notified::Offline
+                },
+            );
+        }
+        for (event, returning) in confirmed {
             let address = event.address.as_str().to_string();
             inner
                 .addresses
                 .entry(address)
                 .or_default()
                 .buffered
-                .push(event);
+                .push((event, returning));
         }
         for key in retire {
             inner.devices.remove(&key);
@@ -508,6 +643,7 @@ impl<C: Clock, L: DeviceLivenessLookup> DeviceStatusGate<C, L> {
         inner.addresses.retain(|_, s| {
             !s.buffered.is_empty() || s.last_emit.is_some_and(|l| now - l < evict_after)
         });
+        writes
     }
 
     /// Release one message per address whose coalescing window is open.
@@ -549,28 +685,50 @@ fn chrono_duration(d: Duration) -> chrono::Duration {
 
 /// One transition stays a plain single message; several become an
 /// aggregate so an address can never exceed one message per window.
-fn collapse(batch: Vec<DeviceStatusEvent>, now: DateTime<Utc>) -> DeviceNotice {
-    if batch.len() == 1 {
-        return DeviceNotice::Single(batch.into_iter().next().expect("len == 1"));
-    }
-    let address = batch[0].address.clone();
-    let mut went_offline = Vec::new();
-    let mut came_online = Vec::new();
-    for event in &batch {
+///
+/// A worker that flapped inside the window appears more than once in the
+/// batch. Only its **last** transition survives — otherwise the message
+/// would name the same miner as both gone and back and never state where
+/// it ended up.
+fn collapse(batch: Vec<(DeviceStatusEvent, bool)>, now: DateTime<Utc>) -> DeviceNotice {
+    let mut net: Vec<(String, DeviceStatusEvent, bool)> = Vec::new();
+    for (event, returning) in batch {
         let worker = event
             .worker_name
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
-        if event.is_online {
-            came_online.push(worker);
-        } else {
+        match net.iter_mut().find(|(w, _, _)| *w == worker) {
+            Some(slot) => {
+                slot.1 = event;
+                slot.2 = returning;
+            }
+            None => net.push((worker, event, returning)),
+        }
+    }
+
+    if net.len() == 1 {
+        let (_, event, _) = net.pop().expect("len == 1");
+        return DeviceNotice::Single(event);
+    }
+
+    let address = net[0].1.address.clone();
+    let mut went_offline = Vec::new();
+    let mut came_back = Vec::new();
+    let mut first_seen = Vec::new();
+    for (worker, event, returning) in net {
+        if !event.is_online {
             went_offline.push(worker);
+        } else if returning {
+            came_back.push(worker);
+        } else {
+            first_seen.push(worker);
         }
     }
     DeviceNotice::Aggregate(DeviceAggregate {
         address,
         went_offline,
-        came_online,
+        came_back,
+        first_seen,
         timestamp: now,
     })
 }
@@ -611,22 +769,41 @@ mod tests {
         fn key(worker: &str) -> DeviceKey {
             (ADDR.to_string(), worker.to_string())
         }
-        /// `first_start_offset_s` is relative to `t0`; negative means the
+        /// `first_seen_offset_s` is relative to `t0`; negative means the
         /// pool saw the worker before the gate started.
-        fn set(&self, worker: &str, live: bool, first_start_offset_s: i64) {
+        fn set(&self, worker: &str, live: bool, first_seen_offset_s: i64) {
             self.rows.lock().expect("lock").insert(
                 Self::key(worker),
                 DeviceLiveness {
                     live,
-                    first_start_ms: (t0() + chrono::Duration::seconds(first_start_offset_s))
+                    first_seen_ms: (t0() + chrono::Duration::seconds(first_seen_offset_s))
                         .timestamp_millis(),
+                    // `live_sessions == 0` means every row carries a
+                    // non-NULL `deletedAt`, so the two can never
+                    // disagree the way a hand-built `None` would.
+                    last_deleted_ms: (!live)
+                        .then(|| (t0() - chrono::Duration::days(1)).timestamp_millis()),
                 },
             );
         }
+        /// Flip liveness. Going offline stamps a soft-delete far enough
+        /// in the past that the reaper guard does not hold it — tests
+        /// that care about that guard use `reap` instead.
         fn set_live(&self, worker: &str, live: bool) {
             let mut rows = self.rows.lock().expect("lock");
             if let Some(entry) = rows.get_mut(&Self::key(worker)) {
                 entry.live = live;
+                entry.last_deleted_ms =
+                    (!live).then(|| (t0() - chrono::Duration::days(1)).timestamp_millis());
+            }
+        }
+        /// The dead-client sweep retiring a still-connected session:
+        /// not live, soft-deleted `at`.
+        fn reap(&self, worker: &str, at: DateTime<Utc>) {
+            let mut rows = self.rows.lock().expect("lock");
+            if let Some(entry) = rows.get_mut(&Self::key(worker)) {
+                entry.live = false;
+                entry.last_deleted_ms = Some(at.timestamp_millis());
             }
         }
         fn forget(&self, worker: &str) {
@@ -665,6 +842,39 @@ mod tests {
         }
     }
 
+    /// Reported state the tests can preload and inspect, standing in
+    /// for the Redis-backed store.
+    #[derive(Default)]
+    struct FakeStore {
+        state: Mutex<HashMap<DeviceKey, bool>>,
+    }
+
+    impl FakeStore {
+        fn preload(&self, worker: &str, online: bool) {
+            self.state
+                .lock()
+                .expect("lock")
+                .insert(FakeDb::key(worker), online);
+        }
+        fn get(&self, worker: &str) -> Option<bool> {
+            self.state
+                .lock()
+                .expect("lock")
+                .get(&FakeDb::key(worker))
+                .copied()
+        }
+    }
+
+    #[async_trait]
+    impl ReportedStateStore for Arc<FakeStore> {
+        async fn load(&self) -> HashMap<DeviceKey, bool> {
+            self.state.lock().expect("lock").clone()
+        }
+        async fn store(&self, key: &DeviceKey, online: bool) {
+            self.state.lock().expect("lock").insert(key.clone(), online);
+        }
+    }
+
     fn address() -> AddressId {
         AddressId::new(ADDR.to_string()).expect("valid address")
     }
@@ -685,12 +895,38 @@ mod tests {
     }
 
     struct Harness {
-        gate: Arc<DeviceStatusGate<TestClock, Arc<FakeDb>>>,
+        gate: Arc<DeviceStatusGate<TestClock, Arc<FakeDb>, Arc<FakeStore>>>,
         clock: TestClock,
         db: Arc<FakeDb>,
     }
 
     fn harness() -> Harness {
+        harness_with(Arc::new(FakeStore::default()))
+    }
+
+    /// A gate with custom timings. Needed where the defaults make a
+    /// scenario impossible to construct — the coalescing window is
+    /// shorter than the offline grace, so two transitions for one worker
+    /// can only share a buffer if the grace is turned down.
+    fn harness_cfg(cfg: DeviceGateConfig) -> Harness {
+        let clock = TestClock::new(t0());
+        let db = Arc::new(FakeDb::default());
+        let store = Arc::new(FakeStore::default());
+        Harness {
+            gate: Arc::new(DeviceStatusGate::new(
+                cfg,
+                clock.clone(),
+                Arc::clone(&db),
+                Arc::clone(&store),
+            )),
+            clock,
+            db,
+        }
+    }
+
+    /// A gate that starts from an existing store — what a restart looks
+    /// like to the second process.
+    fn harness_with(store: Arc<FakeStore>) -> Harness {
         let clock = TestClock::new(t0());
         let db = Arc::new(FakeDb::default());
         Harness {
@@ -698,6 +934,7 @@ mod tests {
                 DeviceGateConfig::default(),
                 clock.clone(),
                 Arc::clone(&db),
+                Arc::clone(&store),
             )),
             clock,
             db,
@@ -1106,6 +1343,178 @@ mod tests {
         }
     }
 
+    // ── Persistence across a restart ────────────────────────────────
+
+    /// A restart must not re-send an offline message the previous
+    /// process already sent. Nothing in the pool's tables records "we
+    /// told this person", so the reported state is persisted; the seed
+    /// alone would re-announce the whole last hour of outages.
+    #[tokio::test]
+    async fn a_restart_does_not_repeat_an_offline_already_reported() {
+        let store = Arc::new(FakeStore::default());
+        let first = harness_with(Arc::clone(&store));
+        first.bring_online("axe01").await;
+        first.open_window();
+        first.db.set_live("axe01", false);
+        first
+            .gate
+            .observe(&event("axe01", false, first.clock.now()));
+        first.advance(301);
+        assert_eq!(
+            singles(&first.gate.poll_due().await),
+            vec![("axe01".into(), false)]
+        );
+        assert_eq!(store.get("axe01"), Some(false), "state was persisted");
+
+        // Second process: same store, device still gone, seeded because
+        // it disconnected recently.
+        let second = harness_with(store);
+        second.gate.restore_reported_state().await;
+        second.db.set("axe01", false, -7200);
+        second
+            .gate
+            .seed([(address(), "axe01".to_string(), Some("BitAxe".into()))]);
+        second.advance(20);
+        assert!(
+            second.gate.poll_due().await.is_empty(),
+            "the subscriber already knows"
+        );
+    }
+
+    /// The mirror case: a return that was confirmed but still sitting in
+    /// the coalescing buffer when the process died. The message itself is
+    /// gone, but because the reported state says "offline" it is simply
+    /// re-derived on the next sweep instead of being lost.
+    #[tokio::test]
+    async fn a_restart_re_derives_a_return_that_was_never_sent() {
+        let store = Arc::new(FakeStore::default());
+        store.preload("axe01", false);
+
+        let h = harness_with(store);
+        h.gate.restore_reported_state().await;
+        // The pool has known this worker for hours — the newness rule
+        // alone would keep it silent.
+        h.db.set("axe01", true, -7200);
+        h.gate
+            .seed([(address(), "axe01".to_string(), Some("BitAxe".into()))]);
+        h.advance(20);
+
+        let out = h.gate.poll_due().await;
+        assert_eq!(singles(&out), vec![("axe01".into(), true)]);
+        match &out[0] {
+            DeviceNotice::Single(e) => assert!(e.is_returning, "it is a return, not a first sight"),
+            DeviceNotice::Aggregate(_) => panic!("expected a single notice"),
+        }
+    }
+
+    /// Retirement drops the polling entry but must NOT drop what the
+    /// subscriber was told — otherwise any outage longer than the
+    /// eviction horizon loses its recovery message, which is the normal
+    /// outage length.
+    #[tokio::test]
+    async fn a_return_after_retirement_is_still_announced() {
+        let h = harness();
+        h.db.set("axe01", true, -7200);
+        h.gate
+            .seed([(address(), "axe01".to_string(), Some("BitAxe".into()))]);
+        h.advance(20);
+        assert!(h.gate.poll_due().await.is_empty(), "known device, silent");
+
+        h.db.set_live("axe01", false);
+        h.gate.observe(&event("axe01", false, h.clock.now()));
+        h.advance(301);
+        assert_eq!(
+            singles(&h.gate.poll_due().await),
+            vec![("axe01".into(), false)]
+        );
+
+        // An hour of silence retires the entry.
+        h.advance(3601);
+        let _ = h.gate.poll_due().await;
+        assert!(h.gate.lock().devices.is_empty(), "no longer supervised");
+        h.open_window();
+
+        // The miner is fixed and comes back.
+        h.db.set_live("axe01", true);
+        h.gate.observe(&event("axe01", true, h.clock.now()));
+        h.advance(100);
+        assert_eq!(
+            singles(&h.gate.poll_due().await),
+            vec![("axe01".into(), true)],
+            "the owner was told it went down and must be told it is back"
+        );
+    }
+
+    // ── The dead-client sweep ───────────────────────────────────────
+
+    /// The sweep retires any session with no accepted share for five
+    /// minutes, which a slow miner does while still connected. Believing
+    /// that produced a false outage — and, because the state is
+    /// re-checked, repeated it every few minutes forever.
+    #[tokio::test]
+    async fn a_reaped_but_connected_miner_is_not_reported_offline() {
+        let h = harness();
+        h.bring_online("axe01").await;
+        h.open_window();
+
+        // Swept for inactivity. No disconnect event exists.
+        for cycle in 0..6 {
+            h.db.reap("axe01", h.clock.now());
+            h.advance(301);
+            assert!(
+                h.gate.poll_due().await.is_empty(),
+                "cycle {cycle}: inactivity is not an outage"
+            );
+            // Its next accepted share revives the row.
+            h.db.set_live("axe01", true);
+            h.advance(301);
+            assert!(
+                h.gate.poll_due().await.is_empty(),
+                "cycle {cycle}: nothing changed"
+            );
+        }
+    }
+
+    /// The guard must not swallow a genuine outage: once the soft-delete
+    /// has stood longer than `reaper_confirm`, inactivity no longer
+    /// explains it.
+    #[tokio::test]
+    async fn a_long_standing_soft_delete_is_believed_without_an_event() {
+        let h = harness();
+        h.bring_online("axe01").await;
+        h.open_window();
+
+        let reaped_at = h.clock.now();
+        h.db.reap("axe01", reaped_at);
+        h.advance(301);
+        assert!(h.gate.poll_due().await.is_empty(), "too soon to believe");
+
+        h.advance(1800);
+        assert_eq!(
+            singles(&h.gate.poll_due().await),
+            vec![("axe01".into(), false)],
+            "half an hour gone is an outage, share-quiet or not"
+        );
+    }
+
+    /// A real disconnect is an event, and must not wait for the
+    /// confirmation window the reaper guard imposes.
+    #[tokio::test]
+    async fn an_observed_disconnect_is_not_delayed_by_the_reaper_guard() {
+        let h = harness();
+        h.bring_online("axe01").await;
+        h.open_window();
+
+        h.db.reap("axe01", h.clock.now());
+        h.gate.observe(&event("axe01", false, h.clock.now()));
+        h.advance(301);
+        assert_eq!(
+            singles(&h.gate.poll_due().await),
+            vec![("axe01".into(), false)],
+            "the grace decides, not the confirmation window"
+        );
+    }
+
     // ── Failure handling, coalescing, memory ────────────────────────
 
     /// A database blip must not be read as "everyone is offline".
@@ -1211,7 +1620,7 @@ mod tests {
                 let mut names = agg.went_offline.clone();
                 names.sort();
                 assert_eq!(names, vec!["a", "b", "c"]);
-                assert!(agg.came_online.is_empty());
+                assert!(agg.came_back.is_empty() && agg.first_seen.is_empty());
             }
             DeviceNotice::Single(_) => panic!("three transitions must aggregate"),
         }
@@ -1256,7 +1665,7 @@ mod tests {
         assert_eq!(out.len(), 1, "one address, one message");
         match &out[0] {
             DeviceNotice::Aggregate(agg) => {
-                let mut names = agg.came_online.clone();
+                let mut names = agg.first_seen.clone();
                 names.sort();
                 assert_eq!(names, vec!["b", "c"]);
             }
@@ -1326,6 +1735,65 @@ mod tests {
             singles(&h.gate.poll_due().await),
             vec![("axe01".into(), false)]
         );
+    }
+
+    /// A worker that flaps across a coalescing window appears twice in
+    /// the batch. Naming it on both sides tells the subscriber nothing —
+    /// only where it ended up matters.
+    #[tokio::test]
+    async fn a_worker_that_flaps_across_the_window_is_reported_once() {
+        // Short dwells so both of `b`'s transitions resolve while the
+        // address's window is still closed; with the defaults the window
+        // reopens between them and the batch never holds two.
+        let h = harness_cfg(DeviceGateConfig {
+            offline_grace: Duration::from_secs(30),
+            online_dwell: Duration::from_secs(10),
+            coalesce_window: Duration::from_secs(300),
+            recheck_interval: Duration::from_secs(300),
+            reaper_confirm: Duration::from_secs(1800),
+        });
+
+        // `b` is known and reported online; `a` is announced, which is
+        // what closes the window.
+        h.db.set("b", true, -7200);
+        h.gate.observe(&event("b", true, h.clock.now()));
+        h.advance(15);
+        assert!(h.gate.poll_due().await.is_empty(), "known device, silent");
+        h.db.set("a", true, 5);
+        h.gate.observe(&event("a", true, h.clock.now()));
+        h.advance(15);
+        assert_eq!(h.gate.poll_due().await.len(), 1, "`a` opens the window");
+
+        // `b` drops...
+        h.db.set_live("b", false);
+        h.gate.observe(&event("b", false, h.clock.now()));
+        h.advance(35);
+        assert!(
+            h.gate.poll_due().await.is_empty(),
+            "buffered, window closed"
+        );
+        // ...and returns, both inside the same window.
+        h.db.set_live("b", true);
+        h.gate.observe(&event("b", true, h.clock.now()));
+        h.advance(15);
+        assert!(h.gate.poll_due().await.is_empty(), "also buffered");
+
+        h.advance(300);
+        let out = h.gate.poll_due().await;
+        assert_eq!(out.len(), 1, "one address, one message");
+        match &out[0] {
+            // Only `b` moved, and its net state is online — so this
+            // collapses back to a single notice rather than an aggregate
+            // naming the same miner twice.
+            DeviceNotice::Single(e) => {
+                assert_eq!(e.worker_name.as_deref(), Some("b"));
+                assert!(e.is_online, "net state is online");
+            }
+            DeviceNotice::Aggregate(agg) => panic!(
+                "a single worker must not be listed twice: offline={:?} back={:?} new={:?}",
+                agg.went_offline, agg.came_back, agg.first_seen
+            ),
+        }
     }
 
     /// A proxy that rotates worker names produces genuine transitions on

@@ -21,6 +21,6 @@ mod orchestrator;
 pub use config::DispatcherConfig;
 pub use device_gate::{
     DeviceAggregate, DeviceGateConfig, DeviceKey, DeviceLiveness, DeviceLivenessLookup,
-    DeviceNotice, DeviceStatusGate,
+    DeviceNotice, DeviceStatusGate, NoReportedStateStore, Notified, ReportedStateStore,
 };
 pub use orchestrator::{DeviceStatusEvent, NotificationDispatcher};

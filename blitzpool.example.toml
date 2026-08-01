@@ -384,6 +384,12 @@ submit_latency = false
 #                              # transitions inside it leave together as one summary
 # recheck_interval_secs = 300  # how often a settled device is re-checked, so a
 #                              # wrong answer corrects itself instead of standing
+# reaper_confirm_secs = 1800   # how long a session must stay soft-deleted before
+#                              # "gone" is believed WITHOUT a disconnect behind it.
+#                              # The dead-client sweep retires a session after 5 min
+#                              # without an accepted share, which a slow miner does
+#                              # while still connected. A real disconnect is an
+#                              # event and is not delayed by this.
 
 # ───────────────────────────────────────────────────────────────
 # SMTP (transactional email — invitations + verification)

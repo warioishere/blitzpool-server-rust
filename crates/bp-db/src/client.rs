@@ -824,11 +824,24 @@ pub struct DeviceLivenessRow {
     pub client_name: String,
     /// Sessions currently connected (`deletedAt IS NULL`).
     pub live_sessions: i64,
-    /// Earliest `startTime` across **all** rows for the pair, including
-    /// soft-deleted ones. This is when the pool first saw this worker —
-    /// the only honest way to tell a genuinely new device from one that
-    /// merely reconnected.
-    pub first_start_ms: i64,
+    /// Earliest `COALESCE("firstSeen", "startTime")` across **all** rows
+    /// for the pair, soft-deleted ones included — when the pool first saw
+    /// this worker.
+    ///
+    /// `startTime` alone is NOT this value: [`upsert_client`]'s
+    /// `ON CONFLICT` refreshes it on every re-register, so a device that
+    /// has been connected for days can carry a `startTime` of minutes ago.
+    /// `firstSeen` is deliberately absent from that SET list and is the
+    /// stable column.
+    pub first_seen_ms: i64,
+    /// Most recent `deletedAt` across the pair's rows, when none is live.
+    ///
+    /// Needed because a soft-delete does **not** prove a disconnect:
+    /// [`kill_dead_clients`] stamps the same column purely for share
+    /// inactivity, so a connected miner that shares less often than
+    /// `STALE_CLIENT_TTL` gets swept while it is still hashing. The gate
+    /// uses the age of this stamp to decide whether "gone" is credible.
+    pub last_deleted_ms: Option<i64>,
 }
 
 /// Liveness + first-seen for each requested `(address, clientName)`.
@@ -842,13 +855,6 @@ pub struct DeviceLivenessRow {
 /// disconnect events in memory — is what makes the debounce survive a
 /// process restart and stay correct across several Stratum fronts.
 ///
-/// `first_start_ms` deliberately spans soft-deleted rows: a reconnect
-/// gets a fresh `sessionId` and therefore a fresh row, so the previous
-/// row survives with its original `startTime` and the pair keeps looking
-/// as old as it really is. It ages out with the 24 h hard-delete, after
-/// which a returning device is treated as new again — which is the right
-/// answer for a device that has been gone a day.
-///
 /// Batched over both key columns so one sweep costs one round-trip
 /// regardless of how many devices are due. The `(address, clientName)`
 /// prefix of the primary key carries the scan.
@@ -860,7 +866,8 @@ pub async fn device_liveness(
     let rows = sqlx::query!(
         r#"SELECT address AS "address!", "clientName" AS "client_name!",
                   COUNT(*) FILTER (WHERE "deletedAt" IS NULL) AS "live_sessions!",
-                  MIN("startTime") AS "first_start_ms!"
+                  MIN(COALESCE("firstSeen", "startTime")) AS "first_seen_ms!",
+                  MAX("deletedAt") AS "last_deleted_ms"
            FROM client_entity
            WHERE (address, "clientName") IN (
                    SELECT * FROM UNNEST($1::text[], $2::text[])
@@ -878,7 +885,8 @@ pub async fn device_liveness(
             address: r.address,
             client_name: r.client_name,
             live_sessions: r.live_sessions,
-            first_start_ms: r.first_start_ms,
+            first_seen_ms: r.first_seen_ms,
+            last_deleted_ms: r.last_deleted_ms,
         })
         .collect())
 }

@@ -535,7 +535,8 @@ async fn send_telegram_device_aggregate(
                 language: lang,
                 time_formatted: &time_str,
                 went_offline: &agg.went_offline,
-                came_online: &agg.came_online,
+                came_back: &agg.came_back,
+                first_seen: &agg.first_seen,
                 address_suffix: suffix.as_deref(),
             });
             log_adapter_send(
@@ -567,10 +568,12 @@ fn device_aggregate_fcm_payload(agg: &DeviceAggregate) -> PushPayload {
         language: Language::En,
         time_formatted: &time_str,
         went_offline: &agg.went_offline,
-        came_online: &agg.came_online,
+        came_back: &agg.came_back,
+        first_seen: &agg.first_seen,
         address_suffix: None,
     });
-    let status = match (agg.went_offline.is_empty(), agg.came_online.is_empty()) {
+    let online = agg.came_back.len() + agg.first_seen.len();
+    let status = match (agg.went_offline.is_empty(), online == 0) {
         (false, true) => "offline",
         (true, false) => "online",
         _ => "mixed",
@@ -578,7 +581,8 @@ fn device_aggregate_fcm_payload(agg: &DeviceAggregate) -> PushPayload {
     let workers: Vec<&str> = agg
         .went_offline
         .iter()
-        .chain(agg.came_online.iter())
+        .chain(agg.came_back.iter())
+        .chain(agg.first_seen.iter())
         .map(String::as_str)
         .collect();
     PushPayload {
@@ -587,11 +591,14 @@ fn device_aggregate_fcm_payload(agg: &DeviceAggregate) -> PushPayload {
         body: text.en,
         tag: status.to_string(),
         extras: vec![
-            ("isReturning".into(), "false".to_string()),
+            (
+                "isReturning".into(),
+                (!agg.came_back.is_empty()).to_string(),
+            ),
             ("workerName".into(), workers.join(", ")),
             ("userAgent".into(), "Multiple".to_string()),
             ("wentOffline".into(), agg.went_offline.len().to_string()),
-            ("cameOnline".into(), agg.came_online.len().to_string()),
+            ("cameOnline".into(), online.to_string()),
             (
                 "timestamp".into(),
                 agg.timestamp.timestamp_millis().to_string(),
@@ -610,7 +617,8 @@ fn device_aggregate_unified_payload(agg: &DeviceAggregate) -> PushPayload {
         language: Language::En,
         time_formatted: &time_str,
         went_offline: &agg.went_offline,
-        came_online: &agg.came_online,
+        came_back: &agg.came_back,
+        first_seen: &agg.first_seen,
         address_suffix: None,
     });
     PushPayload {
@@ -1012,12 +1020,17 @@ mod tests {
         }
     }
 
-    fn aggregate(offline: &[&str], online: &[&str]) -> DeviceAggregate {
+    fn aggregate(offline: &[&str], back: &[&str]) -> DeviceAggregate {
+        aggregate_full(offline, back, &[])
+    }
+
+    fn aggregate_full(offline: &[&str], back: &[&str], fresh: &[&str]) -> DeviceAggregate {
         DeviceAggregate {
             address: AddressId::new("bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l".to_string())
                 .expect("valid address"),
             went_offline: offline.iter().map(|s| (*s).to_string()).collect(),
-            came_online: online.iter().map(|s| (*s).to_string()).collect(),
+            came_back: back.iter().map(|s| (*s).to_string()).collect(),
+            first_seen: fresh.iter().map(|s| (*s).to_string()).collect(),
             timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("timestamp"),
         }
     }
@@ -1051,6 +1064,35 @@ mod tests {
         assert_eq!(
             device_aggregate_fcm_payload(&aggregate(&[], &["b"])).tag,
             "online"
+        );
+        // A batch of nothing but first sightings is still "online" —
+        // the tag describes direction, not novelty.
+        assert_eq!(
+            device_aggregate_fcm_payload(&aggregate_full(&[], &[], &["fresh"])).tag,
+            "online"
+        );
+    }
+
+    /// A brand-new miner must not be described to its owner as having
+    /// recovered from an outage they were never told about.
+    #[test]
+    fn aggregate_separates_first_sightings_from_returns() {
+        let p = device_aggregate_fcm_payload(&aggregate_full(&[], &["back"], &["fresh"]));
+        assert!(p.body.contains("1 worker back online (back)"), "{}", p.body);
+        assert!(p.body.contains("1 new worker (fresh)"), "{}", p.body);
+        let none_returned = device_aggregate_fcm_payload(&aggregate_full(&[], &[], &["a", "b"]));
+        assert!(
+            !none_returned.body.contains("back online"),
+            "{}",
+            none_returned.body
+        );
+        assert_eq!(
+            none_returned
+                .extras
+                .iter()
+                .find(|(k, _)| k == "isReturning")
+                .map(|(_, v)| v.as_str()),
+            Some("false")
         );
     }
 

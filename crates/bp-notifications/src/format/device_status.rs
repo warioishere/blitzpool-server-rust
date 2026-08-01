@@ -102,7 +102,12 @@ pub struct DeviceAggregateArgs<'a> {
     /// Pre-formatted local timestamp, as for [`DeviceStatusArgs`].
     pub time_formatted: &'a str,
     pub went_offline: &'a [String],
-    pub came_online: &'a [String],
+    /// Workers that returned after having been reported offline.
+    pub came_back: &'a [String],
+    /// Workers seen for the first time. Kept apart from `came_back`
+    /// because calling a brand-new miner "back online" tells the reader
+    /// it recovered from an outage they were never notified about.
+    pub first_seen: &'a [String],
     pub address_suffix: Option<&'a str>,
 }
 
@@ -131,16 +136,28 @@ impl DeviceAggregateText {
                 join_names(args.went_offline, Language::En)
             ));
         }
-        if !args.came_online.is_empty() {
-            let n = args.came_online.len();
+        if !args.came_back.is_empty() {
+            let n = args.came_back.len();
             de_parts.push(format!(
                 "\u{1f4f6} {n} Worker wieder online ({})",
-                join_names(args.came_online, Language::De)
+                join_names(args.came_back, Language::De)
             ));
             en_parts.push(format!(
                 "\u{1f4f6} {n} {} back online ({})",
                 plural_worker_en(n),
-                join_names(args.came_online, Language::En)
+                join_names(args.came_back, Language::En)
+            ));
+        }
+        if !args.first_seen.is_empty() {
+            let n = args.first_seen.len();
+            de_parts.push(format!(
+                "\u{2728} {n} Worker neu ({})",
+                join_names(args.first_seen, Language::De)
+            ));
+            en_parts.push(format!(
+                "\u{2728} {n} new {} ({})",
+                plural_worker_en(n),
+                join_names(args.first_seen, Language::En)
             ));
         }
 
@@ -324,14 +341,41 @@ mod tests {
         list.iter().map(|s| (*s).to_string()).collect()
     }
 
-    fn agg_args<'a>(time: &'a str, off: &'a [String], on: &'a [String]) -> DeviceAggregateArgs<'a> {
+    const NO_NAMES: &[String] = &[];
+
+    fn agg_args<'a>(
+        time: &'a str,
+        off: &'a [String],
+        back: &'a [String],
+    ) -> DeviceAggregateArgs<'a> {
         DeviceAggregateArgs {
             language: Language::De,
             time_formatted: time,
             went_offline: off,
-            came_online: on,
+            came_back: back,
+            first_seen: NO_NAMES,
             address_suffix: None,
         }
+    }
+
+    /// First sightings get their own clause — telling someone a brand-new
+    /// miner is "back online" claims an outage they were never told about.
+    #[test]
+    fn aggregate_names_first_sightings_separately() {
+        let back = names(&["old"]);
+        let fresh = names(&["new1", "new2"]);
+        let t = DeviceAggregateText::build(&DeviceAggregateArgs {
+            language: Language::De,
+            time_formatted: "01.05.26, 14:30",
+            went_offline: NO_NAMES,
+            came_back: &back,
+            first_seen: &fresh,
+            address_suffix: None,
+        });
+        assert!(t.de.contains("1 Worker wieder online (old)"), "{}", t.de);
+        assert!(t.de.contains("2 Worker neu (new1, new2)"), "{}", t.de);
+        assert!(t.en.contains("1 worker back online (old)"), "{}", t.en);
+        assert!(t.en.contains("2 new workers (new1, new2)"), "{}", t.en);
     }
 
     #[test]
