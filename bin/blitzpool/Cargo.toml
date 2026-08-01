@@ -114,6 +114,8 @@ thiserror = { workspace = true }
 # Real bitcoin-node for the chain-reconciliation regtest: the RPC shapes it
 # decodes (`getblock`, `getrawtransaction`) can only be verified against Core.
 bp-regtest-harness = { workspace = true }
+# Engine-config tests parse an `AppConfig` from TOML the way boot does.
+toml = { workspace = true }
 
 # Process-wide allocator (Linux only). Wired into `main.rs` via
 # `#[global_allocator]`. See workspace Cargo.toml for rationale.

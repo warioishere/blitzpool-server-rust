@@ -332,13 +332,19 @@ fn to_group_solo_engine_config(cfg: &AppConfig) -> Result<GroupSoloEngineConfig,
         dormant_balance_days: cfg.group_fees.dormant_balance_days,
         // The `min_payout_sats` floor is shared between PPLNS + Group-
         // Solo: both engines read the same value. When `[pplns]` is
-        // configured we reuse its
-        // value; otherwise we fall back to the engine default.
-        min_payout_sats: cfg
-            .pplns
-            .as_ref()
-            .map(|p| Sats(p.min_payout_sats))
-            .unwrap_or_default(),
+        // configured we reuse its value; otherwise the engine's own
+        // default applies.
+        //
+        // NOT `unwrap_or_default()`: that is `Sats(0)`, not the engine
+        // default, and the `..GroupSoloEngineConfig::default()` below
+        // cannot supply it either — struct update syntax only fills
+        // fields that are absent, and this one is present. A deployment
+        // with no `[pplns]` block therefore failed validation at boot
+        // with "min_payout_sats must be ≥ 546, got 0".
+        min_payout_sats: cfg.pplns.as_ref().map_or_else(
+            || GroupSoloEngineConfig::default().min_payout_sats,
+            |p| Sats(p.min_payout_sats),
+        ),
         ..GroupSoloEngineConfig::default()
     };
     let validated = base.try_new()?;
@@ -742,6 +748,96 @@ mod tests {
     use super::*;
     use bp_common::MiningMode;
     use bp_share_stream::AcceptedShareConsumer;
+
+    /// Enough config to reach the engine builders. Deliberately WITHOUT
+    /// `[pplns]` — that is the shape under test.
+    const NO_PPLNS_CFG: &str = r#"
+        network = "mainnet"
+        pool_identifier = "blitzpool"
+
+        [bitcoin_rpc]
+        url = "http://127.0.0.1"
+        user = "u"
+        password = "p"
+        port = 8332
+
+        [tdp]
+        socket_path = "/var/run/bitcoind/bp-tdp.sock"
+
+        [database]
+        driver = "postgres"
+        host = "localhost"
+        user = "postgres"
+        password = "postgres"
+        database = "public_pool"
+
+        [redis]
+        host = "localhost"
+
+        [api]
+        port = 3334
+
+        [stratum]
+        solo_port = 3333
+        solo_start_difficulty = 5000
+        solo_high_diff_port = 3339
+        high_diff_start_difficulty = 1000000
+        job_retention_ms = 90000
+        target_shares_per_minute = 6
+        high_diff_target_shares_per_minute = 6
+        difficulty_check_interval_ms = 60000
+
+        [group_fees]
+        address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        percent = 1.0
+    "#;
+
+    /// A pool that does not run PPLNS must still boot.
+    ///
+    /// `min_payout_sats` is shared between PPLNS and Group-Solo, and the
+    /// Group-Solo builder used `unwrap_or_default()` for the missing
+    /// case — which is `Sats(0)`, not the engine default, because struct
+    /// update syntax cannot fill a field that is explicitly set. Every
+    /// deployment without a `[pplns]` block died at startup with
+    /// "group-solo config invalid: min_payout_sats must be ≥ 546, got 0"
+    /// — an error naming a mode the operator may not even use.
+    #[test]
+    fn a_pool_without_pplns_still_builds_its_group_solo_config() {
+        let cfg: bp_config::AppConfig =
+            toml::from_str(NO_PPLNS_CFG).expect("parse config without [pplns]");
+        assert!(cfg.pplns.is_none(), "the fixture must not define [pplns]");
+
+        let built = to_group_solo_engine_config(&cfg).expect("must build without [pplns]");
+        assert_eq!(
+            built.min_payout_sats,
+            GroupSoloEngineConfig::default().min_payout_sats,
+            "the engine default applies, not Sats(0)"
+        );
+    }
+
+    /// And when `[pplns]` IS configured, its value is the one that wins —
+    /// the two engines share one floor.
+    #[test]
+    fn pplns_min_payout_is_shared_with_group_solo() {
+        let cfg: bp_config::AppConfig = toml::from_str(&format!(
+            "{NO_PPLNS_CFG}\n\
+             [pplns]\n\
+             port = 3340\n\
+             high_diff_port = 3349\n\
+             start_difficulty = 5000\n\
+             target_shares_per_minute = 12\n\
+             fee_address = \"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"\n\
+             fee_percent = 1.5\n\
+             coinbase_weight_budget = 35000\n\
+             min_difficulty = 500\n\
+             warmup_shares = 5\n\
+             min_payout_sats = 12345\n"
+        ))
+        .expect("parse config with [pplns]");
+
+        let built = to_group_solo_engine_config(&cfg).expect("build");
+        assert_eq!(built.min_payout_sats, Sats(12_345));
+    }
 
     // ── CompositeAcceptedShareSink: ArcSwap fan-out list ─────────────
     //
