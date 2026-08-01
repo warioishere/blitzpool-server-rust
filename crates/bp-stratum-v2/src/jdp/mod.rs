@@ -6,4 +6,5 @@
 pub mod client;
 pub mod declarations;
 pub mod dynamic_outputs;
+pub mod payout_distribution;
 pub mod tx_validation;

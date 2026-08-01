@@ -321,6 +321,27 @@ pub fn compute_payout_amounts(
     })
 }
 
+/// A miner's settlement claim on a found block:
+/// `floor(score_weight · (1 − fee) · t_actual / score_total)`, the
+/// weight model's "earned" side. Settlement books
+/// `balance += claim − actually_paid` per address, with `t_actual` and
+/// the paid amounts read from the REAL coinbase of the found block —
+/// so the claim must come from the same raw inputs the published
+/// weights were derived from, never from any projected wire weight.
+///
+/// Integer-exact: `fee_ppm` is parts-per-million (1 % = 10 000);
+/// the u128 product `score · (10^6 − fee_ppm) · t` stays far below
+/// 2^128 for any real score precision and sat amount.
+pub fn claim_sats(score_weight: u64, score_total: u64, fee_ppm: u32, t_actual: u64) -> u64 {
+    if score_total == 0 {
+        return 0;
+    }
+    let miner_ppm = 1_000_000u128.saturating_sub(fee_ppm as u128);
+    let numer = score_weight as u128 * miner_ppm * t_actual as u128;
+    let denom = score_total as u128 * 1_000_000u128;
+    (numer / denom) as u64
+}
+
 /// Identity of a weight distribution: the settlement INPUTS, not any
 /// concrete satoshi outcome.
 ///
@@ -1012,6 +1033,34 @@ mod tests {
             let paid: u64 = r.pays.iter().flatten().sum();
             assert_eq!(paid + r.pool_pay, t);
         }
+    }
+
+    /// `claim is the fee-reduced proportional share of the actual revenue`
+    #[test]
+    fn claim_sats_is_fee_reduced_proportional() {
+        // 50 % of shares, 1.5 % fee, T = 1000 → floor(0.5·0.985·1000) = 492.
+        assert_eq!(claim_sats(500, 1000, 15_000, 1000), 492);
+        // Zero fee → plain proportion.
+        assert_eq!(claim_sats(500, 1000, 0, 1000), 500);
+        // 100 % fee → nothing.
+        assert_eq!(claim_sats(500, 1000, 1_000_000, 1000), 0);
+        // No shares at all → nothing (guards the division).
+        assert_eq!(claim_sats(0, 0, 0, 1000), 0);
+    }
+
+    /// `claim bounds: Σ claims ≤ t for any partition of score_total`
+    #[test]
+    fn claim_sats_never_overpays() {
+        let total = 1_000_000_000_000u64; // SCORE_PRECISION-scale
+        let parts = [499_999_999_999u64, 300_000_000_000, 200_000_000_001];
+        let t = 312_500_000u64;
+        let fee_ppm = 15_000;
+        let sum: u64 = parts
+            .iter()
+            .map(|p| claim_sats(*p, total, fee_ppm, t))
+            .sum();
+        let fee_floor = (t as u128 * fee_ppm as u128 / 1_000_000) as u64;
+        assert!(sum + fee_floor <= t, "claims + fee exceeded revenue");
     }
 
     // ---- weights fingerprint (v2) ----

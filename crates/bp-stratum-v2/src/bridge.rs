@@ -70,10 +70,12 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bp_common::AddressId;
 
 use crate::jdp::declarations::DeclaredJob;
+use crate::jdp::payout_distribution::WeightedOutput;
 use crate::tokens::Token;
 
 // ── Registered job entry ─────────────────────────────────────────────
@@ -156,6 +158,107 @@ pub struct IssuedPayoutSet {
     pub used: bool,
 }
 
+// ── Payout distributions (ext 0x0003 push model) ─────────────────────
+
+/// One published `SetPayoutDistribution` (ext 0x0003 §3.1), tracked
+/// pool-wide so both the JDP declare path and the mining-side
+/// `SetCustomMiningJob` path can resolve a `distribution_id` TLV to
+/// the weights it references and validate the coinbase per §7.1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayoutDistributionEntry {
+    /// §3.1: strictly increasing, universal across all connections.
+    pub distribution_id: u64,
+    /// The pool output (`weight_P` in the amount field).
+    pub pool_payout: WeightedOutput,
+    /// Miner payout slots in §4 coinbase order.
+    pub payouts: Vec<WeightedOutput>,
+    /// Parallel to `payouts` (§3.1).
+    pub dust_limits: Vec<u32>,
+    /// Consensus-serialized 0-value TxOuts the pool appends.
+    pub additional_outputs: Vec<Vec<u8>>,
+    /// Revenue the distribution's weight boosts were projected against
+    /// — the booking band is checked against this.
+    pub reference_reward_sats: u64,
+    /// Settlement-snapshot identity (weights fingerprint). `None` when
+    /// the owning mode books without a snapshot (Solo / Blockparty).
+    pub payouts_fingerprint: Option<[u8; 32]>,
+    /// Whether a booking may be stamped on jobs built from this
+    /// distribution (`false` e.g. when the snapshot write failed — the
+    /// job is still served, but a found block is reported-not-booked).
+    pub bookable: bool,
+    /// `None` = pool-wide (every connection may reference it);
+    /// `Some` = tailored to one miner (Solo / Group-Solo / Blockparty).
+    pub owner: Option<AddressId>,
+    /// JDP session a tailored entry was published to (evicted with it).
+    pub jdp_session_id: Option<u32>,
+    /// Wall-clock ms at publish (drives the cleanup backstop).
+    pub published_at_ms: u64,
+}
+
+/// Which acceptance scope a `distribution_id` is resolved under.
+#[derive(Clone, Copy, Debug)]
+pub enum DistributionScope<'a> {
+    /// JDP declare path — the session id picks its tailored slot.
+    JdpSession(u32),
+    /// Mining-side `SetCustomMiningJob` — no JDP session id on that
+    /// connection; tailored entries are matched by owner address.
+    MinerAddress(&'a AddressId),
+}
+
+/// Outcome of resolving a `distribution_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DistributionAcceptance {
+    /// Within the acceptance window — validate against these weights.
+    Accepted(Arc<PayoutDistributionEntry>),
+    /// Known but superseded / settlement-invalidated (§7.2 / §10)
+    /// → `stale-payout-distribution`.
+    Stale,
+    /// Never published (or long pruned). The spec folds this into the
+    /// same error code — a JDC can't distinguish "too old" from
+    /// "unknown", both mean "re-fetch and re-declare".
+    Unknown,
+}
+
+/// A published entry plus the settlement epoch it was published in.
+/// Entries from an older epoch are stale (§10: a found block
+/// invalidates every distribution); the epoch lives here, registry-
+/// side, so [`PayoutDistributionEntry`] stays plainly constructible by
+/// the publisher.
+#[derive(Clone, Debug)]
+struct PublishedDistribution {
+    entry: Arc<PayoutDistributionEntry>,
+    epoch: u64,
+}
+
+/// Latest + immediately-previous published entry (§7.2 grace window of
+/// exactly one distribution).
+#[derive(Debug, Default)]
+struct DistributionSlot {
+    latest: Option<PublishedDistribution>,
+    previous: Option<PublishedDistribution>,
+}
+
+impl DistributionSlot {
+    fn publish(&mut self, entry: Arc<PayoutDistributionEntry>, epoch: u64) {
+        self.previous = self.latest.take();
+        self.latest = Some(PublishedDistribution { entry, epoch });
+    }
+
+    fn find(&self, id: u64) -> Option<&PublishedDistribution> {
+        [self.latest.as_ref(), self.previous.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|p| p.entry.distribution_id == id)
+    }
+
+    fn newest_publish_ms(&self) -> u64 {
+        self.latest
+            .as_ref()
+            .map(|p| p.entry.published_at_ms)
+            .unwrap_or(0)
+    }
+}
+
 // ── JdpDeclaredJobRegistry ───────────────────────────────────────────
 
 /// Pool-wide cross-connection registry shared by the JDP server (writer)
@@ -175,6 +278,15 @@ pub struct IssuedPayoutSet {
 pub struct JdpDeclaredJobRegistry {
     entries: HashMap<Token, RegisteredDeclaredJob>,
     payout_sets: HashMap<Token, IssuedPayoutSet>,
+    /// Pool-wide distribution (PPLNS) — what every connection gets
+    /// pushed on open and on the publisher's timer.
+    pool_wide_distribution: DistributionSlot,
+    /// Tailored per-JDP-session distributions (Solo / Group-Solo /
+    /// Blockparty, published after the session's identity is known).
+    tailored_distributions: HashMap<u32, DistributionSlot>,
+    /// Bumped by [`Self::invalidate_all_distributions`] (§10). Every
+    /// entry published under an older epoch resolves as `Stale`.
+    settlement_epoch: u64,
 }
 
 impl JdpDeclaredJobRegistry {
@@ -258,6 +370,125 @@ impl JdpDeclaredJobRegistry {
         self.payout_sets.len()
     }
 
+    // ── Payout distributions (ext 0x0003 push model) ────────────────
+
+    /// Publish a fresh pool-wide distribution. The prior latest slides
+    /// into the §7.2 grace slot.
+    pub fn publish_pool_wide(&mut self, entry: PayoutDistributionEntry) {
+        let epoch = self.settlement_epoch;
+        self.pool_wide_distribution.publish(Arc::new(entry), epoch);
+    }
+
+    /// Publish a tailored distribution to one JDP session. On the
+    /// FIRST tailored publish, the session's grace slot is seeded with
+    /// the current pool-wide latest — the JDC may have a declaration
+    /// against the pool-wide distribution in flight while this push
+    /// travels (§7.2's honest race, cross-slot edition).
+    pub fn publish_tailored(&mut self, jdp_session_id: u32, entry: PayoutDistributionEntry) {
+        let epoch = self.settlement_epoch;
+        let pool_wide_latest = self.pool_wide_distribution.latest.clone();
+        let slot = self
+            .tailored_distributions
+            .entry(jdp_session_id)
+            .or_default();
+        let first_tailored = slot.latest.is_none();
+        slot.publish(Arc::new(entry), epoch);
+        // Seed AFTER publish — publish() slides latest into the grace
+        // slot, which on the first tailored push is empty; the grace
+        // entry the session actually needs is the pool-wide
+        // distribution it was declaring against until now.
+        if first_tailored {
+            slot.previous = pool_wide_latest;
+        }
+    }
+
+    /// The current pool-wide distribution, if one was published (for
+    /// the connection-open push and the publisher's skip-if-unchanged
+    /// comparison).
+    pub fn current_pool_wide(&self) -> Option<Arc<PayoutDistributionEntry>> {
+        self.pool_wide_distribution
+            .latest
+            .as_ref()
+            .map(|p| p.entry.clone())
+    }
+
+    /// The current tailored distribution for a JDP session, if any.
+    pub fn current_tailored(&self, jdp_session_id: u32) -> Option<Arc<PayoutDistributionEntry>> {
+        self.tailored_distributions
+            .get(&jdp_session_id)
+            .and_then(|s| s.latest.as_ref())
+            .map(|p| p.entry.clone())
+    }
+
+    /// Resolve a `distribution_id` under `scope` (§7.2 acceptance:
+    /// latest + immediately-previous; a session with a tailored slot
+    /// uses that slot — its grace entry may be the pool-wide
+    /// distribution it saw before the tailored push).
+    pub fn distribution_acceptance(
+        &self,
+        distribution_id: u64,
+        scope: DistributionScope<'_>,
+    ) -> DistributionAcceptance {
+        let slot = match scope {
+            DistributionScope::JdpSession(id) => self
+                .tailored_distributions
+                .get(&id)
+                .filter(|s| s.latest.is_some())
+                .unwrap_or(&self.pool_wide_distribution),
+            DistributionScope::MinerAddress(addr) => self
+                .tailored_distributions
+                .values()
+                .find(|s| {
+                    s.latest
+                        .as_ref()
+                        .is_some_and(|p| p.entry.owner.as_ref() == Some(addr))
+                })
+                .unwrap_or(&self.pool_wide_distribution),
+        };
+        match slot.find(distribution_id) {
+            Some(published) if published.epoch == self.settlement_epoch => {
+                DistributionAcceptance::Accepted(published.entry.clone())
+            }
+            Some(_) => DistributionAcceptance::Stale, // settlement-invalidated (§10)
+            // A stale-but-still-referenced id may also sit in the OTHER
+            // slot's history (e.g. pool-wide k-2 while tailored is
+            // active) — everything not in the acceptance window reads
+            // as Stale/Unknown identically on the wire; distinguish
+            // only for observability.
+            None => {
+                let anywhere = self.pool_wide_distribution.find(distribution_id).is_some()
+                    || self
+                        .tailored_distributions
+                        .values()
+                        .any(|s| s.find(distribution_id).is_some());
+                if anywhere {
+                    DistributionAcceptance::Stale
+                } else {
+                    DistributionAcceptance::Unknown
+                }
+            }
+        }
+    }
+
+    /// §10 settlement invalidation: a block was found and settled per
+    /// its winning distribution — every currently-published
+    /// distribution becomes stale at once (the grace window MUST NOT
+    /// span a settlement event). The publisher is expected to push a
+    /// fresh distribution immediately after.
+    pub fn invalidate_all_distributions(&mut self) {
+        self.settlement_epoch += 1;
+        // The grace slots are meaningless across the boundary.
+        self.pool_wide_distribution.previous = None;
+        for slot in self.tailored_distributions.values_mut() {
+            slot.previous = None;
+        }
+    }
+
+    /// Number of live tailored slots. Diagnostics / tests.
+    pub fn tailored_distribution_count(&self) -> usize {
+        self.tailored_distributions.len()
+    }
+
     /// Drop one specific token. Idempotent.
     pub fn remove(&mut self, token: &Token) -> Option<RegisteredDeclaredJob> {
         self.entries.remove(token)
@@ -274,6 +505,9 @@ impl JdpDeclaredJobRegistry {
         // meaningful while the JDC connection that requested them is live.
         self.payout_sets
             .retain(|_, s| s.jdp_session_id != jdp_session_id);
+        // A tailored distribution dies with the session it was
+        // published to.
+        self.tailored_distributions.remove(&jdp_session_id);
         before - self.entries.len()
     }
 
@@ -292,6 +526,10 @@ impl JdpDeclaredJobRegistry {
         // outlive a clean JDP teardown (forced disconnect / OS reset).
         self.payout_sets
             .retain(|_, s| now_ms.saturating_sub(s.registered_at_ms) <= max_age_ms);
+        // Tailored distribution slots that outlive a clean teardown
+        // age out on their newest publish.
+        self.tailored_distributions
+            .retain(|_, s| now_ms.saturating_sub(s.newest_publish_ms()) <= max_age_ms);
         before - self.entries.len()
     }
 
@@ -516,5 +754,146 @@ mod tests {
         reg.register_payout_set(token(1), payout_set(1, 1_000));
         reg.cleanup_expired(4_000, 1_500); // age 3_000 > 1_500 → drop
         assert!(reg.lookup_payout_set(&token(1)).is_none());
+    }
+
+    // ── Payout distributions (ext 0x0003 push model) ────────────────
+
+    fn distribution(
+        id: u64,
+        owner: Option<AddressId>,
+        session: Option<u32>,
+    ) -> PayoutDistributionEntry {
+        PayoutDistributionEntry {
+            distribution_id: id,
+            pool_payout: WeightedOutput {
+                script_pubkey: vec![0x51],
+                weight: 1,
+            },
+            payouts: vec![WeightedOutput {
+                script_pubkey: vec![0x00, 0x14, 0xAA],
+                weight: 100,
+            }],
+            dust_limits: vec![546],
+            additional_outputs: vec![],
+            reference_reward_sats: 312_500_000,
+            payouts_fingerprint: Some([id as u8; 32]),
+            bookable: true,
+            owner,
+            jdp_session_id: session,
+            published_at_ms: 1_000 + id,
+        }
+    }
+
+    fn accepted_id(a: &DistributionAcceptance) -> Option<u64> {
+        match a {
+            DistributionAcceptance::Accepted(e) => Some(e.distribution_id),
+            _ => None,
+        }
+    }
+
+    /// `grace window: latest + previous accepted, k-2 stale, never-published unknown`
+    #[test]
+    fn distribution_grace_window_latest_plus_previous() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        reg.publish_pool_wide(distribution(1, None, None));
+        reg.publish_pool_wide(distribution(2, None, None));
+        reg.publish_pool_wide(distribution(3, None, None));
+        let scope = DistributionScope::JdpSession(7);
+        assert_eq!(accepted_id(&reg.distribution_acceptance(3, scope)), Some(3));
+        assert_eq!(accepted_id(&reg.distribution_acceptance(2, scope)), Some(2));
+        assert_eq!(
+            reg.distribution_acceptance(1, scope),
+            DistributionAcceptance::Unknown, // k-2 fell out of retention
+        );
+        assert_eq!(
+            reg.distribution_acceptance(99, scope),
+            DistributionAcceptance::Unknown
+        );
+    }
+
+    /// `settlement invalidation: everything published before is stale`
+    #[test]
+    fn distribution_settlement_invalidates_all() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        reg.publish_pool_wide(distribution(1, None, None));
+        reg.publish_pool_wide(distribution(2, None, None));
+        reg.invalidate_all_distributions();
+        let scope = DistributionScope::JdpSession(7);
+        assert_eq!(
+            reg.distribution_acceptance(2, scope),
+            DistributionAcceptance::Stale
+        );
+        // Grace slot cleared — the window never spans a settlement.
+        assert_eq!(
+            reg.distribution_acceptance(1, scope),
+            DistributionAcceptance::Unknown
+        );
+        // A fresh publish after settlement is accepted again.
+        reg.publish_pool_wide(distribution(3, None, None));
+        assert_eq!(accepted_id(&reg.distribution_acceptance(3, scope)), Some(3));
+        // And the settled one stays stale even though it sits in the
+        // grace slot now.
+        assert_eq!(
+            reg.distribution_acceptance(2, scope),
+            DistributionAcceptance::Stale
+        );
+    }
+
+    /// `tailored slot: session resolves its own, first grace = pool-wide`
+    #[test]
+    fn tailored_slot_graces_the_pool_wide_it_replaced() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        reg.publish_pool_wide(distribution(1, None, None));
+        reg.publish_tailored(7, distribution(2, Some(addr()), Some(7)));
+        let scope = DistributionScope::JdpSession(7);
+        assert_eq!(accepted_id(&reg.distribution_acceptance(2, scope)), Some(2));
+        // The pool-wide distribution the session saw pre-tailored
+        // stays acceptable (in-flight declaration race).
+        assert_eq!(accepted_id(&reg.distribution_acceptance(1, scope)), Some(1));
+        // Another session without a tailored slot uses pool-wide only.
+        let other = DistributionScope::JdpSession(9);
+        assert_eq!(accepted_id(&reg.distribution_acceptance(1, other)), Some(1));
+        assert_eq!(
+            reg.distribution_acceptance(2, other),
+            DistributionAcceptance::Stale, // known, but not in THIS scope's window
+        );
+    }
+
+    /// `mining-side scope resolves tailored entries by owner address`
+    #[test]
+    fn miner_address_scope_matches_owner() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        reg.publish_pool_wide(distribution(1, None, None));
+        reg.publish_tailored(7, distribution(2, Some(addr()), Some(7)));
+        let owner = addr();
+        let scope = DistributionScope::MinerAddress(&owner);
+        assert_eq!(accepted_id(&reg.distribution_acceptance(2, scope)), Some(2));
+        // An address without a tailored slot falls back to pool-wide.
+        let stranger = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap();
+        let scope = DistributionScope::MinerAddress(&stranger);
+        assert_eq!(accepted_id(&reg.distribution_acceptance(1, scope)), Some(1));
+    }
+
+    /// `tailored slot dies with its JDP session`
+    #[test]
+    fn tailored_slot_evicted_with_session() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        reg.publish_pool_wide(distribution(1, None, None));
+        reg.publish_tailored(7, distribution(2, Some(addr()), Some(7)));
+        assert_eq!(reg.tailored_distribution_count(), 1);
+        reg.evict_for_jdp_session(7);
+        assert_eq!(reg.tailored_distribution_count(), 0);
+        // The session id (were it reused) is back on pool-wide.
+        let scope = DistributionScope::JdpSession(7);
+        assert_eq!(accepted_id(&reg.distribution_acceptance(1, scope)), Some(1));
+    }
+
+    /// `tailored slot ages out via cleanup_expired`
+    #[test]
+    fn tailored_slot_cleanup_ages_out() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        reg.publish_tailored(7, distribution(2, Some(addr()), Some(7))); // published_at 1_002
+        reg.cleanup_expired(10_000, 1_500);
+        assert_eq!(reg.tailored_distribution_count(), 0);
     }
 }

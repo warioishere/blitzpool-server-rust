@@ -16,14 +16,14 @@ pub use distribution::{
     build_coinbase_distribution, BudgetTelemetry, CoinbaseDistributionEntry,
     CoinbaseDistributionInput, CoinbaseDistributionResult,
 };
-pub use weights::{
-    build_weight_distribution, WeightBuildError, WeightDistribution, WeightDistributionInput,
-    WeightEntry, SCORE_PRECISION,
-};
 pub use weight::{
     is_valid_payout_address, max_coinbase_outputs, output_weight_for_address,
     resolve_min_payout_sats, validate_fee_payout_budget, FeePayoutBudgetError,
     BUDGET_SAFETY_MARGIN_WU, COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT,
     COINBASE_WITNESS_COMMITMENT_WEIGHT, DEFAULT_COINBASE_WEIGHT_BUDGET, DEFAULT_MIN_PAYOUT_SATS,
     DUST_LIMIT_SATS,
+};
+pub use weights::{
+    build_weight_distribution, WeightBuildError, WeightDistribution, WeightDistributionInput,
+    WeightEntry, SCORE_PRECISION,
 };

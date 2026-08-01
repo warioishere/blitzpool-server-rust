@@ -27,7 +27,8 @@ use tracing::warn;
 pub use budget::{read_coinbase_budget, write_coinbase_budget};
 pub use ledger::{ApplyDistributionResult, LedgerError, PayoutRowType};
 pub use snapshot::{
-    delete_snapshot, read_snapshot, write_snapshot, ParsedSnapshot, StoredSnapshot,
+    delete_snapshot, read_snapshot, read_weight_snapshot, write_snapshot, write_weight_snapshot,
+    ParsedSnapshot, StoredSnapshot, StoredWeightSnapshot, WeightSnapshotEntry,
 };
 
 /// Convert a Redis per-address share aggregate (`address → diff-1 sum`,

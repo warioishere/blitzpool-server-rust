@@ -240,28 +240,26 @@ pub fn build_weight_distribution(
         let wire = c.score_weight as i128 + boost_for(c.balance_sats);
         c.wire_weight = wire.clamp(0, u64::MAX as i128) as u64;
     }
-    let finder_bonus: Option<(AddressId, u64)> = match (
-        input.finder_bonus_sats,
-        input.finder_address,
-    ) {
-        (Some(bonus), Some(finder))
-            if bonus.0 > 0 && is_valid_payout_address(finder.as_str()) =>
-        {
-            let bonus_sats = bonus.0 as u64;
-            if publish_all {
-                let c = candidates.entry(finder).or_insert_with(|| Candidate {
-                    address: finder.clone(),
-                    score_weight: 0,
-                    balance_sats: 0,
-                    wire_weight: 0,
-                });
-                let wire = c.wire_weight as i128 + boost_for(bonus_sats as i64);
-                c.wire_weight = wire.clamp(0, u64::MAX as i128) as u64;
+    let finder_bonus: Option<(AddressId, u64)> =
+        match (input.finder_bonus_sats, input.finder_address) {
+            (Some(bonus), Some(finder))
+                if bonus.0 > 0 && is_valid_payout_address(finder.as_str()) =>
+            {
+                let bonus_sats = bonus.0 as u64;
+                if publish_all {
+                    let c = candidates.entry(finder).or_insert_with(|| Candidate {
+                        address: finder.clone(),
+                        score_weight: 0,
+                        balance_sats: 0,
+                        wire_weight: 0,
+                    });
+                    let wire = c.wire_weight as i128 + boost_for(bonus_sats as i64);
+                    c.wire_weight = wire.clamp(0, u64::MAX as i128) as u64;
+                }
+                Some((finder.clone(), bonus_sats))
             }
-            Some((finder.clone(), bonus_sats))
-        }
-        _ => None,
-    };
+            _ => None,
+        };
 
     // ── Deterministic order ─────────────────────────────────────────
     // Published (wire desc, address asc — the §4 coinbase order), then
@@ -284,9 +282,8 @@ pub fn build_weight_distribution(
         input.coinbase_weight_budget
     };
     let effective_budget = budget.saturating_sub(BUDGET_SAFETY_MARGIN_WU);
-    let fixed_overhead = COINBASE_BASE_WEIGHT
-        + COINBASE_WITNESS_COMMITMENT_WEIGHT
-        + COINBASE_OUTPUT_WEIGHT; // the pool_payout output, worst-case type
+    let fixed_overhead =
+        COINBASE_BASE_WEIGHT + COINBASE_WITNESS_COMMITMENT_WEIGHT + COINBASE_OUTPUT_WEIGHT; // the pool_payout output, worst-case type
     let mut used_weight = fixed_overhead;
     let mut desired_weight = fixed_overhead;
     let mut folded_weight: u64 = 0;
@@ -315,12 +312,15 @@ pub fn build_weight_distribution(
 
     let fingerprint = weights_fingerprint_from_parts(
         fee_ppm,
-        finder_bonus
-            .as_ref()
-            .map(|(a, sats)| (a.as_str(), *sats)),
-        entries
-            .iter()
-            .map(|c| (c.address.as_str(), c.score_weight, c.balance_sats, dust_limit)),
+        finder_bonus.as_ref().map(|(a, sats)| (a.as_str(), *sats)),
+        entries.iter().map(|c| {
+            (
+                c.address.as_str(),
+                c.score_weight,
+                c.balance_sats,
+                dust_limit,
+            )
+        }),
     );
 
     Ok(WeightDistribution {
@@ -440,7 +440,11 @@ mod tests {
         let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
         let w1 = d.entries.iter().find(|e| e.address.as_str() == A1).unwrap();
         assert_eq!(w1.wire_weight, 0, "debt-swallowed weight floors at 0");
-        assert_eq!(w1.score_weight, SCORE_PRECISION / 2, "score kept for settlement");
+        assert_eq!(
+            w1.score_weight,
+            SCORE_PRECISION / 2,
+            "score kept for settlement"
+        );
         assert_eq!(w1.balance_sats, -400_000_000);
         assert!(d.published().all(|e| e.address.as_str() != A1));
     }
