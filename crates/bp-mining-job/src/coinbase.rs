@@ -5,6 +5,7 @@
 
 use bitcoin::Network;
 use bp_share::sha256d_from_parts;
+use tracing::warn;
 
 use crate::address;
 
@@ -722,6 +723,88 @@ mod fingerprint_tests {
             payouts.iter().map(|p| (p.address.as_str(), p.sats)),
         );
         assert_eq!(payouts_fingerprint(REWARD, &payouts), from_parts);
+    }
+}
+
+/// [`bp_stratum_v1::client::solo_payouts`]'s inputs).
+#[derive(Clone, Debug)]
+pub struct SoloFeeConfig {
+    /// Bitcoin address that receives the dev fee on solo payouts.
+    /// `None` disables dev fee — full reward to miner.
+    pub dev_fee_address: Option<String>,
+    /// Dev fee in `[0.0, 100.0]`. Ignored when `dev_fee_address` is `None`.
+    pub dev_fee_percent: f64,
+}
+
+impl Default for SoloFeeConfig {
+    fn default() -> Self {
+        Self {
+            dev_fee_address: None,
+            dev_fee_percent: 0.0,
+        }
+    }
+}
+
+/// Solo-mode coinbase split — the ONE implementation.
+///
+/// It lives here because two callers need the same answer and used to
+/// disagree: the payout resolver that builds the real coinbase, and the
+/// `/api/client/:address/block-template` preview, which had its own copy
+/// reading the PPLNS fee config and so showed a solo miner a fee output
+/// its actual `mining.notify` never carried. A preview that does not
+/// call the same code is a second rule, and it will drift again.
+///
+/// The rule:
+/// 100%-to-miner, or `dev_fee_percent` to dev + remainder to miner. Amounts are
+/// exact sats — the dev fee floors, the miner takes the remainder so both
+/// outputs sum to exactly `reward_sats`.
+pub fn solo_payouts(
+    miner_address: &str,
+    fee: &SoloFeeConfig,
+    reward_sats: u64,
+) -> Vec<PayoutEntry> {
+    let dev_addr = fee
+        .dev_fee_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let percent = fee.dev_fee_percent;
+    let full_to_miner = || {
+        vec![PayoutEntry {
+            address: miner_address.to_string(),
+            sats: reward_sats,
+        }]
+    };
+    match (miner_address.is_empty(), dev_addr) {
+        (true, _) => vec![],
+        (false, None) => full_to_miner(),
+        (false, Some(_dev)) if !(0.0..=100.0).contains(&percent) => {
+            // Defensive: out-of-range dev percent → ignore the fee, full to miner.
+            warn!(
+                percent,
+                "solo dev_fee_percent out of [0,100]; ignoring fee + paying 100% to miner"
+            );
+            full_to_miner()
+        }
+        (false, Some(_dev)) if percent <= 0.0 => {
+            // Dev address configured but a zero (or negative) percent — the
+            // common "set dev_fee_address, forgot dev_fee_percent" misconfig,
+            // since the production default is 0.0. Emitting a dev output at 0 %
+            // would put a useless zero-value output in the coinbase; pay the
+            // whole reward to the miner instead.
+            full_to_miner()
+        }
+        (false, Some(dev)) => {
+            let dev = PayoutEntry::from_percent(dev, percent, reward_sats);
+            let miner_sats = reward_sats.saturating_sub(dev.sats);
+            vec![
+                dev,
+                PayoutEntry {
+                    address: miner_address.to_string(),
+                    sats: miner_sats,
+                },
+            ]
+        }
     }
 }
 
@@ -1547,5 +1630,86 @@ mod tests {
             tx.output[2].script_pubkey.to_bytes(),
             vec![0x6a, 0x03, b'P', b'O', b'L']
         );
+    }
+}
+
+#[cfg(test)]
+mod solo_split_tests {
+    use super::*;
+
+    const REWARD: u64 = 5_000_000_000;
+
+    fn fee(address: Option<&str>, percent: f64) -> SoloFeeConfig {
+        SoloFeeConfig {
+            dev_fee_address: address.map(str::to_string),
+            dev_fee_percent: percent,
+        }
+    }
+
+    /// The reported bug: a solo miner's `/block-template` preview showed a
+    /// fee output its real `mining.notify` did not carry, because the
+    /// preview read the PPLNS fee config. With no solo dev fee configured
+    /// the split is one output, and both callers now get that same answer
+    /// from here.
+    #[test]
+    fn without_a_dev_fee_the_solo_split_is_a_single_output() {
+        let out = solo_payouts("bc1qminer", &fee(None, 0.0), REWARD);
+        assert_eq!(out.len(), 1, "no second output: {out:?}");
+        assert_eq!(out[0].address, "bc1qminer");
+        assert_eq!(out[0].sats, REWARD);
+    }
+
+    /// A dev address with the production-default 0 % is the common
+    /// misconfiguration; emitting a zero-value output would be worse than
+    /// dropping the fee.
+    #[test]
+    fn a_zero_percent_dev_fee_is_not_an_output() {
+        let out = solo_payouts("bc1qminer", &fee(Some("bc1qdev"), 0.0), REWARD);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].sats, REWARD);
+    }
+
+    /// A configured fee does split, and the two outputs sum to exactly the
+    /// reward — the coinbase must not lose or invent a satoshi.
+    #[test]
+    fn a_configured_dev_fee_splits_and_conserves_every_satoshi() {
+        let out = solo_payouts("bc1qminer", &fee(Some("bc1qdev"), 1.0), REWARD);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].address, "bc1qdev");
+        assert_eq!(out[1].address, "bc1qminer");
+        assert_eq!(
+            out[0].sats + out[1].sats,
+            REWARD,
+            "the split must conserve the reward exactly"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_whitespace_dev_address_is_ignored() {
+        assert_eq!(
+            solo_payouts("bc1qminer", &fee(Some(""), 1.0), REWARD).len(),
+            1
+        );
+        assert_eq!(
+            solo_payouts("bc1qminer", &fee(Some("   "), 1.0), REWARD).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_percent_falls_back_to_the_miner() {
+        assert_eq!(
+            solo_payouts("bc1qminer", &fee(Some("bc1qdev"), 101.0), REWARD).len(),
+            1
+        );
+        assert_eq!(
+            solo_payouts("bc1qminer", &fee(Some("bc1qdev"), -1.0), REWARD).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_empty_miner_address_yields_nothing() {
+        assert!(solo_payouts("", &fee(None, 0.0), REWARD).is_empty());
     }
 }

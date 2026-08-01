@@ -49,7 +49,9 @@ use async_trait::async_trait;
 use bp_blockparty_engine::BlockpartyApi;
 use bp_common::{AddressId, MiningMode, Sats};
 use bp_group_solo_engine::engine::GroupSoloEngine;
-use bp_mining_job::PayoutEntry;
+/// Re-exported so the wiring keeps one import path for the solo split.
+pub(crate) use bp_mining_job::SoloFeeConfig;
+use bp_mining_job::{solo_payouts, PayoutEntry};
 use bp_pplns::CoinbaseDistributionEntry;
 use bp_pplns_engine::engine::PplnsEngine;
 use tracing::warn;
@@ -58,25 +60,6 @@ use uuid::Uuid;
 use crate::engines::BlitzpoolModeGate;
 
 /// Server-wide solo dev-fee config (mirrors
-/// [`bp_stratum_v1::client::solo_payouts`]'s inputs).
-#[derive(Clone, Debug)]
-pub(crate) struct SoloFeeConfig {
-    /// Bitcoin address that receives the dev fee on solo payouts.
-    /// `None` disables dev fee — full reward to miner.
-    pub(crate) dev_fee_address: Option<String>,
-    /// Dev fee in `[0.0, 100.0]`. Ignored when `dev_fee_address` is `None`.
-    pub(crate) dev_fee_percent: f64,
-}
-
-impl Default for SoloFeeConfig {
-    fn default() -> Self {
-        Self {
-            dev_fee_address: None,
-            dev_fee_percent: 0.0,
-        }
-    }
-}
-
 /// The single production [`PayoutResolver`] impl. Holds clones of the
 /// engines + the mode gate; cheap to clone (each field is internally
 /// `Arc` or already-clone-friendly).
@@ -466,57 +449,6 @@ fn entries_to_payouts(entries: &[CoinbaseDistributionEntry]) -> Vec<PayoutEntry>
             sats: e.sats.0.max(0) as u64,
         })
         .collect()
-}
-
-/// Solo-mode coinbase split. Mirrors
-/// [`bp_stratum_v1::client::solo_payouts`]:
-/// 100%-to-miner, or `dev_fee_percent` to dev + remainder to miner. Amounts are
-/// exact sats — the dev fee floors, the miner takes the remainder so both
-/// outputs sum to exactly `reward_sats`.
-fn solo_payouts(miner_address: &str, fee: &SoloFeeConfig, reward_sats: u64) -> Vec<PayoutEntry> {
-    let dev_addr = fee
-        .dev_fee_address
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let percent = fee.dev_fee_percent;
-    let full_to_miner = || {
-        vec![PayoutEntry {
-            address: miner_address.to_string(),
-            sats: reward_sats,
-        }]
-    };
-    match (miner_address.is_empty(), dev_addr) {
-        (true, _) => vec![],
-        (false, None) => full_to_miner(),
-        (false, Some(_dev)) if !(0.0..=100.0).contains(&percent) => {
-            // Defensive: out-of-range dev percent → ignore the fee, full to miner.
-            warn!(
-                percent,
-                "solo dev_fee_percent out of [0,100]; ignoring fee + paying 100% to miner"
-            );
-            full_to_miner()
-        }
-        (false, Some(_dev)) if percent <= 0.0 => {
-            // Dev address configured but a zero (or negative) percent — the
-            // common "set dev_fee_address, forgot dev_fee_percent" misconfig,
-            // since the production default is 0.0. Emitting a dev output at 0 %
-            // would put a useless zero-value output in the coinbase; pay the
-            // whole reward to the miner instead.
-            full_to_miner()
-        }
-        (false, Some(dev)) => {
-            let dev = PayoutEntry::from_percent(dev, percent, reward_sats);
-            let miner_sats = reward_sats.saturating_sub(dev.sats);
-            vec![
-                dev,
-                PayoutEntry {
-                    address: miner_address.to_string(),
-                    sats: miner_sats,
-                },
-            ]
-        }
-    }
 }
 
 #[cfg(test)]

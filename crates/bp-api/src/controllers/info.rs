@@ -512,41 +512,22 @@ where
                         None => Vec::new(),
                     },
                     _ => {
-                        // Solo: fee_address (if configured) + miner address. Fee %
-                        // is taken from the PPLNS engine config so a pool running
-                        // without PPLNS still publishes the operator's intended
-                        // fee split.
-                        let (fee_address, fee_percent) = s
-                            .pplns
-                            .as_ref()
-                            .map(|e| {
-                                let cfg = e.reader().fee_config();
-                                (cfg.fee_address, cfg.fee_percent)
+                        // Solo: exactly what the payout resolver would build.
+                        // This used to be a second implementation reading the
+                        // PPLNS fee config, so a solo miner saw a fee output
+                        // that its real coinbase never carried.
+                        bp_mining_job::solo_payouts(addr.as_str(), &s.solo_fee, reward_sats)
+                            .into_iter()
+                            .map(|p| PayoutInfoEntry {
+                                percent: if reward_sats == 0 {
+                                    0.0
+                                } else {
+                                    (p.sats as f64) * 100.0 / (reward_sats as f64)
+                                },
+                                address: p.address,
+                                sats: p.sats,
                             })
-                            .unwrap_or((None, 0.0));
-                        let mut entries = Vec::new();
-                        if let Some(fee_addr) = fee_address.filter(|a| !a.is_empty()) {
-                            let fee_sats =
-                                ((reward_sats as f64) * fee_percent / 100.0).floor() as u64;
-                            let miner_sats = reward_sats.saturating_sub(fee_sats);
-                            entries.push(PayoutInfoEntry {
-                                address: fee_addr,
-                                percent: fee_percent,
-                                sats: fee_sats,
-                            });
-                            entries.push(PayoutInfoEntry {
-                                address: addr.as_str().to_string(),
-                                percent: 100.0 - fee_percent,
-                                sats: miner_sats,
-                            });
-                        } else {
-                            entries.push(PayoutInfoEntry {
-                                address: addr.as_str().to_string(),
-                                percent: 100.0,
-                                sats: reward_sats,
-                            });
-                        }
-                        entries
+                            .collect()
                     }
                 };
 

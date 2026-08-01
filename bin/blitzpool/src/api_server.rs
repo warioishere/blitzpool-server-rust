@@ -152,6 +152,12 @@ fn build_app_state(
             bp_config::Network::Regtest => bitcoin::Network::Regtest,
         },
         pool_identifier: cfg.pool_identifier.clone(),
+        // Same values the payout resolver is built with, so the preview
+        // and the real coinbase cannot disagree.
+        solo_fee: bp_mining_job::SoloFeeConfig {
+            dev_fee_address: cfg.solo.dev_fee_address.clone(),
+            dev_fee_percent: cfg.solo.dev_fee_percent.unwrap_or(0.0),
+        },
         cache: ResponseCache::new(cfg.api.cache.clone()),
     };
     Arc::new(state)
