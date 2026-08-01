@@ -132,6 +132,14 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
         .await;
 }
 
+/// Every test owns its OWN pair of addresses.
+///
+/// `pplns_balance` is keyed on the address alone and is shared by every
+/// test in this target — they only differ by Redis database. While they
+/// all used the same two literals, one test's `cleanup_addresses` deleted
+/// the balance row another was mid-way through asserting on. Distinct
+/// addresses per test is what makes them independent; the Redis database
+/// index alone never did.
 async fn cleanup_addresses(pool: &PgPool, addresses: &[&str]) {
     for addr in addresses {
         let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
@@ -152,8 +160,8 @@ async fn build_with_shares_only_returns_payouts_and_writes_snapshot() {
 
     // Use valid Bitcoin addresses so they survive the payout-address
     // sanitisation filter applied before distribution math.
-    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const ADDR_A: &str = "bc1qvzf0p407umrsaxmsnq62yudwf27lmsxd8sshzl";
+    const ADDR_B: &str = "bc1q2a2z2q02mf38pjmtcfc926a52ssk2mw0ekmz6q";
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
 
     let window = build_window(&h).await;
@@ -190,8 +198,8 @@ async fn build_folds_open_balances_into_distribution() {
     };
 
     // Use valid Bitcoin addresses so they survive the payout-address filter.
-    const ADDR_MINER: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-    const ADDR_DEBTOR: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const ADDR_MINER: &str = "bc1qymzqcsak0z8zxlxyrqtdw0tvke9sma0gwfaplq";
+    const ADDR_DEBTOR: &str = "bc1qhntpnmga5u3c96wqvtxx4a429u5l23unmde3g0";
     cleanup_addresses(&h.pool, &[ADDR_MINER, ADDR_DEBTOR]).await;
 
     let window = build_window(&h).await;
@@ -332,8 +340,8 @@ async fn concurrent_distinct_rewards_share_one_inputs_load() {
     };
 
     // Valid Bitcoin addresses so they survive payout-address sanitisation.
-    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const ADDR_A: &str = "bc1q0fqgxscjqch5tmqvnf50e0uyfem9sr432z2zx9";
+    const ADDR_B: &str = "bc1qvuv4q5jp34mlvc97fh0r4l00jrllmunezpl69k";
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
 
     let window = build_window(&h).await;
@@ -393,8 +401,8 @@ async fn distinct_rewards_keep_their_own_fingerprinted_snapshot() {
         None => return,
     };
 
-    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const ADDR_A: &str = "bc1qcv9d0s4mrcpczumg8cr9tj34l0gw29scz552yd";
+    const ADDR_B: &str = "bc1qy5jzxu2u6jeps9duq8fgdxuacjan93vy6yg4j8";
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
 
     let window = build_window(&h).await;
@@ -515,30 +523,13 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
 // become a coinbase. Losing the snapshot costs a reprocess; losing the
 // distribution costs the pool's miners the block, on-chain and irreversibly.
 //
-// Redis is made to reject writes for real (`maxmemory`), not mocked — reads
-// still succeed under it, which is exactly the shape needed here.
-
-/// Restores `maxmemory` even if the test panics — it is server-global, so
-/// leaking it would break every later test against this Redis.
-struct MaxMemoryGuard(redis::aio::ConnectionManager);
-
-impl Drop for MaxMemoryGuard {
-    fn drop(&mut self) {
-        let mut conn = self.0.clone();
-        // Best-effort: a blocking handle inside Drop is not available, so
-        // spawn onto the current runtime.
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let _ = redis::cmd("CONFIG")
-                    .arg("SET")
-                    .arg("maxmemory")
-                    .arg("0")
-                    .query_async::<()>(&mut conn)
-                    .await;
-            })
-        });
-    }
-}
+// The write is made to fail for real, not mocked — but the injection has to
+// be LOCAL. `CONFIG SET maxmemory 1` was used here originally and is
+// server-global: while it was in force, every other test writing to this
+// Redis — in this file and in other crates running concurrently — failed with
+// OOM. That was the whole flake. Occupying the snapshot key with the wrong
+// type reproduces the same shape (the write is rejected, reads still work) and
+// touches nothing but this test's own database.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
@@ -546,8 +537,8 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
         Some(h) => h,
         None => return,
     };
-    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-    const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const ADDR_A: &str = "bc1q5ndveg7ps2wulxxmsdlqgekduxcsys43pxlxjr";
+    const ADDR_B: &str = "bc1qzlx2znc9s9cga7g8836gpej6p9pc94k3xgylrh";
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
 
     let window = build_window(&h).await;
@@ -555,24 +546,17 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
     seed_share(&window, ADDR_A, 60.0, 1_700_000_000_001).await;
     seed_share(&window, ADDR_B, 40.0, 1_700_000_000_002).await;
 
+    // `KEY_SNAPSHOT` is a hash; holding a string there makes the snapshot
+    // HSET fail with WRONGTYPE while every other key is untouched.
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
     let client = Client::open(format!("{redis_base}/6")).expect("client");
     let mut admin = ConnectionManager::new(client).await.expect("admin conn");
-    redis::cmd("CONFIG")
-        .arg("SET")
-        .arg("maxmemory-policy")
-        .arg("noeviction")
+    redis::cmd("SET")
+        .arg(bp_pplns_engine::window::KEY_SNAPSHOT)
+        .arg("occupied-by-the-wrong-type")
         .query_async::<()>(&mut admin)
         .await
-        .expect("policy");
-    let _guard = MaxMemoryGuard(admin.clone());
-    redis::cmd("CONFIG")
-        .arg("SET")
-        .arg("maxmemory")
-        .arg("1")
-        .query_async::<()>(&mut admin)
-        .await
-        .expect("maxmemory");
+        .expect("occupy the snapshot key");
 
     // Window read + ledger read still work; only the snapshot write is
     // rejected. The build must survive it.
@@ -592,6 +576,10 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
          leave only the requesting address"
     );
 
-    drop(_guard);
+    let _: () = redis::cmd("DEL")
+        .arg(bp_pplns_engine::window::KEY_SNAPSHOT)
+        .query_async(&mut admin)
+        .await
+        .expect("release the snapshot key");
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
 }

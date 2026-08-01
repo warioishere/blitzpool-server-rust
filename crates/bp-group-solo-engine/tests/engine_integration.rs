@@ -53,7 +53,7 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_sats: Option<i64>) -> Option<H
             return None;
         }
     };
-    let mut conn = match tokio::time::timeout(
+    let conn = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         ConnectionManager::new(client),
     )
@@ -69,10 +69,12 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_sats: Option<i64>) -> Option<H
             return None;
         }
     };
-    if let Err(e) = redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await {
-        eprintln!("FLUSHDB failed: {e} — skipping");
-        return None;
-    }
+    // Deliberately NO FLUSHDB. Every key this harness touches is
+    // namespaced by the per-test `group_id` below, so flushing buys no
+    // isolation — and several tests here share a Redis database index
+    // (there are only 16 and more tests than that), so one flushing on
+    // entry wiped the state a sibling was mid-way through asserting on.
+    // That was the flake.
 
     let group_id = Uuid::new_v4();
     seed_group(&pool, group_id, finder_bonus_sats).await;

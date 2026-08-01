@@ -106,7 +106,10 @@ mod tests {
     /// mirrors `block_found_consumer`, covered by `regtest_split_e2e`).
     #[tokio::test]
     async fn producing_sink_events_round_trip_and_ack() {
-        let Some(redis) = connect_redis_or_skip(9).await else {
+        // DB 11: every test target in this binary runs as a thread in one
+        // process and FLUSHDBs its index on entry, so two sharing an index
+        // wipe each other's stream. `redis_backup` already owns 9.
+        let Some(redis) = connect_redis_or_skip(11).await else {
             eprintln!("redis unreachable — skipping device-status round-trip test");
             return;
         };
