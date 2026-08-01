@@ -102,13 +102,26 @@ async fn connect_or_skip(redis_db: u8, prefix: &str) -> Option<(ConnectionManage
 
 /// Test config: tight flush cadence + no daily sweep so background
 /// tasks don't loiter / interfere during a test.
+///
+/// A fee address is structural in the weight model — the pool output
+/// anchors the §4 residual (`pay_P` is never pruned), so a build
+/// without one refuses (`NoFeeAddress`). `fee_percent` stays 0.0: the
+/// pool output then only absorbs integer-rounding residue and the
+/// miners keep effectively the whole reward, which is what the payout
+/// assertions in this file are written against.
 fn test_config() -> PplnsEngineConfig {
     PplnsEngineConfig {
         touch_flush_interval_secs: 1,
         dust_sweep_enabled: false,
+        fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).expect("valid fee address")),
         ..PplnsEngineConfig::default()
     }
 }
+
+/// Fee anchor for every engine in this file. Deliberately NOT a miner
+/// address used by any test, so fee rows can never collide with the
+/// per-test prefixed miners.
+const TEST_FEE_ADDRESS: &str = "bc1q9h6mqcxrmk2q6cw5tqcjkkfcrqyzyfxzjjhysx";
 
 async fn spawn_or_skip(redis_db: u8, prefix: &str) -> Option<EngineHarness> {
     let (conn, pool) = connect_or_skip(redis_db, prefix).await?;
@@ -465,7 +478,11 @@ async fn reader_fee_config_returns_engine_settings() {
     assert_eq!(cfg.min_payout_sats, 5_000); // default
     assert_eq!(cfg.coinbase_weight_budget, 50_000); // default
     assert_eq!(cfg.fee_percent, 0.0); // default
-    assert!(cfg.fee_address.is_none());
+    assert_eq!(
+        cfg.fee_address.as_deref(),
+        Some(TEST_FEE_ADDRESS),
+        "the harness fee anchor must surface through the reader"
+    );
 
     drop_harness(h).await;
 }
