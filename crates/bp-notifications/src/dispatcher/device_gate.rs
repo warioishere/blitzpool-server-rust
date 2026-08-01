@@ -546,7 +546,11 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
             } else {
                 Notified::Offline
             };
-            state.armed_by = None;
+            let direction = if live {
+                Direction::Online
+            } else {
+                Direction::Offline
+            };
             // One-shot, and consumed whatever the answer turns out to be:
             // a backfilled device settles into whichever state it is
             // actually in, silently, and is supervised normally from then
@@ -554,6 +558,26 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
             let settling = std::mem::replace(&mut state.settle_silently, false);
 
             let previous = state.notified;
+            // A disagreement between what the front holds open and what
+            // the subscriber was told has to SURVIVE a full dwell before
+            // it counts. Arming that dwell cannot be left to the Stratum
+            // event, because the most important disconnect does not
+            // produce one: a miner that loses power or drops off the
+            // network never sends anything, and only the periodic
+            // re-check notices it is gone. Resolving that on the spot
+            // reported an outage seconds after it began — measured at 8 s
+            // against a 60 s grace — which is exactly the flap the grace
+            // exists to swallow.
+            //
+            // A device that is merely settling is exempt: nothing is
+            // announced for it, so there is nothing to debounce.
+            if target != previous && !settling && state.armed_by != Some(direction) {
+                state.armed_by = Some(direction);
+                state.due_at = now + self.dwell(direction);
+                continue;
+            }
+            state.armed_by = None;
+
             if target != previous {
                 // A device we have never reported on is only announced as
                 // online when the pool first saw it after this gate
@@ -934,6 +958,22 @@ mod tests {
         fn open_window(&self) {
             self.advance(301);
         }
+        /// Resolve a change that no Stratum event announced.
+        ///
+        /// Such a change takes TWO passes: the first spots the
+        /// disagreement and arms the dwell, the second confirms it still
+        /// holds. That is the whole point — a miner that loses power
+        /// sends nothing, so without this the re-check would report the
+        /// outage the moment it happened to run.
+        async fn poll_after_dwell(&self, secs: i64) -> Vec<DeviceNotice> {
+            let armed = self.gate.poll_due().await;
+            assert!(
+                armed.is_empty(),
+                "an unannounced change must not resolve on its first pass"
+            );
+            self.advance(secs);
+            self.gate.poll_due().await
+        }
     }
 
     fn singles(notices: &[DeviceNotice]) -> Vec<(String, bool)> {
@@ -1188,7 +1228,7 @@ mod tests {
 
         h.advance(20);
         assert_eq!(
-            singles(&h.gate.poll_due().await),
+            singles(&h.poll_after_dwell(301).await),
             vec![("axe01".into(), false)],
             "the restart no longer swallows it"
         );
@@ -1246,7 +1286,7 @@ mod tests {
         h.db.set_live("axe01", false);
         h.advance(301);
         assert_eq!(
-            singles(&h.gate.poll_due().await),
+            singles(&h.poll_after_dwell(301).await),
             vec![("axe01".into(), false)],
             "the next change is a real transition"
         );
@@ -1264,11 +1304,12 @@ mod tests {
         h.advance(20);
         assert!(h.gate.poll_due().await.is_empty());
 
-        // Supervised: a later disconnect is reported with no event at all.
+        // Supervised: a later disconnect is reported with no event at
+        // all — after the grace, which the gate arms itself.
         h.db.set_live("axe01", false);
         h.advance(301);
         assert_eq!(
-            singles(&h.gate.poll_due().await),
+            singles(&h.poll_after_dwell(301).await),
             vec![("axe01".into(), false)]
         );
     }
@@ -1294,11 +1335,12 @@ mod tests {
             "the wrong offline does go out"
         );
 
-        // Its next accepted share revives the row. No Stratum event.
+        // Its next accepted share revives the row. No Stratum event, so
+        // the correction has to hold for a dwell before it is believed.
         h.db.set_live("axe01", true);
         h.advance(301);
         assert_eq!(
-            singles(&h.gate.poll_due().await),
+            singles(&h.poll_after_dwell(91).await),
             vec![("axe01".into(), true)],
             "the re-check corrects it with no event to trigger on"
         );
@@ -1369,10 +1411,11 @@ mod tests {
         );
         h.open_window();
 
-        // Comes back with no Stratum event — only the re-check sees it.
+        // Comes back with no Stratum event — only the re-check sees it,
+        // and it has to hold for a dwell before it counts.
         h.db.set_live("axe01", true);
         h.advance(301);
-        match &h.gate.poll_due().await[0] {
+        match &h.poll_after_dwell(91).await[0] {
             DeviceNotice::Single(e) => {
                 assert!(e.is_online);
                 assert!(
@@ -1440,7 +1483,7 @@ mod tests {
             .seed([(address(), "axe01".to_string(), Some("BitAxe".into()))]);
         h.advance(20);
 
-        let out = h.gate.poll_due().await;
+        let out = h.poll_after_dwell(91).await;
         assert_eq!(singles(&out), vec![("axe01".into(), true)]);
         match &out[0] {
             DeviceNotice::Single(e) => assert!(e.is_returning, "it is a return, not a first sight"),
@@ -1511,7 +1554,9 @@ mod tests {
         );
 
         h.advance(20);
-        let out = h.gate.poll_due().await;
+        // Twelve devices, none of which sent a disconnect event, so the
+        // first pass only arms their grace.
+        let out = h.poll_after_dwell(301).await;
         assert_eq!(out.len(), 1, "one address, one aggregate");
 
         assert_eq!(
@@ -1522,6 +1567,73 @@ mod tests {
         for worker in &workers {
             assert_eq!(store.get(worker), Some(false), "{worker} was persisted");
         }
+    }
+
+    /// The grace must not depend on the miner announcing its own death.
+    ///
+    /// A rig that loses power, drops off WiFi or has its cable pulled
+    /// sends nothing — no Stratum event ever arrives, and only the
+    /// periodic re-check notices it is gone. Resolving that on the spot
+    /// reported the outage whenever the re-check happened to run:
+    /// measured against a real cpuminer, an outage 8 s old was pushed
+    /// under a 60 s grace. Worse, the rig coming back produced the
+    /// matching online push — the exact pair the grace exists to
+    /// swallow.
+    #[tokio::test]
+    async fn an_outage_with_no_event_still_waits_out_the_grace() {
+        let h = harness();
+        h.bring_online("axe01").await;
+        h.open_window();
+
+        // Gone, and it never got to say so.
+        h.db.set_live("axe01", false);
+
+        // The re-check lands right after the drop. Nothing may go out:
+        // 300 s of grace have not elapsed, whatever the re-check saw.
+        h.advance(301);
+        assert!(
+            h.gate.poll_due().await.is_empty(),
+            "an outage seconds old must not be pushed under a 300 s grace"
+        );
+
+        // Still gone once the grace has run: now it is real.
+        h.advance(301);
+        assert_eq!(
+            singles(&h.gate.poll_due().await),
+            vec![("axe01".into(), false)]
+        );
+    }
+
+    /// The other half of the same rule: a rig that drops and is back
+    /// before the grace expires must produce nothing at all, even though
+    /// no event announced either edge. This is the flap the operator
+    /// asked to be rid of.
+    #[tokio::test]
+    async fn an_outage_that_heals_inside_the_grace_says_nothing() {
+        let h = harness();
+        h.bring_online("axe01").await;
+        h.open_window();
+
+        h.db.set_live("axe01", false);
+        h.advance(301);
+        assert!(h.gate.poll_due().await.is_empty(), "grace armed, not sent");
+
+        // Back before the grace runs out.
+        h.db.set_live("axe01", true);
+        h.advance(301);
+        assert!(
+            h.gate.poll_due().await.is_empty(),
+            "it never left as far as the subscriber is concerned"
+        );
+
+        // And it is still supervised: a real outage later still lands.
+        h.db.set_live("axe01", false);
+        h.advance(301);
+        assert_eq!(
+            singles(&h.poll_after_dwell(301).await),
+            vec![("axe01".into(), false)],
+            "the gate did not go blind after the flap"
+        );
     }
 
     /// A miner that is merely share-quiet must not read as gone. The
@@ -1737,7 +1849,7 @@ mod tests {
         h.db.forget("rig0");
         h.advance(301);
         assert_eq!(
-            singles(&h.gate.poll_due().await),
+            singles(&h.poll_after_dwell(301).await),
             vec![("rig0".into(), false)]
         );
         h.advance(3601);
@@ -1762,7 +1874,7 @@ mod tests {
         h.db.set_live("axe01", false);
         h.advance(301);
         assert_eq!(
-            singles(&h.gate.poll_due().await),
+            singles(&h.poll_after_dwell(301).await),
             vec![("axe01".into(), false)]
         );
     }
