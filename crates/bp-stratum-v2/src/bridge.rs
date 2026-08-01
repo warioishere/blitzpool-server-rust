@@ -118,46 +118,6 @@ pub struct BridgeJobRef {
     pub declared_prev_hash: Option<[u8; 32]>,
 }
 
-// ── IssuedPayoutSet (ext 0x0003) ─────────────────────────────────────
-
-/// One issued ext-0x0003 payout output set, tracked pool-wide so the
-/// mining-server's `SetCustomMiningJob` handler can validate — and
-/// single-use-consume — the coinbase outputs a JDC submits. This covers
-/// BOTH Job-Declaration modes: in Full-Template mode it re-validates the
-/// mined coinbase against the committed set (binding it to the set the
-/// JDS already checked at declare-time, so a JDC can't swap the coinbase
-/// after `DeclareMiningJob.Success`), and in Coinbase-only mode it is the
-/// Pool's sole validation point (spec §5.3).
-///
-/// Keyed by `mining_job_token`: the JDS registers it under the allocation
-/// token at `RequestPayoutOutputs.Success`, then re-keys it to the
-/// `new_mining_job_token` on `DeclareMiningJob.Success` so a Full-Template
-/// `SetCustomMiningJob` (which carries the new token) still resolves it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IssuedPayoutSet {
-    /// Consensus-serialised `Vec<TxOut>` the pool committed to (the bytes
-    /// returned in `RequestPayoutOutputs.Success.coinbase_tx_outputs`).
-    pub outputs: Vec<u8>,
-    /// Miner address bound to the token — cross-checked against the mining
-    /// channel's locked address (the only such check in Coinbase-only mode,
-    /// where there is no `RegisteredDeclaredJob`).
-    pub miner_address: AddressId,
-    /// JDP session that issued it (evicted on that session's disconnect).
-    pub jdp_session_id: u32,
-    /// Wall-clock ms when issued (drives `cleanup_expired`).
-    pub registered_at_ms: u64,
-    /// Pool chain-tip (`prev_hash`) the set was issued under, if known. The
-    /// `SetCustomMiningJob` validator rejects the set as stale when the
-    /// submitted job's `prev_hash` differs — the payout distribution was
-    /// computed for a now-superseded accounting epoch (spec §4 MAY: stale /
-    /// superseded). `None` when the pool had no tip at issuance (not
-    /// checkable). A JDC can't bypass this: building on a stale `prev_hash`
-    /// to match an old set orphans the block, so there is no payout to steal.
-    pub issued_prev_hash: Option<[u8; 32]>,
-    /// Single-use flag (spec §4): set once a `SetCustomMiningJob` consumed it.
-    pub used: bool,
-}
-
 // ── Payout distributions (ext 0x0003 push model) ─────────────────────
 
 /// One published `SetPayoutDistribution` (ext 0x0003 §3.1), tracked
@@ -267,9 +227,10 @@ impl DistributionSlot {
 /// - **declared jobs** keyed by the `new_mining_job_token` issued in
 ///   `DeclareMiningJobSuccess` — the mining-side `SetCustomMiningJob`
 ///   handler's payload + miner-address cross-check.
-/// - **issued payout sets** ([`IssuedPayoutSet`], ext 0x0003) keyed by
-///   `mining_job_token` — the committed coinbase outputs a
-///   `SetCustomMiningJob` MUST carry.
+/// - **payout distributions** (ext 0x0003 push model): the pool-wide
+///   slot plus tailored per-session slots, resolved by
+///   [`JdpDeclaredJobRegistry::distribution_acceptance`] on both the
+///   declare path and the mining-side `SetCustomMiningJob` path.
 ///
 /// Owned by the IO layer inside `Arc<RwLock<...>>` (or `Mutex`) so
 /// both servers can share it. The struct itself is sync + has no internal
@@ -277,7 +238,6 @@ impl DistributionSlot {
 #[derive(Debug, Default)]
 pub struct JdpDeclaredJobRegistry {
     entries: HashMap<Token, RegisteredDeclaredJob>,
-    payout_sets: HashMap<Token, IssuedPayoutSet>,
     /// Pool-wide distribution (PPLNS) — what every connection gets
     /// pushed on open and on the publisher's timer.
     pool_wide_distribution: DistributionSlot,
@@ -329,45 +289,6 @@ impl JdpDeclaredJobRegistry {
             miner_address: e.miner_address.clone(),
             declared_prev_hash: e.declared_job.prev_hash,
         })
-    }
-
-    /// Register an issued ext-0x0003 payout set. Overwrites any prior set
-    /// for the same token — the JDC requests a fresh set per custom job, so
-    /// the latest is authoritative.
-    pub fn register_payout_set(&mut self, token: Token, set: IssuedPayoutSet) {
-        self.payout_sets.insert(token, set);
-    }
-
-    /// Look up the issued payout set for a token (for `SetCustomMiningJob`
-    /// coinbase-output validation).
-    pub fn lookup_payout_set(&self, token: &Token) -> Option<&IssuedPayoutSet> {
-        self.payout_sets.get(token)
-    }
-
-    /// Re-key a payout set from the allocation token to the
-    /// `new_mining_job_token` issued by `DeclareMiningJob.Success`, so a
-    /// Full-Template `SetCustomMiningJob` (which references the new token)
-    /// resolves it. No-op if no set is registered under `old`, or `old == new`.
-    pub fn rekey_payout_set(&mut self, old: &Token, new: &Token) {
-        if old == new {
-            return;
-        }
-        if let Some(set) = self.payout_sets.remove(old) {
-            self.payout_sets.insert(*new, set);
-        }
-    }
-
-    /// Mark a payout set consumed (spec §4 single-use). Idempotent; no-op
-    /// for an unknown token.
-    pub fn consume_payout_set(&mut self, token: &Token) {
-        if let Some(set) = self.payout_sets.get_mut(token) {
-            set.used = true;
-        }
-    }
-
-    /// Number of tracked payout sets. Diagnostics / tests.
-    pub fn payout_set_count(&self) -> usize {
-        self.payout_sets.len()
     }
 
     // ── Payout distributions (ext 0x0003 push model) ────────────────
@@ -501,10 +422,6 @@ impl JdpDeclaredJobRegistry {
         let before = self.entries.len();
         self.entries
             .retain(|_, e| e.jdp_session_id != jdp_session_id);
-        // Drop this session's issued payout sets too — they're only
-        // meaningful while the JDC connection that requested them is live.
-        self.payout_sets
-            .retain(|_, s| s.jdp_session_id != jdp_session_id);
         // A tailored distribution dies with the session it was
         // published to.
         self.tailored_distributions.remove(&jdp_session_id);
@@ -522,10 +439,6 @@ impl JdpDeclaredJobRegistry {
         let before = self.entries.len();
         self.entries
             .retain(|_, e| now_ms.saturating_sub(e.registered_at_ms) <= max_age_ms);
-        // Same age-out for issued payout sets — bounds the map for sets that
-        // outlive a clean JDP teardown (forced disconnect / OS reset).
-        self.payout_sets
-            .retain(|_, s| now_ms.saturating_sub(s.registered_at_ms) <= max_age_ms);
         // Tailored distribution slots that outlive a clean teardown
         // age out on their newest publish.
         self.tailored_distributions
@@ -694,66 +607,6 @@ mod tests {
         reg.register(token(2), registration(token(2), 2, 2_000));
         let collected: Vec<u32> = reg.iter().map(|(_, e)| e.jdp_session_id).collect();
         assert_eq!(collected.len(), 2);
-    }
-
-    // ── issued payout sets (ext 0x0003) ────────────────────────────
-
-    fn payout_set(session_id: u32, now_ms: u64) -> IssuedPayoutSet {
-        IssuedPayoutSet {
-            outputs: vec![0x01, 0x02, 0x03],
-            miner_address: addr(),
-            jdp_session_id: session_id,
-            registered_at_ms: now_ms,
-            issued_prev_hash: Some([0xAB; 32]),
-            used: false,
-        }
-    }
-
-    #[test]
-    fn payout_set_register_lookup_consume() {
-        let mut reg = JdpDeclaredJobRegistry::new();
-        let t = token(1);
-        reg.register_payout_set(t, payout_set(7, 1_000));
-        assert_eq!(reg.payout_set_count(), 1);
-        assert!(!reg.lookup_payout_set(&t).unwrap().used);
-        reg.consume_payout_set(&t);
-        assert!(reg.lookup_payout_set(&t).unwrap().used);
-        // Consuming an unknown token is a harmless no-op.
-        reg.consume_payout_set(&token(0xFF));
-    }
-
-    #[test]
-    fn payout_set_rekey_moves_to_new_token() {
-        let mut reg = JdpDeclaredJobRegistry::new();
-        let old = token(1);
-        let new = token(2);
-        reg.register_payout_set(old, payout_set(7, 1_000));
-        reg.rekey_payout_set(&old, &new);
-        assert!(reg.lookup_payout_set(&old).is_none());
-        assert!(reg.lookup_payout_set(&new).is_some());
-        assert_eq!(reg.payout_set_count(), 1);
-        // No-op when old == new or old is unknown.
-        reg.rekey_payout_set(&new, &new);
-        reg.rekey_payout_set(&token(9), &token(10));
-        assert_eq!(reg.payout_set_count(), 1);
-    }
-
-    #[test]
-    fn payout_set_evicted_with_jdp_session() {
-        let mut reg = JdpDeclaredJobRegistry::new();
-        reg.register_payout_set(token(1), payout_set(42, 1_000));
-        reg.register_payout_set(token(2), payout_set(99, 1_000));
-        reg.evict_for_jdp_session(42);
-        assert!(reg.lookup_payout_set(&token(1)).is_none());
-        assert!(reg.lookup_payout_set(&token(2)).is_some());
-    }
-
-    #[test]
-    fn payout_set_cleanup_expired_ages_out() {
-        let mut reg = JdpDeclaredJobRegistry::new();
-        reg.register_payout_set(token(1), payout_set(1, 1_000));
-        reg.cleanup_expired(4_000, 1_500); // age 3_000 > 1_500 → drop
-        assert!(reg.lookup_payout_set(&token(1)).is_none());
     }
 
     // ── Payout distributions (ext 0x0003 push model) ────────────────

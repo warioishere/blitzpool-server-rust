@@ -331,6 +331,8 @@ fn decode_set_custom_mining_job(
     m: Sv2SetCustomMiningJob<'static>,
 ) -> Result<SetCustomMiningJobInput, CodecError> {
     Ok(SetCustomMiningJobInput {
+        // §6 TLV — IO-layer-extracted from the frame's trailing TLVs.
+        distribution_id: None,
         channel_id: m.channel_id,
         request_id: m.request_id,
         mining_job_token: token_from_bytes(m.token.as_bytes())?,

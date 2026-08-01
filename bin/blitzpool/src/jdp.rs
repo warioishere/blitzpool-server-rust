@@ -26,10 +26,12 @@
 //! module's `spawn` returns an empty handle with a single `info!`
 //! log. JDP is off by default; operators flip it on deliberately.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
 
 use bitcoin::Network as BitcoinNetwork;
 use bp_bitcoin::BitcoinRpc;
+use bp_common::AddressId;
 use bp_config::AppConfig;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::jdp_server::StratumV2JdpServer;
@@ -41,8 +43,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::jdp_hooks::build_jdp_hooks;
-use crate::payout_resolver::ProductionPayoutResolver;
+use crate::payout_resolver::{ProductionDistributionSource, ProductionPayoutResolver};
 use crate::stratum_v2;
+
+/// Default `SetPayoutDistribution` republish cadence when
+/// `[sv2].jdp_payout_distribution_interval_secs` is unset.
+const DEFAULT_DISTRIBUTION_INTERVAL_SECS: u64 = 60;
 
 #[allow(dead_code)]
 pub(crate) struct JdpHandles {
@@ -100,6 +106,7 @@ pub(crate) enum JdpSpawnError {
 /// is shared with the SV2 mining servers via [`stratum_v2::build_bridge`]
 /// so `DeclareMiningJob`-issued tokens route to the correct mining
 /// channel on `SetCustomMiningJob`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn(
     cfg: &AppConfig,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
@@ -111,6 +118,9 @@ pub(crate) async fn spawn(
     // proven to pay. `None` on a deployment with no ledger fan-out wired —
     // such a block is then reported but not booked.
     ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
+    // Allocator backing for the strictly-increasing ext 0x0003
+    // `distribution_id` (spec §3.1).
+    redis: redis::aio::ConnectionManager,
 ) -> Result<JdpHandles, JdpSpawnError> {
     if !cfg.sv2.jdp_enabled {
         info!("jdp: disabled (sv2.jdp_enabled = false)");
@@ -126,6 +136,25 @@ pub(crate) async fn spawn(
         bp_config::Network::Testnet | bp_config::Network::Testnet4 => BitcoinNetwork::Testnet,
         bp_config::Network::Regtest => BitcoinNetwork::Regtest,
     };
+    // ext 0x0003 payout-distribution source: same resolver + engines the
+    // allocate path uses, so the published weight distribution and the
+    // pool's own coinbase always agree. The fee address anchors tailored
+    // distributions whose mode has no pool output of its own.
+    let fee_address = cfg
+        .pplns
+        .as_ref()
+        .and_then(|p| AddressId::new(p.fee_address.clone()).ok());
+    let distribution_source = Arc::new(ProductionDistributionSource {
+        resolver: payout_resolver.clone(),
+        tdp: tdp.clone(),
+        redis: Some(redis),
+        network,
+        fee_address,
+    });
+
+    // The block sink is built before the server exists, but §10 settlement
+    // needs the server's invalidation handle — late-bound via this slot.
+    let settle_slot = Arc::new(OnceLock::new());
     let hooks = build_jdp_hooks(
         tdp,
         bitcoin_rpc,
@@ -134,9 +163,17 @@ pub(crate) async fn spawn(
         network,
         cfg.sv2.jdp_orphan_submitblock,
         ledger_booker,
+        distribution_source,
+        settle_slot.clone(),
     );
 
-    let server = StratumV2JdpServer::spawn(server_cfg, noise, hooks, bridge);
+    let distribution_interval = Duration::from_secs(
+        cfg.sv2
+            .jdp_payout_distribution_interval_secs
+            .unwrap_or(DEFAULT_DISTRIBUTION_INTERVAL_SECS),
+    );
+    let server = StratumV2JdpServer::spawn(server_cfg, noise, hooks, bridge, distribution_interval);
+    let _ = settle_slot.set(server.distribution_handle());
 
     let bind_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
     let listener = TcpListener::bind(bind_addr)

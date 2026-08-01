@@ -445,6 +445,7 @@ mod tests {
                 jdp_enabled: false,
                 jdp_port: None,
                 jdp_orphan_submitblock: false,
+                jdp_payout_distribution_interval_secs: None,
             },
             debug: Default::default(),
             pplns: Some(PplnsConfig {

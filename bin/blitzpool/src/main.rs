@@ -991,6 +991,7 @@ async fn main() -> ExitCode {
                     jdp_payout_resolver,
                     template_tx_cache,
                     jdp_ledger_booker,
+                    handles.redis.clone(),
                 )
                 .await
                 {

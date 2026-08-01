@@ -20,11 +20,11 @@
 //!   Postgres ledger query, since neither depends on the reward.
 //!
 //! The second layer is what keeps a burst of unrelated callers cheap.
-//! The per-reward layer alone never dedups them: ext-0x0003 has every
-//! JDC report its own `available_payout_value`, so N simultaneous
-//! requests at a chain-tip change mean N distinct keys and, without the
-//! inputs layer, N window reads plus N ledger queries in the same few
-//! milliseconds.
+//! The per-reward layer alone never dedups them: SV1/SV2 job builds
+//! arrive with whatever template revenue their stream currently holds,
+//! so N simultaneous callers at a chain-tip change can mean N distinct
+//! keys and, without the inputs layer, N window reads plus N ledger
+//! queries in the same few milliseconds.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

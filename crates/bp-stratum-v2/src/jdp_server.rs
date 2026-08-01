@@ -28,13 +28,14 @@
 //!
 //! ## Notes
 //!
-//! - **ext 0x0003 (Non-Custodial Pool Payouts)** messages aren't in
-//!   `stratum-core::AnyMessage`; the per-connection task pre-decodes them via a
-//!   raw-bytes path (inbound) and serialises the Success/Error responses the
-//!   same way (outbound) — see the noise-read arm + `write_jdp_outbound_frames`.
-//! - **Full payout-output validation** in `accept_declaration` is wired: the
-//!   declared coinbase is matched against the `PayoutOutputsTracker` single-use
-//!   set the pool committed via `RequestPayoutOutputs`.
+//! - **ext 0x0003 (Non-Custodial Pool Payouts)** is push-only: the
+//!   `SetPayoutDistribution` message isn't in `stratum-core::AnyMessage`, so
+//!   the per-connection task serialises it via the raw-bytes pre-encoder —
+//!   first frame after `RequestExtensions.Success` (§3.1), then re-published
+//!   by the publisher task on interval / settlement invalidation.
+//! - **Payout validation** in `accept_declaration` is positional
+//!   recompute-and-compare (§7.1) against the distribution the declaration's
+//!   `distribution_id` TLV names in the bridge registry.
 //! - **Full-block assembly + submitblock** is split by design — the handler
 //!   emits a `BlockSubmissionCandidate` event carrying the raw components; the
 //!   bin's production hook reconstructs the block via rust-bitcoin and submits
@@ -48,23 +49,30 @@ use async_trait::async_trait;
 use bp_common::AddressId;
 use stratum_core::codec_sv2::StandardSv2Frame;
 use stratum_core::framing_sv2::framing::Frame;
+use stratum_core::job_declaration_sv2::MESSAGE_TYPE_DECLARE_MINING_JOB;
 use stratum_core::parsers_sv2::{parse_message_frame_with_tlvs, AnyMessage};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::bridge::{IssuedPayoutSet, JdpDeclaredJobRegistry, RegisteredDeclaredJob};
+use crate::bridge::{
+    DistributionAcceptance, DistributionScope, JdpDeclaredJobRegistry, PayoutDistributionEntry,
+    RegisteredDeclaredJob,
+};
+use crate::extensions::{
+    parse_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
+};
 use crate::jdp::client::{
     handle_allocate_token, handle_declare_mining_job, handle_provide_missing_transactions_success,
-    handle_push_solution, handle_request_extensions, handle_request_payout_outputs,
-    handle_setup_connection, parse_user_identifier_as_address, AllocateTokenContext,
-    JdpHandlerOutcome, JdpOutboundFrame, JdpSessionEvent, JdpSessionState,
+    handle_push_solution, handle_request_extensions, handle_setup_connection,
+    parse_user_identifier_as_address, AllocateTokenContext, JdpHandlerOutcome, JdpOutboundFrame,
+    JdpSessionEvent, JdpSessionState,
 };
 use crate::jdp::dynamic_outputs::PayoutBooking;
+use crate::jdp::payout_distribution::WeightedOutput;
 use crate::jdp_server_codec::{
-    decode_jdp_inbound, decode_jdp_inbound_ext_0x0003, encode_jdp_outbound,
-    encode_jdp_outbound_ext_0x0003, InboundJdpFrame, EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS,
+    decode_jdp_inbound, encode_jdp_outbound, encode_jdp_outbound_ext_0x0003, InboundJdpFrame,
 };
 use crate::noise::{accept_pool_noise, NoiseConfig, NoiseTcpWriteHalf};
 use crate::server::ServerConfig;
@@ -84,10 +92,16 @@ pub trait JdpAllocateResolver: Send + Sync {
     /// `remote_addr` is the connection's remote IP (string form, e.g.
     /// `"127.0.0.1:48292"`). Caller provides it so IP-based miner
     /// lookup is possible without leaking sockets into the handler.
+    ///
+    /// `payout_distribution_negotiated` — ext 0x0003 is active on this
+    /// connection. §2 then REQUIRES `coinbase_tx_outputs` to be empty
+    /// (the distribution replaces the base §6.4.3 output semantics);
+    /// the resolver must not build outputs at all in that case.
     async fn resolve_allocate_context(
         &self,
         user_identifier: &str,
         remote_addr: &str,
+        payout_distribution_negotiated: bool,
     ) -> Option<AllocateTokenContext>;
 }
 
@@ -108,46 +122,59 @@ pub trait CurrentPrevHashProvider: Send + Sync {
     async fn current_prev_hash(&self) -> Option<[u8; 32]>;
 }
 
-/// Resolve the per-job payout output set for an ext 0x0003
-/// `RequestPayoutOutputs` (spec §2.1). The resolver gets the
-/// miner-address bound to the token (from `JdpSessionState.tokens`)
-/// and the JDC-reported `available_payout_value`; it returns a fresh,
-/// distribution-correct output set summing exactly to that value
-/// (spec §2.2) OR a wire error code.
+/// A freshly-built payout distribution, ready to publish as
+/// `SetPayoutDistribution` (ext 0x0003 §3.1) and to register in the
+/// bridge for §7.1 validation.
+#[derive(Clone, Debug)]
+pub struct BuiltPayoutDistribution {
+    /// The pool output (`weight_P` in the amount field).
+    pub pool_payout: WeightedOutput,
+    /// Miner payout slots in §4 coinbase order.
+    pub payouts: Vec<WeightedOutput>,
+    /// Parallel to `payouts` (§3.1).
+    pub dust_limits: Vec<u32>,
+    /// Consensus-serialized 0-value TxOuts the pool appends.
+    pub additional_outputs: Vec<Vec<u8>>,
+    /// Revenue the weight boosts were projected against.
+    pub reference_reward_sats: u64,
+    /// Settlement-snapshot identity. `None` = the owning mode books
+    /// without a snapshot (Solo / Blockparty).
+    pub payouts_fingerprint: Option<[u8; 32]>,
+    /// Whether a found block on this distribution may be booked
+    /// (`false` when the snapshot write failed).
+    pub bookable: bool,
+}
+
+/// Build the pool's payout distributions for the ext 0x0003 push model.
 ///
-/// Production wiring routes through
-/// [`crate::hooks::PayoutResolver`] (mode-gate-driven: solo /
-/// PPLNS / Group-Solo) and serialises the result via
-/// [`crate::jdp::dynamic_outputs::encode_coinbase_outputs`]. Tests
-/// supply a fixture.
-///
-/// When the extension is not negotiated by the JDC, this hook is
-/// never invoked (the standard `AllocateMiningJobToken.coinbase_outputs`
-/// path applies per the base Job Declaration Protocol).
-///
-/// `committed_outputs` is the consensus-serialised `Vec<TxOut>` blob the
-/// JDS returned in this token's `AllocateMiningJobToken.Success`. Per the
-/// coinbase-reservation invariant (spec §6), the resolver MUST return a
-/// set whose serialised size does not exceed it so the JDC's coinbase
-/// reservation — sized from exactly these bytes — always fits.
+/// The publisher task calls [`Self::build_pool_wide`] on its interval
+/// (and forced after a settlement); the per-connection task calls
+/// [`Self::build_for_miner`] once an allocate reveals the miner's
+/// identity (Solo / Group-Solo / Blockparty get a tailored
+/// distribution; a PPLNS miner rides the pool-wide one).
+/// [`Self::next_distribution_id`] allocates the §3.1 strictly-
+/// increasing pool-global id — infra-backed in production (the stratum
+/// crate stays free of Redis), monotonic-counter in tests.
 #[async_trait]
-pub trait PayoutOutputsResolver: Send + Sync {
-    async fn resolve_payout_outputs(
-        &self,
-        miner_address: &AddressId,
-        committed_outputs: &[u8],
-        available_payout_value: u64,
-        request_id: u32,
-    ) -> crate::jdp::client::PayoutOutputsResolution;
+pub trait PayoutDistributionSource: Send + Sync {
+    /// `None` ⇒ nothing publishable right now (no PPLNS engine / no
+    /// template yet) — ext 0x0003 is then not offered in negotiation.
+    async fn build_pool_wide(&self) -> Option<BuiltPayoutDistribution>;
+    /// `None` ⇒ the pool-wide distribution applies (PPLNS-mode miner).
+    async fn build_for_miner(&self, miner_address: &AddressId) -> Option<BuiltPayoutDistribution>;
+    /// `None` ⇒ the allocator is unavailable; the publish is skipped
+    /// (the previously-published distribution stays valid).
+    async fn next_distribution_id(&self) -> Option<u64>;
 }
 
 /// Block-submission sink for `PushSolution` candidates. Production
 /// wiring reconstructs the block via rust-bitcoin's `Block` + calls
 /// `TdpHandle::submit_solution`; tests use a recording sink.
 ///
-/// `booking` is `Some` only when the declared coinbase was proven to pay the
-/// pool's issued payout set (ext 0x0003 declare-time check). `None` means the
-/// pool cannot say what this block paid it — report it, book nothing.
+/// `booking` is `Some` only when the declared coinbase was validated
+/// positionally against a published payout distribution (ext 0x0003 §7.1
+/// declare-time check). `None` means the pool cannot say what this block
+/// paid it — report it, book nothing.
 #[async_trait]
 pub trait JdpBlockSubmissionSink: Send + Sync {
     #[allow(clippy::too_many_arguments)]
@@ -172,12 +199,10 @@ pub struct JdpServerHooks {
     pub template_tx_provider: Arc<dyn TemplateTxProvider>,
     pub prev_hash_provider: Arc<dyn CurrentPrevHashProvider>,
     pub block_submission_sink: Arc<dyn JdpBlockSubmissionSink>,
-    /// ext 0x0003 per-job payout-outputs resolver. Wired in
-    /// production by `bin/blitzpool::jdp_hooks` to route through
-    /// `PayoutResolver` (mode-gate aware: solo / PPLNS / Group-Solo);
-    /// tests use the [`NoOpJdpHooks`] which echoes the token-time
-    /// committed output set.
-    pub payout_outputs_resolver: Arc<dyn PayoutOutputsResolver>,
+    /// ext 0x0003 distribution source (push model). Wired in
+    /// production by `bin/blitzpool::jdp_hooks`; the [`NoOpJdpHooks`]
+    /// returns `None` everywhere (extension not offered).
+    pub distribution_source: Arc<dyn PayoutDistributionSource>,
 }
 
 impl JdpServerHooks {
@@ -188,7 +213,7 @@ impl JdpServerHooks {
             template_tx_provider: n.clone(),
             prev_hash_provider: n.clone(),
             block_submission_sink: n.clone(),
-            payout_outputs_resolver: n,
+            distribution_source: n,
         }
     }
 }
@@ -202,11 +227,16 @@ impl JdpAllocateResolver for NoOpJdpHooks {
         &self,
         user_identifier: &str,
         _remote_addr: &str,
+        payout_distribution_negotiated: bool,
     ) -> Option<AllocateTokenContext> {
         // Pure parse — no IP fallback. Production wiring overrides.
         parse_user_identifier_as_address(user_identifier).map(|addr| AllocateTokenContext {
             miner_address: addr,
-            coinbase_outputs: vec![0u8],
+            coinbase_outputs: if payout_distribution_negotiated {
+                Vec::new() // §2 MUST: empty when 0x0003 is negotiated
+            } else {
+                vec![0u8]
+            },
         })
     }
 }
@@ -244,26 +274,16 @@ impl JdpBlockSubmissionSink for NoOpJdpHooks {
 }
 
 #[async_trait]
-impl PayoutOutputsResolver for NoOpJdpHooks {
-    async fn resolve_payout_outputs(
-        &self,
-        miner_address: &AddressId,
-        committed_outputs: &[u8],
-        _available_payout_value: u64,
-        request_id: u32,
-    ) -> crate::jdp::client::PayoutOutputsResolution {
-        // Echo the token-time committed bytes verbatim — trivially
-        // satisfies the size invariant without needing a
-        // `bitcoin::Network` context to re-encode. Production wiring
-        // re-scales the values to `available_payout_value`.
-        let _ = miner_address;
-        crate::jdp::client::PayoutOutputsResolution::Success {
-            request_id,
-            outputs: committed_outputs.to_vec(),
-            // A test double has no distribution behind these bytes, so it
-            // vouches for nothing.
-            booking: None,
-        }
+impl PayoutDistributionSource for NoOpJdpHooks {
+    async fn build_pool_wide(&self) -> Option<BuiltPayoutDistribution> {
+        // No distribution to publish → ext 0x0003 is never offered.
+        None
+    }
+    async fn build_for_miner(&self, _miner_address: &AddressId) -> Option<BuiltPayoutDistribution> {
+        None
+    }
+    async fn next_distribution_id(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -285,6 +305,34 @@ struct Inner {
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     cancel: CancellationToken,
     next_session_id: Mutex<u32>,
+    /// Latest pool-wide `distribution_id` published (0 = none yet).
+    /// Connections watch this and push the fresh distribution to every
+    /// negotiated JDC.
+    dist_watch: tokio::sync::watch::Sender<u64>,
+    /// Nudges the publisher out of its interval sleep — settlement
+    /// invalidation (§10) must be followed by an immediate publish.
+    refresh: Arc<tokio::sync::Notify>,
+}
+
+/// Settlement hook (§10): a booked block invalidates every published
+/// distribution at once; the publisher then pushes a fresh one
+/// immediately. Handed to the block-booking sink via
+/// [`StratumV2JdpServer::distribution_handle`].
+#[derive(Clone)]
+pub struct DistributionInvalidationHandle {
+    bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
+    refresh: Arc<tokio::sync::Notify>,
+}
+
+impl DistributionInvalidationHandle {
+    /// §10 settlement invalidation + forced fresh publish.
+    pub fn settle(&self) {
+        self.bridge
+            .write()
+            .expect("bridge RwLock poisoned")
+            .invalidate_all_distributions();
+        self.refresh.notify_one();
+    }
 }
 
 impl StratumV2JdpServer {
@@ -293,8 +341,10 @@ impl StratumV2JdpServer {
         noise_config: NoiseConfig,
         hooks: JdpServerHooks,
         bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
+        payout_distribution_interval: Duration,
     ) -> Self {
-        Self {
+        let (dist_watch, _) = tokio::sync::watch::channel(0u64);
+        let server = Self {
             inner: Arc::new(Inner {
                 server_config: Arc::new(server_config),
                 noise_config,
@@ -302,8 +352,69 @@ impl StratumV2JdpServer {
                 bridge,
                 cancel: CancellationToken::new(),
                 next_session_id: Mutex::new(1),
+                dist_watch,
+                refresh: Arc::new(tokio::sync::Notify::new()),
             }),
+        };
+        server.spawn_distribution_publisher(payout_distribution_interval);
+        server
+    }
+
+    /// The §10 settlement hook for the block-booking sink.
+    pub fn distribution_handle(&self) -> DistributionInvalidationHandle {
+        DistributionInvalidationHandle {
+            bridge: self.inner.bridge.clone(),
+            refresh: self.inner.refresh.clone(),
         }
+    }
+
+    /// The pool-wide publisher (§3.1.1): builds the current
+    /// distribution on the interval (and forced after a settlement),
+    /// publishes it into the bridge, and nudges every connection via
+    /// the watch channel. Skips a tick when the settlement identity is
+    /// unchanged — the wire stays quiet while the window is quiet.
+    fn spawn_distribution_publisher(&self, interval: Duration) {
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_fingerprint: Option<[u8; 32]> = None;
+            loop {
+                let forced = tokio::select! {
+                    biased;
+                    _ = inner.cancel.cancelled() => break,
+                    _ = inner.refresh.notified() => true,
+                    _ = tick.tick() => false,
+                };
+                let Some(built) = inner.hooks.distribution_source.build_pool_wide().await else {
+                    continue;
+                };
+                if !forced
+                    && built.payouts_fingerprint.is_some()
+                    && built.payouts_fingerprint == last_fingerprint
+                {
+                    continue;
+                }
+                let Some(distribution_id) =
+                    inner.hooks.distribution_source.next_distribution_id().await
+                else {
+                    warn!("jdp publisher: distribution-id allocator unavailable — publish skipped");
+                    continue;
+                };
+                last_fingerprint = built.payouts_fingerprint;
+                let entry = entry_from_built(distribution_id, built, None, None, now_ms());
+                inner
+                    .bridge
+                    .write()
+                    .expect("bridge RwLock poisoned")
+                    .publish_pool_wide(entry);
+                let _ = inner.dist_watch.send(distribution_id);
+                debug!(
+                    distribution_id,
+                    "jdp publisher: pool-wide distribution published"
+                );
+            }
+        });
     }
 
     /// Per-connection task. The TCP-accept loop calls this for
@@ -313,6 +424,7 @@ impl StratumV2JdpServer {
         let hooks = self.inner.hooks.clone();
         let bridge = self.inner.bridge.clone();
         let cancel = self.inner.cancel.clone();
+        let dist_rx = self.inner.dist_watch.subscribe();
         let session_id = self.alloc_session_id();
         tokio::spawn(async move {
             let res = run_jdp_connection(
@@ -323,6 +435,7 @@ impl StratumV2JdpServer {
                 socket,
                 remote_addr,
                 cancel,
+                dist_rx,
             )
             .await;
             if let Err(err) = res {
@@ -354,6 +467,7 @@ async fn run_jdp_connection(
     socket: TcpStream,
     remote_addr: String,
     cancel: CancellationToken,
+    mut dist_rx: tokio::sync::watch::Receiver<u64>,
 ) -> std::io::Result<()> {
     let session_id_hex = format!("jdp-{session_id:08x}");
 
@@ -367,11 +481,45 @@ async fn run_jdp_connection(
     let (mut reader, mut writer) = noise.into_split();
 
     let mut state = JdpSessionState::new(session_id);
+    // Whether this session got a tailored distribution (Solo /
+    // Group-Solo / Blockparty); the pool-wide push then stops for it —
+    // §4 "latest MUST be used" makes the tailored stream authoritative.
+    let mut tailored_active = false;
 
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            // Ext 0x0003 push (§3.1): a fresh pool-wide distribution was
+            // published — forward it to every negotiated, non-tailored
+            // session. (The FIRST distribution after RequestExtensions
+            // is appended synchronously in the inbound arm, not here —
+            // the watch channel can't order itself against the
+            // RequestExtensions.Success write.)
+            changed = dist_rx.changed() => {
+                if changed.is_err() {
+                    break; // publisher gone = server shutting down
+                }
+                if tailored_active
+                    || !state
+                        .negotiated_extensions
+                        .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
+                {
+                    continue;
+                }
+                let current = bridge
+                    .read()
+                    .expect("bridge RwLock poisoned")
+                    .current_pool_wide();
+                if let Some(entry) = current {
+                    let frame =
+                        JdpOutboundFrame::SetPayoutDistribution(wire_from_entry(&entry));
+                    if let Err(err) = write_jdp_outbound_frames(&mut writer, vec![frame]).await {
+                        warn!("jdp {session_id_hex} distribution push write: {err:?}");
+                        break;
+                    }
+                }
+            }
             frame_recv = reader.read_frame() => {
                 let frame = match frame_recv {
                     Ok(f) => f,
@@ -394,68 +542,105 @@ async fn run_jdp_connection(
                         continue;
                     }
                 };
-                // ext 0x0003 (Non-Custodial Pool Payouts) frames are NOT
-                // in `stratum-core::AnyMessage`. Pre-decode here via
-                // the raw-bytes path before the AnyMessage parser
-                // (which would error on the unknown extension_type).
+                // The push model defines no inbound ext-0x0003 frames
+                // (`SetPayoutDistribution` is JDS→JDC only; §6 references
+                // arrive as TLVs on base frames). An ext-0x0003 frame
+                // from a client is a protocol error — drop it.
                 let ext_type = header.ext_type_without_channel_msg();
-                let msg_type = header.msg_type();
-                let inbound = if ext_type == 0x0003 {
-                    let payload_copy = sv2_frame.payload().to_vec();
-                    match decode_jdp_inbound_ext_0x0003(ext_type, msg_type, &payload_copy) {
-                        Ok(Some(f)) => f,
-                        Ok(None) => {
-                            debug!(
-                                "jdp {session_id_hex} ext 0x0003 unhandled msg_type 0x{msg_type:02x}"
-                            );
-                            continue;
-                        }
-                        Err(err) => {
-                            warn!("jdp {session_id_hex} ext 0x0003 decode: {err}");
-                            continue;
-                        }
-                    }
-                } else {
-                    let negotiated: Vec<u16> =
-                        state.negotiated_extensions.iter().copied().collect();
-                    let (any_message, _tlvs) = match parse_message_frame_with_tlvs(
-                        header,
-                        sv2_frame.payload(),
-                        &negotiated,
-                    ) {
-                        Ok(parsed) => parsed,
-                        Err(err) => {
-                            warn!("jdp {session_id_hex} parse: {err:?}");
-                            continue;
-                        }
-                    };
-                    match decode_jdp_inbound(any_message) {
-                        Ok(Some(f)) => f,
-                        Ok(None) => {
-                            debug!("jdp {session_id_hex} non-JDP frame, ignoring");
-                            continue;
-                        }
-                        Err(err) => {
-                            warn!("jdp {session_id_hex} decode: {err}");
-                            continue;
-                        }
+                if ext_type == SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS {
+                    warn!("jdp {session_id_hex} unexpected inbound ext-0x0003 frame — ignoring");
+                    continue;
+                }
+                let mut tlv_extensions: Vec<u16> =
+                    state.negotiated_extensions.iter().copied().collect();
+                // §2: a 0x0003 reference from a client that never
+                // negotiated the extension MUST be rejected — so the
+                // TLV has to be SEEN, not silently filtered away with
+                // the rest of the un-negotiated tail. Widen the filter
+                // for the one message that carries it; the declare
+                // handler enforces the gate.
+                if header.msg_type() == MESSAGE_TYPE_DECLARE_MINING_JOB
+                    && !tlv_extensions.contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
+                {
+                    tlv_extensions.push(SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
+                }
+                let (any_message, tlvs) = match parse_message_frame_with_tlvs(
+                    header,
+                    sv2_frame.payload(),
+                    &tlv_extensions,
+                ) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        warn!("jdp {session_id_hex} parse: {err:?}");
+                        continue;
                     }
                 };
-                // Silence unused-import lint on the message-type
-                // constant — referenced symbolically in error logs only.
-                let _ = EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS;
-                let outcome = dispatch_jdp_inbound(
+                let mut inbound = match decode_jdp_inbound(any_message) {
+                    Ok(Some(f)) => f,
+                    Ok(None) => {
+                        debug!("jdp {session_id_hex} non-JDP frame, ignoring");
+                        continue;
+                    }
+                    Err(err) => {
+                        warn!("jdp {session_id_hex} decode: {err}");
+                        continue;
+                    }
+                };
+                // §6: the distribution reference is a TLV on the base
+                // DeclareMiningJob frame (frame ext_type stays 0x0000).
+                if let InboundJdpFrame::DeclareMiningJob(ref mut input) = inbound {
+                    input.distribution_id =
+                        tlvs.as_deref().and_then(parse_distribution_id_tlv);
+                }
+                let was_request_extensions =
+                    matches!(inbound, InboundJdpFrame::RequestExtensions(_));
+                let negotiated_before = state
+                    .negotiated_extensions
+                    .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
+                let mut outcome = dispatch_jdp_inbound(
                     &mut state,
                     inbound,
                     &hooks,
+                    &bridge,
+                    session_id,
                     &remote_addr,
                     now_ms(),
                 )
                 .await;
+                // §3.1 first-message guarantee: the moment 0x0003 lands
+                // in the negotiated set, the current distribution goes
+                // out IN THE SAME WRITE BATCH, right after
+                // RequestExtensions.Success — deterministic ordering the
+                // watch channel cannot give.
+                if was_request_extensions
+                    && !negotiated_before
+                    && state
+                        .negotiated_extensions
+                        .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
+                {
+                    let current = bridge
+                        .read()
+                        .expect("bridge RwLock poisoned")
+                        .current_pool_wide();
+                    match current {
+                        Some(entry) => outcome.outbound.push(
+                            JdpOutboundFrame::SetPayoutDistribution(wire_from_entry(&entry)),
+                        ),
+                        // Negotiation offered 0x0003 only when a
+                        // distribution was publishable; hitting this
+                        // means it vanished in between — loud, and the
+                        // JDC will be rejected at declare time.
+                        None => warn!(
+                            "jdp {session_id_hex} 0x0003 negotiated but no pool-wide \
+                             distribution available for the first push"
+                        ),
+                    }
+                }
                 if let Err(err) = write_jdp_outbound_frames(&mut writer, outcome.outbound).await {
                     warn!("jdp {session_id_hex} write: {err:?}");
                     break;
                 }
+                outcome.outbound = Vec::new();
                 // Register declared jobs in the bridge BEFORE
                 // fan_out_events: the bridge gives the mining-server
                 // its SetCustomMiningJob lookup, so it must be
@@ -468,6 +653,55 @@ async fn run_jdp_connection(
                     now_ms(),
                     &outcome.events,
                 );
+                // Identity became known (allocate) on a negotiated
+                // session → check for a tailored distribution (Solo /
+                // Group-Solo / Blockparty). PPLNS miners get `None`
+                // and keep riding the pool-wide push.
+                if state
+                    .negotiated_extensions
+                    .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
+                {
+                    for event in &outcome.events {
+                        let JdpSessionEvent::TokenAllocated { miner_address, .. } = event else {
+                            continue;
+                        };
+                        let Some(built) =
+                            hooks.distribution_source.build_for_miner(miner_address).await
+                        else {
+                            continue;
+                        };
+                        let Some(distribution_id) =
+                            hooks.distribution_source.next_distribution_id().await
+                        else {
+                            warn!(
+                                "jdp {session_id_hex} tailored publish skipped — \
+                                 distribution-id allocator unavailable"
+                            );
+                            continue;
+                        };
+                        let entry = entry_from_built(
+                            distribution_id,
+                            built,
+                            Some(miner_address.clone()),
+                            Some(session_id),
+                            now_ms(),
+                        );
+                        let wire = wire_from_entry(&entry);
+                        bridge
+                            .write()
+                            .expect("bridge RwLock poisoned")
+                            .publish_tailored(session_id, entry);
+                        tailored_active = true;
+                        if let Err(err) = write_jdp_outbound_frames(
+                            &mut writer,
+                            vec![JdpOutboundFrame::SetPayoutDistribution(wire)],
+                        )
+                        .await
+                        {
+                            warn!("jdp {session_id_hex} tailored push write: {err:?}");
+                        }
+                    }
+                }
                 fan_out_events(outcome.events, &session_id, &bridge, &hooks, now_ms()).await;
             }
         }
@@ -489,20 +723,36 @@ async fn run_jdp_connection(
 /// Dispatch one inbound JDP frame to the matching `handle_*` function.
 /// Resolves async-hook context per-variant before calling the (sync)
 /// handler.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_jdp_inbound(
     state: &mut JdpSessionState,
     inbound: InboundJdpFrame,
     hooks: &JdpServerHooks,
+    bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
+    session_id: u32,
     remote_addr: &str,
     now_ms: u64,
 ) -> JdpHandlerOutcome {
     match inbound {
         InboundJdpFrame::SetupConnection(input) => handle_setup_connection(state, &input),
-        InboundJdpFrame::RequestExtensions(input) => handle_request_extensions(state, &input),
+        InboundJdpFrame::RequestExtensions(input) => {
+            // §3.1 makes `SetPayoutDistribution` the mandatory first
+            // push after this exchange — only offer 0x0003 when one is
+            // actually publishable right now.
+            let distribution_available = bridge
+                .read()
+                .expect("bridge RwLock poisoned")
+                .current_pool_wide()
+                .is_some();
+            handle_request_extensions(state, &input, distribution_available)
+        }
         InboundJdpFrame::AllocateMiningJobToken(input) => {
+            let negotiated = state
+                .negotiated_extensions
+                .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
             let Some(ctx) = hooks
                 .allocate_resolver
-                .resolve_allocate_context(&input.user_identifier, remote_addr)
+                .resolve_allocate_context(&input.user_identifier, remote_addr, negotiated)
                 .await
             else {
                 // Couldn't resolve a miner address — drop silently
@@ -514,11 +764,36 @@ async fn dispatch_jdp_inbound(
         InboundJdpFrame::DeclareMiningJob(input) => {
             let template_txs = hooks.template_tx_provider.snapshot().await;
             let current_prev_hash = hooks.prev_hash_provider.current_prev_hash().await;
-            handle_declare_mining_job(state, &input, &template_txs, current_prev_hash, now_ms)
+            let distribution =
+                resolve_distribution_acceptance(bridge, session_id, input.distribution_id);
+            handle_declare_mining_job(
+                state,
+                &input,
+                &template_txs,
+                current_prev_hash,
+                distribution,
+                now_ms,
+            )
         }
         InboundJdpFrame::ProvideMissingTransactionsSuccess(input) => {
             let current_prev_hash = hooks.prev_hash_provider.current_prev_hash().await;
-            handle_provide_missing_transactions_success(state, &input, current_prev_hash, now_ms)
+            // §7.2/§10 are judged when the declaration is ACCEPTED —
+            // re-resolve against the pending declare's referenced id,
+            // so a supersession or settlement during the round-trip is
+            // seen.
+            let pending_distribution_id = state
+                .pending_declaration
+                .as_ref()
+                .and_then(|p| p.input.distribution_id);
+            let distribution =
+                resolve_distribution_acceptance(bridge, session_id, pending_distribution_id);
+            handle_provide_missing_transactions_success(
+                state,
+                &input,
+                current_prev_hash,
+                distribution,
+                now_ms,
+            )
         }
         InboundJdpFrame::PushSolution(input) => {
             // The miner_address is bound to the declared job's
@@ -543,46 +818,57 @@ async fn dispatch_jdp_inbound(
                 });
             handle_push_solution(state, &input, miner_address)
         }
-        InboundJdpFrame::RequestPayoutOutputs(input) => {
-            // Look up the miner_address bound to this token so the
-            // resolver can route through the mode-gate. If the token
-            // is unknown the pure-logic handler returns the
-            // `invalid-mining-job-token` wire error directly — we
-            // bridge by feeding it a Success-shaped resolution it will
-            // never use (the handler short-circuits on the token miss).
-            let token_ctx = state
-                .tokens
-                .lookup_active(&input.mining_job_token, now_ms)
-                .map(|a| (a.miner_address.clone(), a.coinbase_outputs.clone()));
-            let resolution = match token_ctx {
-                Some((addr, committed_outputs)) => {
-                    hooks
-                        .payout_outputs_resolver
-                        .resolve_payout_outputs(
-                            &addr,
-                            &committed_outputs,
-                            input.available_payout_value,
-                            input.request_id,
-                        )
-                        .await
-                }
-                None => {
-                    // Stub; the handler's token-existence check fires
-                    // first and emits `invalid-mining-job-token`.
-                    crate::jdp::client::PayoutOutputsResolution::Error {
-                        request_id: input.request_id,
-                        error_code:
-                            crate::extensions::payout_outputs_error_codes::INVALID_MINING_JOB_TOKEN
-                                .to_string(),
-                    }
-                }
-            };
-            // The pool's own chain-tip view stamps the issued set's
-            // epoch (NOT a wire field) so a later tip advance flags it
-            // stale at declare-time (spec §4 freshness is validator-side).
-            let current_prev_hash = hooks.prev_hash_provider.current_prev_hash().await;
-            handle_request_payout_outputs(state, &input, resolution, current_prev_hash, now_ms)
-        }
+    }
+}
+
+/// Resolve a §6 `distribution_id` reference against the bridge's
+/// acceptance window, under the declare path's session scope. `None`
+/// TLV → `None` (the handler decides whether that's an error — it is,
+/// on a negotiated connection).
+fn resolve_distribution_acceptance(
+    bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
+    session_id: u32,
+    distribution_id: Option<u64>,
+) -> Option<DistributionAcceptance> {
+    distribution_id.map(|id| {
+        bridge
+            .read()
+            .expect("bridge RwLock poisoned")
+            .distribution_acceptance(id, DistributionScope::JdpSession(session_id))
+    })
+}
+
+/// Lower a [`BuiltPayoutDistribution`] into the bridge's registry entry.
+fn entry_from_built(
+    distribution_id: u64,
+    built: BuiltPayoutDistribution,
+    owner: Option<AddressId>,
+    jdp_session_id: Option<u32>,
+    published_at_ms: u64,
+) -> PayoutDistributionEntry {
+    PayoutDistributionEntry {
+        distribution_id,
+        pool_payout: built.pool_payout,
+        payouts: built.payouts,
+        dust_limits: built.dust_limits,
+        additional_outputs: built.additional_outputs,
+        reference_reward_sats: built.reference_reward_sats,
+        payouts_fingerprint: built.payouts_fingerprint,
+        bookable: built.bookable,
+        owner,
+        jdp_session_id,
+        published_at_ms,
+    }
+}
+
+/// The §3.1 wire form of a registry entry.
+fn wire_from_entry(entry: &PayoutDistributionEntry) -> SetPayoutDistribution {
+    SetPayoutDistribution {
+        distribution_id: entry.distribution_id,
+        pool_payout: entry.pool_payout.to_wire_txout(),
+        payouts: entry.payouts.iter().map(|p| p.to_wire_txout()).collect(),
+        dust_limits: entry.dust_limits.clone(),
+        additional_outputs: entry.additional_outputs.clone(),
     }
 }
 
@@ -602,9 +888,6 @@ async fn fan_out_events(
         match event {
             JdpSessionEvent::SetupComplete { .. } => {}
             JdpSessionEvent::TokenAllocated { .. } => {}
-            // Bridge bookkeeping only — handled in
-            // `register_declared_jobs_in_bridge`, nothing to fan out.
-            JdpSessionEvent::PayoutOutputsIssued { .. } => {}
             JdpSessionEvent::JobDeclared {
                 new_token,
                 original_token,
@@ -766,52 +1049,23 @@ pub(crate) fn register_declared_jobs_in_bridge(
 ) {
     let mut reg = bridge.write().expect("bridge RwLock poisoned");
     for event in events {
-        match event {
-            JdpSessionEvent::PayoutOutputsIssued {
-                token,
-                outputs,
-                miner_address,
-                issued_prev_hash,
-            } => {
-                // ext 0x0003: record the committed payout set so the mining
-                // server can validate + single-use-consume the JDC's
-                // SetCustomMiningJob coinbase against it (both JD modes), and
-                // reject it as stale if the job's tip has moved on.
-                reg.register_payout_set(
-                    *token,
-                    IssuedPayoutSet {
-                        outputs: outputs.clone(),
+        if let JdpSessionEvent::JobDeclared {
+            new_token,
+            miner_address,
+            ..
+        } = event
+        {
+            if let Some(declared_job) = state.declared_jobs.get(new_token) {
+                reg.register(
+                    *new_token,
+                    RegisteredDeclaredJob {
+                        declared_job: declared_job.clone(),
                         miner_address: miner_address.clone(),
                         jdp_session_id,
                         registered_at_ms: now_ms,
-                        issued_prev_hash: *issued_prev_hash,
-                        used: false,
                     },
                 );
             }
-            JdpSessionEvent::JobDeclared {
-                new_token,
-                original_token,
-                miner_address,
-                ..
-            } => {
-                if let Some(declared_job) = state.declared_jobs.get(new_token) {
-                    reg.register(
-                        *new_token,
-                        RegisteredDeclaredJob {
-                            declared_job: declared_job.clone(),
-                            miner_address: miner_address.clone(),
-                            jdp_session_id,
-                            registered_at_ms: now_ms,
-                        },
-                    );
-                }
-                // Full-Template: re-key the payout set issued under the
-                // allocation token to the new mining-job token, so the JDC's
-                // SetCustomMiningJob (which carries the new token) resolves it.
-                reg.rekey_payout_set(original_token, new_token);
-            }
-            _ => {}
         }
     }
 }
@@ -865,6 +1119,43 @@ mod tests {
         s
     }
 
+    fn jdp_setup() -> crate::jdp::client::SetupConnectionInput {
+        crate::jdp::client::SetupConnectionInput {
+            protocol: crate::jdp::client::PROTOCOL_JOB_DECLARATION,
+            min_version: 2,
+            max_version: 2,
+            flags: crate::jdp::client::FLAG_DECLARE_TX_DATA,
+            vendor: "v".to_string(),
+            firmware: "f".to_string(),
+            hardware_version: "h".to_string(),
+            device_id: "d".to_string(),
+        }
+    }
+
+    /// Minimal §3.1 registry entry: one weight-9 miner slot behind a
+    /// weight-1 pool output.
+    fn test_distribution(id: u64) -> PayoutDistributionEntry {
+        PayoutDistributionEntry {
+            distribution_id: id,
+            pool_payout: WeightedOutput {
+                script_pubkey: vec![0x51],
+                weight: 1,
+            },
+            payouts: vec![WeightedOutput {
+                script_pubkey: vec![0x00, 0x14, 0xAA],
+                weight: 9,
+            }],
+            dust_limits: vec![546],
+            additional_outputs: vec![],
+            reference_reward_sats: 312_500_000,
+            payouts_fingerprint: Some([id as u8; 32]),
+            bookable: true,
+            owner: None,
+            jdp_session_id: None,
+            published_at_ms: 1_000,
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn server_handle_is_cloneable_and_shutdown_idempotent() {
         let bridge = fresh_bridge();
@@ -873,6 +1164,7 @@ mod tests {
             noise_cfg(),
             JdpServerHooks::no_op(),
             bridge,
+            Duration::from_secs(3600),
         );
         let _clone = server.clone();
         server.shutdown().await;
@@ -887,6 +1179,7 @@ mod tests {
             noise_cfg(),
             JdpServerHooks::no_op(),
             bridge,
+            Duration::from_secs(3600),
         );
         assert_eq!(server.alloc_session_id(), 1);
         assert_eq!(server.alloc_session_id(), 2);
@@ -897,16 +1190,37 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn no_op_allocate_resolver_parses_user_identifier_as_address() {
         let hooks = NoOpJdpHooks;
-        let ctx = hooks.resolve_allocate_context(ADDR, "1.2.3.4:1234").await;
-        assert!(ctx.is_some());
-        assert_eq!(ctx.unwrap().miner_address.as_str(), ADDR);
+        let ctx = hooks
+            .resolve_allocate_context(ADDR, "1.2.3.4:1234", false)
+            .await;
+        let ctx = ctx.expect("valid address resolves");
+        assert_eq!(ctx.miner_address.as_str(), ADDR);
+        assert_eq!(
+            ctx.coinbase_outputs.as_slice(),
+            &[0u8],
+            "without 0x0003 the base §6.4.3 outputs apply"
+        );
+    }
+
+    /// §2: with ext 0x0003 negotiated the `SetPayoutDistribution` push
+    /// replaces the base output semantics — `coinbase_tx_outputs` in
+    /// `AllocateMiningJobToken.Success` MUST be empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_op_allocate_resolver_empty_outputs_when_0x0003_negotiated() {
+        let hooks = NoOpJdpHooks;
+        let ctx = hooks
+            .resolve_allocate_context(ADDR, "1.2.3.4:1234", true)
+            .await;
+        let ctx = ctx.expect("valid address resolves");
+        assert_eq!(ctx.miner_address.as_str(), ADDR);
+        assert!(ctx.coinbase_outputs.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn no_op_allocate_resolver_rejects_garbage_user_identifier() {
         let hooks = NoOpJdpHooks;
         let ctx = hooks
-            .resolve_allocate_context(&"x".repeat(200), "1.2.3.4:1234")
+            .resolve_allocate_context(&"x".repeat(200), "1.2.3.4:1234", false)
             .await;
         assert!(ctx.is_none(), "garbage user-identifier yields None");
     }
@@ -915,18 +1229,9 @@ mod tests {
     async fn dispatch_allocate_token_emits_success_with_resolver() {
         let mut state = fresh_session();
         // Need setup_complete first.
-        let setup_input = crate::jdp::client::SetupConnectionInput {
-            protocol: crate::jdp::client::PROTOCOL_JOB_DECLARATION,
-            min_version: 2,
-            max_version: 2,
-            flags: crate::jdp::client::FLAG_DECLARE_TX_DATA,
-            vendor: "v".to_string(),
-            firmware: "f".to_string(),
-            hardware_version: "h".to_string(),
-            device_id: "d".to_string(),
-        };
-        let _ = handle_setup_connection(&mut state, &setup_input);
+        let _ = handle_setup_connection(&mut state, &jdp_setup());
         let hooks = JdpServerHooks::no_op();
+        let bridge = fresh_bridge();
         let outcome = dispatch_jdp_inbound(
             &mut state,
             InboundJdpFrame::AllocateMiningJobToken(AllocateMiningJobTokenInput {
@@ -934,6 +1239,8 @@ mod tests {
                 user_identifier: ADDR.to_string(),
             }),
             &hooks,
+            &bridge,
+            1,
             "1.2.3.4:5555",
             1_000,
         )
@@ -955,19 +1262,13 @@ mod tests {
     async fn dispatch_setup_connection_emits_success() {
         let mut state = fresh_session();
         let hooks = JdpServerHooks::no_op();
+        let bridge = fresh_bridge();
         let outcome = dispatch_jdp_inbound(
             &mut state,
-            InboundJdpFrame::SetupConnection(crate::jdp::client::SetupConnectionInput {
-                protocol: crate::jdp::client::PROTOCOL_JOB_DECLARATION,
-                min_version: 2,
-                max_version: 2,
-                flags: 1,
-                vendor: "v".to_string(),
-                firmware: "f".to_string(),
-                hardware_version: "h".to_string(),
-                device_id: "d".to_string(),
-            }),
+            InboundJdpFrame::SetupConnection(jdp_setup()),
             &hooks,
+            &bridge,
+            1,
             "1.2.3.4:5555",
             0,
         )
@@ -977,6 +1278,88 @@ mod tests {
             JdpOutboundFrame::SetupConnectionSuccess { .. }
         ));
         assert!(state.setup_complete);
+    }
+
+    /// §3.1 makes `SetPayoutDistribution` the mandatory first push after
+    /// the extensions exchange — so 0x0003 is only offered while a
+    /// pool-wide distribution is actually publishable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_request_extensions_offers_0x0003_only_when_publishable() {
+        let mut state = fresh_session();
+        let _ = handle_setup_connection(&mut state, &jdp_setup());
+        let hooks = JdpServerHooks::no_op();
+        let bridge = fresh_bridge();
+        let request = |id: u16| {
+            InboundJdpFrame::RequestExtensions(crate::extensions::RequestExtensions {
+                request_id: id,
+                requested_extensions: vec![SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS],
+            })
+        };
+
+        // No distribution published yet → the extension is not offered.
+        let outcome = dispatch_jdp_inbound(
+            &mut state,
+            request(1),
+            &hooks,
+            &bridge,
+            1,
+            "1.2.3.4:5555",
+            1_000,
+        )
+        .await;
+        match &outcome.outbound[0] {
+            JdpOutboundFrame::RequestExtensionsError {
+                unsupported_extensions,
+                ..
+            } => {
+                assert!(unsupported_extensions.contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS))
+            }
+            other => panic!("expected RequestExtensionsError, got {other:?}"),
+        }
+        assert!(!state
+            .negotiated_extensions
+            .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS));
+
+        // With a publishable pool-wide distribution the offer stands.
+        bridge
+            .write()
+            .unwrap()
+            .publish_pool_wide(test_distribution(1));
+        let outcome = dispatch_jdp_inbound(
+            &mut state,
+            request(2),
+            &hooks,
+            &bridge,
+            1,
+            "1.2.3.4:5555",
+            2_000,
+        )
+        .await;
+        match &outcome.outbound[0] {
+            JdpOutboundFrame::RequestExtensionsSuccess {
+                supported_extensions,
+                ..
+            } => assert!(supported_extensions.contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)),
+            other => panic!("expected RequestExtensionsSuccess, got {other:?}"),
+        }
+        assert!(state
+            .negotiated_extensions
+            .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS));
+    }
+
+    /// The §3.1 wire form mirrors the registry entry: weights ride in
+    /// the TxOut amount field, dust limits and additional outputs pass
+    /// through unchanged.
+    #[test]
+    fn wire_from_entry_carries_weights_and_dust_limits() {
+        let entry = test_distribution(7);
+        let wire = wire_from_entry(&entry);
+        assert_eq!(wire.distribution_id, 7);
+        assert_eq!(wire.pool_payout, entry.pool_payout.to_wire_txout());
+        assert_eq!(wire.payouts.len(), 1);
+        assert_eq!(wire.payouts[0], entry.payouts[0].to_wire_txout());
+        assert_eq!(wire.dust_limits, vec![546]);
+        assert!(wire.additional_outputs.is_empty());
     }
 
     /// `register_declared_jobs_in_bridge` pulls the declared-job
@@ -1014,67 +1397,5 @@ mod tests {
         assert_eq!(entry.jdp_session_id, 42);
         assert_eq!(entry.miner_address.as_str(), ADDR);
         assert_eq!(entry.declared_job.prev_hash, Some([0xCC; 32]));
-    }
-
-    /// A `PayoutOutputsIssued` event registers the committed set in the
-    /// shared bridge under the allocation token; a later `JobDeclared`
-    /// re-keys it to the new mining-job token, so a Full-Template
-    /// `SetCustomMiningJob` (which carries the new token) resolves it.
-    #[tokio::test(flavor = "current_thread")]
-    async fn payout_set_registered_then_rekeyed_on_job_declared() {
-        use crate::jdp::declarations::DeclaredJob;
-        let mut state = fresh_session();
-        let alloc_token = Token([0xBB; 16]);
-        let new_token = Token([0xAA; 16]);
-        let bridge = fresh_bridge();
-
-        // RequestPayoutOutputs.Success → PayoutOutputsIssued (alloc token).
-        let issued = vec![JdpSessionEvent::PayoutOutputsIssued {
-            token: alloc_token,
-            outputs: vec![0x01, 0x02, 0x03],
-            miner_address: AddressId::new(ADDR.to_string()).unwrap(),
-            issued_prev_hash: Some([0xCC; 32]),
-        }];
-        register_declared_jobs_in_bridge(&state, &bridge, 42, 1_000, &issued);
-        assert!(bridge
-            .read()
-            .unwrap()
-            .lookup_payout_set(&alloc_token)
-            .is_some());
-
-        // DeclareMiningJob.Success → register declared job + re-key the set.
-        state.declared_jobs.insert(DeclaredJob {
-            new_token,
-            original_token: alloc_token,
-            request_id: 1,
-            version: 0,
-            coinbase_tx_prefix: vec![],
-            coinbase_tx_suffix: vec![],
-            wtxid_list: vec![],
-            raw_transactions: HashMap::new(),
-            prev_hash: Some([0xCC; 32]),
-            declared_at_ms: 500,
-            booking: None,
-        });
-        let declared = vec![JdpSessionEvent::JobDeclared {
-            new_token,
-            original_token: alloc_token,
-            miner_address: AddressId::new(ADDR.to_string()).unwrap(),
-            prev_hash: Some([0xCC; 32]),
-        }];
-        register_declared_jobs_in_bridge(&state, &bridge, 42, 2_000, &declared);
-        let r = bridge.read().unwrap();
-        assert!(
-            r.lookup_payout_set(&alloc_token).is_none(),
-            "re-keyed away from the allocation token"
-        );
-        assert!(
-            r.lookup_payout_set(&new_token).is_some(),
-            "now resolvable under the new mining-job token"
-        );
-        assert!(
-            r.lookup(&new_token).is_some(),
-            "declared job registered too"
-        );
     }
 }

@@ -550,6 +550,13 @@ pub struct Sv2Config {
     /// don't run JDC traffic — flip on when JDPs are in active use.
     #[serde(default)]
     pub jdp_orphan_submitblock: bool,
+    /// Republish cadence (seconds) for the ext 0x0003 payout
+    /// distribution push (`SetPayoutDistribution`). The publisher also
+    /// fires immediately on settlement invalidation; the timer only
+    /// bounds how stale a published distribution may grow between
+    /// blocks. Default 60.
+    #[serde(default)]
+    pub jdp_payout_distribution_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -10,9 +10,9 @@
 //!   piggy-backed on `SubmitSharesExtended` (extension_type stays
 //!   0x0000). See [`encode_worker_id_tlv`], [`parse_worker_id_tlv`],
 //!   [`resolve_share_worker_name_from_tlv`].
-//! - **0x0003 Non-Custodial Pool Payouts** —
-//!   [`RequestPayoutOutputs`] / [`RequestPayoutOutputsSuccess`] /
-//!   [`RequestPayoutOutputsError`].
+//! - **0x0003 Non-Custodial Payouts** (push model) —
+//!   [`SetPayoutDistribution`] (JDS→JDC) + the `distribution_id` TLV
+//!   on `DeclareMiningJob` / `SetCustomMiningJob`.
 //!
 //! Frames for 0x0001 and 0x0003 messages set `extension_type` to the
 //! extension's identifier (NOT 0x0000), because both extensions
@@ -112,26 +112,12 @@ impl<'a> Reader<'a> {
         self.pos += 8;
         Ok(v)
     }
-    fn read_b0_255(&mut self) -> Result<Vec<u8>, ExtensionsParseError> {
-        self.need(1)?;
-        let len = self.buf[self.pos] as usize;
-        self.pos += 1;
-        self.need(len)?;
-        let v = self.buf[self.pos..self.pos + len].to_vec();
-        self.pos += len;
-        Ok(v)
-    }
     fn read_b0_64k(&mut self) -> Result<Vec<u8>, ExtensionsParseError> {
         let len = self.read_u16_le()? as usize;
         self.need(len)?;
         let v = self.buf[self.pos..self.pos + len].to_vec();
         self.pos += len;
         Ok(v)
-    }
-    fn read_str0_255(&mut self) -> Result<String, ExtensionsParseError> {
-        let off = self.pos;
-        let bytes = self.read_b0_255()?;
-        String::from_utf8(bytes).map_err(|_| ExtensionsParseError::InvalidUtf8 { offset: off })
     }
     fn read_seq0_64k_u16(&mut self) -> Result<Vec<u16>, ExtensionsParseError> {
         let count = self.read_u16_le()? as usize;
@@ -168,18 +154,10 @@ fn write_u32_le(dst: &mut Vec<u8>, v: u32) {
 fn write_u64_le(dst: &mut Vec<u8>, v: u64) {
     dst.extend_from_slice(&v.to_le_bytes());
 }
-fn write_b0_255(dst: &mut Vec<u8>, bytes: &[u8]) {
-    debug_assert!(bytes.len() <= 255);
-    dst.push(bytes.len() as u8);
-    dst.extend_from_slice(bytes);
-}
 fn write_b0_64k(dst: &mut Vec<u8>, bytes: &[u8]) {
     debug_assert!(bytes.len() <= u16::MAX as usize);
     write_u16_le(dst, bytes.len() as u16);
     dst.extend_from_slice(bytes);
-}
-fn write_str0_255(dst: &mut Vec<u8>, s: &str) {
-    write_b0_255(dst, s.as_bytes());
 }
 fn write_seq0_64k_u16(dst: &mut Vec<u8>, items: &[u16]) {
     debug_assert!(items.len() <= u16::MAX as usize);
@@ -288,124 +266,6 @@ impl RequestExtensionsError {
             request_id,
             unsupported_extensions,
             required_extensions,
-        })
-    }
-}
-
-// ── 0x0003 Non-Custodial Pool Payouts ──────────────────────────────
-
-/// `RequestPayoutOutputs` — JDC → JDS (spec §2.1).
-/// Frame: `extension_type = 0x0003`, `msg_type = 0x00`.
-///
-/// No `prev_hash` on the wire: payout freshness is resolved by the
-/// validating party from its own accounting state (single-use payout
-/// sets, see spec §4), not signalled per-request by the JDC.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestPayoutOutputs {
-    pub request_id: u32,
-    pub mining_job_token: Vec<u8>, // B0_255
-    /// Amount, in satoshis, the returned output set MUST distribute
-    /// (spec §2.1). The JDC derives it from `coinbase_tx_value_remaining`
-    /// after accounting for any outputs it adds itself.
-    pub available_payout_value: u64,
-}
-
-impl RequestPayoutOutputs {
-    pub fn deserialize(buf: &[u8]) -> Result<Self, ExtensionsParseError> {
-        let mut r = Reader::new(buf);
-        let request_id = r.read_u32_le()?;
-        let mining_job_token = r.read_b0_255()?;
-        let available_payout_value = r.read_u64_le()?;
-        Ok(Self {
-            request_id,
-            mining_job_token,
-            available_payout_value,
-        })
-    }
-
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + 1 + self.mining_job_token.len() + 8);
-        write_u32_le(&mut out, self.request_id);
-        write_b0_255(&mut out, &self.mining_job_token);
-        write_u64_le(&mut out, self.available_payout_value);
-        out
-    }
-}
-
-/// `RequestPayoutOutputs.Success` — JDS → JDC (spec §2.2).
-/// Frame: `extension_type = 0x0003`, `msg_type = 0x01`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestPayoutOutputsSuccess {
-    pub request_id: u32,
-    /// Consensus-serialized `Vec<TxOut>` (varint count + per-output
-    /// `{value_le8, varint_script_len, script_pub_key}`).
-    pub coinbase_tx_outputs: Vec<u8>,
-}
-
-impl RequestPayoutOutputsSuccess {
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(6 + self.coinbase_tx_outputs.len());
-        write_u32_le(&mut out, self.request_id);
-        write_b0_64k(&mut out, &self.coinbase_tx_outputs);
-        out
-    }
-
-    pub fn deserialize(buf: &[u8]) -> Result<Self, ExtensionsParseError> {
-        let mut r = Reader::new(buf);
-        let request_id = r.read_u32_le()?;
-        let coinbase_tx_outputs = r.read_b0_64k()?;
-        Ok(Self {
-            request_id,
-            coinbase_tx_outputs,
-        })
-    }
-}
-
-/// `RequestPayoutOutputs.Error` — JDS → JDC (spec §2.3).
-/// Frame: `extension_type = 0x0003`, `msg_type = 0x02`.
-///
-/// `error_code` is a free `STR0_255`; the spec only mandates that the
-/// JDS return this message when it cannot construct an output set that
-/// both sums to `available_payout_value` and fits the token's coinbase
-/// reservation. The symbolic codes below are our own internal vocabulary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestPayoutOutputsError {
-    pub request_id: u32,
-    pub error_code: String,
-}
-
-/// Error-code vocabulary for the 0x0003 extension.
-///
-/// `STALE_PAYOUT_OUTPUTS` is the only spec-named code (§4): it is a
-/// *job-declaration* rejection code (`DeclareMiningJob.Error` /
-/// `SetCustomMiningJob.Error`), signalling the JDC to request a fresh
-/// payout output set — NOT a `RequestPayoutOutputs.Error` code. The
-/// rest are internal codes we emit on `RequestPayoutOutputs.Error`.
-pub mod payout_outputs_error_codes {
-    /// Spec §4 — job rejected because its payout output set is stale,
-    /// superseded, unknown, or already used. The JDC SHOULD re-request.
-    pub const STALE_PAYOUT_OUTPUTS: &str = "stale-payout-outputs";
-    pub const INVALID_MINING_JOB_TOKEN: &str = "invalid-mining-job-token";
-    pub const REVENUE_TOO_LARGE: &str = "revenue-too-large";
-    pub const COINBASE_SIZE_BUDGET_EXCEEDED: &str = "coinbase-size-budget-exceeded";
-    pub const INTERNAL: &str = "internal";
-}
-
-impl RequestPayoutOutputsError {
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(5 + self.error_code.len());
-        write_u32_le(&mut out, self.request_id);
-        write_str0_255(&mut out, &self.error_code);
-        out
-    }
-
-    pub fn deserialize(buf: &[u8]) -> Result<Self, ExtensionsParseError> {
-        let mut r = Reader::new(buf);
-        let request_id = r.read_u32_le()?;
-        let error_code = r.read_str0_255()?;
-        Ok(Self {
-            request_id,
-            error_code,
         })
     }
 }
@@ -725,115 +585,6 @@ mod tests {
         };
         let parsed = RequestExtensionsError::deserialize(&original.serialize()).unwrap();
         assert_eq!(parsed, original);
-    }
-
-    // ── 0x0003 RequestPayoutOutputs ────────────────────────────────
-
-    /// `round-trips request_id, token, available_payout_value`
-    #[test]
-    fn request_payout_outputs_roundtrip() {
-        let original = RequestPayoutOutputs {
-            request_id: 0xdeadbeef,
-            mining_job_token: b"jdp-token-42".to_vec(),
-            available_payout_value: 312_500_000, // 3.125 BTC in sats
-        };
-
-        let wire = original.serialize();
-        let parsed = RequestPayoutOutputs::deserialize(&wire).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    /// `wire layout: U32-LE request_id, B0_255 token, U64-LE available_payout_value`
-    #[test]
-    fn request_payout_outputs_wire_layout() {
-        let token = vec![0xde, 0xad];
-        let wire = RequestPayoutOutputs {
-            request_id: 0x01020304,
-            mining_job_token: token.clone(),
-            available_payout_value: 0x0000_0000_9988_7766,
-        }
-        .serialize();
-        // 4 (U32) + 1 (token len prefix) + 2 (token bytes) + 8 (U64) = 15
-        assert_eq!(wire.len(), 15);
-        assert_eq!(&wire[0..4], &[0x04, 0x03, 0x02, 0x01]);
-        assert_eq!(wire[4], 0x02);
-        assert_eq!(&wire[5..7], token.as_slice());
-        assert_eq!(
-            &wire[7..15],
-            &[0x66, 0x77, 0x88, 0x99, 0x00, 0x00, 0x00, 0x00]
-        );
-    }
-
-    /// `round-trips request_id and consensus-serialized outputs` (Success)
-    #[test]
-    fn request_payout_outputs_success_roundtrip() {
-        let coinbase_tx_outputs = vec![
-            0x01, // VarInt count = 1
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // U64 value = 0
-            0x00, // VarInt script_len = 0
-        ];
-        let original = RequestPayoutOutputsSuccess {
-            request_id: 7,
-            coinbase_tx_outputs,
-        };
-        let parsed = RequestPayoutOutputsSuccess::deserialize(&original.serialize()).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    /// `wire layout: U32-LE request_id followed by B0_64K outputs`
-    #[test]
-    fn request_payout_outputs_success_wire_layout() {
-        let outputs = vec![0xAA, 0xBB, 0xCC];
-        let wire = RequestPayoutOutputsSuccess {
-            request_id: 0x42,
-            coinbase_tx_outputs: outputs.clone(),
-        }
-        .serialize();
-        // 4 (U32) + 2 (B0_64K len prefix) + 3 (outputs) = 9
-        assert_eq!(wire.len(), 9);
-        assert_eq!(&wire[0..4], &[0x42, 0x00, 0x00, 0x00]);
-        assert_eq!(&wire[4..6], &[0x03, 0x00]);
-        assert_eq!(&wire[6..9], outputs.as_slice());
-    }
-
-    /// `round-trips each defined error code`
-    #[test]
-    fn request_payout_outputs_error_roundtrip() {
-        use payout_outputs_error_codes::*;
-        for code in [
-            STALE_PAYOUT_OUTPUTS,
-            INVALID_MINING_JOB_TOKEN,
-            REVENUE_TOO_LARGE,
-            COINBASE_SIZE_BUDGET_EXCEEDED,
-            INTERNAL,
-        ] {
-            let wire = RequestPayoutOutputsError {
-                request_id: 1,
-                error_code: code.to_string(),
-            }
-            .serialize();
-            let parsed = RequestPayoutOutputsError::deserialize(&wire).unwrap();
-            assert_eq!(parsed.request_id, 1);
-            assert_eq!(parsed.error_code, code);
-        }
-    }
-
-    /// `wire layout: U32-LE request_id followed by STR0_255 error_code`
-    #[test]
-    fn request_payout_outputs_error_wire_layout() {
-        let wire = RequestPayoutOutputsError {
-            request_id: 0xCAFEBABE,
-            error_code: "stale-payout-outputs".to_string(),
-        }
-        .serialize();
-        // 4 (U32) + 1 (STR len prefix) + 20 ("stale-payout-outputs") = 25
-        assert_eq!(wire.len(), 25);
-        assert_eq!(&wire[0..4], &[0xBE, 0xBA, 0xFE, 0xCA]);
-        assert_eq!(wire[4], 20);
-        assert_eq!(
-            std::str::from_utf8(&wire[5..25]).unwrap(),
-            "stale-payout-outputs"
-        );
     }
 
     // ── 0x0003 SetPayoutDistribution (push model) ──────────────────
