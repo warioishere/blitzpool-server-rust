@@ -93,14 +93,35 @@ struct RegistryState {
     sessions: HashMap<String, (String, String)>,
 }
 
+/// What recording a session changed about the live set.
+#[derive(Debug)]
+struct Added {
+    /// This is the device's FIRST session — it just became live.
+    became_live: bool,
+    /// The session used to hold this OTHER device and was its last
+    /// holder, so that one just went away.
+    vacated: Option<(String, String)>,
+}
+
 impl RegistryState {
-    /// Record a session for a device. Returns `true` when this is the
-    /// device's FIRST session, i.e. it just became live.
-    fn add(&mut self, session_id: &str, device: (String, String)) -> bool {
-        self.sessions.insert(session_id.to_string(), device.clone());
+    /// Record a session for a device.
+    fn add(&mut self, session_id: &str, device: (String, String)) -> Added {
+        let previous = self.sessions.insert(session_id.to_string(), device.clone());
+        // One connection may authorize more than once, and the second
+        // authorize may carry a different worker name — SV1's authorize
+        // handler is unconditional. Releasing what the session moved off
+        // is not optional: the holder set is the only thing that can ever
+        // drop a device, and a stale entry in it is unreachable forever.
+        let vacated = match previous {
+            Some(previous) if previous != device => self.release(session_id, &previous),
+            _ => None,
+        };
         let holders = self.devices.entry(device).or_default();
         holders.insert(session_id.to_string());
-        holders.len() == 1
+        Added {
+            became_live: holders.len() == 1,
+            vacated,
+        }
     }
 
     /// Drop a session. Returns the device only when that was its LAST
@@ -108,11 +129,17 @@ impl RegistryState {
     /// the whole worker offline.
     fn remove(&mut self, session_id: &str) -> Option<(String, String)> {
         let device = self.sessions.remove(session_id)?;
-        let holders = self.devices.get_mut(&device)?;
+        self.release(session_id, &device)
+    }
+
+    /// Take `session_id` out of `device`'s holders, reporting the device
+    /// when it held the last one.
+    fn release(&mut self, session_id: &str, device: &(String, String)) -> Option<(String, String)> {
+        let holders = self.devices.get_mut(device)?;
         holders.remove(session_id);
         if holders.is_empty() {
-            self.devices.remove(&device);
-            Some(device)
+            self.devices.remove(device);
+            Some(device.clone())
         } else {
             None
         }
@@ -188,22 +215,41 @@ impl SharedSessionPersistence for LiveSessionRegistry {
         worker: &str,
         user_agent: Option<&str>,
     ) {
-        let became_live = self
+        let added = self
             .lock()
             .add(session_id, (address.to_string(), worker.to_string()));
-        if became_live {
+        if let Some((address, worker)) = added.vacated {
+            let mut conn = self.redis.clone();
+            if let Err(err) = conn
+                .srem::<_, _, ()>(&self.key, member(&address, &worker))
+                .await
+            {
+                warn!(%err, "live-sessions: releasing a re-registered session's previous device failed");
+            }
+        }
+        if added.became_live {
             let mut conn = self.redis.clone();
             // Incremental so a fresh connect is visible before the next
             // republish; the republish is what heals any drift.
             // The tombstone rides along so a key created here, before
             // the first republish, also survives its last SREM.
-            if let Err(err) = conn
-                .sadd::<_, _, ()>(&self.key, &[member(address, worker), PRESENT.to_string()])
-                .await
-            {
+            //
+            // One MULTI/EXEC, not two commands: when this call is what
+            // creates the key, a SADD that lands without its EXPIRE
+            // leaves a key that never expires — and since the front id
+            // is a fresh UUID per process, no later process ever writes
+            // that key again. It would claim its miners are online
+            // forever, which is exactly what the TTL exists to prevent.
+            let queued: redis::RedisResult<()> = redis::pipe()
+                .atomic()
+                .sadd(&self.key, &[member(address, worker), PRESENT.to_string()])
+                .ignore()
+                .expire(&self.key, LIVE_TTL_SECS as i64)
+                .ignore()
+                .query_async(&mut conn)
+                .await;
+            if let Err(err) = queued {
                 warn!(%err, "live-sessions: incremental add failed");
-            } else if let Err(err) = conn.expire::<_, ()>(&self.key, LIVE_TTL_SECS as i64).await {
-                warn!(%err, "live-sessions: incremental expire failed");
             }
         }
         self.inner
@@ -319,6 +365,20 @@ impl RedisLiveSessions {
         let mut out = HashSet::new();
         for key in keys {
             match conn.smembers::<_, Vec<String>>(&key).await {
+                // Redis drops a set with its last member, and the
+                // tombstone means a published key always has one — so
+                // "empty" is not a front holding nothing, it is a key
+                // that expired between the scan above and this read.
+                // Folding it in as empty would silently drop everything
+                // that front was carrying, and with a single front the
+                // whole pool would read as offline.
+                Ok(members) if members.is_empty() => {
+                    warn!(
+                        key,
+                        "live-sessions: key vanished mid-read — drawing no conclusion"
+                    );
+                    return None;
+                }
                 Ok(members) => {
                     for m in members {
                         if let Some((address, worker)) = m.split_once('\u{1f}') {
@@ -345,19 +405,34 @@ impl RedisLiveSessions {
 mod tests {
     use super::*;
     use std::time::Duration as StdDuration;
+    use tokio::io::AsyncWriteExt;
 
     const REDIS_URL: &str = "redis://127.0.0.1:16379";
     const ADDR: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
 
+    /// Connect and take the index over — FLUSHDB on entry. For tests that
+    /// assert on the union as a whole, which only means anything if no
+    /// other front's key is present. There are only 16 Redis databases and
+    /// every test target in this binary runs as a thread in one process,
+    /// so an index taken here is taken from the whole binary; prefer
+    /// [`connect_redis_or_skip_shared`] where the test can tolerate
+    /// company.
     async fn connect_redis_or_skip(db: u8) -> Option<ConnectionManager> {
-        let client = redis::Client::open(format!("{REDIS_URL}/{db}")).ok()?;
-        let mut conn =
-            tokio::time::timeout(StdDuration::from_secs(2), ConnectionManager::new(client))
-                .await
-                .ok()?
-                .ok()?;
+        let mut conn = connect_redis_or_skip_shared(db).await?;
         let _: () = redis::cmd("FLUSHDB").query_async(&mut conn).await.ok()?;
         Some(conn)
+    }
+
+    /// Connect without flushing. Safe to share an index, as long as the
+    /// caller namespaces by its own front id and never asserts on
+    /// anything but its own devices — flushing would buy no isolation
+    /// there and would wipe whatever a sibling is mid-way through.
+    async fn connect_redis_or_skip_shared(db: u8) -> Option<ConnectionManager> {
+        let client = redis::Client::open(format!("{REDIS_URL}/{db}")).ok()?;
+        tokio::time::timeout(StdDuration::from_secs(2), ConnectionManager::new(client))
+            .await
+            .ok()?
+            .ok()
     }
 
     /// A no-op inner hook — the registry decorates the real persistence,
@@ -407,6 +482,49 @@ mod tests {
             .expect("the front is still alive, it just holds nothing");
         assert!(!union.contains(&device), "the last session closed");
         assert!(union.is_empty());
+    }
+
+    /// Every route that can CREATE this front's key has to leave a TTL on
+    /// it. "A dead front disappears by itself" is the property the whole
+    /// design rests on, and it is unrecoverable if it ever fails: the
+    /// front id is a fresh UUID per process, so no later process writes
+    /// that key again and nothing else ever cleans it — it would claim
+    /// its miners are online forever.
+    ///
+    /// This pins the invariant, not the atomicity. That the SADD and the
+    /// EXPIRE cannot be separated is argued from their being one
+    /// MULTI/EXEC; a process dying between two awaits is not something a
+    /// unit test can stage.
+    #[tokio::test]
+    async fn a_key_the_incremental_path_creates_always_expires() {
+        // Shares DB 1 with the two socket tests: this one only ever reads
+        // the TTL of its own key, so a sibling's key in the index is
+        // irrelevant — and none of the three flushes.
+        let Some(mut redis) = connect_redis_or_skip_shared(1).await else {
+            eprintln!("redis unreachable — skipping");
+            return;
+        };
+        // No publish() first: this is the narrow case where a session
+        // registers before the publisher's first tick, so the register is
+        // what brings the key into existence. A key left by a previous run
+        // would already have a TTL and make that vacuously true.
+        let _: Result<(), _> = redis::cmd("DEL")
+            .arg("device:live:front-fresh")
+            .query_async::<()>(&mut redis)
+            .await;
+        let reg = registry(redis.clone(), "front-fresh");
+        reg.register_session("s1", ADDR, "rig-a", None).await;
+
+        let ttl: i64 = redis::cmd("TTL")
+            .arg("device:live:front-fresh")
+            .query_async(&mut redis)
+            .await
+            .expect("ttl");
+        assert!(
+            ttl > 0,
+            "the key exists without a TTL ({ttl}) — a dead front would \
+             claim these miners forever"
+        );
     }
 
     /// No front publishing is NOT "nothing is connected". Reporting the
@@ -479,7 +597,10 @@ mod tests {
     /// and one front going away must not take the other's miners with it.
     #[tokio::test]
     async fn the_union_spans_fronts_and_survives_one_disappearing() {
-        let Some(mut redis) = connect_redis_or_skip(12).await else {
+        // DB 2, not 12: every test target in this binary runs as a thread
+        // in one process and FLUSHDBs its index on entry, so two sharing
+        // an index wipe each other. `cache_sync` already owns 12.
+        let Some(mut redis) = connect_redis_or_skip(2).await else {
             eprintln!("redis unreachable — skipping");
             return;
         };
@@ -512,6 +633,61 @@ mod tests {
         );
     }
 
+    /// A key can expire between the SCAN that finds it and the SMEMBERS
+    /// that reads it. `SMEMBERS` on a missing key answers with an empty
+    /// set rather than an error, so counting that as a real answer drops
+    /// everything the front was carrying — and with a single front, the
+    /// whole pool reads as offline and every subscriber is paged.
+    ///
+    /// Driven concurrently because that window is one round-trip wide.
+    /// The invariant is absolute rather than statistical: this front
+    /// holds exactly one device the entire time, so an empty union is
+    /// never a correct answer, no matter when the read lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_key_that_vanishes_mid_read_is_unknown_not_empty() {
+        let Some(redis) = connect_redis_or_skip(3).await else {
+            eprintln!("redis unreachable — skipping");
+            return;
+        };
+        let reg = Arc::new(registry(redis.clone(), "front-expiring"));
+        reg.register_session("s1", ADDR, "rig-a", None).await;
+        reg.publish().await;
+
+        // Churn the key the way an expiry followed by the next republish
+        // does: gone, then whole again.
+        let stop = CancellationToken::new();
+        let churn = {
+            let reg = Arc::clone(&reg);
+            let stop = stop.clone();
+            let mut conn = redis.clone();
+            tokio::spawn(async move {
+                while !stop.is_cancelled() {
+                    let _: Result<(), _> = redis::cmd("DEL")
+                        .arg("device:live:front-expiring")
+                        .query_async::<()>(&mut conn)
+                        .await;
+                    reg.publish().await;
+                }
+            })
+        };
+
+        let reader = RedisLiveSessions::new(redis);
+        let mut empty_answers = 0usize;
+        for _ in 0..2000 {
+            if reader.union().await.is_some_and(|u| u.is_empty()) {
+                empty_answers += 1;
+            }
+        }
+        stop.cancel();
+        let _ = churn.await;
+
+        assert_eq!(
+            empty_answers, 0,
+            "a vanished key was read as 'this front holds nothing' — that \
+             reports every miner it carried as offline"
+        );
+    }
+
     /// The member encoding has to survive a round trip — an address and
     /// a worker name are both free-form.
     #[test]
@@ -530,5 +706,228 @@ mod tests {
         let mut state = RegistryState::default();
         assert!(state.remove("never-seen").is_none());
         assert!(state.devices.is_empty());
+    }
+
+    /// SV2 fires one `register_session` per channel opened, all carrying
+    /// the SAME session id and the connection's locked worker. Re-recording
+    /// an unchanged device must release nothing: a rental source opening
+    /// its second channel would otherwise take its own worker offline —
+    /// which is the exact spam this feature exists to stop.
+    #[test]
+    fn re_registering_the_same_device_releases_nothing() {
+        let mut state = RegistryState::default();
+        let device = (ADDR.to_string(), "mrr".to_string());
+
+        assert!(state.add("s1", device.clone()).became_live);
+        for _ in 0..4 {
+            let again = state.add("s1", device.clone());
+            assert!(
+                again.vacated.is_none(),
+                "an unchanged device must never be released"
+            );
+        }
+        assert!(state.devices.contains_key(&device), "still held");
+        assert_eq!(state.remove("s1"), Some(device));
+        assert!(state.devices.is_empty(), "one deregister still ends it");
+    }
+
+    /// One SV1 connection may authorize more than once — `handle_authorize`
+    /// is unconditional, so a proxy that switches worker names re-registers
+    /// the SAME session id under a different device. The device it left
+    /// must not keep a phantom holder: nothing will ever remove it, so the
+    /// worker would be reported connected for the life of the process and
+    /// could never go offline again.
+    ///
+    /// Asserted after a full republish, so this is about the registry's
+    /// own state and not about a missed incremental SREM.
+    #[tokio::test]
+    async fn re_authorizing_under_a_new_worker_leaves_nothing_behind() {
+        let Some(redis) = connect_redis_or_skip(4).await else {
+            eprintln!("redis unreachable — skipping");
+            return;
+        };
+        let reg = registry(redis.clone(), "front-reauth");
+        let reader = RedisLiveSessions::new(redis);
+
+        reg.register_session("s1", ADDR, "rig-a", None).await;
+        reg.register_session("s1", ADDR, "rig-b", None).await;
+        reg.deregister_session("s1").await;
+        reg.publish().await;
+
+        let union = reader.union().await.expect("the front is still alive");
+        assert!(
+            union.is_empty(),
+            "the connection is gone, so nothing may still be held: {union:?}"
+        );
+    }
+
+    /// How the fake miner below hangs up.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Hangup {
+        /// `shutdown()` first: the server reads EOF.
+        Fin,
+        /// `SO_LINGER(0)`, then close: the server's read fails with
+        /// ECONNRESET. What a power cut, a yanked cable or a NAT timeout
+        /// actually looks like on the wire.
+        Reset,
+    }
+
+    impl Hangup {
+        /// Own front key + own worker per mode, so the two tests below can
+        /// share one Redis index instead of eating two of the sixteen.
+        /// Neither asserts on the union as a whole — only on its own
+        /// device — so a sibling's key in there is harmless.
+        fn scope(self) -> (&'static str, &'static str) {
+            match self {
+                Hangup::Fin => ("front-hangup-fin", "rig-fin"),
+                Hangup::Reset => ("front-hangup-reset", "rig-reset"),
+            }
+        }
+    }
+
+    /// The two tests below differ in exactly one thing — how the socket
+    /// dies. Everything else is shared so that difference is the only
+    /// candidate explanation when one passes and the other does not.
+    ///
+    /// Drives a real `StratumV1Server` over a real socket rather than the
+    /// trait methods, because what is under test is not the registry: it
+    /// is whether the SV1 connection's exit path reaches
+    /// `deregister_session` on every route out of its loop.
+    async fn device_leaves_the_live_set_after(hangup: Hangup, redis_db: u8) -> bool {
+        let Some(redis) = connect_redis_or_skip_shared(redis_db).await else {
+            eprintln!("redis unreachable — skipping");
+            return true; // treated as "nothing to assert", see call sites
+        };
+        // A real regtest address — the SV1 authorize handler validates it
+        // against the network before it emits `Authorized`.
+        const MINER_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+        let (front_id, worker) = hangup.scope();
+        // Drop only THIS test's key, not the whole index. A key left by a
+        // previous run still has most of its 90 s TTL and would answer the
+        // sync point below before the session has actually registered.
+        let _: Result<(), _> = redis::cmd("DEL")
+            .arg(format!("{LIVE_PREFIX}{front_id}"))
+            .query_async::<()>(&mut redis.clone())
+            .await;
+        let reg = Arc::new(registry(redis.clone(), front_id));
+        let reader = RedisLiveSessions::new(redis);
+        let device = (MINER_ADDR.to_string(), worker.to_string());
+
+        let mut hooks = bp_stratum_v1::ServerHooks::no_op();
+        hooks.session_persistence = Arc::new(bp_stratum_v1::Sv1SessionPersistenceAdapter::new(
+            Arc::clone(&reg),
+        ));
+
+        // The template broadcast is deliberately never fed. Authorize does
+        // not need a template — `apply_outcome` skips the post-authorize
+        // notify when there is none — and this is about how the connection
+        // ends, not about mining. `_template_tx` stays alive so the
+        // server's receiver never closes.
+        let (_template_tx, updates_rx) = tokio::sync::broadcast::channel(8);
+        let server = bp_stratum_v1::StratumV1Server::spawn(
+            bp_stratum_v1::ServerConfig::defaults_for(bitcoin::Network::Regtest),
+            updates_rx,
+            bp_template_distribution::TemplateSnapshot::default(),
+            Vec::new(),
+            hooks,
+            bp_stratum_v1::SharedExtranonce::new(),
+            Arc::new(bp_mining_job::MiningJobCache::new()),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let port_config = bp_stratum_v1::PortConfig::new(addr.port(), 1.0e-18);
+        let accepting = server.clone();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            socket.set_nodelay(true).ok();
+            accepting.accept_connection(socket, port_config);
+        });
+
+        // NOT split into halves: `OwnedWriteHalf` shuts the write side
+        // down on drop, which turns every hangup into a clean FIN and
+        // would make the Reset case silently test the Fin case.
+        let mut miner = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to the server");
+        miner.set_nodelay(true).ok();
+        if hangup == Hangup::Reset {
+            socket2::SockRef::from(&miner)
+                .set_linger(Some(StdDuration::ZERO))
+                .expect("set_linger");
+        }
+        for line in [
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"fake-miner/1.0\"]}\n".to_string(),
+            format!(
+                "{{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"{MINER_ADDR}.{worker}\",\"x\"]}}\n"
+            ),
+        ] {
+            miner
+                .write_all(line.as_bytes())
+                .await
+                .expect("write to the server");
+        }
+
+        // Sync point: the responses are deliberately left unread, so the
+        // live set is what says the session actually registered.
+        assert!(
+            wait_for_union(&reader, |u| u.contains(&device)).await,
+            "the front never published the authorized session"
+        );
+
+        if hangup == Hangup::Fin {
+            miner.shutdown().await.expect("half-close");
+        }
+        drop(miner);
+
+        let left = wait_for_union(&reader, |u| !u.contains(&device)).await;
+        server.shutdown().await;
+        left
+    }
+
+    /// The baseline. A miner that closes cleanly leaves the live set —
+    /// this is what makes the reset case below a statement about the
+    /// reset and not about the harness.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cleanly_closed_connection_leaves_the_live_set() {
+        assert!(
+            device_leaves_the_live_set_after(Hangup::Fin, 1).await,
+            "a clean close must deregister the session"
+        );
+    }
+
+    /// A miner that vanishes without closing cleanly — power cut, NAT
+    /// timeout, a yanked cable — resets the connection instead of sending
+    /// a FIN. That is the most common way an unstable miner disconnects
+    /// and precisely the case the offline notification exists for, so it
+    /// has to reach the live set too. A session left behind here is
+    /// permanent: nothing else can ever remove it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reset_connection_still_leaves_the_live_set() {
+        assert!(
+            device_leaves_the_live_set_after(Hangup::Reset, 1).await,
+            "the reset connection never left the live set — that worker can \
+             never be reported offline again"
+        );
+    }
+
+    /// Poll the union until `pred` holds. Generous: the connection task
+    /// has to notice the socket died and unwind before anything changes.
+    async fn wait_for_union(
+        reader: &RedisLiveSessions,
+        pred: impl Fn(&HashSet<(String, String)>) -> bool,
+    ) -> bool {
+        for _ in 0..100 {
+            if let Some(union) = reader.union().await {
+                if pred(&union) {
+                    return true;
+                }
+            }
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
+        false
     }
 }
