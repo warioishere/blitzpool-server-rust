@@ -21,10 +21,12 @@
 //! `extension_type = 0x0000`.
 //!
 //! Body fields use the standard SV2 little-endian encoding. **TLV
-//! headers (only used by 0x0002) are big-endian** per spec §3.4.3 wire
-//! example, even though §3.1 prose says LE — the on-wire example is
-//! the canonical form and matches every other interop. Worker-ID has a
-//! 32-byte cap on `user_identity` (spec §1.1).
+//! headers are little-endian too**: §3.4.3 types the header fields as
+//! U16/U8, and U16 is little-endian everywhere in SV2. (The 0x0002
+//! spec's §2 wire example shows the extension type as `00 02`, which
+//! contradicts the base data-type convention — the example is the
+//! error, not the rule.) Worker-ID has a 32-byte cap on
+//! `user_identity` (spec §1.1).
 
 // ── Spec constants ─────────────────────────────────────────────────
 
@@ -382,11 +384,12 @@ impl RequestPayoutOutputsError {
 
 /// Encode a Worker-ID TLV, ready to be appended to `SubmitSharesExtended`.
 ///
-/// Wire shape (TLV header is **big-endian** per §3.4.3, value is UTF-8):
-/// `[Type: ext_type U16-BE | field_type U8] [Length U16-BE] [UTF-8 bytes]`.
+/// Wire shape (TLV header fields are U16/U8 per §3.4.3, so the U16s
+/// are **little-endian** like every SV2 integer; value is UTF-8):
+/// `[Type: ext_type U16-LE | field_type U8] [Length U16-LE] [UTF-8 bytes]`.
 ///
-/// Spec wire example for `"Worker_001"` (§2):
-/// `00 02 01 00 0A 57 6F 72 6B 65 72 5F 30 30 31`.
+/// `"Worker_001"` therefore encodes as
+/// `02 00 01 0A 00 57 6F 72 6B 65 72 5F 30 30 31`.
 pub fn encode_worker_id_tlv(user_identity: &str) -> Result<Vec<u8>, WorkerIdEncodeError> {
     let value = user_identity.as_bytes();
     if value.is_empty() {
@@ -399,9 +402,9 @@ pub fn encode_worker_id_tlv(user_identity: &str) -> Result<Vec<u8>, WorkerIdEnco
         });
     }
     let mut buf = Vec::with_capacity(5 + value.len());
-    buf.extend_from_slice(&SV2_EXTENSION_TYPE_WORKER_ID.to_be_bytes()); // 2 bytes BE
+    buf.extend_from_slice(&SV2_EXTENSION_TYPE_WORKER_ID.to_le_bytes());
     buf.push(SV2_FIELD_TYPE_USER_IDENTITY);
-    buf.extend_from_slice(&(value.len() as u16).to_be_bytes()); // 2 bytes BE
+    buf.extend_from_slice(&(value.len() as u16).to_le_bytes());
     buf.extend_from_slice(value);
     Ok(buf)
 }
@@ -411,7 +414,7 @@ pub fn encode_worker_id_tlv(user_identity: &str) -> Result<Vec<u8>, WorkerIdEnco
 /// `user_identity` string, or `None` if no 0x0002 TLV is present.
 ///
 /// Unknown TLVs are skipped per ext 0x0001 §3 (receivers MUST ignore
-/// unexpected TLVs). Same big-endian header convention as 0x0003.
+/// unexpected TLVs). Little-endian header per the SV2 U16 convention.
 ///
 /// Returns `None` on malformed TLV (truncated header / value, length
 /// cap exceeded). Callers SHOULD treat a malformed TLV the same as
@@ -420,9 +423,9 @@ pub fn encode_worker_id_tlv(user_identity: &str) -> Result<Vec<u8>, WorkerIdEnco
 pub fn parse_worker_id_tlv(tail: &[u8]) -> Option<String> {
     let mut o = 0;
     while o + 5 <= tail.len() {
-        let ext_type = u16::from_be_bytes([tail[o], tail[o + 1]]);
+        let ext_type = u16::from_le_bytes([tail[o], tail[o + 1]]);
         let field_type = tail[o + 2];
-        let length = u16::from_be_bytes([tail[o + 3], tail[o + 4]]) as usize;
+        let length = u16::from_le_bytes([tail[o + 3], tail[o + 4]]) as usize;
         let value_start = o + 5;
         let value_end = value_start.checked_add(length)?;
         if value_end > tail.len() {
@@ -695,13 +698,33 @@ mod tests {
 
     // ── 0x0002 Worker-ID TLV ───────────────────────────────────────
 
-    /// `matches the spec wire example: "Worker_001"`
+    /// `wire layout: "Worker_001" with little-endian TLV header`
     #[test]
-    fn worker_id_tlv_matches_spec_wire_example() {
+    fn worker_id_tlv_wire_layout_is_little_endian() {
         let tlv = encode_worker_id_tlv("Worker_001").unwrap();
-        // Per extensions/0x0002-worker-specific-hashrate-tracking.md §2:
-        //   00 02 01 00 0A 57 6F 72 6B 65 72 5F 30 30 31
-        assert_eq!(hex::encode(&tlv), "000201000a576f726b65725f303031");
+        // §3.4.3 types the header as U16|U8 + U16 — U16 is LE in SV2.
+        // (The 0x0002 spec's §2 example shows `00 02 …`, contradicting
+        // the base data-type convention; the example is wrong.)
+        assert_eq!(hex::encode(&tlv), "0200010a00576f726b65725f303031");
+    }
+
+    /// `wire-compatible with the reference TLV codec (parsers_sv2)`
+    #[test]
+    fn worker_id_tlv_matches_reference_codec() {
+        use stratum_core::parsers_sv2::Tlv;
+        let reference = Tlv::new(
+            SV2_EXTENSION_TYPE_WORKER_ID,
+            SV2_FIELD_TYPE_USER_IDENTITY,
+            b"Worker_001".to_vec(),
+        )
+        .encode()
+        .expect("reference encode");
+        assert_eq!(encode_worker_id_tlv("Worker_001").unwrap(), reference);
+        // And the reverse: reference-encoded bytes parse on our side.
+        assert_eq!(
+            parse_worker_id_tlv(&reference).as_deref(),
+            Some("Worker_001")
+        );
     }
 
     /// `round-trips arbitrary UTF-8`
@@ -730,8 +753,8 @@ mod tests {
     /// `parser returns null on > 32 byte declared length (malformed)`
     #[test]
     fn worker_id_tlv_parser_rejects_oversized_length() {
-        // Forge a TLV header claiming length=33.
-        let mut buf = vec![0x00, 0x02, 0x01, 0x00, 0x21];
+        // Forge a TLV header claiming length=33 (0x21 LE).
+        let mut buf = vec![0x02, 0x00, 0x01, 0x21, 0x00];
         buf.extend(std::iter::repeat_n(0x41u8, 33));
         assert_eq!(parse_worker_id_tlv(&buf), None);
     }
@@ -740,9 +763,9 @@ mod tests {
     #[test]
     fn worker_id_tlv_returns_none_when_absent() {
         assert_eq!(parse_worker_id_tlv(&[]), None);
-        // An unrelated TLV (extType=0x0099 BE).
+        // An unrelated TLV (extType=0x0099 LE).
         assert_eq!(
-            parse_worker_id_tlv(&[0x00, 0x99, 0x01, 0x00, 0x01, 0x42]),
+            parse_worker_id_tlv(&[0x99, 0x00, 0x01, 0x01, 0x00, 0x42]),
             None
         );
     }
@@ -750,8 +773,8 @@ mod tests {
     /// `skips unknown leading TLVs and finds the 0x0002 one`
     #[test]
     fn worker_id_tlv_skips_unknown_leading_tlvs() {
-        // Unknown TLV first (ext=0x0099, field=0x01, len=4, value=0x00000000), then 0x0002.
-        let unknown = [0x00, 0x99, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00];
+        // Unknown TLV first (ext=0x0099 LE, field=0x01, len=4, value=0x00000000), then 0x0002.
+        let unknown = [0x99, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
         let ours = encode_worker_id_tlv("rig42").unwrap();
         let mut buf = unknown.to_vec();
         buf.extend_from_slice(&ours);
@@ -827,8 +850,8 @@ mod tests {
     /// `malformed TLV (truncated) → channel default, share remains accountable`
     #[test]
     fn resolve_malformed_truncated_tlv() {
-        // Truncated 0x0002 TLV: claims length=10 but only 5 bytes follow.
-        let malformed = [0x00, 0x02, 0x01, 0x00, 0x0a, 0x41, 0x42, 0x43, 0x44, 0x45];
+        // Truncated 0x0002 TLV: claims length=10 (LE) but only 5 bytes follow.
+        let malformed = [0x02, 0x00, 0x01, 0x0a, 0x00, 0x41, 0x42, 0x43, 0x44, 0x45];
         assert_eq!(resolve(&malformed, true), "default");
     }
 }
