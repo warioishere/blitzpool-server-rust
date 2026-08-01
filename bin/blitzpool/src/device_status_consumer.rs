@@ -77,13 +77,10 @@ mod tests {
     use bp_share_stream::{StreamConsumer, DEVICE_STATUS_STREAM_KEY};
     use bp_stratum_v1::DeviceStatusSink;
     use redis::aio::ConnectionManager;
-    use sqlx::postgres::PgPoolOptions;
-    use sqlx::PgPool;
 
     use crate::device_status::{DeviceStatusStreamEvent, ProducingDeviceStatusSink};
 
     const REDIS_URL: &str = "redis://127.0.0.1:16379";
-    const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
     const ADDR: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
 
     async fn connect_redis_or_skip(db: u8) -> Option<ConnectionManager> {
@@ -96,17 +93,7 @@ mod tests {
         Some(conn)
     }
 
-    async fn connect_pg_or_skip() -> Option<PgPool> {
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            PgPoolOptions::new().max_connections(2).connect(PG_URL),
-        )
-        .await
-        .ok()?
-        .ok()
-    }
-
-    /// End-to-end over real Redis + PG: the split front's producing sink
+    /// End-to-end over real Redis: the split front's producing sink
     /// publishes online + offline events, and a consumer drains them back with
     /// the wire format intact and acks them. This exercises the exact produce →
     /// XREADGROUP → reconstruct → XACK path that [`spawn`] runs (its loop
@@ -120,13 +107,9 @@ mod tests {
             eprintln!("redis unreachable — skipping device-status round-trip test");
             return;
         };
-        let Some(pg) = connect_pg_or_skip().await else {
-            eprintln!("pg unreachable — skipping device-status round-trip test");
-            return;
-        };
-
         // Split front (no dispatcher) → publishes to DEVICE_STATUS_STREAM_KEY.
-        let sink = ProducingDeviceStatusSink::new(redis.clone(), pg);
+        // No Postgres: building the event no longer touches it.
+        let sink = ProducingDeviceStatusSink::new(redis.clone());
         sink.on_device_event(ADDR, "rig1", "sid-online", Some("cpuminer/2.5"), true)
             .await;
         sink.on_device_event(ADDR, "rig1", "sid-offline", None, false)

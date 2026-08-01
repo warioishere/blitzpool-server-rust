@@ -910,42 +910,6 @@ pub async fn device_watch_seed(
         .collect())
 }
 
-/// Latest known `firstSeen` (falling back to `startTime`) for an
-/// `(address, clientName)` pair, but only when the row's `lastActive`
-/// (defined as `deletedAt ?? updatedAt`) is no older than `cutoff_ms`.
-/// Powers the device-online notification's "returning" wording — the
-/// caller renders the message differently when the device was here
-/// within the last 30 min vs a cold first connect.
-///
-/// Returns `None` when no row matches, when the most-recent row is
-/// older than the cutoff, or when both `firstSeen` and `startTime`
-/// are NULL.
-pub async fn find_client_recent_first_seen(
-    pool: &PgPool,
-    address: &str,
-    client_name: &str,
-    cutoff_ms: i64,
-) -> Result<Option<i64>, DbError> {
-    let row = sqlx::query!(
-        r#"SELECT "deletedAt", "updatedAt", "firstSeen", "startTime"
-           FROM client_entity
-           WHERE address = $1 AND "clientName" = $2
-           ORDER BY "updatedAt" DESC NULLS LAST
-           LIMIT 1"#,
-        address,
-        client_name,
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)?;
-    let Some(row) = row else { return Ok(None) };
-    let last_active = row.deletedAt.unwrap_or(row.updatedAt);
-    if last_active < cutoff_ms {
-        return Ok(None);
-    }
-    Ok(row.firstSeen.or(Some(row.startTime)))
-}
-
 /// Bulk variant of [`touch_client_for_share`] — collapses N per-session
 /// updates into a single `UPDATE … FROM unnest(...)`. Same column
 /// semantics as the per-row form: `bestDifficulty` takes `GREATEST`,

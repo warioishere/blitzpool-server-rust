@@ -233,13 +233,10 @@ pub(crate) fn build_per_port_servers(
     // "notifications off".)
     let device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink> = match gate {
         Some((g, subs)) => Arc::new(crate::device_status::DispatcherDeviceStatusSink::new(
-            g,
-            subs,
-            foundation.db.pool().clone(),
+            g, subs,
         )),
         None => Arc::new(crate::device_status::ProducingDeviceStatusSink::new(
             foundation.redis.clone(),
-            foundation.db.pool().clone(),
         )),
     };
 
