@@ -148,7 +148,7 @@ pub(crate) fn build_server_config(cfg: &AppConfig) -> Sv2ServerConfig {
     sc
 }
 
-fn config_network_to_bitcoin(n: bp_config::Network) -> BitcoinNetwork {
+pub(crate) fn config_network_to_bitcoin(n: bp_config::Network) -> BitcoinNetwork {
     match n {
         bp_config::Network::Mainnet => BitcoinNetwork::Bitcoin,
         // testnet4 shares the `tb` HRP + address byte set with
@@ -202,6 +202,7 @@ pub(crate) fn build_per_port_servers(
     // `coinbase_tx_value_remaining`, so the engine ledger-write fires for
     // SV2-found blocks just like SV1; the dispatcher notification fires too.
     let mut sink = crate::block_sink::TdpBlockSubmissionSink::new(tdp.clone())
+        .with_network(network)
         .with_alt_streams(foundation.alt_tdp.clone())
         .with_fanout(
             mode_gate.clone(),

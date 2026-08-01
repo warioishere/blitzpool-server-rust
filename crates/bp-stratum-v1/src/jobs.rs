@@ -479,6 +479,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap()
     }

@@ -963,6 +963,7 @@ async fn main() -> ExitCode {
                 let jdp_ledger_booker = {
                     let mut sink =
                         crate::block_sink::TdpBlockSubmissionSink::new(tdp_handle.clone())
+                            .with_network(crate::stratum_v2::config_network_to_bitcoin(cfg.network))
                             .with_fanout(
                                 engines.mode_gate.clone(),
                                 engines.pplns.clone(),

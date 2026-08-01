@@ -114,6 +114,7 @@ async fn coinbase_from_core31_template_is_bip54_compliant_and_accepted() {
         &coinbase_template,
         "bip54",
         EXTRANONCE_SLOT_LEN,
+        [0u8; 32],
     )
     .expect("build_mining_job_from_tdp must succeed");
 

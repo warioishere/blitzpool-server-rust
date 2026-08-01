@@ -60,6 +60,33 @@ pub fn payouts_fingerprint(block_reward_sats: u64, payouts: &[PayoutEntry]) -> [
     )
 }
 
+/// A resolved payout list plus the identity of the distribution it was
+/// derived from — what a `PayoutResolver` hands the job build.
+///
+/// Under the weight model the fingerprint is a property of the
+/// DISTRIBUTION (settlement inputs), not of the concrete satoshi list:
+/// the same distribution yields different sats at different template
+/// revenues, and they all settle through one snapshot. It therefore
+/// travels WITH the entries instead of being derived from them.
+/// A zeroed fingerprint means "books without a snapshot" (Solo /
+/// Blockparty, which settle by their own recompute paths).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPayouts {
+    pub entries: Vec<PayoutEntry>,
+    pub payouts_fingerprint: [u8; 32],
+}
+
+impl ResolvedPayouts {
+    /// A list that books without a settlement snapshot (zeroed
+    /// fingerprint): Solo and Blockparty, plus every fallback path.
+    pub fn unsnapshotted(entries: Vec<PayoutEntry>) -> Self {
+        Self {
+            entries,
+            payouts_fingerprint: [0u8; 32],
+        }
+    }
+}
+
 /// The block-template fields needed for coinbase construction.
 #[derive(Clone, Debug)]
 pub struct CoinbaseTemplate {
@@ -343,6 +370,7 @@ pub fn build_mining_job_from_tdp(
     template: &TdpCoinbaseTemplate<'_>,
     pool_identifier: &str,
     extranonce_slot_size: usize,
+    payouts_fingerprint: [u8; 32],
 ) -> Result<MiningJob, MiningJobError> {
     if payouts.is_empty() {
         return Err(MiningJobError::NoPayouts);
@@ -366,7 +394,7 @@ pub fn build_mining_job_from_tdp(
         &payout_outputs,
         template,
         extranonce_slot_size,
-        payouts_fingerprint(template.coinbase_tx_value_remaining, payouts),
+        payouts_fingerprint,
     ))
 }
 
@@ -1235,7 +1263,8 @@ mod tests {
             coinbase_tx_locktime: 42,
         };
         let job =
-            build_mining_job_from_tdp(Network::Bitcoin, &payouts, &template, "BP", slot).unwrap();
+            build_mining_job_from_tdp(Network::Bitcoin, &payouts, &template, "BP", slot, [0u8; 32])
+                .unwrap();
 
         // Reference oracle = the pre-refactor "build full, then slice" path.
         let script_sig = checked_tdp_scriptsig(template.coinbase_prefix, "BP", slot).unwrap();
@@ -1304,7 +1333,14 @@ mod tests {
             coinbase_tx_locktime: 0,
         };
         assert!(matches!(
-            build_mining_job_from_tdp(Network::Bitcoin, &[], &template, "BP", EXTRANONCE_SLOT_LEN),
+            build_mining_job_from_tdp(
+                Network::Bitcoin,
+                &[],
+                &template,
+                "BP",
+                EXTRANONCE_SLOT_LEN,
+                [0u8; 32]
+            ),
             Err(MiningJobError::NoPayouts)
         ));
     }
@@ -1328,6 +1364,7 @@ mod tests {
             &template,
             "Blitzpool",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1379,6 +1416,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1423,6 +1461,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1465,6 +1504,7 @@ mod tests {
             &template,
             &long_id,
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .expect("must succeed by dropping the identifier");
 
@@ -1501,6 +1541,7 @@ mod tests {
             &template,
             "Blitzpool",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1535,6 +1576,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1566,6 +1608,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1611,6 +1654,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 

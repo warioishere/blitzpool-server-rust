@@ -200,28 +200,31 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
         .build_distribution(reward_sats)
         .await
         .expect("build_distribution");
+    let entries = dist
+        .distribution
+        .payout_entries_at(reward_sats)
+        .expect("§4 payout vector");
     assert_eq!(
-        dist.payouts.len(),
+        entries.len(),
         4,
-        "fee + 3 miners → 4 outputs, got {:?}",
-        dist.payouts
+        "pool + 3 miners → 4 outputs, got {:?}",
+        entries
             .iter()
-            .map(|p| (p.address.as_str(), p.sats.0))
+            .map(|(a, s)| (a.as_str(), *s))
             .collect::<Vec<_>>()
     );
-    let total_payout_sats: i64 = dist.payouts.iter().map(|p| p.sats.0).sum();
+    let total_payout_sats: u64 = entries.iter().map(|(_, s)| *s).sum();
     assert_eq!(
-        total_payout_sats as u64, reward_sats,
+        total_payout_sats, reward_sats,
         "distribution sat sums must equal the reward (else bad-cb-amount)"
     );
 
     // ── Build the coinbase + brute-force a regtest-target nonce ───
-    let payouts: Vec<PayoutEntry> = dist
-        .payouts
+    let payouts: Vec<PayoutEntry> = entries
         .iter()
-        .map(|p| PayoutEntry {
-            address: p.address.as_str().to_string(),
-            sats: p.sats.0 as u64,
+        .map(|(a, s)| PayoutEntry {
+            address: a.as_str().to_string(),
+            sats: *s,
         })
         .collect();
     let coinbase_template = TdpCoinbaseTemplate {
@@ -239,6 +242,7 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
         &coinbase_template,
         "split-e2e-regtest",
         EXTRANONCE_SLOT_LEN,
+        [0u8; 32],
     )
     .expect("build_mining_job_from_tdp");
     let en1 = [0u8; 4];
@@ -258,6 +262,7 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
 
     // ── Submit + assert bitcoin-core accepts the split-derived block ──
     let witness_coinbase = job.witness_coinbase_with_extranonce(&en1, &en2);
+    let submitted_coinbase = witness_coinbase.clone();
     let before_height = node.current_height().await.expect("current_height");
     tdp.submit_solution(
         template.template_id,
@@ -273,9 +278,18 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
         .expect("bitcoin-core must accept the split-path coinbase (stuck tip = rejected)");
     assert_eq!(after, before_height + 1);
 
-    // ── Satellite applies the block-found ledger ──────────────────
+    // ── Satellite applies the block-found ledger from the REAL
+    //    coinbase (weight-model settlement) ─────────────────────────
+    let coinbase_tx = <bitcoin::Transaction as bitcoin::consensus::Decodable>::consensus_decode(
+        &mut submitted_coinbase.as_slice(),
+    )
+    .expect("submitted coinbase must decode");
+    let actual = bp_coinbase_snapshot::ActualCoinbase::from_coinbase(
+        &coinbase_tx,
+        bitcoin::Network::Regtest,
+    );
     let outcome = engine
-        .on_block_found_for(after as i32, reward_sats, Some(dist.payouts_fingerprint))
+        .on_block_found_scaled(after as i32, &actual, Some(dist.payouts_fingerprint()))
         .await
         .expect("on_block_found");
     assert!(

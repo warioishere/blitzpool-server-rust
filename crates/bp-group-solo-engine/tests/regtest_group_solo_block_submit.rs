@@ -226,6 +226,7 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
         &coinbase_template,
         "group-solo-e2e-regtest",
         EXTRANONCE_SLOT_LEN,
+        [0u8; 32],
     )
     .expect("build_mining_job_from_tdp");
 

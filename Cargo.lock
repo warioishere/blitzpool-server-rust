@@ -639,6 +639,7 @@ dependencies = [
 name = "bp-coinbase-snapshot"
 version = "2.2.5"
 dependencies = [
+ "bitcoin",
  "bp-common",
  "bp-db",
  "bp-pplns",
@@ -879,6 +880,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -957,6 +959,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

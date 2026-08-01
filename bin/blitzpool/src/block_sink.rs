@@ -44,6 +44,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bp_bitcoin::BitcoinRpc;
 use bp_coinbase_snapshot::snapshot::StoredSnapshot;
+use bp_coinbase_snapshot::ActualCoinbase;
 use bp_common::{AddressId, MiningMode, StreamKind};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_notifications::dispatcher::NotificationDispatcher;
@@ -116,6 +117,14 @@ pub(crate) struct BlockFoundEvent {
     /// wire format of a stream other processes replay, so it stays.
     #[serde(default)]
     pub pplns_payouts_fingerprint: Option<[u8; 32]>,
+    /// What the found block's coinbase ACTUALLY paid, decoded from the
+    /// submitted coinbase transaction on the Core. The weight-model
+    /// settlement books `claim − paid` from this — the event carries it
+    /// so a Satellite never has to re-derive it from chain data.
+    /// `None` on events produced before this field existed; those can
+    /// only book through the legacy exact-match path.
+    #[serde(default)]
+    pub actual_coinbase: Option<ActualCoinbase>,
 }
 
 /// `BlockSubmissionSink` for both SV1 + SV2. Forwards every
@@ -153,6 +162,9 @@ pub(crate) struct TdpBlockSubmissionSink {
     /// in-process via [`Self::applier`] as a fallback. `None` only on a sink
     /// with no front role wired (e.g. in tests).
     block_found_producer: Option<StreamProducer<BlockFoundEvent>>,
+    /// Address-display network for decomposing the submitted coinbase
+    /// into per-address payments ([`ActualCoinbase`]).
+    network: bitcoin::Network,
 }
 
 /// The relocatable half of block-found handling: the per-mode engine
@@ -188,7 +200,15 @@ impl TdpBlockSubmissionSink {
             pool: None,
             applier: BlockFoundApplier::default(),
             block_found_producer: None,
+            network: bitcoin::Network::Bitcoin,
         }
+    }
+
+    /// Set the address-display network used to decompose submitted
+    /// coinbases into per-address payments.
+    pub(crate) fn with_network(mut self, network: bitcoin::Network) -> Self {
+        self.network = network;
+        self
     }
 
     /// `core` mode: route block-found events to the stream (the Satellite
@@ -284,6 +304,7 @@ impl TdpBlockSubmissionSink {
     /// distribution the block actually paid rather than a rebuilt guess.
     ///
     /// `worker` is fixed to `jdp` — a declared job has no Stratum worker name.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn book_declared_block_found(
         &self,
         miner_address: String,
@@ -292,6 +313,7 @@ impl TdpBlockSubmissionSink {
         block_hash: String,
         block_data: String,
         payouts_fingerprint: [u8; 32],
+        actual_coinbase: Option<ActualCoinbase>,
     ) -> bool {
         self.emit_block_found(
             miner_address,
@@ -301,6 +323,7 @@ impl TdpBlockSubmissionSink {
             Some(block_hash),
             block_data,
             Some(payouts_fingerprint),
+            actual_coinbase,
         )
         .await
     }
@@ -382,6 +405,7 @@ impl TdpBlockSubmissionSink {
         block_hash: Option<String>,
         block_data: String,
         pplns_payouts_fingerprint: Option<[u8; 32]>,
+        actual_coinbase: Option<ActualCoinbase>,
     ) -> bool {
         // Resolve the payout mode on the Core (the only side with the gate)
         // and stamp it onto the event so the apply side needs no gate.
@@ -468,6 +492,7 @@ impl TdpBlockSubmissionSink {
             group_id: resolved.group_id,
             height,
             groupsolo_snapshot,
+            actual_coinbase,
         };
 
         // The front publishes to the stream (the payout Satellite applies). On
@@ -606,6 +631,7 @@ impl BlockFoundApplier {
     /// pending-balance ledger. Falls back to the immediate apply when
     /// gating isn't possible (no Redis / no hash) or the store write fails
     /// (so a block's distribution is never silently lost).
+    #[allow(clippy::too_many_arguments)]
     async fn gate_or_apply_pplns(
         &self,
         engine: &PplnsEngine,
@@ -614,6 +640,7 @@ impl BlockFoundApplier {
         reward: u64,
         block_hash_hex: Option<&str>,
         payouts_fingerprint: Option<[u8; 32]>,
+        actual: Option<&bp_coinbase_snapshot::ActualCoinbase>,
     ) {
         match (self.redis.as_ref(), block_hash_hex) {
             (Some(redis), Some(block_hash)) => {
@@ -659,16 +686,35 @@ impl BlockFoundApplier {
                          proceeding (watcher reconciles)"),
                 }
 
-                let prepared = match engine
-                    .prepare_block_found_for(height, reward, payouts_fingerprint)
-                    .await
-                {
-                    Ok(p) => p,
-                    Err(err) => {
-                        warn!(%err, address = address_str, height,
-                            "block-found: PPLNS prepare_block_found failed");
-                        return;
+                // Weight-model settlement when the event carries the real
+                // coinbase's payments; the legacy exact-match prepare only
+                // remains for events produced before `actual_coinbase`
+                // existed (their schema-1 snapshots still resolve).
+                let prepared = match actual {
+                    Some(actual) => {
+                        match engine
+                            .prepare_block_found_scaled(height, actual, payouts_fingerprint)
+                            .await
+                        {
+                            Ok(p) => p,
+                            Err(err) => {
+                                warn!(%err, address = address_str, height,
+                                    "block-found: PPLNS prepare_block_found_scaled failed");
+                                return;
+                            }
+                        }
                     }
+                    None => match engine
+                        .prepare_block_found_for(height, reward, payouts_fingerprint)
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(err) => {
+                            warn!(%err, address = address_str, height,
+                                "block-found: PPLNS prepare_block_found failed");
+                            return;
+                        }
+                    },
                 };
                 let pending = PendingBlock {
                     block_hash: block_hash.to_string(),
@@ -698,13 +744,20 @@ impl BlockFoundApplier {
                     warn!(address = address_str, height,
                         "block-found: PPLNS confirmation-gating unavailable (no block hash); applying immediately");
                 }
-                // Same fingerprint the gated arm uses — without it this arm
-                // reads the shared last-writer-wins key, which is exactly the
-                // failure the fingerprint exists to remove.
-                match engine
-                    .on_block_found_for(height, reward, payouts_fingerprint)
-                    .await
-                {
+                // Same fingerprint the gated arm uses.
+                let immediate = match actual {
+                    Some(actual) => {
+                        engine
+                            .on_block_found_scaled(height, actual, payouts_fingerprint)
+                            .await
+                    }
+                    None => {
+                        engine
+                            .on_block_found_for(height, reward, payouts_fingerprint)
+                            .await
+                    }
+                };
+                match immediate {
                     Ok(outcome) => info!(
                         address = address_str,
                         height,
@@ -886,6 +939,7 @@ impl BlockFoundApplier {
                         reward,
                         block_hash_hex.as_deref(),
                         event.pplns_payouts_fingerprint,
+                        event.actual_coinbase.as_ref(),
                     )
                     .await
                 }
@@ -1130,6 +1184,7 @@ impl Sv1BlockSubmissionSink for TdpBlockSubmissionSink {
         let coinbase_tx = accept
             .mining_job
             .witness_coinbase_with_extranonce(&accept.enonce1, &accept.extranonce2);
+        let coinbase_bytes = coinbase_tx.clone();
 
         info!(
             template_id = accept.template.template_id,
@@ -1169,6 +1224,7 @@ impl Sv1BlockSubmissionSink for TdpBlockSubmissionSink {
         // is the share of the block reward our coinbase claims (subsidy +
         // fees after the JDC's `coinbase_outputs` for JDP-declared jobs);
         // for pool-built SV1 jobs it equals the full block reward.
+        let actual = decode_actual_coinbase(&coinbase_bytes, self.network);
         self.emit_block_found(
             address.to_string(),
             worker.to_string(),
@@ -1179,6 +1235,7 @@ impl Sv1BlockSubmissionSink for TdpBlockSubmissionSink {
             // The job the winning share was built on — so the PPLNS apply
             // books the distribution this coinbase actually pays.
             Some(*accept.mining_job.payouts_fingerprint()),
+            actual,
         )
         .await;
     }
@@ -1261,6 +1318,7 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
         // now carried on the SV2 `ShareAccept` (pinned at NewMiningJob/
         // NewExtendedMiningJob send-time), so the per-mode engine ledger-write
         // fires for SV2-found blocks exactly as it does for SV1.
+        let actual = decode_actual_coinbase(&accept.witness_coinbase, self.network);
         self.emit_block_found(
             address.to_string(),
             worker.to_string(),
@@ -1269,6 +1327,7 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
             Some(block_hash_display(&accept.header)),
             hex::encode(accept.header),
             Some(accept.payouts_fingerprint),
+            actual,
         )
         .await;
     }
@@ -1278,6 +1337,25 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
 /// hex) from the assembled 80-byte header. `bp_share::sha256d` returns
 /// the digest in little-endian "internal" order; we reverse and hex-
 /// encode for the human-facing form bitcoind / explorers use.
+/// Decode the submitted witness coinbase into its per-address payment
+/// record. `None` (with a warn) if the bytes don't parse — settlement
+/// then has no actuals and the block is reported-not-booked rather
+/// than booked from a guess.
+fn decode_actual_coinbase(
+    witness_coinbase: &[u8],
+    network: bitcoin::Network,
+) -> Option<ActualCoinbase> {
+    match <bitcoin::Transaction as bitcoin::consensus::Decodable>::consensus_decode(
+        &mut &witness_coinbase[..],
+    ) {
+        Ok(tx) => Some(ActualCoinbase::from_coinbase(&tx, network)),
+        Err(err) => {
+            warn!(%err, "block-found: submitted coinbase failed to decode — no actuals for settlement");
+            None
+        }
+    }
+}
+
 fn block_hash_display(header: &[u8; 80]) -> String {
     let mut hash = bp_share::sha256d(header);
     hash.reverse();
@@ -1431,6 +1509,7 @@ mod tests {
     #[test]
     fn block_found_event_json_round_trips_with_stamped_fields() {
         let event = BlockFoundEvent {
+            actual_coinbase: None,
             pplns_payouts_fingerprint: None,
             address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
             worker: "rig1".to_string(),

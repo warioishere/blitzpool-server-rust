@@ -321,6 +321,21 @@ pub fn compute_payout_amounts(
     })
 }
 
+/// Divergence band between a distribution's reference revenue and the
+/// revenue a block actually pays: booking (and vouching) tolerates
+/// `|T_actual − T_ref| ≤ T_ref / SETTLEMENT_BAND_DIVISOR` (±25 %).
+/// Mempool-fee drift between a distribution publish and a found block
+/// lives comfortably inside this; anything outside means the job and
+/// the distribution disagree about the world and must not be booked
+/// unattended.
+pub const SETTLEMENT_BAND_DIVISOR: u64 = 4;
+
+/// Is `t_actual` within the settlement band around `t_ref`?
+pub fn reward_within_band(t_ref: u64, t_actual: u64) -> bool {
+    let tolerance = t_ref / SETTLEMENT_BAND_DIVISOR;
+    t_actual >= t_ref.saturating_sub(tolerance) && t_actual <= t_ref.saturating_add(tolerance)
+}
+
 /// A miner's settlement claim on a found block:
 /// `floor(score_weight · (1 − fee) · t_actual / score_total)`, the
 /// weight model's "earned" side. Settlement books

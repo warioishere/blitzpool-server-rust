@@ -127,6 +127,7 @@ pub(crate) fn build_jdp_hooks(
         booker: ledger_booker.map(|b| b as Arc<dyn DeclaredBlockBooker>),
         chain: Arc::new(tdp.clone()),
         booked: StdMutex::new(VecDeque::new()),
+        network,
     });
     JdpServerHooks {
         allocate_resolver: Arc::new(ProductionJdpAllocateResolver {
@@ -188,7 +189,7 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         )
         .await;
 
-        if payouts.is_empty() {
+        if payouts.entries.is_empty() {
             warn!(
                 user_identifier,
                 "JDP allocate: PayoutResolver returned empty payouts; using single-output fallback"
@@ -202,7 +203,7 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         // Convert each PayoutEntry to a DynamicOutput, placing the exact
         // per-output sats the distributor already computed verbatim — no
         // percent re-derivation (see `payouts_to_dynamic_outputs`).
-        let outputs = payouts_to_dynamic_outputs(&payouts);
+        let outputs = payouts_to_dynamic_outputs(&payouts.entries);
         match encode_coinbase_outputs(self.network, &outputs) {
             Ok(bytes) => Some(AllocateTokenContext {
                 miner_address,
@@ -216,6 +217,7 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
                 Some(AllocateTokenContext {
                     miner_address: AddressId::new(
                         payouts
+                            .entries
                             .first()
                             .map(|p| p.address.clone())
                             .unwrap_or_default(),
@@ -486,6 +488,7 @@ impl ChainView for TdpHandle {
 /// it in-process, gets discarded as a duplicate.
 #[async_trait]
 pub(crate) trait DeclaredBlockBooker: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     async fn book(
         &self,
         miner_address: String,
@@ -494,6 +497,7 @@ pub(crate) trait DeclaredBlockBooker: Send + Sync {
         block_hash: String,
         block_data: String,
         payouts_fingerprint: [u8; 32],
+        actual_coinbase: Option<bp_coinbase_snapshot::ActualCoinbase>,
     ) -> bool;
 }
 
@@ -507,6 +511,7 @@ impl DeclaredBlockBooker for crate::block_sink::TdpBlockSubmissionSink {
         block_hash: String,
         block_data: String,
         payouts_fingerprint: [u8; 32],
+        actual_coinbase: Option<bp_coinbase_snapshot::ActualCoinbase>,
     ) -> bool {
         self.book_declared_block_found(
             miner_address,
@@ -515,6 +520,7 @@ impl DeclaredBlockBooker for crate::block_sink::TdpBlockSubmissionSink {
             block_hash,
             block_data,
             payouts_fingerprint,
+            actual_coinbase,
         )
         .await
     }
@@ -613,6 +619,9 @@ pub(crate) struct ProductionJdpBlockSink {
     /// twice. Bounded — only the newest few matter, a repeat arrives right
     /// after the original.
     booked: StdMutex<VecDeque<[u8; 32]>>,
+    /// Address-display network for decomposing the block's coinbase into
+    /// per-address payments (the weight-model settlement input).
+    network: BitcoinNetwork,
 }
 
 /// How many recently-booked block hashes are remembered for the repeat check.
@@ -701,6 +710,12 @@ impl ProductionJdpBlockSink {
             );
             return;
         }
+        // The block's own coinbase is the settlement ground truth —
+        // `claim − paid` is booked from what it ACTUALLY pays.
+        let actual = block
+            .txdata
+            .first()
+            .map(|cb| bp_coinbase_snapshot::ActualCoinbase::from_coinbase(cb, self.network));
         let booked = booker
             .book(
                 miner_address.as_str().to_string(),
@@ -709,6 +724,7 @@ impl ProductionJdpBlockSink {
                 hash.to_string(),
                 serialize_hex(&block.header),
                 booking.payouts_fingerprint,
+                actual,
             )
             .await;
         if booked {
@@ -890,7 +906,7 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
             .payout_resolver
             .resolve_payouts_reporting_source(miner_address, available_payout_value)
             .await;
-        if payouts.is_empty() {
+        if payouts.entries.is_empty() {
             warn!(
                 request_id,
                 address = miner_address.as_str(),
@@ -908,9 +924,8 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
         // The pool's own accounting identity for this distribution — the key
         // its snapshot was just stored under. Computed from the resolver's
         // list, before the wire lowering below can touch it.
-        let payouts_fingerprint =
-            bp_mining_job::payouts_fingerprint(available_payout_value, &payouts);
-        let mut outputs = payouts_to_dynamic_outputs(&payouts);
+        let payouts_fingerprint = payouts.payouts_fingerprint;
+        let mut outputs = payouts_to_dynamic_outputs(&payouts.entries);
         if outputs.is_empty() {
             warn!(
                 request_id,
@@ -992,7 +1007,7 @@ impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
         // one that has no other voice. Blaming the lowering for all three sent
         // an operator to the dust floor and the residual fold when the actual
         // cause was the value band or a missing engine.
-        let outputs_still_match = outputs_match_payouts(&outputs, &payouts);
+        let outputs_still_match = outputs_match_payouts(&outputs, &payouts.entries);
         if !outputs_still_match {
             warn!(
                 request_id,
@@ -1343,6 +1358,7 @@ mod tests {
             block_hash: String,
             _: String,
             fp: [u8; 32],
+            _: Option<bp_coinbase_snapshot::ActualCoinbase>,
         ) -> bool {
             self.booked.lock().unwrap().push((reward, fp));
             self.hashes.lock().unwrap().push(block_hash);
@@ -1434,6 +1450,7 @@ mod tests {
         chain: Option<ChainDemands>,
     ) -> ProductionJdpBlockSink {
         ProductionJdpBlockSink {
+            network: BitcoinNetwork::Regtest,
             propagator: propagator.map(|p| p as Arc<dyn BlockPropagator>),
             booker: booker.map(|b| b as Arc<dyn DeclaredBlockBooker>),
             chain: Arc::new(FixedChain(chain)),
@@ -1558,6 +1575,7 @@ mod tests {
         let chain = MovingChain::at(easy);
         let booker = Arc::new(RecordingBooker::default());
         let sink = ProductionJdpBlockSink {
+            network: BitcoinNetwork::Regtest,
             propagator: Some(Arc::new(PropagatorThatMovesTheTip {
                 chain: chain.clone(),
                 to: moved_on,

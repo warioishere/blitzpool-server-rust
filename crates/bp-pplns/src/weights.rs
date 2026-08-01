@@ -106,6 +106,29 @@ impl WeightDistribution {
                 .map(|e| e.wire_weight as u128)
                 .sum::<u128>()
     }
+
+    /// The concrete `(address, sats)` list this distribution yields at
+    /// revenue `t`, in §4 coinbase order: the pool output (`pay_P`,
+    /// absorbing rounding + dust) first, then the kept miner outputs.
+    /// This is the pool's OWN coinbase build — the same §4 evaluation a
+    /// JDC runs with its own template revenue.
+    pub fn payout_entries_at(
+        &self,
+        t: u64,
+    ) -> Result<Vec<(AddressId, u64)>, bp_share::WeightPayoutError> {
+        let published: Vec<&WeightEntry> = self.published().collect();
+        let weights: Vec<u64> = published.iter().map(|e| e.wire_weight).collect();
+        let dusts: Vec<u32> = published.iter().map(|e| e.dust_limit).collect();
+        let amounts = bp_share::compute_payout_amounts(self.weight_p, &weights, &dusts, t)?;
+        let mut out = Vec::with_capacity(1 + published.len());
+        out.push((self.fee_address.clone(), amounts.pool_pay));
+        for (entry, pay) in published.iter().zip(&amounts.pays) {
+            if let Some(sats) = pay {
+                out.push((entry.address.clone(), *sats));
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Inputs to one weight-distribution build.
@@ -571,6 +594,24 @@ mod tests {
         let a = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
         let b = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// `payout_entries_at: fee first, Σ == t, dust pruned`
+    #[test]
+    fn payout_entries_at_is_fee_first_and_exact() {
+        let shares = HashMap::from([(addr(A1), 3.0), (addr(A2), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+        let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
+        let t = 312_500_000u64;
+        let entries = d.payout_entries_at(t).unwrap();
+        assert_eq!(entries[0].0, fee, "pool output first");
+        let total: u64 = entries.iter().map(|(_, s)| s).sum();
+        assert_eq!(total, t, "the §4 vector consumes exactly t");
+        // 75/25 split (fee-diluted) in §4 order after the pool output.
+        assert_eq!(entries[1].0, addr(A1));
+        assert_eq!(entries[2].0, addr(A2));
+        assert!(entries[1].1 > entries[2].1);
     }
 
     /// `fingerprint tracks settlement inputs, not the boost projection`

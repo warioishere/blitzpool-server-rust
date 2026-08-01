@@ -12,5 +12,6 @@
 //! the shared shapes so existing `window::snapshot::…` paths resolve.
 
 pub use bp_coinbase_snapshot::snapshot::{
-    delete_snapshot, read_snapshot, write_snapshot, ParsedSnapshot, StoredSnapshot,
+    delete_snapshot, read_snapshot, read_weight_snapshot, write_snapshot, write_weight_snapshot,
+    ParsedSnapshot, StoredSnapshot, StoredWeightSnapshot, WeightSnapshotEntry,
 };

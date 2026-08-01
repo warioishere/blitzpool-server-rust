@@ -164,6 +164,7 @@ async fn run_block_submit_case(miner_extranonce_size: u8) {
         &coinbase_template,
         "sv2-ext-regtest",
         full_extranonce_size,
+        [0u8; 32],
     )
     .expect("build_mining_job_from_tdp");
 

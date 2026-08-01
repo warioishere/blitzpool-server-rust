@@ -1261,13 +1261,14 @@ async fn resolve_template_mining_job_inputs(
     let Some(addr) = address else {
         return Ok(None);
     };
-    let payouts = hooks
+    let resolved = hooks
         .payout_resolver
         .resolve_payouts(addr, template.coinbase_tx_value_remaining)
         .await;
     Ok(Some(MiningJobInputs {
         network: server_config.network,
-        payouts,
+        payouts: resolved.entries,
+        payouts_fingerprint: resolved.payouts_fingerprint,
         pool_identifier: server_config.pool_identifier.clone(),
         coinbase_prefix: template.coinbase_prefix.clone(),
         coinbase_tx_version: template.coinbase_tx_version,

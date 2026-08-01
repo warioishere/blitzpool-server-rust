@@ -24,7 +24,9 @@ use async_trait::async_trait;
 use bitcoin::consensus::Decodable;
 use bitcoin::Network;
 use bp_common::StreamKind;
-use bp_mining_job::{address_to_script, MiningJobCache, PayoutEntry, EXTRANONCE_SLOT_LEN};
+use bp_mining_job::{
+    address_to_script, MiningJobCache, PayoutEntry, ResolvedPayouts, EXTRANONCE_SLOT_LEN,
+};
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_stratum_v1::{
     PayoutResolver, PortConfig, ServerConfig, ServerHooks, SharedExtranonce, StratumV1Server,
@@ -44,11 +46,11 @@ struct PayToSelfResolver;
 
 #[async_trait]
 impl PayoutResolver for PayToSelfResolver {
-    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> Vec<PayoutEntry> {
-        vec![PayoutEntry {
+    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
+        ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
             address: miner_address.to_string(),
             sats: reward_sats,
-        }]
+        }])
     }
 
     fn resolve_stream(&self, _miner_address: &str) -> StreamKind {

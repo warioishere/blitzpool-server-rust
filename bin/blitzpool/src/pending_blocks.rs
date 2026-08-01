@@ -94,6 +94,7 @@ mod tests {
             found_at_ms: 1_779_000_000_000,
             prepared: PreparedBlockFound {
                 payouts_fingerprint: None,
+                weight_model: false,
                 block_height: 840_000,
                 block_reward_sats: 312_500_000,
                 now_ms: 1_779_000_000_000,

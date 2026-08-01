@@ -138,6 +138,32 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
         .await;
 }
 
+/// A coinbase that pays EXACTLY the distribution's §4 vector at
+/// revenue `t` — the pool output first, then the kept miner outputs.
+/// What every honestly-built job produces; settlement then books
+/// `claim − paid` per address (small integer-rounding deltas between
+/// the claim formula and the §4 weight path are expected and correct).
+fn actual_paying_exactly(
+    dist: &bp_pplns_engine::distribution::DistributionResult,
+    t: u64,
+) -> bp_coinbase_snapshot::ActualCoinbase {
+    let entries = dist
+        .distribution
+        .payout_entries_at(t)
+        .expect("§4 payout vector");
+    let mut paid_by_address = std::collections::HashMap::new();
+    for (address, sats) in entries.iter().skip(1) {
+        *paid_by_address
+            .entry(address.as_str().to_string())
+            .or_insert(0u64) += sats;
+    }
+    bp_coinbase_snapshot::ActualCoinbase {
+        paid_by_address,
+        pool_paid_sats: entries[0].1,
+        total_value_sats: t,
+    }
+}
+
 async fn drop_harness(h: EngineHarness) {
     h.engine.shutdown();
     cleanup(&h.pool, &h.prefix).await;
@@ -193,16 +219,15 @@ async fn build_distribution_returns_payouts_after_shares() {
         .unwrap();
 
     let result = h.engine.build_distribution(312_500_000).await.expect("ok");
-    assert_eq!(result.block_reward_sats, 312_500_000);
-    assert!(!result.payouts.is_empty());
-    assert!(result
-        .considered_addresses
-        .iter()
-        .any(|x| x.as_str() == ADDR_A));
-    assert!(result
-        .considered_addresses
-        .iter()
-        .any(|x| x.as_str() == ADDR_B));
+    assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
+    assert!(result.distribution.published().count() > 0);
+    for addr in [ADDR_A, ADDR_B] {
+        assert!(result
+            .distribution
+            .entries
+            .iter()
+            .any(|e| e.address.as_str() == addr));
+    }
 
     drop_harness(h).await;
 }
@@ -222,9 +247,10 @@ async fn on_block_found_applies_distribution_from_snapshot() {
         .unwrap();
     let result = h.engine.build_distribution(312_500_000).await.expect("ok");
     let block_height = 9_997_001;
+    let actual = actual_paying_exactly(&result, 312_500_000);
     let outcome = h
         .engine
-        .on_block_found_for(block_height, 312_500_000, Some(result.payouts_fingerprint))
+        .on_block_found_scaled(block_height, &actual, Some(result.payouts_fingerprint()))
         .await
         .expect("ok");
     assert!(outcome.history_inserted >= 1, "at least one audit row");
@@ -238,9 +264,15 @@ async fn on_block_found_applies_distribution_from_snapshot() {
             .unwrap();
     assert!(count.0 >= 1, "audit row present in PG");
 
-    // Snapshot deleted post-apply.
-    let snap = h.engine.window().read_snapshot().await.expect("ok");
-    assert!(snap.is_none(), "snapshot cleared after on_block_found");
+    // The weight snapshot SURVIVES the apply (it serves every block of
+    // this distribution; redelivery is blocked by the history guard).
+    let snap = h
+        .engine
+        .window()
+        .read_weight_snapshot_for(&result.payouts_fingerprint())
+        .await
+        .expect("ok");
+    assert!(snap.is_some(), "weight snapshot outlives the apply");
 
     drop_harness(h).await;
 }
@@ -285,41 +317,42 @@ async fn later_build_does_not_cost_the_found_block_its_distribution() {
         .await
         .expect("mined build ok");
     assert!(
-        !mined.payouts.is_empty(),
+        mined.distribution.published().count() > 0,
         "scenario needs a real distribution"
     );
-    let fingerprint = mined.payouts_fingerprint;
+    let fingerprint = mined.payouts_fingerprint();
 
-    // A JD client asks for its own payout value — this is what displaces the
-    // shared key today.
-    let jdc = h
+    // A later build at a drifted reference — under the weight model it
+    // shares the SAME settlement identity (the fingerprint hashes
+    // inputs, not amounts), so it cannot displace anything.
+    let later = h
         .engine
         .build_distribution(MINED_REWARD - 863)
         .await
-        .expect("jdc build ok");
-    assert_ne!(
-        fingerprint, jdc.payouts_fingerprint,
-        "the two builds must be distinguishable"
+        .expect("later build ok");
+    assert_eq!(
+        fingerprint,
+        later.payouts_fingerprint(),
+        "same window + ledger → same settlement identity"
     );
 
     let block_height = 9_997_101;
+    let actual = actual_paying_exactly(&mined, MINED_REWARD);
 
-    // Without the fingerprint: the shared key now holds the JDC's build, so
-    // the reward check refuses. This is the live failure.
+    // Without a fingerprint there is nothing to book against — refuse.
     let blind = h
         .engine
-        .prepare_block_found(block_height, MINED_REWARD)
+        .prepare_block_found_scaled(block_height, &actual, None)
         .await;
     assert!(
         blind.is_err(),
-        "the shared key holds the later build — preparing blind must refuse \
-         rather than book the wrong distribution"
+        "no fingerprint → nothing to book against; preparing blind must refuse"
     );
 
-    // With it: the block's own distribution is still there.
+    // With it: the block's distribution resolves, later build or not.
     let prepared = h
         .engine
-        .prepare_block_found_for(block_height, MINED_REWARD, Some(fingerprint))
+        .prepare_block_found_scaled(block_height, &actual, Some(fingerprint))
         .await
         .expect("the job's own distribution must still resolve");
     let outcome = h.engine.apply_prepared(&prepared).await.expect("apply ok");
@@ -543,12 +576,20 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         .await
         .unwrap();
     let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
+    let entries1 = d1
+        .distribution
+        .payout_entries_at(REWARD)
+        .expect("§4 vector 1");
     assert!(
-        !d1.payouts.iter().any(|p| p.address.as_str() == TINY),
+        !entries1.iter().any(|(a, _)| a.as_str() == TINY),
         "sub-threshold miner must NOT get a block-1 coinbase output"
     );
     h.engine
-        .on_block_found_for(h1, REWARD, Some(d1.payouts_fingerprint))
+        .on_block_found_scaled(
+            h1,
+            &actual_paying_exactly(&d1, REWARD),
+            Some(d1.payouts_fingerprint()),
+        )
         .await
         .expect("apply 1");
 
@@ -571,17 +612,29 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         .await
         .unwrap();
     let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
+    let entries2 = d2
+        .distribution
+        .payout_entries_at(REWARD)
+        .expect("§4 vector 2");
     assert!(
-        d2.payouts.iter().any(|p| p.address.as_str() == TINY),
+        entries2.iter().any(|(a, _)| a.as_str() == TINY),
         "accrued credit must push the tiny miner over min_payout into a block-2 output"
     );
     h.engine
-        .on_block_found_for(h2, REWARD, Some(d2.payouts_fingerprint))
+        .on_block_found_scaled(
+            h2,
+            &actual_paying_exactly(&d2, REWARD),
+            Some(d2.payouts_fingerprint()),
+        )
         .await
         .expect("apply 2");
 
     let (bal2, paid2) = miner_balance_and_paid(&h.pool, TINY).await;
-    assert_eq!(bal2, 0, "pending credit clears once paid (got {bal2})");
+    assert!(
+        bal2.abs() <= 3,
+        "pending credit clears once paid, up to the few-sat integer gap \
+         between the claim formula and the §4 weight path (got {bal2})"
+    );
     assert!(
         paid2 >= MIN_PAYOUT,
         "tiny paid out crossing the threshold (got {paid2})"
@@ -619,7 +672,11 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
     let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
     let p1 = h
         .engine
-        .prepare_block_found_for(h1, REWARD, Some(d1.payouts_fingerprint))
+        .prepare_block_found_scaled(
+            h1,
+            &actual_paying_exactly(&d1, REWARD),
+            Some(d1.payouts_fingerprint()),
+        )
         .await
         .expect("prepare 1");
     h.engine.apply_prepared(&p1).await.expect("apply 1");
@@ -634,7 +691,11 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
     let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
     let p2 = h
         .engine
-        .prepare_block_found_for(h2, REWARD, Some(d2.payouts_fingerprint))
+        .prepare_block_found_scaled(
+            h2,
+            &actual_paying_exactly(&d2, REWARD),
+            Some(d2.payouts_fingerprint()),
+        )
         .await
         .expect("prepare 2");
     h.engine.apply_prepared(&p2).await.expect("apply 2");
@@ -676,7 +737,11 @@ async fn gated_two_prepares_against_same_ledger_clobber_without_flush() {
     let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
     let p1 = h
         .engine
-        .prepare_block_found_for(h1, REWARD, Some(d1.payouts_fingerprint))
+        .prepare_block_found_scaled(
+            h1,
+            &actual_paying_exactly(&d1, REWARD),
+            Some(d1.payouts_fingerprint()),
+        )
         .await
         .expect("prepare 1");
 
@@ -688,11 +753,16 @@ async fn gated_two_prepares_against_same_ledger_clobber_without_flush() {
     let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
     let p2 = h
         .engine
-        .prepare_block_found_for(h2, REWARD, Some(d2.payouts_fingerprint))
+        .prepare_block_found_scaled(
+            h2,
+            &actual_paying_exactly(&d2, REWARD),
+            Some(d2.payouts_fingerprint()),
+        )
         .await
         .expect("prepare 2");
 
-    // Apply both: absolute writes → block 2 clobbers block 1's delta.
+    // Apply both: both were computed against the pre-apply ledger, so
+    // block 2's writes clobber block 1's delta.
     h.engine.apply_prepared(&p1).await.expect("apply 1");
     let t1 = miner_total_paid(&h.pool, MINER).await;
     h.engine.apply_prepared(&p2).await.expect("apply 2");
@@ -765,12 +835,13 @@ async fn spawn_core_skips_crons_but_build_distribution_works() {
 
     // The Core's read path still produces a distribution.
     let result = engine.build_distribution(312_500_000).await.expect("ok");
-    assert_eq!(result.block_reward_sats, 312_500_000);
-    assert!(!result.payouts.is_empty());
+    assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
+    assert!(result.distribution.published().count() > 0);
     assert!(result
-        .considered_addresses
+        .distribution
+        .entries
         .iter()
-        .any(|x| x.as_str() == ADDR));
+        .any(|e| e.address.as_str() == ADDR));
 
     engine.shutdown();
     cleanup(&pool, prefix).await;
@@ -802,16 +873,20 @@ async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
         .unwrap();
 
     const REWARD: u64 = 312_500_000;
-    // A perfectly good shared snapshot for exactly this reward exists — so a
-    // fallback would succeed and pass the reward check.
-    let _ = h.engine.build_distribution(REWARD).await.expect("build ok");
+    // A perfectly good snapshot for this window exists — a fallback
+    // would succeed and pass every plausibility check.
+    let good = h.engine.build_distribution(REWARD).await.expect("build ok");
 
     let never_written = [0x5au8; 32];
     let err = h
         .engine
-        .prepare_block_found_for(9_997_201, REWARD, Some(never_written))
+        .prepare_block_found_scaled(
+            9_997_201,
+            &actual_paying_exactly(&good, REWARD),
+            Some(never_written),
+        )
         .await
-        .expect_err("an unresolvable fingerprint must not be booked from the shared key");
+        .expect_err("an unresolvable fingerprint must not be booked from another snapshot");
     eprintln!("refused with: {err}");
 
     let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
@@ -849,34 +924,40 @@ async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() 
 
     const REWARD: u64 = 312_500_000;
     let dist = h.engine.build_distribution(REWARD).await.expect("build ok");
-    let fp = dist.payouts_fingerprint;
+    let fp = dist.payouts_fingerprint();
     let height = 9_997_301;
+    let actual = actual_paying_exactly(&dist, REWARD);
 
     let prepared = h
         .engine
-        .prepare_block_found_for(height, REWARD, Some(fp))
+        .prepare_block_found_scaled(height, &actual, Some(fp))
         .await
         .expect("prepare ok");
     h.engine.apply_prepared(&prepared).await.expect("apply ok");
 
-    // The snapshot is gone, so the redelivery cannot re-prepare.
+    // The weight snapshot SURVIVES (it serves every block of this
+    // distribution) — redelivery is refused by the payout-history
+    // guard, not by consuming the snapshot.
     assert!(
         h.engine
             .window()
-            .read_snapshot_for(&fp)
+            .read_weight_snapshot_for(&fp)
             .await
             .expect("read ok")
-            .is_none(),
-        "apply must consume the snapshot its block was frozen from"
+            .is_some(),
+        "the weight snapshot must outlive its blocks"
     );
     let redelivered = h
         .engine
-        .prepare_block_found_for(height, REWARD, Some(fp))
+        .prepare_block_found_scaled(height, &actual, Some(fp))
         .await;
     assert!(
-        redelivered.is_err(),
-        "a redelivered block-found must fail closed, not re-prepare against the \
-         ledger it already credited"
+        matches!(
+            redelivered,
+            Err(bp_pplns_engine::engine::EngineError::AlreadyBooked { .. })
+        ),
+        "a redelivered block-found must fail closed on the history guard, \
+         not re-prepare against the ledger it already credited (got {redelivered:?})"
     );
 
     let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
@@ -930,19 +1011,28 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
         .await
         .unwrap();
 
-    // Two blocks in flight, BOTH frozen against the same (empty) ledger.
+    // Two blocks in flight, BOTH frozen against the same (empty) ledger
+    // — and under the weight model from the SAME distribution snapshot.
     let dist_first = h.engine.build_distribution(REWARD_FIRST).await.expect("ok");
     let dist_second = h
         .engine
         .build_distribution(REWARD_SECOND)
         .await
         .expect("ok");
-    let fp_second = dist_second.payouts_fingerprint;
-    assert_ne!(dist_first.payouts_fingerprint, fp_second);
+    let fp_second = dist_second.payouts_fingerprint();
+    assert_eq!(
+        dist_first.payouts_fingerprint(),
+        fp_second,
+        "same settlement inputs → one shared snapshot"
+    );
 
     let prepared_first = h
         .engine
-        .prepare_block_found_for(h1, REWARD_FIRST, Some(dist_first.payouts_fingerprint))
+        .prepare_block_found_scaled(
+            h1,
+            &actual_paying_exactly(&dist_first, REWARD_FIRST),
+            Some(dist_first.payouts_fingerprint()),
+        )
         .await
         .expect("prepare first");
     h.engine
@@ -955,20 +1045,25 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
         "the tiny miner must accrue a sub-threshold credit from the first block"
     );
 
-    // The second block's snapshot was computed against the PRE-apply ledger
-    // and must survive — the delta is what makes it safe to book.
+    // The shared snapshot must survive the first apply — settlement is
+    // a delta from the real coinbase, so the second block books safely
+    // against the post-apply ledger.
     assert!(
         h.engine
             .window()
-            .read_snapshot_for(&fp_second)
+            .read_weight_snapshot_for(&fp_second)
             .await
             .expect("read ok")
             .is_some(),
-        "only the applied block's own snapshot is consumed"
+        "the shared weight snapshot must survive the first apply"
     );
     let prepared_second = h
         .engine
-        .prepare_block_found_for(h2, REWARD_SECOND, Some(fp_second))
+        .prepare_block_found_scaled(
+            h2,
+            &actual_paying_exactly(&dist_second, REWARD_SECOND),
+            Some(fp_second),
+        )
         .await
         .expect("a block frozen before the apply must still be bookable");
     h.engine

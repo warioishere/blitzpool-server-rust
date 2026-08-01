@@ -125,6 +125,7 @@ pub(crate) fn build_per_port_servers(
     // notification dispatcher, in addition to the existing TDP
     // submit_solution path.
     let mut sink = TdpBlockSubmissionSink::new(tdp.clone())
+        .with_network(config_network_to_bitcoin(cfg.network))
         .with_alt_streams(foundation.alt_tdp.clone())
         .with_fanout(
             engines.mode_gate.clone(),

@@ -51,7 +51,7 @@ use bp_common::{AddressId, MiningMode, Sats};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 /// Re-exported so the wiring keeps one import path for the solo split.
 pub(crate) use bp_mining_job::SoloFeeConfig;
-use bp_mining_job::{solo_payouts, PayoutEntry};
+use bp_mining_job::{solo_payouts, PayoutEntry, ResolvedPayouts};
 use bp_pplns::CoinbaseDistributionEntry;
 use bp_pplns_engine::engine::PplnsEngine;
 use tracing::warn;
@@ -107,7 +107,7 @@ impl ProductionPayoutResolver {
         &self,
         miner_address: &str,
         reward_sats: u64,
-    ) -> (Vec<PayoutEntry>, bool) {
+    ) -> (ResolvedPayouts, bool) {
         let result = self.mode_gate.lookup_mode(miner_address);
         let vouchable = books_without_a_snapshot(result.mode);
         match result.mode {
@@ -123,17 +123,23 @@ impl ProductionPayoutResolver {
                     .blockparty_pending_fee_route(miner_address, reward_sats)
                     .await
                 {
-                    return (route, vouchable);
+                    return (ResolvedPayouts::unsnapshotted(route), vouchable);
                 }
                 (
-                    solo_payouts(miner_address, &self.solo_fee, reward_sats),
+                    ResolvedPayouts::unsnapshotted(solo_payouts(
+                        miner_address,
+                        &self.solo_fee,
+                        reward_sats,
+                    )),
                     vouchable,
                 )
             }
             MiningMode::Pplns => self.pplns_payouts(miner_address, reward_sats).await,
             MiningMode::Blockparty => (
-                self.blockparty_payouts(miner_address, reward_sats, result.group_id.as_deref())
-                    .await,
+                ResolvedPayouts::unsnapshotted(
+                    self.blockparty_payouts(miner_address, reward_sats, result.group_id.as_deref())
+                        .await,
+                ),
                 vouchable,
             ),
             MiningMode::GroupSolo => {
@@ -146,7 +152,11 @@ impl ProductionPayoutResolver {
                     // A Group-Solo address on a solo list: the booking path would
                     // look for a snapshot this list never had.
                     return (
-                        solo_payouts(miner_address, &self.solo_fee, reward_sats),
+                        ResolvedPayouts::unsnapshotted(solo_payouts(
+                            miner_address,
+                            &self.solo_fee,
+                            reward_sats,
+                        )),
                         false,
                     );
                 };
@@ -156,7 +166,11 @@ impl ProductionPayoutResolver {
                         gid_str, "GroupSolo group_id failed to parse as UUID; falling back to solo"
                     );
                     return (
-                        solo_payouts(miner_address, &self.solo_fee, reward_sats),
+                        ResolvedPayouts::unsnapshotted(solo_payouts(
+                            miner_address,
+                            &self.solo_fee,
+                            reward_sats,
+                        )),
                         false,
                     );
                 };
@@ -207,7 +221,7 @@ impl ProductionPayoutResolver {
         &self,
         miner_address: &AddressId,
         reward_sats: u64,
-    ) -> (Vec<PayoutEntry>, bool) {
+    ) -> (ResolvedPayouts, bool) {
         // One build, both answers. Anything else lets the promise describe a
         // different outcome than the list it is attached to.
         self.resolve_internal(miner_address.as_str(), reward_sats)
@@ -220,7 +234,7 @@ impl ProductionPayoutResolver {
         &self,
         miner_address: &str,
         reward_sats: u64,
-    ) -> (Vec<PayoutEntry>, bool) {
+    ) -> (ResolvedPayouts, bool) {
         let Some(pplns) = self.pplns.as_ref() else {
             // PPLNS mode was published into the gate but the engine
             // is disabled at this deployment — config inconsistency.
@@ -230,7 +244,11 @@ impl ProductionPayoutResolver {
                 "PPLNS mode in gate but `[pplns]` is absent from config; falling back to solo"
             );
             return (
-                solo_payouts(miner_address, &self.solo_fee, reward_sats),
+                ResolvedPayouts::unsnapshotted(solo_payouts(
+                    miner_address,
+                    &self.solo_fee,
+                    reward_sats,
+                )),
                 false,
             );
         };
@@ -248,7 +266,39 @@ impl ProductionPayoutResolver {
                          stands, a block found on it cannot be booked automatically"
                     );
                 }
-                (entries_to_payouts(&result.payouts), result.snapshot_written)
+                // The §4 evaluation at this template's revenue — the
+                // same formula a JDC runs with its own template value.
+                match result.distribution.payout_entries_at(reward_sats) {
+                    Ok(entries) => (
+                        ResolvedPayouts {
+                            entries: entries
+                                .into_iter()
+                                .map(|(address, sats)| PayoutEntry {
+                                    address: address.into_inner(),
+                                    sats,
+                                })
+                                .collect(),
+                            payouts_fingerprint: result.payouts_fingerprint(),
+                        },
+                        result.snapshot_written,
+                    ),
+                    Err(err) => {
+                        warn!(
+                            %err,
+                            miner_address,
+                            reward_sats,
+                            "PPLNS §4 evaluation failed; falling back to solo coinbase"
+                        );
+                        (
+                            ResolvedPayouts::unsnapshotted(solo_payouts(
+                                miner_address,
+                                &self.solo_fee,
+                                reward_sats,
+                            )),
+                            false,
+                        )
+                    }
+                }
             }
             Err(err) => {
                 warn!(
@@ -258,7 +308,11 @@ impl ProductionPayoutResolver {
                     "PPLNS distribution build failed; falling back to solo coinbase"
                 );
                 (
-                    solo_payouts(miner_address, &self.solo_fee, reward_sats),
+                    ResolvedPayouts::unsnapshotted(solo_payouts(
+                        miner_address,
+                        &self.solo_fee,
+                        reward_sats,
+                    )),
                     false,
                 )
             }
@@ -343,7 +397,7 @@ impl ProductionPayoutResolver {
         miner_address: &str,
         reward_sats: u64,
         group_id: Uuid,
-    ) -> (Vec<PayoutEntry>, bool) {
+    ) -> (ResolvedPayouts, bool) {
         // The finder is the miner connecting on this share path; the
         // Group-Solo engine bumps the finder's payout via the
         // `finder_bonus_sats` config knob when emitting the
@@ -356,7 +410,11 @@ impl ProductionPayoutResolver {
                     "GroupSolo miner address failed AddressId parse; falling back to solo"
                 );
                 return (
-                    solo_payouts(miner_address, &self.solo_fee, reward_sats),
+                    ResolvedPayouts::unsnapshotted(solo_payouts(
+                        miner_address,
+                        &self.solo_fee,
+                        reward_sats,
+                    )),
                     false,
                 );
             }
@@ -376,7 +434,13 @@ impl ProductionPayoutResolver {
                          coinbase stands, a block found on it cannot be booked automatically"
                     );
                 }
-                (entries_to_payouts(&result.payouts), result.snapshot_written)
+                (
+                    ResolvedPayouts {
+                        entries: entries_to_payouts(&result.payouts),
+                        payouts_fingerprint: result.payouts_fingerprint,
+                    },
+                    result.snapshot_written,
+                )
             }
             Err(err) => {
                 warn!(
@@ -387,7 +451,11 @@ impl ProductionPayoutResolver {
                     "Group-Solo distribution build failed; falling back to solo coinbase"
                 );
                 (
-                    solo_payouts(miner_address, &self.solo_fee, reward_sats),
+                    ResolvedPayouts::unsnapshotted(solo_payouts(
+                        miner_address,
+                        &self.solo_fee,
+                        reward_sats,
+                    )),
                     false,
                 )
             }
@@ -399,7 +467,7 @@ impl ProductionPayoutResolver {
 
 #[async_trait]
 impl bp_stratum_v1::PayoutResolver for ProductionPayoutResolver {
-    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> Vec<PayoutEntry> {
+    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
         // Building a job needs the list, not the accounting promise.
         self.resolve_internal(miner_address, reward_sats).await.0
     }
@@ -419,7 +487,7 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
         &self,
         miner_address: &AddressId,
         reward_sats: u64,
-    ) -> Vec<PayoutEntry> {
+    ) -> ResolvedPayouts {
         self.resolve_internal(miner_address.as_str(), reward_sats)
             .await
             .0

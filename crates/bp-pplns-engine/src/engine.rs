@@ -55,7 +55,12 @@ use crate::ledger::{
     LedgerError, PayoutRowType,
 };
 use crate::sweep::{spawn_daily_task, DustSweepRunner, SweepError, SweepStats, SystemClock};
-use crate::window::{snapshot::ParsedSnapshot, NetworkDifficulty, WindowError, WindowStore};
+use crate::window::{
+    snapshot::{ParsedSnapshot, StoredWeightSnapshot},
+    NetworkDifficulty, WindowError, WindowStore,
+};
+use bp_coinbase_snapshot::ActualCoinbase;
+use bp_share::{claim_sats, reward_within_band};
 
 /// How often a transient Redis failure on the block-found snapshot read is
 /// retried before the block is given up on. That read is the only thing
@@ -100,6 +105,21 @@ pub enum EngineError {
         snapshot_reward: u64,
         actual_reward: u64,
     },
+    #[error(
+        "block {block_height} revenue {actual_reward} sats is outside the settlement \
+         band around the distribution's reference {reference_reward} sats — the job \
+         and the distribution disagree; operator must reprocess"
+    )]
+    RewardOutOfBand {
+        block_height: i32,
+        reference_reward: u64,
+        actual_reward: u64,
+    },
+    #[error(
+        "block {block_height} already has payout-history rows — a redelivered \
+         block-found must fail closed, not re-credit the ledger"
+    )]
+    AlreadyBooked { block_height: i32 },
     #[error("on_block_found already in flight — concurrent block-find for same engine")]
     BlockFoundInProgress,
     #[error("invalid address in snapshot: {0}")]
@@ -132,6 +152,14 @@ pub struct PreparedBlockFound {
     /// re-prepare against an already-credited ledger.
     #[serde(default)]
     pub payouts_fingerprint: Option<[u8; 32]>,
+    /// `true` when frozen by [`PplnsEngine::prepare_block_found_scaled`]
+    /// (weight model). The apply then does NOT consume the snapshot —
+    /// one weight snapshot legitimately serves many blocks (it stores
+    /// settlement INPUTS, applied as deltas), and redelivery protection
+    /// comes from the payout-history guard at prepare time instead.
+    /// `serde(default)` keeps blobs frozen before this field readable.
+    #[serde(default)]
+    pub weight_model: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -158,12 +186,14 @@ impl PreparedBlockFound {
         rows: &[AuditRow],
         balances: &[BalanceWrite],
         payouts_fingerprint: Option<[u8; 32]>,
+        weight_model: bool,
     ) -> Self {
         Self {
             block_height,
             block_reward_sats,
             now_ms,
             payouts_fingerprint,
+            weight_model,
             rows: rows
                 .iter()
                 .map(|r| PreparedAuditRow {
@@ -537,6 +567,7 @@ impl PplnsEngine {
             &audit_rows,
             &balance_writes,
             Some(fingerprint),
+            false,
         ))
     }
 
@@ -561,20 +592,22 @@ impl PplnsEngine {
         )
         .await?;
 
-        // Consume only this block's snapshot. Others stay usable: their
-        // balances are applied as a DELTA against the ledger at prepare time,
-        // so a block frozen before this apply still books correctly against
-        // the ledger this apply produced. Keeping the snapshot would let a
-        // redelivered event for THIS block re-prepare, which is why its own
-        // key goes. The rest are bounded by the snapshot TTL.
+        // Schema-1 only: consume this block's snapshot so a redelivered
+        // event cannot re-prepare against the credited ledger. A WEIGHT
+        // snapshot is NOT consumed — it legitimately serves every block
+        // built from its distribution (settlement is a delta from the
+        // REAL coinbase), and redelivery fails closed at prepare time
+        // via the payout-history guard instead. It expires by TTL.
         if let Some(fp) = prepared.payouts_fingerprint {
-            if let Err(e) = self.inner.window.delete_snapshot_for(&fp).await {
-                warn!(
-                    error = %e,
-                    block_height = prepared.block_height,
-                    "failed to delete the applied block's PPLNS snapshot \
-                     — non-fatal, it TTLs out"
-                );
+            if !prepared.weight_model {
+                if let Err(e) = self.inner.window.delete_snapshot_for(&fp).await {
+                    warn!(
+                        error = %e,
+                        block_height = prepared.block_height,
+                        "failed to delete the applied block's PPLNS snapshot \
+                         — non-fatal, it TTLs out"
+                    );
+                }
             }
         }
         self.inner.distribution_builder.invalidate_all();
@@ -586,6 +619,280 @@ impl PplnsEngine {
             "pplns on_block_found applied"
         );
         Ok(outcome)
+    }
+
+    /// [`Self::on_block_found_for`] for the weight model: prepare from
+    /// the REAL coinbase (claim − paid) and apply immediately. The
+    /// ungated block-found arm; the confirmation-gated arm calls
+    /// [`Self::prepare_block_found_scaled`] + [`Self::apply_prepared`]
+    /// itself.
+    pub async fn on_block_found_scaled(
+        &self,
+        block_height: i32,
+        actual: &ActualCoinbase,
+        payouts_fingerprint: Option<[u8; 32]>,
+    ) -> Result<ApplyDistributionResult, EngineError> {
+        if self
+            .inner
+            .block_found_in_progress
+            .swap(true, Ordering::SeqCst)
+        {
+            return Err(EngineError::BlockFoundInProgress);
+        }
+        let result = async {
+            let prepared = self
+                .prepare_block_found_scaled(block_height, actual, payouts_fingerprint)
+                .await?;
+            self.apply_prepared(&prepared).await
+        }
+        .await;
+        self.inner
+            .block_found_in_progress
+            .store(false, Ordering::SeqCst);
+        result
+    }
+
+    /// [`Self::prepare_block_found_for`] for a job built from a WEIGHT
+    /// distribution (schema-2 snapshot): settlement books
+    /// `claim(T_actual) − actually_paid` per address, with both sides
+    /// taken from the REAL coinbase of the found block. Correct for any
+    /// revenue inside the settlement band — the pool's own templates
+    /// and a JDC's independently-valued job settle through this one
+    /// path.
+    pub async fn prepare_block_found_scaled(
+        &self,
+        block_height: i32,
+        actual: &ActualCoinbase,
+        payouts_fingerprint: Option<[u8; 32]>,
+    ) -> Result<PreparedBlockFound, EngineError> {
+        let fingerprint = payouts_fingerprint
+            .filter(|fp| fp != &[0u8; 32])
+            .ok_or(EngineError::NoPayoutFingerprint { block_height })?;
+        // Redelivery guard. A weight snapshot legitimately serves MANY
+        // blocks (every job built between window changes shares one
+        // fingerprint), so the v1 "apply consumes the snapshot" trick
+        // cannot protect against a redelivered block-found here. What
+        // identifies a booked block is its payout history: rows at this
+        // height mean the ledger was already credited — refuse.
+        if bp_db::payout_recorded_at_height(&self.inner.pool, block_height).await? {
+            return Err(EngineError::AlreadyBooked { block_height });
+        }
+        // Same retry rationale as the schema-1 read above.
+        let mut attempt = 0;
+        let snapshot = loop {
+            match self
+                .inner
+                .window
+                .read_weight_snapshot_for(&fingerprint)
+                .await
+            {
+                Ok(Some(s)) => break s,
+                Ok(None) => return Err(EngineError::SnapshotMissing { block_height }),
+                Err(e) if attempt < SNAPSHOT_READ_RETRIES => {
+                    warn!(
+                        error = %e,
+                        block_height,
+                        attempt,
+                        "PPLNS weight-snapshot read failed — retrying before giving up on the block"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(SNAPSHOT_READ_BACKOFF * attempt).await;
+                }
+                Err(e) => return Err(EngineError::Redis(e)),
+            }
+        };
+
+        if !reward_within_band(snapshot.reference_revenue_sats, actual.total_value_sats) {
+            warn!(
+                reference_reward = snapshot.reference_revenue_sats,
+                actual_reward = actual.total_value_sats,
+                block_height,
+                "PPLNS block revenue outside the settlement band — refusing to book unattended"
+            );
+            return Err(EngineError::RewardOutOfBand {
+                block_height,
+                reference_reward: snapshot.reference_revenue_sats,
+                actual_reward: actual.total_value_sats,
+            });
+        }
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let current_window = self.inner.window.read_window_by_address().await?;
+        let (audit_rows, balance_writes) = self
+            .build_writes_from_weight_snapshot(&snapshot, &current_window, actual)
+            .await?;
+
+        Ok(PreparedBlockFound::freeze(
+            block_height,
+            actual.total_value_sats,
+            now_ms,
+            &audit_rows,
+            &balance_writes,
+            Some(fingerprint),
+            true,
+        ))
+    }
+
+    /// The weight-model settlement: per snapshot entry compute the
+    /// claim from the raw inputs (`claim_sats(score, S, fee, T)`), read
+    /// what the coinbase actually paid the address, and book the
+    /// difference as a balance DELTA against the current ledger.
+    ///
+    /// Every case reduces to that one rule: an exactly-paid miner books
+    /// `0`; a dust-pruned or blockspace-folded miner books the full
+    /// claim as credit; a debt-carrying miner's claim pays the debt
+    /// down; an overpaid miner (revenue drifted below the projection)
+    /// books the overshoot as debt. The pool/fee output has no balance
+    /// row — `T − Σ claims` is the pool's by construction.
+    async fn build_writes_from_weight_snapshot(
+        &self,
+        snapshot: &StoredWeightSnapshot,
+        current_window: &HashMap<String, f64>,
+        actual: &ActualCoinbase,
+    ) -> Result<(Vec<AuditRow>, Vec<BalanceWrite>), EngineError> {
+        let t = actual.total_value_sats;
+        let mut address_set: std::collections::HashSet<String> =
+            snapshot.entries.iter().map(|e| e.address.clone()).collect();
+        // Paid addresses outside the snapshot get audit rows too (they
+        // can only be 0-value script matches or operator surprises —
+        // logged below — but the lifetime totals must not miss them).
+        address_set.extend(actual.paid_by_address.keys().cloned());
+        address_set.remove(&snapshot.fee_address);
+        let addresses: Vec<String> = address_set.into_iter().collect();
+        let existing: HashMap<String, PplnsBalanceRow> =
+            find_pplns_balances_for_addresses(&self.inner.pool, &addresses)
+                .await?
+                .into_iter()
+                .map(|r| (r.address.as_str().to_string(), r))
+                .collect();
+
+        let mut audit_rows: Vec<AuditRow> = Vec::new();
+        let mut balance_writes: Vec<BalanceWrite> = Vec::new();
+        let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for entry in &snapshot.entries {
+            if entry.address == snapshot.fee_address {
+                // The fee address should never appear as a miner entry
+                // (the builder routes the pool share via weight_P), but
+                // if it does, its payment attribution is inseparable
+                // from the pool output — skip rather than misbook.
+                warn!(
+                    address = %entry.address,
+                    "weight settlement: fee address doubles as miner entry — skipping its row"
+                );
+                continue;
+            }
+            let claim = claim_sats(
+                entry.score_weight,
+                snapshot.score_total,
+                snapshot.fee_ppm,
+                t,
+            ) + match &snapshot.finder_bonus {
+                Some((finder, bonus)) if *finder == entry.address => *bonus,
+                _ => 0,
+            };
+            let paid = actual
+                .paid_by_address
+                .get(&entry.address)
+                .copied()
+                .unwrap_or(0);
+            let delta = claim as i64 - paid as i64;
+
+            let current = existing
+                .get(&entry.address)
+                .map(|r| r.balance_sats.0)
+                .unwrap_or(0);
+            let prev_total_paid = existing
+                .get(&entry.address)
+                .map(|r| r.total_paid_sats.0)
+                .unwrap_or(0);
+
+            let addr_id = AddressId::new(entry.address.clone())?;
+            if paid > 0 {
+                audit_rows.push(AuditRow {
+                    address: addr_id.clone(),
+                    paid_sats: Sats(paid as i64),
+                    percent: if t > 0 {
+                        (paid as f64 / t as f64 * 100.0) as f32
+                    } else {
+                        0.0
+                    },
+                    row_type: PayoutRowType::Coinbase,
+                });
+            } else if delta != 0 {
+                audit_rows.push(pending_row(addr_id.clone(), Sats(delta)));
+            } else {
+                // No payment, no ledger movement — nothing to record.
+                continue;
+            }
+            emitted.insert(entry.address.clone());
+            balance_writes.push(BalanceWrite {
+                address: addr_id,
+                balance_sats: Sats(current + delta),
+                total_paid_sats: Sats(prev_total_paid + paid as i64),
+            });
+        }
+
+        // Coinbase outputs paying an address the snapshot does not know.
+        // With positional §7.1 validation this cannot happen for value-
+        // carrying outputs; surface loudly if it ever does, and book the
+        // payment into the lifetime total without inventing a claim.
+        for (addr_str, paid) in &actual.paid_by_address {
+            if *paid == 0 || emitted.contains(addr_str) || *addr_str == snapshot.fee_address {
+                continue;
+            }
+            if !snapshot.entries.iter().any(|e| &e.address == addr_str) {
+                warn!(
+                    address = %addr_str,
+                    paid,
+                    "weight settlement: coinbase paid an address outside the distribution"
+                );
+                let Ok(addr_id) = AddressId::new(addr_str.clone()) else {
+                    continue;
+                };
+                let current = existing
+                    .get(addr_str)
+                    .map(|r| r.balance_sats.0)
+                    .unwrap_or(0);
+                let prev_total_paid = existing
+                    .get(addr_str)
+                    .map(|r| r.total_paid_sats.0)
+                    .unwrap_or(0);
+                audit_rows.push(AuditRow {
+                    address: addr_id.clone(),
+                    paid_sats: Sats(*paid as i64),
+                    percent: if t > 0 {
+                        (*paid as f64 / t as f64 * 100.0) as f32
+                    } else {
+                        0.0
+                    },
+                    row_type: PayoutRowType::Coinbase,
+                });
+                emitted.insert(addr_str.clone());
+                balance_writes.push(BalanceWrite {
+                    address: addr_id,
+                    balance_sats: Sats(current - *paid as i64),
+                    total_paid_sats: Sats(prev_total_paid + *paid as i64),
+                });
+            }
+        }
+
+        // Late arrivers: active in the window, unknown to the snapshot.
+        for addr_str in current_window.keys() {
+            if emitted.contains(addr_str)
+                || addr_str == &snapshot.fee_address
+                || snapshot.entries.iter().any(|e| &e.address == addr_str)
+            {
+                continue;
+            }
+            let Ok(addr_id) = AddressId::new(addr_str.clone()) else {
+                continue;
+            };
+            audit_rows.push(pending_row(addr_id, Sats(0)));
+            emitted.insert(addr_str.clone());
+        }
+
+        Ok((audit_rows, balance_writes))
     }
 
     /// Translate a `ParsedSnapshot` + the live `current_window` into

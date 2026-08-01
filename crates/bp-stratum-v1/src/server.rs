@@ -63,7 +63,7 @@ use crate::config::{PortConfig, ServerConfig};
 use crate::hooks::ServerHooks;
 use crate::jobs::JobRegistry;
 use crate::notify::{ActiveSV1Template, SV1TemplateAssembler, TemplateChange};
-use bp_mining_job::{MiningJobCache, PayoutEntry};
+use bp_mining_job::{MiningJobCache, ResolvedPayouts};
 use bp_vardiff::SystemClock;
 
 /// Pool-wide (across every SV1 port) collision-free extranonce1 allocator
@@ -805,7 +805,7 @@ async fn run_connection(
                         if run_inline_vardiff {
                             let payouts = match current_template.as_deref() {
                                 Some(t) => resolve_payouts_for_state(&state, &hooks, t).await,
-                                None => vec![],
+                                None => ResolvedPayouts::unsnapshotted(vec![]),
                             };
                             let outcome = apply_vardiff_check(
                                 &mut state,
@@ -904,7 +904,7 @@ async fn run_connection(
                 // we deliberately avoid (async-handler refactor would be needed).
                 let payouts = match current_template.as_deref() {
                     Some(t) => resolve_payouts_for_state(&state, &hooks, t).await,
-                    None => vec![],
+                    None => ResolvedPayouts::unsnapshotted(vec![]),
                 };
                 let outcome = apply_vardiff_check(
                     &mut state,
@@ -1055,15 +1055,15 @@ async fn write_failed(
 }
 
 /// Async-resolve the coinbase payout list for the session's
-/// authorized address. Returns an empty vec when the session is not
+/// authorized address. Returns an empty list when the session is not
 /// yet authorized; callers MUST treat empty as "no notify".
 async fn resolve_payouts_for_state<C: bp_vardiff::Clock>(
     state: &SessionState<C>,
     hooks: &ServerHooks,
     template: &ActiveSV1Template,
-) -> Vec<PayoutEntry> {
+) -> ResolvedPayouts {
     let Some(auth) = state.authorization.as_ref() else {
-        return vec![];
+        return ResolvedPayouts::unsnapshotted(vec![]);
     };
     hooks
         .payout_resolver
@@ -1316,6 +1316,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap()
     }
@@ -1547,6 +1548,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
         Box::new(ShareAccept {

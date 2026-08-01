@@ -143,6 +143,7 @@ async fn pending_party_admin_routes_block_to_pool_fee_accepted_by_core() {
         &coinbase_template,
         "blockparty-pending-guard",
         EXTRANONCE_SLOT_LEN,
+        [0u8; 32],
     )
     .expect("build_mining_job");
 

@@ -95,7 +95,12 @@ async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> 
     let window = WindowStore::new(
         conn, /*factor=*/ 4.0, /*bucket_shares=*/ 100, net_diff,
     );
-    let cfg = DistributionConfig::from_engine_config(&PplnsEngineConfig::default());
+    // The weight model requires the pool-output recipient (pay_P is
+    // structural) — mirror the production requirement in the harness.
+    let cfg = DistributionConfig::from_engine_config(&PplnsEngineConfig {
+        fee_address: Some(AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap()),
+        ..PplnsEngineConfig::default()
+    });
     let builder = DistributionBuilder::new(pool.clone(), window, cfg);
 
     Some(Harness {
@@ -169,21 +174,39 @@ async fn build_with_shares_only_returns_payouts_and_writes_snapshot() {
     seed_share(&window, ADDR_B, 40.0, 1_700_000_000_002).await;
 
     let result = h.builder.build(312_500_000).await.expect("build ok");
-    assert_eq!(result.block_reward_sats, 312_500_000);
-    assert!(!result.payouts.is_empty(), "expected non-empty payouts");
+    assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
+    assert!(
+        result.distribution.published().count() > 0,
+        "expected published payout weights"
+    );
     let addr_a_id = AddressId::new(ADDR_A).unwrap();
     let addr_b_id = AddressId::new(ADDR_B).unwrap();
-    assert!(result.considered_addresses.contains(&addr_a_id));
-    assert!(result.considered_addresses.contains(&addr_b_id));
+    for id in [&addr_a_id, &addr_b_id] {
+        assert!(
+            result.distribution.entries.iter().any(|e| &e.address == id),
+            "share-holder must be in the distribution entries"
+        );
+    }
+    // 60/40 share split → 60/40 score weights.
+    let score_of = |id: &AddressId| {
+        result
+            .distribution
+            .entries
+            .iter()
+            .find(|e| &e.address == id)
+            .map(|e| e.score_weight)
+            .unwrap_or(0)
+    };
+    assert!(score_of(&addr_a_id) > score_of(&addr_b_id));
 
-    // Snapshot must be readable from Redis.
+    // The schema-2 snapshot must be readable from Redis.
     let snapshot = window
-        .read_snapshot_for(&result.payouts_fingerprint)
+        .read_weight_snapshot_for(&result.payouts_fingerprint())
         .await
         .expect("read snapshot ok");
     let parsed = snapshot.expect("snapshot persisted");
-    assert_eq!(parsed.block_reward_sats, 312_500_000);
-    assert_eq!(parsed.distribution.len(), result.payouts.len());
+    assert_eq!(parsed.reference_revenue_sats, 312_500_000);
+    assert_eq!(parsed.entries.len(), result.distribution.entries.len());
 
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
 }
@@ -212,10 +235,14 @@ async fn build_folds_open_balances_into_distribution() {
 
     let result = h.builder.build(312_500_000).await.expect("build ok");
     let debtor_id = AddressId::new(ADDR_DEBTOR).unwrap();
-    assert!(
-        result.considered_addresses.contains(&debtor_id),
-        "open-balance debtor must be in considered set"
-    );
+    let debtor = result
+        .distribution
+        .entries
+        .iter()
+        .find(|e| e.address == debtor_id)
+        .expect("open-balance debtor must be in the distribution entries");
+    assert_eq!(debtor.balance_sats, -5_000, "debt carried for settlement");
+    assert_eq!(debtor.wire_weight, 0, "no shares + debt → no output");
 
     cleanup_addresses(&h.pool, &[ADDR_MINER, ADDR_DEBTOR]).await;
 }
@@ -317,20 +344,20 @@ async fn distinct_rewards_each_get_their_own_compute() {
 
     let r1 = h.builder.build(300_000_000).await.expect("ok");
     let r2 = h.builder.build(312_500_000).await.expect("ok");
-    assert_eq!(r1.block_reward_sats, 300_000_000);
-    assert_eq!(r2.block_reward_sats, 312_500_000);
+    assert_eq!(r1.distribution.reference_revenue_sats, 300_000_000);
+    assert_eq!(r2.distribution.reference_revenue_sats, 312_500_000);
     assert!(!Arc::ptr_eq(&r1, &r2));
 
     cleanup(&h.pool, &h.address_prefix).await;
 }
 
-// ── Test 7 — distinct rewards share ONE window+ledger load ──────────
+// ── Test 7 — distinct references share ONE window+ledger load ───────
 //
-// The ext-0x0003 burst shape: every JDC reports its own
-// `available_payout_value`, so the reward differs per caller and the
-// per-reward cache never hits. The reward-independent half — the Redis
-// window read and the Postgres ledger query — is identical for all of
-// them and must be loaded once, not once per caller.
+// The reference-independent half — the Redis window read and the
+// Postgres ledger query — is identical for every build and must be
+// loaded once, not once per caller. (The push model removed the old
+// per-JDC-value burst; distinct references now only arise across
+// template changes, but the dedup still has to hold.)
 
 #[tokio::test]
 async fn concurrent_distinct_rewards_share_one_inputs_load() {
@@ -360,8 +387,11 @@ async fn concurrent_distinct_rewards_share_one_inputs_load() {
     }
     for (i, handle) in handles.into_iter().enumerate() {
         let r = handle.await.unwrap().expect("build ok");
-        assert_eq!(r.block_reward_sats, 312_500_000 + i as u64 * 137);
-        assert!(!r.payouts.is_empty());
+        assert_eq!(
+            r.distribution.reference_revenue_sats,
+            312_500_000 + i as u64 * 137
+        );
+        assert!(r.distribution.published().count() > 0);
     }
 
     let loads = h.builder.inputs_loads() - before;
@@ -384,18 +414,17 @@ async fn concurrent_distinct_rewards_share_one_inputs_load() {
     cleanup(&h.pool, &h.address_prefix).await;
 }
 
-// ── Test 8 — distinct rewards keep their own snapshot ───────────────
+// ── Test 8 — distinct references share ONE fingerprint + snapshot ───
 //
-// The ext-0x0003 collision case. Every JDC reports its own payout value, so
-// its build overwrites the shared `pplns:snapshot` key with a distribution
-// that belongs to nobody's block. A block-found then finds a snapshot whose
-// reward disagrees with the coinbase and refuses to apply.
-//
-// Under the payout-list fingerprint each build keeps its own copy, so the
-// distribution a block was mined from is still there when the block is found.
+// The weights fingerprint hashes the settlement INPUTS (scores,
+// balances, fee, dust limits) — not the reference revenue the wire
+// boosts were projected against. Two builds over the same window at
+// different references therefore name the SAME snapshot, which is what
+// lets one snapshot settle the pool's own templates and every JDC's
+// independently-valued job alike.
 
 #[tokio::test]
-async fn distinct_rewards_keep_their_own_fingerprinted_snapshot() {
+async fn distinct_references_share_one_fingerprinted_snapshot() {
     let h = match connect_or_skip(15, "test_dist_fp_").await {
         Some(h) => h,
         None => return,
@@ -409,35 +438,28 @@ async fn distinct_rewards_keep_their_own_fingerprinted_snapshot() {
     seed_share(&window, ADDR_A, 70.0, 1_700_000_000_001).await;
     seed_share(&window, ADDR_B, 30.0, 1_700_000_000_002).await;
 
-    // The pool's own template build...
-    let pool_build = h.builder.build(312_500_000).await.expect("pool build ok");
-    // ...then a JDC asking for its own payout value, which is what overwrites
-    // the shared key today.
-    let jdc_build = h.builder.build(312_499_137).await.expect("jdc build ok");
+    let first = h.builder.build(312_500_000).await.expect("first build ok");
+    let second = h.builder.build(312_499_137).await.expect("second build ok");
 
-    assert_ne!(
-        pool_build.payouts_fingerprint, jdc_build.payouts_fingerprint,
-        "different payout values must produce different payout lists"
+    assert_eq!(
+        first.payouts_fingerprint(),
+        second.payouts_fingerprint(),
+        "same settlement inputs must share one snapshot identity"
     );
 
-    // Both snapshots survive, each under its own fingerprint.
-    let pool_snap = window
-        .read_snapshot_for(&pool_build.payouts_fingerprint)
+    let snap = window
+        .read_weight_snapshot_for(&first.payouts_fingerprint())
         .await
         .expect("read ok")
-        .expect("pool snapshot must survive the later build");
-    assert_eq!(pool_snap.block_reward_sats, 312_500_000);
+        .expect("snapshot present");
+    // Last writer wins on the shared identity — either reference is a
+    // valid projection base; settlement never reads it as an amount.
+    assert!(
+        snap.reference_revenue_sats == 312_500_000 || snap.reference_revenue_sats == 312_499_137
+    );
+    assert_eq!(snap.entries.len(), first.distribution.entries.len());
 
-    let jdc_snap = window
-        .read_snapshot_for(&jdc_build.payouts_fingerprint)
-        .await
-        .expect("read ok")
-        .expect("jdc snapshot present");
-    assert_eq!(jdc_snap.block_reward_sats, 312_499_137);
-
-    // The shared last-writer-wins key is no longer written at all — the
-    // fingerprinted keys are the only snapshots, so there is nothing left for
-    // a block-found to accidentally read.
+    // The shared last-writer-wins key is no longer written at all.
     assert!(
         window.read_snapshot().await.expect("read ok").is_none(),
         "the shared snapshot key must no longer be written"
@@ -455,18 +477,18 @@ async fn empty_state_returns_fee_only_distribution() {
         Some(h) => h,
         None => return,
     };
-    // No shares, no balances. Default config has fee_address=None so
-    // the math returns an empty (or fee-only) distribution. We just
-    // assert it doesn't crash and the result is consistent.
+    // No shares, no balances → an empty entry list with the whole
+    // revenue on the pool output (weight_P alone).
     let result = h.builder.build(312_500_000).await.expect("ok");
-    assert_eq!(result.block_reward_sats, 312_500_000);
+    assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
+    assert!(result.distribution.entries.is_empty());
+    assert!(result.distribution.weight_p >= 1);
 
     // Snapshot still written (pre-condition for on-block-found
-    // replay; even an "empty" pool block needs the snapshot) — under the
-    // fingerprint of its payout list, the only key builds write.
+    // replay; even an "empty" pool block needs the snapshot).
     let window = build_window(&h).await;
     let snapshot = window
-        .read_snapshot_for(&result.payouts_fingerprint)
+        .read_weight_snapshot_for(&result.payouts_fingerprint())
         .await
         .expect("ok");
     assert!(snapshot.is_some());
@@ -566,12 +588,15 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
         .await
         .expect("a rejected snapshot write must not fail the distribution build");
     assert!(
-        result.payouts.len() >= 2,
+        result.distribution.published().count() >= 2,
         "the real PPLNS distribution must come back, not a solo fallback: {:?}",
-        result.payouts
+        result.distribution.entries
     );
     assert!(
-        result.payouts.iter().any(|p| p.address.as_str() == ADDR_B),
+        result
+            .distribution
+            .published()
+            .any(|e| e.address.as_str() == ADDR_B),
         "every miner in the window must still be paid — a solo fallback would \
          leave only the requesting address"
     );

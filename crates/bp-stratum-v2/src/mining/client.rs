@@ -1794,6 +1794,10 @@ pub fn apply_vardiff_check<C: Clock>(state: &mut MiningSessionState<C>) -> Handl
 pub struct MiningJobInputs {
     pub network: Network,
     pub payouts: Vec<PayoutEntry>,
+    /// Settlement-snapshot identity of the distribution `payouts` was
+    /// derived from (zeroed = books without a snapshot). Carried onto
+    /// every job built from these inputs and part of the job-cache key.
+    pub payouts_fingerprint: [u8; 32],
     pub pool_identifier: String,
     pub coinbase_prefix: Vec<u8>,
     pub coinbase_tx_version: u32,
@@ -1830,6 +1834,7 @@ impl MiningJobInputs {
             &tdp,
             &self.pool_identifier,
             extranonce_slot_size,
+            self.payouts_fingerprint,
         )
     }
 }
@@ -4185,6 +4190,7 @@ mod tests {
         MiningJobInputs {
             network: Network::Regtest,
             payouts: payouts(),
+            payouts_fingerprint: [0u8; 32],
             pool_identifier: "blitzpool-test".to_string(),
             coinbase_prefix,
             coinbase_tx_version: 2,

@@ -246,6 +246,7 @@ fn build_job(payouts: &[PayoutEntry], tpl: &NewTemplate) -> (bp_mining_job::Mini
         &coinbase_template,
         "autoscale-rt",
         EXTRANONCE_SLOT_LEN,
+        [0u8; 32],
     )
     .expect("build_mining_job_from_tdp");
     let en1 = [0u8; 4];

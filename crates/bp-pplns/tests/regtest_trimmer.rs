@@ -296,6 +296,7 @@ async fn run_trim_scenario(
         &coinbase_template,
         pool_identifier,
         EXTRANONCE_SLOT_LEN,
+        [0u8; 32],
     )
     .expect("build_mining_job_from_tdp must succeed with trimmed payouts");
 
