@@ -12,8 +12,8 @@ mod language;
 mod number_suffix;
 
 pub use device_status::{
-    format_device_time, DeviceAggregateArgs, DeviceAggregateText, DeviceStatusArgs,
-    DeviceStatusText,
+    format_device_time, DeviceAggregateArgs, DeviceAggregateText, DevicePartialArgs,
+    DevicePartialText, DeviceStatusArgs, DeviceStatusText,
 };
 pub use language::Language;
 pub use number_suffix::format_number_suffix;

@@ -122,7 +122,7 @@ impl DeviceLivenessLookup for FrontLiveness {
                         (
                             key.clone(),
                             DeviceLiveness {
-                                live: live.contains(key),
+                                sessions: live.get(key).copied().unwrap_or(0),
                                 first_seen_ms: *first_seen_ms,
                             },
                         )
@@ -154,7 +154,7 @@ fn parse_redis_key(raw: &str) -> Option<DeviceKey> {
 
 #[async_trait]
 impl ReportedStateStore for RedisReportedState {
-    async fn load(&self) -> HashMap<DeviceKey, bool> {
+    async fn load(&self) -> HashMap<DeviceKey, usize> {
         let mut conn = self.redis.clone();
         let mut out = HashMap::new();
         let mut cursor: u64 = 0;
@@ -183,7 +183,15 @@ impl ReportedStateStore for RedisReportedState {
                 };
                 match conn.get::<_, Option<String>>(&raw).await {
                     Ok(Some(v)) => {
-                        out.insert(device, v == "online");
+                        // Plain counts now; "online"/"offline" are what a
+                        // process from before the count rule wrote, and a
+                        // rolling upgrade still has to read them.
+                        let sessions = match v.as_str() {
+                            "online" => 1,
+                            "offline" => 0,
+                            other => other.parse().unwrap_or(0),
+                        };
+                        out.insert(device, sessions);
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -199,7 +207,7 @@ impl ReportedStateStore for RedisReportedState {
         out
     }
 
-    async fn store(&self, updates: &[(DeviceKey, bool)]) {
+    async fn store(&self, updates: &[(DeviceKey, usize)]) {
         if updates.is_empty() {
             return;
         }
@@ -210,9 +218,8 @@ impl ReportedStateStore for RedisReportedState {
         // independent and best-effort, so all-or-nothing would buy
         // nothing and only widen the failure.
         let mut pipe = redis::pipe();
-        for (key, online) in updates {
-            let value = if *online { "online" } else { "offline" };
-            pipe.set_ex(redis_key(key), value, REPORTED_TTL_SECS)
+        for (key, sessions) in updates {
+            pipe.set_ex(redis_key(key), *sessions, REPORTED_TTL_SECS)
                 .ignore();
         }
         if let Err(err) = pipe.query_async::<()>(&mut conn).await {

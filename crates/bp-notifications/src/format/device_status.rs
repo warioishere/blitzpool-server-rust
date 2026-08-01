@@ -93,6 +93,60 @@ impl DeviceStatusText {
 /// notification instead of a wall of names.
 const MAX_NAMES: usize = 6;
 
+/// Inputs for [`DevicePartialText::build`].
+#[derive(Debug, Clone)]
+pub struct DevicePartialArgs<'a> {
+    pub language: Language,
+    pub time_formatted: &'a str,
+    pub worker_name: Option<&'a str>,
+    /// Sessions still hashing, and how many there were before.
+    pub remaining: usize,
+    pub before: usize,
+    pub address_suffix: Option<&'a str>,
+}
+
+/// Some of a worker's rigs are gone; the worker is still up.
+///
+/// Deliberately worded so it can never read as an outage: the owner of
+/// three rigs under one name has lost one, not all three, and a rental
+/// source whose count dipped has not ended its rental.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevicePartialText {
+    pub de: String,
+    pub en: String,
+}
+
+impl DevicePartialText {
+    pub fn build(args: &DevicePartialArgs<'_>) -> Self {
+        let worker_trim = args.worker_name.map(str::trim).filter(|s| !s.is_empty());
+        let worker_de = worker_trim.unwrap_or("unbekannt");
+        let worker_en = worker_trim.unwrap_or("unknown");
+        let suffix = args.address_suffix.unwrap_or("");
+        let gone = args.before.saturating_sub(args.remaining);
+        DevicePartialText {
+            de: format!(
+                "\u{26a0}\u{fe0f} Worker {worker_de}: {gone} von {before} Geräten weg, {remaining} noch aktiv – Stand {time}{suffix}.",
+                before = args.before,
+                remaining = args.remaining,
+                time = args.time_formatted,
+            ),
+            en: format!(
+                "\u{26a0}\u{fe0f} Worker {worker_en}: {gone} of {before} devices gone, {remaining} still hashing – as of {time}{suffix}.",
+                before = args.before,
+                remaining = args.remaining,
+                time = args.time_formatted,
+            ),
+        }
+    }
+
+    pub fn pick(&self, lang: Language) -> &str {
+        match lang {
+            Language::De => &self.de,
+            Language::En => &self.en,
+        }
+    }
+}
+
 /// Inputs for [`DeviceAggregateText::build`] — the collapsed form used
 /// when one address settles several transitions inside the coalescing
 /// window.
@@ -108,6 +162,9 @@ pub struct DeviceAggregateArgs<'a> {
     /// because calling a brand-new miner "back online" tells the reader
     /// it recovered from an outage they were never notified about.
     pub first_seen: &'a [String],
+    /// `(worker, remaining, before)` for workers that lost some rigs but
+    /// are still hashing.
+    pub reduced: &'a [(String, usize, usize)],
     pub address_suffix: Option<&'a str>,
 }
 
@@ -147,6 +204,17 @@ impl DeviceAggregateText {
                 plural_worker_en(n),
                 join_names(args.came_back, Language::En)
             ));
+        }
+        if !args.reduced.is_empty() {
+            for (worker, remaining, before) in args.reduced {
+                let gone = before.saturating_sub(*remaining);
+                de_parts.push(format!(
+                    "\u{26a0}\u{fe0f} {worker}: {gone} von {before} weg ({remaining} aktiv)"
+                ));
+                en_parts.push(format!(
+                    "\u{26a0}\u{fe0f} {worker}: {gone} of {before} gone ({remaining} hashing)"
+                ));
+            }
         }
         if !args.first_seen.is_empty() {
             let n = args.first_seen.len();
@@ -354,6 +422,7 @@ mod tests {
             went_offline: off,
             came_back: back,
             first_seen: NO_NAMES,
+            reduced: &[],
             address_suffix: None,
         }
     }
@@ -370,6 +439,7 @@ mod tests {
             went_offline: NO_NAMES,
             came_back: &back,
             first_seen: &fresh,
+            reduced: &[],
             address_suffix: None,
         });
         assert!(t.de.contains("1 Worker wieder online (old)"), "{}", t.de);

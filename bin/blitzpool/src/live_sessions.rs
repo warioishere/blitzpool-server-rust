@@ -16,11 +16,14 @@
 //!   about the others, and a process that restarted has seen none of
 //!   them at all.
 //!
-//! So the front publishes the set directly. [`LiveSessionRegistry`]
-//! wraps the session-persistence hook, keeps the live
-//! `(address, worker)` set in memory with a per-device session refcount,
-//! and mirrors it into Redis under a key of its own. Readers take the
-//! union across every front's key.
+//! So the front publishes what it holds directly. [`LiveSessionRegistry`]
+//! wraps the session-persistence hook, keeps a per-device session count
+//! in memory, and mirrors it into a Redis hash of its own. Readers sum
+//! those counts across every front's key.
+//!
+//! A count rather than a membership set, because "one of three rigs is
+//! gone" and "all three are gone" are different things to their owner —
+//! and the front is the only place that can tell them apart.
 //!
 //! Two properties make it safe to trust:
 //!
@@ -61,7 +64,7 @@ fn member(address: &str, worker: &str) -> String {
 
 /// Always present, filtered out on read.
 ///
-/// Redis deletes a set the moment its last member is removed, so without
+/// Redis deletes a hash the moment its last field is removed, so without
 /// this a front whose last miner disconnects would vanish from the union
 /// — and a reader seeing no keys at all correctly refuses to conclude
 /// anything, so the pool would go blind exactly when someone went
@@ -93,56 +96,58 @@ struct RegistryState {
     sessions: HashMap<String, (String, String)>,
 }
 
-/// What recording a session changed about the live set.
-#[derive(Debug)]
-struct Added {
-    /// This is the device's FIRST session — it just became live.
-    became_live: bool,
-    /// The session used to hold this OTHER device and was its last
-    /// holder, so that one just went away.
-    vacated: Option<(String, String)>,
-}
+/// Devices whose published session count has to be updated.
+///
+/// A count rather than a flag, because "one of three rigs is gone" and
+/// "all three are gone" are different things to the owner and only the
+/// front can tell them apart. Zero means the device is gone entirely.
+type Changed = Vec<((String, String), usize)>;
 
 impl RegistryState {
     /// Record a session for a device.
-    fn add(&mut self, session_id: &str, device: (String, String)) -> Added {
+    fn add(&mut self, session_id: &str, device: (String, String)) -> Changed {
         let previous = self.sessions.insert(session_id.to_string(), device.clone());
         // One connection may authorize more than once, and the second
         // authorize may carry a different worker name — SV1's authorize
         // handler is unconditional. Releasing what the session moved off
         // is not optional: the holder set is the only thing that can ever
         // drop a device, and a stale entry in it is unreachable forever.
-        let vacated = match previous {
-            Some(previous) if previous != device => self.release(session_id, &previous),
-            _ => None,
-        };
-        let holders = self.devices.entry(device).or_default();
+        let mut changed = Changed::new();
+        if let Some(previous) = previous {
+            if previous != device {
+                changed.push(self.release(session_id, &previous));
+            }
+        }
+        let holders = self.devices.entry(device.clone()).or_default();
         holders.insert(session_id.to_string());
-        Added {
-            became_live: holders.len() == 1,
-            vacated,
-        }
+        changed.push((device, holders.len()));
+        changed
     }
 
-    /// Drop a session. Returns the device only when that was its LAST
-    /// session — one rig of a rental source rotating out must not take
-    /// the whole worker offline.
-    fn remove(&mut self, session_id: &str) -> Option<(String, String)> {
+    /// Drop a session, reporting the device's remaining session count.
+    /// `Some((device, 0))` is the last rig leaving; anything above zero
+    /// is one of several going while the rest keep hashing.
+    fn remove(&mut self, session_id: &str) -> Option<((String, String), usize)> {
         let device = self.sessions.remove(session_id)?;
-        self.release(session_id, &device)
+        Some(self.release(session_id, &device))
     }
 
-    /// Take `session_id` out of `device`'s holders, reporting the device
-    /// when it held the last one.
-    fn release(&mut self, session_id: &str, device: &(String, String)) -> Option<(String, String)> {
-        let holders = self.devices.get_mut(device)?;
+    /// Take `session_id` out of `device`'s holders and report what is
+    /// left.
+    fn release(
+        &mut self,
+        session_id: &str,
+        device: &(String, String),
+    ) -> ((String, String), usize) {
+        let Some(holders) = self.devices.get_mut(device) else {
+            return (device.clone(), 0);
+        };
         holders.remove(session_id);
-        if holders.is_empty() {
+        let left = holders.len();
+        if left == 0 {
             self.devices.remove(device);
-            Some(device.clone())
-        } else {
-            None
         }
+        (device.clone(), left)
     }
 }
 
@@ -166,12 +171,41 @@ impl LiveSessionRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn snapshot(&self) -> Vec<String> {
+    fn snapshot(&self) -> Vec<(String, usize)> {
         self.lock()
             .devices
-            .keys()
-            .map(|(a, w)| member(a, w))
+            .iter()
+            .map(|((a, w), holders)| (member(a, w), holders.len()))
             .collect()
+    }
+
+    /// Write count changes through to this front's hash.
+    ///
+    /// The tombstone and the TTL ride along in the same MULTI: when this
+    /// call is what creates the key, a field that lands without its
+    /// expiry leaves a key no later process ever writes again (the front
+    /// id is a fresh UUID per start), and it would claim its miners are
+    /// online forever.
+    async fn apply(&self, changed: Changed) {
+        if changed.is_empty() {
+            return;
+        }
+        let mut conn = self.redis.clone();
+        let mut pipe = redis::pipe();
+        pipe.atomic().hset(&self.key, PRESENT, 0).ignore();
+        for ((address, worker), count) in &changed {
+            let field = member(address, worker);
+            if *count == 0 {
+                pipe.hdel(&self.key, field).ignore();
+            } else {
+                pipe.hset(&self.key, field, *count).ignore();
+            }
+        }
+        pipe.expire(&self.key, LIVE_TTL_SECS as i64).ignore();
+        if let Err(err) = pipe.query_async::<()>(&mut conn).await {
+            // The republish heals whatever this missed.
+            warn!(%err, "live-sessions: incremental update failed");
+        }
     }
 
     /// Republish the whole set and refresh the TTL.
@@ -187,9 +221,9 @@ impl LiveSessionRegistry {
 
         let result: redis::RedisResult<()> = async {
             let _: () = conn.del(&scratch).await?;
-            let _: () = conn.sadd(&scratch, PRESENT).await?;
+            let _: () = conn.hset(&scratch, PRESENT, 0).await?;
             for chunk in members.chunks(500) {
-                let _: () = conn.sadd(&scratch, chunk).await?;
+                let _: () = conn.hset_multiple(&scratch, chunk).await?;
             }
             let _: () = conn.expire(&scratch, LIVE_TTL_SECS as i64).await?;
             let _: () = conn.rename(&scratch, &self.key).await?;
@@ -215,58 +249,26 @@ impl SharedSessionPersistence for LiveSessionRegistry {
         worker: &str,
         user_agent: Option<&str>,
     ) {
-        let added = self
+        let changed = self
             .lock()
             .add(session_id, (address.to_string(), worker.to_string()));
-        if let Some((address, worker)) = added.vacated {
-            let mut conn = self.redis.clone();
-            if let Err(err) = conn
-                .srem::<_, _, ()>(&self.key, member(&address, &worker))
-                .await
-            {
-                warn!(%err, "live-sessions: releasing a re-registered session's previous device failed");
-            }
-        }
-        if added.became_live {
-            let mut conn = self.redis.clone();
-            // Incremental so a fresh connect is visible before the next
-            // republish; the republish is what heals any drift.
-            // The tombstone rides along so a key created here, before
-            // the first republish, also survives its last SREM.
-            //
-            // One MULTI/EXEC, not two commands: when this call is what
-            // creates the key, a SADD that lands without its EXPIRE
-            // leaves a key that never expires — and since the front id
-            // is a fresh UUID per process, no later process ever writes
-            // that key again. It would claim its miners are online
-            // forever, which is exactly what the TTL exists to prevent.
-            let queued: redis::RedisResult<()> = redis::pipe()
-                .atomic()
-                .sadd(&self.key, &[member(address, worker), PRESENT.to_string()])
-                .ignore()
-                .expire(&self.key, LIVE_TTL_SECS as i64)
-                .ignore()
-                .query_async(&mut conn)
-                .await;
-            if let Err(err) = queued {
-                warn!(%err, "live-sessions: incremental add failed");
-            }
-        }
+        // Incremental so a fresh connect is visible before the next
+        // republish; the republish is what heals any drift.
+        self.apply(changed).await;
         self.inner
             .register_session(session_id, address, worker, user_agent)
             .await;
     }
 
     async fn deregister_session(&self, session_id: &str) {
-        let emptied = self.lock().remove(session_id);
-        if let Some((address, worker)) = emptied {
-            let mut conn = self.redis.clone();
-            if let Err(err) = conn
-                .srem::<_, _, ()>(&self.key, member(&address, &worker))
-                .await
-            {
-                warn!(%err, "live-sessions: incremental remove failed");
-            }
+        // Publish the new count even when it is not zero: one rig of a
+        // rental source rotating out leaves the others hashing, and the
+        // difference between "fewer" and "gone" is the whole point.
+        // Bound so the guard is dropped before the await below — an
+        // `if let` would hold it across, and the future stops being Send.
+        let change = self.lock().remove(session_id);
+        if let Some(change) = change {
+            self.apply(vec![change]).await;
         }
         self.inner.deregister_session(session_id).await;
     }
@@ -323,13 +325,18 @@ impl RedisLiveSessions {
         Self { redis }
     }
 
-    /// Every `(address, worker)` any front currently holds open.
+    /// How many sessions every `(address, worker)` currently has open,
+    /// summed across the fronts.
+    ///
+    /// A count rather than a set: the owner of three rigs under one
+    /// worker name wants to hear that one of them died, and only the
+    /// number distinguishes that from all three dying.
     ///
     /// `None` means **no front is publishing** — not "nothing is
     /// connected". The two are indistinguishable from here, and treating
     /// the second as the first would report the entire pool as offline
     /// the moment the publisher is behind or a deploy is mid-flight.
-    pub(crate) async fn union(&self) -> Option<HashSet<(String, String)>> {
+    pub(crate) async fn union(&self) -> Option<HashMap<(String, String), usize>> {
         let mut conn = self.redis.clone();
         let mut keys: Vec<String> = Vec::new();
         let mut cursor: u64 = 0;
@@ -362,30 +369,33 @@ impl RedisLiveSessions {
             return None;
         }
 
-        let mut out = HashSet::new();
+        let mut out: HashMap<(String, String), usize> = HashMap::new();
         for key in keys {
-            match conn.smembers::<_, Vec<String>>(&key).await {
-                // Redis drops a set with its last member, and the
+            match conn.hgetall::<_, HashMap<String, usize>>(&key).await {
+                // Redis drops a hash with its last field, and the
                 // tombstone means a published key always has one — so
                 // "empty" is not a front holding nothing, it is a key
                 // that expired between the scan above and this read.
                 // Folding it in as empty would silently drop everything
                 // that front was carrying, and with a single front the
                 // whole pool would read as offline.
-                Ok(members) if members.is_empty() => {
+                Ok(fields) if fields.is_empty() => {
                     warn!(
                         key,
                         "live-sessions: key vanished mid-read — drawing no conclusion"
                     );
                     return None;
                 }
-                Ok(members) => {
-                    for m in members {
-                        if let Some((address, worker)) = m.split_once('\u{1f}') {
+                Ok(fields) => {
+                    for (field, count) in fields {
+                        if let Some((address, worker)) = field.split_once('\u{1f}') {
                             if address.is_empty() {
                                 continue; // the tombstone
                             }
-                            out.insert((address.to_string(), worker.to_string()));
+                            // Summed, not replaced: the same worker may
+                            // have rigs on more than one front.
+                            *out.entry((address.to_string(), worker.to_string()))
+                                .or_insert(0) += count;
                         }
                     }
                 }
@@ -465,12 +475,20 @@ mod tests {
         for sid in ["s1", "s2", "s3"] {
             reg.register_session(sid, ADDR, "mrr", None).await;
         }
-        assert!(reader.union().await.expect("published").contains(&device));
+        assert!(reader
+            .union()
+            .await
+            .expect("published")
+            .contains_key(&device));
 
         for sid in ["s1", "s2"] {
             reg.deregister_session(sid).await;
             assert!(
-                reader.union().await.expect("published").contains(&device),
+                reader
+                    .union()
+                    .await
+                    .expect("published")
+                    .contains_key(&device),
                 "{sid} was not the last session"
             );
         }
@@ -480,7 +498,7 @@ mod tests {
             .union()
             .await
             .expect("the front is still alive, it just holds nothing");
-        assert!(!union.contains(&device), "the last session closed");
+        assert!(!union.contains_key(&device), "the last session closed");
         assert!(union.is_empty());
     }
 
@@ -613,8 +631,8 @@ mod tests {
 
         let reader = RedisLiveSessions::new(redis.clone());
         let union = reader.union().await.expect("published");
-        assert!(union.contains(&(ADDR.to_string(), "rig-a".to_string())));
-        assert!(union.contains(&(ADDR.to_string(), "rig-b".to_string())));
+        assert!(union.contains_key(&(ADDR.to_string(), "rig-a".to_string())));
+        assert!(union.contains_key(&(ADDR.to_string(), "rig-b".to_string())));
 
         // Front 1 is killed — its key expires rather than being cleaned up.
         let _: () = redis::cmd("DEL")
@@ -624,11 +642,11 @@ mod tests {
             .expect("del");
         let union = reader.union().await.expect("front 2 still publishes");
         assert!(
-            !union.contains(&(ADDR.to_string(), "rig-a".to_string())),
+            !union.contains_key(&(ADDR.to_string(), "rig-a".to_string())),
             "the dead front stops claiming its miners"
         );
         assert!(
-            union.contains(&(ADDR.to_string(), "rig-b".to_string())),
+            union.contains_key(&(ADDR.to_string(), "rig-b".to_string())),
             "and takes nobody else with it"
         );
     }
@@ -718,16 +736,14 @@ mod tests {
         let mut state = RegistryState::default();
         let device = (ADDR.to_string(), "mrr".to_string());
 
-        assert!(state.add("s1", device.clone()).became_live);
+        assert_eq!(state.add("s1", device.clone()), vec![(device.clone(), 1)]);
         for _ in 0..4 {
-            let again = state.add("s1", device.clone());
-            assert!(
-                again.vacated.is_none(),
-                "an unchanged device must never be released"
-            );
+            // Re-recording the same session must neither release the
+            // device nor inflate its count.
+            assert_eq!(state.add("s1", device.clone()), vec![(device.clone(), 1)]);
         }
         assert!(state.devices.contains_key(&device), "still held");
-        assert_eq!(state.remove("s1"), Some(device));
+        assert_eq!(state.remove("s1"), Some((device, 0)));
         assert!(state.devices.is_empty(), "one deregister still ends it");
     }
 
@@ -874,7 +890,7 @@ mod tests {
         // Sync point: the responses are deliberately left unread, so the
         // live set is what says the session actually registered.
         assert!(
-            wait_for_union(&reader, |u| u.contains(&device)).await,
+            wait_for_union(&reader, |u| u.contains_key(&device)).await,
             "the front never published the authorized session"
         );
 
@@ -883,7 +899,7 @@ mod tests {
         }
         drop(miner);
 
-        let left = wait_for_union(&reader, |u| !u.contains(&device)).await;
+        let left = wait_for_union(&reader, |u| !u.contains_key(&device)).await;
         server.shutdown().await;
         left
     }
@@ -918,7 +934,7 @@ mod tests {
     /// has to notice the socket died and unwind before anything changes.
     async fn wait_for_union(
         reader: &RedisLiveSessions,
-        pred: impl Fn(&HashSet<(String, String)>) -> bool,
+        pred: impl Fn(&HashMap<(String, String), usize>) -> bool,
     ) -> bool {
         for _ in 0..100 {
             if let Some(union) = reader.union().await {

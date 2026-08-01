@@ -134,8 +134,22 @@ impl Default for DeviceGateConfig {
 pub enum Notified {
     /// Nothing has ever been sent for this device.
     Unknown,
-    Online,
-    Offline,
+    /// How many sessions the subscriber was last told about. Zero is
+    /// "offline"; anything above is "online with this many rigs".
+    ///
+    /// A count rather than a flag because three rigs under one worker
+    /// name are three rigs to their owner: losing one is news, and only
+    /// the number tells that apart from losing all three.
+    Sessions(usize),
+}
+
+impl Notified {
+    fn count(self) -> Option<usize> {
+        match self {
+            Notified::Unknown => None,
+            Notified::Sessions(n) => Some(n),
+        }
+    }
 }
 
 /// Which kind of event set the pending deadline.
@@ -148,8 +162,8 @@ enum Direction {
 /// What the database says about one device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceLiveness {
-    /// At least one session is connected.
-    pub live: bool,
+    /// How many sessions the fronts hold open for this device.
+    pub sessions: usize,
     /// Earliest `COALESCE(firstSeen, startTime)` across every row for the
     /// pair — when the pool first saw this worker.
     pub first_seen_ms: i64,
@@ -178,7 +192,7 @@ pub trait ReportedStateStore: Send + Sync {
     /// Everything remembered, at startup. A failure should return an
     /// empty map rather than block the gate; the cost is one restart's
     /// worth of imprecision, not an outage.
-    async fn load(&self) -> HashMap<DeviceKey, bool>;
+    async fn load(&self) -> HashMap<DeviceKey, usize>;
     /// Record what changed in this sweep. Best-effort.
     ///
     /// Takes the whole batch rather than one device at a time because the
@@ -187,7 +201,7 @@ pub trait ReportedStateStore: Send + Sync {
     /// until this returns. One round-trip per device would put the
     /// persistence of state nobody reads ahead of the notification
     /// somebody is waiting for.
-    async fn store(&self, updates: &[(DeviceKey, bool)]);
+    async fn store(&self, updates: &[(DeviceKey, usize)]);
 }
 
 /// A no-op store — the gate degrades to its pre-persistence behaviour.
@@ -195,10 +209,10 @@ pub struct NoReportedStateStore;
 
 #[async_trait]
 impl ReportedStateStore for NoReportedStateStore {
-    async fn load(&self) -> HashMap<DeviceKey, bool> {
+    async fn load(&self) -> HashMap<DeviceKey, usize> {
         HashMap::new()
     }
-    async fn store(&self, _updates: &[(DeviceKey, bool)]) {}
+    async fn store(&self, _updates: &[(DeviceKey, usize)]) {}
 }
 
 /// A confirmed, ready-to-send device-status message.
@@ -206,9 +220,27 @@ impl ReportedStateStore for NoReportedStateStore {
 pub enum DeviceNotice {
     /// One transition — rendered exactly as before this module existed.
     Single(DeviceStatusEvent),
+    /// Some of a worker's rigs are gone and the rest keep hashing. NOT
+    /// an outage: rendering it as one would tell the owner of three rigs
+    /// that all three died, and would tell a rental source its rental
+    /// ended every time the count dipped.
+    Partial(DevicePartial),
     /// Several transitions for one address inside the coalescing window,
     /// collapsed into a single message.
     Aggregate(DeviceAggregate),
+}
+
+/// Some of a worker's sessions went away; the worker is still up.
+#[derive(Debug, Clone)]
+pub struct DevicePartial {
+    pub address: AddressId,
+    pub worker_name: Option<String>,
+    pub user_agent: Option<String>,
+    /// Sessions still hashing.
+    pub remaining: usize,
+    /// How many there were when the subscriber was last told.
+    pub before: usize,
+    pub timestamp: DateTime<Utc>,
 }
 
 /// Collapsed form of two or more transitions on one address.
@@ -225,6 +257,9 @@ pub struct DeviceAggregate {
     pub came_back: Vec<String>,
     /// Worker names seen for the first time.
     pub first_seen: Vec<String>,
+    /// `(worker, remaining, before)` for workers that lost some rigs but
+    /// are still hashing.
+    pub reduced: Vec<(String, usize, usize)>,
     /// When the batch was released.
     pub timestamp: DateTime<Utc>,
 }
@@ -263,11 +298,21 @@ struct DeviceState {
     last_event_at: DateTime<Utc>,
 }
 
+/// A transition that survived its dwell and is waiting for the
+/// coalescing window to open.
+#[derive(Debug, Clone)]
+struct Confirmed {
+    event: DeviceStatusEvent,
+    returning: bool,
+    /// `(remaining, before)` when only SOME of the worker's rigs left.
+    partial: Option<(usize, usize)>,
+}
+
 /// Per-address coalescing state.
 #[derive(Debug, Default)]
 struct AddressState {
     /// Confirmed transitions waiting for the window to open.
-    buffered: Vec<(DeviceStatusEvent, bool)>,
+    buffered: Vec<Confirmed>,
     /// When this address last had a message released.
     last_emit: Option<DateTime<Utc>>,
 }
@@ -325,12 +370,8 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
     pub async fn restore_reported_state(&self) {
         let remembered = self.store.load().await;
         let mut inner = self.lock();
-        for (key, online) in remembered {
-            let state = if online {
-                Notified::Online
-            } else {
-                Notified::Offline
-            };
+        for (key, sessions) in remembered {
+            let state = Notified::Sessions(sessions);
             inner.reported.insert(key.clone(), state);
             if let Some(device) = inner.devices.get_mut(&key) {
                 device.notified = state;
@@ -506,7 +547,7 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
         due: &[DeviceKey],
         answer: &HashMap<DeviceKey, DeviceLiveness>,
         now: DateTime<Utc>,
-    ) -> Vec<(DeviceKey, bool)> {
+    ) -> Vec<(DeviceKey, usize)> {
         let evict_after = chrono_duration(EVICT_AFTER);
         let online_deadline = now + self.dwell(Direction::Online);
         let offline_deadline = now + self.dwell(Direction::Offline);
@@ -514,8 +555,8 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
 
         let mut inner = self.lock();
         let mut retire = Vec::new();
-        let mut confirmed: Vec<(DeviceStatusEvent, bool)> = Vec::new();
-        let mut writes = Vec::new();
+        let mut confirmed: Vec<Confirmed> = Vec::new();
+        let mut writes: Vec<(DeviceKey, usize)> = Vec::new();
 
         for key in due {
             let Some(state) = inner.devices.get_mut(key) else {
@@ -539,17 +580,16 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
             }
 
             let seen = answer.get(key).copied();
-            let live = seen.is_some_and(|l| l.live);
+            let sessions = seen.map_or(0, |l| l.sessions);
+            let live = sessions > 0;
 
-            let target = if live {
-                Notified::Online
-            } else {
-                Notified::Offline
-            };
-            let direction = if live {
-                Direction::Online
-            } else {
-                Direction::Offline
+            let target = Notified::Sessions(sessions);
+            // A rig joining is not urgent; a rig leaving is the thing the
+            // grace exists for. Both still have to hold.
+            let direction = match state.notified.count() {
+                Some(before) if sessions > before => Direction::Online,
+                None if sessions > 0 => Direction::Online,
+                _ => Direction::Offline,
             };
             // One-shot, and consumed whatever the answer turns out to be:
             // a backfilled device settles into whichever state it is
@@ -569,6 +609,11 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
             // against a 60 s grace — which is exactly the flap the grace
             // exists to swallow.
             //
+            // It applies to every change in the count, not just to
+            // reaching zero: a rental source whose rigs rotate dips and
+            // recovers within the grace and so stays silent, while three
+            // rigs that become two and STAY two is a real loss.
+            //
             // A device that is merely settling is exempt: nothing is
             // announced for it, so there is nothing to debounce.
             if target != previous && !settling && state.armed_by != Some(direction) {
@@ -579,16 +624,27 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
             state.armed_by = None;
 
             if target != previous {
+                let before = previous.count();
                 // A device we have never reported on is only announced as
                 // online when the pool first saw it after this gate
                 // started. Everything older predates our supervision —
                 // announcing it would turn a restart into a broadcast.
+                //
+                // A count that GREW is never announced: nobody needs a
+                // push because a rental gained a rig. It still updates
+                // what we remember, so the next loss is measured against
+                // the level that actually held.
+                let grew = before.is_some_and(|b| sessions > b && b > 0);
                 let announce = !settling
-                    && (previous != Notified::Unknown
-                        || target == Notified::Offline
+                    && !grew
+                    // `is_some`, not `> 0`: a device we already reported
+                    // as gone has been reported on, so its return is a
+                    // transition the subscriber is owed.
+                    && (before.is_some()
+                        || !live
                         || seen.is_some_and(|l| l.first_seen_ms >= self.started_at_ms));
                 state.notified = target;
-                writes.push((key.clone(), live));
+                writes.push((key.clone(), sessions));
                 if announce {
                     let mut event = state.meta.clone();
                     event.is_online = live;
@@ -596,48 +652,57 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
                     // "back online", not a first sighting. The raw event's
                     // flag cannot say this: a re-check-driven correction
                     // has no online event behind it at all.
-                    let returning = live && previous == Notified::Offline;
+                    let returning = live && before == Some(0);
                     if live {
                         event.is_returning = returning;
                     }
+                    // Some rigs left but the worker is still hashing: that
+                    // is not an outage and must not be rendered as one.
+                    let partial = match before {
+                        Some(b) if live && b > sessions => Some(b),
+                        _ => None,
+                    };
                     // Keep the event's own timestamp when it agreed with
                     // the database — "offline since <disconnect>" is more
-                    // useful than "offline since <we checked>".
-                    if state.meta.is_online != live {
+                    // useful than "offline since <we checked>". A partial
+                    // loss has no event behind it at all (the worker is
+                    // still up, so nothing disconnected as far as the
+                    // event stream is concerned), so it has to be stamped
+                    // when it was confirmed or it reads hours old.
+                    if state.meta.is_online != live || partial.is_some() {
                         event.timestamp = now;
                     }
-                    confirmed.push((event, returning));
+                    confirmed.push(Confirmed {
+                        event,
+                        returning,
+                        partial: partial.map(|was| (sessions, was)),
+                    });
                 }
             }
 
             // Settled at offline with nothing happening: stop polling.
             // The reported state stays in `reported` (and in the store),
             // so the device's eventual return is still a transition.
-            if target == Notified::Offline && now - state.last_event_at >= evict_after {
+            if target == Notified::Sessions(0) && now - state.last_event_at >= evict_after {
                 retire.push(key.clone());
             } else {
                 state.due_at = next_check;
             }
         }
 
-        for (key, online) in &writes {
-            inner.reported.insert(
-                key.clone(),
-                if *online {
-                    Notified::Online
-                } else {
-                    Notified::Offline
-                },
-            );
+        for (key, sessions) in &writes {
+            inner
+                .reported
+                .insert(key.clone(), Notified::Sessions(*sessions));
         }
-        for (event, returning) in confirmed {
-            let address = event.address.as_str().to_string();
+        for confirmed in confirmed {
+            let address = confirmed.event.address.as_str().to_string();
             inner
                 .addresses
                 .entry(address)
                 .or_default()
                 .buffered
-                .push((event, returning));
+                .push(confirmed);
         }
         for key in retire {
             inner.devices.remove(&key);
@@ -694,35 +759,48 @@ fn chrono_duration(d: Duration) -> chrono::Duration {
 /// batch. Only its **last** transition survives — otherwise the message
 /// would name the same miner as both gone and back and never state where
 /// it ended up.
-fn collapse(batch: Vec<(DeviceStatusEvent, bool)>, now: DateTime<Utc>) -> DeviceNotice {
-    let mut net: Vec<(String, DeviceStatusEvent, bool)> = Vec::new();
-    for (event, returning) in batch {
-        let worker = event
+fn collapse(batch: Vec<Confirmed>, now: DateTime<Utc>) -> DeviceNotice {
+    let mut net: Vec<(String, Confirmed)> = Vec::new();
+    for confirmed in batch {
+        let worker = confirmed
+            .event
             .worker_name
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
-        match net.iter_mut().find(|(w, _, _)| *w == worker) {
-            Some(slot) => {
-                slot.1 = event;
-                slot.2 = returning;
-            }
-            None => net.push((worker, event, returning)),
+        match net.iter_mut().find(|(w, _)| *w == worker) {
+            Some(slot) => slot.1 = confirmed,
+            None => net.push((worker, confirmed)),
         }
     }
 
     if net.len() == 1 {
-        let (_, event, _) = net.pop().expect("len == 1");
-        return DeviceNotice::Single(event);
+        let (_, only) = net.pop().expect("len == 1");
+        return match only.partial {
+            Some((remaining, before)) => DeviceNotice::Partial(DevicePartial {
+                address: only.event.address,
+                worker_name: only.event.worker_name,
+                user_agent: only.event.user_agent,
+                remaining,
+                before,
+                timestamp: only.event.timestamp,
+            }),
+            None => DeviceNotice::Single(only.event),
+        };
     }
 
-    let address = net[0].1.address.clone();
+    let address = net[0].1.event.address.clone();
     let mut went_offline = Vec::new();
     let mut came_back = Vec::new();
     let mut first_seen = Vec::new();
-    for (worker, event, returning) in net {
-        if !event.is_online {
+    let mut reduced = Vec::new();
+    for (worker, confirmed) in net {
+        if let Some((remaining, before)) = confirmed.partial {
+            // Still hashing, just with fewer rigs — kept apart from the
+            // outages so one message never claims both about a worker.
+            reduced.push((worker, remaining, before));
+        } else if !confirmed.event.is_online {
             went_offline.push(worker);
-        } else if returning {
+        } else if confirmed.returning {
             came_back.push(worker);
         } else {
             first_seen.push(worker);
@@ -733,6 +811,7 @@ fn collapse(batch: Vec<(DeviceStatusEvent, bool)>, now: DateTime<Utc>) -> Device
         went_offline,
         came_back,
         first_seen,
+        reduced,
         timestamp: now,
     })
 }
@@ -776,10 +855,14 @@ mod tests {
         /// `first_seen_offset_s` is relative to `t0`; negative means the
         /// pool saw the worker before the gate started.
         fn set(&self, worker: &str, live: bool, first_seen_offset_s: i64) {
+            self.set_sessions(worker, usize::from(live), first_seen_offset_s)
+        }
+        /// The count form — `set` is the boolean shorthand for it.
+        fn set_sessions(&self, worker: &str, sessions: usize, first_seen_offset_s: i64) {
             self.rows.lock().expect("lock").insert(
                 Self::key(worker),
                 DeviceLiveness {
-                    live,
+                    sessions,
                     first_seen_ms: (t0() + chrono::Duration::seconds(first_seen_offset_s))
                         .timestamp_millis(),
                 },
@@ -787,9 +870,13 @@ mod tests {
         }
         /// Flip what the front reports holding open.
         fn set_live(&self, worker: &str, live: bool) {
+            self.set_count(worker, usize::from(live))
+        }
+        /// How many sessions the fronts hold for this worker.
+        fn set_count(&self, worker: &str, sessions: usize) {
             let mut rows = self.rows.lock().expect("lock");
             if let Some(entry) = rows.get_mut(&Self::key(worker)) {
-                entry.live = live;
+                entry.sessions = sessions;
             }
         }
         fn forget(&self, worker: &str) {
@@ -832,7 +919,7 @@ mod tests {
     /// for the Redis-backed store.
     #[derive(Default)]
     struct FakeStore {
-        state: Mutex<HashMap<DeviceKey, bool>>,
+        state: Mutex<HashMap<DeviceKey, usize>>,
         /// Size of each `store` call, in order. The gate must hand a
         /// sweep's changes over in one go — see
         /// `a_sweeps_writes_are_persisted_in_one_call`.
@@ -844,9 +931,9 @@ mod tests {
             self.state
                 .lock()
                 .expect("lock")
-                .insert(FakeDb::key(worker), online);
+                .insert(FakeDb::key(worker), usize::from(online));
         }
-        fn get(&self, worker: &str) -> Option<bool> {
+        fn get(&self, worker: &str) -> Option<usize> {
             self.state
                 .lock()
                 .expect("lock")
@@ -860,14 +947,14 @@ mod tests {
 
     #[async_trait]
     impl ReportedStateStore for Arc<FakeStore> {
-        async fn load(&self) -> HashMap<DeviceKey, bool> {
+        async fn load(&self) -> HashMap<DeviceKey, usize> {
             self.state.lock().expect("lock").clone()
         }
-        async fn store(&self, updates: &[(DeviceKey, bool)]) {
+        async fn store(&self, updates: &[(DeviceKey, usize)]) {
             self.batches.lock().expect("lock").push(updates.len());
             let mut state = self.state.lock().expect("lock");
-            for (key, online) in updates {
-                state.insert(key.clone(), *online);
+            for (key, sessions) in updates {
+                state.insert(key.clone(), *sessions);
             }
         }
     }
@@ -981,7 +1068,9 @@ mod tests {
             .iter()
             .map(|n| match n {
                 DeviceNotice::Single(e) => (e.worker_name.clone().unwrap_or_default(), e.is_online),
-                DeviceNotice::Aggregate(_) => panic!("expected a single notice"),
+                DeviceNotice::Aggregate(_) | DeviceNotice::Partial(_) => {
+                    panic!("expected a single notice")
+                }
             })
             .collect()
     }
@@ -1398,7 +1487,9 @@ mod tests {
                 assert!(e.is_online);
                 assert!(!e.is_returning, "a first sighting is not a return");
             }
-            DeviceNotice::Aggregate(_) => panic!("expected a single notice"),
+            DeviceNotice::Aggregate(_) | DeviceNotice::Partial(_) => {
+                panic!("expected a single notice")
+            }
         }
         h.open_window();
 
@@ -1423,7 +1514,9 @@ mod tests {
                     "we told them it went offline, so this is a return"
                 );
             }
-            DeviceNotice::Aggregate(_) => panic!("expected a single notice"),
+            DeviceNotice::Aggregate(_) | DeviceNotice::Partial(_) => {
+                panic!("expected a single notice")
+            }
         }
     }
 
@@ -1448,7 +1541,7 @@ mod tests {
             singles(&first.gate.poll_due().await),
             vec![("axe01".into(), false)]
         );
-        assert_eq!(store.get("axe01"), Some(false), "state was persisted");
+        assert_eq!(store.get("axe01"), Some(0), "state was persisted");
 
         // Second process: same store, device still gone, seeded because
         // it disconnected recently.
@@ -1487,7 +1580,9 @@ mod tests {
         assert_eq!(singles(&out), vec![("axe01".into(), true)]);
         match &out[0] {
             DeviceNotice::Single(e) => assert!(e.is_returning, "it is a return, not a first sight"),
-            DeviceNotice::Aggregate(_) => panic!("expected a single notice"),
+            DeviceNotice::Aggregate(_) | DeviceNotice::Partial(_) => {
+                panic!("expected a single notice")
+            }
         }
     }
 
@@ -1565,7 +1660,7 @@ mod tests {
             "twelve changes must reach the store as one batch, not twelve calls"
         );
         for worker in &workers {
-            assert_eq!(store.get(worker), Some(false), "{worker} was persisted");
+            assert_eq!(store.get(worker), Some(0), "{worker} was persisted");
         }
     }
 
@@ -1634,6 +1729,116 @@ mod tests {
             vec![("axe01".into(), false)],
             "the gate did not go blind after the flap"
         );
+    }
+
+    /// Three rigs under one worker name, one dies for good. Its owner is
+    /// owed a message — but NOT an outage: two are still hashing, and
+    /// telling them the worker went offline would be a lie.
+    #[tokio::test]
+    async fn one_of_three_rigs_dying_is_a_partial_loss_not_an_outage() {
+        let h = harness();
+        h.db.set_sessions("mrr", 3, 10);
+        h.advance(10);
+        h.gate.observe(&event("mrr", true, h.clock.now()));
+        h.advance(100);
+        assert_eq!(h.gate.poll_due().await.len(), 1, "announced with 3 rigs");
+        h.open_window();
+
+        h.db.set_count("mrr", 2);
+        h.advance(301);
+        let out = h.poll_after_dwell(301).await;
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            DeviceNotice::Partial(p) => {
+                assert_eq!(p.remaining, 2);
+                assert_eq!(p.before, 3);
+                assert_eq!(p.worker_name.as_deref(), Some("mrr"));
+                // Stamped when it was confirmed, not when the worker last
+                // sent an event — nothing disconnected as far as the
+                // event stream knows, so the meta timestamp is stale.
+                assert_eq!(p.timestamp, h.clock.now(), "stamped at confirmation");
+            }
+            other => panic!("a worker that is still hashing is not offline: {other:?}"),
+        }
+    }
+
+    /// The same drop, healed inside the grace: a rental source rotating a
+    /// rig out and a replacement in, or a rig with a hiccup. Nothing may
+    /// go out — this is the whole reason the count is debounced rather
+    /// than reported.
+    #[tokio::test]
+    async fn a_rig_replaced_inside_the_grace_says_nothing() {
+        let h = harness();
+        h.db.set_sessions("braiins", 40, 10);
+        h.advance(10);
+        h.gate.observe(&event("braiins", true, h.clock.now()));
+        h.advance(100);
+        assert_eq!(h.gate.poll_due().await.len(), 1);
+        h.open_window();
+
+        // Rig leaves...
+        h.db.set_count("braiins", 39);
+        h.advance(301);
+        assert!(h.gate.poll_due().await.is_empty(), "grace armed, not sent");
+        // ...replacement arrives before the grace runs out.
+        h.db.set_count("braiins", 40);
+        h.advance(301);
+        assert!(
+            h.gate.poll_due().await.is_empty(),
+            "a rotated rig is not a loss"
+        );
+    }
+
+    /// The rental ends: every rig leaves. THAT is an outage, and it is
+    /// the only message a rental produces besides its first online.
+    #[tokio::test]
+    async fn a_rental_reports_offline_only_when_the_last_rig_leaves() {
+        let h = harness();
+        h.db.set_sessions("braiins", 40, 10);
+        h.advance(10);
+        h.gate.observe(&event("braiins", true, h.clock.now()));
+        h.advance(100);
+        assert_eq!(h.gate.poll_due().await.len(), 1, "one online at the start");
+        h.open_window();
+
+        h.db.set_count("braiins", 0);
+        h.advance(301);
+        assert_eq!(
+            singles(&h.poll_after_dwell(301).await),
+            vec![("braiins".into(), false)],
+            "all rigs gone is a real outage"
+        );
+    }
+
+    /// A count that GREW is nobody's emergency, so it sends nothing —
+    /// but it must still move the reference, otherwise the rig that
+    /// joined could later die unnoticed.
+    #[tokio::test]
+    async fn a_rig_joining_is_silent_but_becomes_the_new_reference() {
+        let h = harness();
+        h.db.set_sessions("mrr", 2, 10);
+        h.advance(10);
+        h.gate.observe(&event("mrr", true, h.clock.now()));
+        h.advance(100);
+        assert_eq!(h.gate.poll_due().await.len(), 1);
+        h.open_window();
+
+        // A third rig joins: silent.
+        h.db.set_count("mrr", 3);
+        h.advance(301);
+        assert!(h.gate.poll_due().await.is_empty(), "arming, not announcing");
+        h.advance(301);
+        assert!(h.gate.poll_due().await.is_empty(), "growth is not news");
+
+        // It dies again — measured against 3, not against the original 2.
+        h.db.set_count("mrr", 2);
+        h.advance(301);
+        match &h.poll_after_dwell(301).await[0] {
+            DeviceNotice::Partial(p) => {
+                assert_eq!((p.before, p.remaining), (3, 2), "reference followed growth");
+            }
+            other => panic!("expected a partial loss: {other:?}"),
+        }
     }
 
     /// A miner that is merely share-quiet must not read as gone. The
@@ -1764,7 +1969,9 @@ mod tests {
                 assert_eq!(names, vec!["a", "b", "c"]);
                 assert!(agg.came_back.is_empty() && agg.first_seen.is_empty());
             }
-            DeviceNotice::Single(_) => panic!("three transitions must aggregate"),
+            DeviceNotice::Single(_) | DeviceNotice::Partial(_) => {
+                panic!("three transitions must aggregate")
+            }
         }
     }
 
@@ -1811,7 +2018,9 @@ mod tests {
                 names.sort();
                 assert_eq!(names, vec!["b", "c"]);
             }
-            DeviceNotice::Single(_) => panic!("two held transitions must aggregate"),
+            DeviceNotice::Single(_) | DeviceNotice::Partial(_) => {
+                panic!("two held transitions must aggregate")
+            }
         }
     }
 
@@ -1934,6 +2143,7 @@ mod tests {
                 "a single worker must not be listed twice: offline={:?} back={:?} new={:?}",
                 agg.went_offline, agg.came_back, agg.first_seen
             ),
+            DeviceNotice::Partial(p) => panic!("net state is online, not a partial loss: {p:?}"),
         }
     }
 

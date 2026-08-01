@@ -22,10 +22,10 @@ use crate::adapter::{
 };
 use crate::format::{
     format_device_time, format_number_suffix, DeviceAggregateArgs, DeviceAggregateText,
-    DeviceStatusArgs, DeviceStatusText, Language,
+    DevicePartialArgs, DevicePartialText, DeviceStatusArgs, DeviceStatusText, Language,
 };
 
-use super::device_gate::{DeviceAggregate, DeviceNotice};
+use super::device_gate::{DeviceAggregate, DeviceNotice, DevicePartial};
 
 // Canonical stored `subscriptionType` values (lowercase, as written by
 // the `/api/push/*` register endpoints). Comparisons below are
@@ -195,7 +195,72 @@ impl NotificationDispatcher {
         match notice {
             DeviceNotice::Single(event) => self.notify_device_status(event).await,
             DeviceNotice::Aggregate(agg) => self.notify_device_aggregate(agg).await,
+            DeviceNotice::Partial(partial) => self.notify_device_partial(partial).await,
         }
+    }
+
+    /// Some of a worker's rigs are gone and the rest keep hashing.
+    ///
+    /// Same transports and filtering as the other two; only the wording
+    /// differs, and deliberately so — the owner of three rigs must not
+    /// read "offline" when two are still working.
+    pub async fn notify_device_partial(&self, partial: &DevicePartial) {
+        let (telegram_subs, _ntfy_sub, push_subs) = self.load_subs(&partial.address).await;
+
+        let mut tasks = Vec::new();
+        let telegram_dev: Vec<_> = telegram_subs
+            .iter()
+            .filter(|s| s.device_notifications_enabled)
+            .cloned()
+            .collect();
+        if !telegram_dev.is_empty() {
+            if let Some(adapter) = &self.telegram {
+                tasks.push(Box::pin(send_telegram_device_partial(
+                    Arc::clone(adapter),
+                    self.pool.clone(),
+                    self.chat_languages.clone(),
+                    partial.clone(),
+                    telegram_dev,
+                    self.config.timezone,
+                )) as TaskFuture);
+            }
+        }
+        let fcm_dev: Vec<_> = push_subs
+            .iter()
+            .filter(|s| {
+                s.subscription_type.eq_ignore_ascii_case(PUSH_TYPE_FCM)
+                    && s.device_notifications_enabled
+            })
+            .cloned()
+            .collect();
+        if !fcm_dev.is_empty() {
+            tasks.push(Box::pin(fan_push(
+                self.clone_push_handles(),
+                self.pool.clone(),
+                partial.address.clone(),
+                fcm_dev,
+                device_partial_fcm_payload(partial),
+            )) as TaskFuture);
+        }
+        let unified_dev: Vec<_> = push_subs
+            .iter()
+            .filter(|s| {
+                s.subscription_type.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED)
+                    && s.device_notifications_enabled
+            })
+            .cloned()
+            .collect();
+        if !unified_dev.is_empty() {
+            tasks.push(Box::pin(fan_push(
+                self.clone_push_handles(),
+                self.pool.clone(),
+                partial.address.clone(),
+                unified_dev,
+                device_partial_unified_payload(partial),
+            )) as TaskFuture);
+        }
+
+        join_all(tasks).await;
     }
 
     /// Several transitions on one address, collapsed into one message.
@@ -508,6 +573,115 @@ async fn send_telegram_device_status(
     join_all(tasks).await;
 }
 
+async fn send_telegram_device_partial(
+    adapter: Arc<TelegramAdapter>,
+    pool: PgPool,
+    chat_languages: ChatLanguageMap,
+    partial: DevicePartial,
+    subs: Vec<TelegramSubscriptionRow>,
+    tz: chrono_tz::Tz,
+) {
+    let fmt_addr = format_address_short(partial.address.as_str());
+    let tasks = subs.into_iter().map(|sub| {
+        let adapter = Arc::clone(&adapter);
+        let pool = pool.clone();
+        let chat_languages = chat_languages.clone();
+        let partial = partial.clone();
+        let fmt_addr = fmt_addr.clone();
+        async move {
+            let lang = chat_language(&chat_languages, sub.telegram_chat_id).await;
+            let chat_count = count_chat_subscriptions(&pool, sub.telegram_chat_id).await;
+            let time_str = format_device_time(tz, partial.timestamp, lang);
+            let suffix = (chat_count > 1).then(|| match lang {
+                Language::De => format!(" – Adresse {fmt_addr}"),
+                Language::En => format!(" – address {fmt_addr}"),
+            });
+            let text = DevicePartialText::build(&DevicePartialArgs {
+                language: lang,
+                time_formatted: &time_str,
+                worker_name: partial.worker_name.as_deref(),
+                remaining: partial.remaining,
+                before: partial.before,
+                address_suffix: suffix.as_deref(),
+            });
+            log_adapter_send(
+                "telegram-device-partial",
+                adapter
+                    .send_text(sub.telegram_chat_id, text.pick(lang))
+                    .await,
+            );
+        }
+    });
+    join_all(tasks).await;
+}
+
+/// Push payload for a partial loss.
+///
+/// `status` is deliberately NOT `online`/`offline`: a client that branches
+/// on those two must not file this under either, because the worker is
+/// neither gone nor unchanged. The device keys shipped clients read are
+/// all present, with the counts added alongside.
+fn device_partial_fcm_payload(partial: &DevicePartial) -> PushPayload {
+    let time_str = partial.timestamp.format("%m/%d/%y, %-I:%M %p").to_string();
+    let text = DevicePartialText::build(&DevicePartialArgs {
+        language: Language::En,
+        time_formatted: &time_str,
+        worker_name: partial.worker_name.as_deref(),
+        remaining: partial.remaining,
+        before: partial.before,
+        address_suffix: None,
+    });
+    PushPayload {
+        kind: PushKind::DeviceStatus,
+        title: "Device Status".to_string(),
+        body: text.en,
+        tag: "reduced".to_string(),
+        extras: vec![
+            ("isReturning".into(), "false".to_string()),
+            (
+                "workerName".into(),
+                partial
+                    .worker_name
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string()),
+            ),
+            (
+                "userAgent".into(),
+                partial
+                    .user_agent
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string()),
+            ),
+            ("remaining".into(), partial.remaining.to_string()),
+            ("before".into(), partial.before.to_string()),
+            (
+                "timestamp".into(),
+                partial.timestamp.timestamp_millis().to_string(),
+            ),
+        ],
+    }
+}
+
+/// UnifiedPush counterpart — same `title|body|` shape as the others.
+fn device_partial_unified_payload(partial: &DevicePartial) -> PushPayload {
+    let time_str = partial.timestamp.format("%m/%d/%y, %-I:%M %p").to_string();
+    let text = DevicePartialText::build(&DevicePartialArgs {
+        language: Language::En,
+        time_formatted: &time_str,
+        worker_name: partial.worker_name.as_deref(),
+        remaining: partial.remaining,
+        before: partial.before,
+        address_suffix: None,
+    });
+    PushPayload {
+        kind: PushKind::DeviceStatus,
+        title: "Device Status".to_string(),
+        body: text.en,
+        tag: String::new(),
+        extras: Vec::new(),
+    }
+}
+
 async fn send_telegram_device_aggregate(
     adapter: Arc<TelegramAdapter>,
     pool: PgPool,
@@ -537,6 +711,7 @@ async fn send_telegram_device_aggregate(
                 went_offline: &agg.went_offline,
                 came_back: &agg.came_back,
                 first_seen: &agg.first_seen,
+                reduced: &agg.reduced,
                 address_suffix: suffix.as_deref(),
             });
             log_adapter_send(
@@ -570,6 +745,7 @@ fn device_aggregate_fcm_payload(agg: &DeviceAggregate) -> PushPayload {
         went_offline: &agg.went_offline,
         came_back: &agg.came_back,
         first_seen: &agg.first_seen,
+        reduced: &agg.reduced,
         address_suffix: None,
     });
     let online = agg.came_back.len() + agg.first_seen.len();
@@ -619,6 +795,7 @@ fn device_aggregate_unified_payload(agg: &DeviceAggregate) -> PushPayload {
         went_offline: &agg.went_offline,
         came_back: &agg.came_back,
         first_seen: &agg.first_seen,
+        reduced: &agg.reduced,
         address_suffix: None,
     });
     PushPayload {
@@ -1031,6 +1208,7 @@ mod tests {
             went_offline: offline.iter().map(|s| (*s).to_string()).collect(),
             came_back: back.iter().map(|s| (*s).to_string()).collect(),
             first_seen: fresh.iter().map(|s| (*s).to_string()).collect(),
+            reduced: Vec::new(),
             timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("timestamp"),
         }
     }
