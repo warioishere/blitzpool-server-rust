@@ -181,6 +181,7 @@ pub(crate) fn build_per_port_servers(
         Arc<crate::device_status_gate::Gate>,
         crate::device_status_gate::SubscribedAddresses,
     )>,
+    live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
 ) -> Vec<Sv2PortServer> {
     let Some(tdp) = foundation.tdp.as_ref() else {
@@ -252,6 +253,7 @@ pub(crate) fn build_per_port_servers(
             lookup.clone(),
             mode_gate.clone(),
             device_status_sink.clone(),
+            Arc::clone(&live_sessions),
         );
 
         // Subscribe + snapshot — broadcast catches future updates,
@@ -319,6 +321,7 @@ pub(crate) fn build_per_port_servers(
 
 // ─── MiningServerHooks composition ────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn build_port_hooks(
     port_payout_mode: MiningMode,
     payout_resolver: Arc<dyn PayoutResolver>,
@@ -327,6 +330,7 @@ fn build_port_hooks(
     group_lookup: Arc<dyn GroupLookup>,
     mode_gate: Arc<BlitzpoolModeGate>,
     device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink>,
+    live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
 ) -> MiningServerHooks {
     // Front-only path (Stratum spawns only on the front), where
     // `engines::spawn` always builds these composites.
@@ -353,7 +357,7 @@ fn build_port_hooks(
             mode_gate,
             group_lookup,
             blockparty_lookup,
-            Arc::new(engines.session_persistence_hook.clone()),
+            live_sessions,
         ));
     let session: Arc<dyn Sv2SessionPersist> =
         Arc::new(Sv2SessionPersistenceAdapter::new(mode_gate_persistence));

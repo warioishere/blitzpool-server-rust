@@ -107,6 +107,7 @@ pub(crate) fn build_per_port_servers(
         Arc<crate::device_status_gate::Gate>,
         crate::device_status_gate::SubscribedAddresses,
     )>,
+    live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
 ) -> Result<Vec<Sv1PortServer>, StratumV1SpawnError> {
     let Some(tdp) = foundation.tdp.as_ref() else {
@@ -191,6 +192,7 @@ pub(crate) fn build_per_port_servers(
             lookup.clone(),
             engines.mode_gate.clone(),
             device_status_sink.clone(),
+            Arc::clone(&live_sessions),
         );
 
         // Subscribe BEFORE snapshotting — anything broadcast between the
@@ -318,6 +320,7 @@ pub(crate) fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
 
 // ─── ServerHooks composition ──────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn build_port_hooks(
     port_payout_mode: MiningMode,
     block_sink: Arc<dyn bp_stratum_v1::BlockSubmissionSink>,
@@ -326,6 +329,7 @@ fn build_port_hooks(
     group_lookup: Arc<dyn GroupLookup>,
     mode_gate: Arc<BlitzpoolModeGate>,
     device_status_sink: Arc<dyn bp_stratum_v1::DeviceStatusSink>,
+    live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
 ) -> ServerHooks {
     // Front-only path: `build_per_port_servers` runs only when Stratum spawns
     // (the front), where `engines::spawn` always builds these.
@@ -352,7 +356,7 @@ fn build_port_hooks(
             mode_gate,
             group_lookup,
             blockparty_lookup,
-            Arc::new(engines.session_persistence_hook.clone()),
+            live_sessions,
         ));
     let session = Sv1SessionPersistenceAdapter::new(mode_gate_persistence);
 

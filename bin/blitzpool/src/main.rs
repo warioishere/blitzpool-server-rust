@@ -58,6 +58,7 @@ mod jdp;
 mod jdp_hooks;
 mod listeners;
 mod live_mode_marker;
+mod live_sessions;
 mod payout_resolver;
 mod pending_blocks;
 mod pending_group_solo_blocks;
@@ -463,7 +464,6 @@ async fn main() -> ExitCode {
                 online_dwell: Duration::from_secs(ds.online_dwell_secs),
                 coalesce_window: Duration::from_secs(ds.coalesce_window_secs),
                 recheck_interval: Duration::from_secs(ds.recheck_interval_secs),
-                reaper_confirm: Duration::from_secs(ds.reaper_confirm_secs),
             },
             handles.db.pool().clone(),
             handles.redis.clone(),

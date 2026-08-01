@@ -816,14 +816,12 @@ where
     Ok(result.rows_affected())
 }
 
-/// What the device-status debounce needs to know about one
-/// `(address, clientName)` pair — see [`device_liveness`].
+/// When the pool first saw one `(address, clientName)` pair —
+/// see [`device_first_seen`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceLivenessRow {
+pub struct DeviceFirstSeenRow {
     pub address: String,
     pub client_name: String,
-    /// Sessions currently connected (`deletedAt IS NULL`).
-    pub live_sessions: i64,
     /// Earliest `COALESCE("firstSeen", "startTime")` across **all** rows
     /// for the pair, soft-deleted ones included — when the pool first saw
     /// this worker.
@@ -834,14 +832,6 @@ pub struct DeviceLivenessRow {
     /// `firstSeen` is deliberately absent from that SET list and is the
     /// stable column.
     pub first_seen_ms: i64,
-    /// Most recent `deletedAt` across the pair's rows, when none is live.
-    ///
-    /// Needed because a soft-delete does **not** prove a disconnect:
-    /// [`kill_dead_clients`] stamps the same column purely for share
-    /// inactivity, so a connected miner that shares less often than
-    /// `STALE_CLIENT_TTL` gets swept while it is still hashing. The gate
-    /// uses the age of this stamp to decide whether "gone" is credible.
-    pub last_deleted_ms: Option<i64>,
 }
 
 /// Liveness + first-seen for each requested `(address, clientName)`.
@@ -858,16 +848,14 @@ pub struct DeviceLivenessRow {
 /// Batched over both key columns so one sweep costs one round-trip
 /// regardless of how many devices are due. The `(address, clientName)`
 /// prefix of the primary key carries the scan.
-pub async fn device_liveness(
+pub async fn device_first_seen(
     pool: &PgPool,
     addresses: &[String],
     client_names: &[String],
-) -> Result<Vec<DeviceLivenessRow>, DbError> {
+) -> Result<Vec<DeviceFirstSeenRow>, DbError> {
     let rows = sqlx::query!(
         r#"SELECT address AS "address!", "clientName" AS "client_name!",
-                  COUNT(*) FILTER (WHERE "deletedAt" IS NULL) AS "live_sessions!",
-                  MIN(COALESCE("firstSeen", "startTime")) AS "first_seen_ms!",
-                  MAX("deletedAt") AS "last_deleted_ms"
+                  MIN(COALESCE("firstSeen", "startTime")) AS "first_seen_ms!"
            FROM client_entity
            WHERE (address, "clientName") IN (
                    SELECT * FROM UNNEST($1::text[], $2::text[])
@@ -881,12 +869,10 @@ pub async fn device_liveness(
     .map_err(DbError::from)?;
     Ok(rows
         .into_iter()
-        .map(|r| DeviceLivenessRow {
+        .map(|r| DeviceFirstSeenRow {
             address: r.address,
             client_name: r.client_name,
-            live_sessions: r.live_sessions,
             first_seen_ms: r.first_seen_ms,
-            last_deleted_ms: r.last_deleted_ms,
         })
         .collect())
 }

@@ -368,10 +368,10 @@ submit_latency = false
 # connect and disconnect; sent verbatim that is one push pair per WiFi
 # hiccup, per rotating rental rig and per pool restart. Nothing is sent
 # on an event — it only schedules a re-check, and at that moment the
-# pool asks the database how many sessions the (address, worker) really
-# has. So a device that returns inside the grace produces no message at
-# all, and a source with many rigs under one worker name is only
-# reported offline once its last rig is gone.
+# pool asks the Stratum fronts which devices they actually hold open.
+# So a device that returns inside the grace produces no message at all,
+# and a source with many rigs under one worker name is only reported
+# offline once its last rig is gone.
 #
 # Consequence worth knowing: a genuine outage is reported
 # `offline_grace_secs` late. The defaults below are also the built-in
@@ -384,12 +384,6 @@ submit_latency = false
 #                              # transitions inside it leave together as one summary
 # recheck_interval_secs = 300  # how often a settled device is re-checked, so a
 #                              # wrong answer corrects itself instead of standing
-# reaper_confirm_secs = 1800   # how long a session must stay soft-deleted before
-#                              # "gone" is believed WITHOUT a disconnect behind it.
-#                              # The dead-client sweep retires a session after 5 min
-#                              # without an accepted share, which a slow miner does
-#                              # while still connected. A real disconnect is an
-#                              # event and is not delayed by this.
 
 # ───────────────────────────────────────────────────────────────
 # SMTP (transactional email — invitations + verification)

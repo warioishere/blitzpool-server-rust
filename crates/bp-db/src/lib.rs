@@ -91,7 +91,7 @@ pub use client::{
     bulk_set_client_hashrate, bulk_touch_clients_for_share, delete_client_for_session,
     delete_old_client_difficulty_statistics, delete_old_client_rejected_statistics,
     delete_old_client_statistics, delete_old_clients, delete_old_pool_mode_hashrate,
-    device_liveness, device_watch_seed, find_client, find_client_difficulty_statistics,
+    device_first_seen, device_watch_seed, find_client, find_client_difficulty_statistics,
     find_client_recent_first_seen, find_client_rejected_statistics,
     find_client_rejected_statistics_since_for_address, find_client_statistics,
     find_client_statistics_since, find_client_statistics_since_for_address,
@@ -99,7 +99,7 @@ pub use client::{
     kill_dead_clients, reset_all_client_hashrate, sum_active_pool_hashrate,
     sum_hashrate_for_addresses, touch_client_for_share, update_sv2_user_agent_by_address,
     upsert_client, upsert_client_difficulty_statistic, ClientDifficultyStatisticsRow,
-    ClientRejectedStatisticsRow, ClientRow, ClientStatisticsRow, ClientUpsert, DeviceLivenessRow,
+    ClientRejectedStatisticsRow, ClientRow, ClientStatisticsRow, ClientUpsert, DeviceFirstSeenRow,
     PoolWorkerRow, UserAgentAggRow, WorkerSharesRow,
 };
 pub use email::{

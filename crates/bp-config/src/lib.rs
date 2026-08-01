@@ -915,17 +915,6 @@ pub struct DeviceStatusConfig {
     /// until the miner next reconnects.
     #[serde(default = "default_recheck_interval_secs")]
     pub recheck_interval_secs: u64,
-    /// How long a session must stay soft-deleted before "gone" is
-    /// believed without a disconnect behind it.
-    ///
-    /// The dead-client sweep retires a session that has not submitted an
-    /// accepted share for five minutes, which a slow miner does while
-    /// still connected. Believing that directly reported an outage that
-    /// was not one — and, because the state is re-checked, repeated it
-    /// every few minutes. A real disconnect is an event and is not
-    /// delayed by this.
-    #[serde(default = "default_reaper_confirm_secs")]
-    pub reaper_confirm_secs: u64,
 }
 
 fn default_offline_grace_secs() -> u64 {
@@ -944,10 +933,6 @@ fn default_recheck_interval_secs() -> u64 {
     300
 }
 
-fn default_reaper_confirm_secs() -> u64 {
-    1800
-}
-
 impl Default for DeviceStatusConfig {
     fn default() -> Self {
         Self {
@@ -955,7 +940,6 @@ impl Default for DeviceStatusConfig {
             online_dwell_secs: default_online_dwell_secs(),
             coalesce_window_secs: default_coalesce_window_secs(),
             recheck_interval_secs: default_recheck_interval_secs(),
-            reaper_confirm_secs: default_reaper_confirm_secs(),
         }
     }
 }
@@ -1257,7 +1241,6 @@ mod tests {
         assert_eq!(ds.online_dwell_secs, 90);
         assert_eq!(ds.coalesce_window_secs, 300);
         assert_eq!(ds.recheck_interval_secs, 300);
-        assert_eq!(ds.reaper_confirm_secs, 1800);
 
         // A partial block keeps the defaults for the keys it omits.
         let cfg: AppConfig = toml::from_str(&format!(
@@ -1271,7 +1254,6 @@ mod tests {
         assert_eq!(ds.online_dwell_secs, 90);
         assert_eq!(ds.coalesce_window_secs, 300);
         assert_eq!(ds.recheck_interval_secs, 300);
-        assert_eq!(ds.reaper_confirm_secs, 1800);
     }
 
     #[test]

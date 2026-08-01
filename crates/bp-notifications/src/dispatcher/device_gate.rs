@@ -55,22 +55,19 @@
 //! another Stratum event, and a miner that is stably connected (or
 //! stably dead) will never send one.
 //!
-//! ## Why the database, and where it lies
+//! ## Where liveness comes from
 //!
-//! `client_entity` rows with `deletedAt IS NULL` are the only
-//! cross-process view of who is connected. But a soft-delete does not
-//! prove a disconnect: the dead-client cron stamps the same column purely
-//! because a session has not submitted an accepted share for five
-//! minutes, so a slow miner gets swept while it is still hashing. Trusting
-//! that directly produced a false "offline", and — because the re-check
-//! keeps asking — a false offline/online cycle every few minutes, forever.
+//! From the process that holds the sockets. The Stratum front publishes
+//! the set of `(address, worker)` pairs it currently has open, and the
+//! lookup behind [`DeviceLivenessLookup`] answers from that union.
 //!
-//! So "gone" is only believed when one of two things holds: a disconnect
-//! event was actually observed for the device, or the soft-delete has
-//! stood for [`DeviceGateConfig::reaper_confirm`], long enough that share
-//! inactivity is no longer a plausible explanation. The fast path stays
-//! fast (a real disconnect is an event) and inactivity alone can no
-//! longer fabricate an outage.
+//! This is deliberately NOT derived from `client_entity`. A row there is
+//! soft-deleted both by a real disconnect and by the dead-client cron
+//! retiring a session that merely has not submitted an accepted share
+//! for five minutes — so a slow miner is indistinguishable from a dead
+//! one, and a gate built on it reported outages that never happened.
+//! Asking the front removes the inference instead of compensating for
+//! it.
 //!
 //! ## Telling a new device from an old one
 //!
@@ -119,11 +116,6 @@ pub struct DeviceGateConfig {
     /// How often a device is re-checked once it has settled. This is
     /// what makes a wrong answer temporary instead of permanent.
     pub recheck_interval: Duration,
-    /// How long a soft-deleted session must stay soft-deleted before
-    /// "gone" is believed **without** a disconnect event behind it.
-    /// Guards against the dead-client sweep, which retires a connected
-    /// session purely for share inactivity.
-    pub reaper_confirm: Duration,
 }
 
 impl Default for DeviceGateConfig {
@@ -133,7 +125,6 @@ impl Default for DeviceGateConfig {
             online_dwell: Duration::from_secs(90),
             coalesce_window: Duration::from_secs(300),
             recheck_interval: Duration::from_secs(300),
-            reaper_confirm: Duration::from_secs(1800),
         }
     }
 }
@@ -162,8 +153,6 @@ pub struct DeviceLiveness {
     /// Earliest `COALESCE(firstSeen, startTime)` across every row for the
     /// pair — when the pool first saw this worker.
     pub first_seen_ms: i64,
-    /// Most recent `deletedAt` when nothing is live. `None` while live.
-    pub last_deleted_ms: Option<i64>,
 }
 
 /// Liveness lookup, abstracted so the gate is unit-testable without a
@@ -244,10 +233,6 @@ struct DeviceState {
     /// means the deadline is the periodic re-check, so the next event
     /// may claim it.
     armed_by: Option<Direction>,
-    /// A disconnect was actually observed since the device last resolved
-    /// to online. Without this, "no live rows" might only mean the
-    /// dead-client sweep retired a share-quiet session.
-    saw_offline_event: bool,
     /// Set while this device's key is out at the liveness lookup.
     in_flight: bool,
     /// An event landed while the lookup was in flight, so the answer
@@ -359,10 +344,6 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
                 notified,
                 due_at: now,
                 armed_by: None,
-                // A seeded device brings no event with it. Its liveness
-                // is judged on the soft-delete age alone, which is
-                // exactly the conservative path.
-                saw_offline_event: false,
                 in_flight: false,
                 dirty: false,
                 meta: DeviceStatusEvent {
@@ -401,7 +382,6 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
             notified,
             due_at: now,
             armed_by: None,
-            saw_offline_event: false,
             in_flight: false,
             dirty: false,
             meta: event.clone(),
@@ -414,9 +394,6 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
         }
         state.meta = event.clone();
         state.last_event_at = now;
-        if !event.is_online {
-            state.saw_offline_event = true;
-        }
 
         match state.armed_by {
             // The pending deadline is only the periodic re-check, so this
@@ -508,8 +485,6 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
         let online_deadline = now + self.dwell(Direction::Online);
         let offline_deadline = now + self.dwell(Direction::Offline);
         let next_check = now + chrono_duration(self.cfg.recheck_interval);
-        let reaper_confirm_ms = self.cfg.reaper_confirm.as_millis() as i64;
-        let now_ms = now.timestamp_millis();
 
         let mut inner = self.lock();
         let mut retire = Vec::new();
@@ -540,39 +515,12 @@ impl<C: Clock, L: DeviceLivenessLookup, S: ReportedStateStore> DeviceStatusGate<
             let seen = answer.get(key).copied();
             let live = seen.is_some_and(|l| l.live);
 
-            // "No live rows" is not proof of a disconnect — the
-            // dead-client sweep stamps the same column for a session that
-            // merely went quiet. Believe it only with an observed
-            // disconnect behind it, or once the stamp has stood long
-            // enough that inactivity cannot explain it.
-            if !live && !state.saw_offline_event {
-                // No row at all means the pool has no record of the pair
-                // — it aged out of `client_entity` entirely, which is as
-                // gone as it gets. Only a row that still exists but is
-                // soft-deleted is suspect, because that is what the
-                // dead-client sweep produces.
-                let credible = match seen {
-                    None => true,
-                    Some(l) => l
-                        .last_deleted_ms
-                        .is_some_and(|deleted| now_ms - deleted >= reaper_confirm_ms),
-                };
-                if !credible {
-                    state.armed_by = None;
-                    state.due_at = next_check;
-                    continue;
-                }
-            }
-
             let target = if live {
                 Notified::Online
             } else {
                 Notified::Offline
             };
             state.armed_by = None;
-            if live {
-                state.saw_offline_event = false;
-            }
 
             let previous = state.notified;
             if target != previous {
@@ -778,32 +726,14 @@ mod tests {
                     live,
                     first_seen_ms: (t0() + chrono::Duration::seconds(first_seen_offset_s))
                         .timestamp_millis(),
-                    // `live_sessions == 0` means every row carries a
-                    // non-NULL `deletedAt`, so the two can never
-                    // disagree the way a hand-built `None` would.
-                    last_deleted_ms: (!live)
-                        .then(|| (t0() - chrono::Duration::days(1)).timestamp_millis()),
                 },
             );
         }
-        /// Flip liveness. Going offline stamps a soft-delete far enough
-        /// in the past that the reaper guard does not hold it — tests
-        /// that care about that guard use `reap` instead.
+        /// Flip what the front reports holding open.
         fn set_live(&self, worker: &str, live: bool) {
             let mut rows = self.rows.lock().expect("lock");
             if let Some(entry) = rows.get_mut(&Self::key(worker)) {
                 entry.live = live;
-                entry.last_deleted_ms =
-                    (!live).then(|| (t0() - chrono::Duration::days(1)).timestamp_millis());
-            }
-        }
-        /// The dead-client sweep retiring a still-connected session:
-        /// not live, soft-deleted `at`.
-        fn reap(&self, worker: &str, at: DateTime<Utc>) {
-            let mut rows = self.rows.lock().expect("lock");
-            if let Some(entry) = rows.get_mut(&Self::key(worker)) {
-                entry.live = false;
-                entry.last_deleted_ms = Some(at.timestamp_millis());
             }
         }
         fn forget(&self, worker: &str) {
@@ -1445,74 +1375,25 @@ mod tests {
         );
     }
 
-    // ── The dead-client sweep ───────────────────────────────────────
-
-    /// The sweep retires any session with no accepted share for five
-    /// minutes, which a slow miner does while still connected. Believing
-    /// that produced a false outage — and, because the state is
-    /// re-checked, repeated it every few minutes forever.
+    /// A miner that is merely share-quiet must not read as gone. The
+    /// front reports what it holds open, so a session that has not
+    /// submitted a share in a while is still simply live — the
+    /// dead-client sweep, which retires such a session in the database,
+    /// has no say here at all.
     #[tokio::test]
-    async fn a_reaped_but_connected_miner_is_not_reported_offline() {
+    async fn a_share_quiet_but_connected_miner_stays_online() {
         let h = harness();
         h.bring_online("axe01").await;
         h.open_window();
 
-        // Swept for inactivity. No disconnect event exists.
-        for cycle in 0..6 {
-            h.db.reap("axe01", h.clock.now());
+        // Hours of re-checks with no Stratum event and no share.
+        for cycle in 0..20 {
             h.advance(301);
             assert!(
                 h.gate.poll_due().await.is_empty(),
-                "cycle {cycle}: inactivity is not an outage"
-            );
-            // Its next accepted share revives the row.
-            h.db.set_live("axe01", true);
-            h.advance(301);
-            assert!(
-                h.gate.poll_due().await.is_empty(),
-                "cycle {cycle}: nothing changed"
+                "cycle {cycle}: the front still holds it open"
             );
         }
-    }
-
-    /// The guard must not swallow a genuine outage: once the soft-delete
-    /// has stood longer than `reaper_confirm`, inactivity no longer
-    /// explains it.
-    #[tokio::test]
-    async fn a_long_standing_soft_delete_is_believed_without_an_event() {
-        let h = harness();
-        h.bring_online("axe01").await;
-        h.open_window();
-
-        let reaped_at = h.clock.now();
-        h.db.reap("axe01", reaped_at);
-        h.advance(301);
-        assert!(h.gate.poll_due().await.is_empty(), "too soon to believe");
-
-        h.advance(1800);
-        assert_eq!(
-            singles(&h.gate.poll_due().await),
-            vec![("axe01".into(), false)],
-            "half an hour gone is an outage, share-quiet or not"
-        );
-    }
-
-    /// A real disconnect is an event, and must not wait for the
-    /// confirmation window the reaper guard imposes.
-    #[tokio::test]
-    async fn an_observed_disconnect_is_not_delayed_by_the_reaper_guard() {
-        let h = harness();
-        h.bring_online("axe01").await;
-        h.open_window();
-
-        h.db.reap("axe01", h.clock.now());
-        h.gate.observe(&event("axe01", false, h.clock.now()));
-        h.advance(301);
-        assert_eq!(
-            singles(&h.gate.poll_due().await),
-            vec![("axe01".into(), false)],
-            "the grace decides, not the confirmation window"
-        );
     }
 
     // ── Failure handling, coalescing, memory ────────────────────────
@@ -1750,7 +1631,6 @@ mod tests {
             online_dwell: Duration::from_secs(10),
             coalesce_window: Duration::from_secs(300),
             recheck_interval: Duration::from_secs(300),
-            reaper_confirm: Duration::from_secs(1800),
         });
 
         // `b` is known and reported online; `a` is announced, which is

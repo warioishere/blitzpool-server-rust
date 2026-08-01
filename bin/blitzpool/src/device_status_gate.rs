@@ -6,8 +6,10 @@
 //! storage-agnostic; this module supplies the concrete pieces it needs
 //! and the task that drives it:
 //!
-//! - [`PgDeviceLiveness`] — liveness + first-seen + soft-delete age, read
-//!   from `client_entity`.
+//! - [`FrontLiveness`] — the liveness answer. "Is it connected?" comes
+//!   from the union of what the Stratum fronts publish (see
+//!   [`crate::live_sessions`]); only "when did the pool first see this
+//!   worker?", a historical fact, still comes from `client_entity`.
 //! - [`RedisReportedState`] — what each subscriber was last told,
 //!   persisted so a restart neither repeats an offline message nor
 //!   swallows the matching return.
@@ -44,6 +46,8 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::live_sessions::RedisLiveSessions;
+
 /// How often due devices are resolved. Well below the shortest dwell so
 /// the added latency is a rounding error on the configured grace, and
 /// cheap: a tick with nothing due costs one map scan and no query.
@@ -71,41 +75,60 @@ const REPORTED_PREFIX: &str = "device:status:reported:";
 const REPORTED_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// The concrete gate the binary uses.
-pub(crate) type Gate = DeviceStatusGate<SystemClock, PgDeviceLiveness, RedisReportedState>;
+pub(crate) type Gate = DeviceStatusGate<SystemClock, FrontLiveness, RedisReportedState>;
 
-/// Liveness lookup backed by `client_entity`.
-pub(crate) struct PgDeviceLiveness {
+/// Liveness from the fronts, first-seen from the database.
+///
+/// The split is deliberate. Whether a device is connected **right now**
+/// is only known first-hand by the process holding its socket, and every
+/// database-derived answer conflates it with share activity. When the
+/// pool first saw the worker is the opposite: a historical fact no live
+/// process can reconstruct.
+pub(crate) struct FrontLiveness {
     pool: PgPool,
+    live: RedisLiveSessions,
 }
 
 #[async_trait]
-impl DeviceLivenessLookup for PgDeviceLiveness {
+impl DeviceLivenessLookup for FrontLiveness {
     async fn liveness(&self, keys: &[DeviceKey]) -> Option<HashMap<DeviceKey, DeviceLiveness>> {
+        // `None` here means no front is publishing, which is NOT the
+        // same as "nothing is connected" — concluding the latter would
+        // report the whole pool offline during a front deploy.
+        let live = self.live.union().await?;
+
         let addresses: Vec<String> = keys.iter().map(|(a, _)| a.clone()).collect();
         let workers: Vec<String> = keys.iter().map(|(_, w)| w.clone()).collect();
-        match bp_db::device_liveness(&self.pool, &addresses, &workers).await {
-            Ok(rows) => Some(
-                rows.into_iter()
-                    .map(|r| {
+        let first_seen: HashMap<DeviceKey, i64> =
+            match bp_db::device_first_seen(&self.pool, &addresses, &workers).await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|r| ((r.address, r.client_name), r.first_seen_ms))
+                    .collect(),
+                Err(err) => {
+                    warn!(%err, "device-status gate: first-seen lookup failed — holding deadlines");
+                    return None;
+                }
+            };
+
+        Some(
+            keys.iter()
+                .filter_map(|key| {
+                    // A pair the pool has no record of at all cannot be
+                    // judged for novelty, so it is left out entirely and
+                    // the gate treats it as absent.
+                    first_seen.get(key).map(|first_seen_ms| {
                         (
-                            (r.address, r.client_name),
+                            key.clone(),
                             DeviceLiveness {
-                                live: r.live_sessions > 0,
-                                first_seen_ms: r.first_seen_ms,
-                                last_deleted_ms: r.last_deleted_ms,
+                                live: live.contains(key),
+                                first_seen_ms: *first_seen_ms,
                             },
                         )
                     })
-                    .collect(),
-            ),
-            Err(err) => {
-                // Deliberately `None`, not an empty map: an empty map
-                // reads as "nothing is connected" and would fire an
-                // offline notification for every due device.
-                warn!(%err, "device-status gate: liveness lookup failed — holding deadlines");
-                None
-            }
-        }
+                })
+                .collect(),
+        )
     }
 }
 
@@ -254,7 +277,10 @@ pub(crate) fn build(
     let gate = Arc::new(DeviceStatusGate::new(
         cfg,
         SystemClock,
-        PgDeviceLiveness { pool },
+        FrontLiveness {
+            pool,
+            live: RedisLiveSessions::new(redis.clone()),
+        },
         RedisReportedState { redis },
     ));
     (gate, SubscribedAddresses::new())
