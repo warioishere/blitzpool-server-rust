@@ -426,10 +426,14 @@ where
     Ok(result.rows_affected())
 }
 
-/// All `pplns_group_balance` rows for one group with a positive
+/// All `pplns_group_balance` rows for one group with a non-zero
 /// `pendingSats`. Consumed by `bp-group-solo-engine::distribution`
 /// when building a payout distribution — every member with an open
-/// pending claim is folded into the math.
+/// position is folded into the math, in BOTH directions: a positive
+/// balance raises their weight until it is paid out, a negative one
+/// (a coinbase paid them more than they earned) lowers it until the
+/// debt is worked off. Filtering to positives only would leave a debt
+/// invisible to every future distribution, i.e. permanently unrecoverable.
 pub async fn find_pplns_group_balances_for_group(
     pool: &PgPool,
     group_id: Uuid,
@@ -444,7 +448,7 @@ pub async fn find_pplns_group_balances_for_group(
             "updatedAt" AS "updated_at!",
             "lastAcceptedShareAt" AS "last_accepted_share_at?"
            FROM pplns_group_balance
-           WHERE "groupId" = $1 AND "pendingSats" > 0"#,
+           WHERE "groupId" = $1 AND "pendingSats" <> 0"#,
         group_id,
     )
     .fetch_all(pool)

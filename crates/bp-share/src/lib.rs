@@ -336,25 +336,268 @@ pub fn reward_within_band(t_ref: u64, t_actual: u64) -> bool {
     t_actual >= t_ref.saturating_sub(tolerance) && t_actual <= t_ref.saturating_add(tolerance)
 }
 
-/// A miner's settlement claim on a found block:
-/// `floor(score_weight · (1 − fee) · t_actual / score_total)`, the
-/// weight model's "earned" side. Settlement books
-/// `balance += claim − actually_paid` per address, with `t_actual` and
-/// the paid amounts read from the REAL coinbase of the found block —
-/// so the claim must come from the same raw inputs the published
-/// weights were derived from, never from any projected wire weight.
+/// `pot(t) = (1 − fee) · t` — the miners' cut of a block paying `t`.
+/// Everything the weight model splits by score, and the base every
+/// satoshi-denominated promise is measured against.
+pub fn miner_pot_sats(fee_ppm: u32, t: u64) -> u64 {
+    let miner_ppm = 1_000_000u128.saturating_sub(fee_ppm as u128);
+    ((t as u128 * miner_ppm) / 1_000_000u128) as u64
+}
+
+/// Ceiling on `X` as a percentage of `pot(t_ref)`: the extras may
+/// promise at most this much of the miners' cut, leaving the rest to be
+/// split by score.
 ///
-/// Integer-exact: `fee_ppm` is parts-per-million (1 % = 10 000);
-/// the u128 product `score · (10^6 − fee_ppm) · t` stays far below
-/// 2^128 for any real score precision and sat amount.
-pub fn claim_sats(score_weight: u64, score_total: u64, fee_ppm: u32, t_actual: u64) -> u64 {
+/// The divisor of the whole projection is `pot − X`, so an `X` at or
+/// above the pot would divide by zero or flip the sign of every boost.
+/// Five percent of headroom also keeps a distribution payable: with the
+/// full pot promised away, every miner without a promise is pruned to
+/// nothing.
+const EXTRA_SOLVENCY_PERCENT: i128 = 95;
+
+/// The largest FURTHER promise that still leaves the ledger solvent
+/// against `reference_revenue_sats`, given the `committed` (signed)
+/// sum of everything already promised.
+///
+/// A Group-Solo finder bonus MUST go through this before it reaches
+/// [`project_extras`] and before it is recorded for settlement. It is
+/// the one promise the pool picks freely rather than owes, so it is the
+/// one that gives way first — and it is also the only promise whose
+/// capping could never be reproduced later, because the snapshot
+/// records the capped value and settlement cannot tell how large the
+/// operator's original figure was.
+pub fn solvency_headroom_sats(committed: i64, fee_ppm: u32, reference_revenue_sats: u64) -> u64 {
+    let cap =
+        miner_pot_sats(fee_ppm, reference_revenue_sats) as i128 * EXTRA_SOLVENCY_PERCENT / 100;
+    (cap - committed as i128).clamp(0, u64::MAX as i128) as u64
+}
+
+/// The satoshi promises a weight distribution carries on top of the
+/// pure score split, resolved against one reference revenue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraProjection {
+    /// The effective extra per input entry, in input order: the value
+    /// actually projected into weight space after the solvency scale
+    /// and the per-address repayment floor.
+    pub effective: Vec<i64>,
+    /// `X = Σ effective` — signed. Every claim is measured against
+    /// `pot − X`, so build and settlement MUST agree on it exactly.
+    pub total: i64,
+    /// `pot(t_ref) − X`, the projection divisor. Always ≥ 1.
+    pub divisor: u128,
+}
+
+/// Fold a ledger and an optional finder bonus into the
+/// `(score_weight, extra_sats)` pairs [`project_extras`] consumes.
+///
+/// Trivial, and shared anyway: the build reads the pairs off its
+/// candidates and settlement off a stored snapshot, and the two must
+/// agree to the satoshi about which entry carries the bonus.
+pub fn extras_from_ledger<'a>(
+    entries: impl IntoIterator<Item = (&'a str, u64, i64)>,
+    finder_bonus: Option<(&str, u64)>,
+) -> Vec<(u64, i64)> {
+    entries
+        .into_iter()
+        .map(|(address, score_weight, balance_sats)| {
+            let bonus = match finder_bonus {
+                Some((finder, sats)) if finder == address => sats as i64,
+                _ => 0,
+            };
+            (score_weight, balance_sats.saturating_add(bonus))
+        })
+        .collect()
+}
+
+/// Resolve the satoshi extras a distribution promises into the values
+/// it can actually honour at `reference_revenue_sats`.
+///
+/// `entries` is `(score_weight, extra_sats)` per address, where
+/// `extra_sats` is the SIGNED sum of everything that address is to
+/// receive beyond its score share: its ledger balance (negative when it
+/// owes the pool) plus, for a Group-Solo finder, the bonus.
+///
+/// Two things are enforced, in this order:
+///
+/// 1. **Solvency.** `X` above [`EXTRA_SOLVENCY_PERCENT`] of the pot
+///    scales every extra down pro rata. The divisor `pot − X` has to
+///    stay positive, and a promise larger than the block cannot be kept
+///    however the weights are arranged.
+/// 2. **Repayment floor.** A debt can only be collected out of the
+///    payout it shrinks: once an address's weight would go negative
+///    there is nothing left to take, so its extra is floored at
+///    `−score_weight · (pot − X) / score_total` and the remainder stays
+///    on the ledger for the next block. Without the floor the pool
+///    weight goes negative and the block pays out more than it holds.
+///
+/// Deterministic and order-independent (a sum, a per-element scale and
+/// a per-element floor), so settlement reproduces the build's `X` from
+/// the stored snapshot without storing it. Note that a Group-Solo bonus
+/// must be capped BEFORE it is passed in — settlement only ever sees
+/// the capped value, so any scaling of the bonus itself would not be
+/// reproducible from the snapshot.
+pub fn project_extras(
+    entries: &[(u64, i64)],
+    score_total: u64,
+    fee_ppm: u32,
+    reference_revenue_sats: u64,
+) -> ExtraProjection {
+    let pot = miner_pot_sats(fee_ppm, reference_revenue_sats) as i128;
+    if pot <= 0 {
+        // Nothing can be promised out of an empty miner cut, in either
+        // direction — and a claim measured against it must come out 0,
+        // not as the mirror image of a debt nobody can be paid from.
+        return ExtraProjection {
+            effective: vec![0; entries.len()],
+            total: 0,
+            divisor: 1,
+        };
+    }
+    let solvency_cap = pot * EXTRA_SOLVENCY_PERCENT / 100;
+    let mut effective: Vec<i128> = entries.iter().map(|(_, extra)| *extra as i128).collect();
+
+    scale_to_cap(&mut effective, solvency_cap);
+    // Bound for the divisor: the floors below only ever RAISE an extra,
+    // so from here `X` can only grow and `pot − X` only shrink. Without
+    // it a ledger where every scoring address is beyond repayment has
+    // no finite solution at all.
+    let divisor_bound = (pot - sum(&effective)).max(1);
+    apply_repayment_floors(&mut effective, entries, score_total, pot, divisor_bound);
+    // Raising the floors gives satoshis back, which can push the
+    // promises over the cap again. One more scale settles it, and it
+    // cannot re-break the floors: a scale shrinks every promise while
+    // `pot − X` grows, and a larger divisor is a looser floor.
+    scale_to_cap(&mut effective, solvency_cap);
+
+    let total = sum(&effective);
+    ExtraProjection {
+        effective: effective
+            .into_iter()
+            .map(|e| e.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+            .collect(),
+        total: total.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+        // Derived from the FINAL `X` rather than from the solve below,
+        // so the published boosts and the settlement claims are the two
+        // halves of one identity and cannot drift apart.
+        divisor: (pot - total).max(1) as u128,
+    }
+}
+
+fn sum(values: &[i128]) -> i128 {
+    values.iter().sum()
+}
+
+/// Scale every promise pro rata until they fit `cap`. A no-op unless
+/// the ledger is insolvent against this block.
+fn scale_to_cap(effective: &mut [i128], cap: i128) {
+    let x = sum(effective);
+    if x > cap {
+        for e in effective.iter_mut() {
+            *e = (*e * cap) / x;
+        }
+    }
+}
+
+/// Pin every debt that cannot be collected out of the payout it shrinks
+/// to exactly what that payout is worth.
+///
+/// Solved rather than iterated: for a known set `F` of pinned addresses
+/// the divisor follows in closed form from `D = pot − X` and
+/// `X = Σ_{i∉F} extra_i − Σ_{i∈F} u_i·D/S`, and the set only grows
+/// (pinning raises `X`, which shrinks `D`, which pins more) — so at
+/// most one pass per address, and one or two in practice. Iterating the
+/// floor instead converges only geometrically and stalls short of the
+/// fixed point for a large debtor.
+fn apply_repayment_floors(
+    effective: &mut [i128],
+    entries: &[(u64, i64)],
+    score_total: u64,
+    pot: i128,
+    divisor_bound: i128,
+) {
+    if score_total == 0 {
+        return;
+    }
+    let s = score_total as i128;
+    let mut pinned = vec![false; effective.len()];
+    let mut divisor = divisor_bound;
+    for _ in 0..=effective.len() {
+        let mut free_sum: i128 = 0;
+        let mut pinned_score: i128 = 0;
+        for (i, (score_weight, _)) in entries.iter().enumerate() {
+            if pinned[i] {
+                pinned_score += *score_weight as i128;
+            } else {
+                free_sum += effective[i];
+            }
+        }
+        let denom = s - pinned_score;
+        divisor = if denom > 0 {
+            (((pot - free_sum) * s) / denom).clamp(1, divisor_bound)
+        } else {
+            // Every scoring address is beyond repayment: no finite
+            // divisor satisfies all the floors, so take the loosest one
+            // and let the caller's zero-clamp absorb the rest.
+            divisor_bound
+        };
+        let mut grew = false;
+        for (i, (score_weight, _)) in entries.iter().enumerate() {
+            if pinned[i] || effective[i] >= 0 {
+                continue;
+            }
+            if effective[i] < -((*score_weight as i128 * divisor) / s) {
+                pinned[i] = true;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for (i, (score_weight, _)) in entries.iter().enumerate() {
+        if pinned[i] {
+            effective[i] = -((*score_weight as i128 * divisor) / s);
+        }
+    }
+}
+
+/// A miner's settlement claim on a found block: its score share of
+/// whatever the block's miner cut has left after the satoshi promises,
+/// `floor(score_weight · (pot(t_actual) − extras_total) / score_total)`.
+///
+/// `extras_total` is `X` from [`project_extras`] — signed, and the same
+/// value the published weights were projected against. Subtracting it
+/// is what keeps the ledger from inventing money: the coinbase paid
+/// those promises out of this very pot, so a member with no promise of
+/// its own earns a share of the REST, not of the whole. Charging it the
+/// full pot would credit every such member the promises of the others,
+/// block after block.
+///
+/// The finder bonus is NOT added here — the caller owns that, because
+/// only the caller knows which entry is the finder.
+///
+/// Settlement books `balance += claim − actually_paid` per address,
+/// with `t_actual` and the paid amounts read from the REAL coinbase of
+/// the found block, so the claim must come from the same raw inputs the
+/// published weights were derived from, never from a projected wire
+/// weight. Signed: promises exceeding the block's own miner cut (the
+/// revenue came in far below the projection) make the residual claim
+/// negative, and the difference is a debt like any other.
+///
+/// Integer-exact; the i128 product `score · pot` stays far below 2^127
+/// for any real score precision and sat amount.
+pub fn claim_sats(
+    score_weight: u64,
+    score_total: u64,
+    fee_ppm: u32,
+    t_actual: u64,
+    extras_total: i64,
+) -> i64 {
     if score_total == 0 {
         return 0;
     }
-    let miner_ppm = 1_000_000u128.saturating_sub(fee_ppm as u128);
-    let numer = score_weight as u128 * miner_ppm * t_actual as u128;
-    let denom = score_total as u128 * 1_000_000u128;
-    (numer / denom) as u64
+    let claimable = miner_pot_sats(fee_ppm, t_actual) as i128 - extras_total as i128;
+    ((score_weight as i128 * claimable) / score_total as i128) as i64
 }
 
 /// Identity of a weight distribution: the settlement INPUTS, not any
@@ -371,20 +614,34 @@ pub fn claim_sats(score_weight: u64, score_total: u64, fee_ppm: u32, t_actual: u
 /// exactly these inputs from the snapshot stored under this hash and
 /// books `earned(T_actual) − actually_paid` per address.
 ///
+/// `fee_address` IS in the preimage: it is the settlement recipient of
+/// everything the coinbase withholds, and the snapshot stored under
+/// this hash is read back to decide which row is the pool's rather than
+/// a miner's. Two distributions that differ only there must not share a
+/// key.
+///
 /// Deliberately NOT in the preimage: the published wire weights and
 /// the reference revenue behind their balance boosts — distributions
 /// that differ only there settle identically and may share a snapshot.
+/// `weight_P` follows the same rule: settlement never reads it, since
+/// what was actually paid comes from the block's own coinbase.
 ///
-/// Canonical, domain-tagged, length-prefixed; entry order is part of
-/// the identity (it is the coinbase output order).
+/// Canonical, domain-tagged, length-prefixed. Entry ORDER is part of
+/// the identity, so the caller must supply a canonical order that does
+/// not itself depend on an excluded input — address order. (The
+/// coinbase output order is NOT canonical: it sorts by wire weight,
+/// which carries the reference revenue through the balance boosts.)
 pub fn weights_fingerprint_from_parts<'a>(
     fee_ppm: u32,
+    fee_address: &str,
     finder_bonus: Option<(&'a str, u64)>,
     entries: impl IntoIterator<Item = (&'a str, u64, i64, u32)>,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"bp-weights-v2");
     hasher.update(fee_ppm.to_le_bytes());
+    hasher.update((fee_address.len() as u32).to_le_bytes());
+    hasher.update(fee_address.as_bytes());
     match finder_bonus {
         Some((address, sats)) => {
             hasher.update([1u8]);
@@ -1054,13 +1311,28 @@ mod tests {
     #[test]
     fn claim_sats_is_fee_reduced_proportional() {
         // 50 % of shares, 1.5 % fee, T = 1000 → floor(0.5·0.985·1000) = 492.
-        assert_eq!(claim_sats(500, 1000, 15_000, 1000), 492);
+        assert_eq!(claim_sats(500, 1000, 15_000, 1000, 0), 492);
         // Zero fee → plain proportion.
-        assert_eq!(claim_sats(500, 1000, 0, 1000), 500);
+        assert_eq!(claim_sats(500, 1000, 0, 1000, 0), 500);
         // 100 % fee → nothing.
-        assert_eq!(claim_sats(500, 1000, 1_000_000, 1000), 0);
+        assert_eq!(claim_sats(500, 1000, 1_000_000, 1000, 0), 0);
         // No shares at all → nothing (guards the division).
-        assert_eq!(claim_sats(0, 0, 0, 1000), 0);
+        assert_eq!(claim_sats(0, 0, 0, 1000, 0), 0);
+    }
+
+    /// The promises the coinbase already paid out come off the pot
+    /// BEFORE it is split by score — otherwise every member without a
+    /// promise is credited a share of everyone else's.
+    #[test]
+    fn claim_sats_excludes_the_promised_extras() {
+        // Half the shares, no fee, T = 1000, 200 promised away.
+        assert_eq!(claim_sats(500, 1000, 0, 1000, 200), 400);
+        // A net DEBT enlarges the pot: what one member repays is what
+        // the others are owed.
+        assert_eq!(claim_sats(500, 1000, 0, 1000, -200), 600);
+        // Promises beyond the block's own miner cut leave a negative
+        // residual, which is a debt like any other.
+        assert_eq!(claim_sats(500, 1000, 0, 1000, 1400), -200);
     }
 
     /// `claim bounds: Σ claims ≤ t for any partition of score_total`
@@ -1070,12 +1342,95 @@ mod tests {
         let parts = [499_999_999_999u64, 300_000_000_000, 200_000_000_001];
         let t = 312_500_000u64;
         let fee_ppm = 15_000;
-        let sum: u64 = parts
-            .iter()
-            .map(|p| claim_sats(*p, total, fee_ppm, t))
-            .sum();
-        let fee_floor = (t as u128 * fee_ppm as u128 / 1_000_000) as u64;
-        assert!(sum + fee_floor <= t, "claims + fee exceeded revenue");
+        for extras in [0i64, 10_000_000, -10_000_000] {
+            let sum: i64 = parts
+                .iter()
+                .map(|p| claim_sats(*p, total, fee_ppm, t, extras))
+                .sum();
+            let fee_floor = (t as u128 * fee_ppm as u128 / 1_000_000) as i64;
+            // Σ claims is the pot minus the extras: the extras were
+            // already paid out of the same coinbase.
+            assert!(
+                sum + fee_floor + extras <= t as i64,
+                "claims + fee + extras exceeded revenue at extras={extras}"
+            );
+        }
+    }
+
+    // ---- extras projection ----
+
+    /// Ordinary case: nothing to cap, `X` is the plain sum and the
+    /// divisor is what is left of the pot.
+    #[test]
+    fn project_extras_passes_through_a_solvent_ledger() {
+        let p = project_extras(&[(500, 10_000), (500, -4_000)], 1000, 0, 1_000_000);
+        assert_eq!(p.effective, vec![10_000, -4_000]);
+        assert_eq!(p.total, 6_000);
+        assert_eq!(p.divisor, 1_000_000 - 6_000);
+    }
+
+    /// Promises above 95 % of the pot scale down pro rata, and the
+    /// divisor survives — a distribution that divides by `pot − X` has
+    /// no answer at all once `X` reaches the pot.
+    #[test]
+    fn project_extras_scales_an_insolvent_ledger_pro_rata() {
+        let pot = 1_000_000i64;
+        let p = project_extras(&[(500, 900_000), (500, 900_000)], 1000, 0, pot as u64);
+        assert_eq!(p.total, pot * 95 / 100);
+        assert_eq!(p.effective[0], p.effective[1], "scaled pro rata");
+        assert!(p.divisor >= 1, "divisor stays positive");
+        assert_eq!(p.divisor, (pot - p.total) as u128);
+    }
+
+    /// Scaling is idempotent, which is what lets settlement re-derive
+    /// `X` from a snapshot that already holds capped values.
+    #[test]
+    fn project_extras_scaling_is_idempotent() {
+        let first = project_extras(&[(500, 900_000), (500, 900_000)], 1000, 0, 1_000_000);
+        let again = project_extras(
+            &[(500, first.effective[0]), (500, first.effective[1])],
+            1000,
+            0,
+            1_000_000,
+        );
+        assert_eq!(first.total, again.total);
+        assert_eq!(first.effective, again.effective);
+    }
+
+    /// A debt is only collectable out of the payout it shrinks. Beyond
+    /// that the weight would go negative, the pool weight with it, and
+    /// the block would promise more than it holds — so the extra is
+    /// floored and the rest waits for the next block.
+    #[test]
+    fn project_extras_floors_a_debt_at_what_the_payout_can_repay() {
+        let pot = 1_000_000u64;
+        let p = project_extras(&[(500, -10_000_000), (500, 0)], 1000, 0, pot);
+        // Fixed point of `extra = −u·(pot − extra)/S` at u/S = 1/2:
+        // extra = −pot, divisor = 2·pot.
+        assert_eq!(p.effective[1], 0);
+        assert_eq!(p.total, -(pot as i64));
+        assert_eq!(p.divisor, 2 * pot as u128);
+        // The floored extra leaves the debtor exactly zero weight.
+        let boost = p.effective[0] as i128 * 1000 / p.divisor as i128;
+        assert_eq!(500 + boost, 0, "wire weight lands exactly at zero");
+    }
+
+    /// A ledger of pure debt never triggers the solvency scale — the
+    /// divisor only grows.
+    #[test]
+    fn project_extras_never_scales_a_net_debt() {
+        let p = project_extras(&[(1000, -100)], 1000, 0, 1_000_000);
+        assert_eq!(p.total, -100);
+        assert_eq!(p.divisor, 1_000_100);
+    }
+
+    /// With no scores there is nothing to floor against; the projection
+    /// must still terminate with a usable divisor.
+    #[test]
+    fn project_extras_without_scores_is_well_defined() {
+        let p = project_extras(&[(0, -5_000)], 0, 0, 1_000_000);
+        assert_eq!(p.total, -5_000);
+        assert_eq!(p.divisor, 1_005_000);
     }
 
     // ---- weights fingerprint (v2) ----
@@ -1086,6 +1441,7 @@ mod tests {
         let base = || {
             weights_fingerprint_from_parts(
                 15_000,
+                "bc1qpool",
                 Some(("bc1qfinder", 50_000)),
                 [("bc1qa", 10, 5i64, 546u32), ("bc1qb", 20, -3, 546)],
             )
@@ -1093,30 +1449,41 @@ mod tests {
         assert_eq!(base(), base());
         let fee = weights_fingerprint_from_parts(
             15_001,
+            "bc1qpool",
+            Some(("bc1qfinder", 50_000)),
+            [("bc1qa", 10, 5, 546), ("bc1qb", 20, -3, 546)],
+        );
+        let fee_recipient = weights_fingerprint_from_parts(
+            15_000,
+            "bc1qotherpool",
             Some(("bc1qfinder", 50_000)),
             [("bc1qa", 10, 5, 546), ("bc1qb", 20, -3, 546)],
         );
         let bonus = weights_fingerprint_from_parts(
             15_000,
+            "bc1qpool",
             None,
             [("bc1qa", 10, 5, 546), ("bc1qb", 20, -3, 546)],
         );
         let weight = weights_fingerprint_from_parts(
             15_000,
+            "bc1qpool",
             Some(("bc1qfinder", 50_000)),
             [("bc1qa", 11, 5, 546), ("bc1qb", 20, -3, 546)],
         );
         let balance = weights_fingerprint_from_parts(
             15_000,
+            "bc1qpool",
             Some(("bc1qfinder", 50_000)),
             [("bc1qa", 10, 6, 546), ("bc1qb", 20, -3, 546)],
         );
         let order = weights_fingerprint_from_parts(
             15_000,
+            "bc1qpool",
             Some(("bc1qfinder", 50_000)),
             [("bc1qb", 20, -3, 546), ("bc1qa", 10, 5, 546)],
         );
-        for other in [fee, bonus, weight, balance, order] {
+        for other in [fee, fee_recipient, bonus, weight, balance, order] {
             assert_ne!(base(), other);
         }
     }
@@ -1125,7 +1492,7 @@ mod tests {
     #[test]
     fn weights_fingerprint_is_domain_separated_from_v1() {
         let v1 = payouts_fingerprint_from_parts(1000, [("bc1qa", 600u64)]);
-        let v2 = weights_fingerprint_from_parts(0, None, [("bc1qa", 600, 0i64, 0u32)]);
+        let v2 = weights_fingerprint_from_parts(0, "bc1qpool", None, [("bc1qa", 600, 0i64, 0u32)]);
         assert_ne!(v1, v2);
     }
 }

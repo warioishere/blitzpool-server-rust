@@ -118,10 +118,11 @@ fn test_config() -> PplnsEngineConfig {
     }
 }
 
-/// Fee anchor for every engine in this file. Deliberately NOT a miner
-/// address used by any test, so fee rows can never collide with the
-/// per-test prefixed miners.
-const TEST_FEE_ADDRESS: &str = "bc1q9h6mqcxrmk2q6cw5tqcjkkfcrqyzyfxzjjhysx";
+/// Fee anchor for every engine in this file. MUST NOT be an address any
+/// test mines to: the builder excludes the fee address from the miner
+/// entries entirely (it is paid via `weight_P`), so reusing one here
+/// would silently delete that miner from the distribution.
+const TEST_FEE_ADDRESS: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 
 async fn spawn_or_skip(redis_db: u8, prefix: &str) -> Option<EngineHarness> {
     let (conn, pool) = connect_or_skip(redis_db, prefix).await?;

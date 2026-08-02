@@ -15,6 +15,9 @@ workspace = true
 # Domain types shared by the coinbase distribution snapshot.
 bp-common = { workspace = true }
 bp-pplns = { workspace = true }
+# The one shared extras/claim projection both the build and the
+# settlement read a weight snapshot through.
+bp-share = { workspace = true }
 bitcoin = { workspace = true }
 # DbError, wrapped by the shared LedgerError.
 bp-db = { workspace = true }

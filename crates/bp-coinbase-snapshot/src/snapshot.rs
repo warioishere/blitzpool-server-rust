@@ -345,7 +345,10 @@ pub struct WeightSnapshotEntry {
     pub balance_sats: i64,
     /// Published §3.1 weight; `0` = no coinbase output (folded/debt).
     pub wire_weight: u64,
-    /// Per-output dust limit (`max(546, min_payout)`).
+    /// Per-output dust limit — the consensus floor (546). The pool's
+    /// `min_payout` is not this field: it decides at build time who is
+    /// published at all, because a §4 prune pays the withheld value to
+    /// the pool output instead of to the other miners.
     pub dust_limit: u32,
 }
 
@@ -379,6 +382,37 @@ pub struct StoredWeightSnapshot {
 }
 
 impl StoredWeightSnapshot {
+    /// `X` — the satoshi promises this distribution carried on top of
+    /// the pure score split, recomputed the way the build computed it.
+    ///
+    /// Not a stored field, and deliberately so: it is a pure function
+    /// of what IS stored (every entry's score weight and ledger
+    /// balance, the recorded bonus, the fee and the reference revenue),
+    /// and one shared [`bp_share::project_extras`] serving both sides
+    /// is the only way build and settlement cannot drift apart. A
+    /// second copy of this formula would be the next bug.
+    ///
+    /// The bonus needs no re-capping here — [`Self::finder_bonus`]
+    /// already holds the capped figure, which is exactly what the
+    /// coinbase paid.
+    pub fn extras_total(&self) -> i64 {
+        let extras = bp_share::extras_from_ledger(
+            self.entries
+                .iter()
+                .map(|e| (e.address.as_str(), e.score_weight, e.balance_sats)),
+            self.finder_bonus
+                .as_ref()
+                .map(|(a, sats)| (a.as_str(), *sats)),
+        );
+        bp_share::project_extras(
+            &extras,
+            self.score_total,
+            self.fee_ppm,
+            self.reference_revenue_sats,
+        )
+        .total
+    }
+
     /// Lower a built [`bp_pplns::WeightDistribution`] into the wire form.
     pub fn from_distribution(d: &bp_pplns::WeightDistribution) -> Self {
         Self {
@@ -750,6 +784,52 @@ mod tests {
         assert_eq!(s.fee_address, fee.as_str());
         assert_eq!(s.score_total, d.score_total);
         assert_eq!(s.reference_revenue_sats, 312_500_000);
+    }
+
+    /// Settlement measures every claim against `pot − X`, and it
+    /// re-derives `X` here instead of reading it off a stored field.
+    /// If that re-derivation ever disagreed with the build, the
+    /// coinbase and the ledger would be splitting two different pots
+    /// and every block would mint liabilities.
+    #[test]
+    fn extras_total_reproduces_the_build() {
+        use std::collections::HashMap as StdMap;
+        let a1 = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+        let a2 = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
+        let fee = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap();
+        let shares = StdMap::from([(a1.clone(), 3.0), (a2.clone(), 1.0)]);
+        for (balances, bonus) in [
+            (StdMap::new(), None),
+            (StdMap::from([(a1.clone(), Sats(10_000_000))]), None),
+            (StdMap::from([(a2.clone(), Sats(-7_000_000))]), None),
+            (StdMap::new(), Some(Sats(50_000_000))),
+            // Beyond the block: the build caps the bonus and records
+            // the capped figure, which is the only thing that keeps
+            // this reproducible at all.
+            (
+                StdMap::from([(a2.clone(), Sats(20_000_000))]),
+                Some(Sats(10_000_000_000)),
+            ),
+        ] {
+            let d = bp_pplns::build_weight_distribution(bp_pplns::WeightDistributionInput {
+                address_shares: &shares,
+                balances: &balances,
+                fee_percent: 1.5,
+                fee_address: &fee,
+                coinbase_weight_budget: 50_000,
+                min_payout_sats: Some(Sats(5_000)),
+                finder_bonus_sats: bonus,
+                finder_address: Some(&a1),
+                reference_revenue_sats: 312_500_000,
+            })
+            .unwrap();
+            let s = StoredWeightSnapshot::from_distribution(&d);
+            assert_eq!(
+                s.extras_total(),
+                d.extras_total,
+                "snapshot X drifted from the build at bonus={bonus:?}"
+            );
+        }
     }
 
     #[test]

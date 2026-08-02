@@ -244,11 +244,11 @@ async fn compute_distribution(
 
     // 4. Build inputs + call pure math. `bp_group_solo::build_group_solo_distribution`
     //    Weight-native build (SV2 ext 0x0003 model): the round scores
-    //    project onto integer weights, `pendingSats` and the per-group
-    //    finder bonus become weight boosts on their entries, min_payout
-    //    is the per-output dust limit, and the blockspace cap folds into
-    //    `weight_P`. Group-Solo's `pendingSats` is unsigned (≥ 0), so
-    //    the balance boosts here are only ever positive.
+    //    project onto integer weights, and `pendingSats` and the
+    //    per-group finder bonus become weight boosts on their entries.
+    //    A member below `min_payout` — or beyond the blockspace cap —
+    //    is not published; its share goes to the members who are, who
+    //    settle the matching debt, so `weight_P` carries the fee alone.
     let fee_address = config
         .fee_address
         .as_ref()

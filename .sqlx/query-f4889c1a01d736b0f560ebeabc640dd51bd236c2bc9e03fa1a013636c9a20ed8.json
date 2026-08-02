@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"groupId\" AS \"group_id!\",\n            \"pendingSats\" AS \"pending_sats!: Sats\",\n            \"totalPaidSats\" AS \"total_paid_sats!: Sats\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"lastAcceptedShareAt\" AS \"last_accepted_share_at?\"\n           FROM pplns_group_balance\n           WHERE \"groupId\" = $1 AND \"pendingSats\" > 0",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"groupId\" AS \"group_id!\",\n            \"pendingSats\" AS \"pending_sats!: Sats\",\n            \"totalPaidSats\" AS \"total_paid_sats!: Sats\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"lastAcceptedShareAt\" AS \"last_accepted_share_at?\"\n           FROM pplns_group_balance\n           WHERE \"groupId\" = $1 AND \"pendingSats\" <> 0",
   "describe": {
     "columns": [
       {
@@ -48,5 +48,5 @@
       true
     ]
   },
-  "hash": "3f894995f46961b376667261b1f9902b18326a255b474453ffc7a098d51105b9"
+  "hash": "f4889c1a01d736b0f560ebeabc640dd51bd236c2bc9e03fa1a013636c9a20ed8"
 }
