@@ -345,7 +345,10 @@ pub struct WeightSnapshotEntry {
     pub balance_sats: i64,
     /// Published §3.1 weight; `0` = no coinbase output (folded/debt).
     pub wire_weight: u64,
-    /// Per-output dust limit (`max(546, min_payout)`).
+    /// Per-output dust limit — the consensus floor (546). The pool's
+    /// `min_payout` is not this field: it decides at build time who is
+    /// published at all, because a §4 prune pays the withheld value to
+    /// the pool output instead of to the other miners.
     pub dust_limit: u32,
 }
 
