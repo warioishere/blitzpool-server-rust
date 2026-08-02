@@ -402,21 +402,32 @@ impl JdpDeclaredJobRegistry {
         }
     }
 
-    /// The current pool-wide distribution, if one was published (for
-    /// the connection-open push and the publisher's skip-if-unchanged
+    /// The current pool-wide distribution, if one is USABLE (for the
+    /// connection-open push and the publisher's skip-if-unchanged
     /// comparison).
+    ///
+    /// `None` once a settlement invalidated it (§10), even though the
+    /// entry is still held for history: handing it out would push a
+    /// JDC a distribution that every declaration referencing it is then
+    /// answered `stale-payout-distribution` for, and would let the
+    /// publisher compare a rebuilt distribution equal to it and skip
+    /// the republish the settlement exists to force.
     pub fn current_pool_wide(&self) -> Option<Arc<PayoutDistributionEntry>> {
         self.pool_wide_distribution
             .latest
             .as_ref()
+            .filter(|p| p.epoch == self.settlement_epoch)
             .map(|p| p.entry.clone())
     }
 
-    /// The current tailored distribution for a JDP session, if any.
+    /// The current tailored distribution for a JDP session, if one is
+    /// usable. Settlement-invalidated entries are withheld for the same
+    /// reason as in [`Self::current_pool_wide`].
     pub fn current_tailored(&self, jdp_session_id: u32) -> Option<Arc<PayoutDistributionEntry>> {
         self.tailored_distributions
             .get(&jdp_session_id)
             .and_then(|s| s.latest.as_ref())
+            .filter(|p| p.epoch == self.settlement_epoch)
             .map(|p| p.entry.clone())
     }
 
@@ -435,13 +446,24 @@ impl JdpDeclaredJobRegistry {
                 .get(&id)
                 .filter(|s| s.latest.is_some())
                 .unwrap_or(&self.pool_wide_distribution),
+            // One address can own several tailored slots — a JDC that
+            // dropped ungracefully leaves a ghost behind until the
+            // cleanup sweep, and its reconnect gets a new session. Take
+            // the NEWEST publish rather than whichever slot the map
+            // happens to yield first, or the live distribution is
+            // rejected as stale on an arbitrary fraction of lookups.
             DistributionScope::MinerAddress(addr) => self
                 .tailored_distributions
                 .values()
-                .find(|s| {
+                .filter(|s| {
                     s.latest
                         .as_ref()
                         .is_some_and(|p| p.entry.owner.as_ref() == Some(addr))
+                })
+                .max_by_key(|s| {
+                    s.latest
+                        .as_ref()
+                        .map(|p| (p.entry.published_at_ms, p.entry.distribution_id))
                 })
                 .unwrap_or(&self.pool_wide_distribution),
         };
@@ -809,6 +831,66 @@ mod tests {
             reg.distribution_acceptance(99, scope),
             DistributionAcceptance::Unknown
         );
+    }
+
+    /// A settled distribution must not be handed out as the current
+    /// one: the connection-open push would send a JDC an id that every
+    /// declaration is then rejected for, and the publisher's
+    /// skip-if-unchanged compare would swallow the forced republish.
+    #[test]
+    fn settled_distribution_is_no_longer_current() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        let owner = addr();
+        reg.publish_pool_wide(distribution(1, None, None));
+        reg.publish_tailored(7, distribution(2, Some(owner.clone()), Some(7)));
+        assert!(reg.current_pool_wide().is_some());
+        assert!(reg.current_tailored(7).is_some());
+
+        reg.invalidate_all_distributions();
+        assert!(
+            reg.current_pool_wide().is_none(),
+            "a settled pool-wide distribution is not current"
+        );
+        assert!(
+            reg.current_tailored(7).is_none(),
+            "a settled tailored distribution is not current"
+        );
+
+        // A fresh publish restores it.
+        reg.publish_pool_wide(distribution(3, None, None));
+        assert_eq!(reg.current_pool_wide().map(|e| e.distribution_id), Some(3));
+    }
+
+    /// A reconnecting JDC leaves its old tailored slot behind until the
+    /// cleanup sweep. Address-scoped lookups must resolve against the
+    /// NEWEST slot, not an arbitrary one, or the live distribution is
+    /// rejected as stale on a fraction of declarations.
+    #[test]
+    fn address_scope_prefers_the_newest_tailored_slot() {
+        let owner = addr();
+        // Both orders of session ids, and many registry instances: each
+        // gets its own hash seed, so a first-match lookup would pick the
+        // ghost about half the time. 16 rounds per order makes the old
+        // behaviour practically impossible to slip through.
+        let rounds = [(7u32, 8u32), (8, 7)].into_iter().flat_map(|p| [p; 16]);
+        for (ghost_session, live_session) in rounds {
+            let mut reg = JdpDeclaredJobRegistry::new();
+            reg.publish_pool_wide(distribution(1, None, None));
+            reg.publish_tailored(
+                ghost_session,
+                distribution(10, Some(owner.clone()), Some(ghost_session)),
+            );
+            reg.publish_tailored(
+                live_session,
+                distribution(20, Some(owner.clone()), Some(live_session)),
+            );
+            let scope = DistributionScope::MinerAddress(&owner);
+            assert_eq!(
+                accepted_id(&reg.distribution_acceptance(20, scope)),
+                Some(20),
+                "the live distribution must be accepted (ghost {ghost_session})"
+            );
+        }
     }
 
     /// `settlement invalidation: everything published before is stale`

@@ -111,6 +111,10 @@ pub enum DistributionViolation {
     /// malformed additional output) — a registry entry this JDS
     /// published should never trip this; treat as internal.
     Uncomputable,
+    /// The declared output values do not sum to a representable revenue.
+    /// No coinbase can pay more than the money supply, so this is a
+    /// malformed declaration rather than an internal failure.
+    RevenueOverflow,
 }
 
 /// Recompute-and-compare (§7.1) against POSITIONAL §4 order. Returns
@@ -123,7 +127,13 @@ pub fn validate_coinbase_outputs_against_distribution(
     dust_limits: &[u32],
     additional_outputs: &[Vec<u8>],
 ) -> Result<u64, DistributionViolation> {
-    let t: u64 = declared.iter().map(|o| o.value.to_sat()).sum();
+    // Checked: these values come off the wire from the JD-client, and a
+    // plain `sum()` would panic on overflow in a debug build and wrap in
+    // release — letting a crafted declaration pick which.
+    let t: u64 = declared
+        .iter()
+        .try_fold(0u64, |acc, o| acc.checked_add(o.value.to_sat()))
+        .ok_or(DistributionViolation::RevenueOverflow)?;
     let expected = compute_payout_vector(pool_payout, payouts, dust_limits, additional_outputs, t)
         .map_err(|_| DistributionViolation::Uncomputable)?;
 
@@ -181,6 +191,25 @@ mod tests {
         let mut buf = Vec::new();
         t.consensus_encode(&mut buf).unwrap();
         buf
+    }
+
+    /// The declared values are untrusted wire input: a sum that cannot
+    /// be represented must be rejected, not panic (debug) or wrap
+    /// (release) into a revenue the client effectively chose.
+    #[test]
+    fn declared_revenue_overflow_is_rejected() {
+        let huge = u64::MAX / 2 + 1;
+        let declared = vec![txout(huge, script(1)), txout(huge, script(2))];
+        assert_eq!(
+            validate_coinbase_outputs_against_distribution(
+                &declared,
+                &wo(0xFF, 1),
+                &[wo(1, 1)],
+                &[1],
+                &[],
+            ),
+            Err(DistributionViolation::RevenueOverflow)
+        );
     }
 
     /// `expected vector: pool first, kept payouts, additional last`
