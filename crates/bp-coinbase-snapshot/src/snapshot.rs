@@ -352,17 +352,32 @@ pub struct WeightSnapshotEntry {
     pub dust_limit: u32,
 }
 
-/// Persistent form of a weight distribution (schema 2).
+/// Persistent form of a weight distribution (schema 3).
 ///
 /// Where the schema-1 [`StoredSnapshot`] freezes the OUTCOME (exact
 /// sats per output, valid for exactly one reward), this freezes the
 /// INPUTS: settlement recomputes each address's claim from
 /// `bp_share::claim_sats(score_weight, score_total, fee_ppm, T_actual)`
-/// (+ the finder bonus) and books `claim − actually_paid` against the
-/// balance — correct for ANY actual revenue inside the booking band,
-/// which is what makes one snapshot serve the pool's own templates and
-/// every JDC's independently-valued jobs alike.
+/// and books `claim − actually_paid` against the balance — correct for
+/// ANY actual revenue inside the booking band, which is what makes one
+/// snapshot serve the pool's own templates and every JDC's
+/// independently-valued jobs alike.
+///
+/// Schema 3 dropped the `finder_bonus` field: the bonus is a proportion
+/// now, already inside `score_weight`.
+/// `deny_unknown_fields` is load-bearing, not tidiness. This struct is
+/// serialized into the confirmation-gated pending-block queue, which
+/// outlives a deploy by the whole confirmation window — far longer than
+/// any snapshot TTL. A blob frozen by a pre-proportion build still
+/// carries `finder_bonus`, and serde's default is to ignore a field it
+/// no longer knows: the bonus would vanish from `extras_total` while
+/// the coinbase had already paid it, and settlement would book the
+/// finder a debt of nearly the whole bonus with the other members
+/// taking the mirror credit. Refusing the blob outright makes it an
+/// unparsable pending entry — pruned with a warning, having moved no
+/// money.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredWeightSnapshot {
     /// Distribution order (published first — the coinbase output order).
     pub entries: Vec<WeightSnapshotEntry>,
@@ -434,8 +449,16 @@ impl StoredWeightSnapshot {
 
 /// Persist a weight snapshot under `key` with `ttl_seconds`. Same
 /// DEL + HSET + EXPIRE shape (and rationale) as [`write_snapshot`];
-/// the `schema = 2` field is what keeps the two formats from ever
-/// hydrating through the wrong parser.
+/// the `schema` field is what keeps the formats from ever hydrating
+/// through the wrong parser.
+///
+/// Schema 3: the finder bonus left this payload. A schema-2 hash still
+/// carries `finderBonusAddr`/`finderBonusSats`, and its `extras_total`
+/// INCLUDED that bonus — so hydrating one through the schema-3 parser
+/// would compute every claim against a pot short by the bonus, booking
+/// the finder a debt and the other members the mirror credit on a block
+/// whose coinbase was perfectly correct. Refusing it is a
+/// `SnapshotMissing`, which is logged loudly and books nothing.
 pub async fn write_weight_snapshot(
     conn: &mut ConnectionManager,
     key: &str,
@@ -443,7 +466,7 @@ pub async fn write_weight_snapshot(
     ttl_seconds: u32,
 ) -> Result<(), RedisError> {
     let mut fields: Vec<(String, String)> = Vec::with_capacity(8 + snapshot.entries.len() * 5);
-    fields.push(("schema".to_string(), "2".to_string()));
+    fields.push(("schema".to_string(), "3".to_string()));
     fields.push(("weightP".to_string(), snapshot.weight_p.to_string()));
     fields.push(("feePpm".to_string(), snapshot.fee_ppm.to_string()));
     fields.push(("feeAddress".to_string(), snapshot.fee_address.clone()));
@@ -505,7 +528,10 @@ pub async fn read_weight_snapshot(
 }
 
 fn parse_weight_hash(h: &HashMap<String, String>) -> Option<StoredWeightSnapshot> {
-    if h.get("schema")?.as_str() != "2" {
+    // Exact match, so a schema-2 hash (bonus still in `extras`) can
+    // never hydrate into the schema-3 settlement math — see
+    // `write_weight_snapshot`.
+    if h.get("schema")?.as_str() != "3" {
         return None;
     }
     let weight_p: u64 = h.get("weightP")?.parse().ok()?;
@@ -671,7 +697,7 @@ mod tests {
         // Mirror of write_weight_snapshot's field list, so the parse
         // test exercises the same layout the writer produces.
         let mut h = HashMap::new();
-        h.insert("schema".to_string(), "2".to_string());
+        h.insert("schema".to_string(), "3".to_string());
         h.insert("weightP".to_string(), s.weight_p.to_string());
         h.insert("feePpm".to_string(), s.fee_ppm.to_string());
         h.insert("feeAddress".to_string(), s.fee_address.clone());
@@ -698,17 +724,58 @@ mod tests {
         assert_eq!(parsed, s);
     }
 
-    /// A hash still carrying the retired `finderBonus*` fields — written
-    /// by a pool build from before the bonus became a proportion — must
-    /// still hydrate. The parser reads by name and simply ignores them.
+    /// A schema-2 hash — written before the bonus became a proportion —
+    /// must NOT hydrate, even though every field the schema-3 parser
+    /// reads is present and well-formed.
+    ///
+    /// Its `extras_total` included the finder bonus; schema 3's does
+    /// not. Parsing it would measure every claim against a pot short by
+    /// the bonus, booking the finder a debt of nearly the whole bonus
+    /// and the other members the mirror credit — real satoshis moved
+    /// between miners on a correctly-paid block. Returning `None` makes
+    /// it a `SnapshotMissing` instead: loud, and it books nothing.
     #[test]
-    fn parse_weight_hash_ignores_a_retired_bonus_field() {
+    fn parse_weight_hash_refuses_a_schema_2_bonus_hash() {
         let s = weight_snapshot_fixture();
         let mut h = weight_hash_of(&s);
+        h.insert("schema".to_string(), "2".to_string());
         h.insert("finderBonusAddr".to_string(), "bc1qold".to_string());
         h.insert("finderBonusSats".to_string(), "50000".to_string());
-        let parsed = parse_weight_hash(&h).expect("parse ok");
-        assert_eq!(parsed, s);
+        assert!(
+            parse_weight_hash(&h).is_none(),
+            "a pre-proportion snapshot must be refused, not silently stripped of its bonus"
+        );
+    }
+
+    /// The OTHER carrier of a pre-proportion snapshot: the JSON blob in
+    /// the confirmation-gated pending-block queue, which survives a
+    /// deploy for the whole confirmation window.
+    ///
+    /// Serde's default would ignore the retired `finder_bonus` field and
+    /// hand settlement a snapshot whose `extras_total` is short by the
+    /// bonus the coinbase already paid. `deny_unknown_fields` turns that
+    /// into a parse error, which the pending store prunes and warns on
+    /// instead of mis-booking.
+    #[test]
+    fn a_pending_blob_carrying_the_retired_bonus_is_refused() {
+        let s = weight_snapshot_fixture();
+        let mut v = serde_json::to_value(&s).expect("serialize");
+        v.as_object_mut().unwrap().insert(
+            "finder_bonus".to_string(),
+            serde_json::json!(["bc1qold", 50_000]),
+        );
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(
+            serde_json::from_str::<StoredWeightSnapshot>(&json).is_err(),
+            "a blob still carrying finder_bonus must not deserialize into the \
+             proportional model — its bonus would silently leave `extras_total`"
+        );
+        // The same blob without the retired field is still perfectly good.
+        let clean = serde_json::to_string(&s).unwrap();
+        assert_eq!(
+            serde_json::from_str::<StoredWeightSnapshot>(&clean).expect("round-trips"),
+            s
+        );
     }
 
     /// `schema-1 hashes never hydrate through the weight parser`

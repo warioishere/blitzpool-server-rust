@@ -36,3 +36,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # Async test runtime for the Redis-backed budget persistence tests.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# Round-trips the pending-block JSON blob, to pin that a snapshot still
+# carrying the retired finder bonus is refused rather than silently
+# stripped of it.
+serde_json = { workspace = true }

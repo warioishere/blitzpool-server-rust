@@ -306,8 +306,18 @@ where
     }))
 }
 
+/// `deny_unknown_fields` so a client writing the RETIRED
+/// `finderBonusSats` is told, instead of being lied to.
+///
+/// Every field is `#[serde(default)]` (that is the PATCH semantics —
+/// absent means untouched), so without this a body carrying only
+/// `{"finderBonusSats": ...}` deserializes to all-untouched and the
+/// handler answers 200 with a summary that has no such key. The admin
+/// sees a successful save that changed nothing, and nothing is logged.
+/// A pool deployed ahead of its UI hits exactly that, so the failure
+/// has to be loud.
 #[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateSettingsBody {
     /// `Some(value)` → set to value, `Some("clear")` interpreted via the
     /// patch helper. We just default to Untouched/Set semantics; clear
@@ -2183,6 +2193,39 @@ mod tests {
 
     fn parse_include_decided(s: Option<&str>) -> bool {
         s.map(|v| v == "1" || v == "true").unwrap_or(false)
+    }
+
+    /// A settings PATCH from a pre-proportion UI must be REFUSED, not
+    /// silently no-op'd. Without `deny_unknown_fields` this body
+    /// deserializes to all-untouched and the caller gets a 200 for a
+    /// save that changed nothing.
+    #[test]
+    fn settings_patch_refuses_the_retired_finder_bonus_sats() {
+        let old_ui = r#"{"finderBonusSats": 50000000}"#;
+        assert!(
+            serde_json::from_str::<UpdateSettingsBody>(old_ui).is_err(),
+            "a bonus write in the retired unit must fail loudly, not report success"
+        );
+    }
+
+    /// The shapes the current UI actually sends — full and partial —
+    /// must all still deserialize, so the guard above cannot quietly
+    /// break the admin page it is meant to protect.
+    #[test]
+    fn settings_patch_accepts_every_shape_the_ui_sends() {
+        for body in [
+            r#"{"preset":"daily","intervalDays":null,"timezone":"Europe/Zurich",
+                "finderBonusPpm":32000,"resetRoundOnBlock":true}"#,
+            r#"{"maxMembers":25}"#,
+            r#"{"isPublic":true}"#,
+            r#"{"finderBonusPpm":null}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<UpdateSettingsBody>(body).is_ok(),
+                "current-UI payload must still parse: {body}"
+            );
+        }
     }
 
     #[test]

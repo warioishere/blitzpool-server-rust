@@ -307,9 +307,23 @@ pub fn validate_round_reset(config: &RoundResetConfig) -> Result<(), RoundResetE
         }
     }
 
-    // Finder bonus bounds. No min_payout check any more: a proportion
-    // cannot be "too small to be paid" — it scales with the block, and
-    // whatever it comes to is simply part of the finder's output.
+    // Finder bonus bounds — a range check and nothing else.
+    //
+    // The old `min_payout` cross-check is gone because it is no longer
+    // COMPUTABLE, not because small bonuses became harmless. It could
+    // only ever be applied to a satoshi amount; what a percentage comes
+    // to depends on the block's revenue and on how the round's shares
+    // fell, neither of which exists at configuration time. There is no
+    // ppm value that guarantees the finder clears `min_payout`, so
+    // there is nothing here to reject.
+    //
+    // What still happens downstream: `build_weight_distribution` runs a
+    // withholding pass, and a finder whose entire weight is a small
+    // bonus can be pruned from the coinbase by it. On-chain that is
+    // correct — the §4 split hands the withheld value to the published
+    // miners. The ledger booking that follows is the known open
+    // question about Group-Solo carry-forward; it predates the switch to
+    // a proportional bonus and is not decided here.
     let bonus = config.finder_bonus_ppm;
     if !(0..=MAX_FINDER_BONUS_PPM).contains(&bonus) {
         return Err(RoundResetError::FinderBonusOutOfRange(bonus));
