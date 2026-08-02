@@ -384,21 +384,23 @@ where
     Ok(Json(GroupSummary::from(row)))
 }
 
-/// Block subsidy in sats for `height` on `network`, per the standard halving
-/// schedule (regtest halves every 150 blocks, every other network every
-/// 210_000). Fee-independent — the pure coinbase subsidy. Shared with the
-/// next-block-reward endpoint (info.rs) to split coinbasevalue into
-/// subsidy + fees.
+/// Block subsidy in sats for `height` on `network`.
+///
+/// A thin network→interval mapping over [`bp_share::block_subsidy_sats`],
+/// which owns the halving math. Settlement gates on that same function
+/// (a coinbase paying less than its own subsidy is refused), so a second
+/// copy of the rule here is a copy that can drift from the one deciding
+/// whether a block gets booked.
+///
+/// Regtest halves every 150 blocks, every other network every 210 000.
+/// Heights beyond `i32` cannot describe a real block; they clamp, and
+/// the shared function answers 0 for them anyway.
 pub(crate) fn block_subsidy_sats(height: u64, network: bitcoin::Network) -> u64 {
-    let interval: u64 = match network {
-        bitcoin::Network::Regtest => 150,
-        _ => 210_000,
+    let interval = match network {
+        bitcoin::Network::Regtest => bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
+        _ => bp_share::SUBSIDY_HALVING_INTERVAL,
     };
-    let halvings = height / interval;
-    if halvings >= 64 {
-        return 0;
-    }
-    (50u64 * 100_000_000) >> halvings
+    bp_share::block_subsidy_sats(height.min(i32::MAX as u64) as i32, interval)
 }
 
 #[derive(Serialize)]
