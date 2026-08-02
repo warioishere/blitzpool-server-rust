@@ -799,7 +799,6 @@ impl BlockFoundApplier {
     /// distribution the chain did not pay, and unlike PPLNS nothing downstream
     /// would catch it. Unresolved → the caller does not book at all.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn gate_or_apply_group_solo(
         &self,
         engine: &GroupSoloEngine,
@@ -1398,10 +1397,6 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
     }
 }
 
-/// Compute the standard Bitcoin block hash display form (big-endian
-/// hex) from the assembled 80-byte header. `bp_share::sha256d` returns
-/// the digest in little-endian "internal" order; we reverse and hex-
-/// encode for the human-facing form bitcoind / explorers use.
 /// Decode the submitted witness coinbase into its per-address payment
 /// record. `None` (with a warn) if the bytes don't parse — settlement
 /// then has no actuals and the block is reported-not-booked rather
@@ -1421,6 +1416,10 @@ fn decode_actual_coinbase(
     }
 }
 
+/// Compute the standard Bitcoin block hash display form (big-endian
+/// hex) from the assembled 80-byte header. `bp_share::sha256d` returns
+/// the digest in little-endian "internal" order; we reverse and hex-
+/// encode for the human-facing form bitcoind / explorers use.
 fn block_hash_display(header: &[u8; 80]) -> String {
     let mut hash = bp_share::sha256d(header);
     hash.reverse();
