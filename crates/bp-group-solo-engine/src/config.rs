@@ -39,8 +39,10 @@ pub struct GroupSoloEngineConfig {
     /// `PPLNS_MIN_PAYOUT_SATS`.
     pub min_payout_sats: Sats,
 
-    /// Coinbase weight budget (WU). Must match `bitcoin.conf`
-    /// `blockreservedweight`. Reuses `PPLNS_COINBASE_WEIGHT_BUDGET`.
+    /// Coinbase weight budget (WU). Handed straight to bitcoin-core
+    /// over the Group-Solo TDP IPC stream — there is no `bitcoin.conf`
+    /// knob to keep in sync. Reuses `PPLNS_COINBASE_WEIGHT_BUDGET`;
+    /// floored at `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`.
     pub coinbase_weight_budget: u32,
 
     /// Per-(group, finder) snapshot TTL in seconds. Defaults to 1h.

@@ -18,7 +18,7 @@ pub use weight::{
     resolve_min_payout_sats, validate_fee_payout_budget, FeePayoutBudgetError,
     BUDGET_SAFETY_MARGIN_WU, COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT,
     COINBASE_WITNESS_COMMITMENT_WEIGHT, DEFAULT_COINBASE_WEIGHT_BUDGET, DEFAULT_MIN_PAYOUT_SATS,
-    DUST_LIMIT_SATS,
+    DUST_LIMIT_SATS, MIN_COINBASE_WEIGHT_BUDGET,
 };
 pub use weights::{
     build_weight_distribution, WeightBuildError, WeightDistribution, WeightDistributionInput,

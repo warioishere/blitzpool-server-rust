@@ -576,9 +576,12 @@ pub struct PplnsConfig {
     /// dust-sweep never pad this — the fee output equals exactly
     /// this percentage.
     pub fee_percent: f64,
-    /// Coinbase weight budget in WU — **must match** `bitcoin.conf
-    /// blockreservedweight`. Lower budget → fewer payout recipients
-    /// per block but more tx-fee room.
+    /// Coinbase weight budget in WU. Handed straight to bitcoin-core
+    /// over the TDP IPC stream (`tdp_constraint_for_budget`) — there is
+    /// no `bitcoin.conf blockreservedweight` to keep in sync. Lower
+    /// budget → fewer payout recipients per block but more tx-fee room;
+    /// floored at `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`, below which
+    /// nothing is publishable and the pool would take every block.
     pub coinbase_weight_budget: u32,
     /// VarDiff floor for the PPLNS port (sub-ASIC hardware gate).
     pub min_difficulty: u64,

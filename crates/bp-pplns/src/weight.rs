@@ -36,6 +36,28 @@ pub const COINBASE_WITNESS_COMMITMENT_WEIGHT: u32 = 188;
 /// varint growth past 65 535 outputs).
 pub const BUDGET_SAFETY_MARGIN_WU: u32 = 200;
 
+/// The smallest coinbase weight budget that can publish a single miner
+/// output — everything `build_weight_distribution`'s blockspace cut
+/// reserves before it appends the first one, plus that output at its
+/// worst-case type.
+///
+/// Below this the cut publishes NOTHING, and §4 makes the pool output
+/// the residual (`pay_P = T − Σpay`), so the pool takes the entire
+/// block while every miner books their full claim as credit against
+/// coins it already holds. That is why this is a hard config floor and
+/// not a warning: a budget under it is not a degraded pool, it is a
+/// pool that keeps the miners' money.
+///
+/// The worst-case output weight ([`COINBASE_OUTPUT_WEIGHT`], P2TR /
+/// P2WSH) is deliberate — the guarantee has to hold whatever address
+/// types the miners bring. A P2WPKH-only population physically fits at
+/// 1012, but nothing stops one P2TR miner from joining.
+pub const MIN_COINBASE_WEIGHT_BUDGET: u32 = COINBASE_BASE_WEIGHT
+    + BUDGET_SAFETY_MARGIN_WU
+    + COINBASE_WITNESS_COMMITMENT_WEIGHT
+    + COINBASE_OUTPUT_WEIGHT // the pool output — structural under §4
+    + COINBASE_OUTPUT_WEIGHT; // one miner output, worst-case type
+
 /// Resolve the operational minimum-payout setting from raw env input.
 /// Clamped to ≥ DUST_LIMIT_SATS (Bitcoin Core relay policy floor).
 pub fn resolve_min_payout_sats(raw: Option<&str>) -> Sats {
@@ -124,7 +146,9 @@ pub enum FeePayoutBudgetError {
     InvalidFeePercent { value: f64 },
     /// `min_payout_sats` below the relay-policy dust floor.
     MinPayoutBelowDust { value: i64, dust: u64 },
-    /// `coinbase_weight_budget` at/below the structural floor (base + margin).
+    /// `coinbase_weight_budget` below [`MIN_COINBASE_WEIGHT_BUDGET`] —
+    /// too small to publish even one miner output, which would hand the
+    /// pool every block. `min` is the smallest ACCEPTED value.
     WeightBudgetTooLow { value: u32, min: u32 },
 }
 
@@ -146,14 +170,16 @@ pub fn validate_fee_payout_budget(
             dust: DUST_LIMIT_SATS,
         });
     }
-    // The pure-math layer adds BUDGET_SAFETY_MARGIN_WU to the base weight
-    // before subtracting outputs; require at least that floor so callers
-    // can't configure a budget that rejects every payout list.
-    let min_budget = COINBASE_BASE_WEIGHT + BUDGET_SAFETY_MARGIN_WU;
-    if coinbase_weight_budget <= min_budget {
+    // Enough budget for at least one miner output, or the distribution
+    // publishes nothing and the §4 residual hands the pool the whole
+    // block. This used to check `base + margin` alone — 528 — which is
+    // less than the blockspace cut's own fixed reservation, so every
+    // budget from 529 to 1059 passed validation and then published no
+    // outputs at all. See [`MIN_COINBASE_WEIGHT_BUDGET`].
+    if coinbase_weight_budget < MIN_COINBASE_WEIGHT_BUDGET {
         return Err(FeePayoutBudgetError::WeightBudgetTooLow {
             value: coinbase_weight_budget,
-            min: min_budget,
+            min: MIN_COINBASE_WEIGHT_BUDGET,
         });
     }
     Ok(())
@@ -357,10 +383,54 @@ mod tests {
             })
         );
         // then budget floor.
-        let min = COINBASE_BASE_WEIGHT + BUDGET_SAFETY_MARGIN_WU;
+        let too_low = MIN_COINBASE_WEIGHT_BUDGET - 1;
         assert_eq!(
-            validate_fee_payout_budget(1.0, 5_000, min),
-            Err(FeePayoutBudgetError::WeightBudgetTooLow { value: min, min })
+            validate_fee_payout_budget(1.0, 5_000, too_low),
+            Err(FeePayoutBudgetError::WeightBudgetTooLow {
+                value: too_low,
+                min: MIN_COINBASE_WEIGHT_BUDGET
+            })
+        );
+    }
+
+    /// The floor has to be the number the BUILDER needs, not a smaller
+    /// one that merely looks structural.
+    ///
+    /// It used to be `base + margin` = 528, while the blockspace cut
+    /// reserves `base + witness commitment + pool output` = 688 out of
+    /// `budget − margin` before it appends the first miner output. Every
+    /// budget from 529 to 1059 therefore passed validation and then
+    /// published nothing at all — and §4 makes the pool output the
+    /// residual, so the pool took the entire block while every miner
+    /// booked their full claim as credit against coins it already held.
+    #[test]
+    fn budget_floor_is_what_the_blockspace_cut_actually_reserves() {
+        // Exactly the cut's own arithmetic, spelled out independently.
+        let cut_reserves =
+            COINBASE_BASE_WEIGHT + COINBASE_WITNESS_COMMITMENT_WEIGHT + COINBASE_OUTPUT_WEIGHT;
+        let smallest_that_fits_one_output =
+            cut_reserves + COINBASE_OUTPUT_WEIGHT + BUDGET_SAFETY_MARGIN_WU;
+        assert_eq!(
+            MIN_COINBASE_WEIGHT_BUDGET, smallest_that_fits_one_output,
+            "the floor must track the cut's reservation, not a looser guess"
+        );
+        assert_eq!(MIN_COINBASE_WEIGHT_BUDGET, 1_060);
+
+        // The old floor sat inside the dead zone — pin that it is now
+        // rejected, or this whole class of config comes back.
+        let old_floor = COINBASE_BASE_WEIGHT + BUDGET_SAFETY_MARGIN_WU;
+        assert!(old_floor < MIN_COINBASE_WEIGHT_BUDGET);
+        for dead in [old_floor + 1, 700, 1_012, MIN_COINBASE_WEIGHT_BUDGET - 1] {
+            assert!(
+                validate_fee_payout_budget(1.0, 5_000, dead).is_err(),
+                "budget {dead} publishes no miner output and must be refused"
+            );
+        }
+        // And the floor itself is ACCEPTED — `min` is the smallest
+        // usable value, not the largest rejected one.
+        assert_eq!(
+            validate_fee_payout_budget(1.0, 5_000, MIN_COINBASE_WEIGHT_BUDGET),
+            Ok(())
         );
     }
 

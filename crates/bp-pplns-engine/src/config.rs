@@ -40,8 +40,10 @@ pub struct PplnsEngineConfig {
     /// policy. Env var: `PPLNS_MIN_PAYOUT_SATS` (default 5000).
     pub min_payout_sats: Sats,
 
-    /// Coinbase weight budget (WU). Must match bitcoin.conf
-    /// `blockreservedweight`. Default 50_000 (≈400 P2WPKH outputs).
+    /// Coinbase weight budget (WU). Handed straight to bitcoin-core
+    /// over the TDP IPC stream (`tdp_constraint_for_budget`) — there is
+    /// no `bitcoin.conf` knob to keep in sync. Default 50_000 (≈400
+    /// P2WPKH outputs); floored at `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`.
     /// Env var: `PPLNS_COINBASE_WEIGHT_BUDGET`.
     pub coinbase_weight_budget: u32,
 

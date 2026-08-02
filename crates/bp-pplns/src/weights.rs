@@ -1481,6 +1481,66 @@ mod tests {
         );
     }
 
+    /// The config floor and the blockspace cut have to agree. The
+    /// smallest budget validation accepts must still publish an output
+    /// — even when the miner brings the heaviest address type there is,
+    /// because nothing stops one from joining a P2WPKH-only pool.
+    ///
+    /// One weight unit below it the cut publishes nothing, and §4 makes
+    /// the pool output the residual: the pool takes the entire block
+    /// while every miner books their full claim as credit against coins
+    /// it already holds. That state is what the floor exists to make
+    /// unreachable, and for a long time it did not — the floor was
+    /// `base + margin` = 528, half of what the cut reserves.
+    #[test]
+    fn the_smallest_accepted_budget_still_publishes_a_worst_case_output() {
+        use crate::weight::{validate_fee_payout_budget, MIN_COINBASE_WEIGHT_BUDGET};
+        const P2TR: &str = "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297";
+        assert_eq!(
+            output_weight_for_address(P2TR),
+            COINBASE_OUTPUT_WEIGHT,
+            "the fixture must actually be the heaviest output type"
+        );
+        const T: u64 = 312_500_000;
+        let shares = HashMap::from([(addr(P2TR), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+
+        let mut input = base_input(&shares, &balances, &fee);
+        input.coinbase_weight_budget = MIN_COINBASE_WEIGHT_BUDGET;
+        let d = build_weight_distribution(input).unwrap();
+        assert_eq!(
+            d.published().count(),
+            1,
+            "the smallest accepted budget must fit one worst-case output"
+        );
+        assert_eq!(d.budget_telemetry.trimmed_count, 0);
+        // And the pool is paid its fee, not the block.
+        let paid = d.payout_entries_at(T).expect("§4 vector");
+        let pool_pay = paid[0].1 as i64;
+        let fee_only = (T as i64 * d.fee_ppm as i64) / 1_000_000;
+        assert!(
+            (pool_pay - fee_only).abs() <= 2,
+            "pool took {pool_pay} on a fee of {fee_only}"
+        );
+
+        // One WU less: nothing published, pool takes everything.
+        let mut starved = base_input(&shares, &balances, &fee);
+        starved.coinbase_weight_budget = MIN_COINBASE_WEIGHT_BUDGET - 1;
+        let starved = build_weight_distribution(starved).unwrap();
+        assert_eq!(starved.published().count(), 0);
+        assert_eq!(
+            starved.payout_entries_at(T).expect("§4 vector")[0].1,
+            T,
+            "with nothing published the §4 residual is the whole block"
+        );
+        // …which is exactly why config validation has to refuse it.
+        assert!(
+            validate_fee_payout_budget(1.5, 5_000, MIN_COINBASE_WEIGHT_BUDGET - 1).is_err(),
+            "a budget that publishes nothing must not pass validation"
+        );
+    }
+
     /// `100 % fee → nothing published, weight_P alone`
     #[test]
     fn full_fee_publishes_nothing() {
