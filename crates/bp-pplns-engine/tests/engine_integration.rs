@@ -121,7 +121,7 @@ fn test_config() -> PplnsEngineConfig {
 /// Fee anchor for every engine in this file. Deliberately NOT a miner
 /// address used by any test, so fee rows can never collide with the
 /// per-test prefixed miners.
-const TEST_FEE_ADDRESS: &str = "bc1q9h6mqcxrmk2q6cw5tqcjkkfcrqyzyfxzjjhysx";
+const TEST_FEE_ADDRESS: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
 
 async fn spawn_or_skip(redis_db: u8, prefix: &str) -> Option<EngineHarness> {
     let (conn, pool) = connect_or_skip(redis_db, prefix).await?;
