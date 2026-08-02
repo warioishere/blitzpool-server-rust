@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"groupId\" AS \"group_id!\",\n            \"pendingSats\" AS \"pending_sats!: Sats\",\n            \"totalPaidSats\" AS \"total_paid_sats!: Sats\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"lastAcceptedShareAt\" AS \"last_accepted_share_at?\"\n           FROM pplns_group_balance\n           WHERE \"pendingSats\" > 0\n             AND \"pendingSats\" < $1\n             AND \"lastAcceptedShareAt\" IS NOT NULL\n             AND \"lastAcceptedShareAt\" < $2",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"groupId\" AS \"group_id!\",\n            \"pendingSats\" AS \"pending_sats!: Sats\",\n            \"totalPaidSats\" AS \"total_paid_sats!: Sats\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"lastAcceptedShareAt\" AS \"last_accepted_share_at?\"\n           FROM pplns_group_balance\n           WHERE \"pendingSats\" <> 0\n             AND \"lastAcceptedShareAt\" IS NOT NULL\n             AND \"lastAcceptedShareAt\" < $1",
   "describe": {
     "columns": [
       {
@@ -36,7 +36,6 @@
     ],
     "parameters": {
       "Left": [
-        "Int8",
         "Int8"
       ]
     },
@@ -49,5 +48,5 @@
       true
     ]
   },
-  "hash": "7549fb21f9facf2c4237dc320c61b23a9ef789dd88be9dd2a56f19a64e68f21f"
+  "hash": "d1db98aa5170b620c6ae079a4d535e5090dd8cf3d0283308219078663fc2cb62"
 }

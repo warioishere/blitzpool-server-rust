@@ -486,13 +486,19 @@ pub async fn find_all_pplns_group_balances_for_group(
     .map_err(DbError::from)
 }
 
-/// Dust-sweep candidate rows: positive `pendingSats` below the
-/// caller's `min_payout` floor, and `lastAcceptedShareAt` older than
-/// `cutoff_ms`. Group-Solo's sweep is single-sided (no pair-cancel),
-/// so this is the entire candidate set.
+/// Sweep candidate rows: any NON-ZERO `pendingSats` whose
+/// `lastAcceptedShareAt` is older than `cutoff_ms`.
+///
+/// Both signs, and no `min_payout` filter. The Group-Solo ledger became
+/// signed with the weight model — an overpaid member owes the pool —
+/// so the sweep pair-cancels a dormant credit against a dormant debit
+/// before it absorbs anything, exactly as PPLNS does. Filtering to
+/// positive sub-`min_payout` rows here (as this used to) hides every
+/// debit from the pairing and leaves dormant debts standing forever;
+/// the dust threshold belongs to the caller, applied to what the
+/// pairing leaves.
 pub async fn find_pplns_group_balances_dormant(
     pool: &PgPool,
-    min_payout: i64,
     cutoff_ms: i64,
 ) -> Result<Vec<PplnsGroupBalanceRow>, DbError> {
     sqlx::query_as!(
@@ -505,11 +511,9 @@ pub async fn find_pplns_group_balances_dormant(
             "updatedAt" AS "updated_at!",
             "lastAcceptedShareAt" AS "last_accepted_share_at?"
            FROM pplns_group_balance
-           WHERE "pendingSats" > 0
-             AND "pendingSats" < $1
+           WHERE "pendingSats" <> 0
              AND "lastAcceptedShareAt" IS NOT NULL
-             AND "lastAcceptedShareAt" < $2"#,
-        min_payout,
+             AND "lastAcceptedShareAt" < $1"#,
         cutoff_ms,
     )
     .fetch_all(pool)

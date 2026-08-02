@@ -994,10 +994,21 @@ impl GroupSoloEngine {
     /// is recomputed from the raw inputs (`claim_sats` + the finder
     /// bonus), the actually-paid amount comes from the real coinbase,
     /// and the difference lands on `pendingSats` as a delta against the
-    /// CURRENT row — clamped at 0 (unsigned model, same rationale as
-    /// [`Self::resolve_new_balance`]). One entry per address by
-    /// construction: the finder's bonus is part of their single weight,
-    /// so the old duplicate-address merge has nothing left to merge.
+    /// CURRENT row.
+    ///
+    /// SIGNED, and deliberately so — unlike the legacy
+    /// [`Self::resolve_new_balance`], which clamps at 0 because the old
+    /// model had no way to carry a debt. A coinbase that paid a member
+    /// more than they earned leaves them owing the pool, and clamping
+    /// that away gifts real satoshis; it is reachable whenever the
+    /// paying coinbase was computed against a richer revenue than the
+    /// distribution was projected for (a JD-client's own template).
+    /// The daily sweep pair-cancels those debts against the credits
+    /// that funded them.
+    ///
+    /// One entry per address by construction: the finder's bonus is
+    /// part of their single weight, so the old duplicate-address merge
+    /// has nothing left to merge.
     async fn build_writes_from_weight_snapshot(
         &self,
         group_id: Uuid,

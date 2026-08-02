@@ -97,6 +97,19 @@ async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
         .await;
 }
 
+/// Σ `pendingSats` across one group — the invariant a pair-cancel must
+/// preserve and a single-sided absorption breaks.
+async fn group_pending_sum(pool: &PgPool, group_id: Uuid) -> i64 {
+    let row: (Option<i64>,) = sqlx::query_as(
+        r#"SELECT SUM("pendingSats")::bigint FROM pplns_group_balance WHERE "groupId" = $1"#,
+    )
+    .bind(group_id)
+    .fetch_one(pool)
+    .await
+    .expect("sum");
+    row.0.unwrap_or(0)
+}
+
 fn clock_at(year: i32, month: u32, day: u32) -> Arc<TestClock> {
     Arc::new(TestClock::new(
         Utc.with_ymd_and_hms(year, month, day, 12, 0, 0).unwrap(),
@@ -392,4 +405,169 @@ async fn sweep_replay_safe_after_absorption() {
     assert_eq!(audit_count.0, 1);
 
     cleanup_group(&pool, group_id).await;
+}
+
+// ── Pair-cancel: the signed half of the ledger ─────────────────────
+//
+// The Group-Solo ledger became signed with the weight model — a member
+// the coinbase overpaid owes the pool. The sweep only ever looked at
+// `pendingSats > 0`, so it absorbed the credit that funded such a debt
+// and left the debt itself standing forever: the two sides of one
+// movement retired on different schedules, and `Σ pendingSats` drifted
+// by the absorbed amount every time.
+
+/// A dormant credit and the dormant debit it funded must retire
+/// TOGETHER, leaving the group's ledger sum exactly where it was.
+#[tokio::test]
+async fn sweep_pair_cancels_a_dormant_debt_against_its_credit() {
+    let _guard = SWEEP_TEST_LOCK.lock().await;
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    wipe_leftover_test_state(&pool).await;
+
+    let group_id = Uuid::new_v4();
+    seed_group(&pool, group_id).await;
+    let stale = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    // Sub-`min_payout` on purpose: this is exactly the credit the old
+    // sweep absorbed on its own, leaving the matching debit behind.
+    seed_balance(
+        &pool,
+        group_id,
+        "test_grpsw_pair_credit",
+        3_000,
+        Some(stale),
+    )
+    .await;
+    seed_balance(
+        &pool,
+        group_id,
+        "test_grpsw_pair_debit",
+        -3_000,
+        Some(stale),
+    )
+    .await;
+
+    let sum_before = group_pending_sum(&pool, group_id).await;
+    assert_eq!(sum_before, 0, "the fixture starts balanced");
+
+    let runner = GroupDustSweepRunner::new(pool.clone(), clock_at(2026, 5, 16), Sats(5_000), 30);
+    let stats = runner.sweep().await.expect("ok");
+
+    assert_eq!(stats.pairs_closed, 2, "one pair, two rows");
+    assert_eq!(stats.sats_paired, 3_000);
+    assert_eq!(
+        stats.rows_absorbed, 0,
+        "the credit was PAIRED, not absorbed — absorbing it is the bug"
+    );
+
+    let rows: (i64,) =
+        sqlx::query_as(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
+            .bind(group_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.0, 0, "both sides retired");
+    assert_eq!(
+        group_pending_sum(&pool, group_id).await,
+        sum_before,
+        "a pair-cancel moves +X and -X to zero together; the sum cannot drift"
+    );
+
+    // Both sides get an audit row so an operator can see the cancel.
+    let audit: (i64,) = sqlx::query_as(
+        r#"SELECT count(*) FROM pplns_group_block_history
+           WHERE "groupId" = $1 AND "rowType" = $2"#,
+    )
+    .bind(group_id)
+    .bind(ROW_TYPE_SWEEP)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audit.0, 2);
+
+    cleanup_group(&pool, group_id).await;
+}
+
+/// A dormant debit with no counterparty stays on the books. Deleting it
+/// would forgive satoshis the other members are owed, and age is not a
+/// reason to hand them over.
+#[tokio::test]
+async fn sweep_leaves_an_unpaired_debt_standing() {
+    let _guard = SWEEP_TEST_LOCK.lock().await;
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    wipe_leftover_test_state(&pool).await;
+
+    let group_id = Uuid::new_v4();
+    seed_group(&pool, group_id).await;
+    let stale = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    seed_balance(
+        &pool,
+        group_id,
+        "test_grpsw_lone_debit",
+        -4_200,
+        Some(stale),
+    )
+    .await;
+
+    let runner = GroupDustSweepRunner::new(pool.clone(), clock_at(2026, 5, 16), Sats(5_000), 30);
+    let stats = runner.sweep().await.expect("ok");
+
+    assert_eq!(stats.pairs_closed, 0);
+    assert_eq!(stats.rows_absorbed, 0, "a debt is never absorbed");
+    assert_eq!(
+        group_pending_sum(&pool, group_id).await,
+        -4_200,
+        "the debt is still owed"
+    );
+
+    cleanup_group(&pool, group_id).await;
+}
+
+/// Pairing is scoped to one group. `pplns_group_balance` is keyed
+/// `(address, groupId)` and each group's coinbase pays only its own
+/// members, so cancelling across groups would move satoshis between two
+/// ledgers that never traded.
+#[tokio::test]
+async fn sweep_never_cancels_across_groups() {
+    let _guard = SWEEP_TEST_LOCK.lock().await;
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    wipe_leftover_test_state(&pool).await;
+
+    let group_a = Uuid::new_v4();
+    let group_b = Uuid::new_v4();
+    seed_group(&pool, group_a).await;
+    seed_group(&pool, group_b).await;
+    let stale = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    // Above min_payout so the dust pass cannot touch it either — the
+    // only thing that could move these rows is a cross-group pairing.
+    seed_balance(&pool, group_a, "test_grpsw_x_credit", 9_000, Some(stale)).await;
+    seed_balance(&pool, group_b, "test_grpsw_x_debit", -9_000, Some(stale)).await;
+
+    let runner = GroupDustSweepRunner::new(pool.clone(), clock_at(2026, 5, 16), Sats(5_000), 30);
+    let stats = runner.sweep().await.expect("ok");
+
+    assert_eq!(stats.pairs_closed, 0, "no counterparty inside either group");
+    assert_eq!(stats.rows_absorbed, 0);
+    assert_eq!(group_pending_sum(&pool, group_a).await, 9_000);
+    assert_eq!(group_pending_sum(&pool, group_b).await, -9_000);
+
+    cleanup_group(&pool, group_a).await;
+    cleanup_group(&pool, group_b).await;
 }
