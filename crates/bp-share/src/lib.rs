@@ -371,20 +371,34 @@ pub fn claim_sats(score_weight: u64, score_total: u64, fee_ppm: u32, t_actual: u
 /// exactly these inputs from the snapshot stored under this hash and
 /// books `earned(T_actual) − actually_paid` per address.
 ///
+/// `fee_address` IS in the preimage: it is the settlement recipient of
+/// everything the coinbase withholds, and the snapshot stored under
+/// this hash is read back to decide which row is the pool's rather than
+/// a miner's. Two distributions that differ only there must not share a
+/// key.
+///
 /// Deliberately NOT in the preimage: the published wire weights and
 /// the reference revenue behind their balance boosts — distributions
 /// that differ only there settle identically and may share a snapshot.
+/// `weight_P` follows the same rule: settlement never reads it, since
+/// what was actually paid comes from the block's own coinbase.
 ///
-/// Canonical, domain-tagged, length-prefixed; entry order is part of
-/// the identity (it is the coinbase output order).
+/// Canonical, domain-tagged, length-prefixed. Entry ORDER is part of
+/// the identity, so the caller must supply a canonical order that does
+/// not itself depend on an excluded input — address order. (The
+/// coinbase output order is NOT canonical: it sorts by wire weight,
+/// which carries the reference revenue through the balance boosts.)
 pub fn weights_fingerprint_from_parts<'a>(
     fee_ppm: u32,
+    fee_address: &str,
     finder_bonus: Option<(&'a str, u64)>,
     entries: impl IntoIterator<Item = (&'a str, u64, i64, u32)>,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"bp-weights-v2");
     hasher.update(fee_ppm.to_le_bytes());
+    hasher.update((fee_address.len() as u32).to_le_bytes());
+    hasher.update(fee_address.as_bytes());
     match finder_bonus {
         Some((address, sats)) => {
             hasher.update([1u8]);
@@ -1086,6 +1100,7 @@ mod tests {
         let base = || {
             weights_fingerprint_from_parts(
                 15_000,
+                "bc1qpool",
                 Some(("bc1qfinder", 50_000)),
                 [("bc1qa", 10, 5i64, 546u32), ("bc1qb", 20, -3, 546)],
             )
@@ -1093,30 +1108,41 @@ mod tests {
         assert_eq!(base(), base());
         let fee = weights_fingerprint_from_parts(
             15_001,
+            "bc1qpool",
+            Some(("bc1qfinder", 50_000)),
+            [("bc1qa", 10, 5, 546), ("bc1qb", 20, -3, 546)],
+        );
+        let fee_recipient = weights_fingerprint_from_parts(
+            15_000,
+            "bc1qotherpool",
             Some(("bc1qfinder", 50_000)),
             [("bc1qa", 10, 5, 546), ("bc1qb", 20, -3, 546)],
         );
         let bonus = weights_fingerprint_from_parts(
             15_000,
+            "bc1qpool",
             None,
             [("bc1qa", 10, 5, 546), ("bc1qb", 20, -3, 546)],
         );
         let weight = weights_fingerprint_from_parts(
             15_000,
+            "bc1qpool",
             Some(("bc1qfinder", 50_000)),
             [("bc1qa", 11, 5, 546), ("bc1qb", 20, -3, 546)],
         );
         let balance = weights_fingerprint_from_parts(
             15_000,
+            "bc1qpool",
             Some(("bc1qfinder", 50_000)),
             [("bc1qa", 10, 6, 546), ("bc1qb", 20, -3, 546)],
         );
         let order = weights_fingerprint_from_parts(
             15_000,
+            "bc1qpool",
             Some(("bc1qfinder", 50_000)),
             [("bc1qb", 20, -3, 546), ("bc1qa", 10, 5, 546)],
         );
-        for other in [fee, bonus, weight, balance, order] {
+        for other in [fee, fee_recipient, bonus, weight, balance, order] {
             assert_ne!(base(), other);
         }
     }
@@ -1125,7 +1151,7 @@ mod tests {
     #[test]
     fn weights_fingerprint_is_domain_separated_from_v1() {
         let v1 = payouts_fingerprint_from_parts(1000, [("bc1qa", 600u64)]);
-        let v2 = weights_fingerprint_from_parts(0, None, [("bc1qa", 600, 0i64, 0u32)]);
+        let v2 = weights_fingerprint_from_parts(0, "bc1qpool", None, [("bc1qa", 600, 0i64, 0u32)]);
         assert_ne!(v1, v2);
     }
 }
