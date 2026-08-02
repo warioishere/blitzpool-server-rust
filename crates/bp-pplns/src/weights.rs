@@ -70,11 +70,14 @@ pub struct WeightEntry {
 pub struct WeightDistribution {
     /// Deterministic order: published entries first (wire weight desc,
     /// address asc — the §4 coinbase output order), then unpublished
-    /// entries (address asc). The fingerprint is over this order.
+    /// entries (address asc). NOT the fingerprint order, which is by
+    /// address (this one moves with the reference revenue).
     pub entries: Vec<WeightEntry>,
-    /// `weight_P` (§3.1): the pool output's weight — fee share plus
-    /// every weight folded by the blockspace cut. Always ≥ 1 (the §4
-    /// residual needs a live pool output).
+    /// `weight_P` (§3.1): the pool output's weight — the fee over
+    /// everything this block owes the miners, plus every weight owed
+    /// but not paid out (folded by the blockspace cut, or held back
+    /// against the miner's own debt). Always ≥ 1 (the §4 residual needs
+    /// a live pool output).
     pub weight_p: u64,
     /// Pool fee in parts-per-million of revenue (1 % = 10 000 ppm).
     pub fee_ppm: u32,
@@ -158,9 +161,12 @@ pub fn build_weight_distribution(
     }
     let t_ref = input.reference_revenue_sats;
 
+    // Saturating, not truncating: `as u32` WRAPS, so a min_payout
+    // entered in the wrong unit could land below the dust floor the
+    // `.max()` exists to guarantee — 2^32 sats would become 0.
     let dust_limit: u32 = input
         .min_payout_sats
-        .map(|s| s.0.max(DUST_LIMIT_SATS as i64) as u32)
+        .map(|s| s.0.clamp(DUST_LIMIT_SATS as i64, u32::MAX as i64) as u32)
         .unwrap_or(DUST_LIMIT_SATS as u32);
 
     // 1 % = 10_000 ppm. fee_percent is pre-validated to [0, 100].
@@ -170,31 +176,44 @@ pub fn build_weight_distribution(
     // u_i = round(share_i / Σshares · SCORE_PRECISION). Scale-invariant
     // in the window's own units; miners below 1/SCORE_PRECISION of the
     // pool project to 0 and settle (to 0) without an output.
-    let score_total_f64: f64 = input
+    // Summed in ADDRESS order, not `HashMap` order: f64 addition is not
+    // associative and every map instance iterates differently, so a
+    // HashMap-order sum makes the total — and with it a rounded score,
+    // and with it the fingerprint — depend on which map object happened
+    // to carry the shares. Unchanged pool state would then mint a new
+    // settlement identity and age the live distribution out of the
+    // acceptance window.
+    let mut scored: Vec<(&AddressId, f64)> = input
         .address_shares
         .iter()
         .filter(|(a, s)| s.is_finite() && **s > 0.0 && is_valid_payout_address(a.as_str()))
-        .map(|(_, s)| *s)
-        .sum();
+        .map(|(a, s)| (a, *s))
+        .collect();
+    scored.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    let score_total_f64: f64 = scored.iter().map(|(_, s)| *s).sum();
 
     struct Candidate {
         address: AddressId,
         score_weight: u64,
         balance_sats: i64,
+        /// What this block owes the address: its score claim plus any
+        /// credit being repaid. A DEBT lowers what is paid out, never
+        /// what is owed — see `weight_p` below.
+        entitlement_weight: u64,
+        /// What is actually paid on-chain. Never above the entitlement;
+        /// the difference is withheld into the pool output.
         wire_weight: u64,
     }
     let mut candidates: HashMap<&AddressId, Candidate> = HashMap::new();
-    for (address, shares) in input.address_shares {
-        if !shares.is_finite() || *shares <= 0.0 || !is_valid_payout_address(address.as_str()) {
-            continue;
-        }
-        let u = ((*shares / score_total_f64) * SCORE_PRECISION as f64).round() as u64;
+    for (address, shares) in &scored {
+        let u = ((shares / score_total_f64) * SCORE_PRECISION as f64).round() as u64;
         candidates.insert(
             address,
             Candidate {
-                address: address.clone(),
+                address: (*address).clone(),
                 score_weight: u,
                 balance_sats: 0,
+                entitlement_weight: 0,
                 wire_weight: 0,
             },
         );
@@ -209,6 +228,7 @@ pub fn build_weight_distribution(
                 address: address.clone(),
                 score_weight: 0,
                 balance_sats: 0,
+                entitlement_weight: 0,
                 wire_weight: 0,
             })
             .balance_sats = balance.0;
@@ -216,29 +236,33 @@ pub fn build_weight_distribution(
 
     let score_total: u64 = candidates.values().map(|c| c.score_weight).sum();
 
-    // ── Fee weight ──────────────────────────────────────────────────
-    // weight_P/W = fee fraction when no boosts are in play:
-    // weight_P = S · f / (1 − f), in ppm integer math. 100 % fee is the
-    // degenerate whole-revenue-to-pool distribution.
-    let fee_weight: u64 = if fee_ppm >= 1_000_000 || score_total == 0 {
-        0 // resolved below: no miner weights → weight_p floors at 1
+    // ── Weight-per-sat scale ────────────────────────────────────────
+    // The miners' cut of a block is (1 − f)·T and maps onto the score
+    // space S, so one satoshi is worth S/((1 − f)·T_ref) in weight.
+    // `w0 = S + S·f/(1 − f) = S/(1 − f)` is that scale without a
+    // division, and it is derived from the score total ALONE so the
+    // projection can never depend on its own output.
+    let score_fee_weight: u128 = if fee_ppm >= 1_000_000 || score_total == 0 {
+        0
     } else {
-        ((score_total as u128 * fee_ppm as u128) / (1_000_000 - fee_ppm) as u128) as u64
+        (score_total as u128 * fee_ppm as u128) / (1_000_000 - fee_ppm) as u128
     };
-
-    // ── Boost projection (the two documented sats→weight sites) ─────
-    // boost = sats · W₀ / T_ref against the pre-boost weight space.
-    let w0 = (score_total as u128 + fee_weight as u128).max(1);
+    let w0 = (score_total as u128 + score_fee_weight).max(1);
     let boost_for = |sats: i64| -> i128 { (sats as i128 * w0 as i128) / t_ref as i128 };
 
     let publish_all = fee_ppm < 1_000_000;
     for c in candidates.values_mut() {
         if !publish_all {
             c.wire_weight = 0;
+            c.entitlement_weight = 0;
             continue;
         }
-        let wire = c.score_weight as i128 + boost_for(c.balance_sats);
-        c.wire_weight = wire.clamp(0, u64::MAX as i128) as u64;
+        let raw = c.score_weight as i128 + boost_for(c.balance_sats);
+        c.wire_weight = raw.clamp(0, u64::MAX as i128) as u64;
+        // A credit raises what this block owes the miner; a debt does
+        // NOT lower it — it only lowers what is paid out, and the
+        // difference is the pool recovering the debt in cash.
+        c.entitlement_weight = raw.max(c.score_weight as i128).clamp(0, u64::MAX as i128) as u64;
     }
     let finder_bonus: Option<(AddressId, u64)> =
         match (input.finder_bonus_sats, input.finder_address) {
@@ -251,10 +275,14 @@ pub fn build_weight_distribution(
                         address: finder.clone(),
                         score_weight: 0,
                         balance_sats: 0,
+                        entitlement_weight: 0,
                         wire_weight: 0,
                     });
-                    let wire = c.wire_weight as i128 + boost_for(bonus_sats as i64);
+                    let bonus_boost = boost_for(bonus_sats as i64);
+                    let wire = c.wire_weight as i128 + bonus_boost;
                     c.wire_weight = wire.clamp(0, u64::MAX as i128) as u64;
+                    let ent = c.entitlement_weight as i128 + bonus_boost;
+                    c.entitlement_weight = ent.clamp(0, u64::MAX as i128) as u64;
                 }
                 Some((finder.clone(), bonus_sats))
             }
@@ -286,7 +314,6 @@ pub fn build_weight_distribution(
         COINBASE_BASE_WEIGHT + COINBASE_WITNESS_COMMITMENT_WEIGHT + COINBASE_OUTPUT_WEIGHT; // the pool_payout output, worst-case type
     let mut used_weight = fixed_overhead;
     let mut desired_weight = fixed_overhead;
-    let mut folded_weight: u64 = 0;
     let mut trimmed_count: u32 = 0;
     for c in entries.iter_mut() {
         if c.wire_weight == 0 {
@@ -297,23 +324,60 @@ pub fn build_weight_distribution(
         if used_weight.saturating_add(ow) <= effective_budget {
             used_weight += ow;
         } else {
-            folded_weight = folded_weight.saturating_add(c.wire_weight);
             c.wire_weight = 0;
             trimmed_count += 1;
         }
     }
 
-    let weight_p = fee_weight.saturating_add(folded_weight).max(1);
+    // ── Pool weight ─────────────────────────────────────────────────
+    //
+    // Two parts, and keeping them apart is what makes the configured
+    // fee mean what it says:
+    //
+    // 1. The FEE, taken over what this block owes the miners in total
+    //    (`E`), not over their bare scores. Because `W = E + weight_P`
+    //    resolves to `E/(1 − f)`, the pool output is exactly `f·T`
+    //    however large the credits being repaid are — a repayment is a
+    //    redistribution WITHIN the miners' cut, as it was before the
+    //    weight model, never a discount on the pool's fee.
+    // 2. Everything WITHHELD: `E − Σ published`. A weight that is owed
+    //    but not paid out — folded by the blockspace cut, or a payout
+    //    shrunk by the miner's own debt — must land in the pool output,
+    //    never silently leave `W`. Dropping it would inflate every
+    //    remaining miner's share above their settlement claim, paying
+    //    real satoshis against an IOU the pool can only collect from
+    //    future blocks. Settlement books the difference back: as a
+    //    balance credit for a folded miner, as debt recovered for a
+    //    shrunk one.
+    let total_entitlement: u128 = entries.iter().map(|c| c.entitlement_weight as u128).sum();
+    let published_total: u128 = entries.iter().map(|c| c.wire_weight as u128).sum();
+    let withheld = total_entitlement.saturating_sub(published_total);
+    let fee_weight: u128 = if fee_ppm >= 1_000_000 || total_entitlement == 0 {
+        0 // no miner weights → weight_p floors at 1 and takes the block
+    } else {
+        (total_entitlement * fee_ppm as u128) / (1_000_000 - fee_ppm) as u128
+    };
+    let weight_p = fee_weight
+        .saturating_add(withheld)
+        .clamp(1, u64::MAX as u128) as u64;
 
     // Order can change where the cut zeroed wire weights mid-list:
     // restore the published-then-unpublished invariant (stable sort
     // keeps the relative order of both groups).
     entries.sort_by_key(|c| c.wire_weight == 0);
 
+    // Hashed over an ADDRESS-ordered view, not the coinbase order above:
+    // that order sorts by wire weight, and wire weights carry `t_ref`
+    // through the balance boosts. Hashing it would smuggle the reference
+    // revenue back into an identity that exists precisely so builds at
+    // different revenues can share one settlement snapshot.
+    let mut identity: Vec<&Candidate> = entries.iter().collect();
+    identity.sort_by(|a, b| a.address.as_str().cmp(b.address.as_str()));
     let fingerprint = weights_fingerprint_from_parts(
         fee_ppm,
+        input.fee_address.as_str(),
         finder_bonus.as_ref().map(|(a, sats)| (a.as_str(), *sats)),
-        entries.iter().map(|c| {
+        identity.iter().map(|c| {
             (
                 c.address.as_str(),
                 c.score_weight,
@@ -409,6 +473,146 @@ mod tests {
         assert!((14_999..=15_000).contains(&ppm), "fee ppm was {ppm}");
     }
 
+    /// The build must not depend on which `HashMap` instance carried the
+    /// shares. Every map gets its own hash seed, so identical contents
+    /// iterate differently — and f64 addition is not associative, which
+    /// is why the score total is summed in address order.
+    #[test]
+    fn build_is_independent_of_hashmap_iteration_order() {
+        // Order-sensitive by construction: adding the large value first
+        // absorbs both small ones, adding it last does not.
+        let big = 1e16f64;
+        assert_ne!(
+            (big + 1.0) + 1.0,
+            (1.0 + 1.0) + big,
+            "fixture must actually be order-sensitive in f64"
+        );
+        let fee = addr(FEE);
+        let balances = HashMap::new();
+        let mut seen: Option<[u8; 32]> = None;
+        // Fresh maps, each with its own iteration order.
+        for _ in 0..32 {
+            let shares = HashMap::from([(addr(A1), big), (addr(A2), 1.0), (addr(A3), 1.0)]);
+            let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
+            match seen {
+                None => seen = Some(d.fingerprint),
+                Some(first) => assert_eq!(
+                    d.fingerprint, first,
+                    "same inputs must produce one settlement identity"
+                ),
+            }
+        }
+    }
+
+    /// A min_payout too large for the dust-limit field must never wrap
+    /// below the 546-sat floor — an operator entering sats where BTC
+    /// was meant would otherwise turn dust-pruning off entirely.
+    #[test]
+    fn oversized_min_payout_saturates_instead_of_wrapping() {
+        let shares = HashMap::from([(addr(A1), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+        for min_payout in [
+            i64::from(u32::MAX) + 1, // wraps to 0 with a truncating cast
+            i64::from(u32::MAX) + 547,
+            i64::MAX,
+        ] {
+            let mut input = base_input(&shares, &balances, &fee);
+            input.min_payout_sats = Some(Sats(min_payout));
+            let d = build_weight_distribution(input).unwrap();
+            assert_eq!(
+                d.entries[0].dust_limit,
+                u32::MAX,
+                "min_payout {min_payout} must saturate, not wrap"
+            );
+        }
+    }
+
+    /// The configured fee is what the pool is paid, whatever the ledger
+    /// owes the miners. A repayment is a redistribution WITHIN the
+    /// miners' cut — never a discount on the pool's fee.
+    #[test]
+    fn accumulated_credit_never_dilutes_the_fee() {
+        let fee = addr(FEE);
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
+        // Credits from nothing up to 1.5x the whole block: the ledger
+        // can hold arbitrarily much after a long stretch without a block.
+        for credit in [0i64, 31_250_000, 156_250_000, 468_750_000] {
+            let balances = if credit == 0 {
+                HashMap::new()
+            } else {
+                HashMap::from([(addr(A1), Sats(credit))])
+            };
+            let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
+            let ppm = (d.weight_p as u128 * 1_000_000 / d.wire_weight_total()) as u32;
+            assert!(
+                (14_999..=15_000).contains(&ppm),
+                "credit {credit} moved the fee to {ppm} ppm"
+            );
+        }
+    }
+
+    /// A payout shrunk by the miner's own debt is the pool COLLECTING
+    /// that debt: the withheld weight belongs in the pool output, and
+    /// every other miner must still be paid exactly their own claim.
+    #[test]
+    fn debt_recovery_goes_to_the_pool_not_to_the_other_miners() {
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
+        // A1 owes more than a whole block share is worth → pays nothing.
+        let balances = HashMap::from([(addr(A1), Sats(-400_000_000))]);
+        let fee = addr(FEE);
+        let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
+        assert_eq!(
+            d.entries
+                .iter()
+                .find(|e| e.address.as_str() == A1)
+                .unwrap()
+                .wire_weight,
+            0
+        );
+
+        const T: u64 = 312_500_000;
+        let published: Vec<&WeightEntry> = d.published().collect();
+        let amounts = bp_share::compute_payout_amounts(
+            d.weight_p,
+            &published.iter().map(|e| e.wire_weight).collect::<Vec<_>>(),
+            &published.iter().map(|e| e.dust_limit).collect::<Vec<_>>(),
+            T,
+        )
+        .expect("§4 vector");
+        let a2_paid = published
+            .iter()
+            .zip(&amounts.pays)
+            .find(|(e, _)| e.address.as_str() == A2)
+            .and_then(|(_, pay)| *pay)
+            .expect("A2 is paid");
+        // A2's settlement claim: half the miners' cut, nothing more.
+        // Without the withheld weight in weight_P, A2 would collect
+        // ~97 % of the block and owe the difference back.
+        let a2_claim = bp_share::claim_sats(
+            d.entries
+                .iter()
+                .find(|e| e.address.as_str() == A2)
+                .unwrap()
+                .score_weight,
+            d.score_total,
+            d.fee_ppm,
+            T,
+        );
+        assert!(
+            a2_paid.abs_diff(a2_claim) <= 2,
+            "A2 paid {a2_paid} but claims {a2_claim} — the debt was redistributed, not collected"
+        );
+        // The pool holds its fee PLUS the recovered debt.
+        assert!(
+            amounts.pool_pay > T / 2,
+            "pool got {}: fee plus A1's withheld share is more than half the block",
+            amounts.pool_pay
+        );
+        let total: u64 = amounts.pool_pay + amounts.pays.iter().flatten().sum::<u64>();
+        assert_eq!(total, T, "Σ == T");
+    }
+
     /// `positive balance boosts the wire weight by ≈ balance·W₀/T_ref`
     #[test]
     fn positive_balance_boosts_wire_weight() {
@@ -418,10 +622,13 @@ mod tests {
         let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
         let w1 = d.entries.iter().find(|e| e.address.as_str() == A1).unwrap();
         let w2 = d.entries.iter().find(|e| e.address.as_str() == A2).unwrap();
-        // A1's boost ≈ 10 % of W₀ on top of its 50 % score.
+        // A1's boost ≈ 10 % of W₀ on top of its 50 % score. W₀ is the
+        // SCORE-space scale `S/(1 − f)` — not `weight_p`, which also
+        // carries whatever the block withholds.
         let boost = w1.wire_weight - w1.score_weight;
-        let w0 = d.score_total + (d.weight_p);
-        let expected = (31_250_000u128 * w0 as u128 / 312_500_000u128) as u64;
+        let w0 = d.score_total as u128
+            + (d.score_total as u128 * d.fee_ppm as u128) / (1_000_000 - d.fee_ppm) as u128;
+        let expected = (31_250_000u128 * w0 / 312_500_000u128) as u64;
         assert!(
             boost.abs_diff(expected) <= 1,
             "boost {boost} vs expected {expected}"
@@ -590,6 +797,31 @@ mod tests {
         assert_eq!(
             a.fingerprint, b.fingerprint,
             "same settlement inputs → same snapshot identity"
+        );
+    }
+
+    /// The single-entry case above cannot reorder. With two miners whose
+    /// wire weights CROSS as the reference revenue moves, the coinbase
+    /// order flips — and the identity must not move with it, or every
+    /// rebuild against a fresh template mints a new snapshot.
+    #[test]
+    fn fingerprint_survives_a_boost_driven_reorder() {
+        let shares = HashMap::from([(addr(A1), 51.0), (addr(A2), 49.0)]);
+        // A2 trails on shares but holds credit, so a small T_ref lifts
+        // it past A1 while a large one leaves it behind.
+        let balances = HashMap::from([(addr(A2), Sats(5_000_000))]);
+        let fee = addr(FEE);
+        let a = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
+        let mut input = base_input(&shares, &balances, &fee);
+        input.reference_revenue_sats = 50_000_000;
+        let b = build_weight_distribution(input).unwrap();
+        assert_ne!(
+            a.entries[0].address, b.entries[0].address,
+            "fixture must actually reorder the coinbase between the two revenues"
+        );
+        assert_eq!(
+            a.fingerprint, b.fingerprint,
+            "the coinbase order is not the settlement identity"
         );
     }
 }
