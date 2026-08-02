@@ -937,10 +937,7 @@ impl PplnsEngine {
                 snapshot.fee_ppm,
                 t,
                 extras_total,
-            ) + match &snapshot.finder_bonus {
-                Some((finder, bonus)) if *finder == entry.address => *bonus as i64,
-                _ => 0,
-            };
+            );
             let paid = actual
                 .paid_by_address
                 .get(&entry.address)

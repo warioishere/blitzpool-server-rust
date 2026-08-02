@@ -58,6 +58,19 @@ pub const MIN_COINBASE_WEIGHT_BUDGET: u32 = COINBASE_BASE_WEIGHT
     + COINBASE_OUTPUT_WEIGHT // the pool output — structural under §4
     + COINBASE_OUTPUT_WEIGHT; // one miner output, worst-case type
 
+/// Hard cap on the Group-Solo finder bonus, in parts-per-million of
+/// the miner cut (50 %).
+///
+/// A typo guard, not a policy: half the pot to one member already
+/// makes the proportional split nearly meaningless. Chosen ABOVE the
+/// 32 % that the previous 1-BTC sats cap worked out to against a
+/// 3.125-BTC block, so converting an existing configuration can never
+/// silently clamp it down.
+///
+/// Must stay below 1 000 000: the bonus weight is `S·ppm/(1e6 − ppm)`
+/// and the divisor has to remain positive.
+pub const MAX_FINDER_BONUS_PPM: u32 = 500_000;
+
 /// Resolve the operational minimum-payout setting from raw env input.
 /// Clamped to ≥ DUST_LIMIT_SATS (Bitcoin Core relay policy floor).
 pub fn resolve_min_payout_sats(raw: Option<&str>) -> Sats {

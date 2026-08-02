@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use bp_common::{AddressId, Sats};
+use bp_common::AddressId;
 use bp_db::{PatchField, PplnsGroupMemberRow, PplnsGroupRow, RoundResetConfigPatch};
 use bp_group_mgmt::{
     constants::{MIN_MEMBERS_ACTIVE, MS_PER_DAY},
@@ -48,7 +48,7 @@ pub struct UpdateRoundResetSettings {
     pub preset: PatchField<RoundResetPreset>,
     pub interval_days: PatchField<u32>,
     pub timezone: PatchField<String>,
-    pub finder_bonus_sats: PatchField<Sats>,
+    pub finder_bonus_ppm: PatchField<i32>,
     pub is_public: PatchField<bool>,
     pub reset_round_on_block: PatchField<bool>,
     pub max_members: PatchField<i32>,
@@ -512,7 +512,7 @@ impl<H: GroupServiceHooks> GroupService<H> {
         // Build the resolved config we'd see after the PATCH applies —
         // needed for the cross-field validation that follows.
         let resolved = resolve_after_patch(&group, &settings);
-        validate_resolved_round_reset(&resolved, self.hooks.min_payout_sats())?;
+        validate_resolved_round_reset(&resolved)?;
 
         let patch = settings_to_db_patch(settings);
         let now = now_ms();
@@ -576,27 +576,24 @@ fn resolve_after_patch(
         PatchField::Clear => None,
         PatchField::Set(tz) => Some(tz.clone()),
     };
-    let finder_bonus_sats = match &settings.finder_bonus_sats {
-        PatchField::Untouched => current.finder_bonus_sats.unwrap_or(Sats(0)),
-        PatchField::Clear => Sats(0),
+    let finder_bonus_ppm = match &settings.finder_bonus_ppm {
+        PatchField::Untouched => current.finder_bonus_ppm.unwrap_or(0),
+        PatchField::Clear => 0,
         PatchField::Set(b) => *b,
     };
     RoundResetConfig {
         preset,
         interval_days,
         timezone,
-        finder_bonus_sats,
+        finder_bonus_ppm,
     }
 }
 
 /// Validate the post-patch config. Combines the pure-math validators
 /// from `bp-group-mgmt::group::validate_round_reset` with an IANA TZ
 /// check the pure crate deliberately leaves to the service layer.
-fn validate_resolved_round_reset(
-    resolved: &RoundResetConfig,
-    min_payout: Sats,
-) -> Result<(), GroupServiceError> {
-    bp_group_mgmt::group::validate_round_reset(resolved, min_payout).map_err(|e| {
+fn validate_resolved_round_reset(resolved: &RoundResetConfig) -> Result<(), GroupServiceError> {
+    bp_group_mgmt::group::validate_round_reset(resolved).map_err(|e| {
         use bp_group_mgmt::group::RoundResetError;
         match e {
             RoundResetError::IntervalWithoutCustomPreset
@@ -604,8 +601,7 @@ fn validate_resolved_round_reset(
             RoundResetError::MissingTimezone | RoundResetError::IntervalRequiredForCustom => {
                 GroupServiceError::IncompleteSchedule
             }
-            RoundResetError::FinderBonusOutOfRange(_)
-            | RoundResetError::FinderBonusSubMinPayout { .. } => GroupServiceError::InvalidBonus,
+            RoundResetError::FinderBonusOutOfRange(_) => GroupServiceError::InvalidBonus,
         }
     })?;
     // IANA TZ check happens here (service layer owns the TZ DB).
@@ -626,7 +622,7 @@ fn settings_to_db_patch(s: UpdateRoundResetSettings) -> RoundResetConfigPatch {
         // hour_local is hard-coded to 0 on every PATCH —
         // calendar resets fire at midnight local time, always.
         hour_local: PatchField::Set(0),
-        finder_bonus_sats: s.finder_bonus_sats.map_set(|sats| sats.to_i64()),
+        finder_bonus_ppm: s.finder_bonus_ppm,
         is_public: s.is_public,
         reset_round_on_block: s.reset_round_on_block,
         max_members: s.max_members,

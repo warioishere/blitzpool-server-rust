@@ -298,26 +298,28 @@ async fn on_block_found_applies_distribution_and_resets_round() {
 // ── Overpayment must be recorded as debt, not forgiven ─────────────
 //
 // A JD-client computes its coinbase amounts against ITS OWN template
-// revenue, so a block that pays more than the distribution was
-// projected against hands a member more than they earned. That
-// difference is a debt: the pool must record it and recover it from the
-// member's next payout. Clamping it away silently gifts real satoshis.
+// revenue. That used to matter: the finder bonus was a fixed satoshi
+// promise carried as a weight, so §4 paid `bonus · T/t_ref` and a
+// richer block overpaid the finder by the difference — real satoshis,
+// recoverable only by booking a debt and clawing it back next block.
+//
+// The bonus is a PROPORTION now. A weight is exact at every revenue,
+// for every payer, so there is nothing left to overpay and nothing to
+// claw back. These two tests pin that: the same fixtures that used to
+// produce a 5M and a 15M debt now settle flat.
 
 #[tokio::test]
-async fn overpayment_is_booked_as_debt_and_recovered_next_block() {
-    // A 50M finder bonus, as the API sets it.
-    let h = match spawn_or_skip(12, Some(50_000_000)).await {
+async fn a_richer_block_leaves_nobody_owing() {
+    // 16 % finder bonus — what the old 50M-sat carve-out came to.
+    let h = match spawn_or_skip(12, Some(160_000)).await {
         Some(h) => h,
         None => return,
     };
     let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
     const T_REF: u64 = 312_500_000;
     // What the JD-client's own template actually paid: 20 % richer.
     const T_ACTUAL: u64 = 375_000_000;
-    // Two members: the bonus only redistributes if there is someone to
-    // redistribute from. With a single member the finder already takes
-    // the whole miner cut and the bonus cannot show up on-chain at all.
-    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
     h.engine
         .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
         .await
@@ -332,16 +334,11 @@ async fn overpayment_is_booked_as_debt_and_recovered_next_block() {
         .await
         .expect("build");
 
-    // The score share scales with the revenue and so does the claim —
-    // those match. The BONUS does not: it is a fixed sats promise
-    // carried as a weight, so a richer block pays it out inflated while
-    // the ledger still owes exactly 50M. The difference is a debt.
-    let actual = actual_paying_exactly(&result, T_ACTUAL);
     h.engine
         .on_block_found_scaled(
             h.group_id,
             9_995_401,
-            &actual,
+            &actual_paying_exactly(&result, T_ACTUAL),
             &finder,
             None,
             Some(result.payouts_fingerprint()),
@@ -349,69 +346,26 @@ async fn overpayment_is_booked_as_debt_and_recovered_next_block() {
         .await
         .expect("apply");
 
-    let pending: i64 = sqlx::query_scalar(
-        r#"SELECT "pendingSats" FROM pplns_group_balance
-           WHERE "groupId" = $1 AND address = $2"#,
-    )
-    .bind(h.group_id)
-    .bind(finder.as_str())
-    .fetch_one(&h.pool)
-    .await
-    .expect("balance row");
-    assert!(
-        pending < 0,
-        "an overpaid member owes the pool; got pendingSats = {pending}"
-    );
-    // The size is not incidental. Two 50 % members, fee 0: the block
-    // pays out `pot(T) = 375M`, of which the bonus takes a fixed 50M
-    // and the rest splits by score, so the finder earns
-    // `(375M − 50M)/2 + 50M = 212.5M`. The coinbase pays it its wire
-    // share of a 20 %-richer block instead, 217.5M — the bonus rode the
-    // revenue up while the promise did not. 5M is exactly that
-    // overshoot, and it is the OTHER member who was short-changed for
-    // it, so their credit must mirror it.
-    assert!(
-        (pending + 5_000_000).abs() <= 2,
-        "expected the ~5M bonus overshoot as debt, got {pending}"
-    );
-    let other_pending: i64 = sqlx::query_scalar(
-        r#"SELECT "pendingSats" FROM pplns_group_balance
-           WHERE "groupId" = $1 AND address = $2"#,
-    )
-    .bind(h.group_id)
-    .bind(other.as_str())
-    .fetch_one(&h.pool)
-    .await
-    .expect("balance row");
-    assert!(
-        (other_pending + pending).abs() <= 2,
-        "the overpayment came out of the other member's share: \
-         finder {pending} vs other {other_pending}"
-    );
-
-    // And the debt must reach the next distribution, or it can never be
-    // recovered: the builder reads open balances, so a filtered-out
-    // negative row would leave the money gone for good.
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_060_001)
+    // Both members settle flat. Under the fixed-sats bonus the finder
+    // was left owing ~5M here and the other member holding the mirror
+    // credit.
+    for who in [&finder, &other] {
+        let pending: i64 = sqlx::query_scalar(
+            r#"SELECT "pendingSats" FROM pplns_group_balance
+               WHERE "groupId" = $1 AND address = $2"#,
+        )
+        .bind(h.group_id)
+        .bind(who.as_str())
+        .fetch_optional(&h.pool)
         .await
-        .unwrap();
-    let next = h
-        .engine
-        .build_distribution(h.group_id, T_REF, &finder)
-        .await
-        .expect("build 2");
-    let carried = next
-        .distribution
-        .entries
-        .iter()
-        .find(|e| e.address.as_str() == finder.as_str())
-        .map(|e| e.balance_sats)
-        .expect("finder is in the next distribution");
-    assert_eq!(
-        carried, pending,
-        "the debt must be carried into the next distribution"
-    );
+        .expect("balance read")
+        .unwrap_or(0);
+        assert!(
+            pending.abs() <= 2,
+            "{} moved by {pending} on a 20 %-richer block — the bonus must not drift",
+            who.as_str()
+        );
+    }
 
     drop_harness(h).await;
 }
@@ -491,17 +445,13 @@ async fn ledger_movement_equals_claims_minus_payments() {
         .iter()
         .filter(|e| e.address != snapshot.fee_address)
         .map(|e| {
-            let bonus = match &snapshot.finder_bonus {
-                Some((a, sats)) if *a == e.address => *sats as i64,
-                _ => 0,
-            };
             bp_share::claim_sats(
                 e.score_weight,
                 snapshot.score_total,
                 snapshot.fee_ppm,
                 T_ACTUAL,
                 extras_total,
-            ) + bonus
+            )
         })
         .sum();
     let paid: i64 = actual
@@ -1511,6 +1461,7 @@ fn reset_row(
         round_reset_timezone: timezone.map(str::to_string),
         last_round_reset_at: None,
         finder_bonus_sats: None,
+        finder_bonus_ppm: None,
         round_reset_preset: preset.map(str::to_string),
         is_public: false,
         reset_round_on_block: false,
@@ -1878,7 +1829,7 @@ async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
 /// inside the band — the arithmetic does not change at the boundary.
 #[tokio::test]
 async fn a_group_block_far_off_the_reference_is_still_booked() {
-    let h = match spawn_or_skip(3, Some(50_000_000)).await {
+    let h = match spawn_or_skip(3, Some(160_000)).await {
         Some(h) => h,
         None => return,
     };
@@ -1922,15 +1873,9 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
         .await
         .expect("a block off the reference revenue must still book");
 
-    // Two 50 % members, fee 0, a fixed 50M bonus carried as a weight.
-    // The ledger owes the finder `(pot(T) − X)/2 + bonus =
-    // (500M − 50M)/2 + 50M = 275M`; the coinbase pays it its wire share
-    // of the 1.6× block, `0.5·1.6·(312.5M − 50M) + 1.6·50M = 290M`.
-    // The bonus rode the revenue up to 80M while the promise stayed at
-    // 50M — 30M of inflation — but the finder funds half of that itself
-    // through its own diluted score share, so the net debt is 15M. The
-    // same identity as the in-band test above: `(r−1)·(u/S·X − bonus)`,
-    // which at r = 1.2 gives the 5M that test pins.
+    // Both members settle flat even 1.6× off the reference. The bonus
+    // is a proportion, and no satoshi-denominated promise is left in a
+    // Group-Solo distribution — so `claim == paid` at any revenue.
     let pending_of = |addr: String| {
         let pool = h.pool.clone();
         let gid = h.group_id;
@@ -1941,22 +1886,20 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
             )
             .bind(gid)
             .bind(addr)
-            .fetch_one(&pool)
+            .fetch_optional(&pool)
             .await
-            .expect("balance row")
+            .expect("balance read")
+            .unwrap_or(0)
         }
     };
-    let finder_pending = pending_of(finder.as_str().to_string()).await;
-    let other_pending = pending_of(other.as_str().to_string()).await;
-    assert!(
-        (finder_pending + 15_000_000).abs() <= 2,
-        "expected the ~15M net bonus overshoot as debt, got {finder_pending}"
-    );
-    assert!(
-        (other_pending + finder_pending).abs() <= 2,
-        "the overpayment came out of the other member: finder {finder_pending} \
-         vs other {other_pending}"
-    );
+    for who in [&finder, &other] {
+        let pending = pending_of(who.as_str().to_string()).await;
+        assert!(
+            pending.abs() <= 2,
+            "{} moved by {pending} at 1.6× the reference — nothing may drift",
+            who.as_str()
+        );
+    }
 
     drop_harness(h).await;
 }

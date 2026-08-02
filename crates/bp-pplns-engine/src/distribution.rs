@@ -338,7 +338,7 @@ async fn build_from_inputs(
         fee_address,
         coinbase_weight_budget: config.coinbase_weight_budget.get(),
         min_payout_sats: Some(config.min_payout_sats),
-        finder_bonus_sats: None, // finder-bonus is a Group-Solo feature
+        finder_bonus_ppm: 0, // finder-bonus is a Group-Solo feature
         finder_address: None,
         reference_revenue_sats,
     })?;
@@ -462,7 +462,7 @@ mod tests {
             fee_address: &fee,
             coinbase_weight_budget: 50_000,
             min_payout_sats: Some(Sats(5_000)),
-            finder_bonus_sats: None,
+            finder_bonus_ppm: 0,
             finder_address: None,
             reference_revenue_sats: 312_500_000,
         })

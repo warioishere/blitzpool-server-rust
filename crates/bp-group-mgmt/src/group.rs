@@ -5,10 +5,8 @@
 //! Pure logic only — no DB lookups, no Redis. The service-wiring layer
 //! does the I/O and consults these functions for "is this OK?" answers.
 
-use bp_common::Sats;
-
 use crate::constants::{
-    MAX_FINDER_BONUS_SATS, MAX_GROUP_NAME_LEN, MAX_RESET_INTERVAL_DAYS, MIN_GROUP_NAME_LEN,
+    MAX_FINDER_BONUS_PPM, MAX_GROUP_NAME_LEN, MAX_RESET_INTERVAL_DAYS, MIN_GROUP_NAME_LEN,
     MIN_MEMBERS_ACTIVE, MS_PER_DAY,
 };
 
@@ -261,8 +259,10 @@ pub struct RoundResetConfig {
     /// is set. Validation of the actual IANA shape is the service layer's
     /// job (depends on OS / chrono-tz); here we only enforce non-empty.
     pub timezone: Option<String>,
-    /// 0 = disabled. Otherwise capped at [`MAX_FINDER_BONUS_SATS`].
-    pub finder_bonus_sats: Sats,
+    /// Finder bonus as a fraction of the miner cut, in parts-per-million
+    /// (1 % = 10 000 ppm). 0 = disabled, capped at
+    /// [`MAX_FINDER_BONUS_PPM`].
+    pub finder_bonus_ppm: i32,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -275,23 +275,17 @@ pub enum RoundResetError {
     MissingTimezone,
     #[error("intervalDays must be set when preset='custom' (in [1, {MAX_RESET_INTERVAL_DAYS}])")]
     IntervalRequiredForCustom,
-    #[error("finderBonusSats must be in [0, {MAX_FINDER_BONUS_SATS}] sats (got {0})")]
-    FinderBonusOutOfRange(i64),
-    #[error("finderBonusSats below pool min payout ({min_payout}): {got}")]
-    FinderBonusSubMinPayout { got: i64, min_payout: i64 },
+    #[error("finderBonusPpm must be in [0, {MAX_FINDER_BONUS_PPM}] ppm (got {0})")]
+    FinderBonusOutOfRange(i32),
 }
 
 /// Validate a `RoundResetConfig`. Pure — does not consult the DB.
 ///
-/// `min_payout_sats` lets the caller reject configurations whose
-/// `finder_bonus_sats` would silently be cleared at coinbase-build time
-/// because it falls below the pool's dust floor — better to fail the
-/// PATCH up front than confuse the admin with "I set 1000 sats but no
-/// block paid it".
-pub fn validate_round_reset(
-    config: &RoundResetConfig,
-    min_payout_sats: Sats,
-) -> Result<(), RoundResetError> {
+/// The finder bonus no longer needs a `min_payout` cross-check: it is a
+/// PROPORTION of the miner cut, not a satoshi amount, so it cannot fall
+/// below a satoshi floor at build time and be silently cleared. It is
+/// simply part of the finder's own output.
+pub fn validate_round_reset(config: &RoundResetConfig) -> Result<(), RoundResetError> {
     // intervalDays only meaningful with Custom preset.
     if let Some(d) = config.interval_days {
         if config.preset != Some(RoundResetPreset::Custom) {
@@ -313,17 +307,12 @@ pub fn validate_round_reset(
         }
     }
 
-    // Finder bonus bounds.
-    let bonus = config.finder_bonus_sats.to_i64();
-    if !(0..=MAX_FINDER_BONUS_SATS).contains(&bonus) {
+    // Finder bonus bounds. No min_payout check any more: a proportion
+    // cannot be "too small to be paid" — it scales with the block, and
+    // whatever it comes to is simply part of the finder's output.
+    let bonus = config.finder_bonus_ppm;
+    if !(0..=MAX_FINDER_BONUS_PPM).contains(&bonus) {
         return Err(RoundResetError::FinderBonusOutOfRange(bonus));
-    }
-    let min = min_payout_sats.to_i64();
-    if bonus > 0 && bonus < min {
-        return Err(RoundResetError::FinderBonusSubMinPayout {
-            got: bonus,
-            min_payout: min,
-        });
     }
     Ok(())
 }
@@ -440,13 +429,13 @@ mod tests {
             preset: Some(RoundResetPreset::Daily),
             interval_days: None,
             timezone: Some("Europe/Berlin".into()),
-            finder_bonus_sats: Sats(0),
+            finder_bonus_ppm: 0,
         }
     }
 
     #[test]
     fn round_reset_daily_with_tz_is_ok() {
-        assert!(validate_round_reset(&ok_cfg(), Sats(546)).is_ok());
+        assert!(validate_round_reset(&ok_cfg()).is_ok());
     }
 
     #[test]
@@ -455,9 +444,9 @@ mod tests {
             preset: None,
             interval_days: None,
             timezone: None,
-            finder_bonus_sats: Sats(0),
+            finder_bonus_ppm: 0,
         };
-        assert!(validate_round_reset(&cfg, Sats(546)).is_ok());
+        assert!(validate_round_reset(&cfg).is_ok());
     }
 
     #[test]
@@ -466,10 +455,10 @@ mod tests {
             preset: Some(RoundResetPreset::Weekly),
             interval_days: None,
             timezone: None,
-            finder_bonus_sats: Sats(0),
+            finder_bonus_ppm: 0,
         };
         assert_eq!(
-            validate_round_reset(&cfg, Sats(546)),
+            validate_round_reset(&cfg),
             Err(RoundResetError::MissingTimezone)
         );
     }
@@ -480,10 +469,10 @@ mod tests {
             preset: Some(RoundResetPreset::Custom),
             interval_days: None,
             timezone: Some("UTC".into()),
-            finder_bonus_sats: Sats(0),
+            finder_bonus_ppm: 0,
         };
         assert_eq!(
-            validate_round_reset(&cfg, Sats(546)),
+            validate_round_reset(&cfg),
             Err(RoundResetError::IntervalRequiredForCustom)
         );
     }
@@ -494,10 +483,10 @@ mod tests {
             preset: Some(RoundResetPreset::Daily),
             interval_days: Some(3),
             timezone: Some("UTC".into()),
-            finder_bonus_sats: Sats(0),
+            finder_bonus_ppm: 0,
         };
         assert_eq!(
-            validate_round_reset(&cfg, Sats(546)),
+            validate_round_reset(&cfg),
             Err(RoundResetError::IntervalWithoutCustomPreset)
         );
     }
@@ -508,10 +497,10 @@ mod tests {
             preset: Some(RoundResetPreset::Custom),
             interval_days: Some(0),
             timezone: Some("UTC".into()),
-            finder_bonus_sats: Sats(0),
+            finder_bonus_ppm: 0,
         };
         assert_eq!(
-            validate_round_reset(&cfg, Sats(546)),
+            validate_round_reset(&cfg),
             Err(RoundResetError::IntervalOutOfRange(MAX_RESET_INTERVAL_DAYS))
         );
 
@@ -519,10 +508,10 @@ mod tests {
             preset: Some(RoundResetPreset::Custom),
             interval_days: Some(366),
             timezone: Some("UTC".into()),
-            finder_bonus_sats: Sats(0),
+            finder_bonus_ppm: 0,
         };
         assert_eq!(
-            validate_round_reset(&cfg2, Sats(546)),
+            validate_round_reset(&cfg2),
             Err(RoundResetError::IntervalOutOfRange(MAX_RESET_INTERVAL_DAYS))
         );
     }
@@ -530,9 +519,9 @@ mod tests {
     #[test]
     fn round_reset_finder_bonus_negative_rejected() {
         let mut cfg = ok_cfg();
-        cfg.finder_bonus_sats = Sats(-1);
+        cfg.finder_bonus_ppm = -1;
         assert_eq!(
-            validate_round_reset(&cfg, Sats(546)),
+            validate_round_reset(&cfg),
             Err(RoundResetError::FinderBonusOutOfRange(-1))
         );
     }
@@ -540,34 +529,32 @@ mod tests {
     #[test]
     fn round_reset_finder_bonus_above_cap_rejected() {
         let mut cfg = ok_cfg();
-        cfg.finder_bonus_sats = Sats(MAX_FINDER_BONUS_SATS + 1);
+        cfg.finder_bonus_ppm = MAX_FINDER_BONUS_PPM + 1;
         assert_eq!(
-            validate_round_reset(&cfg, Sats(546)),
+            validate_round_reset(&cfg),
             Err(RoundResetError::FinderBonusOutOfRange(
-                MAX_FINDER_BONUS_SATS + 1
+                MAX_FINDER_BONUS_PPM + 1
             ))
         );
     }
 
+    /// A tiny bonus is now perfectly valid. As a proportion it cannot be
+    /// "below the payout floor" — it scales with the block and is simply
+    /// part of the finder's own output. The old sats form had to be
+    /// rejected here, because a bonus under `min_payout` was silently
+    /// dropped at coinbase-build time.
     #[test]
-    fn round_reset_finder_bonus_below_min_payout_rejected() {
+    fn round_reset_a_tiny_finder_bonus_is_accepted() {
         let mut cfg = ok_cfg();
-        cfg.finder_bonus_sats = Sats(100);
-        let err = validate_round_reset(&cfg, Sats(546));
-        match err {
-            Err(RoundResetError::FinderBonusSubMinPayout { got, min_payout }) => {
-                assert_eq!(got, 100);
-                assert_eq!(min_payout, 546);
-            }
-            _ => panic!("expected FinderBonusSubMinPayout, got {err:?}"),
-        }
+        cfg.finder_bonus_ppm = 1; // 0.0001 %
+        assert!(validate_round_reset(&cfg).is_ok());
     }
 
     #[test]
     fn round_reset_zero_bonus_always_allowed() {
         let mut cfg = ok_cfg();
-        cfg.finder_bonus_sats = Sats(0);
-        assert!(validate_round_reset(&cfg, Sats(10_000_000)).is_ok());
+        cfg.finder_bonus_ppm = 0;
+        assert!(validate_round_reset(&cfg).is_ok());
     }
 
     // ── Payout mode ──────────────────────────────────────────────────

@@ -542,7 +542,7 @@ async fn update_round_reset_config_applies_and_fires_hook() {
                 preset: PatchField::Set(RoundResetPreset::Weekly),
                 interval_days: PatchField::Untouched,
                 timezone: PatchField::Set("Europe/Berlin".into()),
-                finder_bonus_sats: PatchField::Set(Sats(50_000)),
+                finder_bonus_ppm: PatchField::Set(160_000),
                 is_public: PatchField::Set(true),
                 reset_round_on_block: PatchField::Untouched,
                 max_members: PatchField::Untouched,
@@ -553,7 +553,7 @@ async fn update_round_reset_config_applies_and_fires_hook() {
         .expect("update");
     assert_eq!(row.round_reset_preset.as_deref(), Some("weekly"));
     assert_eq!(row.round_reset_timezone.as_deref(), Some("Europe/Berlin"));
-    assert_eq!(row.finder_bonus_sats.map(|s| s.to_i64()), Some(50_000));
+    assert_eq!(row.finder_bonus_ppm, Some(160_000));
     assert!(row.is_public);
     let snap = hooks.snapshot();
     assert_eq!(snap.round_reset_applied, vec![g.group.id]);
@@ -591,7 +591,7 @@ async fn update_round_reset_rejects_invalid_timezone() {
 }
 
 #[tokio::test]
-async fn update_round_reset_rejects_sub_min_payout_bonus() {
+async fn update_round_reset_rejects_a_bonus_past_the_ppm_cap() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -608,13 +608,13 @@ async fn update_round_reset_rejects_sub_min_payout_bonus() {
         .update_round_reset_config(
             g.group.id,
             UpdateRoundResetSettings {
-                finder_bonus_sats: PatchField::Set(Sats(100)),
+                finder_bonus_ppm: PatchField::Set(900_000),
                 ..Default::default()
             },
             Some(&g.admin_token),
         )
         .await
-        .expect_err("low bonus");
+        .expect_err("bonus past the ppm cap");
     assert!(matches!(err, GroupServiceError::InvalidBonus));
     cleanup_group(&pool, g.group.id).await;
 }

@@ -544,6 +544,7 @@ CREATE TABLE public.pplns_group (
     "roundResetTimezone" character varying(64),
     "lastRoundResetAt" bigint,
     "finderBonusSats" bigint,
+    "finderBonusPpm" integer,
     "roundResetPreset" character varying(16),
     "isPublic" boolean DEFAULT false NOT NULL,
     "resetRoundOnBlock" boolean DEFAULT false NOT NULL,

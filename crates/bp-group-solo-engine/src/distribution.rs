@@ -200,11 +200,13 @@ async fn compute_distribution(
     block_reward_sats: u64,
     finder_address: &AddressId,
 ) -> Result<DistributionResult, DistributionError> {
-    // 1. Per-group config: finder_bonus_sats lives in the DB row.
+    // 1. Per-group config: the finder bonus lives in the DB row, as a
+    //    FRACTION of the miner cut (ppm) rather than a sats amount —
+    //    a proportion is what §4 can pay exactly at any revenue.
     let group_row = find_group(pool, group_id)
         .await?
         .ok_or(DistributionError::GroupNotFound { group_id })?;
-    let finder_bonus_sats = group_row.finder_bonus_sats;
+    let finder_bonus_ppm = group_row.finder_bonus_ppm.unwrap_or(0).max(0) as u32;
 
     // 2. Round state from Redis. Mode-aware: a PROP group reads its per-round
     //    aggregate; a Window group trims to the sliding window first, so the
@@ -260,7 +262,7 @@ async fn compute_distribution(
         fee_address,
         coinbase_weight_budget: config.coinbase_weight_budget,
         min_payout_sats: Some(config.min_payout_sats),
-        finder_bonus_sats,
+        finder_bonus_ppm,
         finder_address: Some(finder_address),
         reference_revenue_sats: block_reward_sats,
     })?;
@@ -420,7 +422,7 @@ mod tests {
             fee_address: &fee,
             coinbase_weight_budget: 50_000,
             min_payout_sats: Some(Sats(5_000)),
-            finder_bonus_sats: Some(Sats(50_000)),
+            finder_bonus_ppm: 160_000,
             finder_address: Some(&finder),
             reference_revenue_sats: 312_500_000,
         })

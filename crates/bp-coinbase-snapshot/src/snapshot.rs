@@ -372,8 +372,6 @@ pub struct StoredWeightSnapshot {
     pub fee_ppm: u32,
     /// Pool-output recipient.
     pub fee_address: String,
-    /// Group-Solo finder bonus recorded for settlement.
-    pub finder_bonus: Option<(String, u64)>,
     /// Revenue the wire-weight boosts were projected against; the
     /// booking band is checked against this.
     pub reference_revenue_sats: u64,
@@ -387,22 +385,20 @@ impl StoredWeightSnapshot {
     ///
     /// Not a stored field, and deliberately so: it is a pure function
     /// of what IS stored (every entry's score weight and ledger
-    /// balance, the recorded bonus, the fee and the reference revenue),
-    /// and one shared [`bp_share::project_extras`] serving both sides
-    /// is the only way build and settlement cannot drift apart. A
-    /// second copy of this formula would be the next bug.
+    /// balance, the fee and the reference revenue), and one shared
+    /// [`bp_share::project_extras`] serving both sides is the only way
+    /// build and settlement cannot drift apart. A second copy of this
+    /// formula would be the next bug.
     ///
-    /// The bonus needs no re-capping here — [`Self::finder_bonus`]
-    /// already holds the capped figure, which is exactly what the
-    /// coinbase paid.
+    /// The finder bonus is NOT in here any more: it is a proportion,
+    /// carried as plain score weight, so it is exact at every revenue
+    /// and has nothing to project. Only satoshi-denominated promises —
+    /// ledger balances — still reach this.
     pub fn extras_total(&self) -> i64 {
         let extras = bp_share::extras_from_ledger(
             self.entries
                 .iter()
                 .map(|e| (e.address.as_str(), e.score_weight, e.balance_sats)),
-            self.finder_bonus
-                .as_ref()
-                .map(|(a, sats)| (a.as_str(), *sats)),
         );
         bp_share::project_extras(
             &extras,
@@ -430,10 +426,6 @@ impl StoredWeightSnapshot {
             weight_p: d.weight_p,
             fee_ppm: d.fee_ppm,
             fee_address: d.fee_address.as_str().to_string(),
-            finder_bonus: d
-                .finder_bonus
-                .as_ref()
-                .map(|(a, sats)| (a.as_str().to_string(), *sats)),
             reference_revenue_sats: d.reference_revenue_sats,
             score_total: d.score_total,
         }
@@ -460,10 +452,6 @@ pub async fn write_weight_snapshot(
         snapshot.reference_revenue_sats.to_string(),
     ));
     fields.push(("scoreTotal".to_string(), snapshot.score_total.to_string()));
-    if let Some((addr, sats)) = &snapshot.finder_bonus {
-        fields.push(("finderBonusAddr".to_string(), addr.clone()));
-        fields.push(("finderBonusSats".to_string(), sats.to_string()));
-    }
     fields.push((
         "entry_count".to_string(),
         snapshot.entries.len().to_string(),
@@ -525,10 +513,6 @@ fn parse_weight_hash(h: &HashMap<String, String>) -> Option<StoredWeightSnapshot
     let fee_address = h.get("feeAddress")?.clone();
     let reference_revenue_sats: u64 = h.get("referenceRevenueSats")?.parse().ok()?;
     let score_total: u64 = h.get("scoreTotal")?.parse().ok()?;
-    let finder_bonus = match (h.get("finderBonusAddr"), h.get("finderBonusSats")) {
-        (Some(addr), Some(sats)) => Some((addr.clone(), sats.parse().ok()?)),
-        _ => None,
-    };
     let entry_count: usize = h.get("entry_count")?.parse().ok()?;
     let mut entries = Vec::with_capacity(entry_count);
     for i in 0..entry_count {
@@ -545,7 +529,6 @@ fn parse_weight_hash(h: &HashMap<String, String>) -> Option<StoredWeightSnapshot
         weight_p,
         fee_ppm,
         fee_address,
-        finder_bonus,
         reference_revenue_sats,
         score_total,
     })
@@ -679,7 +662,6 @@ mod tests {
             weight_p: 15_228_426_395,
             fee_ppm: 15_000,
             fee_address: "bc1qfee0000000000000000000000000".to_string(),
-            finder_bonus: Some(("bc1qfinder0000000000000000000000".to_string(), 50_000)),
             reference_revenue_sats: 312_500_000,
             score_total: 1_000_000_000_000,
         }
@@ -698,10 +680,6 @@ mod tests {
             s.reference_revenue_sats.to_string(),
         );
         h.insert("scoreTotal".to_string(), s.score_total.to_string());
-        if let Some((addr, sats)) = &s.finder_bonus {
-            h.insert("finderBonusAddr".to_string(), addr.clone());
-            h.insert("finderBonusSats".to_string(), sats.to_string());
-        }
         h.insert("entry_count".to_string(), s.entries.len().to_string());
         for (i, e) in s.entries.iter().enumerate() {
             h.insert(format!("e{i}_addr"), e.address.clone());
@@ -720,12 +698,17 @@ mod tests {
         assert_eq!(parsed, s);
     }
 
+    /// A hash still carrying the retired `finderBonus*` fields — written
+    /// by a pool build from before the bonus became a proportion — must
+    /// still hydrate. The parser reads by name and simply ignores them.
     #[test]
-    fn parse_weight_hash_without_bonus() {
-        let mut s = weight_snapshot_fixture();
-        s.finder_bonus = None;
-        let parsed = parse_weight_hash(&weight_hash_of(&s)).expect("parse ok");
-        assert_eq!(parsed.finder_bonus, None);
+    fn parse_weight_hash_ignores_a_retired_bonus_field() {
+        let s = weight_snapshot_fixture();
+        let mut h = weight_hash_of(&s);
+        h.insert("finderBonusAddr".to_string(), "bc1qold".to_string());
+        h.insert("finderBonusSats".to_string(), "50000".to_string());
+        let parsed = parse_weight_hash(&h).expect("parse ok");
+        assert_eq!(parsed, s);
     }
 
     /// `schema-1 hashes never hydrate through the weight parser`
@@ -769,7 +752,7 @@ mod tests {
             fee_address: &fee,
             coinbase_weight_budget: 50_000,
             min_payout_sats: Some(Sats(5_000)),
-            finder_bonus_sats: None,
+            finder_bonus_ppm: 0,
             finder_address: None,
             reference_revenue_sats: 312_500_000,
         })
@@ -798,18 +781,18 @@ mod tests {
         let a2 = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
         let fee = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap();
         let shares = StdMap::from([(a1.clone(), 3.0), (a2.clone(), 1.0)]);
-        for (balances, bonus) in [
-            (StdMap::new(), None),
-            (StdMap::from([(a1.clone(), Sats(10_000_000))]), None),
-            (StdMap::from([(a2.clone(), Sats(-7_000_000))]), None),
-            (StdMap::new(), Some(Sats(50_000_000))),
-            // Beyond the block: the build caps the bonus and records
-            // the capped figure, which is the only thing that keeps
-            // this reproducible at all.
-            (
-                StdMap::from([(a2.clone(), Sats(20_000_000))]),
-                Some(Sats(10_000_000_000)),
-            ),
+        // The bonus is a proportion now — plain score weight, nothing to
+        // project — so what still has to reproduce is the LEDGER side:
+        // credits, debts, and a promise larger than the block.
+        for (balances, bonus_ppm) in [
+            (StdMap::new(), 0u32),
+            (StdMap::from([(a1.clone(), Sats(10_000_000))]), 0),
+            (StdMap::from([(a2.clone(), Sats(-7_000_000))]), 0),
+            (StdMap::new(), 160_000),
+            (StdMap::from([(a1.clone(), Sats(10_000_000))]), 160_000),
+            // Beyond the block: the solvency scale fires on the balance,
+            // and settlement has to land on the same scaled figure.
+            (StdMap::from([(a2.clone(), Sats(3_000_000_000))]), 160_000),
         ] {
             let d = bp_pplns::build_weight_distribution(bp_pplns::WeightDistributionInput {
                 address_shares: &shares,
@@ -818,7 +801,7 @@ mod tests {
                 fee_address: &fee,
                 coinbase_weight_budget: 50_000,
                 min_payout_sats: Some(Sats(5_000)),
-                finder_bonus_sats: bonus,
+                finder_bonus_ppm: bonus_ppm,
                 finder_address: Some(&a1),
                 reference_revenue_sats: 312_500_000,
             })
@@ -827,7 +810,7 @@ mod tests {
             assert_eq!(
                 s.extras_total(),
                 d.extras_total,
-                "snapshot X drifted from the build at bonus={bonus:?}"
+                "snapshot X drifted from the build at bonus_ppm={bonus_ppm}"
             );
         }
     }

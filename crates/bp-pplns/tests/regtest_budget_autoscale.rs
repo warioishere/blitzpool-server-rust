@@ -289,7 +289,7 @@ fn build_distribution(
         fee_address: fee_addr,
         coinbase_weight_budget,
         min_payout_sats: None,
-        finder_bonus_sats: None,
+        finder_bonus_ppm: 0,
         finder_address: None,
         reference_revenue_sats: REGTEST_BLOCK_REWARD_SATS,
     })

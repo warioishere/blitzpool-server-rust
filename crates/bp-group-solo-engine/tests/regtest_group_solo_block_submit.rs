@@ -81,13 +81,16 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
     // `pplns_group_member` has UNIQUE(address) — a prior failed run
     // could leave leftover rows that block re-seeding. Clean those
     // by address first (we own these deterministic addresses
-    // per-test). `finder_bonus_sats` is non-trivial so the test
+    // per-test). The finder bonus is non-trivial so the test
     // exercises the bonus-splice path (subtract bonus from pool
     // before share-weighting, credit back to the finder's output).
     cleanup_member_rows(&pg, &[&addr_alice, &addr_bob, &addr_charlie]).await;
     let group_id = Uuid::new_v4();
-    let finder_bonus_sats: i64 = 1_000_000; // 0.01 BTC carve-out
-    seed_group(&pg, group_id, &addr_alice, finder_bonus_sats).await;
+    // 3 200 ppm (0.32 %) — what migration 0009 turns the old 1M-sat
+    // carve-out into. A proportion, so the block's own revenue decides
+    // the amount and every payer arrives at the same number.
+    let finder_bonus_ppm: i32 = 3_200;
+    seed_group(&pg, group_id, &addr_alice, finder_bonus_ppm).await;
     seed_member(&pg, group_id, &addr_alice).await;
     seed_member(&pg, group_id, &addr_bob).await;
     seed_member(&pg, group_id, &addr_charlie).await;
@@ -205,7 +208,7 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
     assert!(
         alice_sats > bob_sats / 2,
         "finder bonus folded into Alice's weight must exceed pro-rata \
-         (alice={alice_sats}, bob={bob_sats}, bonus={finder_bonus_sats})"
+         (alice={alice_sats}, bob={bob_sats}, bonus_ppm={finder_bonus_ppm})"
     );
 
     // Bit-exact: the §4 vector must consume exactly the revenue
@@ -344,18 +347,18 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
 
 // ── Connection + seed helpers ───────────────────────────────────────
 
-async fn seed_group(pool: &PgPool, group_id: Uuid, creator: &str, finder_bonus_sats: i64) {
+async fn seed_group(pool: &PgPool, group_id: Uuid, creator: &str, finder_bonus_ppm: i32) {
     sqlx::query(
         r#"INSERT INTO pplns_group
              (id, name, "creatorAddress", "adminTokenHash", active,
-              "createdAt", "updatedAt", "isPublic", "finderBonusSats")
+              "createdAt", "updatedAt", "isPublic", "finderBonusPpm")
            VALUES ($1, $2, $3, $4, true, 0, 0, false, $5)"#,
     )
     .bind(group_id)
     .bind(format!("e2e-grp-{group_id}"))
     .bind(creator)
     .bind(format!("hash-{group_id}"))
-    .bind(finder_bonus_sats)
+    .bind(finder_bonus_ppm)
     .execute(pool)
     .await
     .expect("seed group row");

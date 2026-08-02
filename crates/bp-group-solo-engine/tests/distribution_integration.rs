@@ -37,7 +37,7 @@ struct Harness {
     group_id: Uuid,
 }
 
-async fn spawn_or_skip(redis_db: u8, finder_bonus_sats: Option<i64>) -> Option<Harness> {
+async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Harness> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
     let redis_url = format!("{redis_base}/{redis_db}");
@@ -90,7 +90,7 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_sats: Option<i64>) -> Option<H
     }
 
     let group_id = Uuid::new_v4();
-    seed_group(&pool, group_id, finder_bonus_sats).await;
+    seed_group(&pool, group_id, finder_bonus_ppm).await;
 
     let round = GroupRoundStore::new(conn);
     // The weight model requires the pool-output recipient (§4 pay_P is
@@ -109,17 +109,17 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_sats: Option<i64>) -> Option<H
     })
 }
 
-async fn seed_group(pool: &PgPool, group_id: Uuid, finder_bonus_sats: Option<i64>) {
+async fn seed_group(pool: &PgPool, group_id: Uuid, finder_bonus_ppm: Option<i32>) {
     sqlx::query(
         r#"INSERT INTO pplns_group
              (id, name, "creatorAddress", "adminTokenHash", active,
-              "createdAt", "updatedAt", "isPublic", "finderBonusSats")
+              "createdAt", "updatedAt", "isPublic", "finderBonusPpm")
            VALUES ($1, $2, 'test_dist_creator', $3, true, 0, 0, false, $4)"#,
     )
     .bind(group_id)
     .bind(format!("test-group-{group_id}"))
     .bind(format!("hash-{group_id}"))
-    .bind(finder_bonus_sats)
+    .bind(finder_bonus_ppm)
     .execute(pool)
     .await
     .expect("seed group");
@@ -255,8 +255,9 @@ async fn build_for_nonexistent_group_returns_group_not_found() {
 
 #[tokio::test]
 async fn finder_bonus_from_db_row_is_applied() {
-    // 1M sats bonus configured for the group.
-    let h = match spawn_or_skip(2, Some(1_000_000)).await {
+    // 3 200 ppm (0.32 %) — what migration 0009 turns the old 1M-sat
+    // bonus into against a 3.125-BTC subsidy.
+    let h = match spawn_or_skip(2, Some(3_200)).await {
         Some(h) => h,
         None => return,
     };
@@ -306,13 +307,15 @@ async fn finder_bonus_from_db_row_is_applied() {
         finder_total,
         other_total
     );
-    // Configured bonus is 1M sats; tolerance is loose because the
-    // share-proportional part is projected on the bonus-reduced pot.
+    // 3 200 ppm of the miner cut, off the top: on a 312.5M block with
+    // the harness fee that is ~1M sats, and it is EXACT rather than a
+    // projection — the bonus is plain score weight now.
     let diff = finder_total - other_total;
+    let pot = bp_share::miner_pot_sats(result.distribution.fee_ppm, 312_500_000) as i64;
+    let expected = pot * 3_200 / 1_000_000;
     assert!(
-        diff >= 500_000,
-        "finder bonus visible in receipt diff ({})",
-        diff
+        (diff - expected).abs() <= 2,
+        "finder bonus in the receipt diff: {diff}, expected {expected}"
     );
 
     cleanup_group(&h.pool, h.group_id).await;

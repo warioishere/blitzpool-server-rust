@@ -18,11 +18,16 @@ pub const DEFAULT_KICK_INACTIVITY_DAYS: u32 = 14;
 /// Hard upper bound on the round-reset custom interval, in days.
 pub const MAX_RESET_INTERVAL_DAYS: u32 = 365;
 
-/// Hard cap for the optional per-block finder-bonus output, in sats.
-/// 1 BTC is already absurd as a per-block bonus on top of the
-/// proportional split — anything bigger is almost certainly a config
-/// typo and would strand more sats than a normal block reward.
-pub const MAX_FINDER_BONUS_SATS: i64 = 100_000_000;
+/// Hard cap for the optional per-block finder bonus, in parts-per-
+/// million of the miner cut (50 %). Mirrors
+/// `bp_pplns::MAX_FINDER_BONUS_PPM`, which is what the build clamps to.
+///
+/// Half the pot to one member already makes the proportional split
+/// nearly meaningless, so anything past this is a typo. Deliberately
+/// ABOVE the 32 % that the previous 1-BTC sats cap worked out to
+/// against a 3.125-BTC block, so migration 0009 never clamps an
+/// existing configuration down.
+pub const MAX_FINDER_BONUS_PPM: i32 = 500_000;
 
 /// How long a directed invitation stays valid before auto-expiring.
 pub const INVITATION_TTL_DAYS: u32 = 7;

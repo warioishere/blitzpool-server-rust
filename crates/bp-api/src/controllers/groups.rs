@@ -27,7 +27,7 @@ use axum::{
     routing::{delete, get, patch, post},
     Extension, Router,
 };
-use bp_common::{AddressId, Sats};
+use bp_common::AddressId;
 use bp_db::PatchField;
 use bp_group_mgmt::group::{PayoutMode, RoundResetPreset};
 use bp_group_mgmt_engine::{
@@ -89,10 +89,6 @@ where
 
     let public_routes = Router::new()
         .route("/api/pplns/groups/public", get(list_public::<H, M>))
-        .route(
-            "/api/pplns/groups/finder-bonus-cap",
-            get(finder_bonus_cap::<H, M>),
-        )
         .route(
             "/api/pplns/groups/coinbase-capacity",
             get(coinbase_capacity::<H, M>),
@@ -323,7 +319,7 @@ struct UpdateSettingsBody {
     #[serde(default)]
     timezone: Option<Option<String>>,
     #[serde(default)]
-    finder_bonus_sats: Option<Option<i64>>,
+    finder_bonus_ppm: Option<Option<i32>>,
     #[serde(default)]
     is_public: Option<bool>,
     #[serde(default)]
@@ -351,23 +347,11 @@ where
     M: EmailHooks + 'static,
 {
     let svc = require_group_service(&state)?;
-    // Set-time guard: a finder bonus above the current block subsidy is almost
-    // certainly a mistake (e.g. 2 BTC when the subsidy is 3.125 and a halving
-    // is near). The coinbase builder already clamps the bonus to the real
-    // reward, so this never breaks a payout — it's an early, clear rejection.
-    // Skipped when no bitcoin RPC is wired (the cap can't be determined).
-    if let Some(Some(bonus)) = body.finder_bonus_sats {
-        if bonus > 0 {
-            if let Some(cap) = current_subsidy_ceiling_sats(&state).await {
-                if bonus as u64 > cap {
-                    return Err(ApiError::GroupService {
-                        code: "finder-bonus-exceeds-subsidy",
-                        status: StatusCode::BAD_REQUEST,
-                    });
-                }
-            }
-        }
-    }
+    // The bonus is a FRACTION of the miner cut now, so it cannot exceed
+    // the block by construction — the old "is this more sats than the
+    // subsidy?" guard (and its bitcoin-RPC lookup) has nothing left to
+    // catch. What remains is the plain range check, which the service
+    // layer's validator owns.
     let preset = match &body.preset {
         None => PatchField::Untouched,
         Some(None) => PatchField::Clear,
@@ -382,7 +366,7 @@ where
         preset,
         interval_days: lift_patch(&body.interval_days, |d| *d),
         timezone: lift_patch(&body.timezone, |t| t.clone()),
-        finder_bonus_sats: lift_patch(&body.finder_bonus_sats, |s| Sats(*s)),
+        finder_bonus_ppm: lift_patch(&body.finder_bonus_ppm, |p| *p),
         is_public: match body.is_public {
             None => PatchField::Untouched,
             Some(v) => PatchField::Set(v),
@@ -415,49 +399,6 @@ pub(crate) fn block_subsidy_sats(height: u64, network: bitcoin::Network) -> u64 
         return 0;
     }
     (50u64 * 100_000_000) >> halvings
-}
-
-/// Current finder-bonus ceiling: the subsidy of the next block (chain tip + 1).
-/// `None` when no bitcoin RPC is wired or the height read fails — the caller
-/// then skips the set-time check (the coinbase builder still clamps the bonus).
-async fn current_subsidy_ceiling_sats<H, M>(state: &SharedState<H, M>) -> Option<u64>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let rpc = state.bitcoin_rpc.as_ref()?;
-    let tip = rpc.get_block_count().await.ok()?;
-    Some(block_subsidy_sats(tip + 1, state.network))
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FinderBonusCap {
-    /// Next-block height the subsidy is computed for.
-    height: u64,
-    /// Max sensible finder bonus = current block subsidy, in sats. The UI
-    /// surfaces this as the input ceiling + hint.
-    subsidy_sats: u64,
-}
-
-/// `GET /api/pplns/groups/finder-bonus-cap` — the current block subsidy, so the
-/// admin UI can cap the finder-bonus input + show the limit.
-async fn finder_bonus_cap<H, M>(
-    State(state): State<SharedState<H, M>>,
-) -> Result<Json<FinderBonusCap>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let rpc = state
-        .bitcoin_rpc
-        .as_ref()
-        .ok_or(ApiError::Unavailable("bitcoin-rpc not wired"))?;
-    let height = rpc.get_block_count().await? + 1;
-    Ok(Json(FinderBonusCap {
-        height,
-        subsidy_sats: block_subsidy_sats(height, state.network),
-    }))
 }
 
 #[derive(Serialize)]
@@ -799,7 +740,7 @@ struct GroupSummary {
     round_reset_preset: Option<String>,
     round_reset_interval_days: Option<i32>,
     round_reset_timezone: Option<String>,
-    finder_bonus_sats: i64,
+    finder_bonus_ppm: i32,
     last_round_reset_at: Option<String>,
     /// Computed next-reset wall-clock (ISO), derived from the preset +
     /// timezone + interval by [`compute_next_reset_at`]. `None` when the
@@ -841,7 +782,7 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
             round_reset_preset: r.round_reset_preset,
             round_reset_interval_days: r.round_reset_interval_days,
             round_reset_timezone: r.round_reset_timezone,
-            finder_bonus_sats: r.finder_bonus_sats.map(|s| s.to_i64()).unwrap_or(0),
+            finder_bonus_ppm: r.finder_bonus_ppm.unwrap_or(0),
             last_round_reset_at: r
                 .last_round_reset_at
                 .map(crate::time_range::format_slot_label),
@@ -2370,7 +2311,7 @@ mod tests {
             round_reset_preset: None,
             round_reset_interval_days: None,
             round_reset_timezone: None,
-            finder_bonus_sats: 0,
+            finder_bonus_ppm: 0,
             last_round_reset_at: None,
             next_reset_at: None,
             is_public: false,
@@ -2404,7 +2345,7 @@ mod tests {
             round_reset_preset: None,
             round_reset_interval_days: None,
             round_reset_timezone: None,
-            finder_bonus_sats: 0,
+            finder_bonus_ppm: 0,
             last_round_reset_at: None,
             next_reset_at: None,
             is_public: true,
@@ -2526,7 +2467,7 @@ mod tests {
                 round_reset_preset: None,
                 round_reset_interval_days: None,
                 round_reset_timezone: None,
-                finder_bonus_sats: 0,
+                finder_bonus_ppm: 0,
                 last_round_reset_at: None,
                 next_reset_at: None,
                 is_public: true,

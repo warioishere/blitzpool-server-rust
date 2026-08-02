@@ -437,25 +437,23 @@ pub struct ExtraProjection {
     pub divisor: u128,
 }
 
-/// Fold a ledger and an optional finder bonus into the
-/// `(score_weight, extra_sats)` pairs [`project_extras`] consumes.
+/// Fold a ledger into the `(score_weight, extra_sats)` pairs
+/// [`project_extras`] consumes.
 ///
 /// Trivial, and shared anyway: the build reads the pairs off its
 /// candidates and settlement off a stored snapshot, and the two must
-/// agree to the satoshi about which entry carries the bonus.
+/// agree to the satoshi.
+///
+/// The Group-Solo finder bonus used to be folded in here as a second
+/// satoshi promise. It is a PROPORTION now — plain score weight — so
+/// it never reaches this projection: a weight is exact at every
+/// revenue, and only amounts denominated in satoshis need projecting.
 pub fn extras_from_ledger<'a>(
     entries: impl IntoIterator<Item = (&'a str, u64, i64)>,
-    finder_bonus: Option<(&str, u64)>,
 ) -> Vec<(u64, i64)> {
     entries
         .into_iter()
-        .map(|(address, score_weight, balance_sats)| {
-            let bonus = match finder_bonus {
-                Some((finder, sats)) if finder == address => sats as i64,
-                _ => 0,
-            };
-            (score_weight, balance_sats.saturating_add(bonus))
-        })
+        .map(|(_address, score_weight, balance_sats)| (score_weight, balance_sats))
         .collect()
 }
 
@@ -684,23 +682,13 @@ pub fn claim_sats(
 pub fn weights_fingerprint_from_parts<'a>(
     fee_ppm: u32,
     fee_address: &str,
-    finder_bonus: Option<(&'a str, u64)>,
     entries: impl IntoIterator<Item = (&'a str, u64, i64, u32)>,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"bp-weights-v2");
+    hasher.update(b"bp-weights-v3");
     hasher.update(fee_ppm.to_le_bytes());
     hasher.update((fee_address.len() as u32).to_le_bytes());
     hasher.update(fee_address.as_bytes());
-    match finder_bonus {
-        Some((address, sats)) => {
-            hasher.update([1u8]);
-            hasher.update((address.len() as u32).to_le_bytes());
-            hasher.update(address.as_bytes());
-            hasher.update(sats.to_le_bytes());
-        }
-        None => hasher.update([0u8]),
-    }
     for (address, score_weight, balance_sats, dust_limit) in entries {
         hasher.update((address.len() as u32).to_le_bytes());
         hasher.update(address.as_bytes());
@@ -1483,16 +1471,19 @@ mod tests {
         assert_eq!(p.divisor, 1_005_000);
     }
 
-    // ---- weights fingerprint (v2) ----
+    // ---- weights fingerprint (v3) ----
 
     /// `identical inputs agree, any input change disagrees`
+    ///
+    /// The finder bonus is no longer a preimage field of its own: it is
+    /// a proportion, carried as plain score weight, so a change to it
+    /// shows up as a changed `score_weight` — covered by `weight` below.
     #[test]
     fn weights_fingerprint_binds_every_input() {
         let base = || {
             weights_fingerprint_from_parts(
                 15_000,
                 "bc1qpool",
-                Some(("bc1qfinder", 50_000)),
                 [("bc1qa", 10, 5i64, 546u32), ("bc1qb", 20, -3, 546)],
             )
         };
@@ -1500,40 +1491,29 @@ mod tests {
         let fee = weights_fingerprint_from_parts(
             15_001,
             "bc1qpool",
-            Some(("bc1qfinder", 50_000)),
             [("bc1qa", 10, 5, 546), ("bc1qb", 20, -3, 546)],
         );
         let fee_recipient = weights_fingerprint_from_parts(
             15_000,
             "bc1qotherpool",
-            Some(("bc1qfinder", 50_000)),
-            [("bc1qa", 10, 5, 546), ("bc1qb", 20, -3, 546)],
-        );
-        let bonus = weights_fingerprint_from_parts(
-            15_000,
-            "bc1qpool",
-            None,
             [("bc1qa", 10, 5, 546), ("bc1qb", 20, -3, 546)],
         );
         let weight = weights_fingerprint_from_parts(
             15_000,
             "bc1qpool",
-            Some(("bc1qfinder", 50_000)),
             [("bc1qa", 11, 5, 546), ("bc1qb", 20, -3, 546)],
         );
         let balance = weights_fingerprint_from_parts(
             15_000,
             "bc1qpool",
-            Some(("bc1qfinder", 50_000)),
             [("bc1qa", 10, 6, 546), ("bc1qb", 20, -3, 546)],
         );
         let order = weights_fingerprint_from_parts(
             15_000,
             "bc1qpool",
-            Some(("bc1qfinder", 50_000)),
             [("bc1qb", 20, -3, 546), ("bc1qa", 10, 5, 546)],
         );
-        for other in [fee, fee_recipient, bonus, weight, balance, order] {
+        for other in [fee, fee_recipient, weight, balance, order] {
             assert_ne!(base(), other);
         }
     }
@@ -1542,7 +1522,7 @@ mod tests {
     #[test]
     fn weights_fingerprint_is_domain_separated_from_v1() {
         let v1 = payouts_fingerprint_from_parts(1000, [("bc1qa", 600u64)]);
-        let v2 = weights_fingerprint_from_parts(0, "bc1qpool", None, [("bc1qa", 600, 0i64, 0u32)]);
+        let v2 = weights_fingerprint_from_parts(0, "bc1qpool", [("bc1qa", 600, 0i64, 0u32)]);
         assert_ne!(v1, v2);
     }
 

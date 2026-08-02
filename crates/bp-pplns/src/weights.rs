@@ -48,7 +48,7 @@ use bp_share::weights_fingerprint_from_parts;
 use crate::weight::{
     is_valid_payout_address, output_weight_for_address, BUDGET_SAFETY_MARGIN_WU,
     COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT, COINBASE_WITNESS_COMMITMENT_WEIGHT,
-    DEFAULT_COINBASE_WEIGHT_BUDGET, DUST_LIMIT_SATS,
+    DEFAULT_COINBASE_WEIGHT_BUDGET, DUST_LIMIT_SATS, MAX_FINDER_BONUS_PPM,
 };
 use crate::BudgetTelemetry;
 
@@ -103,8 +103,6 @@ pub struct WeightDistribution {
     pub fee_ppm: u32,
     /// Recipient of the pool output (`pool_payout` script source).
     pub fee_address: AddressId,
-    /// Group-Solo finder bonus as recorded for settlement.
-    pub finder_bonus: Option<(AddressId, u64)>,
     /// Revenue the balance/bonus boosts were projected against.
     pub reference_revenue_sats: u64,
     /// `S = Σ score_weight` — denominator of every settlement claim.
@@ -188,8 +186,14 @@ pub struct WeightDistributionInput<'a> {
     /// settles as credit instead). `None` falls back to
     /// `DUST_LIMIT_SATS`; always clamped ≥ it.
     pub min_payout_sats: Option<Sats>,
-    /// Group-Solo finder bonus (both fields or nothing).
-    pub finder_bonus_sats: Option<Sats>,
+    /// Group-Solo finder bonus as a fraction of the miner cut, in
+    /// parts-per-million (1 % = 10 000 ppm). `0` disables it. Clamped
+    /// to [`MAX_FINDER_BONUS_PPM`].
+    ///
+    /// A PROPORTION, deliberately — see the derivation in the build. A
+    /// fixed satoshi bonus cannot be paid exactly by a party using a
+    /// different template revenue, and §4 gives every payer their own.
+    pub finder_bonus_ppm: u32,
     pub finder_address: Option<&'a AddressId>,
     /// Current template revenue — the projection base for balance and
     /// bonus boosts. Must be non-zero (a pool with no template has
@@ -340,49 +344,54 @@ pub fn build_weight_distribution(
     let score_total: u64 = candidates.values().map(|c| c.score_weight).sum();
     let publish_all = fee_ppm < 1_000_000;
 
-    // The bonus is the one promise the pool PICKS rather than owes, so
-    // it is the one that gives way when the promises outgrow the block
-    // — and it must give way here, because the snapshot records the
-    // capped figure and settlement can never recover the operator's
-    // original one. A bonus configured before a halving, or against a
-    // low-fee template, would otherwise swallow the whole score space:
-    // the finder takes nearly the entire coinbase and every other group
-    // member is dust-pruned to nothing.
-    let balance_total: i64 = candidates
-        .values()
-        .map(|c| c.balance_sats as i128)
-        .sum::<i128>()
-        .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-    let finder_bonus: Option<(AddressId, u64)> =
-        match (input.finder_bonus_sats, input.finder_address) {
-            (Some(bonus), Some(finder))
-                if bonus.0 > 0 && is_valid_payout_address(finder.as_str()) =>
-            {
-                let headroom = bp_share::solvency_headroom_sats(balance_total, fee_ppm, t_ref);
-                let bonus_sats = (bonus.0 as u64).min(headroom);
-                if bonus_sats < DUST_LIMIT_SATS {
-                    // Below the consensus floor the output is pruned by
-                    // §4 whatever we do, and the value lands in the pool
-                    // output — recording it would make settlement pay a
-                    // bonus no coinbase ever carried. Above it, a bonus
-                    // under `min_payout` is safe to record even when the
-                    // finder is withheld: it settles as credit like any
-                    // other unpaid claim.
-                    None
-                } else {
-                    if publish_all {
-                        candidates.entry(finder).or_insert_with(|| Candidate {
+    // ── Finder bonus ────────────────────────────────────────────────
+    //
+    // A PROPORTION of the miner cut, never a fixed satoshi amount.
+    //
+    // §4 pays every weight `w·T/W`, so a weight IS a proportion of the
+    // block. Expressing a fixed sats bonus as one means projecting it
+    // against a chosen revenue — and then any party paying at a
+    // different revenue (a job-declaring client uses its OWN template)
+    // delivers a different bonus, which only a signed ledger could
+    // correct afterwards. A proportion has nothing to correct: it is
+    // exact at every revenue, for every payer.
+    //
+    // Solving `(u_f + b)/(S + b) = f + (1−f)·u_f/S` for the weight that
+    // actually delivers the fraction `f` on top of the score split:
+    //
+    //     b = S · f / (1 − f)
+    //
+    // — the same closed form [`pool_weight_for`] uses for the fee, and
+    // for the same reason: a share has to survive its own dilution.
+    //
+    // It lands on the SCORE weight, not the wire weight, so it is part
+    // of the settlement claim by construction — no `+ bonus` term at
+    // settlement, no entry in `extras`, no reference revenue, no
+    // solvency cap. The finder simply counts as if they had mined more.
+    let bonus_ppm = input.finder_bonus_ppm.min(MAX_FINDER_BONUS_PPM);
+    if bonus_ppm > 0 && score_total > 0 {
+        if let Some(finder) = input.finder_address {
+            if is_valid_payout_address(finder.as_str()) && !is_fee(finder) {
+                let boost = ((score_total as u128 * bonus_ppm as u128)
+                    / (1_000_000 - bonus_ppm) as u128)
+                    .min(u64::MAX as u128) as u64;
+                if boost > 0 {
+                    candidates
+                        .entry(finder)
+                        .or_insert_with(|| Candidate {
                             address: finder.clone(),
                             score_weight: 0,
                             balance_sats: 0,
                             wire_weight: 0,
-                        });
-                    }
-                    Some((finder.clone(), bonus_sats))
+                        })
+                        .score_weight += boost;
                 }
             }
-            _ => None,
-        };
+        }
+    }
+    // Re-read AFTER the boost: the bonus is score weight now, so it is
+    // in the denominator every claim is measured against.
+    let score_total: u64 = candidates.values().map(|c| c.score_weight).sum();
 
     let mut entries: Vec<Candidate> = candidates.into_values().collect();
 
@@ -417,7 +426,6 @@ pub fn build_weight_distribution(
         entries
             .iter()
             .map(|c| (c.address.as_str(), c.score_weight, c.balance_sats)),
-        finder_bonus.as_ref().map(|(a, sats)| (a.as_str(), *sats)),
     );
     let projection = bp_share::project_extras(&extras, score_total, fee_ppm, t_ref);
     for (c, extra) in entries.iter_mut().zip(&projection.effective) {
@@ -531,7 +539,6 @@ pub fn build_weight_distribution(
     let fingerprint = weights_fingerprint_from_parts(
         fee_ppm,
         input.fee_address.as_str(),
-        finder_bonus.as_ref().map(|(a, sats)| (a.as_str(), *sats)),
         identity.iter().map(|c| {
             (
                 c.address.as_str(),
@@ -561,7 +568,6 @@ pub fn build_weight_distribution(
         weight_p,
         fee_ppm,
         fee_address: input.fee_address.clone(),
-        finder_bonus,
         reference_revenue_sats: t_ref,
         score_total,
         extras_total: projection.total,
@@ -599,7 +605,7 @@ mod tests {
             fee_address,
             coinbase_weight_budget: 50_000,
             min_payout_sats: Some(Sats(5_000)),
-            finder_bonus_sats: None,
+            finder_bonus_ppm: 0,
             finder_address: None,
             reference_revenue_sats: 312_500_000,
         }
@@ -721,58 +727,103 @@ mod tests {
         ));
     }
 
-    /// A fixed sats bonus configured before a halving — or against a
-    /// low-fee template — must not let the finder take the block while
-    /// every other group member is pruned to nothing.
+    /// A configured bonus can no longer swallow the block. As a
+    /// PROPORTION it is bounded by construction — the operator cannot
+    /// express "more than the pot" at all — and the ppm cap keeps even
+    /// a typo inside [`MAX_FINDER_BONUS_PPM`].
+    ///
+    /// The old fixed-sats form needed a 95 %-of-the-pot solvency cap for
+    /// exactly this: a bonus set before a halving, or against a low-fee
+    /// template, took nearly the whole coinbase and pruned every other
+    /// member to nothing. There is nothing left to cap.
     #[test]
-    fn finder_bonus_is_capped_at_most_of_the_miner_cut() {
+    fn a_bonus_beyond_the_cap_is_clamped_and_leaves_the_others_paid() {
         let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
         let balances = HashMap::new();
         let fee = addr(FEE);
         let finder = addr(A1);
         let mut input = base_input(&shares, &balances, &fee);
-        input.finder_bonus_sats = Some(Sats(10_000_000_000)); // 32x the block
+        input.finder_bonus_ppm = 900_000; // 90 % — past the cap
         input.finder_address = Some(&finder);
         let d = build_weight_distribution(input).unwrap();
 
         const T: u64 = 312_500_000;
-        let published: Vec<&WeightEntry> = d.published().collect();
-        let amounts = bp_share::compute_payout_amounts(
-            d.weight_p,
-            &published.iter().map(|e| e.wire_weight).collect::<Vec<_>>(),
-            &published.iter().map(|e| e.dust_limit).collect::<Vec<_>>(),
-            T,
-        )
-        .expect("§4 vector");
-        let a2_paid = published
-            .iter()
-            .zip(&amounts.pays)
-            .find(|(e, _)| e.address.as_str() == A2)
-            .and_then(|(_, pay)| *pay);
+        let paid = d.payout_entries_at(T).expect("§4 vector");
+        let of = |a: &str| -> u64 {
+            paid.iter()
+                .filter(|(addr, _)| addr.as_str() == a)
+                .map(|(_, s)| *s)
+                .sum()
+        };
+        let pot = bp_share::miner_pot_sats(d.fee_ppm, T) as f64;
+        // Clamped to 50 %, so the finder takes half the pot plus half of
+        // what is left (it holds 1 of 2 equal scores) = 75 %.
+        let finder_share = of(A1) as f64 / pot;
         assert!(
-            a2_paid.is_some_and(|s| s > 546),
-            "the non-finder must still get a real output, got {a2_paid:?}"
+            (finder_share - 0.75).abs() < 0.001,
+            "finder took {finder_share} of the pot, expected the clamped 0.75"
         );
-        // The recorded bonus is the capped one — settlement pays what
-        // the coinbase actually carried.
-        let (_, recorded) = d.finder_bonus.expect("bonus recorded");
-        let miner_cut = T - (T * 15_000 / 1_000_000);
-        assert_eq!(recorded, miner_cut * 95 / 100);
+        assert!(
+            of(A2) as f64 / pot > 0.24,
+            "the non-finder keeps its quarter, got {}",
+            of(A2)
+        );
     }
 
-    /// A bonus too small to survive dust-pruning is not recorded either:
-    /// settlement must not credit a bonus no coinbase ever paid.
+    /// The whole point of a proportional bonus: it is EXACT at every
+    /// revenue, so a job-declaring client paying from its own template
+    /// delivers the same bonus the pool would have.
+    ///
+    /// The fixed-sats form could not do this. It had to be projected
+    /// against one chosen revenue, and §4 then paid `bonus · T/t_ref` —
+    /// measured at 25 % over the reference, the finder was overpaid by a
+    /// quarter of the bonus and the ledger had to claw it back.
     #[test]
-    fn sub_dust_finder_bonus_is_suppressed() {
-        let shares = HashMap::from([(addr(A1), 1.0)]);
+    fn the_bonus_is_the_same_fraction_at_every_revenue() {
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0), (addr(A3), 1.0)]);
         let balances = HashMap::new();
         let fee = addr(FEE);
         let finder = addr(A1);
         let mut input = base_input(&shares, &balances, &fee);
-        input.finder_bonus_sats = Some(Sats(100)); // below the 5_000 min_payout
+        input.finder_bonus_ppm = 100_000; // 10 %
         input.finder_address = Some(&finder);
         let d = build_weight_distribution(input).unwrap();
-        assert_eq!(d.finder_bonus, None);
+
+        // 10 % off the top, then an equal third of the rest: 0.4.
+        const T_REF: u64 = 312_500_000;
+        for pct in [50u64, 75, 100, 125, 200, 400] {
+            let t = T_REF * pct / 100;
+            let paid = d.payout_entries_at(t).expect("§4 vector");
+            let finder_paid: u64 = paid
+                .iter()
+                .filter(|(a, _)| a.as_str() == A1)
+                .map(|(_, s)| *s)
+                .sum();
+            let pot = bp_share::miner_pot_sats(d.fee_ppm, t) as f64;
+            let fraction = finder_paid as f64 / pot;
+            assert!(
+                (fraction - 0.4).abs() < 0.0001,
+                "at T = {pct} % the finder got {fraction} of the pot, not 0.4"
+            );
+        }
+    }
+
+    /// A disabled bonus must leave the distribution byte-identical —
+    /// including the settlement identity, which no longer has a bonus
+    /// slot of its own.
+    #[test]
+    fn a_disabled_bonus_changes_nothing() {
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+        let finder = addr(A1);
+        let plain = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
+        let mut input = base_input(&shares, &balances, &fee);
+        input.finder_bonus_ppm = 0;
+        input.finder_address = Some(&finder);
+        let d = build_weight_distribution(input).unwrap();
+        assert_eq!(d.score_total, plain.score_total);
+        assert_eq!(d.fingerprint, plain.fingerprint);
     }
 
     /// A min_payout beyond the 32-bit wire field must never wrap — an
@@ -912,17 +963,13 @@ mod tests {
         d.entries
             .iter()
             .map(|e| {
-                let bonus = match &d.finder_bonus {
-                    Some((a, sats)) if *a == e.address => *sats as i64,
-                    _ => 0,
-                };
                 let claim = bp_share::claim_sats(
                     e.score_weight,
                     d.score_total,
                     d.fee_ppm,
                     t,
                     d.extras_total,
-                ) + bonus;
+                );
                 let paid = paid_by_address
                     .get(e.address.as_str())
                     .copied()
@@ -989,38 +1036,36 @@ mod tests {
         );
     }
 
-    /// The finder bonus is the same promise in a different wrapper: on
-    /// the wire it is a weight boost, in the ledger a fixed sats
-    /// entitlement, and the coinbase has to deliver it whole.
+    /// The bonus settles flat at EVERY revenue, not just at the one it
+    /// was built against — that is what makes a job-declaring client
+    /// paying from its own template harmless.
+    ///
+    /// Under the fixed-sats form this test could only pass at
+    /// `T == t_ref`: the claim carried a fixed `+ bonus` while §4 paid
+    /// `bonus · T/t_ref`, so every other revenue left a delta the ledger
+    /// had to carry.
     #[test]
-    fn the_finder_bonus_arrives_whole() {
-        const T: u64 = 312_500_000;
-        const BONUS: i64 = 50_000_000;
+    fn the_bonus_settles_flat_at_every_revenue() {
+        const T_REF: u64 = 312_500_000;
         let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
         let balances = HashMap::new();
         let fee = addr(FEE);
         let finder = addr(A1);
         let mut input = base_input(&shares, &balances, &fee);
-        input.finder_bonus_sats = Some(Sats(BONUS));
+        input.finder_bonus_ppm = 160_000; // 16 %
         input.finder_address = Some(&finder);
         let d = build_weight_distribution(input).unwrap();
-        assert_eq!(d.finder_bonus, Some((addr(A1), BONUS as u64)));
 
-        let settled = settle(&d, T);
-        let share_of_the_rest = settled[A1].claim - BONUS;
-        assert!(
-            (settled[A1].paid - share_of_the_rest - BONUS).abs() <= 2,
-            "the finder was paid {} on a score share of {share_of_the_rest} — \
-             the bonus arrived only partly",
-            settled[A1].paid
-        );
-        // Both members settle flat: the bonus was promised AND paid.
-        for a in [A1, A2] {
-            assert!(
-                settled[a].delta.abs() <= 2,
-                "{a} moved by {} on an exactly-paying block",
-                settled[a].delta
-            );
+        for pct in [75u64, 100, 125, 250] {
+            let t = T_REF * pct / 100;
+            let settled = settle(&d, t);
+            for a in [A1, A2] {
+                assert!(
+                    settled[a].delta.abs() <= 2,
+                    "at T = {pct} % {a} moved by {} — the bonus must not drift",
+                    settled[a].delta
+                );
+            }
         }
     }
 
@@ -1037,33 +1082,34 @@ mod tests {
         let finder = addr(A1);
         let shares = HashMap::from([(addr(A1), 3.0), (addr(A2), 1.0)]);
         for (label, balances, bonus, t) in [
-            ("flat", HashMap::new(), None, 312_500_000u64),
+            ("flat", HashMap::new(), 0u32, 312_500_000u64),
             (
                 "credit",
                 HashMap::from([(addr(A1), Sats(10_000_000))]),
-                None,
+                0,
                 312_500_000,
             ),
             (
                 "debt",
                 HashMap::from([(addr(A2), Sats(-7_000_000))]),
-                None,
+                0,
                 312_500_000,
             ),
-            ("bonus", HashMap::new(), Some(Sats(50_000_000)), 312_500_000),
+            ("bonus", HashMap::new(), 160_000, 312_500_000),
             (
-                // Revenue 20 % above the projection: individual members
-                // move (the fixed bonus scales with the block, the
-                // claim does not), but the books still close.
+                // Revenue 20 % above the projection. The BONUS no longer
+                // moves anyone — it is a proportion — but the held credit
+                // still is a fixed sats promise, so members move for that
+                // alone and the books still close.
                 "bonus + credit + rich block",
                 HashMap::from([(addr(A2), Sats(4_000_000))]),
-                Some(Sats(50_000_000)),
+                160_000,
                 375_000_000,
             ),
         ] {
             let mut input = base_input(&shares, &balances, &fee);
-            input.finder_bonus_sats = bonus;
-            input.finder_address = bonus.map(|_| &finder);
+            input.finder_bonus_ppm = bonus;
+            input.finder_address = (bonus > 0).then_some(&finder);
             let d = build_weight_distribution(input).unwrap();
             let settled = settle(&d, t);
 
@@ -1082,22 +1128,21 @@ mod tests {
         }
     }
 
-    /// Promises larger than the block cannot all be kept: `pot − X` is
-    /// the divisor of the whole projection, so it must stay positive.
-    /// The bonus gives way first — it is the promise the pool picks
-    /// rather than owes — and the RECORDED bonus is the reduced one,
-    /// because settlement pays what the coinbase carried.
+    /// A held BALANCE is still a fixed sats promise — the one thing the
+    /// weight model must still project — so `pot − X` still has to stay
+    /// positive and the solvency scale still has to fire.
+    ///
+    /// The bonus used to be the promise that gave way here. It is a
+    /// proportion now and cannot outgrow the block at all, so this only
+    /// exercises the ledger side.
     #[test]
-    fn promises_beyond_the_block_are_capped_to_a_payable_distribution() {
+    fn a_balance_beyond_the_block_is_scaled_to_a_payable_distribution() {
         const T: u64 = 312_500_000;
         let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
-        let balances = HashMap::from([(addr(A2), Sats(20_000_000))]);
+        // Ten times the whole block, held as credit.
+        let balances = HashMap::from([(addr(A2), Sats(3_000_000_000))]);
         let fee = addr(FEE);
-        let finder = addr(A1);
-        let mut input = base_input(&shares, &balances, &fee);
-        input.finder_bonus_sats = Some(Sats(10_000_000_000)); // 32x the block
-        input.finder_address = Some(&finder);
-        let d = build_weight_distribution(input).unwrap();
+        let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
 
         let pot = bp_share::miner_pot_sats(d.fee_ppm, T) as i64;
         assert!(
@@ -1105,30 +1150,20 @@ mod tests {
             "X = {} must stay below the pot {pot} — the projection divides by pot − X",
             d.extras_total
         );
-        let (_, recorded) = d.finder_bonus.clone().expect("bonus recorded");
-        assert_eq!(
-            recorded as i64,
-            pot * 95 / 100 - 20_000_000,
-            "the recorded bonus is what the ledger's own claims leave"
-        );
-        // Still a payable distribution: the non-finder keeps a real
-        // output rather than being pruned to nothing.
+        // Still payable: the member without a balance keeps a real output.
         let settled = settle(&d, T);
         assert!(
-            settled[A2].paid > 546,
-            "the non-finder must still get a real output, got {}",
-            settled[A2].paid
+            settled[A1].paid > 546,
+            "the other member must still get a real output, got {}",
+            settled[A1].paid
         );
-        // And it is a CONSISTENT one: the capped bonus is what both the
-        // coinbase and the claim use, so an exactly-paying block clears
-        // the ledger rather than leaving a residue behind the cap.
-        for a in [A1, A2] {
-            assert!(
-                settled[a].balance_after.abs() <= 2,
-                "{a} left holding {} under the solvency cap",
-                settled[a].balance_after
-            );
-        }
+        // What the scale could not pay stays on the ledger rather than
+        // vanishing — the credit holder is still owed the remainder.
+        assert!(
+            settled[A2].balance_after > 0,
+            "the unpayable part of the credit must carry, got {}",
+            settled[A2].balance_after
+        );
     }
 
     // ── The pool is paid its fee, and only its fee ──────────────────
@@ -1393,20 +1428,30 @@ mod tests {
         assert!(w2.wire_weight > 0, "positive balance alone earns an output");
     }
 
-    /// `finder bonus boosts the finder and is recorded for settlement`
+    /// The bonus lands on the SCORE weight, not the wire weight — that
+    /// is what makes it part of the settlement claim by construction,
+    /// with no `+ bonus` term for settlement to remember.
+    ///
+    /// A finder with no shares of their own still earns their fraction:
+    /// `b = S·f/(1−f)` does not depend on what they mined.
     #[test]
-    fn finder_bonus_boosts_and_records() {
+    fn the_bonus_is_score_weight_even_for_a_finder_with_no_shares() {
         let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
         let balances = HashMap::new();
         let fee = addr(FEE);
         let finder = addr(A3); // no shares of their own
         let mut input = base_input(&shares, &balances, &fee);
-        input.finder_bonus_sats = Some(Sats(50_000));
+        input.finder_bonus_ppm = 200_000; // 20 %
         input.finder_address = Some(&finder);
         let d = build_weight_distribution(input).unwrap();
+
         let wf = d.entries.iter().find(|e| e.address.as_str() == A3).unwrap();
-        assert!(wf.wire_weight > 0);
-        assert_eq!(d.finder_bonus, Some((addr(A3), 50_000)));
+        assert!(wf.score_weight > 0, "the bonus IS score weight");
+        assert!(wf.wire_weight > 0, "and buys a real output");
+        // b = S·0.2/0.8 = S/4, so the finder holds 1/5 of the score space.
+        assert_eq!(wf.score_weight * 5, d.score_total);
+        // Nothing sats-denominated was recorded, so nothing is projected.
+        assert_eq!(d.extras_total, 0);
     }
 
     /// The blockspace cut drops the smallest entries from the PUBLISHED
