@@ -322,18 +322,68 @@ pub fn compute_payout_amounts(
 }
 
 /// Divergence band between a distribution's reference revenue and the
-/// revenue a block actually pays: booking (and vouching) tolerates
-/// `|T_actual − T_ref| ≤ T_ref / SETTLEMENT_BAND_DIVISOR` (±25 %).
-/// Mempool-fee drift between a distribution publish and a found block
-/// lives comfortably inside this; anything outside means the job and
-/// the distribution disagree about the world and must not be booked
-/// unattended.
+/// revenue a block actually pays: `|T_actual − T_ref| ≤ T_ref /
+/// SETTLEMENT_BAND_DIVISOR` (±25 %). Mempool-fee drift between a
+/// distribution publish and a found block lives comfortably inside
+/// this.
+///
+/// This is an ALARM, not a booking gate. `T_ref` is only the base the
+/// wire weights were projected against; settlement books `claim −
+/// paid` from the block's own coinbase, and that identity holds at
+/// every `T` (`Σ deltas = 0` for any `T_actual/T_ref`). Refusing to
+/// book outside the band left the paid-out balances standing in the
+/// ledger, so the next block paid them a second time — the drift is
+/// worth an operator's attention, never a reason to lose the block.
+/// The hard gate is [`block_subsidy_sats`].
 pub const SETTLEMENT_BAND_DIVISOR: u64 = 4;
 
 /// Is `t_actual` within the settlement band around `t_ref`?
 pub fn reward_within_band(t_ref: u64, t_actual: u64) -> bool {
     let tolerance = t_ref / SETTLEMENT_BAND_DIVISOR;
     t_actual >= t_ref.saturating_sub(tolerance) && t_actual <= t_ref.saturating_add(tolerance)
+}
+
+/// The genesis block subsidy: 50 BTC.
+pub const INITIAL_BLOCK_SUBSIDY_SATS: u64 = 5_000_000_000;
+
+/// Blocks between subsidy halvings on mainnet — and on testnet3 and
+/// testnet4, which share the schedule.
+pub const SUBSIDY_HALVING_INTERVAL: u32 = 210_000;
+
+/// Blocks between subsidy halvings on regtest.
+pub const REGTEST_SUBSIDY_HALVING_INTERVAL: u32 = 150;
+
+/// The block subsidy at `height`, in satoshis — consensus' own rule:
+/// 50 BTC halved once per `halving_interval` blocks, and 0 once the
+/// shift would exhaust a 64-bit value.
+///
+/// This is the floor settlement gates on. A coinbase may always pay
+/// LESS than subsidy + fees — the difference is simply destroyed — so
+/// a total below the subsidy alone means the block forfeited money it
+/// was entitled to. Nothing about mempool drift, a stale projection
+/// base or a job-declaring client's own template can produce that,
+/// which is what makes it the honest gate: it never fires on a healthy
+/// block, and it is the one condition worth refusing to book on.
+///
+/// The interval is a PARAMETER rather than the mainnet constant
+/// because regtest halves every 150 blocks. Hard-coding 210 000 would
+/// make every regtest block past height 150 look like it had burned
+/// part of its own subsidy — and the pool's own regtests mine well
+/// past it.
+///
+/// Fails OPEN (returns 0, so no block is ever gated) on inputs that
+/// cannot describe a real block: a negative height — the dust sweep
+/// mints synthetic negative heights for its audit rows — and a zero
+/// interval.
+pub fn block_subsidy_sats(height: i32, halving_interval: u32) -> u64 {
+    if height < 0 || halving_interval == 0 {
+        return 0;
+    }
+    let halvings = height as u64 / halving_interval as u64;
+    if halvings >= 64 {
+        return 0;
+    }
+    INITIAL_BLOCK_SUBSIDY_SATS >> halvings
 }
 
 /// `pot(t) = (1 − fee) · t` — the miners' cut of a block paying `t`.
@@ -1494,5 +1544,83 @@ mod tests {
         let v1 = payouts_fingerprint_from_parts(1000, [("bc1qa", 600u64)]);
         let v2 = weights_fingerprint_from_parts(0, "bc1qpool", None, [("bc1qa", 600, 0i64, 0u32)]);
         assert_ne!(v1, v2);
+    }
+
+    // ── Block subsidy (the settlement gate) ─────────────────────────
+
+    /// `the mainnet schedule halves on the interval boundary`
+    #[test]
+    fn subsidy_halves_on_the_interval_boundary() {
+        const I: u32 = SUBSIDY_HALVING_INTERVAL;
+        for (height, expect) in [
+            (0i32, 5_000_000_000u64),
+            (I as i32 - 1, 5_000_000_000),
+            (I as i32, 2_500_000_000),
+            (2 * I as i32 - 1, 2_500_000_000),
+            (2 * I as i32, 1_250_000_000),
+            // The epoch this pool actually runs in.
+            (4 * I as i32, 312_500_000),
+        ] {
+            assert_eq!(
+                block_subsidy_sats(height, I),
+                expect,
+                "subsidy at height {height}"
+            );
+        }
+    }
+
+    /// Regtest halves every 150 blocks, so the interval has to be a
+    /// parameter: with the mainnet constant, every regtest block past
+    /// 150 would look like it had burned part of its own subsidy and
+    /// the settlement gate would refuse to book it.
+    #[test]
+    fn regtest_uses_its_own_shorter_schedule() {
+        const R: u32 = REGTEST_SUBSIDY_HALVING_INTERVAL;
+        assert_eq!(block_subsidy_sats(149, R), 5_000_000_000);
+        assert_eq!(block_subsidy_sats(150, R), 2_500_000_000);
+        assert_eq!(block_subsidy_sats(300, R), 1_250_000_000);
+        // The regtest heights the pool's own harnesses mine at would be
+        // over-estimated by a factor of 4 under the mainnet schedule.
+        assert!(block_subsidy_sats(500, R) < block_subsidy_sats(500, SUBSIDY_HALVING_INTERVAL));
+    }
+
+    /// The subsidy runs out at the 33rd halving — 50 BTC is only about
+    /// 2^32 satoshis, so the last payable one is a single sat. The 64
+    /// guard is there for the SHIFT (`u64 >> 64` is undefined), not for
+    /// the money, and it has to hold at the far end of the height type.
+    #[test]
+    fn subsidy_runs_out_and_the_shift_guard_holds() {
+        const I: u32 = SUBSIDY_HALVING_INTERVAL;
+        assert_eq!(block_subsidy_sats(32 * I as i32, I), 1);
+        assert_eq!(block_subsidy_sats(33 * I as i32, I), 0);
+        assert_eq!(block_subsidy_sats(i32::MAX, I), 0);
+        // Regtest reaches the shift guard at a height a test could
+        // plausibly mine to, so it must not panic there either.
+        assert_eq!(
+            block_subsidy_sats(64 * REGTEST_SUBSIDY_HALVING_INTERVAL as i32, 150),
+            0
+        );
+    }
+
+    /// The gate must fail OPEN on anything that cannot describe a real
+    /// block — a floor computed from nonsense would refuse to book a
+    /// perfectly good one. The dust sweep mints synthetic negative
+    /// heights for its audit rows, so that case is not hypothetical.
+    #[test]
+    fn subsidy_fails_open_on_impossible_inputs() {
+        assert_eq!(block_subsidy_sats(-1, SUBSIDY_HALVING_INTERVAL), 0);
+        assert_eq!(block_subsidy_sats(i32::MIN, SUBSIDY_HALVING_INTERVAL), 0);
+        assert_eq!(block_subsidy_sats(800_000, 0), 0);
+    }
+
+    /// The band is an alarm, not a gate — but it still has to describe
+    /// the ±25 % it claims to.
+    #[test]
+    fn settlement_band_spans_a_quarter_either_way() {
+        const T: u64 = 400_000_000;
+        assert!(reward_within_band(T, 300_000_000));
+        assert!(reward_within_band(T, 500_000_000));
+        assert!(!reward_within_band(T, 299_999_999));
+        assert!(!reward_within_band(T, 500_000_001));
     }
 }

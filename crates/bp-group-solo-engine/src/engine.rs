@@ -41,7 +41,7 @@ use sqlx::PgPool;
 use thiserror::Error;
 use tokio::sync::{watch, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::config::{ConfigError, GroupSoloEngineConfig};
@@ -101,10 +101,58 @@ pub enum EngineError {
         snapshot_reward: u64,
         actual_reward: u64,
     },
+    #[error(
+        "group {group_id} block {block_height} coinbase pays {actual_reward} sats, less than \
+         the {subsidy} sat subsidy the block was entitled to — it forfeited money, so nothing \
+         about it is trustworthy enough to book unattended"
+    )]
+    RevenueBelowSubsidy {
+        group_id: Uuid,
+        block_height: i32,
+        actual_reward: u64,
+        subsidy: u64,
+    },
     #[error("on_block_found already in flight for group {group_id}")]
     BlockFoundInProgress { group_id: Uuid },
     #[error("invalid address in snapshot: {0}")]
     Address(#[from] InvalidAddressError),
+}
+
+impl EngineError {
+    /// Would retrying this ever succeed?
+    ///
+    /// The confirmation watcher re-applies a pending block on every
+    /// tick and only drops it once the apply returns `Ok`. That is
+    /// right for a database blip and wrong for a verdict: a snapshot
+    /// that expired, a coinbase that burned its own subsidy or an
+    /// address that will not parse produce the SAME failure forever,
+    /// so retrying them is an infinite loop that hides the block
+    /// behind a repeating warning instead of surfacing it once.
+    ///
+    /// Terminal here does not mean the block is lost — it means no
+    /// automatic path can book it, and the operator reprocess reads
+    /// the block's own coinbase off the chain rather than the parked
+    /// blob.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            EngineError::Config(_)
+            | EngineError::SnapshotMissing { .. }
+            | EngineError::SnapshotMissingForPayouts { .. }
+            | EngineError::SnapshotRewardMismatch { .. }
+            | EngineError::RevenueBelowSubsidy { .. }
+            | EngineError::Address(_) => true,
+            // Infrastructure, and the per-group in-flight guard — all
+            // of these clear on their own.
+            EngineError::Redis(_)
+            | EngineError::Round(_)
+            | EngineError::Db(_)
+            | EngineError::Ledger(_)
+            | EngineError::Sweep(_)
+            | EngineError::Reset(_)
+            | EngineError::Distribution(_)
+            | EngineError::BlockFoundInProgress { .. } => false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -816,19 +864,43 @@ impl GroupSoloEngine {
             }
         };
 
+        // The one hard gate: a coinbase that pays less than its own
+        // subsidy destroyed money it was entitled to. Nothing healthy
+        // produces that — not mempool drift, not a stale projection
+        // base, not a job-declaring client's own template.
+        let subsidy =
+            bp_share::block_subsidy_sats(block_height, self.inner.config.subsidy_halving_interval);
+        if actual.total_value_sats < subsidy {
+            error!(
+                %group_id,
+                subsidy,
+                actual_reward = actual.total_value_sats,
+                block_height,
+                "group-solo block coinbase pays less than the block subsidy — refusing to book"
+            );
+            return Err(EngineError::RevenueBelowSubsidy {
+                group_id,
+                block_height,
+                actual_reward: actual.total_value_sats,
+                subsidy,
+            });
+        }
+        // Drift off the projection base is an ALARM, not a gate. The
+        // claims below come from the block's own coinbase, so they are
+        // right at any revenue — including the finder bonus, which the
+        // §4 split scales with the block while the ledger holds it as
+        // fixed sats. Refusing to book here used to leave the balances
+        // this block already paid standing, and the next block paid
+        // them out a second time.
         if !bp_share::reward_within_band(snapshot.reference_revenue_sats, actual.total_value_sats) {
             warn!(
                 %group_id,
                 reference_reward = snapshot.reference_revenue_sats,
                 actual_reward = actual.total_value_sats,
                 block_height,
-                "group-solo block revenue outside the settlement band — refusing to book unattended"
+                "group-solo block revenue far off the distribution's reference — booking it from \
+                 the real coinbase, but the job source is worth a look"
             );
-            return Err(EngineError::SnapshotRewardMismatch {
-                group_id,
-                snapshot_reward: snapshot.reference_revenue_sats,
-                actual_reward: actual.total_value_sats,
-            });
         }
 
         // 2. Mode + reset gate (one row read), round state for the

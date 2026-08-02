@@ -43,7 +43,7 @@ use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::{ConfigError, PplnsEngineConfig};
 use crate::distribution::{
@@ -60,7 +60,7 @@ use crate::window::{
     NetworkDifficulty, WindowError, WindowStore,
 };
 use bp_coinbase_snapshot::ActualCoinbase;
-use bp_share::{claim_sats, reward_within_band};
+use bp_share::{block_subsidy_sats, claim_sats, reward_within_band};
 
 /// How often a transient Redis failure on the block-found snapshot read is
 /// retried before the block is given up on. That read is the only thing
@@ -106,14 +106,14 @@ pub enum EngineError {
         actual_reward: u64,
     },
     #[error(
-        "block {block_height} revenue {actual_reward} sats is outside the settlement \
-         band around the distribution's reference {reference_reward} sats — the job \
-         and the distribution disagree; operator must reprocess"
+        "block {block_height} coinbase pays {actual_reward} sats, less than the \
+         {subsidy} sat subsidy the block was entitled to — it forfeited money, so \
+         nothing about it is trustworthy enough to book unattended"
     )]
-    RewardOutOfBand {
+    RevenueBelowSubsidy {
         block_height: i32,
-        reference_reward: u64,
         actual_reward: u64,
+        subsidy: u64,
     },
     #[error(
         "block {block_height} already has payout-history rows — a redelivered \
@@ -126,6 +126,44 @@ pub enum EngineError {
     Address(#[from] InvalidAddressError),
     #[error("prepared block-found decode: {0}")]
     PreparedDecode(String),
+}
+
+impl EngineError {
+    /// Would retrying this ever succeed?
+    ///
+    /// The confirmation watcher re-applies a pending block on every
+    /// tick and only drops it once the apply returns `Ok`. That is
+    /// right for a database blip and wrong for a verdict: a snapshot
+    /// that expired, a coinbase that burned its own subsidy or an
+    /// address that will not parse produce the SAME failure forever,
+    /// so retrying them is an infinite loop that hides the block
+    /// behind a repeating warning instead of surfacing it once.
+    ///
+    /// Terminal here does not mean the block is lost — it means no
+    /// automatic path can book it, and the operator reprocess reads
+    /// the block's own coinbase off the chain rather than the parked
+    /// blob.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            EngineError::Config(_)
+            | EngineError::SnapshotMissing { .. }
+            | EngineError::NoPayoutFingerprint { .. }
+            | EngineError::SnapshotRewardMismatch { .. }
+            | EngineError::RevenueBelowSubsidy { .. }
+            | EngineError::AlreadyBooked { .. }
+            | EngineError::Address(_)
+            | EngineError::PreparedDecode(_) => true,
+            // Infrastructure, and the in-flight guard — all of these
+            // clear on their own.
+            EngineError::Redis(_)
+            | EngineError::Window(_)
+            | EngineError::Db(_)
+            | EngineError::Ledger(_)
+            | EngineError::Sweep(_)
+            | EngineError::Distribution(_)
+            | EngineError::BlockFoundInProgress => false,
+        }
+    }
 }
 
 /// A PPLNS block-found distribution computed at found-time and frozen
@@ -702,18 +740,38 @@ impl PplnsEngine {
             }
         };
 
+        // The one hard gate: a coinbase that pays less than its own
+        // subsidy destroyed money it was entitled to. No mempool drift,
+        // no stale projection base and no job-declaring client's own
+        // template can produce that, so it never fires on a healthy
+        // block — and a block that DID do it is not one to book blind.
+        let subsidy = block_subsidy_sats(block_height, self.inner.config.subsidy_halving_interval);
+        if actual.total_value_sats < subsidy {
+            error!(
+                subsidy,
+                actual_reward = actual.total_value_sats,
+                block_height,
+                "PPLNS block coinbase pays less than the block subsidy — refusing to book"
+            );
+            return Err(EngineError::RevenueBelowSubsidy {
+                block_height,
+                actual_reward: actual.total_value_sats,
+                subsidy,
+            });
+        }
+        // Drift off the projection base is an ALARM, not a gate. The
+        // claims below come from the block's own coinbase, so they are
+        // right at any revenue; refusing to book here used to leave the
+        // balances this block already paid standing in the ledger, and
+        // the next block paid them out a second time.
         if !reward_within_band(snapshot.reference_revenue_sats, actual.total_value_sats) {
             warn!(
                 reference_reward = snapshot.reference_revenue_sats,
                 actual_reward = actual.total_value_sats,
                 block_height,
-                "PPLNS block revenue outside the settlement band — refusing to book unattended"
+                "PPLNS block revenue far off the distribution's reference — booking it from the \
+                 real coinbase, but the job source is worth a look"
             );
-            return Err(EngineError::RewardOutOfBand {
-                block_height,
-                reference_reward: snapshot.reference_revenue_sats,
-                actual_reward: actual.total_value_sats,
-            });
         }
 
         let now_ms = chrono::Utc::now().timestamp_millis();

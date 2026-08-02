@@ -34,7 +34,7 @@ use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::pending_blocks::{remove_pending_block, PENDING_KEY};
 use crate::pending_group_solo_blocks::{remove_pending_group_solo_block, GS_PENDING_KEY};
@@ -242,6 +242,18 @@ async fn reconcile(
                     );
                     let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
                 }
+                Err(err) if err.is_terminal() => {
+                    error!(
+                        %err,
+                        block_hash = %pb.block_hash,
+                        height = pb.prepared.block_height,
+                        "block-confirmation: PPLNS block cannot be booked automatically — \
+                         dropping it from the pending store instead of retrying forever; \
+                         the miners it paid are owed their ledger entry, reprocess from the \
+                         block's own coinbase"
+                    );
+                    let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+                }
                 Err(err) => warn!(
                     %err,
                     block_hash = %pb.block_hash,
@@ -330,6 +342,19 @@ async fn reconcile(
                         history_inserted = outcome.history_inserted,
                         balances_affected = outcome.balances_affected,
                         "block-confirmation: confirmed → Group-Solo ledger applied"
+                    );
+                    let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
+                }
+                Err(err) if err.is_terminal() => {
+                    error!(
+                        %err,
+                        block_hash = %pb.block_hash,
+                        height = pb.block_height,
+                        group_id = %pb.group_id,
+                        "block-confirmation: Group-Solo block cannot be booked automatically — \
+                         dropping it from the pending store instead of retrying forever; the \
+                         members it paid are owed their ledger entry, reprocess from the \
+                         block's own coinbase"
                     );
                     let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
                 }

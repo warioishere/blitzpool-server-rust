@@ -1859,3 +1859,167 @@ async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
 
     drop_harness(h).await;
 }
+
+// ── The settlement gate: subsidy, not the reference revenue ────────
+//
+// `overpayment_is_booked_as_debt_and_recovered_next_block` above pins
+// the +20 % case. Anything past ±25 % used to be refused outright, and
+// refusing meant the block's balances stayed exactly as they were —
+// so the credits its coinbase had already paid were paid a second time
+// out of the next block's miner cut. The claims come from the block's
+// own coinbase and are right at any revenue; only a coinbase paying
+// less than the block's own subsidy is still refused.
+//
+// Heights sit in the current subsidy epoch (4 halvings → 312 500 000
+// sats) so the gate is genuinely exercised.
+
+/// A Group-Solo block paying far outside the band must still book, and
+/// the finder's bonus overshoot must land as debt just as it does
+/// inside the band — the arithmetic does not change at the boundary.
+#[tokio::test]
+async fn a_group_block_far_off_the_reference_is_still_booked() {
+    let h = match spawn_or_skip(3, Some(50_000_000)).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
+    const T_REF: u64 = 312_500_000;
+    // 1.6 × the projection base — far outside the ±25 % band, and well
+    // above the block subsidy, so only the alarm fires.
+    const T_ACTUAL: u64 = 500_000_000;
+    let height: i32 = 840_801;
+    assert!(
+        !bp_share::reward_within_band(T_REF, T_ACTUAL),
+        "the fixture must actually sit outside the settlement band"
+    );
+
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, h.group_id, other.as_str(), 100.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+    let result = h
+        .engine
+        .build_distribution(h.group_id, T_REF, &finder)
+        .await
+        .expect("build");
+
+    // THE REGRESSION: this returned `SnapshotRewardMismatch` and booked
+    // nothing at all.
+    h.engine
+        .on_block_found_scaled(
+            h.group_id,
+            height,
+            &actual_paying_exactly(&result, T_ACTUAL),
+            &finder,
+            None,
+            Some(result.payouts_fingerprint()),
+        )
+        .await
+        .expect("a block off the reference revenue must still book");
+
+    // Two 50 % members, fee 0, a fixed 50M bonus carried as a weight.
+    // The ledger owes the finder `(pot(T) − X)/2 + bonus =
+    // (500M − 50M)/2 + 50M = 275M`; the coinbase pays it its wire share
+    // of the 1.6× block, `0.5·1.6·(312.5M − 50M) + 1.6·50M = 290M`.
+    // The bonus rode the revenue up to 80M while the promise stayed at
+    // 50M — 30M of inflation — but the finder funds half of that itself
+    // through its own diluted score share, so the net debt is 15M. The
+    // same identity as the in-band test above: `(r−1)·(u/S·X − bonus)`,
+    // which at r = 1.2 gives the 5M that test pins.
+    let pending_of = |addr: String| {
+        let pool = h.pool.clone();
+        let gid = h.group_id;
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                r#"SELECT "pendingSats" FROM pplns_group_balance
+                   WHERE "groupId" = $1 AND address = $2"#,
+            )
+            .bind(gid)
+            .bind(addr)
+            .fetch_one(&pool)
+            .await
+            .expect("balance row")
+        }
+    };
+    let finder_pending = pending_of(finder.as_str().to_string()).await;
+    let other_pending = pending_of(other.as_str().to_string()).await;
+    assert!(
+        (finder_pending + 15_000_000).abs() <= 2,
+        "expected the ~15M net bonus overshoot as debt, got {finder_pending}"
+    );
+    assert!(
+        (other_pending + finder_pending).abs() <= 2,
+        "the overpayment came out of the other member: finder {finder_pending} \
+         vs other {other_pending}"
+    );
+
+    drop_harness(h).await;
+}
+
+/// The one thing Group-Solo settlement still refuses: a coinbase paying
+/// less than the block's own subsidy destroyed money it was entitled
+/// to — and it must not be retried forever by the confirmation watcher.
+#[tokio::test]
+async fn a_group_coinbase_below_the_block_subsidy_is_refused() {
+    let h = match spawn_or_skip(4, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    const T_REF: u64 = 312_500_000;
+    let height: i32 = 840_802;
+    let subsidy = bp_share::block_subsidy_sats(height, bp_share::SUBSIDY_HALVING_INTERVAL);
+    assert_eq!(subsidy, 312_500_000, "fixture height must be in epoch 4");
+
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    let result = h
+        .engine
+        .build_distribution(h.group_id, T_REF, &finder)
+        .await
+        .expect("build");
+
+    let err = h
+        .engine
+        .on_block_found_scaled(
+            h.group_id,
+            height,
+            &actual_paying_exactly(&result, subsidy - 1),
+            &finder,
+            None,
+            Some(result.payouts_fingerprint()),
+        )
+        .await
+        .expect_err("a coinbase below the subsidy must not book");
+    assert!(
+        matches!(
+            err,
+            bp_group_solo_engine::engine::EngineError::RevenueBelowSubsidy { .. }
+        ),
+        "expected RevenueBelowSubsidy, got {err}"
+    );
+    assert!(
+        err.is_terminal(),
+        "the confirmation watcher must drop this rather than retry it every tick"
+    );
+
+    let booked: i64 = sqlx::query_scalar(
+        r#"SELECT count(*) FROM pplns_group_block_history
+           WHERE "groupId" = $1 AND "blockHeight" = $2"#,
+    )
+    .bind(h.group_id)
+    .bind(height)
+    .fetch_one(&h.pool)
+    .await
+    .expect("count");
+    assert_eq!(booked, 0, "nothing may be booked for a burned block");
+
+    drop_harness(h).await;
+}

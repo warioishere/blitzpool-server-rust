@@ -103,6 +103,15 @@ pub struct PplnsEngineConfig {
     /// ledger. Mirrored from the per-port toml for the same reason
     /// as `min_difficulty`.
     pub warmup_shares: u32,
+
+    /// Blocks between subsidy halvings on the network this pool runs
+    /// on — the input to the settlement gate's floor
+    /// (`bp_share::block_subsidy_sats`). NOT an operator knob: it is
+    /// derived from the configured network at boot, because regtest
+    /// halves every 150 blocks and the mainnet 210 000 would make
+    /// every regtest block past height 150 look like it had burned
+    /// part of its own subsidy.
+    pub subsidy_halving_interval: u32,
 }
 
 impl Default for PplnsEngineConfig {
@@ -121,6 +130,7 @@ impl Default for PplnsEngineConfig {
             abandoned_balance_days: 90,
             min_difficulty: 500,
             warmup_shares: 5,
+            subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
         }
     }
 }

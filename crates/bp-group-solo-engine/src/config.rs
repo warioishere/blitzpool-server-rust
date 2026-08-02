@@ -53,6 +53,15 @@ pub struct GroupSoloEngineConfig {
     /// Defaults to 30. Shorter than PPLNS's 90d because group balances
     /// are all-positive and have no counterparty to wait for.
     pub dormant_balance_days: u32,
+
+    /// Blocks between subsidy halvings on the network this pool runs
+    /// on — the input to the settlement gate's floor
+    /// (`bp_share::block_subsidy_sats`). NOT an operator knob: it is
+    /// derived from the configured network at boot, because regtest
+    /// halves every 150 blocks and the mainnet 210 000 would make
+    /// every regtest block past height 150 look like it had burned
+    /// part of its own subsidy.
+    pub subsidy_halving_interval: u32,
 }
 
 impl Default for GroupSoloEngineConfig {
@@ -65,6 +74,7 @@ impl Default for GroupSoloEngineConfig {
             snapshot_ttl_secs: 3_600,
             dust_sweep_enabled: true,
             dormant_balance_days: 30,
+            subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
         }
     }
 }

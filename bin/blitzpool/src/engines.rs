@@ -224,7 +224,7 @@ async fn spawn_pplns(
         info!("pplns: disabled (no [pplns] table in config)");
         return Ok(None);
     };
-    let engine_cfg = to_pplns_engine_config(toml_cfg)?;
+    let engine_cfg = to_pplns_engine_config(toml_cfg, cfg.network)?;
     let net_diff = bootstrap_network_difficulty(handles).await;
     info!(
         net_diff = %net_diff.get(),
@@ -244,7 +244,25 @@ async fn spawn_pplns(
     Ok(Some(engine))
 }
 
-fn to_pplns_engine_config(cfg: &TomlPplnsConfig) -> Result<PplnsEngineConfig, EngineError> {
+/// Blocks between subsidy halvings for the configured network. The
+/// settlement gate refuses to book a coinbase paying less than the
+/// block's own subsidy, so this has to be the network's real schedule:
+/// regtest halves every 150 blocks, and feeding it the mainnet 210 000
+/// would make every regtest block past height 150 look like it had
+/// burned money and stop the harnesses booking anything.
+fn subsidy_halving_interval(network: bp_config::Network) -> u32 {
+    match network {
+        bp_config::Network::Regtest => bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
+        bp_config::Network::Mainnet
+        | bp_config::Network::Testnet
+        | bp_config::Network::Testnet4 => bp_share::SUBSIDY_HALVING_INTERVAL,
+    }
+}
+
+fn to_pplns_engine_config(
+    cfg: &TomlPplnsConfig,
+    network: bp_config::Network,
+) -> Result<PplnsEngineConfig, EngineError> {
     let fee_address = if cfg.fee_address.trim().is_empty() {
         None
     } else {
@@ -263,6 +281,7 @@ fn to_pplns_engine_config(cfg: &TomlPplnsConfig) -> Result<PplnsEngineConfig, En
         dust_sweep_enabled: cfg.dust_sweep_enabled,
         abandoned_balance_days: cfg.abandoned_balance_days,
         bucket_shares: cfg.bucket_shares,
+        subsidy_halving_interval: subsidy_halving_interval(network),
         ..PplnsEngineConfig::default()
     };
     let validated = base.try_new()?;
@@ -330,6 +349,7 @@ fn to_group_solo_engine_config(cfg: &AppConfig) -> Result<GroupSoloEngineConfig,
         coinbase_weight_budget: cfg.group_fees.coinbase_weight_budget,
         dust_sweep_enabled: cfg.group_fees.dust_sweep_enabled,
         dormant_balance_days: cfg.group_fees.dormant_balance_days,
+        subsidy_halving_interval: subsidy_halving_interval(cfg.network),
         // The `min_payout_sats` floor is shared between PPLNS + Group-
         // Solo: both engines read the same value. When `[pplns]` is
         // configured we reuse its value; otherwise the engine's own
@@ -748,6 +768,60 @@ mod tests {
     use super::*;
     use bp_common::MiningMode;
     use bp_share_stream::AcceptedShareConsumer;
+
+    /// The settlement gate refuses to book a coinbase paying less than
+    /// the block's own subsidy, so this mapping decides whether the
+    /// pool's own regtests can book anything at all: regtest halves
+    /// every 150 blocks, and the harnesses mine well past that. Handing
+    /// the engines the mainnet 210 000 would over-state the subsidy by
+    /// 4× at height 500 and refuse every block they find.
+    #[test]
+    fn regtest_gets_its_own_halving_schedule() {
+        assert_eq!(
+            subsidy_halving_interval(bp_config::Network::Regtest),
+            bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL
+        );
+        for net in [
+            bp_config::Network::Mainnet,
+            bp_config::Network::Testnet,
+            bp_config::Network::Testnet4,
+        ] {
+            assert_eq!(
+                subsidy_halving_interval(net),
+                bp_share::SUBSIDY_HALVING_INTERVAL,
+                "{net:?} shares the mainnet schedule"
+            );
+        }
+        // The concrete consequence, at a height a regtest harness reaches.
+        let regtest = bp_share::block_subsidy_sats(
+            500,
+            subsidy_halving_interval(bp_config::Network::Regtest),
+        );
+        assert_eq!(regtest, 625_000_000, "3 halvings in on regtest");
+        assert!(
+            regtest
+                < bp_share::block_subsidy_sats(
+                    500,
+                    subsidy_halving_interval(bp_config::Network::Mainnet)
+                ),
+            "the mainnet schedule would over-state it and gate the block"
+        );
+    }
+
+    /// Both engines must carry the same schedule — a Group-Solo block
+    /// and a PPLNS block on the same node cannot disagree about what
+    /// their own subsidy was.
+    #[test]
+    fn both_engine_configs_default_to_the_mainnet_schedule() {
+        assert_eq!(
+            PplnsEngineConfig::default().subsidy_halving_interval,
+            bp_share::SUBSIDY_HALVING_INTERVAL
+        );
+        assert_eq!(
+            bp_group_solo_engine::config::GroupSoloEngineConfig::default().subsidy_halving_interval,
+            bp_share::SUBSIDY_HALVING_INTERVAL
+        );
+    }
 
     /// Enough config to reach the engine builders. Deliberately WITHOUT
     /// `[pplns]` — that is the shape under test.

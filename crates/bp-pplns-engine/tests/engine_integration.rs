@@ -1102,3 +1102,180 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
     cleanup_addr(&h.pool, TINY, &[h1, h2]).await;
     drop_harness(h).await;
 }
+
+// ── The settlement gate: subsidy, not the reference revenue ────────
+//
+// The distribution's `reference_revenue_sats` is only the base the
+// wire weights were projected against. Settlement books `claim − paid`
+// from the block's OWN coinbase, so it is right at any revenue.
+// Refusing to book on a wide reference drift used to leave the
+// balances the block had already paid standing in the ledger — and the
+// next block paid them out a second time, out of the other miners'
+// cut. Heights here sit in the current subsidy epoch (4 halvings →
+// 312 500 000 sats) so the gate is genuinely exercised rather than
+// passing on a synthetic height where the subsidy has decayed to 0.
+
+/// A block whose coinbase pays far outside the ±25 % band around the
+/// distribution's reference revenue MUST still be booked: the claims
+/// come from that coinbase, and dropping the block is what left the
+/// paid-out credits standing to be paid again.
+#[tokio::test]
+async fn a_block_far_off_the_reference_revenue_is_still_booked() {
+    let _serial = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(2, "test_offband_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const BIG: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const TINY: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const T_REF: u64 = 3_000_000_000;
+    // 1.6 × the projection base — far outside the band, and still well
+    // above the block subsidy, so only the alarm fires.
+    const T_ACTUAL: u64 = 4_800_000_000;
+    let h1: i32 = 840_601;
+    let h2: i32 = 840_602;
+    cleanup_addr(&h.pool, BIG, &[h1, h2]).await;
+    cleanup_addr(&h.pool, TINY, &[h1, h2]).await;
+
+    // Block 1 pays exactly, leaving TINY a sub-threshold credit.
+    h.engine
+        .record_share(None, BIG, 1_000_000.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, TINY, 1.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+    let d1 = h.engine.build_distribution(T_REF).await.expect("build 1");
+    h.engine
+        .on_block_found_scaled(
+            h1,
+            &actual_paying_exactly(&d1, T_REF),
+            Some(d1.payouts_fingerprint()),
+        )
+        .await
+        .expect("apply 1");
+    let (credit, _) = miner_balance_and_paid(&h.pool, TINY).await;
+    assert!(
+        credit > 0,
+        "block 1 must leave TINY a credit (got {credit})"
+    );
+
+    // Block 2 is built against T_REF but paid at T_ACTUAL — the case a
+    // job-declaring client's own template produces.
+    h.engine
+        .record_share(None, BIG, 1_000_000.0, 1_700_000_060_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, TINY, 1.0, 1_700_000_060_002)
+        .await
+        .unwrap();
+    let d2 = h.engine.build_distribution(T_REF).await.expect("build 2");
+    assert!(
+        !bp_share::reward_within_band(T_REF, T_ACTUAL),
+        "the fixture must actually sit outside the settlement band"
+    );
+    let actual2 = actual_paying_exactly(&d2, T_ACTUAL);
+    assert!(
+        actual2
+            .paid_by_address
+            .get(TINY)
+            .is_some_and(|paid| *paid > 0),
+        "the credit must buy TINY a real coinbase output, or this proves nothing"
+    );
+
+    // THE REGRESSION: this returned `RewardOutOfBand` and booked nothing.
+    h.engine
+        .on_block_found_scaled(h2, &actual2, Some(d2.payouts_fingerprint()))
+        .await
+        .expect("a block off the reference revenue must still book");
+
+    let booked: (i64,) =
+        sqlx::query_as(r#"SELECT count(*) FROM pplns_payout_history WHERE "blockHeight" = $1"#)
+            .bind(h2)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(booked.0 >= 1, "the off-band block must leave audit rows");
+
+    // And the credit is GONE rather than standing to be paid again. The
+    // coinbase paid it at 1.6 × the projection, so TINY is left owing
+    // the overshoot — signed, small, and the counterparties are booked
+    // the matching credits.
+    let (after, paid) = miner_balance_and_paid(&h.pool, TINY).await;
+    assert!(paid > 0, "TINY was paid on chain (got {paid})");
+    assert!(
+        after < credit,
+        "the credit must be consumed by the payment, not left standing \
+         (before {credit}, after {after})"
+    );
+    assert!(
+        after <= 0,
+        "paid at 1.6× the promise, TINY should owe the overshoot (got {after})"
+    );
+
+    cleanup_addr(&h.pool, BIG, &[h1, h2]).await;
+    cleanup_addr(&h.pool, TINY, &[h1, h2]).await;
+    drop_harness(h).await;
+}
+
+/// The one thing settlement still refuses: a coinbase paying less than
+/// the block's own subsidy destroyed money it was entitled to. No
+/// mempool drift and no stale projection base can produce that.
+#[tokio::test]
+async fn a_coinbase_below_the_block_subsidy_is_refused() {
+    let _serial = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(10, "test_burn_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const MINER: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const T_REF: u64 = 3_000_000_000;
+    // Height 840 701 is 4 halvings in: the subsidy is 312 500 000 sats.
+    let height: i32 = 840_701;
+    let subsidy = bp_share::block_subsidy_sats(height, bp_share::SUBSIDY_HALVING_INTERVAL);
+    assert_eq!(subsidy, 312_500_000, "fixture height must be in epoch 4");
+    cleanup_addr(&h.pool, MINER, &[height]).await;
+
+    h.engine
+        .record_share(None, MINER, 1_000.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    let d = h.engine.build_distribution(T_REF).await.expect("build");
+
+    // A §4-consistent coinbase — it just forfeits most of the block.
+    let burned = actual_paying_exactly(&d, subsidy - 1);
+    let err = h
+        .engine
+        .on_block_found_scaled(height, &burned, Some(d.payouts_fingerprint()))
+        .await
+        .expect_err("a coinbase below the subsidy must not book");
+    assert!(
+        matches!(
+            err,
+            bp_pplns_engine::engine::EngineError::RevenueBelowSubsidy { .. }
+        ),
+        "expected RevenueBelowSubsidy, got {err}"
+    );
+    assert!(err.is_terminal(), "the watcher must not retry this forever");
+
+    let booked: (i64,) =
+        sqlx::query_as(r#"SELECT count(*) FROM pplns_payout_history WHERE "blockHeight" = $1"#)
+            .bind(height)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(booked.0, 0, "nothing may be booked for a burned block");
+
+    // One satoshi more and the same coinbase books fine — the gate is
+    // the subsidy, nothing fuzzier.
+    let honest = actual_paying_exactly(&d, subsidy);
+    h.engine
+        .on_block_found_scaled(height, &honest, Some(d.payouts_fingerprint()))
+        .await
+        .expect("a coinbase paying exactly the subsidy books");
+
+    cleanup_addr(&h.pool, MINER, &[height]).await;
+    drop_harness(h).await;
+}

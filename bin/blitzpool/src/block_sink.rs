@@ -709,8 +709,12 @@ impl BlockFoundApplier {
                         {
                             Ok(p) => p,
                             Err(err) => {
-                                warn!(%err, address = address_str, height,
-                                    "block-found: PPLNS prepare_block_found_scaled failed");
+                                error!(%err, address = address_str, height, block_hash,
+                                    "block-found: PPLNS block could not be frozen for booking — \
+                                     it is NOT parked and will not be retried; the miners its \
+                                     coinbase paid are owed their ledger entry, and until it is \
+                                     reprocessed their balances stand as if this block never \
+                                     paid them. block-reconcile will report it as unbooked");
                                 return;
                             }
                         }
@@ -721,8 +725,10 @@ impl BlockFoundApplier {
                     {
                         Ok(p) => p,
                         Err(err) => {
-                            warn!(%err, address = address_str, height,
-                                "block-found: PPLNS prepare_block_found failed");
+                            error!(%err, address = address_str, height, block_hash,
+                                "block-found: PPLNS block could not be frozen for booking — \
+                                 it is NOT parked and will not be retried; block-reconcile \
+                                 will report it as unbooked");
                             return;
                         }
                     },
