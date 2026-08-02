@@ -108,6 +108,7 @@ mod tests {
                     address: "bc1qexampleaddr".to_string(),
                     balance_sats: 0,
                     total_paid_sats: 5_000_000,
+                    balance_before_sats: Some(5_000_000),
                 }],
             },
         };

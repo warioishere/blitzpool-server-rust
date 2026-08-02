@@ -214,6 +214,13 @@ pub struct PreparedBalanceWrite {
     pub address: String,
     pub balance_sats: i64,
     pub total_paid_sats: i64,
+    /// The ledger row as it stood when this block was frozen, so the
+    /// apply can re-base its movement onto whatever the row holds by
+    /// the time the block confirms (see [`BalanceWrite::balance_before`]).
+    /// `serde(default)` keeps blobs frozen before this field readable —
+    /// they apply their absolute, exactly as they always did.
+    #[serde(default)]
+    pub balance_before_sats: Option<i64>,
 }
 
 impl PreparedBlockFound {
@@ -247,6 +254,7 @@ impl PreparedBlockFound {
                     address: b.address.as_str().to_string(),
                     balance_sats: b.balance_sats.0,
                     total_paid_sats: b.total_paid_sats.0,
+                    balance_before_sats: b.balance_before.map(|s| s.0),
                 })
                 .collect(),
         }
@@ -275,6 +283,7 @@ impl PreparedBlockFound {
                 address: AddressId::new(b.address.clone())?,
                 balance_sats: Sats(b.balance_sats),
                 total_paid_sats: Sats(b.total_paid_sats),
+                balance_before: b.balance_before_sats.map(Sats),
             });
         }
         Ok((rows, balances))
@@ -609,17 +618,91 @@ impl PplnsEngine {
         ))
     }
 
+    /// Re-base each balance write onto the row as it stands NOW.
+    ///
+    /// A confirmation-gated block freezes ABSOLUTE post-block balances
+    /// at found-time and writes them `confirmation_depth` blocks later
+    /// (default 3, ~30 min), and `bulk_upsert_pplns_balances` sets
+    /// `balanceSats = EXCLUDED`. So every writer that touches a row in
+    /// that window is undone by the apply.
+    ///
+    /// The block-found path already guards the writer it knew about —
+    /// an earlier pending block, flushed before the next one freezes.
+    /// The daily 03:00-UTC dust sweep is the other one: it pair-cancels
+    /// an abandoned credit against an abandoned debit and deletes both
+    /// rows. Landing the frozen absolute afterwards restored the credit
+    /// while the debit stayed swept, leaving the ledger owing satoshis
+    /// no one owed it — paid out of the miners' cut on the next block.
+    ///
+    /// So the movement, not the outcome, is what gets applied:
+    /// `now + (frozen_after − frozen_before)`. Signed, unclamped — the
+    /// PPLNS ledger carries debts. Same shape as Group-Solo's
+    /// `resolve_new_balance`, which solved this for its own snapshots.
+    async fn rebase_onto_current(
+        &self,
+        balance_writes: &mut [BalanceWrite],
+        block_height: i32,
+    ) -> Result<(), EngineError> {
+        let rebasable: Vec<String> = balance_writes
+            .iter()
+            .filter(|b| b.balance_before.is_some())
+            .map(|b| b.address.as_str().to_string())
+            .collect();
+        if rebasable.is_empty() {
+            return Ok(());
+        }
+        let current: HashMap<String, i64> =
+            find_pplns_balances_for_addresses(&self.inner.pool, &rebasable)
+                .await?
+                .into_iter()
+                .map(|r| (r.address.as_str().to_string(), r.balance_sats.0))
+                .collect();
+
+        for write in balance_writes.iter_mut() {
+            let Some(before) = write.balance_before else {
+                continue;
+            };
+            // A row absent now reads as 0 — the sweep deletes a row it
+            // has zeroed, and re-basing onto 0 is what keeps that
+            // deletion standing.
+            let now = current.get(write.address.as_str()).copied().unwrap_or(0);
+            if now == before.0 {
+                continue;
+            }
+            let rebased = now + (write.balance_sats.0 - before.0);
+            warn!(
+                address = write.address.as_str(),
+                block_height,
+                frozen_before = before.0,
+                frozen_after = write.balance_sats.0,
+                current = now,
+                rebased,
+                "pplns apply: the ledger row moved between freeze and apply — applying the \
+                 block's movement to the current row rather than the frozen absolute"
+            );
+            write.balance_sats = Sats(rebased);
+        }
+        Ok(())
+    }
+
     /// **Apply** a previously [`prepared`](Self::prepare_block_found)
     /// distribution to the ledger. Idempotent on replay via the
-    /// `(blockHeight, address)` UNIQUE constraint — re-applying a block
-    /// already written converges to the same absolute balances. Clears
-    /// the (now-stale) snapshot best-effort and drops the distribution
+    /// `(blockHeight, address)` UNIQUE constraint. Clears the
+    /// (now-stale) snapshot best-effort and drops the distribution
     /// cache so the next build reads the fresh ledger.
+    ///
+    /// The balance writes are RE-BASED first — see
+    /// [`Self::rebase_onto_current`]. A gated block is computed at
+    /// found-time and lands `confirmation_depth` blocks later, and the
+    /// upsert is absolute, so without this anything that touched a row
+    /// in between would be silently undone.
     pub async fn apply_prepared(
         &self,
         prepared: &PreparedBlockFound,
     ) -> Result<ApplyDistributionResult, EngineError> {
-        let (audit_rows, balance_writes) = prepared.thaw()?;
+        let (audit_rows, mut balance_writes) = prepared.thaw()?;
+        self.rebase_onto_current(&mut balance_writes, prepared.block_height)
+            .await?;
 
         let outcome = apply_distribution(
             &self.inner.pool,
@@ -897,6 +980,7 @@ impl PplnsEngine {
                 address: addr_id,
                 balance_sats: Sats(current + delta),
                 total_paid_sats: Sats(prev_total_paid + paid as i64),
+                balance_before: Some(Sats(current)),
             });
         }
 
@@ -940,6 +1024,7 @@ impl PplnsEngine {
                     address: addr_id,
                     balance_sats: Sats(current - *paid as i64),
                     total_paid_sats: Sats(prev_total_paid + *paid as i64),
+                    balance_before: Some(Sats(current)),
                 });
             }
         }
@@ -1030,6 +1115,12 @@ impl PplnsEngine {
                 address: entry.address.clone(),
                 balance_sats: Sats(new_balance),
                 total_paid_sats: Sats(prev_total_paid + entry.sats.0),
+                balance_before: Some(Sats(
+                    existing
+                        .get(entry.address.as_str())
+                        .map(|r| r.balance_sats.0)
+                        .unwrap_or(0),
+                )),
             });
         }
 
@@ -1058,6 +1149,7 @@ impl PplnsEngine {
                 balance_sats: Sats(resolved),
                 // No on-chain delta for pending rows.
                 total_paid_sats: Sats(prev_total_paid),
+                balance_before: Some(Sats(prev_balance)),
             });
         }
 

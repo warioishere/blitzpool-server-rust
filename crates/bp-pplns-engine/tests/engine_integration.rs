@@ -1279,3 +1279,108 @@ async fn a_coinbase_below_the_block_subsidy_is_refused() {
     cleanup_addr(&h.pool, MINER, &[height]).await;
     drop_harness(h).await;
 }
+
+// ── The gated apply must not undo what moved underneath it ─────────
+//
+// A confirmation-gated block freezes ABSOLUTE post-block balances at
+// found-time and writes them ~3 blocks later, and the upsert sets
+// `balanceSats = EXCLUDED`. `gate_or_apply_pplns` already flushes an
+// earlier pending block before the next one freezes — that was the one
+// interleaving writer it knew about. The daily 03:00-UTC dust sweep is
+// the other, and it was not guarded.
+
+/// The sweep pair-cancels an abandoned credit against an abandoned
+/// debit and deletes both rows. If that lands between freeze and apply,
+/// writing the frozen absolute puts the credit back while the debit
+/// stays swept — the ledger then owes satoshis nobody owes it, and the
+/// next block pays them out of the other miners' cut.
+///
+/// Re-basing books what actually happened instead: the credit was
+/// cancelled AND the coinbase paid it out, so the holder owes it back.
+#[tokio::test]
+async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
+    let _serial = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(13, "test_rebase_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const MINER: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const DORMANT: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const CREDIT: i64 = 50_000; // above the 5_000 min_payout → published
+    const T: u64 = 312_500_000;
+    let height: i32 = 840_901;
+    cleanup_addr(&h.pool, MINER, &[height]).await;
+    cleanup_addr(&h.pool, DORMANT, &[height]).await;
+
+    h.engine
+        .record_share(None, MINER, 1_000.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    // A credit with no shares behind it — exactly what the sweep hunts.
+    sqlx::query(
+        r#"INSERT INTO pplns_balance (address, "balanceSats", "totalPaidSats", "updatedAt")
+           VALUES ($1, $2, 0, 0)"#,
+    )
+    .bind(DORMANT)
+    .bind(CREDIT)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    let d = h.engine.build_distribution(T).await.expect("build");
+    let actual = actual_paying_exactly(&d, T);
+    assert!(
+        actual.paid_by_address.get(DORMANT).is_some_and(|p| *p > 0),
+        "the credit must buy a real coinbase output, or this proves nothing"
+    );
+
+    // Freeze, as the block-found path does.
+    let prepared = h
+        .engine
+        .prepare_block_found_scaled(height, &actual, Some(d.payouts_fingerprint()))
+        .await
+        .expect("freeze");
+    let frozen = prepared
+        .balances
+        .iter()
+        .find(|b| b.address == DORMANT)
+        .expect("the dormant holder is in the frozen set");
+    let before = frozen
+        .balance_before_sats
+        .expect("the freeze must record what the row held");
+    let frozen_after = frozen.balance_sats;
+    assert_eq!(before, CREDIT, "baseline is the row at freeze time");
+
+    // …now the 03:00 sweep pair-cancels the credit and deletes the row.
+    sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
+        .bind(DORMANT)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    h.engine.apply_prepared(&prepared).await.expect("apply");
+
+    let (after, _) = miner_balance_and_paid(&h.pool, DORMANT).await;
+    // The movement this block causes is `frozen_after − before`; applied
+    // to a swept (absent → 0) row it lands there, not on the stale
+    // absolute.
+    assert_eq!(
+        after,
+        frozen_after - before,
+        "the block's movement must land on the CURRENT row"
+    );
+    assert!(
+        after < 0,
+        "the sweep gave the credit away and the coinbase paid it too, so \
+         the holder owes it back — got {after}"
+    );
+    assert_ne!(
+        after, frozen_after,
+        "writing the frozen absolute is exactly the bug: it would have \
+         restored the swept credit"
+    );
+
+    cleanup_addr(&h.pool, MINER, &[height]).await;
+    cleanup_addr(&h.pool, DORMANT, &[height]).await;
+    drop_harness(h).await;
+}

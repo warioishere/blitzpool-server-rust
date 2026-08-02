@@ -149,6 +149,18 @@ pub struct BalanceWrite {
     pub address: AddressId,
     pub balance_sats: Sats,
     pub total_paid_sats: Sats,
+    /// What the ledger row held when `balance_sats` was computed.
+    ///
+    /// A confirmation-gated block is computed at found-time and written
+    /// `confirmation_depth` blocks later, and the upsert is absolute —
+    /// so anything that touched the row in between would be silently
+    /// undone. `PplnsEngine::apply_prepared` re-reads the row and
+    /// re-bases the movement onto it: `now + (balance_sats − before)`.
+    ///
+    /// `None` means "write `balance_sats` as-is": blobs frozen before
+    /// this field existed carry no baseline, and applying the absolute
+    /// is exactly what they have always done.
+    pub balance_before: Option<Sats>,
 }
 
 #[cfg(test)]
