@@ -295,6 +295,250 @@ async fn on_block_found_applies_distribution_and_resets_round() {
     drop_harness(h).await;
 }
 
+// ── Overpayment must be recorded as debt, not forgiven ─────────────
+//
+// A JD-client computes its coinbase amounts against ITS OWN template
+// revenue, so a block that pays more than the distribution was
+// projected against hands a member more than they earned. That
+// difference is a debt: the pool must record it and recover it from the
+// member's next payout. Clamping it away silently gifts real satoshis.
+
+#[tokio::test]
+async fn overpayment_is_booked_as_debt_and_recovered_next_block() {
+    // A 50M finder bonus, as the API sets it.
+    let h = match spawn_or_skip(12, Some(50_000_000)).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    const T_REF: u64 = 312_500_000;
+    // What the JD-client's own template actually paid: 20 % richer.
+    const T_ACTUAL: u64 = 375_000_000;
+    // Two members: the bonus only redistributes if there is someone to
+    // redistribute from. With a single member the finder already takes
+    // the whole miner cut and the bonus cannot show up on-chain at all.
+    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, h.group_id, other.as_str(), 100.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+    let result = h
+        .engine
+        .build_distribution(h.group_id, T_REF, &finder)
+        .await
+        .expect("build");
+
+    // The score share scales with the revenue and so does the claim —
+    // those match. The BONUS does not: it is a fixed sats promise
+    // carried as a weight, so a richer block pays it out inflated while
+    // the ledger still owes exactly 50M. The difference is a debt.
+    let actual = actual_paying_exactly(&result, T_ACTUAL);
+    h.engine
+        .on_block_found_scaled(
+            h.group_id,
+            9_995_401,
+            &actual,
+            &finder,
+            None,
+            Some(result.payouts_fingerprint()),
+        )
+        .await
+        .expect("apply");
+
+    let pending: i64 = sqlx::query_scalar(
+        r#"SELECT "pendingSats" FROM pplns_group_balance
+           WHERE "groupId" = $1 AND address = $2"#,
+    )
+    .bind(h.group_id)
+    .bind(finder.as_str())
+    .fetch_one(&h.pool)
+    .await
+    .expect("balance row");
+    assert!(
+        pending < 0,
+        "an overpaid member owes the pool; got pendingSats = {pending}"
+    );
+    // The size is not incidental. Two 50 % members, fee 0: the block
+    // pays out `pot(T) = 375M`, of which the bonus takes a fixed 50M
+    // and the rest splits by score, so the finder earns
+    // `(375M − 50M)/2 + 50M = 212.5M`. The coinbase pays it its wire
+    // share of a 20 %-richer block instead, 217.5M — the bonus rode the
+    // revenue up while the promise did not. 5M is exactly that
+    // overshoot, and it is the OTHER member who was short-changed for
+    // it, so their credit must mirror it.
+    assert!(
+        (pending + 5_000_000).abs() <= 2,
+        "expected the ~5M bonus overshoot as debt, got {pending}"
+    );
+    let other_pending: i64 = sqlx::query_scalar(
+        r#"SELECT "pendingSats" FROM pplns_group_balance
+           WHERE "groupId" = $1 AND address = $2"#,
+    )
+    .bind(h.group_id)
+    .bind(other.as_str())
+    .fetch_one(&h.pool)
+    .await
+    .expect("balance row");
+    assert!(
+        (other_pending + pending).abs() <= 2,
+        "the overpayment came out of the other member's share: \
+         finder {pending} vs other {other_pending}"
+    );
+
+    // And the debt must reach the next distribution, or it can never be
+    // recovered: the builder reads open balances, so a filtered-out
+    // negative row would leave the money gone for good.
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_060_001)
+        .await
+        .unwrap();
+    let next = h
+        .engine
+        .build_distribution(h.group_id, T_REF, &finder)
+        .await
+        .expect("build 2");
+    let carried = next
+        .distribution
+        .entries
+        .iter()
+        .find(|e| e.address.as_str() == finder.as_str())
+        .map(|e| e.balance_sats)
+        .expect("finder is in the next distribution");
+    assert_eq!(
+        carried, pending,
+        "the debt must be carried into the next distribution"
+    );
+
+    drop_harness(h).await;
+}
+
+// ── The books have to close ────────────────────────────────────────
+//
+// Settlement's whole job is to record the gap between what a block
+// earned a member and what its coinbase actually handed them. So across
+// every row it touches, the ledger may move by exactly
+// `Σ claims − Σ paid` and not one satoshi more — no clamp, no rounding
+// slack, no address quietly skipped. A single write that drops a
+// negative on the floor is real money gifted away, and it shows up
+// here and nowhere else.
+
+#[tokio::test]
+async fn ledger_movement_equals_claims_minus_payments() {
+    let h = match spawn_or_skip(12, Some(50_000_000)).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
+    const T_REF: u64 = 312_500_000;
+    // A block 20 % richer than the projection, so claims and payments
+    // genuinely disagree and there is something to conserve.
+    const T_ACTUAL: u64 = 375_000_000;
+
+    // Both directions of open position, so the run covers a credit
+    // being repaid and a debt being collected in the same block.
+    for (address, pending) in [(&finder, 12_000_000i64), (&other, -3_000_000i64)] {
+        sqlx::query(
+            r#"INSERT INTO pplns_group_balance
+                 (address, "groupId", "pendingSats", "totalPaidSats", "updatedAt")
+               VALUES ($1, $2, $3, 0, 0)"#,
+        )
+        .bind(address.as_str())
+        .bind(h.group_id)
+        .bind(pending)
+        .execute(&h.pool)
+        .await
+        .expect("seed balance");
+    }
+    for (address, at) in [(&finder, 1_700_000_000_001), (&other, 1_700_000_000_002)] {
+        h.engine
+            .record_share(None, h.group_id, address.as_str(), 100.0, at)
+            .await
+            .unwrap();
+    }
+
+    let result = h
+        .engine
+        .build_distribution(h.group_id, T_REF, &finder)
+        .await
+        .expect("build");
+    let snapshot = StoredWeightSnapshot::from_distribution(&result.distribution);
+    let before = read_group_balances(&h.pool, h.group_id).await;
+
+    let actual = actual_paying_exactly(&result, T_ACTUAL);
+    h.engine
+        .on_block_found_scaled(
+            h.group_id,
+            9_995_501,
+            &actual,
+            &finder,
+            None,
+            Some(result.payouts_fingerprint()),
+        )
+        .await
+        .expect("apply");
+    let after = read_group_balances(&h.pool, h.group_id).await;
+
+    // What the block earned every member, from the stored settlement
+    // inputs — the same `X` the coinbase weights were projected with.
+    let extras_total = snapshot.extras_total();
+    let claims: i64 = snapshot
+        .entries
+        .iter()
+        .filter(|e| e.address != snapshot.fee_address)
+        .map(|e| {
+            let bonus = match &snapshot.finder_bonus {
+                Some((a, sats)) if *a == e.address => *sats as i64,
+                _ => 0,
+            };
+            bp_share::claim_sats(
+                e.score_weight,
+                snapshot.score_total,
+                snapshot.fee_ppm,
+                T_ACTUAL,
+                extras_total,
+            ) + bonus
+        })
+        .sum();
+    let paid: i64 = actual
+        .paid_by_address
+        .iter()
+        .filter(|(a, _)| **a != snapshot.fee_address)
+        .map(|(_, sats)| *sats as i64)
+        .sum();
+
+    let movement: i64 = after
+        .iter()
+        .map(|(address, sats)| sats - before.get(address).copied().unwrap_or(0))
+        .sum();
+    assert_eq!(
+        movement,
+        claims - paid,
+        "ledger moved by {movement} on claims {claims} vs payments {paid}"
+    );
+
+    drop_harness(h).await;
+}
+
+async fn read_group_balances(
+    pool: &PgPool,
+    group_id: Uuid,
+) -> std::collections::HashMap<String, i64> {
+    sqlx::query_as::<_, (String, i64)>(
+        r#"SELECT address, "pendingSats" FROM pplns_group_balance WHERE "groupId" = $1"#,
+    )
+    .bind(group_id)
+    .fetch_all(pool)
+    .await
+    .expect("read balances")
+    .into_iter()
+    .collect()
+}
+
 // ── Test 3b — snapshot-carried apply survives a Redis snapshot overwrite ──
 //
 // The Core/Satellite split race: the per-(group, finder) Redis snapshot is

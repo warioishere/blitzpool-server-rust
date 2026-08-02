@@ -643,6 +643,7 @@ dependencies = [
  "bp-common",
  "bp-db",
  "bp-pplns",
+ "bp-share",
  "redis",
  "serde",
  "sqlx",

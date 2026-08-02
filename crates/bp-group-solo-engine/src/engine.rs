@@ -946,6 +946,14 @@ impl GroupSoloEngine {
         let mut balance_writes: Vec<BalanceWrite> = Vec::new();
         let mut emitted: HashSet<String> = HashSet::new();
 
+        // The promises this distribution carried — every member's held
+        // balance plus the finder bonus — recomputed exactly as the
+        // build did. The coinbase paid them out of this same pot, so
+        // what is split by score is what they LEAVE. Charging the full
+        // pot instead would hand every member without a balance a
+        // credit for the finder's bonus, block after block.
+        let extras_total = snapshot.extras_total();
+
         for entry in &snapshot.entries {
             if entry.address == snapshot.fee_address {
                 warn!(
@@ -960,8 +968,9 @@ impl GroupSoloEngine {
                 snapshot.score_total,
                 snapshot.fee_ppm,
                 t,
+                extras_total,
             ) + match &snapshot.finder_bonus {
-                Some((finder, bonus)) if *finder == entry.address => *bonus,
+                Some((finder, bonus)) if *finder == entry.address => *bonus as i64,
                 _ => 0,
             };
             let paid = actual
@@ -969,7 +978,7 @@ impl GroupSoloEngine {
                 .get(&entry.address)
                 .copied()
                 .unwrap_or(0);
-            let delta = claim as i64 - paid as i64;
+            let delta = claim - paid as i64;
 
             let current = existing
                 .get(&entry.address)
@@ -979,19 +988,15 @@ impl GroupSoloEngine {
                 .get(&entry.address)
                 .map(|r| r.total_paid_sats.0)
                 .unwrap_or(0);
-            let mut pending = current + delta;
-            if pending < 0 {
-                warn!(
-                    %group_id,
-                    address = %entry.address,
-                    current,
-                    claim,
-                    paid,
-                    "group-solo weight settlement: coinbase paid more than claim + held credit — \
-                     booking 0 rather than a debit the unsigned model cannot carry"
-                );
-                pending = 0;
-            }
+            // Signed, like the PPLNS ledger: a coinbase that paid more
+            // than the member earned leaves them owing the pool, and the
+            // debt shrinks their weight on the next distribution until
+            // it is worked off. Clamping it to 0 instead would gift the
+            // difference away — reachable whenever the paying coinbase
+            // was computed against a richer revenue than the
+            // distribution was projected for (a JD-client's own
+            // template).
+            let pending = current + delta;
 
             let addr_id = AddressId::new(entry.address.clone())?;
             let shares_in_round = round_by_addr
@@ -1061,9 +1066,12 @@ impl GroupSoloEngine {
                     .get(addr_str)
                     .map(|r| r.pending_sats.0)
                     .unwrap_or(0);
+                // Paid without any claim behind it — the whole amount is
+                // owed back, so it is booked signed like every other
+                // overpayment rather than clamped away.
                 balance_writes.push(BalanceWrite {
                     address: addr_id,
-                    pending_sats: Sats((current - *paid as i64).max(0)),
+                    pending_sats: Sats(current - *paid as i64),
                     total_paid_sats: Sats(prev_total_paid + *paid as i64),
                 });
             }

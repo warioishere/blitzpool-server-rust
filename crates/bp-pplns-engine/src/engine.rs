@@ -770,6 +770,14 @@ impl PplnsEngine {
         let mut balance_writes: Vec<BalanceWrite> = Vec::new();
         let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+        // The promises this distribution carried, recomputed exactly as
+        // the build did. Subtracting them is what keeps the ledger from
+        // inventing money: the coinbase paid those satoshis out of this
+        // same pot, so a miner without a promise of its own earns a
+        // share of the REST — charging it the full pot would credit it
+        // the others' promises on every block.
+        let extras_total = snapshot.extras_total();
+
         for entry in &snapshot.entries {
             if entry.address == snapshot.fee_address {
                 // The fee address should never appear as a miner entry
@@ -787,8 +795,9 @@ impl PplnsEngine {
                 snapshot.score_total,
                 snapshot.fee_ppm,
                 t,
+                extras_total,
             ) + match &snapshot.finder_bonus {
-                Some((finder, bonus)) if *finder == entry.address => *bonus,
+                Some((finder, bonus)) if *finder == entry.address => *bonus as i64,
                 _ => 0,
             };
             let paid = actual
@@ -796,7 +805,7 @@ impl PplnsEngine {
                 .get(&entry.address)
                 .copied()
                 .unwrap_or(0);
-            let delta = claim as i64 - paid as i64;
+            let delta = claim - paid as i64;
 
             let current = existing
                 .get(&entry.address)

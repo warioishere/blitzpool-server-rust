@@ -19,6 +19,12 @@
 //! 2. **Group-Solo finder bonus** — a fixed sats bonus becomes a weight
 //!    boost on the finder's entry.
 //!
+//! Both come out of the same pot they are paid from, so the score split
+//! runs over `pot(T) − X` (with `X` the signed sum of all of them) on
+//! BOTH sides — the published weights and the settlement claims. One
+//! shared [`bp_share::project_extras`] resolves `X` for both, because
+//! two sides splitting two different pots is how a ledger mints money.
+//!
 //! The pool's own policies map onto spec mechanics instead of bespoke
 //! phases: `min_payout` is the per-output `dust_limit` (§3.1 — the JDC
 //! prunes and the value flows to the pool output, to be credited back
@@ -75,9 +81,10 @@ pub struct WeightDistribution {
     pub entries: Vec<WeightEntry>,
     /// `weight_P` (§3.1): the pool output's weight — the fee over
     /// everything this block owes the miners, plus every weight owed
-    /// but not paid out (folded by the blockspace cut, or held back
-    /// against the miner's own debt). Always ≥ 1 (the §4 residual needs
-    /// a live pool output).
+    /// but with no room in the coinbase (folded by the blockspace cut).
+    /// A repayment is NOT in here: it moves between miners, since it is
+    /// the other miners the debt is owed to. Always ≥ 1 (the §4
+    /// residual needs a live pool output).
     pub weight_p: u64,
     /// Pool fee in parts-per-million of revenue (1 % = 10 000 ppm).
     pub fee_ppm: u32,
@@ -89,6 +96,12 @@ pub struct WeightDistribution {
     pub reference_revenue_sats: u64,
     /// `S = Σ score_weight` — denominator of every settlement claim.
     pub score_total: u64,
+    /// `X` — the satoshi promises (balances + bonus) this distribution
+    /// pays on top of the score split, after solvency capping. The
+    /// score share is taken over `pot(T) − X`, never over the whole
+    /// pot, both here and at settlement. Not part of the fingerprint:
+    /// settlement recomputes it from the stored inputs.
+    pub extras_total: i64,
     /// Settlement identity (see `bp_share::weights_fingerprint_from_parts`).
     pub fingerprint: [u8; 32],
     /// Blockspace pressure for the coinbase-budget autoscaler.
@@ -224,10 +237,20 @@ pub fn build_weight_distribution(
     // to carry the shares. Unchanged pool state would then mint a new
     // settlement identity and age the live distribution out of the
     // acceptance window.
+    // The fee address is NEVER a miner entry. It already receives the
+    // pool output via `weight_P`, and settlement refuses to book a row
+    // for it (its payment is inseparable from the pool output). Paying
+    // it a second, miner-shaped output would hand out satoshis nothing
+    // ever debits — a balance on that address would be paid out again
+    // on every single block, forever.
+    let is_fee = |a: &AddressId| a.as_str() == input.fee_address.as_str();
+
     let mut scored: Vec<(&AddressId, f64)> = input
         .address_shares
         .iter()
-        .filter(|(a, s)| s.is_finite() && **s > 0.0 && is_valid_payout_address(a.as_str()))
+        .filter(|(a, s)| {
+            s.is_finite() && **s > 0.0 && is_valid_payout_address(a.as_str()) && !is_fee(a)
+        })
         .map(|(a, s)| (a, *s))
         .collect();
     scored.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
@@ -237,12 +260,10 @@ pub fn build_weight_distribution(
         address: AddressId,
         score_weight: u64,
         balance_sats: i64,
-        /// What this block owes the address: its score claim plus any
-        /// credit being repaid. A DEBT lowers what is paid out, never
-        /// what is owed — see `weight_p` below.
-        entitlement_weight: u64,
-        /// What is actually paid on-chain. Never above the entitlement;
-        /// the difference is withheld into the pool output.
+        /// What this block owes AND pays the address: its score share
+        /// of what the promises leave, plus its own promise. The only
+        /// weight ever withheld from a miner is the one the blockspace
+        /// cut folds away — see `weight_p` below.
         wire_weight: u64,
     }
     let mut candidates: HashMap<&AddressId, Candidate> = HashMap::new();
@@ -254,13 +275,12 @@ pub fn build_weight_distribution(
                 address: (*address).clone(),
                 score_weight: u,
                 balance_sats: 0,
-                entitlement_weight: 0,
                 wire_weight: 0,
             },
         );
     }
     for (address, balance) in input.balances {
-        if balance.0 == 0 || !is_valid_payout_address(address.as_str()) {
+        if balance.0 == 0 || !is_valid_payout_address(address.as_str()) || is_fee(address) {
             continue;
         }
         candidates
@@ -269,57 +289,34 @@ pub fn build_weight_distribution(
                 address: address.clone(),
                 score_weight: 0,
                 balance_sats: 0,
-                entitlement_weight: 0,
                 wire_weight: 0,
             })
             .balance_sats = balance.0;
     }
 
     let score_total: u64 = candidates.values().map(|c| c.score_weight).sum();
-
-    // ── Weight-per-sat scale ────────────────────────────────────────
-    // The miners' cut of a block is (1 − f)·T and maps onto the score
-    // space S, so one satoshi is worth S/((1 − f)·T_ref) in weight.
-    // `w0 = S + S·f/(1 − f) = S/(1 − f)` is that scale without a
-    // division, and it is derived from the score total ALONE so the
-    // projection can never depend on its own output.
-    let score_fee_weight: u128 = if fee_ppm >= 1_000_000 || score_total == 0 {
-        0
-    } else {
-        (score_total as u128 * fee_ppm as u128) / (1_000_000 - fee_ppm) as u128
-    };
-    let w0 = (score_total as u128 + score_fee_weight).max(1);
-    let boost_for = |sats: i64| -> i128 { (sats as i128 * w0 as i128) / t_ref as i128 };
-
     let publish_all = fee_ppm < 1_000_000;
-    for c in candidates.values_mut() {
-        if !publish_all {
-            c.wire_weight = 0;
-            c.entitlement_weight = 0;
-            continue;
-        }
-        let raw = c.score_weight as i128 + boost_for(c.balance_sats);
-        c.wire_weight = raw.clamp(0, u64::MAX as i128) as u64;
-        // A credit raises what this block owes the miner; a debt does
-        // NOT lower it — it only lowers what is paid out, and the
-        // difference is the pool recovering the debt in cash.
-        c.entitlement_weight = raw.max(c.score_weight as i128).clamp(0, u64::MAX as i128) as u64;
-    }
+
+    // The bonus is the one promise the pool PICKS rather than owes, so
+    // it is the one that gives way when the promises outgrow the block
+    // — and it must give way here, because the snapshot records the
+    // capped figure and settlement can never recover the operator's
+    // original one. A bonus configured before a halving, or against a
+    // low-fee template, would otherwise swallow the whole score space:
+    // the finder takes nearly the entire coinbase and every other group
+    // member is dust-pruned to nothing.
+    let balance_total: i64 = candidates
+        .values()
+        .map(|c| c.balance_sats as i128)
+        .sum::<i128>()
+        .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     let finder_bonus: Option<(AddressId, u64)> =
         match (input.finder_bonus_sats, input.finder_address) {
             (Some(bonus), Some(finder))
                 if bonus.0 > 0 && is_valid_payout_address(finder.as_str()) =>
             {
-                // Capped at 95 % of the miners' cut, and suppressed
-                // below the dust limit. A fixed sats bonus configured
-                // before a halving, or against a low-fee template, would
-                // otherwise dwarf the whole score space: the finder takes
-                // nearly the entire coinbase and every other group member
-                // is dust-pruned to nothing.
-                let miner_cut =
-                    (t_ref as u128 * (1_000_000 - fee_ppm.min(1_000_000)) as u128) / 1_000_000;
-                let cap = (miner_cut * 95 / 100) as u64;
-                let bonus_sats = (bonus.0 as u64).min(cap);
+                let headroom = bp_share::solvency_headroom_sats(balance_total, fee_ppm, t_ref);
+                let bonus_sats = (bonus.0 as u64).min(headroom);
                 if bonus_sats < dust_limit as u64 {
                     // Would be pruned on-chain anyway; recording it
                     // would make settlement pay a bonus no coinbase ever
@@ -327,18 +324,12 @@ pub fn build_weight_distribution(
                     None
                 } else {
                     if publish_all {
-                        let c = candidates.entry(finder).or_insert_with(|| Candidate {
+                        candidates.entry(finder).or_insert_with(|| Candidate {
                             address: finder.clone(),
                             score_weight: 0,
                             balance_sats: 0,
-                            entitlement_weight: 0,
                             wire_weight: 0,
                         });
-                        let bonus_boost = boost_for(bonus_sats as i64);
-                        let wire = c.wire_weight as i128 + bonus_boost;
-                        c.wire_weight = wire.clamp(0, u64::MAX as i128) as u64;
-                        let ent = c.entitlement_weight as i128 + bonus_boost;
-                        c.entitlement_weight = ent.clamp(0, u64::MAX as i128) as u64;
                     }
                     Some((finder.clone(), bonus_sats))
                 }
@@ -346,16 +337,64 @@ pub fn build_weight_distribution(
             _ => None,
         };
 
+    let mut entries: Vec<Candidate> = candidates.into_values().collect();
+
+    // ── Sats → weight projection ────────────────────────────────────
+    //
+    // Two quantities here are denominated in satoshis rather than in
+    // shares: a miner's ledger balance and the finder bonus. Both are
+    // promises to pay a FIXED amount on top of the score split, and the
+    // weight model has exactly one way to say that — a boost on that
+    // entry's weight.
+    //
+    // The scale is NOT `sats · S / pot`, because a boost lands in the
+    // denominator as well: with `e_i = u_i + boost_i` and
+    // `E = Σ e_i = S + Σ boost`, each entry is paid `e_i · pot / E`, so
+    // raising one entry dilutes every entry including itself. Solving
+    // for the boost that actually delivers `extra_i` on top of the
+    // score split gives
+    //
+    //     boost_i = extra_i · S / (pot(t_ref) − X),   X = Σ extra_i
+    //
+    // since then `E = S · pot/(pot − X)` and therefore
+    //
+    //     paid_i = e_i · pot / E = (u_i/S)·(pot − X) + extra_i
+    //
+    // — the score share of what is LEFT after the promises, plus this
+    // entry's own promise. Signs carry through unchanged, so a debt
+    // shrinks the payout by exactly what is owed, and the settlement
+    // claim (`bp_share::claim_sats`, same `X`) is the first term alone.
+    // Scaling by `S/pot` instead delivers only `extra_i · (1 − u_i/S)`
+    // — for a 50 % miner, half of what was promised.
+    let extras = bp_share::extras_from_ledger(
+        entries
+            .iter()
+            .map(|c| (c.address.as_str(), c.score_weight, c.balance_sats)),
+        finder_bonus.as_ref().map(|(a, sats)| (a.as_str(), *sats)),
+    );
+    let projection = bp_share::project_extras(&extras, score_total, fee_ppm, t_ref);
+    for (c, extra) in entries.iter_mut().zip(&projection.effective) {
+        if !publish_all {
+            c.wire_weight = 0;
+            continue;
+        }
+        let boost = (*extra as i128 * score_total as i128) / projection.divisor as i128;
+        c.wire_weight = (c.score_weight as i128 + boost).clamp(0, u64::MAX as i128) as u64;
+    }
+
     // ── Deterministic order ─────────────────────────────────────────
     // Published (wire desc, address asc — the §4 coinbase order), then
     // unpublished (address asc). Fixed BEFORE the blockspace cut so
     // folding cannot reshuffle the fingerprinted order.
-    let mut entries: Vec<Candidate> = candidates.into_values().collect();
     entries.sort_by(|a, b| {
         b.wire_weight
             .cmp(&a.wire_weight)
             .then_with(|| a.address.as_str().cmp(b.address.as_str()))
     });
+
+    // `E` — what this block owes the miners, read off before the cut
+    // because the cut is the only thing that separates owed from paid.
+    let total_entitlement: u128 = entries.iter().map(|c| c.wire_weight as u128).sum();
 
     // ── Blockspace cut ──────────────────────────────────────────────
     // Greedy keep in published order while the real serialized weight
@@ -397,16 +436,13 @@ pub fn build_weight_distribution(
     //    however large the credits being repaid are — a repayment is a
     //    redistribution WITHIN the miners' cut, as it was before the
     //    weight model, never a discount on the pool's fee.
-    // 2. Everything WITHHELD: `E − Σ published`. A weight that is owed
-    //    but not paid out — folded by the blockspace cut, or a payout
-    //    shrunk by the miner's own debt — must land in the pool output,
-    //    never silently leave `W`. Dropping it would inflate every
-    //    remaining miner's share above their settlement claim, paying
-    //    real satoshis against an IOU the pool can only collect from
-    //    future blocks. Settlement books the difference back: as a
-    //    balance credit for a folded miner, as debt recovered for a
-    //    shrunk one.
-    let total_entitlement: u128 = entries.iter().map(|c| c.entitlement_weight as u128).sum();
+    // 2. Everything the blockspace cut FOLDED: `E − Σ published`. A
+    //    weight that is owed but has no room in the coinbase must land
+    //    in the pool output, never silently leave `W`. Dropping it
+    //    would inflate every remaining miner's share above their
+    //    settlement claim, paying real satoshis against an IOU the pool
+    //    can only collect from future blocks. Settlement books the
+    //    folded miner's whole claim back as a balance credit.
     let published_total: u128 = entries.iter().map(|c| c.wire_weight as u128).sum();
     let withheld = total_entitlement.saturating_sub(published_total);
     let fee_weight: u128 = if fee_ppm >= 1_000_000 || total_entitlement == 0 {
@@ -461,6 +497,7 @@ pub fn build_weight_distribution(
         finder_bonus,
         reference_revenue_sats: t_ref,
         score_total,
+        extras_total: projection.total,
         fingerprint,
         budget_telemetry: BudgetTelemetry {
             desired_weight,
@@ -559,6 +596,46 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// The fee address must never receive a miner-shaped output. It is
+    /// paid via `weight_P`, and settlement will not book a row for it —
+    /// so a balance sitting on that address would be paid out on EVERY
+    /// block while the ledger entry it came from is never reduced.
+    #[test]
+    fn fee_address_never_becomes_a_payable_entry() {
+        let fee = addr(FEE);
+        let balances = HashMap::from([(addr(FEE), Sats(10_000_000))]);
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
+        let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
+        assert!(
+            !d.entries.iter().any(|e| e.address.as_str() == FEE),
+            "the fee address must not appear among the miner entries"
+        );
+        const T: u64 = 312_500_000;
+        let paid = d.payout_entries_at(T).expect("§4 vector");
+        // Exactly one output to the fee address: the pool output.
+        assert_eq!(
+            paid.iter().filter(|(a, _)| a.as_str() == FEE).count(),
+            1,
+            "fee address paid twice: {paid:?}"
+        );
+        assert_eq!(paid.iter().map(|(_, s)| *s).sum::<u64>(), T, "Σ == T");
+    }
+
+    /// Same for shares: a fee address that also mines is the pool
+    /// mining to itself, and must not dilute the other miners' shares
+    /// with an entry settlement will refuse to book.
+    #[test]
+    fn fee_address_with_shares_is_not_a_miner_entry() {
+        let fee = addr(FEE);
+        let balances = HashMap::new();
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(FEE), 1.0)]);
+        let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
+        assert!(!d.entries.iter().any(|e| e.address.as_str() == FEE));
+        // A1 is the only miner left, so it holds the whole score space.
+        assert_eq!(d.entries.len(), 1);
+        assert_eq!(d.entries[0].score_weight, SCORE_PRECISION);
     }
 
     /// The pool output is structural under §4, so an unusable fee
@@ -679,11 +756,14 @@ mod tests {
         }
     }
 
-    /// A payout shrunk by the miner's own debt is the pool COLLECTING
-    /// that debt: the withheld weight belongs in the pool output, and
-    /// every other miner must still be paid exactly their own claim.
+    /// A debt is a claim the OTHER miners hold, not the pool's income.
+    /// It exists because an earlier coinbase paid this miner out of
+    /// their share, so collecting it has to reach them — and it does,
+    /// through `X`: a negative `X` enlarges the pot every score is
+    /// measured against, by exactly what is being repaid. The pool
+    /// keeps its fee and not one satoshi more.
     #[test]
-    fn debt_recovery_goes_to_the_pool_not_to_the_other_miners() {
+    fn debt_recovery_reaches_the_other_miners_not_the_pool() {
         let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
         // A1 owes more than a whole block share is worth → pays nothing.
         let balances = HashMap::from([(addr(A1), Sats(-400_000_000))]);
@@ -699,48 +779,285 @@ mod tests {
         );
 
         const T: u64 = 312_500_000;
-        let published: Vec<&WeightEntry> = d.published().collect();
-        let amounts = bp_share::compute_payout_amounts(
-            d.weight_p,
-            &published.iter().map(|e| e.wire_weight).collect::<Vec<_>>(),
-            &published.iter().map(|e| e.dust_limit).collect::<Vec<_>>(),
-            T,
-        )
-        .expect("§4 vector");
-        let a2_paid = published
-            .iter()
-            .zip(&amounts.pays)
-            .find(|(e, _)| e.address.as_str() == A2)
-            .and_then(|(_, pay)| *pay)
-            .expect("A2 is paid");
-        // A2's settlement claim: half the miners' cut, nothing more.
-        // Without the withheld weight in weight_P, A2 would collect
-        // ~97 % of the block and owe the difference back.
-        let a2_claim = bp_share::claim_sats(
-            d.entries
-                .iter()
-                .find(|e| e.address.as_str() == A2)
-                .unwrap()
-                .score_weight,
-            d.score_total,
-            d.fee_ppm,
-            T,
-        );
+        let settled = settle(&d, T);
+        // A2 is paid what it claims — the repayment is not a windfall
+        // it would owe back, and not a credit it can never collect.
         assert!(
-            a2_paid.abs_diff(a2_claim) <= 2,
-            "A2 paid {a2_paid} but claims {a2_claim} — the debt was redistributed, not collected"
+            settled[A2].delta.abs() <= 2,
+            "A2: paid {} vs claim {}",
+            settled[A2].paid,
+            settled[A2].claim
         );
-        // The pool holds its fee PLUS the recovered debt.
+        // A1 pays nothing, so the whole claim goes against the debt —
+        // and what it could not repay this block stays on the ledger.
+        assert_eq!(settled[A1].paid, 0);
+        assert!(settled[A1].delta > 0, "the claim works the debt off");
         assert!(
-            amounts.pool_pay > T / 2,
-            "pool got {}: fee plus A1's withheld share is more than half the block",
-            amounts.pool_pay
+            -400_000_000 + settled[A1].delta < 0,
+            "a debt larger than one block's share carries over"
         );
-        let total: u64 = amounts.pool_pay + amounts.pays.iter().flatten().sum::<u64>();
-        assert_eq!(total, T, "Σ == T");
+        // Fee only: the recovery went to A2, not into the pool output.
+        let pool_pay = T as i64 - settled.values().map(|s| s.paid).sum::<i64>();
+        let fee_only = (T as i64 * d.fee_ppm as i64) / 1_000_000;
+        assert!(
+            (pool_pay - fee_only).abs() <= 2,
+            "pool got {pool_pay}, its fee is {fee_only} — the repayment leaked into the pool output"
+        );
     }
 
-    /// `positive balance boosts the wire weight by ≈ balance·W₀/T_ref`
+    // ── The promise ↔ claim identity ────────────────────────────────
+    //
+    // Everything below nails down one equation. The coinbase pays
+    //
+    //     paid_i = (u_i/S)·(pot(T) − X) + extra_i
+    //
+    // and settlement claims the first term alone (plus the finder's own
+    // bonus). At `T == t_ref` the difference is therefore exactly the
+    // held balance, so the ledger clears and nobody else moves. Both
+    // halves have to use the same `X` or the ledger mints money on
+    // every block.
+
+    /// One address's settlement line for a block paying `t`.
+    #[derive(Debug)]
+    struct Settled {
+        paid: i64,
+        claim: i64,
+        delta: i64,
+        balance_after: i64,
+    }
+
+    /// Settle a distribution against a coinbase that pays its §4 vector
+    /// exactly — the same arithmetic both payout engines run.
+    fn settle(d: &WeightDistribution, t: u64) -> HashMap<String, Settled> {
+        let mut paid_by_address: HashMap<String, i64> = HashMap::new();
+        for (address, sats) in d.payout_entries_at(t).expect("§4 vector").iter().skip(1) {
+            *paid_by_address
+                .entry(address.as_str().to_string())
+                .or_insert(0) += *sats as i64;
+        }
+        d.entries
+            .iter()
+            .map(|e| {
+                let bonus = match &d.finder_bonus {
+                    Some((a, sats)) if *a == e.address => *sats as i64,
+                    _ => 0,
+                };
+                let claim = bp_share::claim_sats(
+                    e.score_weight,
+                    d.score_total,
+                    d.fee_ppm,
+                    t,
+                    d.extras_total,
+                ) + bonus;
+                let paid = paid_by_address
+                    .get(e.address.as_str())
+                    .copied()
+                    .unwrap_or(0);
+                let delta = claim - paid;
+                (
+                    e.address.as_str().to_string(),
+                    Settled {
+                        paid,
+                        claim,
+                        delta,
+                        balance_after: e.balance_sats + delta,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// A held credit must arrive in FULL. The projection has to account
+    /// for the boost landing in the denominator too, or the miner gets
+    /// only `credit · (1 − u_i/S)` of what the ledger promised — for a
+    /// 50 % miner, half — and carries the rest forever.
+    #[test]
+    fn a_held_credit_is_paid_out_in_full() {
+        const T: u64 = 312_500_000;
+        const CREDIT: i64 = 10_000_000;
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
+        let balances = HashMap::from([(addr(A1), Sats(CREDIT))]);
+        let fee = addr(FEE);
+        let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
+        let settled = settle(&d, T);
+        assert!(
+            (settled[A1].paid - settled[A1].claim - CREDIT).abs() <= 2,
+            "A1 was paid {} on a claim of {} — the credit arrived only partly",
+            settled[A1].paid,
+            settled[A1].claim
+        );
+        assert!(
+            settled[A1].balance_after.abs() <= 2,
+            "the credit must be settled, balance left at {}",
+            settled[A1].balance_after
+        );
+    }
+
+    /// And nobody else may move for it. The miner with no balance is
+    /// paid its score share of what the credit LEAVES and claims the
+    /// same — charging it a share of the whole pot instead would credit
+    /// it the other miner's repayment, on this block and every block
+    /// after it.
+    #[test]
+    fn repaying_one_miner_leaves_the_others_flat() {
+        const T: u64 = 312_500_000;
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
+        let balances = HashMap::from([(addr(A1), Sats(10_000_000))]);
+        let fee = addr(FEE);
+        let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
+        let settled = settle(&d, T);
+        assert!(
+            settled[A2].delta.abs() <= 2,
+            "A2 holds no balance yet moved by {} (paid {}, claim {})",
+            settled[A2].delta,
+            settled[A2].paid,
+            settled[A2].claim
+        );
+    }
+
+    /// The finder bonus is the same promise in a different wrapper: on
+    /// the wire it is a weight boost, in the ledger a fixed sats
+    /// entitlement, and the coinbase has to deliver it whole.
+    #[test]
+    fn the_finder_bonus_arrives_whole() {
+        const T: u64 = 312_500_000;
+        const BONUS: i64 = 50_000_000;
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+        let finder = addr(A1);
+        let mut input = base_input(&shares, &balances, &fee);
+        input.finder_bonus_sats = Some(Sats(BONUS));
+        input.finder_address = Some(&finder);
+        let d = build_weight_distribution(input).unwrap();
+        assert_eq!(d.finder_bonus, Some((addr(A1), BONUS as u64)));
+
+        let settled = settle(&d, T);
+        let share_of_the_rest = settled[A1].claim - BONUS;
+        assert!(
+            (settled[A1].paid - share_of_the_rest - BONUS).abs() <= 2,
+            "the finder was paid {} on a score share of {share_of_the_rest} — \
+             the bonus arrived only partly",
+            settled[A1].paid
+        );
+        // Both members settle flat: the bonus was promised AND paid.
+        for a in [A1, A2] {
+            assert!(
+                settled[a].delta.abs() <= 2,
+                "{a} moved by {} on an exactly-paying block",
+                settled[a].delta
+            );
+        }
+    }
+
+    /// The pool's books close on every block. Every satoshi it holds
+    /// back from a claim is a satoshi it owes, and every satoshi it
+    /// pays beyond one is a satoshi it is owed — so `Σ balances` after
+    /// an exactly-paying block is zero, whatever the promises were and
+    /// whatever revenue the block came in at. A projection and a claim
+    /// formula computed from two different `X` would leave a residue
+    /// here that grows block after block.
+    #[test]
+    fn the_ledger_closes_on_every_block() {
+        let fee = addr(FEE);
+        let finder = addr(A1);
+        let shares = HashMap::from([(addr(A1), 3.0), (addr(A2), 1.0)]);
+        for (label, balances, bonus, t) in [
+            ("flat", HashMap::new(), None, 312_500_000u64),
+            (
+                "credit",
+                HashMap::from([(addr(A1), Sats(10_000_000))]),
+                None,
+                312_500_000,
+            ),
+            (
+                "debt",
+                HashMap::from([(addr(A2), Sats(-7_000_000))]),
+                None,
+                312_500_000,
+            ),
+            ("bonus", HashMap::new(), Some(Sats(50_000_000)), 312_500_000),
+            (
+                // Revenue 20 % above the projection: individual members
+                // move (the fixed bonus scales with the block, the
+                // claim does not), but the books still close.
+                "bonus + credit + rich block",
+                HashMap::from([(addr(A2), Sats(4_000_000))]),
+                Some(Sats(50_000_000)),
+                375_000_000,
+            ),
+        ] {
+            let mut input = base_input(&shares, &balances, &fee);
+            input.finder_bonus_sats = bonus;
+            input.finder_address = bonus.map(|_| &finder);
+            let d = build_weight_distribution(input).unwrap();
+            let settled = settle(&d, t);
+
+            // The identity settlement books, read back from the parts.
+            let before: i64 = d.entries.iter().map(|e| e.balance_sats).sum();
+            let after: i64 = settled.values().map(|s| s.balance_after).sum();
+            let claims: i64 = settled.values().map(|s| s.claim).sum();
+            let paid: i64 = settled.values().map(|s| s.paid).sum();
+            assert_eq!(after - before, claims - paid, "{label}: ledger movement");
+            // The §4 integer floors leave a few satoshis in the pool
+            // output; nothing beyond that may survive.
+            assert!(
+                after.abs() <= d.entries.len() as i64 + 2,
+                "{label}: {after} sats of liability left standing after the block"
+            );
+        }
+    }
+
+    /// Promises larger than the block cannot all be kept: `pot − X` is
+    /// the divisor of the whole projection, so it must stay positive.
+    /// The bonus gives way first — it is the promise the pool picks
+    /// rather than owes — and the RECORDED bonus is the reduced one,
+    /// because settlement pays what the coinbase carried.
+    #[test]
+    fn promises_beyond_the_block_are_capped_to_a_payable_distribution() {
+        const T: u64 = 312_500_000;
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
+        let balances = HashMap::from([(addr(A2), Sats(20_000_000))]);
+        let fee = addr(FEE);
+        let finder = addr(A1);
+        let mut input = base_input(&shares, &balances, &fee);
+        input.finder_bonus_sats = Some(Sats(10_000_000_000)); // 32x the block
+        input.finder_address = Some(&finder);
+        let d = build_weight_distribution(input).unwrap();
+
+        let pot = bp_share::miner_pot_sats(d.fee_ppm, T) as i64;
+        assert!(
+            d.extras_total < pot,
+            "X = {} must stay below the pot {pot} — the projection divides by pot − X",
+            d.extras_total
+        );
+        let (_, recorded) = d.finder_bonus.clone().expect("bonus recorded");
+        assert_eq!(
+            recorded as i64,
+            pot * 95 / 100 - 20_000_000,
+            "the recorded bonus is what the ledger's own claims leave"
+        );
+        // Still a payable distribution: the non-finder keeps a real
+        // output rather than being pruned to nothing.
+        let settled = settle(&d, T);
+        assert!(
+            settled[A2].paid > 546,
+            "the non-finder must still get a real output, got {}",
+            settled[A2].paid
+        );
+        // And it is a CONSISTENT one: the capped bonus is what both the
+        // coinbase and the claim use, so an exactly-paying block clears
+        // the ledger rather than leaving a residue behind the cap.
+        for a in [A1, A2] {
+            assert!(
+                settled[a].balance_after.abs() <= 2,
+                "{a} left holding {} under the solvency cap",
+                settled[a].balance_after
+            );
+        }
+    }
+
+    /// `positive balance boosts the wire weight by balance·S/(pot − X)`
     #[test]
     fn positive_balance_boosts_wire_weight() {
         let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
@@ -749,13 +1066,15 @@ mod tests {
         let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
         let w1 = d.entries.iter().find(|e| e.address.as_str() == A1).unwrap();
         let w2 = d.entries.iter().find(|e| e.address.as_str() == A2).unwrap();
-        // A1's boost ≈ 10 % of W₀ on top of its 50 % score. W₀ is the
-        // SCORE-space scale `S/(1 − f)` — not `weight_p`, which also
-        // carries whatever the block withholds.
+        // The scale is the SCORE space over what the promises leave of
+        // the miner cut — the boost has to cover its own dilution, so
+        // the divisor is `pot − X`, not the pot and not `weight_p`
+        // (which also carries whatever the blockspace cut folded).
         let boost = w1.wire_weight - w1.score_weight;
-        let w0 = d.score_total as u128
-            + (d.score_total as u128 * d.fee_ppm as u128) / (1_000_000 - d.fee_ppm) as u128;
-        let expected = (31_250_000u128 * w0 / 312_500_000u128) as u64;
+        let pot = bp_share::miner_pot_sats(d.fee_ppm, d.reference_revenue_sats) as u128;
+        let expected =
+            (31_250_000u128 * d.score_total as u128 / (pot - d.extras_total as u128)) as u64;
+        assert_eq!(d.extras_total, 31_250_000);
         assert!(
             boost.abs_diff(expected) <= 1,
             "boost {boost} vs expected {expected}"
