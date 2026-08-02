@@ -126,7 +126,12 @@ pub struct WeightDistributionInput<'a> {
     /// without it — `pay_P` is structural (§4).
     pub fee_address: &'a AddressId,
     /// Max weight units for coinbase outputs. `0` falls back to
-    /// `DEFAULT_COINBASE_WEIGHT_BUDGET`.
+    /// `DEFAULT_COINBASE_WEIGHT_BUDGET`. The cut reserves the base
+    /// transaction, the witness commitment and the pool output; a
+    /// distribution that ever carries `additional_outputs` (§3.1, e.g.
+    /// an OP_RETURN) must reserve those here too — they are appended to
+    /// the same coinbase and a single ~50-byte one already outweighs the
+    /// safety margin.
     pub coinbase_weight_budget: u32,
     /// Operational minimum on-chain output → per-output `dust_limit`.
     /// `None` falls back to `DUST_LIMIT_SATS`; always clamped ≥ it.
@@ -146,6 +151,14 @@ pub enum WeightBuildError {
     /// `reference_revenue_sats == 0` — boosts have no projection base.
     #[error("reference revenue is zero")]
     ZeroReferenceRevenue,
+    /// The configured pool-output recipient is not a usable payout
+    /// address. Fail here rather than publish a distribution whose pool
+    /// output cannot be scripted: `pay_P` is structural (§4), so the
+    /// failure would otherwise surface as an aborted coinbase build,
+    /// taking down jobs for every miner on the pool instead of one
+    /// output.
+    #[error("fee address is not a valid payout address: {0}")]
+    InvalidFeeAddress(String),
 }
 
 /// Build the weight distribution from the pool's native state.
@@ -158,6 +171,11 @@ pub fn build_weight_distribution(
 ) -> Result<WeightDistribution, WeightBuildError> {
     if input.reference_revenue_sats == 0 {
         return Err(WeightBuildError::ZeroReferenceRevenue);
+    }
+    if !is_valid_payout_address(input.fee_address.as_str()) {
+        return Err(WeightBuildError::InvalidFeeAddress(
+            input.fee_address.as_str().to_string(),
+        ));
     }
     let t_ref = input.reference_revenue_sats;
 
@@ -269,22 +287,38 @@ pub fn build_weight_distribution(
             (Some(bonus), Some(finder))
                 if bonus.0 > 0 && is_valid_payout_address(finder.as_str()) =>
             {
-                let bonus_sats = bonus.0 as u64;
-                if publish_all {
-                    let c = candidates.entry(finder).or_insert_with(|| Candidate {
-                        address: finder.clone(),
-                        score_weight: 0,
-                        balance_sats: 0,
-                        entitlement_weight: 0,
-                        wire_weight: 0,
-                    });
-                    let bonus_boost = boost_for(bonus_sats as i64);
-                    let wire = c.wire_weight as i128 + bonus_boost;
-                    c.wire_weight = wire.clamp(0, u64::MAX as i128) as u64;
-                    let ent = c.entitlement_weight as i128 + bonus_boost;
-                    c.entitlement_weight = ent.clamp(0, u64::MAX as i128) as u64;
+                // Capped at 95 % of the miners' cut, and suppressed
+                // below the dust limit. A fixed sats bonus configured
+                // before a halving, or against a low-fee template, would
+                // otherwise dwarf the whole score space: the finder takes
+                // nearly the entire coinbase and every other group member
+                // is dust-pruned to nothing.
+                let miner_cut =
+                    (t_ref as u128 * (1_000_000 - fee_ppm.min(1_000_000)) as u128) / 1_000_000;
+                let cap = (miner_cut * 95 / 100) as u64;
+                let bonus_sats = (bonus.0 as u64).min(cap);
+                if bonus_sats < dust_limit as u64 {
+                    // Would be pruned on-chain anyway; recording it
+                    // would make settlement pay a bonus no coinbase ever
+                    // carried.
+                    None
+                } else {
+                    if publish_all {
+                        let c = candidates.entry(finder).or_insert_with(|| Candidate {
+                            address: finder.clone(),
+                            score_weight: 0,
+                            balance_sats: 0,
+                            entitlement_weight: 0,
+                            wire_weight: 0,
+                        });
+                        let bonus_boost = boost_for(bonus_sats as i64);
+                        let wire = c.wire_weight as i128 + bonus_boost;
+                        c.wire_weight = wire.clamp(0, u64::MAX as i128) as u64;
+                        let ent = c.entitlement_weight as i128 + bonus_boost;
+                        c.entitlement_weight = ent.clamp(0, u64::MAX as i128) as u64;
+                    }
+                    Some((finder.clone(), bonus_sats))
                 }
-                Some((finder.clone(), bonus_sats))
             }
             _ => None,
         };
@@ -502,6 +536,76 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// The pool output is structural under §4, so an unusable fee
+    /// address must fail the BUILD. Letting it through would abort the
+    /// coinbase assembly instead, which blocks jobs for every miner on
+    /// the pool rather than dropping one output.
+    #[test]
+    fn unusable_fee_address_fails_the_build() {
+        let shares = HashMap::from([(addr(A1), 1.0)]);
+        let balances = HashMap::new();
+        // Well-formed enough for `AddressId`, not a payable script.
+        let bad = addr("bc1qtypo");
+        assert!(matches!(
+            build_weight_distribution(base_input(&shares, &balances, &bad)),
+            Err(WeightBuildError::InvalidFeeAddress(_))
+        ));
+    }
+
+    /// A fixed sats bonus configured before a halving — or against a
+    /// low-fee template — must not let the finder take the block while
+    /// every other group member is pruned to nothing.
+    #[test]
+    fn finder_bonus_is_capped_at_most_of_the_miner_cut() {
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+        let finder = addr(A1);
+        let mut input = base_input(&shares, &balances, &fee);
+        input.finder_bonus_sats = Some(Sats(10_000_000_000)); // 32x the block
+        input.finder_address = Some(&finder);
+        let d = build_weight_distribution(input).unwrap();
+
+        const T: u64 = 312_500_000;
+        let published: Vec<&WeightEntry> = d.published().collect();
+        let amounts = bp_share::compute_payout_amounts(
+            d.weight_p,
+            &published.iter().map(|e| e.wire_weight).collect::<Vec<_>>(),
+            &published.iter().map(|e| e.dust_limit).collect::<Vec<_>>(),
+            T,
+        )
+        .expect("§4 vector");
+        let a2_paid = published
+            .iter()
+            .zip(&amounts.pays)
+            .find(|(e, _)| e.address.as_str() == A2)
+            .and_then(|(_, pay)| *pay);
+        assert!(
+            a2_paid.is_some_and(|s| s > 546),
+            "the non-finder must still get a real output, got {a2_paid:?}"
+        );
+        // The recorded bonus is the capped one — settlement pays what
+        // the coinbase actually carried.
+        let (_, recorded) = d.finder_bonus.expect("bonus recorded");
+        let miner_cut = T - (T * 15_000 / 1_000_000);
+        assert_eq!(recorded, miner_cut * 95 / 100);
+    }
+
+    /// A bonus too small to survive dust-pruning is not recorded either:
+    /// settlement must not credit a bonus no coinbase ever paid.
+    #[test]
+    fn sub_dust_finder_bonus_is_suppressed() {
+        let shares = HashMap::from([(addr(A1), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+        let finder = addr(A1);
+        let mut input = base_input(&shares, &balances, &fee);
+        input.finder_bonus_sats = Some(Sats(100)); // below the 5_000 min_payout
+        input.finder_address = Some(&finder);
+        let d = build_weight_distribution(input).unwrap();
+        assert_eq!(d.finder_bonus, None);
     }
 
     /// A min_payout too large for the dust-limit field must never wrap

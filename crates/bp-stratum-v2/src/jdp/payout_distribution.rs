@@ -115,6 +115,11 @@ pub enum DistributionViolation {
     /// No coinbase can pay more than the money supply, so this is a
     /// malformed declaration rather than an internal failure.
     RevenueOverflow,
+    /// The declared coinbase pays nothing at all. Self-consistent (every
+    /// §4 amount is 0 at T = 0) and therefore invisible to the compare,
+    /// but it is a block that forfeits its own subsidy — never a job a
+    /// pool should declare valid.
+    ZeroRevenue,
 }
 
 /// Recompute-and-compare (§7.1) against POSITIONAL §4 order. Returns
@@ -134,6 +139,9 @@ pub fn validate_coinbase_outputs_against_distribution(
         .iter()
         .try_fold(0u64, |acc, o| acc.checked_add(o.value.to_sat()))
         .ok_or(DistributionViolation::RevenueOverflow)?;
+    if t == 0 {
+        return Err(DistributionViolation::ZeroRevenue);
+    }
     let expected = compute_payout_vector(pool_payout, payouts, dust_limits, additional_outputs, t)
         .map_err(|_| DistributionViolation::Uncomputable)?;
 
@@ -191,6 +199,24 @@ mod tests {
         let mut buf = Vec::new();
         t.consensus_encode(&mut buf).unwrap();
         buf
+    }
+
+    /// A coinbase paying nothing is self-consistent under the compare
+    /// (every §4 amount is 0 at T = 0) but forfeits the block's subsidy
+    /// and pays the pool and every miner nothing.
+    #[test]
+    fn declared_zero_revenue_is_rejected() {
+        let declared = vec![txout(0, script(0xFF))];
+        assert_eq!(
+            validate_coinbase_outputs_against_distribution(
+                &declared,
+                &wo(0xFF, 1),
+                &[wo(1, 1)],
+                &[1],
+                &[],
+            ),
+            Err(DistributionViolation::ZeroRevenue)
+        );
     }
 
     /// The declared values are untrusted wire input: a sum that cannot
@@ -373,8 +399,10 @@ mod tests {
         let pool = wo(0xFF, 1);
         assert_eq!(
             validate_coinbase_outputs_against_distribution(&[], &pool, &[], &[], &[]),
-            // T = 0 → pool output expected with amount 0; absent → missing.
-            Err(DistributionViolation::MissingExpectedOutput { position: 0 })
+            // A coinbase with no outputs pays nothing — caught by the
+            // revenue check before the positional compare gets to call
+            // it a missing output.
+            Err(DistributionViolation::ZeroRevenue)
         );
     }
 

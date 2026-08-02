@@ -250,13 +250,6 @@ impl DistributionSlot {
             .flatten()
             .find(|p| p.entry.distribution_id == id)
     }
-
-    fn newest_publish_ms(&self) -> u64 {
-        self.latest
-            .as_ref()
-            .map(|p| p.entry.published_at_ms)
-            .unwrap_or(0)
-    }
 }
 
 // ── JdpDeclaredJobRegistry ───────────────────────────────────────────
@@ -548,10 +541,15 @@ impl JdpDeclaredJobRegistry {
         // outlive a clean JDP teardown (forced disconnect / OS reset).
         self.payout_sets
             .retain(|_, s| now_ms.saturating_sub(s.registered_at_ms) <= max_age_ms);
-        // Tailored distribution slots that outlive a clean teardown
-        // age out on their newest publish.
-        self.tailored_distributions
-            .retain(|_, s| now_ms.saturating_sub(s.newest_publish_ms()) <= max_age_ms);
+        // Tailored distribution slots are NOT aged out here. They die
+        // with their session (`evict_for_jdp_session`, which the IO
+        // layer calls whenever a JDP connection task ends, clean or
+        // not), and a live session can hold one for days without ever
+        // republishing — a Solo distribution has a single payout entry
+        // and simply does not change. Ageing them on publish time would
+        // drop the slot underneath a connected miner, whose every later
+        // declaration then resolves against the pool-wide slot that
+        // never held its id and is answered `stale-payout-distribution`.
         before - self.entries.len()
     }
 
@@ -970,12 +968,25 @@ mod tests {
         assert_eq!(accepted_id(&reg.distribution_acceptance(1, scope)), Some(1));
     }
 
-    /// `tailored slot ages out via cleanup_expired`
+    /// A tailored slot must survive the age sweep: a Solo distribution
+    /// never changes, so its publish timestamp says nothing about
+    /// whether the session still exists. Only the session's own
+    /// eviction removes it.
     #[test]
-    fn tailored_slot_cleanup_ages_out() {
+    fn tailored_slot_outlives_the_age_sweep() {
         let mut reg = JdpDeclaredJobRegistry::new();
+        reg.publish_pool_wide(distribution(1, None, None));
         reg.publish_tailored(7, distribution(2, Some(addr()), Some(7))); // published_at 1_002
-        reg.cleanup_expired(10_000, 1_500);
+                                                                         // Far beyond any job-token horizon.
+        reg.cleanup_expired(10_000_000, 1_500);
+        assert_eq!(reg.tailored_distribution_count(), 1);
+        let scope = DistributionScope::JdpSession(7);
+        assert_eq!(
+            accepted_id(&reg.distribution_acceptance(2, scope)),
+            Some(2),
+            "a connected miner's declarations must still resolve"
+        );
+        reg.evict_for_jdp_session(7);
         assert_eq!(reg.tailored_distribution_count(), 0);
     }
 }
