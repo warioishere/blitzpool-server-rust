@@ -29,7 +29,7 @@ struct Harness {
     group_id: Uuid,
 }
 
-async fn spawn_or_skip(redis_db: u8, finder_bonus_sats: Option<i64>) -> Option<Harness> {
+async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Harness> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
     let redis_url = format!("{redis_base}/{redis_db}");
@@ -84,7 +84,7 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_sats: Option<i64>) -> Option<H
     // That was the flake.
 
     let group_id = Uuid::new_v4();
-    seed_group(&pool, group_id, finder_bonus_sats).await;
+    seed_group(&pool, group_id, finder_bonus_ppm).await;
 
     // dust_sweep + per-group reset crons run in background — we
     // disable dust_sweep to avoid interference; per-group reset
@@ -109,23 +109,59 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_sats: Option<i64>) -> Option<H
     })
 }
 
-async fn seed_group(pool: &PgPool, group_id: Uuid, finder_bonus_sats: Option<i64>) {
+async fn seed_group(pool: &PgPool, group_id: Uuid, finder_bonus_ppm: Option<i32>) {
     // Seed with resetRoundOnBlock = true so the existing tests that assert the
     // round wipes after a block keep exercising that path. The default-false
     // (no-reset) behavior has its own dedicated test.
+    //
+    // The bonus column MUST be the one the engine reads (`finderBonusPpm`, see
+    // distribution.rs). Seeding the retired `finderBonusSats` leaves the engine
+    // reading NULL → zero bonus, which silently turns every bonus test in this
+    // file into a no-bonus test that still passes.
     sqlx::query(
         r#"INSERT INTO pplns_group
              (id, name, "creatorAddress", "adminTokenHash", active,
-              "createdAt", "updatedAt", "isPublic", "finderBonusSats", "resetRoundOnBlock")
+              "createdAt", "updatedAt", "isPublic", "finderBonusPpm", "resetRoundOnBlock")
            VALUES ($1, $2, 'test_eng_creator', $3, true, 0, 0, false, $4, true)"#,
     )
     .bind(group_id)
     .bind(format!("test-group-{group_id}"))
     .bind(format!("hash-{group_id}"))
-    .bind(finder_bonus_sats)
+    .bind(finder_bonus_ppm)
     .execute(pool)
     .await
     .expect("seed group");
+}
+
+/// Guard the PREMISE of a bonus test.
+///
+/// The drift tests below assert that the ledger settles flat — which a
+/// distribution carrying NO bonus does just as happily. That makes them
+/// blind to the one mistake that actually disables the feature: seeding
+/// the wrong bonus column, so the engine reads NULL. Asserting the
+/// finder's share of the score space first means those tests fail loudly
+/// when their own fixture stops carrying a bonus.
+///
+/// On an even split with a bonus of fraction `f`, the finder ends up
+/// holding `f + (1 − f)/2` of the score space.
+fn assert_finder_score_fraction(
+    distribution: &bp_pplns::WeightDistribution,
+    finder: &AddressId,
+    expected: f64,
+) {
+    let total: u64 = distribution.entries.iter().map(|e| e.score_weight).sum();
+    let finder_weight = distribution
+        .entries
+        .iter()
+        .find(|e| e.address.as_str() == finder.as_str())
+        .map(|e| e.score_weight)
+        .expect("the finder must be in the distribution");
+    let got = finder_weight as f64 / total as f64;
+    assert!(
+        (got - expected).abs() < 1e-6,
+        "the fixture must actually carry the finder bonus: expected the \
+         finder at {expected} of the score space, got {got}"
+    );
 }
 
 async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
@@ -333,6 +369,8 @@ async fn a_richer_block_leaves_nobody_owing() {
         .build_distribution(h.group_id, T_REF, &finder)
         .await
         .expect("build");
+    // 16 % bonus on an even two-way split → finder holds 0.16 + 0.42.
+    assert_finder_score_fraction(&result.distribution, &finder, 0.58);
 
     h.engine
         .on_block_found_scaled(
@@ -349,6 +387,11 @@ async fn a_richer_block_leaves_nobody_owing() {
     // Both members settle flat. Under the fixed-sats bonus the finder
     // was left owing ~5M here and the other member holding the mirror
     // credit.
+    //
+    // `fetch_one`, not `fetch_optional(...).unwrap_or(0)`: settlement
+    // writes a balance row for every entry it pays, so a missing row means
+    // settlement skipped the member entirely — and defaulting that to 0
+    // would report the very flat ledger this test exists to prove.
     for who in [&finder, &other] {
         let pending: i64 = sqlx::query_scalar(
             r#"SELECT "pendingSats" FROM pplns_group_balance
@@ -356,16 +399,121 @@ async fn a_richer_block_leaves_nobody_owing() {
         )
         .bind(h.group_id)
         .bind(who.as_str())
-        .fetch_optional(&h.pool)
+        .fetch_one(&h.pool)
         .await
-        .expect("balance read")
-        .unwrap_or(0);
+        .expect("settlement must have written a balance row for every paid member");
         assert!(
             pending.abs() <= 2,
             "{} moved by {pending} on a 20 %-richer block — the bonus must not drift",
             who.as_str()
         );
     }
+
+    drop_harness(h).await;
+}
+
+// ── A debt must survive the trip to the next distribution ──────────
+//
+// The finder bonus no longer drifts — but a HELD LEDGER BALANCE still
+// does, and it is the last satoshi-denominated promise a Group-Solo
+// distribution carries. `x_i` is projected into a weight against the
+// reference revenue, and §4 scales that weight with the block's actual
+// revenue, so a coinbase computed against a richer template than the
+// distribution was projected for pays the promise out inflated. The
+// difference is booked as a debt.
+//
+// That debt is only recoverable if the NEXT build reads it back:
+// `find_pplns_group_balances_for_group` selects `pendingSats <> 0`, so
+// a regression that filtered negative rows out would forgive every
+// debt in the pool — silently, and with every other test still green.
+// The previous version of this test proved the round trip via the
+// bonus overshoot; the bonus cannot overshoot any more, so the promise
+// has to come from the ledger instead.
+#[tokio::test]
+async fn a_debt_reaches_the_next_distribution() {
+    let h = match spawn_or_skip(12, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
+    const T_REF: u64 = 312_500_000;
+    // The JD-client's own template: 20 % richer than the projection.
+    const T_ACTUAL: u64 = 375_000_000;
+
+    // An open credit — the pool owes the finder. This is the fixed-sats
+    // promise that a richer block overpays.
+    sqlx::query(
+        r#"INSERT INTO pplns_group_balance
+             (address, "groupId", "pendingSats", "totalPaidSats", "updatedAt")
+           VALUES ($1, $2, $3, 0, 0)"#,
+    )
+    .bind(finder.as_str())
+    .bind(h.group_id)
+    .bind(12_000_000i64)
+    .execute(&h.pool)
+    .await
+    .expect("seed credit");
+
+    for (address, at) in [(&finder, 1_700_000_000_001), (&other, 1_700_000_000_002)] {
+        h.engine
+            .record_share(None, h.group_id, address.as_str(), 100.0, at)
+            .await
+            .unwrap();
+    }
+    let result = h
+        .engine
+        .build_distribution(h.group_id, T_REF, &finder)
+        .await
+        .expect("build");
+    h.engine
+        .on_block_found_scaled(
+            h.group_id,
+            9_995_601,
+            &actual_paying_exactly(&result, T_ACTUAL),
+            &finder,
+            None,
+            Some(result.payouts_fingerprint()),
+        )
+        .await
+        .expect("apply");
+
+    let pending: i64 = sqlx::query_scalar(
+        r#"SELECT "pendingSats" FROM pplns_group_balance
+           WHERE "groupId" = $1 AND address = $2"#,
+    )
+    .bind(h.group_id)
+    .bind(finder.as_str())
+    .fetch_one(&h.pool)
+    .await
+    .expect("balance row");
+    assert!(
+        pending < 0,
+        "a credit paid out against a 20 %-richer block leaves the holder \
+         owing the difference; got pendingSats = {pending}"
+    );
+
+    // THE POINT: the builder has to see that debt on the next round.
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_060_001)
+        .await
+        .unwrap();
+    let next = h
+        .engine
+        .build_distribution(h.group_id, T_REF, &finder)
+        .await
+        .expect("build 2");
+    let carried = next
+        .distribution
+        .entries
+        .iter()
+        .find(|e| e.address.as_str() == finder.as_str())
+        .map(|e| e.balance_sats)
+        .expect("finder is in the next distribution");
+    assert_eq!(
+        carried, pending,
+        "the debt must be carried into the next distribution or it is forgiven"
+    );
 
     drop_harness(h).await;
 }
@@ -382,7 +530,8 @@ async fn a_richer_block_leaves_nobody_owing() {
 
 #[tokio::test]
 async fn ledger_movement_equals_claims_minus_payments() {
-    let h = match spawn_or_skip(12, Some(50_000_000)).await {
+    // 16 % finder bonus — what the old 50M-sat carve-out came to.
+    let h = match spawn_or_skip(12, Some(160_000)).await {
         Some(h) => h,
         None => return,
     };
@@ -1290,7 +1439,7 @@ async fn record_reject_updates_round_rejected_total() {
 
 // ── Test 9 — finder bonus + finder shares land in ONE row ──────────
 //
-// When a group has `finderBonusSats` set AND the finder also has shares
+// When a group has `finderBonusPpm` set AND the finder also has shares
 // this round, the §4 weight model folds the bonus into the finder's
 // single weight — one coinbase output, one ledger upsert per address by
 // construction. (The old model emitted a dedicated bonus output plus a
@@ -1299,8 +1448,9 @@ async fn record_reject_updates_round_rejected_total() {
 // new invariant: single bonus-inclusive output, correctly booked.
 #[tokio::test]
 async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
-    let bonus: i64 = 5_000_000;
-    let h = match spawn_or_skip(8, Some(bonus)).await {
+    // 1.6 % of the miner cut — what the old 5M-sat bonus came to.
+    const BONUS_PPM: i32 = 16_000;
+    let h = match spawn_or_skip(8, Some(BONUS_PPM)).await {
         Some(h) => h,
         None => return,
     };
@@ -1349,12 +1499,24 @@ async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
         .find(|(a, _)| *a == other)
         .map(|(_, s)| *s)
         .expect("peer must be paid");
-    // 70/30 shares: pro-rata alone would put the finder at 7/3 × the
-    // peer; the folded 5M-sat bonus must lift it strictly above that.
+    // Pin the ARITHMETIC, not just the direction. `finder > other · 7/3`
+    // is satisfied by two satoshis of integer-division rounding, so it
+    // passes just as happily with no bonus at all — which is exactly the
+    // failure a mis-seeded harness produces.
+    //
+    // The bonus is a share of the miner cut taken off the top; the rest
+    // splits 70/30. The two miner outputs ARE the miner cut, so deriving
+    // the pot from them keeps this independent of the pool fee.
+    let pot = (finder_sats + other_sats) as u128;
+    let bonus_sats = pot * BONUS_PPM as u128 / 1_000_000;
+    let expected_finder = bonus_sats + (pot - bonus_sats) * 7 / 10;
+    let drift = (finder_sats as i128) - (expected_finder as i128);
     assert!(
-        finder_sats > other_sats * 7 / 3,
-        "finder output must exceed pro-rata by the folded bonus \
-         (finder={finder_sats}, other={other_sats})"
+        drift.abs() <= 4,
+        "finder output must be bonus + 70 % of the remainder: \
+         expected ≈{expected_finder}, got {finder_sats} (off by {drift}; \
+         pot={pot}, bonus={bonus_sats}). A zero bonus lands ~{} short.",
+        bonus_sats * 3 / 10
     );
     let expected_finder_sats = finder_sats as i64;
 
@@ -1666,7 +1828,7 @@ async fn seed_group_with_daily_reset(pool: &PgPool, group_id: Uuid) {
     sqlx::query(
         r#"INSERT INTO pplns_group
              (id, name, "creatorAddress", "adminTokenHash", active,
-              "createdAt", "updatedAt", "isPublic", "finderBonusSats",
+              "createdAt", "updatedAt", "isPublic", "finderBonusPpm",
               "roundResetPreset", "roundResetTimezone")
            VALUES ($1, $2, 'test_core_creator', $3, true, 0, 0, false, NULL,
                    'daily', 'UTC')"#,
@@ -1858,6 +2020,8 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
         .build_distribution(h.group_id, T_REF, &finder)
         .await
         .expect("build");
+    // 16 % bonus on an even two-way split → finder holds 0.16 + 0.42.
+    assert_finder_score_fraction(&result.distribution, &finder, 0.58);
 
     // THE REGRESSION: this returned `SnapshotRewardMismatch` and booked
     // nothing at all.
@@ -1880,16 +2044,17 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
         let pool = h.pool.clone();
         let gid = h.group_id;
         async move {
+            // fetch_one: a missing row means settlement never reached this
+            // member, which unwrap_or(0) would render as a flat ledger.
             sqlx::query_scalar::<_, i64>(
                 r#"SELECT "pendingSats" FROM pplns_group_balance
                    WHERE "groupId" = $1 AND address = $2"#,
             )
             .bind(gid)
             .bind(addr)
-            .fetch_optional(&pool)
+            .fetch_one(&pool)
             .await
-            .expect("balance read")
-            .unwrap_or(0)
+            .expect("settlement must have written a balance row for every paid member")
         }
     };
     for who in [&finder, &other] {

@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bp_common::{AddressId, Sats};
+use bp_common::AddressId;
 use bp_db::PatchField;
 use bp_group_mgmt::group::{PayoutMode, RoundResetPreset};
 use bp_group_mgmt_engine::{
@@ -55,17 +55,15 @@ struct TestHooksState {
     member_removed: Vec<(Uuid, String, Vec<String>)>,
     group_dissolved: Vec<Uuid>,
     round_reset_applied: Vec<Uuid>,
-    min_payout: i64,
 }
 
 #[derive(Clone, Default, Debug)]
 struct TestHooks(Arc<Mutex<TestHooksState>>);
 
 impl TestHooks {
-    fn new(min_payout: i64, last_active: Option<i64>) -> Self {
+    fn new(last_active: Option<i64>) -> Self {
         Self(Arc::new(Mutex::new(TestHooksState {
             last_active,
-            min_payout,
             ..Default::default()
         })))
     }
@@ -76,7 +74,6 @@ impl TestHooks {
             member_removed: g.member_removed.clone(),
             group_dissolved: g.group_dissolved.clone(),
             round_reset_applied: g.round_reset_applied.clone(),
-            min_payout: g.min_payout,
         }
     }
 }
@@ -85,9 +82,6 @@ impl TestHooks {
 impl GroupServiceHooks for TestHooks {
     async fn last_active_for_member(&self, _group_id: Uuid, _address: &AddressId) -> Option<i64> {
         self.0.lock().unwrap().last_active
-    }
-    fn min_payout_sats(&self) -> Sats {
-        Sats(self.0.lock().unwrap().min_payout)
     }
     async fn on_member_removed(&self, group_id: Uuid, kicked: &AddressId, remaining: &[AddressId]) {
         self.0.lock().unwrap().member_removed.push((
@@ -123,7 +117,7 @@ async fn create_group_happy_path_returns_token_and_seeds_creator() {
         Some(p) => p,
         None => return,
     };
-    let hooks = TestHooks::new(1000, None);
+    let hooks = TestHooks::new(None);
     let svc = GroupService::new(pool.clone(), Arc::new(hooks.clone()), 14);
     let name = format!("test-create-{}", Uuid::new_v4());
     let creator = format!("bc1qcreator{}", Uuid::new_v4().simple());
@@ -146,7 +140,7 @@ async fn create_group_defaults_to_prop_mode() {
         Some(p) => p,
         None => return,
     };
-    let hooks = TestHooks::new(1000, None);
+    let hooks = TestHooks::new(None);
     let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14);
     let name = format!("test-mode-default-{}", Uuid::new_v4());
     let creator = format!("bc1qpropdef{}", Uuid::new_v4().simple());
@@ -162,7 +156,7 @@ async fn create_group_with_window_mode_persists_window() {
         Some(p) => p,
         None => return,
     };
-    let hooks = TestHooks::new(1000, None);
+    let hooks = TestHooks::new(None);
     let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14);
     let name = format!("test-mode-window-{}", Uuid::new_v4());
     let creator = format!("bc1qwindow{}", Uuid::new_v4().simple());
@@ -190,7 +184,7 @@ async fn create_group_rejects_invalid_name() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let err = svc
         .create_group("ab", "bc1qx")
         .await
@@ -210,7 +204,7 @@ async fn create_group_rejects_duplicate_name() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let name = format!("dup-{}", Uuid::new_v4());
     let first = svc
         .create_group(&name, &format!("bc1qfirst{}", Uuid::new_v4().simple()))
@@ -230,7 +224,7 @@ async fn create_group_rejects_address_already_in_group() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let shared_addr = format!("bc1qshared{}", Uuid::new_v4().simple());
     let g1 = svc
         .create_group(&format!("a-{}", Uuid::new_v4()), &shared_addr)
@@ -252,7 +246,7 @@ async fn group_active_from_creation_and_stays_after_add() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let new_member = format!("bc1qnew{}", Uuid::new_v4().simple());
     let g = svc
@@ -280,7 +274,7 @@ async fn add_member_rejects_address_in_other_group() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let g1_creator = format!("bc1qg1cr{}", Uuid::new_v4().simple());
     let g2_creator = format!("bc1qg2cr{}", Uuid::new_v4().simple());
     let shared = format!("bc1qshared{}", Uuid::new_v4().simple());
@@ -312,7 +306,7 @@ async fn require_admin_token_rejects_invalid() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let g = svc
         .create_group(
             &format!("auth-{}", Uuid::new_v4()),
@@ -347,7 +341,7 @@ async fn remove_member_creator_rejected() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let creator = format!("bc1qrmc{}", Uuid::new_v4().simple());
     let g = svc
         .create_group(&format!("rm-{}", Uuid::new_v4()), &creator)
@@ -368,7 +362,7 @@ async fn remove_member_inactivity_guard_then_kick_succeeds() {
         None => return,
     };
     // First with last_active = now (still active): expect StillActive
-    let hooks_active = TestHooks::new(1000, Some(now_ms()));
+    let hooks_active = TestHooks::new(Some(now_ms()));
     let svc_active = GroupService::new(pool.clone(), Arc::new(hooks_active.clone()), 14);
     let creator = format!("bc1qrmkc{}", Uuid::new_v4().simple());
     let target = format!("bc1qrmkt{}", Uuid::new_v4().simple());
@@ -387,7 +381,7 @@ async fn remove_member_inactivity_guard_then_kick_succeeds() {
     assert!(matches!(err, GroupServiceError::MemberStillActive { .. }));
 
     // Now with last_active 30 days ago: kick succeeds.
-    let hooks_old = TestHooks::new(1000, Some(now_ms() - 30 * 86_400_000));
+    let hooks_old = TestHooks::new(Some(now_ms() - 30 * 86_400_000));
     let svc_old = GroupService::new(pool.clone(), Arc::new(hooks_old.clone()), 14);
     svc_old
         .remove_member(g.group.id, &target, Some(&g.admin_token))
@@ -411,7 +405,7 @@ async fn remove_member_keeps_group_active_down_to_creator() {
         None => return,
     };
     // last_active = 30 days ago so the kick-inactivity guard passes.
-    let hooks = TestHooks::new(1000, Some(now_ms() - 30 * 86_400_000));
+    let hooks = TestHooks::new(Some(now_ms() - 30 * 86_400_000));
     let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14);
     let creator = format!("bc1qrmact_c{}", Uuid::new_v4().simple());
     let member = format!("bc1qrmact_m{}", Uuid::new_v4().simple());
@@ -444,7 +438,7 @@ async fn transfer_creator_rotates_role_and_token() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let old_creator = format!("bc1qtcold{}", Uuid::new_v4().simple());
     let new_creator = format!("bc1qtcnew{}", Uuid::new_v4().simple());
     let g = svc
@@ -500,7 +494,7 @@ async fn transfer_creator_rejects_non_member() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let g = svc
         .create_group(
             &format!("tcnm-{}", Uuid::new_v4()),
@@ -525,7 +519,7 @@ async fn update_round_reset_config_applies_and_fires_hook() {
         Some(p) => p,
         None => return,
     };
-    let hooks = TestHooks::new(1000, None);
+    let hooks = TestHooks::new(None);
     let svc = GroupService::new(pool.clone(), Arc::new(hooks.clone()), 14);
     let g = svc
         .create_group(
@@ -566,7 +560,7 @@ async fn update_round_reset_rejects_invalid_timezone() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let g = svc
         .create_group(
             &format!("rrbad-{}", Uuid::new_v4()),
@@ -596,7 +590,7 @@ async fn update_round_reset_rejects_a_bonus_past_the_ppm_cap() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(10_000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let g = svc
         .create_group(
             &format!("rrlow-{}", Uuid::new_v4()),
@@ -627,7 +621,7 @@ async fn dissolve_group_removes_members_and_marks_row() {
         Some(p) => p,
         None => return,
     };
-    let hooks = TestHooks::new(1000, None);
+    let hooks = TestHooks::new(None);
     let svc = GroupService::new(pool.clone(), Arc::new(hooks.clone()), 14);
     let g = svc
         .create_group(
@@ -668,7 +662,7 @@ async fn address_cache_reflects_membership_changes() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let creator = format!("bc1qcc{}", Uuid::new_v4().simple());
     let cache_addr = AddressId::new(creator.to_lowercase()).unwrap();
     let g = svc
@@ -711,7 +705,7 @@ async fn address_cache_rebuild_skips_invalid_address_member() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14);
     let creator = format!("bc1qok{}", Uuid::new_v4().simple());
     let good_addr = AddressId::new(creator.to_lowercase()).unwrap();
     let g = svc

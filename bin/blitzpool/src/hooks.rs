@@ -40,7 +40,7 @@ use bp_api::email_hooks::{
     VerificationContext as ApiVerificationContext,
 };
 use bp_api::push_hooks::{FcmRegisterContext, PushHooks, UnifiedPushRegisterContext};
-use bp_common::{AddressId, Sats};
+use bp_common::AddressId;
 use bp_config::AppConfig;
 use bp_db::Db;
 use bp_db::{
@@ -146,15 +146,9 @@ pub(crate) async fn spawn(
         fcm: fcm.clone(),
         web_push: web_push.clone(),
     });
-    let min_payout = cfg
-        .pplns
-        .as_ref()
-        .map(|p| Sats(p.min_payout_sats))
-        .unwrap_or(Sats(1000));
     let group_service = Arc::new(ProductionGroupServiceHooks {
         db: foundation.db.clone(),
         group_solo: engines.group_solo.clone(),
-        min_payout,
     });
 
     info!(
@@ -162,7 +156,6 @@ pub(crate) async fn spawn(
         fcm_ready = fcm.is_some(),
         web_push_ready = web_push.is_some(),
         pool_base_url_set = pool_base_url.is_some(),
-        min_payout_sats = min_payout.0,
         "production hooks ready"
     );
     Ok(ProductionHooks {
@@ -395,7 +388,6 @@ impl PushHooks for MultiChannelPushHooks {
 pub(crate) struct ProductionGroupServiceHooks {
     db: Db,
     group_solo: GroupSoloEngine,
-    min_payout: Sats,
 }
 
 #[async_trait]
@@ -435,10 +427,6 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
                 None
             }
         }
-    }
-
-    fn min_payout_sats(&self) -> Sats {
-        self.min_payout
     }
 
     async fn on_member_removed(

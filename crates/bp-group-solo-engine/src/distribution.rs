@@ -5,7 +5,7 @@
 //!
 //! Reads the group's round state from Redis (`by-address` hash),
 //! the group's open balances from Postgres, and the group's
-//! per-group config row (`finder_bonus_sats`) from the
+//! per-group config row (`finder_bonus_ppm`) from the
 //! `pplns_group` table. Calls the pure-math distribution builder
 //! with `suppress_matching_debits = true` (Group-Solo never goes
 //! negative), then persists a per-(group, finder) snapshot.

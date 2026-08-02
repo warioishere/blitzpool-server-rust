@@ -8,18 +8,19 @@
 //! later as `floor(weight·T/W)` (§4) — by the pool for its own
 //! templates, by a JDC for its declared jobs, and by the validator.
 //!
-//! Only two satoshi-denominated quantities exist in the pool's ledger
-//! and cannot be weights by nature; both are projected into weight
-//! space at build time against the current reference revenue and are
-//! self-correcting at settlement (which books `earned(T_actual) −
-//! actually_paid` from the raw inputs, not from these projections):
+//! Exactly ONE satoshi-denominated quantity is left in the pool's
+//! ledger that cannot be a weight by nature: a **balance repayment** —
+//! a signed sats debt, projected into weight space at build time
+//! against the current reference revenue, and self-correcting at
+//! settlement (which books `earned(T_actual) − actually_paid` from the
+//! raw inputs, not from that projection).
 //!
-//! 1. **balance repayment** — a signed sats debt becomes a weight
-//!    boost/penalty on the miner's entry;
-//! 2. **Group-Solo finder bonus** — a fixed sats bonus becomes a weight
-//!    boost on the finder's entry.
+//! The Group-Solo finder bonus used to be the second. It is a
+//! PROPORTION now (`b = S·f/(1−f)` on the finder's score weight), so it
+//! is exact at every revenue and has nothing to project, nothing to cap
+//! for solvency, and no entry in `X`.
 //!
-//! Both come out of the same pot they are paid from, so the score split
+//! A repayment comes out of the same pot it is paid from, so the score split
 //! runs over `pot(T) − X` (with `X` the signed sum of all of them) on
 //! BOTH sides — the published weights and the settlement claims. One
 //! shared [`bp_share::project_extras`] resolves `X` for both, because
@@ -64,7 +65,7 @@ pub const SCORE_PRECISION: u64 = 1_000_000_000_000;
 /// `score_weight` and `balance_sats` are the SETTLEMENT INPUTS — the
 /// snapshot stores them and `earned(T_actual)` is recomputed from them
 /// when a block is booked. `wire_weight` is the PUBLISHED weight
-/// (score + projected balance/bonus boosts); `0` means the address has
+/// (score + the projected balance boost); `0` means the address has
 /// no coinbase output this distribution (below `min_payout`, folded by
 /// the blockspace cut, zero score with no positive balance, or a debt
 /// that swallowed the score) but still settles.
@@ -103,12 +104,13 @@ pub struct WeightDistribution {
     pub fee_ppm: u32,
     /// Recipient of the pool output (`pool_payout` script source).
     pub fee_address: AddressId,
-    /// Revenue the balance/bonus boosts were projected against.
+    /// Revenue the balance boosts were projected against.
     pub reference_revenue_sats: u64,
     /// `S = Σ score_weight` — denominator of every settlement claim.
     pub score_total: u64,
-    /// `X` — the satoshi promises (balances + bonus) this distribution
-    /// pays on top of the score split, after solvency capping. The
+    /// `X` — the satoshi promises (ledger balances; the finder bonus is
+    /// a proportion and is NOT in here) this distribution pays on top of
+    /// the score split, after solvency capping. The
     /// score share is taken over `pot(T) − X`, never over the whole
     /// pot, both here and at settlement. Not part of the fingerprint:
     /// settlement recomputes it from the stored inputs.
@@ -709,6 +711,79 @@ mod tests {
         // A1 is the only miner left, so it holds the whole score space.
         assert_eq!(d.entries.len(), 1);
         assert_eq!(d.entries[0].score_weight, SCORE_PRECISION);
+    }
+
+    /// And the same for the finder bonus. The bonus lands on a SCORE
+    /// weight, and settlement skips any entry whose address is the fee
+    /// address (`build_writes_from_weight_snapshot` logs and `continue`s
+    /// on it). So a bonus boost on the fee address would be paid by the
+    /// coinbase and debited by nothing — money created out of the
+    /// ledger's blind spot, the same hole the balance and share guards
+    /// above exist to close.
+    ///
+    /// The trade is deliberate: a pool mining Group-Solo to its own fee
+    /// address forfeits the bonus rather than minting it.
+    #[test]
+    fn a_fee_address_finder_gets_no_bonus_boost() {
+        let fee = addr(FEE);
+        let balances = HashMap::new();
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
+        let mut input = base_input(&shares, &balances, &fee);
+        input.finder_bonus_ppm = 200_000; // 20 %
+        input.finder_address = Some(&fee);
+        let d = build_weight_distribution(input).unwrap();
+
+        assert!(
+            !d.entries.iter().any(|e| e.address.as_str() == FEE),
+            "the bonus must not conjure a fee-address entry settlement refuses to book"
+        );
+        // The two miners keep the whole score space, split evenly — the
+        // bonus was dropped, not silently redistributed to one of them.
+        assert_eq!(d.entries.len(), 2);
+        assert_eq!(d.entries[0].score_weight, d.entries[1].score_weight);
+        const T: u64 = 312_500_000;
+        let paid = d.payout_entries_at(T).expect("§4 vector");
+        assert_eq!(
+            paid.iter().filter(|(a, _)| a.as_str() == FEE).count(),
+            1,
+            "fee address must be paid exactly once — the pool output: {paid:?}"
+        );
+        assert_eq!(paid.iter().map(|(_, s)| *s).sum::<u64>(), T, "Σ == T");
+    }
+
+    /// The mirror case, so the guard above is pinned as a fee-address
+    /// rule and not as "the bonus never applies": the same input with a
+    /// normal finder must actually boost that finder.
+    #[test]
+    fn a_normal_finder_still_gets_the_bonus_boost() {
+        let fee = addr(FEE);
+        let balances = HashMap::new();
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
+        let finder = addr(A1);
+        let mut input = base_input(&shares, &balances, &fee);
+        input.finder_bonus_ppm = 200_000; // 20 %
+        input.finder_address = Some(&finder);
+        let d = build_weight_distribution(input).unwrap();
+
+        let score_of = |a: &str| {
+            d.entries
+                .iter()
+                .find(|e| e.address.as_str() == a)
+                .map(|e| e.score_weight)
+                .expect("entry")
+        };
+        assert!(
+            score_of(A1) > score_of(A2),
+            "the finder must out-weigh an equal-share peer by the bonus"
+        );
+        // b = S·f/(1−f) on a 50/50 split: the finder ends up holding
+        // f + (1−f)/2 = 60 % of the score space at f = 0.2.
+        let total = score_of(A1) + score_of(A2);
+        let finder_pct = score_of(A1) as f64 / total as f64;
+        assert!(
+            (finder_pct - 0.6).abs() < 1e-6,
+            "expected the finder at 60 % of the score space, got {finder_pct}"
+        );
     }
 
     /// The pool output is structural under §4, so an unusable fee

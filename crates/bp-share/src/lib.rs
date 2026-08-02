@@ -405,23 +405,6 @@ pub fn miner_pot_sats(fee_ppm: u32, t: u64) -> u64 {
 /// nothing.
 const EXTRA_SOLVENCY_PERCENT: i128 = 95;
 
-/// The largest FURTHER promise that still leaves the ledger solvent
-/// against `reference_revenue_sats`, given the `committed` (signed)
-/// sum of everything already promised.
-///
-/// A Group-Solo finder bonus MUST go through this before it reaches
-/// [`project_extras`] and before it is recorded for settlement. It is
-/// the one promise the pool picks freely rather than owes, so it is the
-/// one that gives way first — and it is also the only promise whose
-/// capping could never be reproduced later, because the snapshot
-/// records the capped value and settlement cannot tell how large the
-/// operator's original figure was.
-pub fn solvency_headroom_sats(committed: i64, fee_ppm: u32, reference_revenue_sats: u64) -> u64 {
-    let cap =
-        miner_pot_sats(fee_ppm, reference_revenue_sats) as i128 * EXTRA_SOLVENCY_PERCENT / 100;
-    (cap - committed as i128).clamp(0, u64::MAX as i128) as u64
-}
-
 /// The satoshi promises a weight distribution carries on top of the
 /// pure score split, resolved against one reference revenue.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,8 +445,10 @@ pub fn extras_from_ledger<'a>(
 ///
 /// `entries` is `(score_weight, extra_sats)` per address, where
 /// `extra_sats` is the SIGNED sum of everything that address is to
-/// receive beyond its score share: its ledger balance (negative when it
-/// owes the pool) plus, for a Group-Solo finder, the bonus.
+/// receive beyond its score share. Today that is exactly one thing: its
+/// ledger balance (negative when it owes the pool). The Group-Solo
+/// finder bonus is a proportion carried as score weight and never
+/// reaches this.
 ///
 /// Two things are enforced, in this order:
 ///
@@ -621,8 +606,9 @@ fn apply_repayment_floors(
 /// full pot would credit every such member the promises of the others,
 /// block after block.
 ///
-/// The finder bonus is NOT added here — the caller owns that, because
-/// only the caller knows which entry is the finder.
+/// The finder bonus does not appear here at all: it is a proportion
+/// folded into the finder's score weight at build time, so it is
+/// already inside `score_weight / score_total`.
 ///
 /// Settlement books `balance += claim − actually_paid` per address,
 /// with `t_actual` and the paid amounts read from the REAL coinbase of
