@@ -24,6 +24,7 @@ use std::sync::Arc;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisError};
 use thiserror::Error;
+use tracing::warn;
 
 // ── Redis keys ───────────────────────────────────────────────────────
 
@@ -74,27 +75,52 @@ const DEDUP_KEEP: i64 = 100_000;
 /// Never drops the newest (currently-filling) bucket: stops when only one
 /// bucket remains, so the window holds at most one bucket above the target
 /// (the bucket-granular overshoot). Decrements by-address by exactly the
-/// dropped bucket's per-address contribution, hDel-ing any address that hits
-/// ~0 so the aggregate doesn't retain dead zero-fields. Returns 1 when a
-/// bucket was dropped, 0 when at/under the window (or <2 buckets) — the
-/// caller loops until it sees 0.
+/// dropped bucket's per-address contribution.
+///
+/// Returns `{dropped, underflowed}` — `dropped` is 1 when a bucket went and
+/// 0 when the window is at/under target (or has <2 buckets), so the caller
+/// loops until it sees 0. `underflowed` counts the addresses the decrement
+/// would have driven BELOW zero.
+///
+/// The second number exists because an underflow is not a rounding artefact
+/// and must not be cleaned up silently. The aggregate is a sum of
+/// non-negative difficulties, so a decrement can only exceed it if the
+/// bucket holds a share the aggregate never received — which the
+/// `DUMP`-per-key backup can produce: it captures `window:by-address` and
+/// the `bucket:*` hashes at different instants, so a restore can hand the
+/// trim a bucket that is ahead of the aggregate (see
+/// `blitzpool::redis_backup`).
+///
+/// Both the near-zero and the negative case `HDEL` the field, and that is
+/// the point: `read_window_by_address` filters `diff > 0`, so a field left
+/// sitting at a negative value drops the address out of the window
+/// ENTIRELY — silently unpaid until it earns its way back. Removing it is
+/// the same outcome, but the count makes it visible.
 const TRIM_BATCH_LUA: &str = r#"
 local total = tonumber(redis.call('GET', KEYS[1]) or '0') or 0
-if total <= tonumber(ARGV[1]) then return 0 end
+if total <= tonumber(ARGV[1]) then return {0, 0} end
 local oldest = redis.call('ZRANGE', KEYS[3], 0, 1)
-if #oldest < 2 then return 0 end
+if #oldest < 2 then return {0, 0} end
 local bucket_id = oldest[1]
 local bkey = 'pplns:bucket:' .. bucket_id
 local flat = redis.call('HGETALL', bkey)
 local removed = 0
+local underflowed = 0
 for i = 1, #flat, 2 do
     local addr = flat[i]
     local d = tonumber(flat[i + 1]) or 0
     if d ~= 0 then
         removed = removed + d
         local rem = tonumber(redis.call('HINCRBYFLOAT', KEYS[2], addr, -d))
-        if rem and math.abs(rem) < 1e-9 then
-            redis.call('HDEL', KEYS[2], addr)
+        if rem then
+            if rem < -1e-9 then
+                underflowed = underflowed + 1
+            end
+            -- Near-zero (f64 drift) AND negative (aggregate/bucket skew)
+            -- both leave nothing payable behind.
+            if rem < 1e-9 then
+                redis.call('HDEL', KEYS[2], addr)
+            end
         end
     end
 end
@@ -103,7 +129,7 @@ redis.call('ZREM', KEYS[3], bucket_id)
 if removed ~= 0 then
     redis.call('INCRBYFLOAT', KEYS[1], -removed)
 end
-return 1
+return {1, underflowed}
 "#;
 
 /// Atomic, optionally-idempotent append of one accepted share into its count
@@ -318,13 +344,28 @@ impl WindowStore {
         // active bucket remains) → done.
         let trim = redis::Script::new(TRIM_BATCH_LUA);
         loop {
-            let dropped: i64 = trim
+            let (dropped, underflowed): (i64, i64) = trim
                 .key(KEY_WINDOW_TOTAL)
                 .key(KEY_WINDOW_BY_ADDRESS)
                 .key(KEY_BUCKETS)
                 .arg(window_size)
                 .invoke_async(conn)
                 .await?;
+            if underflowed > 0 {
+                // Not a rounding artefact: the bucket held more for an
+                // address than the aggregate ever received. The addresses
+                // are dropped (a negative field is unpayable anyway — the
+                // read filters `> 0`), but somebody has to hear about it,
+                // because the likely cause is a restored backup whose
+                // aggregate and buckets were captured at different instants.
+                warn!(
+                    underflowed,
+                    "pplns window trim: the aggregate went negative for {underflowed} \
+                     address(es) — bucket and aggregate disagree, which a per-key Redis \
+                     restore can produce. Those addresses are out of the window until they \
+                     earn back into it."
+                );
+            }
             if dropped == 0 {
                 break;
             }

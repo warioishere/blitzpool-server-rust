@@ -12,8 +12,22 @@
 //!
 //! Restore is **never automatic** — there is no fail-state detection. An
 //! operator runs `blitzpool --restore-redis-state [--restore-force]` after
-//! deciding the live state is bad. `DUMP`/`RESTORE` is verbatim (zset scores,
-//! hash fields, bucket structure preserved), so trimming resumes normally.
+//! deciding the live state is bad. `DUMP`/`RESTORE` is verbatim per key (zset
+//! scores, hash fields, bucket structure preserved).
+//!
+//! **It is not a point-in-time snapshot, and a restore is therefore an
+//! APPROXIMATION.** The keys are `DUMP`ed one after another, so
+//! `pplns:window:by-address` and the `pplns:bucket:*` hashes are captured at
+//! different instants and shares land in between. A restored state can hold a
+//! bucket that is ahead of the aggregate, and the trim then decrements the
+//! aggregate by value it never received. The skew is bounded by the duration
+//! of one SCAN+DUMP pass, i.e. a second or two of shares.
+//!
+//! That is acceptable because the alternative on this path is no state at
+//! all — but it is not invisible: the PPLNS trim counts the addresses such a
+//! decrement drives below zero and warns, rather than leaving a negative
+//! field that the payout read (`diff > 0`) would silently treat as absent.
+//! See `bp_pplns_engine::window`'s `TRIM_BATCH_LUA`.
 
 use std::time::Duration;
 

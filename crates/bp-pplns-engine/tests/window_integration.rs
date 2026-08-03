@@ -236,6 +236,158 @@ async fn trim_window_drops_oldest_over_window_size() {
     assert!((by["bc1q5"] - 1.0).abs() < 1e-9);
 }
 
+// ── The snapshot write is all-or-nothing ────────────────────────────
+//
+// It used to be three round trips — `DEL`, `HSET`, `EXPIRE` — and between the
+// first two the snapshot DID NOT EXIST. That window is the one case
+// `read_weight_snapshot_with_retry` deliberately does not retry: it takes
+// `Ok(None)` at face value because "a genuinely missing snapshot will not
+// appear", which is true of an expired key and false of this one. Both sides
+// run on the front — the template build writes, the Stratum block-found path
+// reads — so a block found in that window is parked with no settlement
+// inputs. A single script closes it.
+//
+// The race itself cannot be pinned in a test that is not flaky; atomicity is
+// structural (one `Script` invocation). What IS deterministic is the reason
+// the `DEL` has to stay inside it, and that is what this asserts: a rewrite
+// with FEWER entries must not leave the longer one's fields behind, or the
+// parser reads a truncated entry list as a longer one.
+
+#[tokio::test]
+async fn rewriting_a_snapshot_with_fewer_entries_leaves_no_stale_fields() {
+    use bp_coinbase_snapshot::{
+        read_weight_snapshot, write_weight_snapshot, StoredWeightSnapshot, WeightSnapshotEntry,
+    };
+
+    let mut conn = match connect_or_skip(14).await {
+        Some(c) => c,
+        None => return,
+    };
+    let key = "pplns:snapshot:fp:test_atomic_rewrite";
+    let _: () = conn.del(key).await.unwrap();
+
+    let entry = |addr: &str, score: u64| WeightSnapshotEntry {
+        address: addr.to_string(),
+        score_weight: score,
+        balance_sats: 0,
+        wire_weight: score,
+        dust_limit: 546,
+    };
+    let mut snap = StoredWeightSnapshot {
+        entries: vec![
+            entry("bc1qaaa", 500_000_000_000),
+            entry("bc1qbbb", 300_000_000_000),
+            entry("bc1qccc", 200_000_000_000),
+        ],
+        weight_p: 15_228_426_395,
+        fee_ppm: 15_000,
+        fee_address: "bc1qfee".to_string(),
+        reference_revenue_sats: 312_500_000,
+        score_total: 1_000_000_000_000,
+    };
+    write_weight_snapshot(&mut conn, key, &snap, 600)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_weight_snapshot(&mut conn, key).await.unwrap().as_ref(),
+        Some(&snap)
+    );
+
+    // Rewrite with ONE entry. `e1_*` / `e2_*` must be gone.
+    snap.entries.truncate(1);
+    snap.score_total = 500_000_000_000;
+    write_weight_snapshot(&mut conn, key, &snap, 600)
+        .await
+        .unwrap();
+
+    let back = read_weight_snapshot(&mut conn, key)
+        .await
+        .unwrap()
+        .expect("the rewritten snapshot is readable");
+    assert_eq!(
+        back, snap,
+        "the shorter rewrite must replace the snapshot, not overlay it"
+    );
+    let leftover: Option<String> = conn.hget(key, "e1_addr").await.unwrap();
+    assert!(
+        leftover.is_none(),
+        "field from the longer snapshot survived: {leftover:?} — with entry_count \
+         back at 1 the parser would not read it, but the next LONGER rewrite \
+         would inherit it"
+    );
+    // And the TTL landed, or the key would outlive its job forever.
+    let ttl: i64 = conn.ttl(key).await.unwrap();
+    assert!(ttl > 0 && ttl <= 600, "ttl = {ttl}");
+
+    let _: () = conn.del(key).await.unwrap();
+}
+
+// ── An aggregate/bucket skew must not leave a NEGATIVE window entry ─
+//
+// MONEY. The aggregate is a sum of non-negative difficulties, so a trim can
+// only decrement past zero if a bucket holds more for an address than the
+// aggregate ever received. The `DUMP`-per-key Redis backup produces exactly
+// that: it captures `window:by-address` and the `bucket:*` hashes at
+// DIFFERENT instants, so a restore can hand the trim a bucket that is ahead
+// of the aggregate.
+//
+// The old trim only `HDEL`ed a field within 1e-9 of zero, so a materially
+// negative one was left sitting there — and `read_window_by_address` filters
+// `diff > 0`, which drops that address out of the window ENTIRELY. Silently
+// unpaid until it earns its way back in. The field is removed either way now
+// (a negative is unpayable), but the trim counts the underflows so the
+// operator hears about the skew instead of it passing as a clean trim.
+
+#[tokio::test]
+async fn a_bucket_ahead_of_the_aggregate_does_not_strand_a_negative_entry() {
+    let mut conn = match connect_or_skip(13).await {
+        Some(c) => c,
+        None => return,
+    };
+    // window_size = 4.0 × 1.0 = 4.0, one share per bucket.
+    let (store, _) = make_store(conn.clone(), 1.0, 1);
+
+    for i in 1..=4 {
+        store
+            .record_share(None, &format!("bc1q{i}"), 1.0, 1_700_000_000_000 + i)
+            .await
+            .unwrap();
+    }
+    // Forge the restore skew: the aggregate holds LESS for bc1q1 than its
+    // bucket does. This is the state a per-key restore can produce.
+    let _: () = conn
+        .hset(KEY_WINDOW_BY_ADDRESS, "bc1q1", "0.25")
+        .await
+        .unwrap();
+    let before = store.read_window_by_address().await.unwrap();
+    assert!(
+        (before["bc1q1"] - 0.25).abs() < 1e-9,
+        "precondition: the aggregate must be BEHIND the bucket's 1.0"
+    );
+
+    // A fifth share pushes the window over and trims bc1q1's bucket, whose
+    // 1.0 exceeds the 0.25 the aggregate holds.
+    store
+        .record_share(None, "bc1q5", 1.0, 1_700_000_000_005)
+        .await
+        .unwrap();
+
+    // The field must be GONE, not sitting at -0.75.
+    let raw: Option<String> = conn.hget(KEY_WINDOW_BY_ADDRESS, "bc1q1").await.unwrap();
+    assert!(
+        raw.is_none(),
+        "the underflowed entry must be removed, found {raw:?} — a negative field \
+         reads as absent to the payout path anyway, so leaving it only hides the skew"
+    );
+    let by = store.read_window_by_address().await.unwrap();
+    assert!(!by.contains_key("bc1q1"));
+    // And the trim did not take anyone else down with it.
+    assert!(
+        (by["bc1q5"] - 1.0).abs() < 1e-9,
+        "the fresh share survives: {by:?}"
+    );
+}
+
 // ── Test 5 — read_window_by_address falls back to summing buckets ───
 
 #[tokio::test]

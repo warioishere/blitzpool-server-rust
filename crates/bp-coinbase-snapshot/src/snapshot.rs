@@ -186,11 +186,48 @@ pub async fn write_weight_snapshot(
         fields.push((format!("e{i}_dust"), e.dust_limit.to_string()));
     }
 
-    let _: () = conn.del(key).await?;
-    let _: () = conn.hset_multiple(key, &fields).await?;
-    let _: () = conn.expire(key, ttl_seconds as i64).await?;
+    let script = redis::Script::new(WRITE_SNAPSHOT_LUA);
+    let mut invocation = script.key(key);
+    invocation.arg(ttl_seconds as i64);
+    for (field, value) in &fields {
+        invocation.arg(field).arg(value);
+    }
+    let _: () = invocation.invoke_async(conn).await?;
     Ok(())
 }
+
+/// `DEL` + `HSET` + `EXPIRE` as ONE indivisible step.
+/// KEYS[1] = the snapshot key. ARGV[1] = TTL seconds, then alternating
+/// field/value pairs.
+///
+/// Three separate round trips is what this replaces, and it was wrong twice
+/// over. Between the `DEL` and the `HSET` the snapshot **did not exist**,
+/// and a read landing there is the one case
+/// [`read_weight_snapshot_with_retry`] deliberately does not retry: it takes
+/// `Ok(None)` at face value on the grounds that a missing snapshot "will not
+/// appear". Here it would have, microseconds later — and the caller maps that
+/// `None` to a found block parked with no settlement inputs. The two sides
+/// are the same process: the template build writes, the Stratum block-found
+/// path reads.
+///
+/// The second failure is the one the write's own retry policy already
+/// documents: a fault between the `DEL` and the `HSET` left the key
+/// **deleted**, so a build that would have been a harmless rewrite of an
+/// existing snapshot destroyed it instead. A script is all-or-nothing, so
+/// that cannot happen either.
+///
+/// The `DEL` stays: a rebuild with FEWER entries has to drop the fields the
+/// longer one left behind, or the parse reads a truncated entry list as a
+/// longer one. Fields are set one at a time rather than through `unpack`, to
+/// keep the argument count off Lua's C-stack limit at a full member set.
+const WRITE_SNAPSHOT_LUA: &str = r#"
+redis.call('DEL', KEYS[1])
+for i = 2, #ARGV, 2 do
+    redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1])
+end
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return 1
+"#;
 
 /// Load a weight snapshot, or `Ok(None)` when the key is missing, has
 /// a different schema (including every schema-1 snapshot), or fails to
