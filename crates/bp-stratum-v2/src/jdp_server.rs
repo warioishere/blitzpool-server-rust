@@ -145,6 +145,48 @@ pub struct BuiltPayoutDistribution {
     pub bookable: bool,
 }
 
+/// Floor the publish interval at 1s.
+///
+/// `tokio::time::interval` PANICS on a zero period, and the publisher
+/// runs as a detached task — the panic is confined to it, so the JDP
+/// listener keeps accepting while no distribution is ever published:
+/// `current_pool_wide()` stays empty, 0x0003 is never offered, and
+/// every JDC silently drops to the base protocol with no non-custodial
+/// payout enforcement at all. Nothing in the logs would name the config
+/// value. `jdp_payout_distribution_interval_secs = 0` reads as "as fast
+/// as possible", so clamp and say so rather than refuse to boot.
+fn sane_publish_interval(interval: Duration) -> Duration {
+    if interval.is_zero() {
+        warn!(
+            "jdp: payout-distribution interval of 0 is not a valid period — using 1s. \
+             Set [sv2].jdp_payout_distribution_interval_secs to a positive value."
+        );
+        return Duration::from_secs(1);
+    }
+    interval
+}
+
+/// What the pool can publish for one JDP session's miner.
+///
+/// The three cases are deliberately distinct. Collapsing "this miner
+/// rides the pool-wide distribution" and "the tailored build failed"
+/// into a single `None` made every failure path — missing fee address,
+/// engine error, no template yet — silently serve a Solo / Group-Solo /
+/// Blockparty JDC the PPLNS distribution, so its block paid the PPLNS
+/// window and booked under the PPLNS fingerprint.
+#[derive(Debug)]
+pub enum TailoredDistribution {
+    /// PPLNS-mode miner: the pool-wide distribution IS their accounting.
+    PoolWide,
+    /// A distribution tailored to this miner.
+    Built(Box<BuiltPayoutDistribution>),
+    /// The tailored build could not be produced. This miner's shares do
+    /// not enter the PPLNS window, so the pool-wide distribution is the
+    /// wrong answer — the session must be served nothing until a later
+    /// build succeeds.
+    Unavailable,
+}
+
 /// Build the pool's payout distributions for the ext 0x0003 push model.
 ///
 /// The publisher task calls [`Self::build_pool_wide`] on its interval
@@ -160,8 +202,10 @@ pub trait PayoutDistributionSource: Send + Sync {
     /// `None` ⇒ nothing publishable right now (no PPLNS engine / no
     /// template yet) — ext 0x0003 is then not offered in negotiation.
     async fn build_pool_wide(&self) -> Option<BuiltPayoutDistribution>;
-    /// `None` ⇒ the pool-wide distribution applies (PPLNS-mode miner).
-    async fn build_for_miner(&self, miner_address: &AddressId) -> Option<BuiltPayoutDistribution>;
+    /// What this session's miner should be served. See
+    /// [`TailoredDistribution`] — `PoolWide` and `Unavailable` are NOT
+    /// interchangeable.
+    async fn build_for_miner(&self, miner_address: &AddressId) -> TailoredDistribution;
     /// `None` ⇒ the allocator is unavailable; the publish is skipped
     /// (the previously-published distribution stays valid).
     async fn next_distribution_id(&self) -> Option<u64>;
@@ -279,8 +323,10 @@ impl PayoutDistributionSource for NoOpJdpHooks {
         // No distribution to publish → ext 0x0003 is never offered.
         None
     }
-    async fn build_for_miner(&self, _miner_address: &AddressId) -> Option<BuiltPayoutDistribution> {
-        None
+    async fn build_for_miner(&self, _miner_address: &AddressId) -> TailoredDistribution {
+        // Nothing wired: no tailored distribution and no pool-wide one
+        // either, so there is nothing to fall back TO.
+        TailoredDistribution::PoolWide
     }
     async fn next_distribution_id(&self) -> Option<u64> {
         None
@@ -356,7 +402,7 @@ impl StratumV2JdpServer {
                 refresh: Arc::new(tokio::sync::Notify::new()),
             }),
         };
-        server.spawn_distribution_publisher(payout_distribution_interval);
+        server.spawn_distribution_publisher(sane_publish_interval(payout_distribution_interval));
         server
     }
 
@@ -379,6 +425,14 @@ impl StratumV2JdpServer {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut last_fingerprint: Option<[u8; 32]> = None;
+            // A forced pass (settlement) that aborts before publishing
+            // MUST stay owed. `last_fingerprint` describes what this
+            // task last published, not what the registry holds: after a
+            // settlement the registry holds nothing usable, so skipping
+            // the next tick as "unchanged" leaves `current_pool_wide()`
+            // empty — 0x0003 stops being offered and every declare is
+            // rejected until the window's weights happen to move.
+            let mut force_pending = false;
             loop {
                 let forced = tokio::select! {
                     biased;
@@ -386,10 +440,13 @@ impl StratumV2JdpServer {
                     _ = inner.refresh.notified() => true,
                     _ = tick.tick() => false,
                 };
+                force_pending |= forced;
                 let Some(built) = inner.hooks.distribution_source.build_pool_wide().await else {
+                    // No template yet / PPLNS build failed. Retry on the
+                    // next tick with the debt still owed.
                     continue;
                 };
-                if !forced
+                if !force_pending
                     && built.payouts_fingerprint.is_some()
                     && built.payouts_fingerprint == last_fingerprint
                 {
@@ -408,6 +465,8 @@ impl StratumV2JdpServer {
                     .write()
                     .expect("bridge RwLock poisoned")
                     .publish_pool_wide(entry);
+                // Only now is a forced republish actually discharged.
+                force_pending = false;
                 let _ = inner.dist_watch.send(distribution_id);
                 debug!(
                     distribution_id,
@@ -458,6 +517,78 @@ impl StratumV2JdpServer {
 
 // ── Per-connection task ─────────────────────────────────────────────
 
+/// Build and push a fresh tailored distribution for `miner` on this
+/// session. Returns `false` when the session was left WITHOUT one — the
+/// caller must not then treat it as tailored-and-served.
+///
+/// Used both on the first allocate and after a §10 settlement, which
+/// invalidates a tailored slot exactly like the pool-wide one while the
+/// publisher only ever republishes the latter.
+async fn republish_tailored(
+    hooks: &JdpServerHooks,
+    bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
+    writer: &mut NoiseTcpWriteHalf<AnyMessage<'static>>,
+    session_id: u32,
+    session_id_hex: &str,
+    miner: &AddressId,
+) -> bool {
+    let built = match hooks.distribution_source.build_for_miner(miner).await {
+        TailoredDistribution::Built(b) => *b,
+        // The miner's mode changed under us (now PPLNS): the pool-wide
+        // push is its accounting again.
+        TailoredDistribution::PoolWide => {
+            bridge
+                .write()
+                .expect("bridge RwLock poisoned")
+                .allow_pool_wide(session_id);
+            return false;
+        }
+        TailoredDistribution::Unavailable => {
+            warn!(
+                miner = miner.as_str(),
+                "jdp {session_id_hex} tailored republish unavailable — \
+                 refusing to fall back to the pool-wide distribution"
+            );
+            bridge
+                .write()
+                .expect("bridge RwLock poisoned")
+                .deny_pool_wide(session_id);
+            return false;
+        }
+    };
+    let Some(distribution_id) = hooks.distribution_source.next_distribution_id().await else {
+        warn!(
+            "jdp {session_id_hex} tailored republish skipped — \
+             distribution-id allocator unavailable"
+        );
+        bridge
+            .write()
+            .expect("bridge RwLock poisoned")
+            .deny_pool_wide(session_id);
+        return false;
+    };
+    let entry = entry_from_built(
+        distribution_id,
+        built,
+        Some(miner.clone()),
+        Some(session_id),
+        now_ms(),
+    );
+    let wire = wire_from_entry(&entry);
+    {
+        let mut guard = bridge.write().expect("bridge RwLock poisoned");
+        guard.publish_tailored(session_id, entry);
+        guard.allow_pool_wide(session_id);
+    }
+    if let Err(err) =
+        write_jdp_outbound_frames(writer, vec![JdpOutboundFrame::SetPayoutDistribution(wire)]).await
+    {
+        warn!("jdp {session_id_hex} tailored republish write: {err:?}");
+    }
+    debug!(distribution_id, "jdp {session_id_hex} tailored republished");
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_jdp_connection(
     session_id: u32,
@@ -485,6 +616,11 @@ async fn run_jdp_connection(
     // Group-Solo / Blockparty); the pool-wide push then stops for it —
     // §4 "latest MUST be used" makes the tailored stream authoritative.
     let mut tailored_active = false;
+    // The miner a tailored distribution was built for. Kept so a §10
+    // settlement can be answered with a FRESH tailored distribution —
+    // the publisher only ever republishes the pool-wide one, which this
+    // session is (correctly) not listening for.
+    let mut tailored_miner: Option<AddressId> = None;
 
     loop {
         tokio::select! {
@@ -500,11 +636,47 @@ async fn run_jdp_connection(
                 if changed.is_err() {
                     break; // publisher gone = server shutting down
                 }
-                if tailored_active
-                    || !state
-                        .negotiated_extensions
-                        .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
+                if !state
+                    .negotiated_extensions
+                    .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
                 {
+                    continue;
+                }
+                if tailored_active {
+                    // A tailored session ignores the pool-wide push —
+                    // §4 "latest MUST be used" makes its own stream
+                    // authoritative. But the publisher fires this watch
+                    // after a §10 settlement too, and a settlement
+                    // invalidates EVERY distribution including this
+                    // session's. Nobody else republishes a tailored one,
+                    // so without this the JDC is answered
+                    // `stale-payout-distribution` forever and simply
+                    // stops declaring.
+                    let still_current = bridge
+                        .read()
+                        .expect("bridge RwLock poisoned")
+                        .current_tailored(session_id)
+                        .is_some();
+                    if still_current {
+                        continue;
+                    }
+                    let Some(miner) = tailored_miner.clone() else {
+                        continue;
+                    };
+                    if !republish_tailored(
+                        &hooks,
+                        &bridge,
+                        &mut writer,
+                        session_id,
+                        &session_id_hex,
+                        &miner,
+                    )
+                    .await
+                    {
+                        // Left denied / unpublished on purpose — better
+                        // no distribution than the PPLNS one.
+                        tailored_active = false;
+                    }
                     continue;
                 }
                 let current = bridge
@@ -665,10 +837,30 @@ async fn run_jdp_connection(
                         let JdpSessionEvent::TokenAllocated { miner_address, .. } = event else {
                             continue;
                         };
-                        let Some(built) =
-                            hooks.distribution_source.build_for_miner(miner_address).await
-                        else {
-                            continue;
+                        let built = match hooks
+                            .distribution_source
+                            .build_for_miner(miner_address)
+                            .await
+                        {
+                            TailoredDistribution::Built(b) => *b,
+                            // PPLNS: the pool-wide push is this miner's
+                            // own accounting, nothing tailored to do.
+                            TailoredDistribution::PoolWide => continue,
+                            // Not the same thing. Fail closed rather
+                            // than let this session declare against the
+                            // PPLNS weights.
+                            TailoredDistribution::Unavailable => {
+                                warn!(
+                                    miner = miner_address.as_str(),
+                                    "jdp {session_id_hex} tailored distribution unavailable — \
+                                     refusing to fall back to the pool-wide distribution"
+                                );
+                                bridge
+                                    .write()
+                                    .expect("bridge RwLock poisoned")
+                                    .deny_pool_wide(session_id);
+                                continue;
+                            }
                         };
                         let Some(distribution_id) =
                             hooks.distribution_source.next_distribution_id().await
@@ -687,11 +879,15 @@ async fn run_jdp_connection(
                             now_ms(),
                         );
                         let wire = wire_from_entry(&entry);
-                        bridge
-                            .write()
-                            .expect("bridge RwLock poisoned")
-                            .publish_tailored(session_id, entry);
+                        {
+                            let mut guard = bridge.write().expect("bridge RwLock poisoned");
+                            guard.publish_tailored(session_id, entry);
+                            // A later build succeeded — the session has
+                            // its own distribution again.
+                            guard.allow_pool_wide(session_id);
+                        }
                         tailored_active = true;
+                        tailored_miner = Some(miner_address.clone());
                         if let Err(err) = write_jdp_outbound_frames(
                             &mut writer,
                             vec![JdpOutboundFrame::SetPayoutDistribution(wire)],

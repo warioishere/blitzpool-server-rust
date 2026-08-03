@@ -45,7 +45,7 @@ use bp_stratum_v2::jdp::dynamic_outputs::PayoutBooking;
 use bp_stratum_v2::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
 use bp_stratum_v2::jdp_server::{
     BuiltPayoutDistribution, CurrentPrevHashProvider, JdpBlockSubmissionSink, JdpServerHooks,
-    PayoutDistributionSource, StratumV2JdpServer,
+    PayoutDistributionSource, StratumV2JdpServer, TailoredDistribution,
 };
 use bp_stratum_v2::jdp_server_codec::EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION;
 use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
@@ -127,8 +127,8 @@ impl PayoutDistributionSource for FixedSource {
         })
     }
 
-    async fn build_for_miner(&self, _miner_address: &AddressId) -> Option<BuiltPayoutDistribution> {
-        None // pool-wide applies
+    async fn build_for_miner(&self, _miner_address: &AddressId) -> TailoredDistribution {
+        TailoredDistribution::PoolWide
     }
 
     async fn next_distribution_id(&self) -> Option<u64> {

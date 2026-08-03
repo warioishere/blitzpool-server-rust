@@ -54,6 +54,7 @@ pub(crate) use bp_mining_job::SoloFeeConfig;
 use bp_mining_job::{solo_payouts, PayoutEntry, ResolvedPayouts};
 use bp_pplns::CoinbaseDistributionEntry;
 use bp_pplns_engine::engine::PplnsEngine;
+use bp_stratum_v2::jdp_server::TailoredDistribution;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -626,18 +627,37 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
         )
     }
 
-    async fn build_for_miner(
-        &self,
-        miner_address: &AddressId,
-    ) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
-        let t_ref = self.reference_revenue()?;
+    async fn build_for_miner(&self, miner_address: &AddressId) -> TailoredDistribution {
+        // Everything below `Pplns` is a mode whose shares do NOT enter
+        // the PPLNS window, so every failure path here returns
+        // `Unavailable`, never `PoolWide`. Serving the pool-wide
+        // distribution to such a miner pays its block to the PPLNS
+        // window and books it under the PPLNS fingerprint.
         let lookup = self.resolver.mode_gate.lookup_mode(miner_address.as_str());
-        match lookup.mode {
-            // PPLNS rides the pool-wide distribution.
-            MiningMode::Pplns => None,
+        if lookup.mode == MiningMode::Pplns {
+            return TailoredDistribution::PoolWide;
+        }
+        let Some(t_ref) = self.reference_revenue() else {
+            warn!(
+                miner = miner_address.as_str(),
+                "jdp distribution source: no reference revenue yet — no tailored distribution"
+            );
+            return TailoredDistribution::Unavailable;
+        };
+        let built = match lookup.mode {
+            MiningMode::Pplns => unreachable!("handled above"),
             MiningMode::GroupSolo => {
-                let gid = lookup.group_id.as_deref()?;
-                let group_id = Uuid::parse_str(gid).ok()?;
+                let Some(group_id) = lookup
+                    .group_id
+                    .as_deref()
+                    .and_then(|gid| Uuid::parse_str(gid).ok())
+                else {
+                    warn!(
+                        miner = miner_address.as_str(),
+                        "jdp distribution source: group-solo miner without a usable group id"
+                    );
+                    return TailoredDistribution::Unavailable;
+                };
                 match self
                     .resolver
                     .group_solo
@@ -676,10 +696,14 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                             entries.into_iter().filter(|(a, _)| *a != dev).collect();
                         self.lower_exact_entries(&dev, dev_weight, &miners, t_ref)
                     }
-                    None => {
-                        let fee = self.fee_address.as_ref()?;
-                        self.lower_exact_entries(fee.as_str(), 1, &entries, t_ref)
-                    }
+                    None => match self.fee_address.as_ref() {
+                        Some(fee) => self.lower_exact_entries(fee.as_str(), 1, &entries, t_ref),
+                        None => {
+                            warn!(miner = miner_address.as_str(),
+                                "jdp distribution source: solo miner but no pool fee address configured");
+                            None
+                        }
+                    },
                 }
             }
             MiningMode::Blockparty => {
@@ -691,9 +715,25 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                     .map(|p| (p.address, p.sats))
                     .collect();
                 // Blockparty's allocator puts the pool-fee output FIRST.
-                let (pool, miners) = entries.split_first()?;
-                self.lower_exact_entries(&pool.0, pool.1.max(1), miners, t_ref)
+                match entries.split_first() {
+                    Some((pool, miners)) => {
+                        self.lower_exact_entries(&pool.0, pool.1.max(1), miners, t_ref)
+                    }
+                    None => {
+                        warn!(
+                            miner = miner_address.as_str(),
+                            "jdp distribution source: blockparty allocator returned no outputs"
+                        );
+                        None
+                    }
+                }
             }
+        };
+        match built {
+            Some(b) => TailoredDistribution::Built(Box::new(b)),
+            // `lower_*` failed (unusable address / weight overflow).
+            // Still not the pool-wide distribution's problem.
+            None => TailoredDistribution::Unavailable,
         }
     }
 

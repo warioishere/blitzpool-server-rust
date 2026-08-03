@@ -69,7 +69,7 @@
 //! IO-layer calls registry.evict_for_jdp_session(id)   (write)
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bp_common::AddressId;
@@ -237,6 +237,10 @@ pub struct JdpDeclaredJobRegistry {
     /// Tailored per-JDP-session distributions (Solo / Group-Solo /
     /// Blockparty, published after the session's identity is known).
     tailored_distributions: HashMap<u32, DistributionSlot>,
+    /// JDP sessions whose miner NEEDS a tailored distribution but whose
+    /// build failed. Without this they would silently resolve against
+    /// `pool_wide_distribution` — see [`Self::deny_pool_wide`].
+    pool_wide_denied: HashSet<u32>,
     /// Bumped by [`Self::invalidate_all_distributions`] (§10). Every
     /// entry published under an older epoch resolves as `Stale`.
     settlement_epoch: u64,
@@ -355,6 +359,21 @@ impl JdpDeclaredJobRegistry {
         scope: DistributionScope<'_>,
     ) -> DistributionAcceptance {
         let slot = match scope {
+            // A session that NEEDS a tailored distribution and has none
+            // must not silently borrow the pool-wide one: the pool-wide
+            // distribution is the PPLNS window's, and this miner's
+            // shares do not enter it. Answering Unknown makes the JDC
+            // re-fetch and the declare fail closed, instead of paying
+            // its block to the wrong accounting.
+            DistributionScope::JdpSession(id)
+                if self.pool_wide_denied.contains(&id)
+                    && self
+                        .tailored_distributions
+                        .get(&id)
+                        .is_none_or(|s| s.latest.is_none()) =>
+            {
+                return DistributionAcceptance::Unknown;
+            }
             DistributionScope::JdpSession(id) => self
                 .tailored_distributions
                 .get(&id)
@@ -425,6 +444,26 @@ impl JdpDeclaredJobRegistry {
         self.tailored_distributions.len()
     }
 
+    /// Mark a JDP session as requiring a tailored distribution it does
+    /// not have — its miner is Solo / Group-Solo / Blockparty and the
+    /// tailored build failed (no fee address, engine error, no
+    /// template).
+    ///
+    /// Without this the session falls through to the pool-wide slot and
+    /// declares against the PPLNS weights, so a group's block pays the
+    /// PPLNS window instead of the group's members — and books under the
+    /// PPLNS fingerprint. "Serve nothing" is the only safe answer: the
+    /// pool cannot say what this miner's coinbase should pay.
+    pub fn deny_pool_wide(&mut self, jdp_session_id: u32) {
+        self.pool_wide_denied.insert(jdp_session_id);
+    }
+
+    /// Clear the denial once a tailored distribution was published for
+    /// the session (a later build succeeded).
+    pub fn allow_pool_wide(&mut self, jdp_session_id: u32) {
+        self.pool_wide_denied.remove(&jdp_session_id);
+    }
+
     /// Drop one specific token. Idempotent.
     pub fn remove(&mut self, token: &Token) -> Option<RegisteredDeclaredJob> {
         self.entries.remove(token)
@@ -440,6 +479,7 @@ impl JdpDeclaredJobRegistry {
         // A tailored distribution dies with the session it was
         // published to.
         self.tailored_distributions.remove(&jdp_session_id);
+        self.pool_wide_denied.remove(&jdp_session_id);
         before - self.entries.len()
     }
 
@@ -681,6 +721,64 @@ mod tests {
         assert_eq!(
             reg.distribution_acceptance(99, scope),
             DistributionAcceptance::Unknown
+        );
+    }
+
+    /// A session whose tailored build failed must NOT quietly resolve
+    /// against the pool-wide distribution.
+    ///
+    /// The pool-wide entry is the PPLNS window's. A Group-Solo /
+    /// Solo / Blockparty miner's shares never enter that window, so
+    /// serving it would have their block pay the PPLNS miners and book
+    /// under the PPLNS fingerprint. Answering `Unknown` fails the
+    /// declare closed instead.
+    #[test]
+    fn a_denied_session_does_not_fall_back_to_the_pool_wide_distribution() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        reg.publish_pool_wide(distribution(1, None, None));
+        let scope = DistributionScope::JdpSession(7);
+        // Before the denial the fallback is the documented behaviour.
+        assert_eq!(accepted_id(&reg.distribution_acceptance(1, scope)), Some(1));
+
+        reg.deny_pool_wide(7);
+        assert_eq!(
+            reg.distribution_acceptance(1, scope),
+            DistributionAcceptance::Unknown,
+            "a tailored-required session must not borrow the PPLNS distribution"
+        );
+        // Other sessions are untouched.
+        assert_eq!(
+            accepted_id(&reg.distribution_acceptance(1, DistributionScope::JdpSession(8))),
+            Some(1)
+        );
+    }
+
+    /// Once a tailored distribution IS published for the session the
+    /// denial lifts, and its own entry resolves normally.
+    #[test]
+    fn publishing_a_tailored_distribution_lifts_the_denial() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        reg.publish_pool_wide(distribution(1, None, None));
+        reg.deny_pool_wide(7);
+        let owner = AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string())
+            .expect("addr");
+        reg.publish_tailored(7, distribution(2, Some(owner), Some(7)));
+        reg.allow_pool_wide(7);
+        let scope = DistributionScope::JdpSession(7);
+        assert_eq!(accepted_id(&reg.distribution_acceptance(2, scope)), Some(2));
+    }
+
+    /// The denial dies with the session, so a reconnecting JDC that
+    /// reuses the id is not stuck behind a stale flag.
+    #[test]
+    fn evicting_a_session_clears_its_pool_wide_denial() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        reg.publish_pool_wide(distribution(1, None, None));
+        reg.deny_pool_wide(7);
+        reg.evict_for_jdp_session(7);
+        assert_eq!(
+            accepted_id(&reg.distribution_acceptance(1, DistributionScope::JdpSession(7))),
+            Some(1)
         );
     }
 
