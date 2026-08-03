@@ -101,13 +101,14 @@ async fn record_share_writes_all_keys() {
         .parse()
         .unwrap();
     assert_eq!(last_at, 1_700_000_000_000);
-    let counter_v: u64 = conn
-        .get::<_, String>(key_counter(group))
-        .await
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert_eq!(counter_v, 1);
+    // This call passes `None` for the share_id, so no dedup marker is
+    // written — the marker's scoring is pinned in
+    // `record_share_is_idempotent_per_share_id`.
+    let counter_exists: bool = conn.exists(key_counter(group)).await.unwrap();
+    assert!(
+        !counter_exists,
+        "the per-group counter is legacy and must no longer be written"
+    );
 }
 
 // ── Test 2 — record_reject increments per-address rejected ─────────
@@ -198,12 +199,26 @@ async fn reset_for_block_found_preserves_last_accepted_share_at() {
 
     assert!(!total_exists, "total wiped");
     assert!(!by_addr_exists, "by-address wiped");
-    assert!(!counter_exists, "counter wiped");
+    assert!(!counter_exists, "the legacy counter key is cleared");
     assert!(!best_exists, "best-share wiped");
-    assert!(!applied_exists, "dedup zset wiped with the round");
     assert!(
         last_at_exists,
         "last-accepted-share-at preserved across block-found reset"
+    );
+    // MONEY: the dedup set must OUTLIVE the reset.
+    //
+    // The satellite dispatches a batch of up to 256 shares and only then
+    // ACKs it. If a reset lands in that gap, a redelivery (process death
+    // mid-batch, or a failed ack) finds no markers and REAPPLIES those
+    // shares into the fresh round — work already accounted for in the round
+    // that was just wiped, credited a second time to whoever was in the
+    // batch. Right after a reset the round is empty, so they can dominate
+    // it. PPLNS never had this hole: `pplns:applied` is scored by a
+    // monotonic counter and is never reset.
+    assert!(
+        applied_exists,
+        "the dedup zset must survive a round reset, or an un-ACKed satellite \
+         batch is reapplied into the fresh round"
     );
 }
 
@@ -234,7 +249,14 @@ async fn reset_full_wipes_everything_including_last_accepted() {
     let applied_exists: bool = conn.exists(key_applied(group)).await.unwrap();
     assert!(!last_at_exists, "last-accepted-share-at wiped");
     assert!(!rejected_exists, "rejected-shares wiped");
-    assert!(!applied_exists, "dedup zset wiped on full reset");
+    // Even a full (calendar) reset leaves the dedup set alone — see
+    // `reset_for_block_found_preserves_last_accepted_share_at`. A calendar
+    // reset discards the round's work deliberately; reapplying an un-ACKed
+    // batch into the fresh one would hand those miners an unearned start.
+    assert!(
+        applied_exists,
+        "the dedup zset must survive a full reset too"
+    );
 }
 
 // ── Test 6 — best-share only updates on improvement ────────────────
@@ -531,6 +553,99 @@ async fn record_share_is_idempotent_per_share_id() {
     assert!(
         (by - 200.0).abs() < 1e-9,
         "by-address must also exclude the dup"
+    );
+
+    // The marker is scored by the SHARE'S OWN accept time, not by a
+    // per-group counter. That is exactly what lets the set outlive a round
+    // reset — a counter-scored set had to be wiped with the counter.
+    let score: f64 = conn
+        .zscore(key_applied(group), "ep1:0")
+        .await
+        .expect("marker present");
+    assert_eq!(score, 1_700_000_000_000.0);
+}
+
+// ── The dedup marker must outlive a round reset ────────────────────
+//
+// MONEY. The satellite dispatches a batch of up to 256 shares to the sinks
+// and only ACKs the whole batch afterwards. A reset landing in that gap used
+// to delete the dedup markers with the round, so a redelivery — process
+// death mid-batch, which is every unclean restart, or a failed ack — found
+// no marker and REAPPLIED those shares into the fresh round. That is work
+// already accounted for in the round that was just wiped, credited a second
+// time; and right after a reset the round is empty, so a redelivered batch
+// can dominate it.
+//
+// PPLNS never had this hole (`pplns:applied` is scored by a monotonic
+// counter and is never reset), which is what made it an asymmetry between
+// two implementations of one contract rather than a shared limitation.
+
+#[tokio::test]
+async fn a_redelivered_share_is_still_deduped_across_a_round_reset() {
+    let conn = match connect_or_skip(12).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let group = "g_dedup_reset";
+    let addr = "bc1qfoo";
+
+    // The satellite applies a share…
+    assert!(store
+        .record_share(Some("ep9:7"), group, addr, 100.0, 1_700_000_000_000)
+        .await
+        .expect("ok"));
+    // …a block is found for the group and the round is wiped…
+    store.reset_for_block_found(group).await.unwrap();
+    // …and only now does the batch get redelivered (the ack never landed).
+    let replay = store
+        .record_share(Some("ep9:7"), group, addr, 100.0, 1_700_000_000_000)
+        .await
+        .expect("ok");
+    assert!(
+        !replay,
+        "a share redelivered after a reset must STILL be a deduped no-op"
+    );
+
+    let mut conn = conn;
+    // The fresh round must be untouched by the replay — not carrying the
+    // previous round's work.
+    let total_exists: bool = conn.exists(key_total(group)).await.unwrap();
+    assert!(
+        !total_exists,
+        "the redelivery must not resurrect the wiped round's total"
+    );
+    let by_exists: bool = conn.exists(key_by_address(group)).await.unwrap();
+    assert!(
+        !by_exists,
+        "nor its by-address aggregate — that is the double credit"
+    );
+
+    // And the same holds for the calendar reset, which discards a round's
+    // work deliberately.
+    store.reset_full(group).await.unwrap();
+    assert!(
+        !store
+            .record_share(Some("ep9:7"), group, addr, 100.0, 1_700_000_000_000)
+            .await
+            .expect("ok"),
+        "a full reset must not re-open the redelivery either"
+    );
+
+    // A genuinely new share still lands, so this is dedup and not a freeze.
+    assert!(store
+        .record_share(Some("ep9:8"), group, addr, 42.0, 1_700_000_000_001)
+        .await
+        .expect("ok"));
+    let by: f64 = conn
+        .hget::<_, _, String>(key_by_address(group), addr)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (by - 42.0).abs() < 1e-9,
+        "only the new share counts, got {by}"
     );
 }
 

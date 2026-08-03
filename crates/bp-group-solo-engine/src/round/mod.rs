@@ -4,7 +4,9 @@
 //!
 //! Key layout (`{groupId}` is the UUID of the `pplns_group` row):
 //!
-//! - `groupsolo:{groupId}:counter` — monotonic INCR counter
+//! - `groupsolo:{groupId}:counter` — LEGACY. Scored the dedup zset until
+//!   that moved to the share's own timestamp; nothing reads it now, and the
+//!   reset paths still delete it so old keys do not linger.
 //! - `groupsolo:{groupId}:total` — float string, Σ diff in round
 //! - `groupsolo:{groupId}:by-address` — hash `addr → diff` aggregate
 //! - `groupsolo:{groupId}:rejected-shares` — hash `addr → diff` rejected
@@ -21,12 +23,14 @@
 //! Two reset paths exist (PROP semantics; `Window` groups skip the per-block
 //! gate entirely):
 //!
-//! `reset_for_block_found` wipes counter, total, by-address,
-//! rejected-shares, best-share, and all per-finder snapshots, but
-//! preserves `last-accepted-share-at` (PROP semantics: inactivity
-//! clock survives across blocks).
+//! `reset_for_block_found` wipes total, by-address, rejected-shares,
+//! best-share, and all per-finder snapshots, but preserves
+//! `last-accepted-share-at` (PROP semantics: inactivity clock survives
+//! across blocks) and `applied` (the dedup set — see [`key_applied`]).
 //!
-//! `reset_full` wipes everything including `last-accepted-share-at`.
+//! `reset_full` wipes everything including `last-accepted-share-at` —
+//! except `applied`, which must outlive a reset so an un-ACKed satellite
+//! batch is not reapplied into the fresh round.
 //! Used by the scheduled (calendar-aligned) cron reset path.
 
 pub mod snapshot;
@@ -66,8 +70,21 @@ pub fn key_last_accepted_share_at(group_id: &str) -> String {
 pub fn key_best_share(group_id: &str) -> String {
     key(group_id, "best-share")
 }
-/// Dedup zset `share_id → counter` for exactly-once `record_share`,
+/// Dedup zset `share_id → timestamp_ms` for exactly-once `record_share`,
 /// per group. Capped to the newest [`DEDUP_KEEP`] ids by rank.
+///
+/// Scored by the SHARE'S OWN accept time, not by the per-group counter it
+/// used to use. The score's only job is rank ordering for the trim, and a
+/// counter-based one forced this zset to be wiped by every round reset
+/// (a reset zeroes the counter, so surviving high scores would have trimmed
+/// fresh low-scored markers). Wiping it meant a satellite batch that was
+/// dispatched but not yet ACKed got REAPPLIED into the fresh round on
+/// redelivery. A timestamp is monotonic across resets, so this set now
+/// survives them — matching PPLNS, whose `pplns:applied` was never reset.
+///
+/// Slight disorder between producers is harmless here: at a 100 000-deep
+/// horizon, trimming a marginally newer marker before a marginally older
+/// one changes nothing.
 pub fn key_applied(group_id: &str) -> String {
     key(group_id, "applied")
 }
@@ -86,7 +103,7 @@ pub fn key_applied(group_id: &str) -> String {
 // - `groupsolo:{id}:window:by-address` — hash `addr → Σdiff`, the AUTHORITATIVE
 //   window aggregate, maintained lock-step with the buckets in Lua
 //
-// `counter` + `applied` (the dedup set) are reused from the PROP layout so the
+// `applied` (the dedup set) is reused from the PROP layout so the
 // exactly-once contract is identical across modes.
 
 /// Index zset of live time-bucket ids for a `Window`-mode group.
@@ -121,37 +138,39 @@ const DEDUP_KEEP: i64 = 100_000;
 
 /// Atomic, optionally-idempotent append of one accepted Group-Solo share.
 /// Round state is the per-address aggregate only (no per-share zset — PROP
-/// needs sums, not individual shares). KEYS[1]=counter, [2]=total,
-/// [3]=by-address, [4]=last-accepted-share-at, [5]=applied. ARGV[1]=difficulty
-/// (string), [2]=address, [3]=timestamp_ms (string), [4]=share_id (empty ⇒
-/// no dedup), [5]=keep-count. Same exactly-once contract as the PPLNS window:
-/// with a `share_id`, a redelivered share is a no-op and the marker is
-/// recorded in the same script, so a consumer crash between apply and ack
-/// can't double-count the round. No trim — Group-Solo is a PROP round.
-/// Returns 1 on append, 0 on a deduped no-op. (The counter is still INCR'd —
-/// it scores the dedup marker zset.)
+/// needs sums, not individual shares). KEYS[1]=total, [2]=by-address,
+/// [3]=last-accepted-share-at, [4]=applied. ARGV[1]=difficulty (string),
+/// [2]=address, [3]=timestamp_ms (string), [4]=share_id (empty ⇒ no dedup),
+/// [5]=keep-count. Same exactly-once contract as the PPLNS window: with a
+/// `share_id`, a redelivered share is a no-op and the marker is recorded in
+/// the same script, so a consumer crash between apply and ack can't
+/// double-count the round. No trim — Group-Solo is a PROP round.
+/// Returns 1 on append, 0 on a deduped no-op.
+///
+/// `timestamp_ms` does double duty: the `last-accepted-share-at` touch and
+/// the dedup marker's score — see [`key_applied`] for why that is not the
+/// counter any more.
 const RECORD_SHARE_LUA: &str = r#"
 local has_dedup = ARGV[4] ~= ''
-if has_dedup and redis.call('ZSCORE', KEYS[5], ARGV[4]) then
+if has_dedup and redis.call('ZSCORE', KEYS[4], ARGV[4]) then
     return 0
 end
-local counter = redis.call('INCR', KEYS[1])
-redis.call('INCRBYFLOAT', KEYS[2], ARGV[1])
-redis.call('HINCRBYFLOAT', KEYS[3], ARGV[2], ARGV[1])
-redis.call('HSET', KEYS[4], ARGV[2], ARGV[3])
+redis.call('INCRBYFLOAT', KEYS[1], ARGV[1])
+redis.call('HINCRBYFLOAT', KEYS[2], ARGV[2], ARGV[1])
+redis.call('HSET', KEYS[3], ARGV[2], ARGV[3])
 if has_dedup then
-    redis.call('ZADD', KEYS[5], counter, ARGV[4])
-    redis.call('ZREMRANGEBYRANK', KEYS[5], 0, -tonumber(ARGV[5]) - 1)
+    redis.call('ZADD', KEYS[4], ARGV[3], ARGV[4])
+    redis.call('ZREMRANGEBYRANK', KEYS[4], 0, -tonumber(ARGV[5]) - 1)
 end
 return 1
 "#;
 
 /// Atomic, optionally-idempotent append of one accepted share into its TIME
-/// bucket for a `Window`-mode group. KEYS[1]=counter, [2]=applied (dedup zset),
-/// [3]=wbuckets (index zset), [4]=window:by-address, [5]=wbucket:{bid},
-/// [6]=last-accepted-share-at. ARGV[1]=difficulty (string), [2]=address,
+/// bucket for a `Window`-mode group. KEYS[1]=applied (dedup zset),
+/// [2]=wbuckets (index zset), [3]=window:by-address, [4]=wbucket:{bid},
+/// [5]=last-accepted-share-at. ARGV[1]=difficulty (string), [2]=address,
 /// [3]=share_id (empty ⇒ no dedup), [4]=dedup keep-count, [5]=bucket_id,
-/// [6]=timestamp_ms.
+/// [6]=timestamp_ms (also the dedup marker's score — see [`key_applied`]).
 ///
 /// Aggregates the share into its time bucket + the window aggregate +
 /// registers the bucket in the index zset, all indivisibly so a snapshot taken
@@ -160,17 +179,16 @@ return 1
 /// no-op. Returns 1 on append, 0 on a deduped no-op.
 const RECORD_SHARE_WINDOWED_LUA: &str = r#"
 local has_dedup = ARGV[3] ~= ''
-if has_dedup and redis.call('ZSCORE', KEYS[2], ARGV[3]) then
+if has_dedup and redis.call('ZSCORE', KEYS[1], ARGV[3]) then
     return 0
 end
-local counter = redis.call('INCR', KEYS[1])
-redis.call('HINCRBYFLOAT', KEYS[5], ARGV[2], ARGV[1])
-redis.call('ZADD', KEYS[3], ARGV[5], ARGV[5])
 redis.call('HINCRBYFLOAT', KEYS[4], ARGV[2], ARGV[1])
-redis.call('HSET', KEYS[6], ARGV[2], ARGV[6])
+redis.call('ZADD', KEYS[2], ARGV[5], ARGV[5])
+redis.call('HINCRBYFLOAT', KEYS[3], ARGV[2], ARGV[1])
+redis.call('HSET', KEYS[5], ARGV[2], ARGV[6])
 if has_dedup then
-    redis.call('ZADD', KEYS[2], counter, ARGV[3])
-    redis.call('ZREMRANGEBYRANK', KEYS[2], 0, -tonumber(ARGV[4]) - 1)
+    redis.call('ZADD', KEYS[1], ARGV[6], ARGV[3])
+    redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -tonumber(ARGV[4]) - 1)
 end
 return 1
 "#;
@@ -256,7 +274,7 @@ impl GroupRoundStore {
     /// Append one accepted share to the round, optionally exactly-once.
     ///
     /// Runs the whole append (total/by-address increments + the
-    /// `last-accepted-share-at` touch, + the dedup-marker counter) as one
+    /// `last-accepted-share-at` touch, + the dedup marker) as one
     /// indivisible Lua script ([`RECORD_SHARE_LUA`]) — same atomicity the old
     /// `MULTI/EXEC` gave. With a `Some(share_id)` it also dedups: a
     /// redelivered share whose id is still in the per-group dedup set is a
@@ -276,7 +294,6 @@ impl GroupRoundStore {
         let mut conn = self.conn.clone();
 
         let applied: i64 = redis::Script::new(RECORD_SHARE_LUA)
-            .key(key_counter(group_id))
             .key(key_total(group_id))
             .key(key_by_address(group_id))
             .key(key_last_accepted_share_at(group_id))
@@ -312,7 +329,6 @@ impl GroupRoundStore {
         let bucket_id = timestamp_ms.div_euclid(WINDOW_BUCKET_MS);
 
         let applied: i64 = redis::Script::new(RECORD_SHARE_WINDOWED_LUA)
-            .key(key_counter(group_id))
             .key(key_applied(group_id))
             .key(key_window_buckets(group_id))
             .key(key_window_by_address(group_id))
@@ -557,16 +573,27 @@ impl GroupRoundStore {
     pub async fn reset_for_block_found(&self, group_id: &str) -> Result<(), RoundError> {
         let mut conn = self.conn.clone();
         let keys = vec![
-            key_counter(group_id),
             key_total(group_id),
             key_by_address(group_id),
             key_rejected_shares(group_id),
             key_best_share(group_id),
-            // The dedup zset is scored by the per-group counter, which resets
-            // here — so it MUST reset with the round. Leaving stale high-scored
-            // entries would make `ZREMRANGEBYRANK` trim freshly-added low-scored
-            // markers, breaking exactly-once on consumer-redelivery.
-            key_applied(group_id),
+            // `key_applied` — the dedup zset — is deliberately NOT here.
+            //
+            // It used to be, and it had to be: the marker was scored by the
+            // per-group counter, which resets here, so stale high-scored
+            // entries would have made `ZREMRANGEBYRANK` trim freshly-added
+            // low-scored markers. But wiping it opened a hole PPLNS does not
+            // have (`pplns:applied` is never reset — its counter is
+            // monotonic): a batch of up to 256 shares dispatched by the
+            // satellite but not yet ACKed, with a reset landing in between,
+            // would be REAPPLIED into the fresh round on redelivery — work
+            // already accounted for in the round that was just wiped.
+            //
+            // The marker is scored by the share's own `timestamp_ms` now, so
+            // rank order survives a reset and the zset does not need to.
+            // `key_counter` stays in this list only to clear keys written by
+            // versions that scored by it; nothing reads it any more.
+            key_counter(group_id),
         ];
         let _: i64 = conn.del(keys).await?;
         // Window-mode keys are dynamic (one per live time bucket) — drop them
@@ -581,15 +608,14 @@ impl GroupRoundStore {
     pub async fn reset_full(&self, group_id: &str) -> Result<(), RoundError> {
         let mut conn = self.conn.clone();
         let keys = vec![
-            key_counter(group_id),
             key_total(group_id),
             key_by_address(group_id),
             key_rejected_shares(group_id),
             key_best_share(group_id),
             key_last_accepted_share_at(group_id),
-            // Round-scoped dedup set — reset with the round (see
-            // `reset_for_block_found`).
-            key_applied(group_id),
+            // NOT `key_applied` — see `reset_for_block_found` for why the
+            // dedup set must survive a reset. Legacy counter key only.
+            key_counter(group_id),
         ];
         let _: i64 = conn.del(keys).await?;
         // Window-mode keys (dynamic per-bucket) — drop them too so a dissolve
