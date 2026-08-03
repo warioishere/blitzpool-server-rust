@@ -414,8 +414,8 @@ dependencies = [
 
 [[package]]
 name = "bitcoin_core_sv2"
-version = "0.4.0"
-source = "git+https://github.com/warioishere/sv2-apps.git?rev=c2cf6f2f92cad2d337a861efff76d65988742afa#c2cf6f2f92cad2d337a861efff76d65988742afa"
+version = "0.5.0"
+source = "git+https://github.com/stratum-mining/sv2-apps.git?tag=v0.7.0#d7d556d1a3c7e1c26dfccd076b491a38c038a5e0"
 dependencies = [
  "async-channel",
  "bitcoin-capnp-types 0.1.2",
@@ -507,6 +507,7 @@ dependencies = [
  "chrono",
  "clap",
  "hex",
+ "jd_server_sv2",
  "redis",
  "serde",
  "serde_json",
@@ -774,21 +775,6 @@ version = "2.2.5"
 dependencies = [
  "thiserror 1.0.69",
  "tokio",
-]
-
-[[package]]
-name = "bp-job-declaration"
-version = "2.2.5"
-dependencies = [
- "async-channel",
- "bitcoin",
- "bitcoin_core_sv2",
- "bp-regtest-harness",
- "stratum-core",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -2337,6 +2323,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotpath"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7d9982fcb4356a5260502f0e646411ec1feb2962cc98c230777104a8d1c5ed3"
+dependencies = [
+ "hotpath-macros",
+]
+
+[[package]]
+name = "hotpath-macros"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4398eddb78466298f1ddcc739abbbd8a942e541d1972c7590bd83de364e626e0"
+
+[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2654,6 +2655,21 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jd_server_sv2"
+version = "0.5.0"
+source = "git+https://github.com/stratum-mining/sv2-apps.git?tag=v0.7.0#d7d556d1a3c7e1c26dfccd076b491a38c038a5e0"
+dependencies = [
+ "async-channel",
+ "async-trait",
+ "dashmap",
+ "hotpath",
+ "serde",
+ "stratum-apps",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "job_declaration_sv2"
@@ -4581,8 +4597,8 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stratum-apps"
-version = "0.6.0"
-source = "git+https://github.com/warioishere/sv2-apps.git?rev=c2cf6f2f92cad2d337a861efff76d65988742afa#c2cf6f2f92cad2d337a861efff76d65988742afa"
+version = "0.7.0"
+source = "git+https://github.com/stratum-mining/sv2-apps.git?tag=v0.7.0#d7d556d1a3c7e1c26dfccd076b491a38c038a5e0"
 dependencies = [
  "async-channel",
  "bitcoin_core_sv2",
@@ -4606,9 +4622,9 @@ dependencies = [
 
 [[package]]
 name = "stratum-core"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7b4d4e495ede8387185f9d2c2bea6318b007e5c2e318f071d772c28f947a4f6"
+checksum = "72fa00ca1fb8af001a56c8a6c36cda416237aa0d1c5e6805fc50d6d10c1181d7"
 dependencies = [
  "binary_sv2",
  "bitcoin",

@@ -59,6 +59,7 @@ chrono = { workspace = true }
 # JobClassification enum used in the per-test ShareAccept builder.
 bp-stratum-v1 = { workspace = true }
 bp-stratum-v2 = { workspace = true }
+jd_server_sv2 = { workspace = true }
 bp-share = { workspace = true }
 bp-protocol-detect = { workspace = true }
 bp-mining-job = { workspace = true }

@@ -6,7 +6,6 @@ members = [
     "crates/bp-db",
     "crates/bp-bitcoin",
     "crates/bp-template-distribution",
-    "crates/bp-job-declaration",
     "crates/bp-share",
     "crates/bp-mining-job",
     "crates/bp-vardiff",
@@ -156,26 +155,33 @@ proptest = "1"
 # Hochziehen auf neuen sv2-apps-Stand: rev tauschen + `cargo update -p
 # bitcoin_core_sv2`.
 #
-# FORK-PIN: warioishere/sv2-apps @ branch v0.6.0-blitzpool = upstream
-# RELEASE TAG v0.6.0 + EIN Patch-Commit, der den min_interval-Sleep im
-# v31x-TDP-Monitor durch skip-statt-sleep ersetzt (sv2-apps#541, upstream
-# ungefixt). Baut auf binary_sv2 v6 (stratum-core 0.5.0). Rückweg auf Upstream
-# + Revert-Recipe: siehe UPSTREAM_DEPS.md.
-bitcoin_core_sv2 = { git = "https://github.com/warioishere/sv2-apps.git", rev = "c2cf6f2f92cad2d337a861efff76d65988742afa" }
+# UPSTREAM-PIN: stratum-mining/sv2-apps RELEASE TAG v0.7.0 (rev d7d556d1).
+# Der Fork ist WEG. Er trug genau einen Patch — skip-statt-sleep im
+# v31x-TDP-Monitor gegen sv2-apps#541 — und v0.7.0 löst dasselbe Problem
+# besser: im min_interval-Fenster wird `fee_threshold = MAX_MONEY` gesetzt,
+# damit Core gar nicht erst wegen Fees aufweckt; `waitNext` bleibt permanent
+# offen, Tip-Wechsel werden sofort erkannt (Commit 4b4a55cd, 2026-07-07).
+# Baut weiter auf binary_sv2 v6 (stratum-core 0.5.1).
+bitcoin_core_sv2 = { git = "https://github.com/stratum-mining/sv2-apps.git", tag = "v0.7.0" }
 # stratum-core liefert `parsers_sv2::TemplateDistribution` und die Subprotokoll-
 # Strukturen, die wir zum Bauen von SubmitSolution/CoinbaseOutputConstraints
 # brauchen. bitcoin_core_sv2 re-exportiert das (noch) nicht.
-# Gepinnt auf den crates.io-semver `0.5.0` — exakt die Version, die das
-# sv2-apps-Release v0.6.0 für bitcoin_core_sv2/stratum-apps pinnt, damit Cargo
-# EINEN stratum-core-Graph (binary_sv2 v6) baut. Fester semver statt bewegliches
-# `branch = "main"` → reproduzierbar.
-stratum-core = "0.5.0"
+# Fester crates.io-semver — exakt die Version, die sv2-apps v0.7.0 pinnt, damit
+# Cargo EINEN stratum-core-Graph (binary_sv2 v6) baut.
+stratum-core = "0.5.1"
 # stratum-apps liefert die App-Layer-Helfer für SV2 (Noise-wrapped tokio
 # TcpStream via `network_helpers::accept_noise_connection`, key_utils,
 # task_manager, custom_mutex). Feature `pool` zieht network + config + core
-# + with_buffer_pool. Selber rev wie bitcoin_core_sv2 damit Cargo nur einen
+# + with_buffer_pool. Selber tag wie bitcoin_core_sv2 damit Cargo nur einen
 # stratum-core-Graph baut. Runtime-Dep, kein Source-Copy.
-stratum-apps = { git = "https://github.com/warioishere/sv2-apps.git", rev = "c2cf6f2f92cad2d337a861efff76d65988742afa", features = ["pool"] }
+stratum-apps = { git = "https://github.com/stratum-mining/sv2-apps.git", tag = "v0.7.0", features = ["pool"] }
+# SRIs eigene JDS-Bibliothek. Wir brauchen daraus genau
+# `job_declarator::job_validation::bitcoin_core_ipc::BitcoinCoreIPCEngine`:
+# den gepflegten Weg, einen deklarierten Job von bitcoin-core per `checkBlock`
+# prüfen zu lassen (SV2-Spec §6.1 "Maintaining an internal mempool") und eine
+# Lösung über den JDP-IPC zu propagieren (§6.4.9 MUST). Reines `[lib]`-Crate,
+# selber tag damit Cargo einen Graph baut.
+jd_server_sv2 = { git = "https://github.com/stratum-mining/sv2-apps.git", tag = "v0.7.0" }
 # SipHash-2-4 als pure-math-Lib für SHORT_TX_ID-Hashing
 # (TS portiert eigene Impl in sv2-siphash.ts; in Rust nehmen wir
 # `siphasher` — die aktuell gepflegte Standard-Crate, MIT/Apache).
@@ -225,7 +231,6 @@ bp-config = { path = "crates/bp-config" }
 bp-db = { path = "crates/bp-db" }
 bp-bitcoin = { path = "crates/bp-bitcoin" }
 bp-template-distribution = { path = "crates/bp-template-distribution" }
-bp-job-declaration = { path = "crates/bp-job-declaration" }
 bp-share = { path = "crates/bp-share" }
 bp-mining-job = { path = "crates/bp-mining-job" }
 bp-vardiff = { path = "crates/bp-vardiff" }
