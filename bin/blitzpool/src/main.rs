@@ -612,11 +612,6 @@ async fn main() -> ExitCode {
                 .as_ref()
                 .map(|e| e.coinbase_budget().get())
                 .unwrap_or(DEFAULT_COINBASE_WEIGHT_BUDGET),
-            has_fee_output: engines
-                .pplns
-                .as_ref()
-                .map(|e| e.config().fee_address.is_some())
-                .unwrap_or(false),
         };
         let crons = crons::spawn(
             &handles,

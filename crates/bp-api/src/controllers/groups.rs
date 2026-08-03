@@ -447,14 +447,15 @@ where
         .as_ref()
         .ok_or(ApiError::Unavailable("group-solo not wired"))?;
     let cfg = engine.config();
-    let has_fee_output = cfg.fee_address.is_some() && cfg.fee_percent > 0.0;
     Ok(Json(GroupCoinbaseCapacity {
-        max_members: bp_pplns_engine::max_coinbase_outputs(
-            cfg.coinbase_weight_budget,
-            has_fee_output,
-        ),
+        max_members: bp_pplns_engine::max_coinbase_outputs(cfg.coinbase_weight_budget),
         weight_budget: cfg.coinbase_weight_budget,
-        has_fee_output,
+        // Constant now, and the field's documented meaning is what became
+        // constant: §4 makes the pool output structural, so a slot is
+        // reserved at every fee. It used to report `false` for a 0 %-fee
+        // pool, which is precisely where the ceiling was one too high.
+        // Kept on the wire because the UI declares it; drop both together.
+        has_fee_output: true,
     }))
 }
 

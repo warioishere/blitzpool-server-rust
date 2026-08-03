@@ -204,12 +204,6 @@ impl PplnsEngineConfig {
         }
         Ok(self)
     }
-
-    /// Fee output disabled? Either no address configured or a zero
-    /// percent (fee suppressed when `feePercent === 0`).
-    pub fn fee_suppressed(&self) -> bool {
-        self.fee_address.is_none() || self.fee_percent <= 0.0
-    }
 }
 
 /// Field-level validation errors for [`PplnsEngineConfig::try_new`].
@@ -458,34 +452,19 @@ mod tests {
         ));
     }
 
+    /// A non-zero fee still validates. (The `fee_suppressed()` helper this
+    /// used to also assert on is gone: it answered "is there a fee output?"
+    /// with `fee_address.is_none() || fee_percent <= 0.0`, and §4 makes the
+    /// pool output structural at every fee. Nothing in production read it —
+    /// the same dead assumption that put `max_coinbase_outputs` one over.)
     #[test]
-    fn fee_suppressed_when_no_address() {
-        let cfg = valid();
-        assert!(cfg.fee_suppressed());
-    }
-
-    #[test]
-    fn fee_suppressed_when_zero_percent() {
-        let cfg = PplnsEngineConfig {
-            fee_address: Some(AddressId::new("bc1qexample0000000000000000000000").unwrap()),
-            fee_percent: 0.0,
-            ..valid()
-        };
-        assert!(cfg.fee_suppressed());
-    }
-
-    #[test]
-    fn fee_active_when_address_and_percent() {
-        // A REAL address: this used to read `bc1qexample000…`, which
-        // `AddressId` accepts and `bitcoin::Address` does not — so the test
-        // asserted that a config the coinbase builder cannot use validates
-        // cleanly.
-        let cfg = PplnsEngineConfig {
+    fn a_non_zero_fee_validates() {
+        PplnsEngineConfig {
             fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).unwrap()),
             fee_percent: 1.5,
             ..valid()
-        };
-        assert!(!cfg.fee_suppressed());
-        cfg.try_new().expect("active fee config validates");
+        }
+        .try_new()
+        .expect("active fee config validates");
     }
 }

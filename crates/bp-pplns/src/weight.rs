@@ -132,17 +132,31 @@ pub fn output_weight_for_address(address: &str) -> u32 {
 /// weight budget can hold. Pessimistic on purpose: assumes every output is
 /// the heaviest standard address type (P2TR / P2WSH = `COINBASE_OUTPUT_WEIGHT`),
 /// so real P2WPKH-heavy populations fit *more* than this. The fixed coinbase
-/// overhead is reserved first — structural base, the budget safety margin, the
-/// segwit-commitment OP_RETURN, and (when `has_fee_output`) the one pool-fee
-/// output. Returns at least 1 even on a degenerate sub-overhead budget.
-pub fn max_coinbase_outputs(budget: u32, has_fee_output: bool) -> u64 {
-    let fee_w = if has_fee_output {
-        COINBASE_OUTPUT_WEIGHT
-    } else {
-        0
-    };
-    let fixed =
-        COINBASE_BASE_WEIGHT + BUDGET_SAFETY_MARGIN_WU + COINBASE_WITNESS_COMMITMENT_WEIGHT + fee_w;
+/// overhead is reserved first — structural base, the budget safety margin,
+/// the segwit-commitment OP_RETURN and the pool output. Returns at least 1
+/// even on a degenerate sub-overhead budget.
+///
+/// **The pool output is reserved unconditionally**, matching what
+/// `build_weight_distribution`'s blockspace cut actually does. This used to
+/// take a `has_fee_output` flag, left over from a model where a 0 % fee
+/// meant no fee output. §4 ended that: `pay_P` is the residual, so
+/// `pool_weight_for` floors at 1 and `payout_entries_at` emits the pool
+/// output at every fee — a 0 % fee just makes it small, not absent. With
+/// the flag `false` this returned ONE MORE than the cut can publish, so
+/// `GroupService` admitted a member the coinbase then folded away, and
+/// under `WithheldValue::ToPool` their whole share went to the pool. That
+/// is exactly the ledger-free invariant `coinbase_max_members` exists to
+/// hold.
+///
+/// The flag had also drifted across its three callers — two derived it as
+/// `fee_address.is_some() && fee_percent > 0.0`, the capacity cron as
+/// `fee_address.is_some()` alone. Removing it makes all three agree by
+/// construction.
+pub fn max_coinbase_outputs(budget: u32) -> u64 {
+    let fixed = COINBASE_BASE_WEIGHT
+        + BUDGET_SAFETY_MARGIN_WU
+        + COINBASE_WITNESS_COMMITMENT_WEIGHT
+        + COINBASE_OUTPUT_WEIGHT; // the pool output — structural under §4
     if budget <= fixed {
         return 1;
     }
@@ -385,25 +399,33 @@ mod tests {
         assert_eq!(output_weight_for_address(""), 0);
     }
 
+    /// The pool output costs one member slot, always.
+    ///
+    /// This replaces a test that compared the old `has_fee_output` flag
+    /// against itself (`without_fee == with_fee + 1`). It could not fail
+    /// while the flag existed, and it never looked at what the builder
+    /// reserves — so it cemented the very off-by-one it was meant to
+    /// guard. The real guarantee is cross-checked against
+    /// `build_weight_distribution` in
+    /// `weights::tests::the_member_ceiling_is_what_the_blockspace_cut_publishes`.
     #[test]
-    fn max_outputs_reserves_one_slot_for_the_fee_output() {
-        // With a fee output present, exactly one fewer member output fits —
-        // the fee output costs the same worst-case slot as any miner output.
-        let with_fee = max_coinbase_outputs(50_000, true);
-        let without_fee = max_coinbase_outputs(50_000, false);
-        assert_eq!(
-            without_fee,
-            with_fee + 1,
-            "the reserved fee output must cost exactly one member slot"
-        );
+    fn max_outputs_reserves_a_slot_for_the_pool_output() {
+        let fixed =
+            COINBASE_BASE_WEIGHT + BUDGET_SAFETY_MARGIN_WU + COINBASE_WITNESS_COMMITMENT_WEIGHT;
+        // One worst-case output of headroom above the non-pool overhead
+        // still fits NO member: that slot is the pool's.
+        assert_eq!(max_coinbase_outputs(fixed + COINBASE_OUTPUT_WEIGHT), 1);
+        // Two, and exactly one member fits.
+        assert_eq!(max_coinbase_outputs(fixed + 2 * COINBASE_OUTPUT_WEIGHT), 1);
+        assert_eq!(max_coinbase_outputs(fixed + 3 * COINBASE_OUTPUT_WEIGHT), 2);
     }
 
     #[test]
     fn max_outputs_degenerate_budget_returns_at_least_one() {
         // Budget at/below the fixed overhead can't fit any member but never
         // reports zero capacity.
-        assert_eq!(max_coinbase_outputs(0, true), 1);
-        assert_eq!(max_coinbase_outputs(COINBASE_BASE_WEIGHT, false), 1);
+        assert_eq!(max_coinbase_outputs(0), 1);
+        assert_eq!(max_coinbase_outputs(COINBASE_BASE_WEIGHT), 1);
     }
 
     /// A usable pool-output recipient, for the cases that are about

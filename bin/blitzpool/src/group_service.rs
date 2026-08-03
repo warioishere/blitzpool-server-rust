@@ -57,11 +57,9 @@ pub(crate) async fn spawn(
     group_solo: &GroupSoloEngine,
 ) -> Result<SharedGroupService, GroupServiceSpawnError> {
     let cfg = group_solo.config();
-    let has_fee_output = cfg.fee_address.is_some() && cfg.fee_percent > 0.0;
-    let coinbase_max_members = max_coinbase_outputs(cfg.coinbase_weight_budget, has_fee_output);
+    let coinbase_max_members = max_coinbase_outputs(cfg.coinbase_weight_budget);
     info!(
         coinbase_weight_budget = cfg.coinbase_weight_budget,
-        has_fee_output,
         coinbase_max_members,
         "group-service: group member ceiling derived from the group-solo coinbase budget"
     );

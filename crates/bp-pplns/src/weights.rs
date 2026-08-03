@@ -672,6 +672,95 @@ mod tests {
         }
     }
 
+    /// A distinct, valid P2WSH address per index — the worst-case output
+    /// weight (172 WU), so the ceiling's own pessimistic assumption is the
+    /// one being exercised.
+    fn worst_case_addr(i: u32) -> String {
+        use bitcoin::hashes::Hash as _;
+        let mut h = [0u8; 32];
+        h[..4].copy_from_slice(&i.to_le_bytes());
+        let script = bitcoin::ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array(h));
+        bitcoin::Address::from_script(&script, bitcoin::Network::Bitcoin)
+            .expect("p2wsh script is addressable")
+            .to_string()
+    }
+
+    /// MONEY / Group-Solo's ledger-free invariant: `max_coinbase_outputs`
+    /// is what `GroupService` refuses a join against, so it MUST equal what
+    /// the blockspace cut can actually publish. One too many and a member is
+    /// admitted whose output the cut then folds away — and under
+    /// `WithheldValue::ToPool` their entire share goes to the pool, with no
+    /// ledger to remember it.
+    ///
+    /// Cross-checked against the builder rather than against the formula.
+    /// The test this replaces compared the old `has_fee_output` flag with
+    /// itself and so could not see that at `fee_percent = 0` the ceiling was
+    /// one too high — the pool output is structural under §4 and is emitted
+    /// at every fee.
+    #[test]
+    fn the_member_ceiling_is_what_the_blockspace_cut_publishes() {
+        for budget in [
+            crate::weight::MIN_COINBASE_WEIGHT_BUDGET,
+            1_500,
+            2_000,
+            5_000,
+            10_000,
+        ] {
+            let ceiling = crate::weight::max_coinbase_outputs(budget) as usize;
+            // A 0 % fee is the case the old flag got wrong; 1.5 % is the
+            // ordinary one. Both must land on the same ceiling, because the
+            // pool output exists either way.
+            for fee_percent in [0.0, 1.5] {
+                let fee = addr(FEE);
+                // Exactly `ceiling` miners must ALL be published.
+                let shares: HashMap<AddressId, f64> = (0..ceiling as u32)
+                    .map(|i| (addr(&worst_case_addr(i)), 1.0))
+                    .collect();
+                let balances = HashMap::new();
+                let d = build_weight_distribution(WeightDistributionInput {
+                    coinbase_weight_budget: budget,
+                    fee_percent,
+                    // Every miner gets an equal 1/ceiling slice of a whole
+                    // block, so `min_payout` never withholds anyone — the
+                    // blockspace cut is the only thing that can trim here.
+                    min_payout_sats: Some(Sats(546)),
+                    ..base_input(&shares, &balances, &fee)
+                })
+                .unwrap();
+                assert_eq!(
+                    d.published().count(),
+                    ceiling,
+                    "budget {budget} at {fee_percent} % fee: the ceiling says {ceiling} \
+                     members fit, the cut published {} — a member the pool admits and \
+                     then cannot pay forfeits their whole share",
+                    d.published().count()
+                );
+                assert_eq!(
+                    d.budget_telemetry.trimmed_count, 0,
+                    "budget {budget} at {fee_percent} %: nothing may be trimmed at the ceiling"
+                );
+
+                // And one more must NOT fit — otherwise the ceiling is
+                // merely conservative and this test proves nothing.
+                let shares: HashMap<AddressId, f64> = (0..=ceiling as u32)
+                    .map(|i| (addr(&worst_case_addr(i)), 1.0))
+                    .collect();
+                let d = build_weight_distribution(WeightDistributionInput {
+                    coinbase_weight_budget: budget,
+                    fee_percent,
+                    min_payout_sats: Some(Sats(546)),
+                    ..base_input(&shares, &balances, &fee)
+                })
+                .unwrap();
+                assert_eq!(
+                    d.budget_telemetry.trimmed_count, 1,
+                    "budget {budget} at {fee_percent} %: one past the ceiling must be \
+                     trimmed, or the ceiling is not the real limit"
+                );
+            }
+        }
+    }
+
     /// `scores project to SCORE_PRECISION-scaled fractions`
     #[test]
     fn projects_share_fractions() {
