@@ -127,6 +127,12 @@ pub(crate) async fn spawn(
         Arc<crate::device_status_gate::Gate>,
         crate::device_status_gate::SubscribedAddresses,
     )>,
+    // ext 0x0003 §10: a block booked through a Stratum sink's immediate
+    // apply must invalidate the published payout distributions exactly
+    // like a JDP-declared one. Filled once the JDP server exists.
+    settle: std::sync::Arc<
+        std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
+    >,
 ) -> Result<StratumHandles, StratumSpawnError> {
     if foundation.tdp.is_none() {
         warn!("stratum: TDP missing (--skip-tdp); skipping unified SV1+SV2 listener bind");
@@ -179,6 +185,7 @@ pub(crate) async fn spawn(
         gate.clone(),
         Arc::clone(&live_sessions),
         job_cache.clone(),
+        settle.clone(),
     )?;
     let noise_config = stratum_v2::build_noise_config(cfg)?;
     let bridge = stratum_v2::build_bridge();
@@ -194,6 +201,7 @@ pub(crate) async fn spawn(
         gate,
         Arc::clone(&live_sessions),
         job_cache,
+        settle,
     );
 
     // Pair SV1 + SV2 servers by port. Both builders enumerate ports

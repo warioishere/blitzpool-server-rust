@@ -212,10 +212,6 @@ impl TdpBlockSubmissionSink {
     /// Wire the ext 0x0003 §10 settlement hook onto this sink's applier,
     /// so a block booked through the Stratum path invalidates the
     /// published payout distributions exactly like a JDP-declared one.
-    // Never called: the §10 settle slot is wired on the gated
-    // (confirmation-watcher) path only, not on the sinks' immediate
-    // apply. Kept pending the decision to wire or drop it.
-    #[allow(dead_code)]
     pub(crate) fn with_settle_handle(
         mut self,
         slot: Arc<OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>,
@@ -1329,6 +1325,91 @@ mod tests {
     use bp_mining_job::{build_mining_job, CoinbaseTemplate, PayoutEntry, EXTRANONCE_SLOT_LEN};
     use bp_stratum_v1::ActiveSV1Template;
     use bp_template_distribution::TdpConfig;
+
+    /// ext 0x0003 §10: a block booked through a Stratum sink's IMMEDIATE
+    /// (ungated) apply must invalidate every published payout distribution,
+    /// exactly like a JDP-declared one does.
+    ///
+    /// This was wired for the confirmation-gated path and the JDP sink only.
+    /// The published weights encode the pre-settlement balances, so a 0x0003
+    /// JDC still mining them would pay those balances out a second time.
+    ///
+    /// The slot itself can no longer be forgotten — `stratum::spawn` and both
+    /// `build_per_port_servers` take it as a required argument. What this test
+    /// covers is the other half: that a filled slot actually settles.
+    #[tokio::test(flavor = "current_thread")]
+    async fn immediate_apply_settles_the_published_distributions() {
+        use bp_stratum_v2::bridge::{JdpDeclaredJobRegistry, PayoutDistributionEntry};
+        use bp_stratum_v2::jdp::payout_distribution::WeightedOutput;
+        use bp_stratum_v2::jdp_server::{JdpServerHooks, StratumV2JdpServer};
+        use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
+
+        let bridge = std::sync::Arc::new(std::sync::RwLock::new(JdpDeclaredJobRegistry::new()));
+        bridge
+            .write()
+            .unwrap()
+            .publish_pool_wide(PayoutDistributionEntry {
+                distribution_id: 1,
+                pool_payout: WeightedOutput {
+                    script_pubkey: vec![0x51],
+                    weight: 1,
+                },
+                payouts: vec![WeightedOutput {
+                    script_pubkey: vec![0x00, 0x14, 0xAA],
+                    weight: 100,
+                }],
+                dust_limits: vec![546],
+                additional_outputs: vec![],
+                reference_reward_sats: 312_500_000,
+                payouts_fingerprint: Some([1u8; 32]),
+                bookable: true,
+                owner: None,
+                jdp_session_id: None,
+                published_at_ms: 1_001,
+            });
+        assert!(
+            bridge.read().unwrap().current_pool_wide().is_some(),
+            "precondition: a distribution is published and current"
+        );
+
+        let noise = NoiseConfig::parse_strings(
+            "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72",
+            "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n",
+            DEFAULT_CERT_VALIDITY,
+        )
+        .expect("noise config");
+        let server = StratumV2JdpServer::spawn(
+            noise,
+            JdpServerHooks::no_op(),
+            bridge.clone(),
+            std::time::Duration::from_secs(3600),
+        );
+
+        let slot = std::sync::Arc::new(std::sync::OnceLock::new());
+        let _ = slot.set(server.distribution_handle());
+
+        let applier = BlockFoundApplier {
+            settle: Some(slot),
+            ..Default::default()
+        };
+        applier.settle_distributions();
+
+        assert!(
+            bridge.read().unwrap().current_pool_wide().is_none(),
+            "a settled block must leave no distribution current — a JDC still \
+             mining it would pay the pre-settlement balances a second time"
+        );
+        server.shutdown().await;
+    }
+
+    /// No JDP server (the common deployment): settling is a no-op, not a
+    /// panic. The slot stays empty because nothing ever fills it.
+    #[test]
+    fn settling_without_a_jdp_server_is_a_no_op() {
+        let applier = BlockFoundApplier::default();
+        assert!(applier.settle.is_none());
+        applier.settle_distributions();
+    }
 
     /// The header stores `prevHash` little-endian (internal); the function must
     /// reverse it back to the big-endian display hash `getblockheader` wants.
