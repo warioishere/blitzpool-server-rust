@@ -948,9 +948,10 @@ async fn main() -> ExitCode {
                         },
                         engines.blockparty.clone(),
                     ));
-                // Spawn the JDP template-tx cache only when the pool needs the
-                // txs (`jdp_orphan_submitblock = true` → reconstruct the full
-                // block + `submitblock`). Spawn it BEFORE jdp::spawn so its
+                // Spawn the JDP template-tx cache when the pool needs the txs
+                // (`jdp_orphan_submitblock` → reconstruct the full block +
+                // `submitblock`); on by default, so this normally runs. Spawn
+                // it BEFORE jdp::spawn so its
                 // broadcast subscription registers before the first NewTemplate
                 // (see `feedback-tdp-initial-template-drain`).
                 let template_tx_cache: Option<

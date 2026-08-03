@@ -518,7 +518,7 @@ pub struct StratumConfig {
     pub vardiff_silence_easing_enabled: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sv2Config {
     /// 32-byte secp256k1 authority private key in hex. When absent
@@ -551,12 +551,14 @@ pub struct Sv2Config {
     /// 2026-08-03. It arrives with Core v32 via sv2-apps#593; do not wire it
     /// before then, the call would silently do nothing.
     ///
-    /// `false` (default): on `PushSolution` the pool logs only — the JDC
-    /// propagates through its own node, which the spec guarantees happens
-    /// regardless. The pool then contributes nothing to shrinking the orphan
-    /// window, so a deployment that actually serves JDCs wants this on.
-    /// `true`: reconstruct the block and submit it via `bitcoind submitblock`.
-    #[serde(default)]
+    /// `true` (default): reconstruct the block and submit it via `bitcoind
+    /// submitblock`. Costs one RPC per found block — the node answers
+    /// "duplicate" when the JDC's copy already arrived, which is the normal
+    /// case and is harmless.
+    /// `false`: log only. The JDC still propagates through its own node, so
+    /// the block travels either way; the pool just stops contributing the
+    /// second path that shrinks the orphan window.
+    #[serde(default = "default_true")]
     pub jdp_orphan_submitblock: bool,
     /// Bitcoin-core data directory for the JDP validation IPC (SV2 §6.1).
     /// When set, every declared Custom Job is handed to bitcoin-core's
@@ -576,6 +578,22 @@ pub struct Sv2Config {
     /// blocks. Default 60.
     #[serde(default)]
     pub jdp_payout_distribution_interval_secs: Option<u64>,
+}
+
+impl Default for Sv2Config {
+    /// A config with no `[sv2]` section at all must land on the same values a
+    /// present-but-empty one would. `#[derive(Default)]` would not: serde's
+    /// per-field defaults only run while deserializing a table that exists, so
+    /// every `default = "…"` field would silently fall back to the type's own
+    /// zero. `jdp_orphan_submitblock` is the one where that matters — off means
+    /// the pool stops doing what §6.4.9 asks of a JDS.
+    fn default() -> Self {
+        // Deserialize an empty table rather than list fields: "no section" is
+        // then the same answer as "empty section" BY CONSTRUCTION, including
+        // for every field added later. Cannot fail — an empty table is exactly
+        // what a config omitting `[sv2]` hands to serde anyway.
+        toml::from_str("").expect("empty [sv2] table applies every serde default")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1560,6 +1578,15 @@ mod tests {
         assert_eq!(cfg.aggregation.pool_stats_interval_ms, 600_000);
         // [tdp] staleness threshold defaults to 120s when unset.
         assert_eq!(cfg.tdp.staleness_threshold_secs, 120);
+        // §6.4.9 makes propagating a pushed solution a MUST for the JDS, and
+        // JSON-RPC is the only route Core v31 offers. A config that says
+        // nothing must therefore leave it ON — flipping this default back to
+        // false silently stops the pool contributing its half of the
+        // anti-orphan redundancy.
+        assert!(
+            cfg.sv2.jdp_orphan_submitblock,
+            "pool-side block propagation must default to on"
+        );
     }
 
     #[test]

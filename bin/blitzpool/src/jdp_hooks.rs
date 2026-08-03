@@ -108,15 +108,15 @@ pub(crate) fn build_jdp_hooks(
 ) -> JdpServerHooks {
     let propagator: Option<Arc<dyn BlockPropagator>> = if orphan_submitblock_enabled {
         info!(
-            "jdp: orphan-protection submitblock RPC ENABLED \
-             (`[sv2].jdp_orphan_submitblock = true`)"
+            "jdp: pool-side block propagation ENABLED (submitblock RPC) — \
+             the pool's half of the §6.4.9 redundancy"
         );
         Some(Arc::new(bitcoin_rpc))
     } else {
         info!(
-            "jdp: orphan-protection submitblock RPC DISABLED — JDC is sole \
-             block propagator (set `[sv2].jdp_orphan_submitblock = true` to enable \
-             pool-side resubmit for commercial JDC deployments)"
+            "jdp: pool-side block propagation DISABLED \
+             (`[sv2].jdp_orphan_submitblock = false`) — the JDC is the sole \
+             propagator, so the pool does not do what §6.4.9 asks of a JDS"
         );
         None
     };
@@ -278,9 +278,10 @@ fn solo_fallback_outputs(miner: &AddressId, network: BitcoinNetwork) -> Option<V
 /// Production tx-provider: pulls the newest template's
 /// `wtxid → raw_witness_tx` map from the long-lived
 /// [`TemplateTxCache`] when present. The cache is gated on
-/// `[sv2].jdp_orphan_submitblock = true` (see `main.rs`); in default
-/// mode (orphan-resubmit off) the cache is `None` and snapshot returns
-/// an empty map — the JDC then fills in via the standard
+/// `[sv2].jdp_orphan_submitblock` (see `main.rs`), which now defaults to
+/// on — the pool needs the raw txs to rebuild a JDC block it propagates.
+/// With the switch off the cache is `None` and snapshot returns an empty
+/// map; the JDC then fills in every tx via the standard
 /// `ProvideMissingTransactions` round-trip.
 ///
 /// A cache-miss with the cache present means either the cache hasn't
