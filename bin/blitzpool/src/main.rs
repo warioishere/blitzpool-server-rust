@@ -470,15 +470,16 @@ async fn main() -> ExitCode {
         )
     });
 
-    let group_service = match group_service::spawn(&handles, &production_hooks).await {
-        Ok(g) => g,
-        Err(err) => {
-            tracing::error!(%err, "group-service spawn failed");
-            eprintln!("blitzpool: {err}");
-            print_group_service_error_help(&err);
-            return ExitCode::from(7);
-        }
-    };
+    let group_service =
+        match group_service::spawn(&handles, &production_hooks, &engines.group_solo).await {
+            Ok(g) => g,
+            Err(err) => {
+                tracing::error!(%err, "group-service spawn failed");
+                eprintln!("blitzpool: {err}");
+                print_group_service_error_help(&err);
+                return ExitCode::from(7);
+            }
+        };
 
     let blockparty = match blockparty_service::spawn(&cfg, &handles, &group_service).await {
         Ok(bp) => bp,

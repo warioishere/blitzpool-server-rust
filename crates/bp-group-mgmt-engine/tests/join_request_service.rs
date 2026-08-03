@@ -18,6 +18,10 @@ use uuid::Uuid;
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
+/// Coinbase member ceiling — high enough to stay out of the way here.
+/// The cap itself is exercised in `group_service.rs`.
+const TEST_COINBASE_CAP: u64 = 10_000;
+
 async fn connect_or_skip() -> Option<PgPool> {
     let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
     match tokio::time::timeout(
@@ -87,7 +91,12 @@ fn build_services(
     JoinRequestService<NoopHooks, CapturingEmailHooks>,
     CapturingEmailHooks,
 ) {
-    let group = Arc::new(GroupService::new(pool.clone(), Arc::new(NoopHooks), 14));
+    let group = Arc::new(GroupService::new(
+        pool.clone(),
+        Arc::new(NoopHooks),
+        14,
+        TEST_COINBASE_CAP,
+    ));
     let email = CapturingEmailHooks::new();
     let svc = JoinRequestService::new(
         pool,
