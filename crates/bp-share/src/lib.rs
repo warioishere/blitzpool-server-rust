@@ -196,43 +196,6 @@ pub fn sha256d_from_parts(parts: &[&[u8]]) -> [u8; 32] {
     Sha256::digest(first).into()
 }
 
-/// Identity of a coinbase payout list: the block reward it was built against
-/// plus its `(address, sats)` pairs in coinbase order.
-///
-/// This is the binding between a mined block and the payout accounting that
-/// must be booked for it — the distribution snapshot is stored under this
-/// value, and the block-found path recovers it from the job the winning share
-/// was built on. It lives here, in the hashing leaf, so both sides can derive
-/// it without the accounting crate having to depend on job assembly: the
-/// payout engine hashes its distributor entries, the Stratum job build hashes
-/// the `PayoutEntry` list it turns into the coinbase, and the two must agree
-/// byte-for-byte.
-///
-/// Canonical, length-prefixed encoding so no two payout lists can alias:
-/// `block_reward_sats` as 8 LE bytes, then per entry, in list order, `sats` as
-/// 8 LE bytes, the address byte length as 4 LE bytes, then the address bytes.
-/// Order is part of the identity — coinbase output order is. Streamed into the
-/// hasher, so no allocation regardless of list length.
-///
-/// The reward is in the preimage because the list alone does not always imply
-/// it: a list that leaves sats unclaimed would be the same list at two
-/// different rewards, and the second build would take over the first one's
-/// snapshot key.
-pub fn payouts_fingerprint_from_parts<'a>(
-    block_reward_sats: u64,
-    payouts: impl IntoIterator<Item = (&'a str, u64)>,
-) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(block_reward_sats.to_le_bytes());
-    for (address, sats) in payouts {
-        hasher.update(sats.to_le_bytes());
-        hasher.update((address.len() as u32).to_le_bytes());
-        hasher.update(address.as_bytes());
-    }
-    let first = hasher.finalize();
-    Sha256::digest(first).into()
-}
-
 // ============================================================================
 // Weight-proportional payouts (SV2 ext 0x0003 §4)
 // ============================================================================
@@ -637,9 +600,9 @@ pub fn claim_sats(
 /// Identity of a weight distribution: the settlement INPUTS, not any
 /// concrete satoshi outcome.
 ///
-/// The v1 [`payouts_fingerprint_from_parts`] hashes `(reward, sats)` —
-/// an identity that only works when the coinbase pays those exact
-/// sats. Under the weight model the same distribution legitimately
+/// The identity this replaced hashed `(reward, sats)` — one that only
+/// works when the coinbase pays those exact sats. Under the weight
+/// model the same distribution legitimately
 /// yields different satoshi vectors for different template revenues
 /// (`floor(weight·T/W)`), so the identity must be the thing every
 /// outcome is derived FROM: per address its integer score weight, its
@@ -1502,14 +1465,6 @@ mod tests {
         for other in [fee, fee_recipient, weight, balance, order] {
             assert_ne!(base(), other);
         }
-    }
-
-    /// `v2 never collides with v1 for byte-similar inputs (domain tag)`
-    #[test]
-    fn weights_fingerprint_is_domain_separated_from_v1() {
-        let v1 = payouts_fingerprint_from_parts(1000, [("bc1qa", 600u64)]);
-        let v2 = weights_fingerprint_from_parts(0, "bc1qpool", [("bc1qa", 600, 0i64, 0u32)]);
-        assert_ne!(v1, v2);
     }
 
     // ── Block subsidy (the settlement gate) ─────────────────────────

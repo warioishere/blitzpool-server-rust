@@ -455,59 +455,10 @@ impl WindowStore {
         })
     }
 
-    /// Snapshot accessor — convenience around [`snapshot::write_snapshot`].
-    ///
-    /// Writes the shared [`KEY_SNAPSHOT`] key, which every distribution build
-    /// overwrites. Prefer [`Self::write_snapshot_for`]: a block-found needs the
-    /// distribution its own coinbase was built from, and this key only ever
-    /// holds the most recent build's.
-    pub async fn write_snapshot(
-        &self,
-        snapshot: &snapshot::StoredSnapshot,
-        ttl_seconds: u32,
-    ) -> Result<(), RedisError> {
-        let mut conn = self.conn.clone();
-        snapshot::write_snapshot(&mut conn, KEY_SNAPSHOT, snapshot, ttl_seconds).await
-    }
-
-    /// Snapshot reader — convenience around [`snapshot::read_snapshot`].
-    /// Reads the shared key; see [`Self::write_snapshot`].
-    pub async fn read_snapshot(&self) -> Result<Option<snapshot::ParsedSnapshot>, RedisError> {
-        let mut conn = self.conn.clone();
-        snapshot::read_snapshot(&mut conn, KEY_SNAPSHOT).await
-    }
-
     /// Delete the snapshot key (after `on_block_found` consumed it).
     pub async fn delete_snapshot(&self) -> Result<(), RedisError> {
         let mut conn = self.conn.clone();
         snapshot::delete_snapshot(&mut conn, KEY_SNAPSHOT).await
-    }
-
-    /// Store a snapshot under the fingerprint of the payout list it
-    /// distributes. Concurrent builds for different rewards — and the
-    /// ext-0x0003 payout requests Job-Declaration clients make with their own
-    /// value — then no longer overwrite each other, and a block-found can ask
-    /// for exactly the distribution its coinbase was built from.
-    pub async fn write_snapshot_for(
-        &self,
-        payouts_fingerprint: &[u8; 32],
-        snapshot: &snapshot::StoredSnapshot,
-        ttl_seconds: u32,
-    ) -> Result<(), RedisError> {
-        let mut conn = self.conn.clone();
-        let key = snapshot_key_for(payouts_fingerprint);
-        snapshot::write_snapshot(&mut conn, &key, snapshot, ttl_seconds).await
-    }
-
-    /// Read the snapshot for one payout-list fingerprint. `None` when it was
-    /// never written or has since expired.
-    pub async fn read_snapshot_for(
-        &self,
-        payouts_fingerprint: &[u8; 32],
-    ) -> Result<Option<snapshot::ParsedSnapshot>, RedisError> {
-        let mut conn = self.conn.clone();
-        let key = snapshot_key_for(payouts_fingerprint);
-        snapshot::read_snapshot(&mut conn, &key).await
     }
 
     /// Delete one fingerprint-keyed snapshot.

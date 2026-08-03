@@ -459,12 +459,6 @@ async fn distinct_references_share_one_fingerprinted_snapshot() {
     );
     assert_eq!(snap.entries.len(), first.distribution.entries.len());
 
-    // The shared last-writer-wins key is no longer written at all.
-    assert!(
-        window.read_snapshot().await.expect("read ok").is_none(),
-        "the shared snapshot key must no longer be written"
-    );
-
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
     cleanup(&h.pool, &h.address_prefix).await;
 }

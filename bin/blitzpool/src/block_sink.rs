@@ -721,41 +721,35 @@ impl BlockFoundApplier {
                          proceeding (watcher reconciles)"),
                 }
 
-                // Weight-model settlement when the event carries the real
-                // coinbase's payments; the legacy exact-match prepare only
-                // remains for events produced before `actual_coinbase`
-                // existed (their schema-1 snapshots still resolve).
-                let prepared = match actual {
-                    Some(actual) => {
-                        match engine
-                            .prepare_block_found_scaled(height, actual, payouts_fingerprint)
-                            .await
-                        {
-                            Ok(p) => p,
-                            Err(err) => {
-                                error!(%err, address = address_str, height, block_hash,
-                                    "block-found: PPLNS block could not be frozen for booking — \
-                                     it is NOT parked and will not be retried; the miners its \
-                                     coinbase paid are owed their ledger entry, and until it is \
-                                     reprocessed their balances stand as if this block never \
-                                     paid them. block-reconcile will report it as unbooked");
-                                return;
-                            }
-                        }
+                // Settlement is `claim − paid` against the block's OWN
+                // coinbase, so its payments are not optional: without them
+                // there is nothing to settle against and the block is an
+                // operator reprocess.
+                let Some(actual) = actual else {
+                    error!(
+                        address = address_str,
+                        height,
+                        block_hash,
+                        "block-found: PPLNS event carries no parsed coinbase — the block is \
+                         NOT frozen and NOT booked; block-reconcile will report it as \
+                         unbooked and it must be reprocessed from its own coinbase"
+                    );
+                    return;
+                };
+                let prepared = match engine
+                    .prepare_block_found_scaled(height, actual, payouts_fingerprint)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(err) => {
+                        error!(%err, address = address_str, height, block_hash,
+                            "block-found: PPLNS block could not be frozen for booking — \
+                             it is NOT parked and will not be retried; the miners its \
+                             coinbase paid are owed their ledger entry, and until it is \
+                             reprocessed their balances stand as if this block never \
+                             paid them. block-reconcile will report it as unbooked");
+                        return;
                     }
-                    None => match engine
-                        .prepare_block_found_for(height, reward, payouts_fingerprint)
-                        .await
-                    {
-                        Ok(p) => p,
-                        Err(err) => {
-                            error!(%err, address = address_str, height, block_hash,
-                                "block-found: PPLNS block could not be frozen for booking — \
-                                 it is NOT parked and will not be retried; block-reconcile \
-                                 will report it as unbooked");
-                            return;
-                        }
-                    },
                 };
                 let pending = PendingBlock {
                     block_hash: block_hash.to_string(),
@@ -785,19 +779,20 @@ impl BlockFoundApplier {
                     warn!(address = address_str, height,
                         "block-found: PPLNS confirmation-gating unavailable (no block hash); applying immediately");
                 }
-                // Same fingerprint the gated arm uses.
-                let immediate = match actual {
-                    Some(actual) => {
-                        engine
-                            .on_block_found_scaled(height, actual, payouts_fingerprint)
-                            .await
-                    }
-                    None => {
-                        engine
-                            .on_block_found_for(height, reward, payouts_fingerprint)
-                            .await
-                    }
+                // Same fingerprint the gated arm uses, and the same hard
+                // requirement: no parsed coinbase, nothing to settle against.
+                let Some(actual) = actual else {
+                    error!(
+                        address = address_str,
+                        height,
+                        "block-found: PPLNS event carries no parsed coinbase — NOT booked, \
+                         reprocess from the block's own coinbase"
+                    );
+                    return;
                 };
+                let immediate = engine
+                    .on_block_found_scaled(height, actual, payouts_fingerprint)
+                    .await;
                 match immediate {
                     Ok(outcome) => {
                         self.settle_distributions();
@@ -1501,8 +1496,15 @@ mod tests {
             coinbase_value_sats: 5_000_000_000,
             witness_commitment: [0u8; 32],
         };
-        let job = build_mining_job(Network::Regtest, &payouts, &cb, "test", EXTRANONCE_SLOT_LEN)
-            .expect("build job");
+        let job = build_mining_job(
+            Network::Regtest,
+            &payouts,
+            &cb,
+            "test",
+            EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
+        )
+        .expect("build job");
         // Header: version=1 (LE), then 32B prev_hash + 32B merkle +
         // 4B ntime (0x12345678) + 4B n_bits (0x1d00ffff) + 4B nonce
         // (0xdeadbeef). Filled to taste — only positions 0..4, 68..72,

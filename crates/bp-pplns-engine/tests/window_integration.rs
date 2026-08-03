@@ -25,11 +25,9 @@
 
 use std::collections::HashMap;
 
-use bp_common::{AddressId, Sats};
-use bp_pplns::CoinbaseDistributionEntry;
 use bp_pplns_engine::window::{
-    bucket_key, snapshot::StoredSnapshot, NetworkDifficulty, WindowStore, KEY_APPLIED, KEY_BUCKETS,
-    KEY_WINDOW_BY_ADDRESS, KEY_WINDOW_TOTAL,
+    bucket_key, NetworkDifficulty, WindowStore, KEY_APPLIED, KEY_BUCKETS, KEY_WINDOW_BY_ADDRESS,
+    KEY_WINDOW_TOTAL,
 };
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 
@@ -290,66 +288,6 @@ async fn record_share_with_zero_network_difficulty_does_not_trim() {
         (total - 10.0).abs() < 1e-9,
         "no shares trimmed, total={total}"
     );
-}
-
-// ── Test 7 — snapshot roundtrip ─────────────────────────────────────
-
-#[tokio::test]
-async fn snapshot_roundtrip_via_window_store() {
-    let conn = match connect_or_skip(6).await {
-        Some(c) => c,
-        None => return,
-    };
-    let (store, _) = make_store(conn, 1_000_000.0, 10_000);
-
-    let addr_a = AddressId::new("bc1qcredit0000000000000000000000").unwrap();
-    let addr_b = AddressId::new("bc1qdebit00000000000000000000000".to_string()).unwrap();
-
-    let snapshot = StoredSnapshot {
-        balance_before: Vec::new(),
-        distribution: vec![
-            CoinbaseDistributionEntry {
-                address: addr_a.clone(),
-                percent: 60.0,
-                sats: Sats(187_500_000),
-            },
-            CoinbaseDistributionEntry {
-                address: addr_b.clone(),
-                percent: 40.0,
-                sats: Sats(125_000_000),
-            },
-        ],
-        block_reward_sats: 312_500_000,
-        considered_addresses: vec![
-            "bc1qcredit0000000000000000000000".to_string(),
-            "bc1qdebit00000000000000000000000".to_string(),
-            "bc1qlatearrival00000000000000000".to_string(),
-        ],
-        balance_after: vec![
-            ("bc1qcredit0000000000000000000000".to_string(), 5_000),
-            ("bc1qdebit00000000000000000000000".to_string(), -5_000),
-        ],
-    };
-
-    store.write_snapshot(&snapshot, 60).await.expect("write ok");
-
-    let parsed = store
-        .read_snapshot()
-        .await
-        .expect("read ok")
-        .expect("snapshot present");
-
-    assert_eq!(parsed.block_reward_sats, 312_500_000);
-    assert_eq!(parsed.distribution.len(), 2);
-    assert_eq!(parsed.distribution[0].sats.0, 187_500_000);
-    assert_eq!(parsed.distribution[1].sats.0, 125_000_000);
-    assert_eq!(parsed.considered_addresses.len(), 3);
-    let credit = parsed.balance_after["bc1qcredit0000000000000000000000"];
-    let debit = parsed.balance_after["bc1qdebit00000000000000000000000"];
-    assert_eq!(credit + debit, 0, "signed-ledger pair must sum to zero");
-
-    store.delete_snapshot().await.expect("delete ok");
-    assert!(store.read_snapshot().await.unwrap().is_none());
 }
 
 // ── Test 8 — incremental aggregate stays in sync with the buckets ───

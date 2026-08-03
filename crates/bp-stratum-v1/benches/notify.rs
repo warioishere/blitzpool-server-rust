@@ -70,6 +70,7 @@ fn make_job() -> MiningJob {
         },
         "BP",
         EXTRANONCE_SLOT_LEN,
+        [0u8; 32],
     )
     .expect("build_mining_job")
 }

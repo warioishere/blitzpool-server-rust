@@ -10,14 +10,12 @@
 //! cleanly via `eprintln!` if the URL is unreachable. Group-ids are
 //! kept unique per test so within-DB tests don't interfere either.
 
-use bp_common::{AddressId, Sats};
 use bp_group_mgmt::group::PayoutMode;
 use bp_group_solo_engine::round::{
     key_applied, key_best_share, key_by_address, key_counter, key_last_accepted_share_at,
     key_rejected_shares, key_total, key_window_buckets, snapshot, GroupRoundStore,
     WINDOW_BUCKET_MS,
 };
-use bp_pplns::CoinbaseDistributionEntry;
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 
 const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
@@ -346,32 +344,35 @@ async fn snapshot_roundtrip_per_group_and_finder() {
     };
     let group = "g_snap1";
     let finder = "bc1qfinder";
-    let snap = snapshot::StoredSnapshot {
-        balance_before: Vec::new(),
-        distribution: vec![CoinbaseDistributionEntry {
-            address: AddressId::new("bc1qminer").unwrap(),
-            percent: 100.0,
-            sats: Sats(312_500_000),
+    let snap = bp_coinbase_snapshot::StoredWeightSnapshot {
+        entries: vec![bp_coinbase_snapshot::WeightSnapshotEntry {
+            address: "bc1qminer".to_string(),
+            score_weight: 1_000_000_000_000,
+            balance_sats: 0,
+            wire_weight: 1_000_000_000_000,
+            dust_limit: 546,
         }],
-        block_reward_sats: 312_500_000,
-        considered_addresses: vec!["bc1qminer".to_string()],
-        balance_after: vec![("bc1qminer".to_string(), 0)],
+        score_total: 1_000_000_000_000,
+        weight_p: 15_228_426_395,
+        fee_ppm: 15_000,
+        fee_address: "bc1qfee".to_string(),
+        reference_revenue_sats: 312_500_000,
     };
 
-    snapshot::write_snapshot(&mut conn, group, finder, &snap, 60)
+    snapshot::write_weight_snapshot(&mut conn, group, finder, &snap, 60)
         .await
         .expect("write ok");
-    let parsed = snapshot::read_snapshot(&mut conn, group, finder)
+    let parsed = snapshot::read_weight_snapshot(&mut conn, group, finder)
         .await
         .expect("read ok")
         .expect("present");
-    assert_eq!(parsed.block_reward_sats, 312_500_000);
-    assert_eq!(parsed.distribution.len(), 1);
+    assert_eq!(parsed.reference_revenue_sats, 312_500_000);
+    assert_eq!(parsed.entries.len(), 1);
 
     snapshot::delete_snapshot(&mut conn, group, finder)
         .await
         .expect("delete ok");
-    assert!(snapshot::read_snapshot(&mut conn, group, finder)
+    assert!(snapshot::read_weight_snapshot(&mut conn, group, finder)
         .await
         .unwrap()
         .is_none());
@@ -386,21 +387,28 @@ async fn delete_all_snapshots_for_group_scans_and_deletes() {
         None => return,
     };
     let group = "g_snap_del";
-    let snap = snapshot::StoredSnapshot {
-        balance_before: Vec::new(),
-        distribution: vec![],
-        block_reward_sats: 100,
-        considered_addresses: vec![],
-        balance_after: vec![],
+    let snap = bp_coinbase_snapshot::StoredWeightSnapshot {
+        entries: vec![bp_coinbase_snapshot::WeightSnapshotEntry {
+            address: "bc1qminer".to_string(),
+            score_weight: 1_000_000_000_000,
+            balance_sats: 0,
+            wire_weight: 1_000_000_000_000,
+            dust_limit: 546,
+        }],
+        score_total: 1_000_000_000_000,
+        weight_p: 15_228_426_395,
+        fee_ppm: 15_000,
+        fee_address: "bc1qfee".to_string(),
+        reference_revenue_sats: 312_500_000,
     };
     // Write snapshots for 3 different finders.
     for finder in &["bc1qf1", "bc1qf2", "bc1qf3"] {
-        snapshot::write_snapshot(&mut conn, group, finder, &snap, 60)
+        snapshot::write_weight_snapshot(&mut conn, group, finder, &snap, 60)
             .await
             .unwrap();
     }
     // Plus one snapshot for an UNRELATED group — must survive.
-    snapshot::write_snapshot(&mut conn, "g_other", "bc1qf1", &snap, 60)
+    snapshot::write_weight_snapshot(&mut conn, "g_other", "bc1qf1", &snap, 60)
         .await
         .unwrap();
 
@@ -411,15 +419,17 @@ async fn delete_all_snapshots_for_group_scans_and_deletes() {
 
     // Confirm: target group's snapshots gone, other group's survives.
     for finder in &["bc1qf1", "bc1qf2", "bc1qf3"] {
-        assert!(snapshot::read_snapshot(&mut conn, group, finder)
+        assert!(snapshot::read_weight_snapshot(&mut conn, group, finder)
             .await
             .unwrap()
             .is_none());
     }
-    assert!(snapshot::read_snapshot(&mut conn, "g_other", "bc1qf1")
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        snapshot::read_weight_snapshot(&mut conn, "g_other", "bc1qf1")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 // ── Test 11 — multiple groups are isolated ─────────────────────────

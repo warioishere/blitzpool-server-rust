@@ -635,6 +635,8 @@ fn assemble_block_preview(
         &cb_template,
         pool_identifier,
         EXTRANONCE_SLOT_LEN,
+        // A preview is never submitted, so no settlement hangs off it.
+        [0u8; 32],
     )
     .map_err(|e| format!("build_mining_job: {e}"))?;
 

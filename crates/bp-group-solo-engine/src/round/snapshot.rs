@@ -3,10 +3,10 @@
 //! Per-(group, finder) coinbase snapshot persistence.
 //!
 //! Each miner in a group writes their own snapshot keyed by their
-//! address as the prospective finder (`groupsolo:{groupId}:snapshot:{finderAddress}`).
-//! `on_block_found` reads the snapshot for the *actual* finder; if
-//! missing or reward-mismatched, falls back to a recompute against the
-//! current round state.
+//! address as the prospective finder (`groupsolo:{groupId}:snapshot:{finderAddress}`),
+//! and the same snapshot is written a second time under the payout
+//! list's own fingerprint. `on_block_found` resolves the fingerprint
+//! key — that is the one the winning job's coinbase was built from.
 //!
 //! The hash format + read/write/delete logic lives in
 //! [`bp_coinbase_snapshot::snapshot`] (shared with PPLNS so the wire
@@ -15,8 +15,6 @@
 //! group-wide cleanup.
 
 use redis::{aio::ConnectionManager, AsyncCommands, AsyncIter, RedisError};
-
-pub use bp_coinbase_snapshot::snapshot::{ParsedSnapshot, StoredSnapshot};
 
 /// Build the snapshot key `groupsolo:{group_id}:snapshot:{finder_address}`.
 pub fn key(group_id: &str, finder_address: &str) -> String {
@@ -55,40 +53,6 @@ pub fn key_match_all(group_id: &str) -> String {
 /// job of that group can still be worth booking.
 pub fn key_match_everything(group_id: &str) -> String {
     format!("groupsolo:{group_id}:*snapshot*")
-}
-
-/// Persist a snapshot for one (group, finder) pair with `ttl_seconds` TTL.
-pub async fn write_snapshot(
-    conn: &mut ConnectionManager,
-    group_id: &str,
-    finder_address: &str,
-    snapshot: &StoredSnapshot,
-    ttl_seconds: u32,
-) -> Result<(), RedisError> {
-    bp_coinbase_snapshot::snapshot::write_snapshot(
-        conn,
-        &key(group_id, finder_address),
-        snapshot,
-        ttl_seconds,
-    )
-    .await
-}
-
-/// Persist a snapshot under its payout-list identity with `ttl_seconds` TTL.
-pub async fn write_snapshot_for(
-    conn: &mut ConnectionManager,
-    group_id: &str,
-    payouts_fingerprint: &[u8; 32],
-    snapshot: &StoredSnapshot,
-    ttl_seconds: u32,
-) -> Result<(), RedisError> {
-    bp_coinbase_snapshot::snapshot::write_snapshot(
-        conn,
-        &key_for_fingerprint(group_id, payouts_fingerprint),
-        snapshot,
-        ttl_seconds,
-    )
-    .await
 }
 
 /// Persist a schema-2 WEIGHT snapshot under the (group, finder) key.
@@ -145,30 +109,6 @@ pub async fn read_weight_snapshot(
     finder_address: &str,
 ) -> Result<Option<bp_coinbase_snapshot::StoredWeightSnapshot>, RedisError> {
     bp_coinbase_snapshot::snapshot::read_weight_snapshot(conn, &key(group_id, finder_address)).await
-}
-
-/// Load + hydrate the snapshot for one payout list, or `None` if missing /
-/// unparseable.
-pub async fn read_snapshot_for(
-    conn: &mut ConnectionManager,
-    group_id: &str,
-    payouts_fingerprint: &[u8; 32],
-) -> Result<Option<ParsedSnapshot>, RedisError> {
-    bp_coinbase_snapshot::snapshot::read_snapshot(
-        conn,
-        &key_for_fingerprint(group_id, payouts_fingerprint),
-    )
-    .await
-}
-
-/// Load + hydrate one (group, finder) snapshot, or `None` if missing /
-/// unparseable.
-pub async fn read_snapshot(
-    conn: &mut ConnectionManager,
-    group_id: &str,
-    finder_address: &str,
-) -> Result<Option<ParsedSnapshot>, RedisError> {
-    bp_coinbase_snapshot::snapshot::read_snapshot(conn, &key(group_id, finder_address)).await
 }
 
 /// Delete one (group, finder) snapshot. Called by `on_block_found`

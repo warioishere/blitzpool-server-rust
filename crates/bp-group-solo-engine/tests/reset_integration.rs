@@ -160,16 +160,17 @@ async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
         .await
         .unwrap();
     let mut snap_conn = round.connection_for_snapshot();
-    snapshot::write_snapshot(
+    snapshot::write_weight_snapshot(
         &mut snap_conn,
         &group_key,
         "test_reset_finder",
-        &snapshot::StoredSnapshot {
-            balance_before: Vec::new(),
-            distribution: vec![],
-            block_reward_sats: 100,
-            considered_addresses: vec![],
-            balance_after: vec![],
+        &bp_coinbase_snapshot::StoredWeightSnapshot {
+            entries: vec![],
+            score_total: 0,
+            weight_p: 1,
+            fee_ppm: 15_000,
+            fee_address: "bc1qfee".to_string(),
+            reference_revenue_sats: 312_500_000,
         },
         60,
     )
@@ -185,7 +186,7 @@ async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
     assert!(round.read_by_address(&group_key).await.unwrap().is_empty());
     let mut snap_conn = round.connection_for_snapshot();
     assert!(
-        snapshot::read_snapshot(&mut snap_conn, &group_key, "test_reset_finder")
+        snapshot::read_weight_snapshot(&mut snap_conn, &group_key, "test_reset_finder")
             .await
             .unwrap()
             .is_none()
