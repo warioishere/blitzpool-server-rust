@@ -157,7 +157,7 @@ pub(crate) async fn spawn(
 
     // SV2 §6.1: hand declared jobs to bitcoin-core for a real verdict when the
     // operator points us at the node's data directory. Off → trusted, as before.
-    let job_validator = match cfg.sv2.jdp_validation_data_dir.clone() {
+    let node_backend = match cfg.sv2.jdp_validation_data_dir.clone() {
         Some(data_dir) => {
             crate::jdp_hooks::ProductionJobValidator::connect(
                 data_dir,
@@ -185,7 +185,7 @@ pub(crate) async fn spawn(
         ledger_booker,
         distribution_source,
         settle_slot.clone(),
-        job_validator,
+        node_backend,
     );
 
     let distribution_interval = Duration::from_secs(
