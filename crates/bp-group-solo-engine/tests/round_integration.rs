@@ -582,7 +582,7 @@ async fn record_share_is_idempotent_per_share_id() {
 
 #[tokio::test]
 async fn a_redelivered_share_is_still_deduped_across_a_round_reset() {
-    let conn = match connect_or_skip(12).await {
+    let conn = match connect_or_skip(16).await {
         Some(c) => c,
         None => return,
     };

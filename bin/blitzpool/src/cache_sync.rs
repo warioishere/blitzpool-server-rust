@@ -416,11 +416,14 @@ mod tests {
         use bp_stratum_v2::jdp_server::{JdpServerHooks, StratumV2JdpServer};
         use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
 
-        // DB 9: free in this test binary. Other crates' tests may still
-        // FLUSHDB it concurrently, so the publish+read below RETRIES —
-        // a wiped stream then costs a round, not a red test, while a
-        // broken mechanism still never produces an entry.
-        let Some(redis) = connect_redis_or_skip(9).await else {
+        // DB 16, and it has to be its own: DB 9 was shared with
+        // `redis_backup`'s test in this same binary, which FLUSHDBs it. The
+        // comment here used to blame "other crates" for the resulting
+        // flakiness — per-binary ranges (`bp_test_support::redis_db`) rule
+        // those out; the collision was a sibling. The publish+read below
+        // still RETRIES, which costs a round on a wipe rather than a red
+        // test while a broken mechanism never produces an entry.
+        let Some(redis) = connect_redis_or_skip(16).await else {
             eprintln!("redis unreachable — skipping settlement cross-process test");
             return;
         };

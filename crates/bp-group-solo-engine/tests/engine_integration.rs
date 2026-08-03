@@ -1254,11 +1254,11 @@ async fn spawn_core_skips_startup_reset_crons() {
         Some(p) => p,
         None => return,
     };
-    let full_conn = match connect_redis_or_skip(10).await {
+    let full_conn = match connect_redis_or_skip(20).await {
         Some(c) => c,
         None => return,
     };
-    let core_conn = match connect_redis_or_skip(11).await {
+    let core_conn = match connect_redis_or_skip(21).await {
         Some(c) => c,
         None => return,
     };
