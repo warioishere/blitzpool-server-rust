@@ -26,6 +26,12 @@ Recorded instances, so this is not an abstraction:
   flush-before-freeze rule and two pending-block formats went with it.
 - The pure-math crate `bp-group-solo` outlived its only caller by two days
   without a single compiler warning.
+- **2026-08-03** — a found block's settlement inputs were stamped into the
+  block-found event by `if resolved.mode == MiningMode::GroupSolo`. PPLNS fell
+  out of that `if` and read its snapshot ~20 min later instead, against a
+  20-minute TTL, so roughly half its blocks lost the inputs for good. Several
+  reviews had passed over the line. The `match` that replaced it would not have
+  compiled with a mode missing.
 
 ## Rules that follow from it
 
@@ -39,6 +45,11 @@ Recorded instances, so this is not an abstraction:
    things that only made sense under it. They will still compile.
 4. **Verify before claiming a cause.** Every "why" in this file was checked
    against `git log`, not remembered.
+5. **Branch on a mode with `match`, never with `if mode ==`.** An `if` cannot
+   be exhaustive, so it is where a mode goes missing without anything
+   complaining — that is not a hypothetical, it is the 2026-08-03 entry above.
+   The same goes for `is_some()` on a per-mode field: it reads as a mode test
+   and answers a different question.
 
 ## Money invariants — do not weaken these to make a refactor fit
 
@@ -53,7 +64,44 @@ Recorded instances, so this is not an abstraction:
 
 ## Testing
 
-`cargo test --workspace` before pushing. CI covers fmt/clippy/check and the
-suite, but the ~29 bitcoin-core regtests run **only locally** — a green CI does
-not mean they passed. Check `grep -c skipping` is 0: missing infrastructure
-makes tests skip while cargo still reports "ok".
+`cargo test --workspace -- --nocapture` before pushing. CI covers
+fmt/clippy/check and the suite, but the ~29 bitcoin-core regtests run **only
+locally** — a green CI does not mean they passed.
+
+**A green suite here is not evidence until you have checked these three.**
+
+1. **The services must be up.** Every Redis/Postgres-backed test calls
+   `connect_or_skip`, which returns `None` and makes the test *pass* when the
+   service is unreachable. Start them first:
+   ```bash
+   docker start bp-test-pg bp-test-redis   # 15433 / 16379
+   ```
+   New migrations (`crates/bp-db/migrations/`) are NOT applied to those
+   containers automatically. A stale schema surfaces first as a
+   `cargo sqlx prepare` failure on the missing column — compile-time is
+   stricter here than the tests, which only notice if they touch it.
+2. **`--nocapture`, or the skip check is a lie.** `cargo test` swallows the
+   output of *passing* tests, and a skipped test passes — so its "… skipping"
+   line never reaches the log and `grep -c skipping` reports 0 on a run where
+   everything skipped. It confirms exactly what it was meant to refute. Only
+   with `--nocapture` does the count mean anything.
+3. **Watch the passed-count, not the exit code.** Adding N tests must move it
+   by N. A skipped test is indistinguishable from a passing one in `$?`.
+
+Measured 2026-08-03: the containers had been down five days, the whole
+integration suite was skipping, `grep -c skipping` said 0, and two new tests
+reported green while proving nothing.
+
+**Writing a money test: use real addresses.** `build_weight_distribution`
+drops every entry `bitcoin::Address` cannot parse, so a `format!("{prefix}aaa")`
+address yields an EMPTY distribution — and the miners then surface as 0-sat
+"late arriver" rows, so `history_inserted >= 1` still holds and the test passes
+without ever exercising a payout. Assert a precondition that pins the shape you
+meant to build (the miner is in `distribution.entries`, or is absent from
+`actual.paid_by_address` when you meant it withheld).
+
+**A test that claims a safeguard must be shown to fail without it.** Run it
+against the unfixed code first, or pair it with the negative control in the
+same test — `a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone`
+asserts both directions, so it cannot pass on a precondition that silently
+did not hold.
