@@ -59,6 +59,7 @@ mod jdp_hooks;
 mod listeners;
 mod live_mode_marker;
 mod live_sessions;
+mod network_difficulty;
 mod payout_resolver;
 mod pending_blocks;
 mod redis_backup;
@@ -669,6 +670,21 @@ async fn main() -> ExitCode {
     // process (single owner of the money window) with its own Redis connection
     // so the SCAN/DUMP burst never touches the share hot-path. Restore is never
     // automatic — see `--restore-redis-state`.
+    // Keep the PPLNS window's trim size on the CURRENT network difficulty.
+    // Payout role only: the window is trimmed inside `record_share`, which
+    // only that process runs, and it is the only reader of the value. The
+    // RPC (not the TDP stream) is the source because this process has no
+    // TDP feed — see `crate::network_difficulty`.
+    let _net_diff_refresh = match (cfg.has_role(Role::Payout), engines.pplns.as_ref()) {
+        (true, Some(pplns)) => Some(crate::network_difficulty::spawn_refresh_task(
+            handles.bitcoin_rpc.clone(),
+            pplns.window().network_difficulty(),
+            crate::network_difficulty::REFRESH_INTERVAL,
+        )),
+        // No PPLNS engine ⇒ no window to trim. Any other role never trims.
+        _ => None,
+    };
+
     let _redis_state_backup = if cfg.has_role(Role::Payout) {
         let backup_redis = handles
             .dedicated_redis(&cfg.redis, "redis-state-backup")

@@ -152,13 +152,30 @@ pub enum WindowError {
 
 // ── Network difficulty view ──────────────────────────────────────────
 
-/// Thread-safe shared view of the pool's current `networkDifficulty`,
-/// as published by the TDP template stream.
+/// Thread-safe shared view of the pool's current `networkDifficulty`.
 ///
 /// Backed by `Arc<AtomicU64>` over `f64::to_bits`/`f64::from_bits`,
-/// so reads + writes are lock-free across worker threads. Initial
-/// value is 0; the engine refuses to trim or build distributions
-/// until the first template lands.
+/// so reads + writes are lock-free across worker threads.
+///
+/// **Who writes it, and why it is not the TDP stream.** This value is read
+/// by exactly one thing: [`WindowStore::window_size`], which only
+/// [`WindowStore::trim_window`] calls, which only
+/// [`WindowStore::record_share`] calls. That path runs on the process that
+/// consumes the accepted-share stream — the `payout` role — and that
+/// process has no TDP feed at all. So it is seeded from `getmininginfo` at
+/// boot and refreshed from the same RPC on a timer by the binary (see
+/// `blitzpool::network_difficulty`).
+///
+/// The doc here used to say "as published by the TDP template stream", and
+/// [`Self::set`] was never called from anywhere: the window was sized to
+/// the difficulty at process start and frozen there for the process's whole
+/// life. `window_factor` then meant "x times the difficulty at the last
+/// restart" rather than the current one, so a long-running payout process
+/// trimmed to a window that spanned steadily fewer blocks than configured.
+///
+/// A zero or negative value makes `window_size` return 0, which disables
+/// trimming entirely — so a failed reading must never be written. The
+/// refresher's guard is what keeps that from happening.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkDifficulty {
     bits: Arc<AtomicU64>,
@@ -459,6 +476,15 @@ impl WindowStore {
     /// Mirrors `GroupRoundStore::connection_for_snapshot`.
     pub fn connection_for_snapshot(&self) -> ConnectionManager {
         self.conn.clone()
+    }
+
+    /// The live network-difficulty view this store trims against.
+    ///
+    /// Handed out so the process that owns a Bitcoin RPC can keep it
+    /// current — see [`NetworkDifficulty`]. `Arc`-backed, so the clone and
+    /// this store observe the same value.
+    pub fn network_difficulty(&self) -> NetworkDifficulty {
+        self.net_diff.clone()
     }
 
     /// Read the schema-2 weight snapshot for one weights fingerprint.

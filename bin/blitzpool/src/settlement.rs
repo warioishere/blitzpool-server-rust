@@ -62,8 +62,20 @@ pub(crate) struct SettlementSignal {
     /// the confirmation watcher are built BEFORE the JDP server exists.
     local: Arc<OnceLock<DistributionInvalidationHandle>>,
     /// `None` on a process with no Redis handle (tests). Present
-    /// otherwise, including on a front — a second front would not hear a
-    /// settlement any other way.
+    /// otherwise, including on a front — a front that books in-process
+    /// settles locally AND publishes, which is harmless (the second epoch
+    /// bump invalidates an already-invalid set).
+    ///
+    /// It does NOT reach a second front. Every front's consumer shares one
+    /// group and one consumer name ([`crate::cache_sync`]), and a Redis
+    /// consumer group hands each entry to exactly one consumer — so with
+    /// two fronts a settlement reaches whichever asked first. The other
+    /// keeps its published distribution current until its own publisher's
+    /// next tick (`[sv2].jdp_payout_distribution_interval_secs`, 60 s by
+    /// default), which rebuilds from the post-settlement ledger. Bounded
+    /// and self-healing, but it is a real window and this comment used to
+    /// claim the opposite. Making a settlement reach every front needs a
+    /// group PER front, not a shared one — see `cache_sync::GROUP`.
     remote: Option<StreamProducer<CacheInvalidation>>,
 }
 

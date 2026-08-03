@@ -42,6 +42,37 @@ use bp_mining_mode::MiningModeResult;
 use crate::engines::BlitzpoolModeGate;
 use crate::group_service::SharedGroupService;
 
+/// Consumer group for the Front's invalidation drain.
+///
+/// **One group, shared by every front — so exactly ONE front may consume
+/// it.** A Redis consumer group hands each entry to exactly one consumer,
+/// so with two fronts running this code each invalidation reaches whichever
+/// asked first and the other never sees it. That is survivable for the
+/// membership kinds (the 60 s [`BACKSTOP_INTERVAL`] rebuild covers a miss)
+/// and a real, if bounded, window for [`cache_kind::SETTLEMENT`], which
+/// deliberately has no backstop — see [`crate::settlement`].
+///
+/// Making a settlement reach EVERY front means a group per front, not a
+/// consumer name per front: distinct consumer names inside one group still
+/// split the entries between them. It would need a stable per-instance
+/// identifier (a fresh group per boot leaks a group and a growing PEL each
+/// restart), or dropping the group entirely in favour of a plain tail
+/// `XREAD`, which is the natural primitive for a broadcast and needs no
+/// acks — the Front warms both caches from the DB at boot, so entries
+/// missed while it was down are not needed.
+///
+/// Left as-is on an OPERATOR DECISION, not by omission: this pool runs one
+/// front and is not going to run more (stated 2026-08-03). So the shared
+/// group is correct for the deployment it has, and rebuilding it would
+/// change shared stream infrastructure to serve a topology nobody wants.
+///
+/// What that decision buys, and therefore what it costs to reverse: the
+/// settlement fan-out ([`crate::settlement`]) is allowed to assume the one
+/// front hears every invalidation. A second front would silently keep a
+/// pre-settlement payout distribution current for up to one publish
+/// interval. `two_consumers_in_one_group_split_the_entries` pins the
+/// underlying semantics so that consequence cannot be re-discovered the
+/// hard way.
 const GROUP: &str = "cache-sync-front";
 const CONSUMER: &str = "c1";
 const BATCH: usize = 32;
@@ -313,6 +344,59 @@ mod tests {
             }
         }
         assert_eq!(kinds, vec!["group".to_string(), "blockparty".to_string()]);
+    }
+
+    /// The constraint behind [`GROUP`]: two consumers in ONE group SPLIT the
+    /// entries — they do not each get a copy.
+    ///
+    /// Every front runs this module with the same group and the same
+    /// consumer name, so a second front does not receive an invalidation the
+    /// first one took. For the membership kinds the 60 s backstop rebuild
+    /// covers that; [`cache_kind::SETTLEMENT`] has no backstop by design, so
+    /// there the miss is a real (bounded) window in which a JDC can keep
+    /// declaring against pre-settlement weights.
+    ///
+    /// Asserted on the TOTAL number of deliveries rather than on who got
+    /// what: which consumer wins a race is not the property, "each entry is
+    /// delivered once, not once per front" is.
+    #[tokio::test]
+    async fn two_consumers_in_one_group_split_the_entries() {
+        let Some(redis) = connect_redis_or_skip(1).await else {
+            eprintln!("redis unreachable — skipping consumer-group semantics test");
+            return;
+        };
+        let notifier = StreamCacheNotifier::new(redis.clone());
+        for _ in 0..4 {
+            notifier.membership_changed(cache_kind::GROUP).await;
+        }
+
+        // Same group as production, two distinct consumer names — the most
+        // favourable case for "both hear everything", and it still splits.
+        let first: StreamConsumer<CacheInvalidation> = StreamConsumer::new(
+            redis.clone(),
+            CACHE_INVALIDATION_STREAM_KEY,
+            GROUP,
+            "front-a",
+        );
+        let second: StreamConsumer<CacheInvalidation> =
+            StreamConsumer::new(redis, CACHE_INVALIDATION_STREAM_KEY, GROUP, "front-b");
+        first.ensure_group().await.expect("ensure_group");
+
+        // Explicit counts, so the split is deterministic rather than a race.
+        let a = first.read_new(2, 500).await.expect("read a");
+        let b = second.read_new(16, 500).await.expect("read b");
+        assert_eq!(a.len(), 2, "the first front takes the two it asked for");
+        assert_eq!(
+            b.len(),
+            2,
+            "the second front sees only what was LEFT — not the 4 that were \
+             published. A settlement the first front consumed never reaches it."
+        );
+        assert_eq!(
+            a.len() + b.len(),
+            4,
+            "each entry is delivered exactly once across the group"
+        );
     }
 
     /// MONEY / ext 0x0003 §10: a settlement must cross the process

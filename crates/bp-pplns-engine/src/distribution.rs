@@ -280,8 +280,10 @@ impl DistributionBuilder {
     }
 
     /// Invalidate the cache for a specific reward. Called by the
-    /// engine on hot-path state changes (a new accepted share landed,
-    /// a block was found, network difficulty changed).
+    /// engine on hot-path state changes: a new accepted share landed, or a
+    /// block was found. (A network-difficulty change is NOT one of them —
+    /// it moves the window's trim size, and the trim already runs inside
+    /// `record_share`, whose invalidation covers it.)
     ///
     /// Common pattern: `invalidate_all` (drops every cached reward)
     /// because the window changed for *any* reward, not just one.
