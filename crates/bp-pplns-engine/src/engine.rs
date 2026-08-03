@@ -322,6 +322,27 @@ impl PplnsEngine {
             .map_err(EngineError::Distribution)
     }
 
+    /// The empty-window answer for one asking miner — see
+    /// [`crate::distribution::DistributionBuilder::build_bootstrap`].
+    ///
+    /// Only valid after [`Self::build_distribution`] answered
+    /// [`bp_pplns::WeightBuildError::NoScoredMiners`]. The caller is the
+    /// payout resolver, which is the only place that knows which miner is
+    /// asking; the pool-wide JDP publisher must NOT use this — it builds
+    /// one distribution for every job-declaring client at once and has
+    /// nobody to name.
+    pub async fn build_bootstrap_distribution(
+        &self,
+        block_reward_sats: u64,
+        claimant: &AddressId,
+    ) -> Result<Arc<DistributionResult>, EngineError> {
+        self.inner
+            .distribution_builder
+            .build_bootstrap(block_reward_sats, claimant)
+            .await
+            .map_err(EngineError::Distribution)
+    }
+
     /// Look up the settlement inputs the found block's coinbase was built
     /// from, so the Core can stamp them into the block-found event.
     ///

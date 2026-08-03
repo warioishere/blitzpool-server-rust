@@ -183,6 +183,31 @@ fn books_without_a_snapshot(mode: MiningMode) -> bool {
     }
 }
 
+/// Did the build fail because NOTHING in the window holds a share?
+///
+/// Matched as its own condition because it is the one build failure that
+/// must not become "serve no job": the window fills only from accepted
+/// shares and shares come only from jobs, so refusing would leave a fresh
+/// window unable to ever start. Every OTHER failure keeps the no-job
+/// answer — a window that cannot be read may be full of miners whose
+/// claims are simply invisible right now, and handing the block to one
+/// connecting miner would rob all of them.
+///
+/// Group-Solo needs no equivalent here: its builder always carries the
+/// prospective finder as the claimant (its cache is keyed per-finder), so
+/// this verdict never reaches its arm.
+fn is_empty_share_window(err: &bp_pplns_engine::engine::EngineError) -> bool {
+    match err {
+        bp_pplns_engine::engine::EngineError::Distribution(inner) => matches!(
+            **inner,
+            bp_pplns_engine::distribution::DistributionError::WeightBuild(
+                bp_pplns::WeightBuildError::NoScoredMiners
+            )
+        ),
+        _ => false,
+    }
+}
+
 impl ProductionPayoutResolver {
     /// Second half of the pair: could a block found on this list be booked? See
     /// [`Self::resolve_internal`].
@@ -201,12 +226,65 @@ impl ProductionPayoutResolver {
             );
             return (ResolvedPayouts::none(), false);
         };
-        match pplns.build_distribution(reward_sats).await {
+        // The pool-wide build first. It is shared by every PPLNS
+        // connection, so it cannot name a claimant — an empty window comes
+        // back as `NoScoredMiners` and is answered per-miner below.
+        let built = match pplns.build_distribution(reward_sats).await {
+            Ok(result) => Some(result),
+            Err(err) if is_empty_share_window(&err) => {
+                // Nobody in the window holds a share. The distribution the
+                // weight model would otherwise produce pays the WHOLE
+                // block to the pool output, and serving no job at all
+                // would deadlock a fresh window: the window only fills
+                // from accepted shares, and shares only come from jobs.
+                // So this miner claims the block — nobody else has a claim
+                // to lose, and the pool still takes exactly its fee.
+                match AddressId::new(miner_address.to_string()) {
+                    Ok(claimant) => {
+                        match pplns
+                            .build_bootstrap_distribution(reward_sats, &claimant)
+                            .await
+                        {
+                            Ok(result) => Some(result),
+                            Err(err) => {
+                                error!(
+                                    %err,
+                                    miner_address,
+                                    reward_sats,
+                                    "PPLNS window holds no scored miner and the bootstrap build \
+                                     failed too; serving NO JOB"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        error!(
+                            %err,
+                            miner_address,
+                            "PPLNS window holds no scored miner and the asking address will not \
+                             parse; serving NO JOB"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    %err,
+                    miner_address,
+                    reward_sats,
+                    "PPLNS distribution build failed; serving NO JOB until it succeeds"
+                );
+                None
+            }
+        };
+        match built {
             // The build can succeed while its snapshot write does not — the
             // engine keeps the distribution on purpose, because failing it would
             // hand this miner the whole block. But the fingerprint then names a
             // key that does not exist, so there is nothing to vouch for.
-            Ok(result) => {
+            Some(result) => {
                 if !result.snapshot_written {
                     warn!(
                         miner_address,
@@ -242,15 +320,7 @@ impl ProductionPayoutResolver {
                     }
                 }
             }
-            Err(err) => {
-                error!(
-                    %err,
-                    miner_address,
-                    reward_sats,
-                    "PPLNS distribution build failed; serving NO JOB until it succeeds"
-                );
-                (ResolvedPayouts::none(), false)
-            }
+            None => (ResolvedPayouts::none(), false),
         }
     }
 

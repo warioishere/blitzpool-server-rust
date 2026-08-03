@@ -259,14 +259,43 @@ async fn on_block_found_applies_distribution_from_snapshot() {
         Some(h) => h,
         None => return,
     };
-    let a = format!("{}aaa", h.prefix);
+    // A REAL address. This used to be `format!("{}aaa", h.prefix)`, which
+    // `AddressId` accepts and the distribution build then DROPS — so the
+    // distribution was empty, the miner surfaced only as a 0-sat
+    // "late arriver" row, and `history_inserted >= 1` held without a
+    // payout ever being exercised. Exactly the trap the repo's CLAUDE.md
+    // names.
+    const ADDR: &str = "bc1qvzf0p407umrsaxmsnq62yudwf27lmsxd8sshzl";
     h.engine
-        .record_share(None, &a, 100.0, 1_700_000_000_001)
+        .record_share(None, ADDR, 100.0, 1_700_000_000_001)
         .await
         .unwrap();
     let result = h.engine.build_distribution(312_500_000).await.expect("ok");
+    // Precondition pinning the SHAPE this test means to build: the miner
+    // must really be a published payout, or the assertions below pass on
+    // an empty distribution again.
+    assert!(
+        result
+            .distribution
+            .published()
+            .any(|e| e.address.as_str() == ADDR),
+        "the miner must be a published coinbase output, not a late-arriver row"
+    );
     let block_height = 9_997_001;
+    // Clean this height FIRST. `apply_distribution`'s replay guard asks
+    // "does this blockHeight have history?", so a row left by an earlier
+    // run makes the apply a silent no-op — and `cleanup` only deletes by
+    // ADDRESS prefix, which a real Bitcoin address does not match. The
+    // sibling tests below already clean by height for the same reason.
+    let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
+        .bind(block_height)
+        .execute(&h.pool)
+        .await;
     let actual = actual_paying_exactly(&result, 312_500_000);
+    assert!(
+        actual.paid_by_address.get(ADDR).copied().unwrap_or(0) > 0,
+        "the coinbase must actually pay the miner"
+    );
     let outcome = h
         .engine
         .on_block_found(
@@ -298,6 +327,14 @@ async fn on_block_found_applies_distribution_from_snapshot() {
         .expect("ok");
     assert!(snap.is_some(), "weight snapshot outlives the apply");
 
+    let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
+        .bind(block_height)
+        .execute(&h.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
+        .bind(ADDR)
+        .execute(&h.pool)
+        .await;
     drop_harness(h).await;
 }
 

@@ -249,6 +249,39 @@ pub enum WeightBuildError {
     /// output.
     #[error("fee address is not a valid payout address: {0}")]
     InvalidFeeAddress(String),
+    /// `Σ score_weight == 0` — not one address holds a share of this
+    /// window/round, so there is no proportion to split the block by.
+    ///
+    /// This is refused rather than answered, because the answer the
+    /// weight model would otherwise give is the worst one available.
+    /// With nothing scored nothing is published, `pool_weight_for`
+    /// floors `weight_P` at 1, and §4 makes the pool output the residual
+    /// — so `payout_entries_at` yields a SINGLE output paying the whole
+    /// block to `fee_address`. That list is not empty, so
+    /// `ResolvedPayouts::is_none()` is false and a job goes out on it;
+    /// settlement then books nothing (every claim is 0 at
+    /// `score_total == 0`) while the coinbase has already paid the pool
+    /// 100 %. It is the same outcome
+    /// [`crate::weight::MIN_COINBASE_WEIGHT_BUDGET`] exists to make
+    /// unreachable — "not a degraded pool, a pool that keeps the
+    /// miners' money" — reached from the other side.
+    ///
+    /// Deliberately NOT the same condition as "nothing published".
+    /// A 100 % fee and a `min_payout` above the whole block both publish
+    /// nothing too, and for both that IS the intended coinbase; they
+    /// keep `score_total > 0` and are unaffected. This fires only when
+    /// the share source itself is empty — a brand-new Group-Solo group,
+    /// a group whose members reconnect after a calendar reset, or a
+    /// fresh PPLNS window.
+    ///
+    /// A caller that knows which miner is asking should retry with that
+    /// miner as the sole claimant (see
+    /// `bp_coinbase_snapshot::BuildRequest::bootstrap_claimant`): with
+    /// nobody scored, nobody is robbed by paying the one miner who is
+    /// actually working. A caller that does not know (the pool-wide JDP
+    /// publisher) must publish nothing.
+    #[error("no address holds a share — nothing to split the block by")]
+    NoScoredMiners,
 }
 
 /// `weight_P` for a given published weight total: the fee, and only
@@ -376,6 +409,19 @@ pub fn build_weight_distribution(
     }
 
     let score_total: u64 = candidates.values().map(|c| c.score_weight).sum();
+    // Nobody holds a share, so there is no proportion to split by — and
+    // the distribution this would otherwise produce pays the whole block
+    // to the pool output. Refuse it; see
+    // [`WeightBuildError::NoScoredMiners`] for why this is checked on the
+    // SCORE total and not on "did anything get published".
+    //
+    // Checked before the finder bonus on purpose: the bonus is
+    // `S·f/(1−f)` and is applied only `if score_total > 0`, so it can
+    // never lift a zero total. Reading it here keeps the one condition in
+    // one place instead of leaving a second, equivalent one behind it.
+    if score_total == 0 {
+        return Err(WeightBuildError::NoScoredMiners);
+    }
     let publish_all = fee_ppm < 1_000_000;
 
     // ── Finder bonus ────────────────────────────────────────────────
@@ -1987,16 +2033,81 @@ mod tests {
         assert_eq!(d.weight_p, 1);
     }
 
-    /// `no shares + no balances → empty entries, pool takes all`
+    /// MONEY: an empty share source must be REFUSED, not answered.
+    ///
+    /// This used to return a distribution with no entries, and that is
+    /// not a harmless empty answer — `pool_weight_for` floors `weight_P`
+    /// at 1 and §4 makes the pool output the residual, so
+    /// `payout_entries_at` yielded ONE output paying the entire block to
+    /// `fee_address`. Measured at T = 312 500 000: 312 500 000 sats to
+    /// the pool, 0 to everyone else, and settlement books nothing
+    /// because every claim is 0 at `score_total == 0`. The list is not
+    /// empty either, so `ResolvedPayouts::is_none()` was false and a job
+    /// went out on it.
+    ///
+    /// Reachable without any fault: a brand-new Group-Solo group, a
+    /// group whose members reconnect after a calendar reset (the reset
+    /// DELs the round's by-address hash and Group-Solo's reader has no
+    /// bucket fallback), or a fresh PPLNS window.
     #[test]
-    fn empty_inputs_yield_pool_only_distribution() {
+    fn an_empty_share_source_is_refused_instead_of_paying_the_pool() {
         let shares = HashMap::new();
         let balances = HashMap::new();
         let fee = addr(FEE);
-        let d = build_weight_distribution(base_input(&shares, &balances, &fee)).unwrap();
-        assert!(d.entries.is_empty());
-        assert_eq!(d.weight_p, 1);
-        assert_eq!(d.score_total, 0);
+        assert_eq!(
+            build_weight_distribution(base_input(&shares, &balances, &fee)),
+            Err(WeightBuildError::NoScoredMiners)
+        );
+    }
+
+    /// The same refusal when the ledger has entries but the WINDOW is
+    /// empty — a standing credit is not a share and cannot carry the
+    /// split.
+    ///
+    /// This is the case that made the old behaviour worst: the credit
+    /// holder was a candidate, so `entries` was non-empty and the build
+    /// looked healthy, but its boost is `extra · score_total / divisor`
+    /// = 0 at `score_total == 0`. Wire weight 0, no output, claim 0 —
+    /// the pool took the block AND the credit stayed on the ledger.
+    #[test]
+    fn a_standing_credit_alone_does_not_carry_the_split() {
+        let shares = HashMap::new();
+        let balances = HashMap::from([(addr(A1), Sats(10_000_000))]);
+        let fee = addr(FEE);
+        assert_eq!(
+            build_weight_distribution(base_input(&shares, &balances, &fee)),
+            Err(WeightBuildError::NoScoredMiners)
+        );
+    }
+
+    /// The guard is on the SCORE total, not on "nothing published" — and
+    /// this is the difference that keeps it from switching off two
+    /// legitimate configurations.
+    ///
+    /// A 100 % fee and a `min_payout` above the whole block both publish
+    /// nothing, and for both the pool-only coinbase is the INTENDED
+    /// output. Both keep `score_total > 0`, so both must still build.
+    /// (`full_fee_publishes_nothing` and
+    /// `oversized_min_payout_withholds_instead_of_wrapping` pin their
+    /// payout shapes; this pins that the new refusal does not reach
+    /// them.)
+    #[test]
+    fn withholding_on_purpose_is_not_an_empty_source() {
+        let shares = HashMap::from([(addr(A1), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+
+        let mut full_fee = base_input(&shares, &balances, &fee);
+        full_fee.fee_percent = 100.0;
+        let d = build_weight_distribution(full_fee).expect("a 100 % fee is a valid configuration");
+        assert_eq!(d.published().count(), 0);
+        assert!(d.score_total > 0);
+
+        let mut oversized = base_input(&shares, &balances, &fee);
+        oversized.min_payout_sats = Some(Sats(i64::MAX));
+        let d = build_weight_distribution(oversized).expect("an oversized min_payout still builds");
+        assert_eq!(d.published().count(), 0);
+        assert!(d.score_total > 0);
     }
 
     /// `zero reference revenue is refused`

@@ -18,8 +18,15 @@ use std::sync::Arc;
 
 use bp_common::AddressId;
 use bp_pplns_engine::config::PplnsEngineConfig;
-use bp_pplns_engine::distribution::{DistributionBuilder, DistributionConfig, DistributionResult};
+use bp_pplns_engine::distribution::{
+    DistributionBuilder, DistributionConfig, DistributionError, DistributionResult,
+};
 use bp_pplns_engine::window::{NetworkDifficulty, WindowStore};
+
+/// Pool-output recipient. §4 makes `pay_P` structural, so the weight model
+/// has no distribution without one. One constant because three harnesses
+/// in this file configured the same literal separately.
+const FEE_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 use redis::{aio::ConnectionManager, Client};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
@@ -103,7 +110,7 @@ async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> 
     // The weight model requires the pool-output recipient (pay_P is
     // structural) — mirror the production requirement in the harness.
     let cfg = DistributionConfig::from_engine_config(&PplnsEngineConfig {
-        fee_address: Some(AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap()),
+        fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
         ..PplnsEngineConfig::default()
     });
     let builder = DistributionBuilder::new(pool.clone(), window, cfg);
@@ -261,14 +268,13 @@ async fn concurrent_builds_for_same_reward_share_one_compute() {
         None => return,
     };
 
+    // A REAL address, or the sanitize pass drops it and every build below
+    // dedups an EMPTY distribution — see `cleanup_addresses`.
+    const ADDR: &str = "bc1q69dqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq4vkle";
+    cleanup_addresses(&h.pool, &[ADDR]).await;
+
     let window = build_window(&h).await;
-    seed_share(
-        &window,
-        &format!("{}solo", h.address_prefix),
-        100.0,
-        1_700_000_000_001,
-    )
-    .await;
+    seed_share(&window, ADDR, 100.0, 1_700_000_000_001).await;
 
     let builder = Arc::new(h.builder.clone());
     let mut handles = Vec::new();
@@ -303,14 +309,14 @@ async fn invalidate_all_triggers_fresh_compute() {
         None => return,
     };
 
+    // A REAL address — a prefix placeholder is dropped by the sanitize
+    // pass and the cache identity below would be compared over an EMPTY
+    // distribution.
+    const ADDR: &str = "bc1q6fdqqqqqqqqqqqqqqqqqqqqqqqqqqqqqz09s7u";
+    cleanup_addresses(&h.pool, &[ADDR]).await;
+
     let window = build_window(&h).await;
-    seed_share(
-        &window,
-        &format!("{}foo", h.address_prefix),
-        100.0,
-        1_700_000_000_001,
-    )
-    .await;
+    seed_share(&window, ADDR, 100.0, 1_700_000_000_001).await;
 
     let r1 = h.builder.build(312_500_000).await.expect("ok");
     let r2 = h.builder.build(312_500_000).await.expect("ok");
@@ -338,14 +344,12 @@ async fn distinct_rewards_each_get_their_own_compute() {
         None => return,
     };
 
+    // A REAL address, for the same reason as the two tests above.
+    const ADDR: &str = "bc1q6ddqqqqqqqqqqqqqqqqqqqqqqqqqqqqqm7zjxl";
+    cleanup_addresses(&h.pool, &[ADDR]).await;
+
     let window = build_window(&h).await;
-    seed_share(
-        &window,
-        &format!("{}foo", h.address_prefix),
-        50.0,
-        1_700_000_000_001,
-    )
-    .await;
+    seed_share(&window, ADDR, 50.0, 1_700_000_000_001).await;
 
     let r1 = h.builder.build(300_000_000).await.expect("ok");
     let r2 = h.builder.build(312_500_000).await.expect("ok");
@@ -468,30 +472,120 @@ async fn distinct_references_share_one_fingerprinted_snapshot() {
     cleanup(&h.pool, &h.address_prefix).await;
 }
 
-// ── Test 6 — empty window with no balances → empty distribution ─────
+// ── Test 6 — empty window: refused here, bootstrapped per-miner ──────
 
+/// MONEY: an empty window must not produce a servable distribution.
+///
+/// It used to return an entry list with nothing in it, and that is not a
+/// harmless empty answer: `weight_P` floors at 1 and §4 makes the pool
+/// output the residual, so `payout_entries_at` yielded a SINGLE output
+/// paying the WHOLE block to the fee address — and the list is not empty,
+/// so the job path served it and settlement then booked nothing (every
+/// claim is 0 at `score_total == 0`).
+///
+/// The shared build is the one that must refuse: its result is cached by
+/// revenue alone and handed to every PPLNS connection, so it has no single
+/// miner it could name as the claimant.
+///
+/// The test this replaces asserted `entries.is_empty()` — i.e. it pinned
+/// the defect as the contract.
 #[tokio::test]
-async fn empty_state_returns_fee_only_distribution() {
+async fn an_empty_window_is_refused_by_the_shared_build() {
     let h = match connect_or_skip(13, "test_dist_empty_").await {
         Some(h) => h,
         None => return,
     };
-    // No shares, no balances → an empty entry list with the whole
-    // revenue on the pool output (weight_P alone).
-    let result = h.builder.build(312_500_000).await.expect("ok");
-    assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
-    assert!(result.distribution.entries.is_empty());
-    assert!(result.distribution.weight_p >= 1);
+    let err = h
+        .builder
+        .build(312_500_000)
+        .await
+        .expect_err("an empty window must not yield a shared distribution");
+    assert!(
+        matches!(
+            &*err,
+            DistributionError::WeightBuild(bp_pplns::WeightBuildError::NoScoredMiners)
+        ),
+        "expected NoScoredMiners, got {err:?}"
+    );
 
-    // Snapshot still written (pre-condition for on-block-found
-    // replay; even an "empty" pool block needs the snapshot).
+    cleanup(&h.pool, &h.address_prefix).await;
+}
+
+/// The other half: the per-miner bootstrap build DOES answer, and it pays
+/// the asking miner rather than the pool.
+///
+/// This is what keeps the refusal above from bricking a fresh pool — the
+/// window fills only from accepted shares, and shares come only from jobs.
+#[tokio::test]
+async fn the_bootstrap_build_pays_the_asking_miner() {
+    let h = match connect_or_skip(4, "test_dist_boot_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const ADDR: &str = "bc1q69dqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq4vkle";
+    const T: u64 = 312_500_000;
+    cleanup_addresses(&h.pool, &[ADDR]).await;
+    let claimant = AddressId::new(ADDR).unwrap();
+
+    // Precondition: the shared build really has nothing to work with, so
+    // what follows is the bootstrap and not an ordinary window read.
+    assert!(h.builder.build(T).await.is_err(), "window must be empty");
+
+    let result = h
+        .builder
+        .build_bootstrap(T, &claimant)
+        .await
+        .expect("the bootstrap build must answer");
+    // The claimant carries the whole SCORE space — it is the only scored
+    // address. (`entries` may hold more than one: `pplns_balance` is
+    // global to this Postgres and other tests leave open-balance rows
+    // behind, which legitimately enter as balance-only candidates.)
+    let entry = result
+        .distribution
+        .entries
+        .iter()
+        .find(|e| e.address == claimant)
+        .expect("the claimant must be an entry");
+    assert_eq!(
+        entry.score_weight, result.distribution.score_total,
+        "the claimant holds the entire score space"
+    );
+    assert!(entry.wire_weight > 0, "and is published");
+
+    let paid = result.distribution.payout_entries_at(T).expect("§4 vector");
+    let of = |a: &str| -> u64 {
+        paid.iter()
+            .filter(|(addr, _)| addr.as_str() == a)
+            .map(|(_, s)| *s)
+            .sum()
+    };
+    // THE money assertion: the pool takes its fee and not the block.
+    // `weight_P` carries only the fee whatever the ledger owes, so this
+    // holds regardless of any leftover balance rows.
+    let fee_only = T * u64::from(result.distribution.fee_ppm) / 1_000_000;
+    assert!(
+        of(FEE_ADDR).abs_diff(fee_only) <= 2 + paid.len() as u64,
+        "pool took {} where its fee is {fee_only} — the old behaviour took all {T}",
+        of(FEE_ADDR)
+    );
+    assert!(
+        of(ADDR) > 0,
+        "the asking miner must actually be paid, got {}",
+        of(ADDR)
+    );
+    assert_eq!(paid.iter().map(|(_, s)| *s).sum::<u64>(), T, "Σ == T");
+
+    // And it is bookable — the snapshot landed under its own fingerprint,
+    // so a block found on this job settles like any other.
+    assert!(result.snapshot_written);
     let window = build_window(&h).await;
-    let snapshot = window
+    assert!(window
         .read_weight_snapshot_for(&result.payouts_fingerprint())
         .await
-        .expect("ok");
-    assert!(snapshot.is_some());
+        .expect("read ok")
+        .is_some());
 
+    cleanup_addresses(&h.pool, &[ADDR]).await;
     cleanup(&h.pool, &h.address_prefix).await;
 }
 
@@ -535,6 +629,7 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
         "test_dist_oom_" => 6,
         "test_dist_nopg_" => 5,
         "test_dist_nowin_" => 7,
+        "test_dist_boot_" => 4,
         other => panic!("unknown test prefix: {other}"),
     }
 }
@@ -621,9 +716,7 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
         h.pool.clone(),
         WindowStore::new(ro_conn, 4.0, 100, NetworkDifficulty::new(1_000_000.0)),
         DistributionConfig::from_engine_config(&PplnsEngineConfig {
-            fee_address: Some(
-                AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap(),
-            ),
+            fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
             ..PplnsEngineConfig::default()
         }),
     );
@@ -735,9 +828,7 @@ async fn an_unreadable_ledger_degrades_to_a_score_only_distribution() {
         unreachable_pool(),
         build_window(&h).await,
         DistributionConfig::from_engine_config(&PplnsEngineConfig {
-            fee_address: Some(
-                AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap(),
-            ),
+            fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
             ..PplnsEngineConfig::default()
         }),
     );

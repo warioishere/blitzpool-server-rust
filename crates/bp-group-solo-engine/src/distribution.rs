@@ -235,6 +235,18 @@ async fn compute_distribution(
             coinbase_weight_budget: config.coinbase_weight_budget,
             finder_bonus_ppm,
             finder_address: Some(finder_address),
+            // The prospective finder claims the block if the round turns
+            // out to be empty. Every caller of `build_distribution`
+            // already supplies them (the job path and the JDP tailored
+            // push both build per-finder), and the in-flight cache is
+            // keyed per-finder too, so a bootstrap distribution can never
+            // be served to a different member.
+            //
+            // This is the mode where the empty round is ROUTINE rather
+            // than exotic: `reset_for_block_found` / `reset_full` /
+            // `manual_reset` all DEL the round's by-address hash, and
+            // `read_by_address` has no bucket fallback to soften it.
+            bootstrap_claimant: Some(finder_address),
             reference_revenue_sats: block_reward_sats,
             // Group-Solo: a member the coinbase cannot pay forfeits this
             // block and their share falls to the pool output. Nobody is

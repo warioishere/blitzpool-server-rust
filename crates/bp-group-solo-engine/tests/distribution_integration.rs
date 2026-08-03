@@ -30,6 +30,20 @@ const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 /// these tests use.
 const FEE_ADDR: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 
+/// Finder addresses `bitcoin::Address` can actually PARSE.
+///
+/// `AddressId` only checks the shape, so a placeholder like `bc1qfinder`
+/// passes it and is then dropped by the distribution build's
+/// `is_valid_payout_address` sanitize pass. Six tests below used such
+/// placeholders, which meant every one of them ran against an EMPTY share
+/// map — `per_finder_snapshots_are_isolated` compared two snapshots that
+/// were empty and therefore identical whatever the code did, and
+/// `concurrent_same_finder_builds_share_one_compute` deduped a
+/// distribution with no payouts in it. Both are only meaningful with real
+/// addresses.
+const FINDER_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+const FINDER_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+
 struct Harness {
     pool: PgPool,
     builder: DistributionBuilder,
@@ -335,8 +349,8 @@ async fn per_finder_snapshots_are_isolated() {
         Some(h) => h,
         None => return,
     };
-    let finder1 = AddressId::new("bc1qfinder1").unwrap();
-    let finder2 = AddressId::new("bc1qfinder2").unwrap();
+    let finder1 = AddressId::new(FINDER_A).unwrap();
+    let finder2 = AddressId::new(FINDER_B).unwrap();
     h.round
         .record_share(None, &h.group_id.to_string(), finder1.as_str(), 50.0, 1)
         .await
@@ -386,7 +400,7 @@ async fn concurrent_same_finder_builds_share_one_compute() {
         Some(h) => h,
         None => return,
     };
-    let finder = AddressId::new("bc1qfinder").unwrap();
+    let finder = AddressId::new(FINDER_A).unwrap();
     h.round
         .record_share(None, &h.group_id.to_string(), finder.as_str(), 100.0, 1)
         .await
@@ -423,7 +437,7 @@ async fn invalidate_all_triggers_fresh_compute() {
         Some(h) => h,
         None => return,
     };
-    let finder = AddressId::new("bc1qfinder").unwrap();
+    let finder = AddressId::new(FINDER_A).unwrap();
     h.round
         .record_share(None, &h.group_id.to_string(), finder.as_str(), 100.0, 1)
         .await
@@ -452,23 +466,74 @@ async fn invalidate_all_triggers_fresh_compute() {
     cleanup_group(&h.pool, h.group_id).await;
 }
 
-// ── Test 7 — empty round still builds (fee-only fallback) ──────────
+// ── Test 7 — empty round bootstraps to the finder, not the pool ─────
 
+/// MONEY: a Group-Solo round is EMPTY right after every reset —
+/// `reset_for_block_found` / `reset_full` / `manual_reset` all DEL the
+/// by-address hash, and `read_by_address` has no bucket fallback. A build
+/// in that gap used to return an entry list with nothing in it, and that
+/// is not a harmless empty answer: `weight_P` floors at 1 and §4 makes the
+/// pool output the residual, so the §4 vector was a SINGLE output paying
+/// the entire block to the fee address. The list is not empty either, so
+/// the job path served it.
+///
+/// The prospective finder now claims that block instead. Nobody is robbed
+/// — with an empty round no member holds a share — and the pool still
+/// takes exactly its fee.
+///
+/// The test this replaces asserted only `reference_revenue_sats`, which is
+/// an input echoed back. It could not have seen the payout at all.
 #[tokio::test]
-async fn empty_round_builds_without_panic() {
+async fn an_empty_round_pays_the_finder_not_the_whole_block_to_the_pool() {
     let h = match spawn_or_skip(6, None).await {
         Some(h) => h,
         None => return,
     };
-    let finder = AddressId::new("bc1qfinder").unwrap();
+    let finder = AddressId::new(FINDER_A).unwrap();
+    const T: u64 = 312_500_000;
+
     let result = h
         .builder
-        .build(h.group_id, 312_500_000, &finder)
+        .build(h.group_id, T, &finder)
         .await
-        .expect("ok");
-    // Empty round → an empty entry list with the whole revenue on the
-    // §4 pool output (`weight_P` alone), not an error.
-    assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
+        .expect("an empty round must still yield a servable distribution");
+
+    // Precondition: the round really was empty, so the finder is in here
+    // because the bootstrap put them there and not because of a share.
+    assert_eq!(
+        result.distribution.entries.len(),
+        1,
+        "an empty round has exactly one claimant — the asking finder"
+    );
+    assert_eq!(result.distribution.entries[0].address, finder);
+
+    let paid = result.distribution.payout_entries_at(T).expect("§4 vector");
+    let of = |a: &str| -> u64 {
+        paid.iter()
+            .filter(|(addr, _)| addr.as_str() == a)
+            .map(|(_, s)| *s)
+            .sum()
+    };
+    let fee_only = T * u64::from(result.distribution.fee_ppm) / 1_000_000;
+    assert!(
+        of(FEE_ADDR).abs_diff(fee_only) <= 2,
+        "pool took {} where its fee is {fee_only} — the old behaviour handed it all {T}",
+        of(FEE_ADDR)
+    );
+    assert!(
+        of(FINDER_A).abs_diff(T - fee_only) <= 2,
+        "the finder got {} of the {} the pool does not keep",
+        of(FINDER_A),
+        T - fee_only
+    );
+    assert_eq!(paid.iter().map(|(_, s)| *s).sum::<u64>(), T, "Σ == T");
+
+    // And it is BOOKABLE: the bootstrap distribution is an ordinary one,
+    // so its snapshot landed under its own fingerprint.
+    assert!(
+        result.snapshot_written,
+        "a bootstrap block must be bookable like any other"
+    );
 
     cleanup_group(&h.pool, h.group_id).await;
 }
@@ -481,7 +546,7 @@ async fn distinct_rewards_for_same_group_finder_run_independently() {
         Some(h) => h,
         None => return,
     };
-    let finder = AddressId::new("bc1qfinder").unwrap();
+    let finder = AddressId::new(FINDER_A).unwrap();
     h.round
         .record_share(None, &h.group_id.to_string(), finder.as_str(), 50.0, 1)
         .await

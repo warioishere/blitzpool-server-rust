@@ -224,9 +224,59 @@ impl DistributionBuilder {
                     })
                     .await
                     .map_err(|e| DistributionError::Inputs(e.to_string()))?;
-                build_from_inputs(&inputs, &window, &config, reference_revenue_sats).await
+                // No bootstrap claimant: this build is SHARED by every
+                // PPLNS miner (the cache is keyed by revenue alone), so
+                // there is no single miner it could name. An empty window
+                // therefore surfaces as `NoScoredMiners` — see
+                // [`Self::build_bootstrap`] for who resolves that.
+                build_from_inputs(&inputs, &window, &config, reference_revenue_sats, None).await
             })
             .await
+    }
+
+    /// The empty-window answer for ONE asking miner.
+    ///
+    /// [`Self::build`] cannot give it: its result is shared across every
+    /// PPLNS connection (keyed by revenue only), and a distribution that
+    /// names one miner as the sole claimant must never be handed to
+    /// another. So the bootstrap build is per-miner and deliberately
+    /// UNCACHED at the distribution layer — it only runs while the window
+    /// holds no scored miner at all, which lasts until that miner's first
+    /// accepted share.
+    ///
+    /// The window+ledger `inputs_cache` IS still shared, because the read
+    /// does not depend on the claimant.
+    ///
+    /// Call this only after [`Self::build`] answered
+    /// [`bp_pplns::WeightBuildError::NoScoredMiners`]. Calling it
+    /// unconditionally would hand a miner the whole block on a window
+    /// that has other claimants in it.
+    pub async fn build_bootstrap(
+        &self,
+        reference_revenue_sats: u64,
+        claimant: &AddressId,
+    ) -> Result<Arc<DistributionResult>, Arc<DistributionError>> {
+        let pool = self.pool.clone();
+        let window_for_inputs = self.window.clone();
+        let inputs_loads = self.inputs_loads.clone();
+        let inputs = self
+            .inputs_cache
+            .get_or_compute((), || async move {
+                inputs_loads.fetch_add(1, Ordering::Relaxed);
+                load_inputs(&pool, &window_for_inputs).await
+            })
+            .await
+            .map_err(|e| Arc::new(DistributionError::Inputs(e.to_string())))?;
+        build_from_inputs(
+            &inputs,
+            &self.window,
+            &self.config,
+            reference_revenue_sats,
+            Some(claimant),
+        )
+        .await
+        .map(Arc::new)
+        .map_err(Arc::new)
     }
 
     /// Invalidate the cache for a specific reward. Called by the
@@ -327,6 +377,7 @@ async fn build_from_inputs(
     window: &WindowStore,
     config: &DistributionConfig,
     reference_revenue_sats: u64,
+    bootstrap_claimant: Option<&AddressId>,
 ) -> Result<DistributionResult, DistributionError> {
     // 4-5. Sanitize, project onto weights, persist the snapshot — the
     //      one path both payout engines share. The *live* budget is read
@@ -353,6 +404,7 @@ async fn build_from_inputs(
             // the point of the mode — a small miner accumulates across
             // blocks until they clear `min_payout` instead of forfeiting.
             withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
+            bootstrap_claimant,
             scope: "pplns",
         },
         &mut conn,
