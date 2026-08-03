@@ -170,31 +170,22 @@ pub struct BalanceWrite {
     pub address: AddressId,
     pub balance_sats: Sats,
     pub total_paid_sats: Sats,
-    /// What the ledger row held when `balance_sats` was computed.
-    ///
-    /// A confirmation-gated block is computed at found-time and written
-    /// `confirmation_depth` blocks later, and the upsert is absolute —
-    /// so anything that touched the row in between would be silently
-    /// undone. `PplnsEngine::apply_prepared` re-reads the row and
-    /// re-bases the movement onto it: `now + (balance_sats − before)`.
-    ///
-    /// `None` means "write `balance_sats` as-is": blobs frozen before
-    /// this field existed carry no baseline, and applying the absolute
-    /// is exactly what they have always done.
-    pub balance_before: Option<Sats>,
-    /// The same baseline for `total_paid_sats`, which the upsert also
-    /// writes absolutely.
-    ///
-    /// `total_paid_sats` is frozen as `prev_total_paid + paid`. Without
-    /// a baseline to re-base onto, two blocks maturing in the same
-    /// reconcile pass make the second one's write REVERT the first's
-    /// increment, and the miner's lifetime-paid figure permanently
-    /// under-reports a block. The flush-before-freeze that is supposed
-    /// to prevent the overlap is explicitly best-effort.
-    ///
-    /// `None` = write the absolute (pre-field blobs).
-    pub total_paid_before: Option<Sats>,
 }
+
+// The struct used to carry `balance_before` / `total_paid_before` — a
+// baseline for re-basing an absolute write onto whatever touched the row
+// in between. Both were WRITE-ONLY: `apply_distribution` maps
+// `BalanceWrite` into `BalanceUpsert`, which has no such fields, so
+// nothing ever read them. Their doc named `PplnsEngine::apply_prepared`
+// as the re-baser; that function has not existed since the design moved
+// to freezing a block's INPUTS instead of a computed result. Computing
+// the balances at apply time is what removed the need: `current` is read
+// moments before the write, in the same call.
+//
+// What that leaves is a narrow window between that read and the commit,
+// against the one other writer of `balanceSats` — the daily 03:00 UTC
+// dust sweep (`sweep::update_pplns_balance_sats`). Neither the removed
+// fields nor anything else guarded it; they only claimed to.
 
 #[cfg(test)]
 mod tests {

@@ -748,16 +748,18 @@ async fn reader_current_distribution_sorts_descending() {
     drop_harness(h).await;
 }
 
-// ── Confirmation-gating ordering: prepare/apply interleaving ────────
+// ── Two blocks in sequence must both land ───────────────────────────
 //
-// `prepare_block_found` freezes ABSOLUTE post-distribution balances read
-// from the ledger at found-time; `apply_prepared` writes them verbatim.
-// The two tests below pin the contract that
-// `block_sink::gate_or_apply_pplns`'s flush-before-prepare relies on:
-//   • apply the earlier block BEFORE preparing the next  → totals accumulate
-//   • prepare two blocks against the same (pre-apply) ledger, apply both
-//     → the second absolute write clobbers the first (the hazard the flush
-//       prevents by keeping at most one block pending at a time).
+// This comment used to describe a `prepare_block_found` / `apply_prepared`
+// pair that froze ABSOLUTE balances at found-time, and a
+// flush-before-prepare rule that kept at most one block pending so the
+// second absolute write could not clobber the first. None of that exists:
+// the gated path parks a block's INPUTS and computes the balances at apply
+// time, which is what removed the hazard — and with it the flush rule and
+// the re-base baseline that went with it.
+//
+// What the tests below still pin is the outcome that mattered: two blocks
+// applied in sequence both accumulate, whatever order they mature in.
 
 async fn cleanup_addr(pool: &PgPool, address: &str, heights: &[i32]) {
     let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = ANY($1)"#)

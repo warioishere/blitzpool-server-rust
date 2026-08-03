@@ -597,8 +597,6 @@ impl PplnsEngine {
                 address: addr_id,
                 balance_sats: Sats(current + delta),
                 total_paid_sats: Sats(prev_total_paid + paid as i64),
-                total_paid_before: Some(Sats(prev_total_paid)),
-                balance_before: Some(Sats(current)),
             });
         }
 
@@ -642,8 +640,6 @@ impl PplnsEngine {
                     address: addr_id,
                     balance_sats: Sats(current - *paid as i64),
                     total_paid_sats: Sats(prev_total_paid + *paid as i64),
-                    total_paid_before: Some(Sats(prev_total_paid)),
-                    balance_before: Some(Sats(current)),
                 });
             }
         }

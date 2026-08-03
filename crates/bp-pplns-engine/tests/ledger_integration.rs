@@ -92,15 +92,11 @@ async fn apply_distribution_writes_history_and_balance() {
             address: addr_a.clone(),
             balance_sats: Sats(0),
             total_paid_sats: Sats(150_000),
-            balance_before: None,
-            total_paid_before: None,
         },
         BalanceWrite {
             address: addr_b.clone(),
             balance_sats: Sats(0),
             total_paid_sats: Sats(100_000),
-            balance_before: None,
-            total_paid_before: None,
         },
     ];
 
@@ -157,8 +153,6 @@ async fn apply_distribution_replay_idempotent() {
         address: addr.clone(),
         balance_sats: Sats(0),
         total_paid_sats: Sats(500_000),
-        balance_before: None,
-        total_paid_before: None,
     }];
 
     let first = apply_distribution(&pool, block_height, &rows, &balances, 1_700_000_000_000)
@@ -235,22 +229,16 @@ async fn apply_distribution_mixed_row_types() {
             address: addr_a.clone(),
             balance_sats: Sats(0),
             total_paid_sats: Sats(80_000),
-            balance_before: None,
-            total_paid_before: None,
         },
         BalanceWrite {
             address: addr_b.clone(),
             balance_sats: Sats(1_500),
             total_paid_sats: Sats(0),
-            balance_before: None,
-            total_paid_before: None,
         },
         BalanceWrite {
             address: addr_c.clone(),
             balance_sats: Sats(-1_500),
             total_paid_sats: Sats(0),
-            balance_before: None,
-            total_paid_before: None,
         },
     ];
 
@@ -323,8 +311,6 @@ async fn coinbase_row_constructor_roundtrips_via_apply_distribution() {
             address: addr.clone(),
             balance_sats: Sats(0),
             total_paid_sats: Sats(83_333),
-            balance_before: None,
-            total_paid_before: None,
         }],
         1_700_000_000_000,
     )
