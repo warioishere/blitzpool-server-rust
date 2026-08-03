@@ -159,6 +159,19 @@ pub fn validate_coinbase_outputs_against_distribution(
     // to T). This check only becomes load-bearing if T is ever derived
     // from something other than the declared outputs — keep it so that
     // change cannot silently open a valued-trailing-output hole.
+    //
+    // Trailing outputs are checked for VALUE only, deliberately. §4
+    // also requires the witness commitment to come last, but that is a
+    // construction rule for the JDC; §7.1 defines this verifier's job
+    // as recompute-and-compare plus "only 0-value outputs may follow",
+    // and that is what this is. Nor is it a consensus "last": BIP-141
+    // takes the HIGHEST-index output matching the commitment pattern,
+    // so a 0-value output after it is inert unless it matches too — in
+    // which case the JDC has invalidated its own block and forfeited
+    // its own payout with it. bitcoind is the authority on that, and
+    // rejects it at submit. Checking it here would mix "does this
+    // coinbase pay the published distribution?" (ours) with "is this
+    // block valid?" (not ours).
     for (offset, got) in declared[expected.len()..].iter().enumerate() {
         if got.value != Amount::ZERO {
             return Err(DistributionViolation::NonZeroTrailingOutput {
