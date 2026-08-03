@@ -171,9 +171,17 @@ fn sane_publish_interval(interval: Duration) -> Duration {
 /// The three cases are deliberately distinct. Collapsing "this miner
 /// rides the pool-wide distribution" and "the tailored build failed"
 /// into a single `None` made every failure path — missing fee address,
-/// engine error, no template yet — silently serve a Solo / Group-Solo /
-/// Blockparty JDC the PPLNS distribution, so its block paid the PPLNS
-/// window and booked under the PPLNS fingerprint.
+/// engine error, no template yet — silently serve a Solo or Group-Solo
+/// JDC the PPLNS distribution, so its block paid the PPLNS window and
+/// booked under the PPLNS fingerprint.
+///
+/// **Which modes JDP serves.** PPLNS rides `PoolWide`; Solo and
+/// Group-Solo get `Built`. **Blockparty is not offered over JDP at all**
+/// and resolves to `Unavailable` — a Blockparty group is a rental whose
+/// hashrate is pointed straight at an address and whose coinbase the pool
+/// splits by fixed per-member percentages from Postgres, so there is
+/// nothing a job-declaring client adds. The refusal lives in the
+/// production `build_for_miner`.
 #[derive(Debug)]
 pub enum TailoredDistribution {
     /// PPLNS-mode miner: the pool-wide distribution IS their accounting.
@@ -192,8 +200,9 @@ pub enum TailoredDistribution {
 /// The publisher task calls [`Self::build_pool_wide`] on its interval
 /// (and forced after a settlement); the per-connection task calls
 /// [`Self::build_for_miner`] once an allocate reveals the miner's
-/// identity (Solo / Group-Solo / Blockparty get a tailored
-/// distribution; a PPLNS miner rides the pool-wide one).
+/// identity (Solo and Group-Solo get a tailored distribution; a PPLNS
+/// miner rides the pool-wide one; Blockparty is not served over JDP —
+/// see [`TailoredDistribution`]).
 /// [`Self::next_distribution_id`] allocates the §3.1 strictly-
 /// increasing pool-global id — infra-backed in production (the stratum
 /// crate stays free of Redis), monotonic-counter in tests.

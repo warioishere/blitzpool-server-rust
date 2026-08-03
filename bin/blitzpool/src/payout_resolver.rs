@@ -183,6 +183,33 @@ fn books_without_a_snapshot(mode: MiningMode) -> bool {
     }
 }
 
+/// Does the pool serve this mode a payout distribution over JDP at all?
+///
+/// **Blockparty does not get one.** A Blockparty group is a rental: the
+/// hashrate is pointed straight at an address and the pool splits the
+/// coinbase by fixed per-member percentages read from Postgres. A
+/// job-declaring client exists so a miner can pick its own transaction
+/// set, which a rental customer neither does nor wants — so there is
+/// nothing for JDP to add, and the pool does not offer it.
+///
+/// This is a REFUSAL, not an omission. The Blockparty arm of
+/// `build_for_miner` used to build a tailored distribution from the
+/// Blockparty allocator, so the whole path existed and any Blockparty
+/// admin pointing a JDC at the pool would have exercised it — untested
+/// money surface for a feature that is not offered. Answering
+/// `Unavailable` denies the session the pool-wide distribution too (see
+/// [`TailoredDistribution`]), so it can declare nothing at all rather
+/// than declare something the pool cannot account for.
+///
+/// A `match`, not an `if`: which modes JDP serves is exactly the kind of
+/// per-mode decision a fourth mode must not be able to fall out of.
+fn jdp_serves_a_distribution(mode: MiningMode) -> bool {
+    match mode {
+        MiningMode::Pplns | MiningMode::Solo | MiningMode::GroupSolo => true,
+        MiningMode::Blockparty => false,
+    }
+}
+
 /// Did the build fail because NOTHING in the window holds a share?
 ///
 /// Matched as its own condition because it is the one build failure that
@@ -648,6 +675,18 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
         if lookup.mode == MiningMode::Pplns {
             return TailoredDistribution::PoolWide;
         }
+        // Decided by mode BEFORE anything is built, and by an exhaustive
+        // `match` (see [`jdp_serves_a_distribution`]) so a mode cannot fall
+        // out of it silently.
+        if !jdp_serves_a_distribution(lookup.mode) {
+            warn!(
+                miner = miner_address.as_str(),
+                mode = ?lookup.mode,
+                "jdp distribution source: this mode is not served over JDP — serving NO \
+                 distribution"
+            );
+            return TailoredDistribution::Unavailable;
+        }
         let Some(t_ref) = self.reference_revenue() else {
             warn!(
                 miner = miner_address.as_str(),
@@ -718,26 +757,7 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                 }
             }
             MiningMode::Blockparty => {
-                let entries: Vec<(String, u64)> = self
-                    .resolver
-                    .blockparty_payouts(miner_address.as_str(), t_ref, lookup.group_id.as_deref())
-                    .await
-                    .into_iter()
-                    .map(|p| (p.address, p.sats))
-                    .collect();
-                // Blockparty's allocator puts the pool-fee output FIRST.
-                match entries.split_first() {
-                    Some((pool, miners)) => {
-                        self.lower_exact_entries(&pool.0, pool.1.max(1), miners, t_ref)
-                    }
-                    None => {
-                        warn!(
-                            miner = miner_address.as_str(),
-                            "jdp distribution source: blockparty allocator returned no outputs"
-                        );
-                        None
-                    }
-                }
+                unreachable!("refused by jdp_serves_a_distribution above")
             }
         };
         match built {
@@ -826,6 +846,28 @@ mod tests {
         // the list, or booking would name a snapshot nobody wrote.
         assert!(!books_without_a_snapshot(MiningMode::Pplns));
         assert!(!books_without_a_snapshot(MiningMode::GroupSolo));
+    }
+
+    /// Which modes JDP serves, pinned as a mode→answer decision.
+    ///
+    /// Blockparty is the refusal: a rental points its hashrate at an address
+    /// and the pool splits the coinbase from Postgres, so a job-declaring
+    /// client adds nothing. Before this, `build_for_miner` built a tailored
+    /// distribution for it out of the Blockparty allocator — a reachable,
+    /// untested money path for a feature the pool does not offer.
+    ///
+    /// The other three must stay served, or JDP silently stops working for
+    /// them: PPLNS rides the pool-wide distribution, Solo and Group-Solo get
+    /// a tailored one.
+    #[test]
+    fn jdp_serves_every_mode_except_blockparty() {
+        assert!(!jdp_serves_a_distribution(MiningMode::Blockparty));
+        for served in [MiningMode::Pplns, MiningMode::Solo, MiningMode::GroupSolo] {
+            assert!(
+                jdp_serves_a_distribution(served),
+                "{served:?} must keep its JDP distribution — refusing it serves no job at all"
+            );
+        }
     }
 
     #[test]
