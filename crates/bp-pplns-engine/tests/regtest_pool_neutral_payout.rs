@@ -340,14 +340,11 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
         "the ledger must be untouched before the block is booked"
     );
 
-    let prepared_1 = engine
-        .prepare_block_found_scaled(height_1, &actual_1, Some(fingerprint_1))
+    let _prepared_1 = engine
+        .on_block_found(height_1, &actual_1, None, Some(fingerprint_1))
         .await
         .expect("the mined job's own distribution must resolve for booking");
-    engine
-        .apply_prepared(&prepared_1)
-        .await
-        .expect("apply_prepared");
+    // (apply happens inside on_block_found now)
 
     // Read the WRITTEN state: what the engine returned is an intention,
     // `pplns_balance` is the ledger.
@@ -461,14 +458,11 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
     };
     let paid_2 = |address: &str| actual_2.paid_by_address.get(address).copied().unwrap_or(0) as i64;
 
-    let prepared_2 = engine
-        .prepare_block_found_scaled(height_2, &actual_2, Some(fingerprint_2))
+    let _prepared_2 = engine
+        .on_block_found(height_2, &actual_2, None, Some(fingerprint_2))
         .await
         .expect("the second block's distribution must resolve for booking");
-    engine
-        .apply_prepared(&prepared_2)
-        .await
-        .expect("apply_prepared");
+    // (apply happens inside on_block_found now)
 
     // ── (6) The credit is paid on-chain and the debts are gone ────
     //

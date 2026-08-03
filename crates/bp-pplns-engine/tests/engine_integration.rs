@@ -264,7 +264,12 @@ async fn on_block_found_applies_distribution_from_snapshot() {
     let actual = actual_paying_exactly(&result, 312_500_000);
     let outcome = h
         .engine
-        .on_block_found_scaled(block_height, &actual, Some(result.payouts_fingerprint()))
+        .on_block_found(
+            block_height,
+            &actual,
+            None,
+            Some(result.payouts_fingerprint()),
+        )
         .await
         .expect("ok");
     assert!(outcome.history_inserted >= 1, "at least one audit row");
@@ -356,7 +361,7 @@ async fn later_build_does_not_cost_the_found_block_its_distribution() {
     // Without a fingerprint there is nothing to book against — refuse.
     let blind = h
         .engine
-        .prepare_block_found_scaled(block_height, &actual, None)
+        .on_block_found(block_height, &actual, None, None)
         .await;
     assert!(
         blind.is_err(),
@@ -364,12 +369,11 @@ async fn later_build_does_not_cost_the_found_block_its_distribution() {
     );
 
     // With it: the block's distribution resolves, later build or not.
-    let prepared = h
+    let outcome = h
         .engine
-        .prepare_block_found_scaled(block_height, &actual, Some(fingerprint))
+        .on_block_found(block_height, &actual, None, Some(fingerprint))
         .await
         .expect("the job's own distribution must still resolve");
-    let outcome = h.engine.apply_prepared(&prepared).await.expect("apply ok");
     assert!(outcome.history_inserted >= 1, "audit rows written");
 
     let count: (i64,) =
@@ -603,9 +607,10 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         "sub-threshold miner must NOT get a block-1 coinbase output"
     );
     h.engine
-        .on_block_found_scaled(
+        .on_block_found(
             h1,
             &actual_paying_exactly(&d1, REWARD),
+            None,
             Some(d1.payouts_fingerprint()),
         )
         .await
@@ -639,9 +644,10 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         "accrued credit must push the tiny miner over min_payout into a block-2 output"
     );
     h.engine
-        .on_block_found_scaled(
+        .on_block_found(
             h2,
             &actual_paying_exactly(&d2, REWARD),
+            None,
             Some(d2.payouts_fingerprint()),
         )
         .await
@@ -688,16 +694,17 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         .await
         .unwrap();
     let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
-    let p1 = h
+    let _p1 = h
         .engine
-        .prepare_block_found_scaled(
+        .on_block_found(
             h1,
             &actual_paying_exactly(&d1, REWARD),
+            None,
             Some(d1.payouts_fingerprint()),
         )
         .await
         .expect("prepare 1");
-    h.engine.apply_prepared(&p1).await.expect("apply 1");
+    // (apply happens inside on_block_found now)
     let t1 = miner_total_paid(&h.pool, MINER).await;
     assert!(t1 > 0, "block 1 must credit the miner, got {t1}");
 
@@ -707,16 +714,17 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         .await
         .unwrap();
     let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
-    let p2 = h
+    let _p2 = h
         .engine
-        .prepare_block_found_scaled(
+        .on_block_found(
             h2,
             &actual_paying_exactly(&d2, REWARD),
+            None,
             Some(d2.payouts_fingerprint()),
         )
         .await
-        .expect("prepare 2");
-    h.engine.apply_prepared(&p2).await.expect("apply 2");
+        .expect("block 2");
+    // (apply happens inside on_block_found now)
     let t2 = miner_total_paid(&h.pool, MINER).await;
 
     assert_eq!(
@@ -729,19 +737,17 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
     drop_harness(h).await;
 }
 
-/// Two blocks prepared against the SAME pre-apply ledger and applied
-/// back-to-back must both land — the second must not clobber the first.
+/// Two blocks applied back-to-back must both land — the second must not
+/// clobber the first.
 ///
 /// This used to be a characterization test for the opposite: the apply
 /// re-based `balanceSats` onto the current row but wrote `totalPaidSats`
-/// as a frozen absolute, so block 2 reverted block 1's increment and a
-/// miner's lifetime-paid figure silently lost a block. The interleaving
-/// is supposed to be prevented by `gate_or_apply_pplns` flushing an
-/// earlier pending block first — but that flush is explicitly
-/// best-effort and freezes anyway when the Redis read or the earlier
-/// apply fails, so the ledger must not depend on it.
+/// as an absolute frozen at found-time, so block 2 reverted block 1's
+/// increment and a miner's lifetime-paid figure silently lost a block.
+/// The whole class is gone with the freeze — every write is a delta onto
+/// the row as it stands at apply time — and this pins that it stays gone.
 #[tokio::test]
-async fn gated_two_prepares_against_same_ledger_both_accumulate() {
+async fn two_blocks_in_sequence_both_accumulate() {
     let _serial = balance_table_lock().lock().await;
     let h = match spawn_or_skip(8, "test_gated_clobber_").await {
         Some(h) => h,
@@ -759,38 +765,35 @@ async fn gated_two_prepares_against_same_ledger_both_accumulate() {
         .await
         .unwrap();
     let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
-    let p1 = h
+    let _p1 = h
         .engine
-        .prepare_block_found_scaled(
+        .on_block_found(
             h1,
             &actual_paying_exactly(&d1, REWARD),
+            None,
             Some(d1.payouts_fingerprint()),
         )
         .await
-        .expect("prepare 1");
+        .expect("block 1");
+    let t1 = miner_total_paid(&h.pool, MINER).await;
 
-    // Freeze block 2 against the SAME pre-apply ledger (no flush).
+    // Block 2, against the ledger block 1 just moved.
     h.engine
         .record_share(None, MINER, 100.0, 1_700_000_060_001)
         .await
         .unwrap();
     let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
-    let p2 = h
+    let _p2 = h
         .engine
-        .prepare_block_found_scaled(
+        .on_block_found(
             h2,
             &actual_paying_exactly(&d2, REWARD),
+            None,
             Some(d2.payouts_fingerprint()),
         )
         .await
-        .expect("prepare 2");
+        .expect("block 2");
 
-    // Apply both. Each carries its own frozen baseline, so the apply
-    // lands the block's OWN increment on whatever the row holds now
-    // rather than the absolute it was frozen with.
-    h.engine.apply_prepared(&p1).await.expect("apply 1");
-    let t1 = miner_total_paid(&h.pool, MINER).await;
-    h.engine.apply_prepared(&p2).await.expect("apply 2");
     let t2 = miner_total_paid(&h.pool, MINER).await;
 
     assert!(t1 > 0, "block 1 must credit the miner, got {t1}");
@@ -904,9 +907,10 @@ async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
     let never_written = [0x5au8; 32];
     let err = h
         .engine
-        .prepare_block_found_scaled(
+        .on_block_found(
             9_997_201,
             &actual_paying_exactly(&good, REWARD),
+            None,
             Some(never_written),
         )
         .await
@@ -952,12 +956,12 @@ async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() 
     let height = 9_997_301;
     let actual = actual_paying_exactly(&dist, REWARD);
 
-    let prepared = h
+    let _prepared = h
         .engine
-        .prepare_block_found_scaled(height, &actual, Some(fp))
+        .on_block_found(height, &actual, None, Some(fp))
         .await
         .expect("prepare ok");
-    h.engine.apply_prepared(&prepared).await.expect("apply ok");
+    // (apply happens inside on_block_found now)
 
     // The weight snapshot SURVIVES (it serves every block of this
     // distribution) — redelivery is refused by the payout-history
@@ -973,15 +977,15 @@ async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() 
     );
     let redelivered = h
         .engine
-        .prepare_block_found_scaled(height, &actual, Some(fp))
-        .await;
-    assert!(
-        matches!(
-            redelivered,
-            Err(bp_pplns_engine::engine::EngineError::AlreadyBooked { .. })
-        ),
-        "a redelivered block-found must fail closed on the history guard, \
-         not re-prepare against the ledger it already credited (got {redelivered:?})"
+        .on_block_found(height, &actual, None, Some(fp))
+        .await
+        .expect("a redelivered block-found is a no-op, not an error");
+    assert_eq!(
+        (redelivered.history_inserted, redelivered.balances_affected),
+        (0, 0),
+        "a redelivered block-found must write nothing: the payout-history \
+         UNIQUE swallows the insert and the balance upsert is gated on it \
+         (got {redelivered:?})"
     );
 
     let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
@@ -1050,19 +1054,17 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
         "same settlement inputs → one shared snapshot"
     );
 
-    let prepared_first = h
+    let _prepared_first = h
         .engine
-        .prepare_block_found_scaled(
+        .on_block_found(
             h1,
             &actual_paying_exactly(&dist_first, REWARD_FIRST),
+            None,
             Some(dist_first.payouts_fingerprint()),
         )
         .await
         .expect("prepare first");
-    h.engine
-        .apply_prepared(&prepared_first)
-        .await
-        .expect("apply first");
+    // (apply happens inside on_block_found now)
     let (accrued_once, _) = miner_balance_and_paid(&h.pool, TINY).await;
     assert!(
         accrued_once > 0,
@@ -1081,19 +1083,17 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
             .is_some(),
         "the shared weight snapshot must survive the first apply"
     );
-    let prepared_second = h
+    let _prepared_second = h
         .engine
-        .prepare_block_found_scaled(
+        .on_block_found(
             h2,
             &actual_paying_exactly(&dist_second, REWARD_SECOND),
+            None,
             Some(fp_second),
         )
         .await
         .expect("a block frozen before the apply must still be bookable");
-    h.engine
-        .apply_prepared(&prepared_second)
-        .await
-        .expect("apply second");
+    // (apply happens inside on_block_found now)
 
     // Writing the snapshot's ABSOLUTE would leave the credit at one block's
     // worth — the second block's accrual silently lost.
@@ -1154,9 +1154,10 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
         .unwrap();
     let d1 = h.engine.build_distribution(T_REF).await.expect("build 1");
     h.engine
-        .on_block_found_scaled(
+        .on_block_found(
             h1,
             &actual_paying_exactly(&d1, T_REF),
+            None,
             Some(d1.payouts_fingerprint()),
         )
         .await
@@ -1193,7 +1194,7 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
 
     // THE REGRESSION: this returned `RewardOutOfBand` and booked nothing.
     h.engine
-        .on_block_found_scaled(h2, &actual2, Some(d2.payouts_fingerprint()))
+        .on_block_found(h2, &actual2, None, Some(d2.payouts_fingerprint()))
         .await
         .expect("a block off the reference revenue must still book");
 
@@ -1254,7 +1255,7 @@ async fn a_coinbase_below_the_block_subsidy_is_refused() {
     let burned = actual_paying_exactly(&d, subsidy - 1);
     let err = h
         .engine
-        .on_block_found_scaled(height, &burned, Some(d.payouts_fingerprint()))
+        .on_block_found(height, &burned, None, Some(d.payouts_fingerprint()))
         .await
         .expect_err("a coinbase below the subsidy must not book");
     assert!(
@@ -1278,7 +1279,7 @@ async fn a_coinbase_below_the_block_subsidy_is_refused() {
     // the subsidy, nothing fuzzier.
     let honest = actual_paying_exactly(&d, subsidy);
     h.engine
-        .on_block_found_scaled(height, &honest, Some(d.payouts_fingerprint()))
+        .on_block_found(height, &honest, None, Some(d.payouts_fingerprint()))
         .await
         .expect("a coinbase paying exactly the subsidy books");
 
@@ -1340,50 +1341,79 @@ async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
         "the credit must buy a real coinbase output, or this proves nothing"
     );
 
-    // Freeze, as the block-found path does.
-    let prepared = h
-        .engine
-        .prepare_block_found_scaled(height, &actual, Some(d.payouts_fingerprint()))
-        .await
-        .expect("freeze");
-    let frozen = prepared
-        .balances
-        .iter()
-        .find(|b| b.address == DORMANT)
-        .expect("the dormant holder is in the frozen set");
-    let before = frozen
-        .balance_before_sats
-        .expect("the freeze must record what the row held");
-    let frozen_after = frozen.balance_sats;
-    assert_eq!(before, CREDIT, "baseline is the row at freeze time");
-
-    // …now the 03:00 sweep pair-cancels the credit and deletes the row.
+    // …the 03:00 sweep pair-cancels the credit and deletes the row
+    // BEFORE the block is applied. Under confirmation gating that gap is
+    // hours wide.
     sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
         .bind(DORMANT)
         .execute(&h.pool)
         .await
         .unwrap();
 
-    h.engine.apply_prepared(&prepared).await.expect("apply");
+    h.engine
+        .on_block_found(height, &actual, None, Some(d.payouts_fingerprint()))
+        .await
+        .expect("apply");
 
+    // The settlement reads the row as it stands NOW and books a delta
+    // onto it, so the swept row is not restored. Freezing an absolute
+    // post-block balance at found-time and writing it verbatim later was
+    // exactly the bug this guards: it would have put the credit back.
     let (after, _) = miner_balance_and_paid(&h.pool, DORMANT).await;
-    // The movement this block causes is `frozen_after − before`; applied
-    // to a swept (absent → 0) row it lands there, not on the stale
-    // absolute.
-    assert_eq!(
-        after,
-        frozen_after - before,
-        "the block's movement must land on the CURRENT row"
-    );
     assert!(
         after < 0,
         "the sweep gave the credit away and the coinbase paid it too, so \
          the holder owes it back — got {after}"
     );
-    assert_ne!(
-        after, frozen_after,
-        "writing the frozen absolute is exactly the bug: it would have \
-         restored the swept credit"
+
+    cleanup_addr(&h.pool, MINER, &[height]).await;
+    cleanup_addr(&h.pool, DORMANT, &[height]).await;
+
+    h.engine
+        .record_share(None, MINER, 1_000.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    // A credit with no shares behind it — exactly what the sweep hunts.
+    sqlx::query(
+        r#"INSERT INTO pplns_balance (address, "balanceSats", "totalPaidSats", "updatedAt")
+           VALUES ($1, $2, 0, 0)"#,
+    )
+    .bind(DORMANT)
+    .bind(CREDIT)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    let d = h.engine.build_distribution(T).await.expect("build");
+    let actual = actual_paying_exactly(&d, T);
+    assert!(
+        actual.paid_by_address.get(DORMANT).is_some_and(|p| *p > 0),
+        "the credit must buy a real coinbase output, or this proves nothing"
+    );
+
+    // …the 03:00 sweep pair-cancels the credit and deletes the row
+    // BEFORE the block is applied. Under confirmation gating that gap is
+    // hours wide.
+    sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
+        .bind(DORMANT)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    h.engine
+        .on_block_found(height, &actual, None, Some(d.payouts_fingerprint()))
+        .await
+        .expect("apply");
+
+    // The settlement reads the row as it stands NOW and books a delta
+    // onto it, so the swept row is not restored. Freezing an absolute
+    // post-block balance at found-time and writing it verbatim later was
+    // exactly the bug this guards: it would have put the credit back.
+    let (after, _) = miner_balance_and_paid(&h.pool, DORMANT).await;
+    assert!(
+        after < 0,
+        "the sweep gave the credit away and the coinbase paid it too, so \
+         the holder owes it back — got {after}"
     );
 
     cleanup_addr(&h.pool, MINER, &[height]).await;

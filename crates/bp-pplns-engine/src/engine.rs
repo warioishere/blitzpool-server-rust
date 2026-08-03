@@ -163,127 +163,6 @@ impl EngineError {
     }
 }
 
-/// A PPLNS block-found distribution computed at found-time and frozen
-/// for deferred (confirmation-gated) application. Carries only primitive
-/// fields so it round-trips through the pending-block store (Redis)
-/// without leaking engine/ledger types onto the wire. Built by
-/// [`PplnsEngine::prepare_block_found`], replayed by
-/// [`PplnsEngine::apply_prepared`].
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct PreparedBlockFound {
-    pub block_height: i32,
-    /// The reward the snapshot was computed against — carried for
-    /// logging / cross-checks at apply time.
-    pub block_reward_sats: u64,
-    /// Found-time wall clock (epoch ms); stamped onto the ledger rows so
-    /// history `created_at` reflects when the block was found, not when
-    /// it confirmed.
-    pub now_ms: i64,
-    pub rows: Vec<PreparedAuditRow>,
-    pub balances: Vec<PreparedBalanceWrite>,
-    /// The payout-list fingerprint whose snapshot this was frozen from, if
-    /// it came from one. Carried so the apply consumes exactly that key: a
-    /// snapshot outliving its own block is what lets a redelivered event
-    /// re-prepare against an already-credited ledger.
-    #[serde(default)]
-    pub payouts_fingerprint: Option<[u8; 32]>,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct PreparedAuditRow {
-    pub address: String,
-    pub paid_sats: i64,
-    pub percent: f32,
-    /// `PayoutRowType` wire string (`coinbase` / `pending` / `dust-sweep`).
-    pub row_type: String,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct PreparedBalanceWrite {
-    pub address: String,
-    pub balance_sats: i64,
-    pub total_paid_sats: i64,
-    /// The ledger row as it stood when this block was frozen, so the
-    /// apply can re-base its movement onto whatever the row holds by
-    /// the time the block confirms (see [`BalanceWrite::balance_before`]).
-    /// `serde(default)` keeps blobs frozen before this field readable —
-    /// they apply their absolute, exactly as they always did.
-    #[serde(default)]
-    pub balance_before_sats: Option<i64>,
-    /// Baseline for `total_paid_sats` — see
-    /// [`BalanceWrite::total_paid_before`]. `serde(default)` for blobs
-    /// frozen before the field existed.
-    #[serde(default)]
-    pub total_paid_before_sats: Option<i64>,
-}
-
-impl PreparedBlockFound {
-    fn freeze(
-        block_height: i32,
-        block_reward_sats: u64,
-        now_ms: i64,
-        rows: &[AuditRow],
-        balances: &[BalanceWrite],
-        payouts_fingerprint: Option<[u8; 32]>,
-    ) -> Self {
-        Self {
-            block_height,
-            block_reward_sats,
-            now_ms,
-            payouts_fingerprint,
-            rows: rows
-                .iter()
-                .map(|r| PreparedAuditRow {
-                    address: r.address.as_str().to_string(),
-                    paid_sats: r.paid_sats.0,
-                    percent: r.percent,
-                    row_type: r.row_type.as_wire().to_string(),
-                })
-                .collect(),
-            balances: balances
-                .iter()
-                .map(|b| PreparedBalanceWrite {
-                    address: b.address.as_str().to_string(),
-                    balance_sats: b.balance_sats.0,
-                    total_paid_sats: b.total_paid_sats.0,
-                    balance_before_sats: b.balance_before.map(|s| s.0),
-                    total_paid_before_sats: b.total_paid_before.map(|s| s.0),
-                })
-                .collect(),
-        }
-    }
-
-    /// Reconstruct the engine/ledger types from the frozen wire form.
-    /// Fails only if the persisted blob is corrupt (bad address shape or
-    /// unknown row-type string) — never in normal operation, since the
-    /// blob was produced by [`Self::freeze`] from valid types.
-    fn thaw(&self) -> Result<(Vec<AuditRow>, Vec<BalanceWrite>), EngineError> {
-        let mut rows = Vec::with_capacity(self.rows.len());
-        for r in &self.rows {
-            let row_type = PayoutRowType::from_wire(&r.row_type).ok_or_else(|| {
-                EngineError::PreparedDecode(format!("unknown row_type {:?}", r.row_type))
-            })?;
-            rows.push(AuditRow {
-                address: AddressId::new(r.address.clone())?,
-                paid_sats: Sats(r.paid_sats),
-                percent: r.percent,
-                row_type,
-            });
-        }
-        let mut balances = Vec::with_capacity(self.balances.len());
-        for b in &self.balances {
-            balances.push(BalanceWrite {
-                address: AddressId::new(b.address.clone())?,
-                balance_sats: Sats(b.balance_sats),
-                total_paid_sats: Sats(b.total_paid_sats),
-                balance_before: b.balance_before_sats.map(Sats),
-                total_paid_before: b.total_paid_before_sats.map(Sats),
-            });
-        }
-        Ok((rows, balances))
-    }
-}
-
 /// Top-level handle. Cloneable (`Arc<Inner>`); callers share one
 /// engine across the whole pool.
 #[derive(Clone)]
@@ -467,158 +346,24 @@ impl PplnsEngine {
             .map_err(EngineError::Distribution)
     }
 
-    /// Re-base each balance write onto the row as it stands NOW.
+    /// Apply a found block: settle `claim(T_actual) − paid` per address
+    /// against the block's OWN coinbase, then write the payout history.
     ///
-    /// A confirmation-gated block freezes ABSOLUTE post-block balances
-    /// at found-time and writes them `confirmation_depth` blocks later
-    /// (default 3, ~30 min), and `bulk_upsert_pplns_balances` sets
-    /// `balanceSats = EXCLUDED`. So every writer that touches a row in
-    /// that window is undone by the apply.
+    /// `snapshot` is the distribution's settlement inputs. The
+    /// confirmation-gated path carries it in the parked blob (the Redis
+    /// key can TTL out before a block confirms); the immediate path
+    /// passes `None` and it is read back under the fingerprint.
     ///
-    /// The block-found path already guards the writer it knew about —
-    /// an earlier pending block, flushed before the next one freezes.
-    /// The daily 03:00-UTC dust sweep is the other one: it pair-cancels
-    /// an abandoned credit against an abandoned debit and deletes both
-    /// rows. Landing the frozen absolute afterwards restored the credit
-    /// while the debit stayed swept, leaving the ledger owing satoshis
-    /// no one owed it — paid out of the miners' cut on the next block.
-    ///
-    /// So the movement, not the outcome, is what gets applied:
-    /// `now + (frozen_after − frozen_before)`. Signed, unclamped — the
-    /// PPLNS ledger carries debts. Same shape as Group-Solo's
-    /// `resolve_new_balance`, which solved this for its own snapshots.
-    async fn rebase_onto_current(
-        &self,
-        balance_writes: &mut [BalanceWrite],
-        block_height: i32,
-    ) -> Result<(), EngineError> {
-        let rebasable: Vec<String> = balance_writes
-            .iter()
-            .filter(|b| b.balance_before.is_some() || b.total_paid_before.is_some())
-            .map(|b| b.address.as_str().to_string())
-            .collect();
-        if rebasable.is_empty() {
-            return Ok(());
-        }
-        let current: HashMap<String, (i64, i64)> =
-            find_pplns_balances_for_addresses(&self.inner.pool, &rebasable)
-                .await?
-                .into_iter()
-                .map(|r| {
-                    (
-                        r.address.as_str().to_string(),
-                        (r.balance_sats.0, r.total_paid_sats.0),
-                    )
-                })
-                .collect();
-
-        for write in balance_writes.iter_mut() {
-            // A row absent now reads as (0, 0) — the sweep deletes a row
-            // it has zeroed, and re-basing onto 0 is what keeps that
-            // deletion standing.
-            let (now, now_total) = current
-                .get(write.address.as_str())
-                .copied()
-                .unwrap_or((0, 0));
-
-            // `totalPaidSats` is written absolutely by the same upsert,
-            // so it needs the same treatment: apply the block's OWN
-            // increment to whatever the row holds now. Without this a
-            // second block maturing in the same pass reverts the first
-            // one's increment and the lifetime-paid figure loses a block.
-            if let Some(before_total) = write.total_paid_before {
-                let paid_this_block = write.total_paid_sats.0 - before_total.0;
-                let rebased_total = now_total + paid_this_block;
-                if rebased_total != write.total_paid_sats.0 {
-                    warn!(
-                        address = write.address.as_str(),
-                        block_height,
-                        frozen_total_before = before_total.0,
-                        frozen_total_after = write.total_paid_sats.0,
-                        current_total = now_total,
-                        rebased_total,
-                        "pplns apply: totalPaidSats moved between freeze and apply — applying \
-                         this block's increment to the current row"
-                    );
-                    write.total_paid_sats = Sats(rebased_total);
-                }
-            }
-
-            let Some(before) = write.balance_before else {
-                continue;
-            };
-            if now == before.0 {
-                continue;
-            }
-            let rebased = now + (write.balance_sats.0 - before.0);
-            warn!(
-                address = write.address.as_str(),
-                block_height,
-                frozen_before = before.0,
-                frozen_after = write.balance_sats.0,
-                current = now,
-                rebased,
-                "pplns apply: the ledger row moved between freeze and apply — applying the \
-                 block's movement to the current row rather than the frozen absolute"
-            );
-            write.balance_sats = Sats(rebased);
-        }
-        Ok(())
-    }
-
-    /// **Apply** a previously [`prepared`](Self::prepare_block_found)
-    /// distribution to the ledger. Idempotent on replay via the
-    /// `(blockHeight, address)` UNIQUE constraint. Clears the
-    /// (now-stale) snapshot best-effort and drops the distribution
-    /// cache so the next build reads the fresh ledger.
-    ///
-    /// The balance writes are RE-BASED first — see
-    /// [`Self::rebase_onto_current`]. A gated block is computed at
-    /// found-time and lands `confirmation_depth` blocks later, and the
-    /// upsert is absolute, so without this anything that touched a row
-    /// in between would be silently undone.
-    pub async fn apply_prepared(
-        &self,
-        prepared: &PreparedBlockFound,
-    ) -> Result<ApplyDistributionResult, EngineError> {
-        let (audit_rows, mut balance_writes) = prepared.thaw()?;
-        self.rebase_onto_current(&mut balance_writes, prepared.block_height)
-            .await?;
-
-        let outcome = apply_distribution(
-            &self.inner.pool,
-            prepared.block_height,
-            &audit_rows,
-            &balance_writes,
-            prepared.now_ms,
-        )
-        .await?;
-
-        // The weight snapshot is NOT consumed here: it legitimately
-        // serves every block built from its distribution (settlement is
-        // a delta from the REAL coinbase), and redelivery fails closed
-        // at prepare time via the payout-history guard instead. It
-        // expires by TTL.
-        self.inner.distribution_builder.invalidate_all();
-
-        info!(
-            block_height = prepared.block_height,
-            history_inserted = outcome.history_inserted,
-            balances_affected = outcome.balances_affected,
-            "pplns on_block_found applied"
-        );
-        Ok(outcome)
-    }
-
-    /// [`Self::on_block_found_for`] for the weight model: prepare from
-    /// the REAL coinbase (claim − paid) and apply immediately. The
-    /// ungated block-found arm; the confirmation-gated arm calls
-    /// [`Self::prepare_block_found_scaled`] + [`Self::apply_prepared`]
-    /// itself.
-    pub async fn on_block_found_scaled(
+    /// Idempotent on redelivery without a guard of its own:
+    /// `pplns_payout_history` is UNIQUE on `(blockHeight, address)` and
+    /// the balance upsert only runs when history rows were actually
+    /// inserted, so a second delivery writes nothing and reports
+    /// `history_inserted == 0`.
+    pub async fn on_block_found(
         &self,
         block_height: i32,
         actual: &ActualCoinbase,
+        snapshot: Option<StoredWeightSnapshot>,
         payouts_fingerprint: Option<[u8; 32]>,
     ) -> Result<ApplyDistributionResult, EngineError> {
         if self
@@ -628,66 +373,55 @@ impl PplnsEngine {
         {
             return Err(EngineError::BlockFoundInProgress);
         }
-        let result = async {
-            let prepared = self
-                .prepare_block_found_scaled(block_height, actual, payouts_fingerprint)
-                .await?;
-            self.apply_prepared(&prepared).await
-        }
-        .await;
+        let result = self
+            .on_block_found_inner(block_height, actual, snapshot, payouts_fingerprint)
+            .await;
         self.inner
             .block_found_in_progress
             .store(false, Ordering::SeqCst);
         result
     }
 
-    /// [`Self::prepare_block_found_for`] for a job built from a WEIGHT
-    /// distribution (schema-2 snapshot): settlement books
-    /// `claim(T_actual) − actually_paid` per address, with both sides
-    /// taken from the REAL coinbase of the found block. Correct for any
-    /// revenue inside the settlement band — the pool's own templates
-    /// and a JDC's independently-valued job settle through this one
-    /// path.
-    pub async fn prepare_block_found_scaled(
+    async fn on_block_found_inner(
         &self,
         block_height: i32,
         actual: &ActualCoinbase,
+        snapshot: Option<StoredWeightSnapshot>,
         payouts_fingerprint: Option<[u8; 32]>,
-    ) -> Result<PreparedBlockFound, EngineError> {
-        let fingerprint = payouts_fingerprint
-            .filter(|fp| fp != &[0u8; 32])
-            .ok_or(EngineError::NoPayoutFingerprint { block_height })?;
-        // Redelivery guard. A weight snapshot legitimately serves MANY
-        // blocks (every job built between window changes shares one
-        // fingerprint), so the v1 "apply consumes the snapshot" trick
-        // cannot protect against a redelivered block-found here. What
-        // identifies a booked block is its payout history: rows at this
-        // height mean the ledger was already credited — refuse.
-        if bp_db::payout_recorded_at_height(&self.inner.pool, block_height).await? {
-            return Err(EngineError::AlreadyBooked { block_height });
-        }
-        // Same retry rationale as the schema-1 read above.
-        let mut attempt = 0;
-        let snapshot = loop {
-            match self
-                .inner
-                .window
-                .read_weight_snapshot_for(&fingerprint)
-                .await
-            {
-                Ok(Some(s)) => break s,
-                Ok(None) => return Err(EngineError::SnapshotMissing { block_height }),
-                Err(e) if attempt < SNAPSHOT_READ_RETRIES => {
-                    warn!(
-                        error = %e,
-                        block_height,
-                        attempt,
-                        "PPLNS weight-snapshot read failed — retrying before giving up on the block"
-                    );
-                    attempt += 1;
-                    tokio::time::sleep(SNAPSHOT_READ_BACKOFF * attempt).await;
+    ) -> Result<ApplyDistributionResult, EngineError> {
+        // 1. Snapshot source: the parked blob, else the fingerprint key.
+        let snapshot = match snapshot {
+            Some(s) => s,
+            None => {
+                let fingerprint = payouts_fingerprint
+                    .filter(|fp| fp != &[0u8; 32])
+                    .ok_or(EngineError::NoPayoutFingerprint { block_height })?;
+                // Retry a transient Redis failure rather than discarding
+                // the block; the caller has no retry of its own. A
+                // genuinely missing snapshot is NOT retried.
+                let mut attempt = 0;
+                loop {
+                    match self
+                        .inner
+                        .window
+                        .read_weight_snapshot_for(&fingerprint)
+                        .await
+                    {
+                        Ok(Some(s)) => break s,
+                        Ok(None) => return Err(EngineError::SnapshotMissing { block_height }),
+                        Err(e) if attempt < SNAPSHOT_READ_RETRIES => {
+                            warn!(
+                                error = %e,
+                                block_height,
+                                attempt,
+                                "PPLNS weight-snapshot read failed — retrying before giving up"
+                            );
+                            attempt += 1;
+                            tokio::time::sleep(SNAPSHOT_READ_BACKOFF * attempt).await;
+                        }
+                        Err(e) => return Err(EngineError::Redis(e)),
+                    }
                 }
-                Err(e) => return Err(EngineError::Redis(e)),
             }
         };
 
@@ -712,9 +446,7 @@ impl PplnsEngine {
         }
         // Drift off the projection base is an ALARM, not a gate. The
         // claims below come from the block's own coinbase, so they are
-        // right at any revenue; refusing to book here used to leave the
-        // balances this block already paid standing in the ledger, and
-        // the next block paid them out a second time.
+        // right at any revenue.
         if !reward_within_band(snapshot.reference_revenue_sats, actual.total_value_sats) {
             warn!(
                 reference_reward = snapshot.reference_revenue_sats,
@@ -725,20 +457,38 @@ impl PplnsEngine {
             );
         }
 
+        // 2. Settle. Every balance write is a DELTA onto the row as it
+        //    stands right now, so nothing has to be re-based — computing
+        //    here rather than at found-time is what removes that whole
+        //    problem. The window read only decides which addresses get a
+        //    0-sat late-arriver audit row; no satoshi depends on it.
         let now_ms = chrono::Utc::now().timestamp_millis();
         let current_window = self.inner.window.read_window_by_address().await?;
         let (audit_rows, balance_writes) = self
             .build_writes_from_weight_snapshot(&snapshot, &current_window, actual)
             .await?;
 
-        Ok(PreparedBlockFound::freeze(
+        let outcome = apply_distribution(
+            &self.inner.pool,
             block_height,
-            actual.total_value_sats,
-            now_ms,
             &audit_rows,
             &balance_writes,
-            Some(fingerprint),
-        ))
+            now_ms,
+        )
+        .await?;
+
+        // The weight snapshot is NOT consumed: it legitimately serves
+        // every block built from its distribution (settlement is a delta
+        // from the REAL coinbase). It expires by TTL.
+        self.inner.distribution_builder.invalidate_all();
+
+        info!(
+            block_height,
+            history_inserted = outcome.history_inserted,
+            balances_affected = outcome.balances_affected,
+            "pplns on_block_found applied"
+        );
+        Ok(outcome)
     }
 
     /// The weight-model settlement: per snapshot entry compute the

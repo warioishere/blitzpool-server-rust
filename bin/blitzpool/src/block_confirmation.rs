@@ -37,9 +37,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::pending_blocks::{remove_pending_block, PENDING_KEY, UNBOOKABLE_KEY};
-use crate::pending_group_solo_blocks::{
-    remove_pending_group_solo_block, GS_PENDING_KEY, GS_UNBOOKABLE_KEY,
-};
 use crate::pending_store::{load_pending, put_pending, remove_pending, PendingBlockRef};
 
 /// Fallback re-check cadence when the TDP stream is quiet. New blocks normally
@@ -220,7 +217,10 @@ async fn collect_confirmed<T: DeserializeOwned + PendingBlockRef>(
     confirmed
 }
 
-/// One reconciliation pass over both stores.
+/// One reconciliation pass over the pending store.
+///
+/// One loop for both modes: the parked blob carries the settlement
+/// inputs either way, and `group` decides which engine settles them.
 async fn reconcile(
     bitcoin_rpc: &BitcoinRpc,
     redis: &ConnectionManager,
@@ -235,157 +235,130 @@ async fn reconcile(
     >,
 ) {
     let depth = i64::from(confirmation_depth);
+    let mut conn = redis.clone();
+    let confirmed = collect_confirmed::<crate::pending_blocks::PendingBlock>(
+        bitcoin_rpc,
+        &mut conn,
+        PENDING_KEY,
+        depth,
+        "pool",
+    )
+    .await;
 
-    if let Some(pplns) = pplns {
-        let mut conn = redis.clone();
-        let confirmed = collect_confirmed::<crate::pending_blocks::PendingBlock>(
-            bitcoin_rpc,
-            &mut conn,
-            PENDING_KEY,
-            depth,
-            "PPLNS",
-        )
-        .await;
-        for pb in confirmed {
-            match pplns.apply_prepared(&pb.prepared).await {
-                Ok(outcome) => {
-                    if let Some(handle) = settle.and_then(|s| s.get()) {
-                        handle.settle();
-                    }
-                    info!(
+    for pb in confirmed {
+        // Settlement is `claim − paid` against the block's OWN coinbase,
+        // so its payments are not optional: without them there is
+        // nothing to settle against and the block is an operator
+        // reprocess.
+        let Some(actual) = pb.actual_coinbase.clone() else {
+            error!(
+                block_hash = %pb.block_hash,
+                height = pb.block_height,
+                "block-confirmation: parked block carries no parsed coinbase — discarding, \
+                 reprocess from the block's own coinbase"
+            );
+            let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+            continue;
+        };
+
+        let applied = match (&pb.group, pplns, group_solo) {
+            (Some(group), _, Some(engine)) => {
+                let (Ok(group_uuid), Ok(finder)) = (
+                    uuid::Uuid::parse_str(&group.group_id),
+                    AddressId::new(group.finder.clone()),
+                ) else {
+                    error!(
                         block_hash = %pb.block_hash,
-                        height = pb.prepared.block_height,
-                        history_inserted = outcome.history_inserted,
-                        balances_affected = outcome.balances_affected,
-                        "block-confirmation: confirmed → PPLNS ledger applied"
+                        group_id = %group.group_id,
+                        "block-confirmation: parked Group-Solo block has an unusable group id \
+                         or finder — discarding"
                     );
                     let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
-                }
-                Err(err) if err.is_terminal() => {
-                    // Park, don't destroy: the frozen blob is the only
-                    // record of what this block paid every miner, and
-                    // there is no reprocess path that can rebuild it.
-                    let parked = put_pending(&mut conn, UNBOOKABLE_KEY, &pb.block_hash, &pb)
-                        .await
-                        .is_ok();
-                    error!(
-                        %err,
-                        block_hash = %pb.block_hash,
-                        height = pb.prepared.block_height,
-                        parked,
-                        unbookable_key = UNBOOKABLE_KEY,
-                        "block-confirmation: PPLNS block cannot be booked automatically — \
-                         moved to the unbookable store instead of retrying forever; the \
-                         miners it paid are owed their ledger entry and the frozen \
-                         distribution is preserved there for a manual apply"
-                    );
-                    if parked {
-                        let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
-                    }
-                }
-                Err(err) => warn!(
-                    %err,
-                    block_hash = %pb.block_hash,
-                    "block-confirmation: PPLNS apply_prepared failed; will retry next tick"
-                ),
+                    continue;
+                };
+                engine
+                    .on_block_found(
+                        group_uuid,
+                        pb.block_height,
+                        &actual,
+                        &finder,
+                        pb.weight_snapshot.clone(),
+                        pb.payouts_fingerprint,
+                    )
+                    .await
+                    .map_err(SettleError::GroupSolo)
             }
-        }
-    }
-
-    if let Some(group_solo) = group_solo {
-        let mut conn = redis.clone();
-        let confirmed =
-            collect_confirmed::<crate::pending_group_solo_blocks::PendingGroupSoloBlock>(
-                bitcoin_rpc,
-                &mut conn,
-                GS_PENDING_KEY,
-                depth,
-                "Group-Solo",
-            )
-            .await;
-        for pb in confirmed {
-            let group_uuid = match uuid::Uuid::parse_str(&pb.group_id) {
-                Ok(u) => u,
-                Err(err) => {
-                    warn!(%err, block_hash = %pb.block_hash, group_id = %pb.group_id,
-                        "block-confirmation: Group-Solo group_id not a UUID — discarding");
-                    let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
-                    continue;
-                }
-            };
-            let finder = match AddressId::new(pb.finder.clone()) {
-                Ok(a) => a,
-                Err(err) => {
-                    warn!(%err, block_hash = %pb.block_hash, finder = %pb.finder,
-                        "block-confirmation: Group-Solo finder not a valid address — discarding");
-                    let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
-                    continue;
-                }
-            };
-            // The payout history is transcribed from the block's own
-            // coinbase, so both halves are required: the snapshot alone
-            // says what the pool intended, not what it paid.
-            let (Some(ws), Some(actual)) = (&pb.weight_snapshot, &pb.actual_coinbase) else {
-                warn!(
-                    block_hash = %pb.block_hash,
-                    group_id = %pb.group_id,
-                    "block-confirmation: pending Group-Solo blob carries no weight snapshot + \
-                     parsed coinbase — discarding, reprocess from the block's coinbase"
-                );
-                let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
-                continue;
-            };
-            let applied = group_solo
+            (None, Some(engine), _) => engine
                 .on_block_found(
-                    group_uuid,
                     pb.block_height,
-                    actual,
-                    &finder,
-                    Some(ws.clone()),
+                    &actual,
+                    pb.weight_snapshot.clone(),
                     pb.payouts_fingerprint,
                 )
-                .await;
-            match applied {
-                Ok(outcome) => {
-                    if let Some(handle) = settle.and_then(|s| s.get()) {
-                        handle.settle();
-                    }
-                    info!(
-                        block_hash = %pb.block_hash,
-                        height = pb.block_height,
-                        group_id = %pb.group_id,
-                        history_inserted = outcome.history_inserted,
-                        balances_affected = outcome.balances_affected,
-                        "block-confirmation: confirmed → Group-Solo ledger applied"
-                    );
-                    let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
+                .await
+                .map_err(SettleError::Pplns),
+            // The engine this block belongs to is not wired on this
+            // process. Leave it parked — another process may own it.
+            _ => continue,
+        };
+
+        match applied {
+            Ok(outcome) => {
+                if let Some(handle) = settle.and_then(|s| s.get()) {
+                    handle.settle();
                 }
-                Err(err) if err.is_terminal() => {
-                    let parked = put_pending(&mut conn, GS_UNBOOKABLE_KEY, &pb.block_hash, &pb)
-                        .await
-                        .is_ok();
-                    error!(
-                        %err,
-                        block_hash = %pb.block_hash,
-                        height = pb.block_height,
-                        group_id = %pb.group_id,
-                        parked,
-                        unbookable_key = GS_UNBOOKABLE_KEY,
-                        "block-confirmation: Group-Solo block cannot be booked automatically — \
-                         moved to the unbookable store instead of retrying forever; the \
-                         members it paid are owed their ledger entry and the frozen \
-                         distribution is preserved there for a manual apply"
-                    );
-                    if parked {
-                        let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
-                    }
-                }
-                Err(err) => warn!(
+                info!(
+                    block_hash = %pb.block_hash,
+                    height = pb.block_height,
+                    group = pb.group.as_ref().map(|g| g.group_id.as_str()).unwrap_or("-"),
+                    history_inserted = outcome.history_inserted,
+                    "block-confirmation: confirmed → payout history applied"
+                );
+                let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+            }
+            Err(err) if err.is_terminal() => {
+                // Park, don't destroy: the frozen blob is the only record
+                // of what this block paid every miner.
+                let parked = put_pending(&mut conn, UNBOOKABLE_KEY, &pb.block_hash, &pb)
+                    .await
+                    .is_ok();
+                error!(
                     %err,
                     block_hash = %pb.block_hash,
-                    "block-confirmation: Group-Solo apply failed; will retry next tick"
-                ),
+                    height = pb.block_height,
+                    parked,
+                    unbookable_key = UNBOOKABLE_KEY,
+                    "block-confirmation: block cannot be booked automatically — moved to the \
+                     unbookable store instead of retrying forever; the miners it paid are owed \
+                     their ledger entry and the frozen distribution is preserved there"
+                );
+                if parked {
+                    let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+                }
             }
+            Err(err) => warn!(
+                %err,
+                block_hash = %pb.block_hash,
+                "block-confirmation: apply failed; will retry next tick"
+            ),
+        }
+    }
+}
+
+/// The two engines' errors, so one loop can treat them alike.
+#[derive(Debug, thiserror::Error)]
+enum SettleError {
+    #[error(transparent)]
+    Pplns(bp_pplns_engine::engine::EngineError),
+    #[error(transparent)]
+    GroupSolo(bp_group_solo_engine::engine::EngineError),
+}
+
+impl SettleError {
+    fn is_terminal(&self) -> bool {
+        match self {
+            SettleError::Pplns(e) => e.is_terminal(),
+            SettleError::GroupSolo(e) => e.is_terminal(),
         }
     }
 }

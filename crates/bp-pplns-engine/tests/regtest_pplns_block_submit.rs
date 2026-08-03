@@ -652,14 +652,11 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
         bitcoin::Network::Regtest,
     );
     assert_eq!(actual.total_value_sats, reward_sats);
-    let prepared = engine
-        .prepare_block_found_scaled(height as i32, &actual, Some(fingerprint))
+    let _prepared = engine
+        .on_block_found(height as i32, &actual, None, Some(fingerprint))
         .await
         .expect("the mined job's own distribution must resolve for booking");
-    engine
-        .apply_prepared(&prepared)
-        .await
-        .expect("apply_prepared");
+    // (apply happens inside on_block_found now)
 
     // ── The ledger must match the coinbase the chain accepted ────
     let rows: Vec<(String, i64)> = sqlx::query_as(

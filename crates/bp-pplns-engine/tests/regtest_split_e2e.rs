@@ -289,7 +289,12 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
         bitcoin::Network::Regtest,
     );
     let outcome = engine
-        .on_block_found_scaled(after as i32, &actual, Some(dist.payouts_fingerprint()))
+        .on_block_found(
+            after as i32,
+            &actual,
+            None,
+            Some(dist.payouts_fingerprint()),
+        )
         .await
         .expect("on_block_found");
     assert!(
