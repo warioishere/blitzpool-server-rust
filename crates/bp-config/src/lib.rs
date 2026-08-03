@@ -560,17 +560,22 @@ pub struct Sv2Config {
     /// second path that shrinks the orphan window.
     #[serde(default = "default_true")]
     pub jdp_orphan_submitblock: bool,
-    /// Bitcoin-core data directory for the JDP validation IPC (SV2 §6.1).
-    /// When set, every declared Custom Job is handed to bitcoin-core's
-    /// `job_declaration_protocol` interface for a real `checkBlock` verdict
-    /// instead of being accepted on the JDC's word. The socket is derived the
-    /// way bitcoin-core lays it out: `<data_dir>/<network>/node.sock` (no
-    /// subdirectory on mainnet) — the same node the pool already draws
-    /// templates from, just a second interface on it.
+    /// bitcoin-core IPC socket for declared-job validation (SV2 §6.1). Same
+    /// shape as `[tdp] socket_path`, and normally the SAME socket — validation
+    /// is a second interface on the one node, not a second node.
     ///
-    /// Unset (default) keeps the previous behaviour: declarations are trusted.
+    /// When set, every declared Custom Job goes to bitcoin-core's
+    /// `job_declaration_protocol` interface for a real `checkBlock` verdict
+    /// instead of being accepted on the JDC's word. Unset (default) keeps
+    /// declarations trusted.
+    ///
+    /// Upstream's engine takes a data DIRECTORY and derives
+    /// `<dir>/<network>/node.sock` itself (no subdirectory on mainnet), so the
+    /// path given here must be one that derivation can produce. Boot checks it
+    /// and refuses to start on a mismatch — the alternative is connecting
+    /// somewhere else, or nowhere, while the log says validation is on.
     #[serde(default)]
-    pub jdp_validation_data_dir: Option<PathBuf>,
+    pub jdp_validation_socket_path: Option<PathBuf>,
     /// Republish cadence (seconds) for the ext 0x0003 payout
     /// distribution push (`SetPayoutDistribution`). The publisher also
     /// fires immediately on settlement invalidation; the timer only

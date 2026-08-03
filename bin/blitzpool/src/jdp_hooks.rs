@@ -851,18 +851,61 @@ pub(crate) struct ProductionJobValidator {
 }
 
 impl ProductionJobValidator {
-    /// Connect to bitcoin-core's JDP IPC interface. `data_dir` is the node's
-    /// data directory — the socket is `<data_dir>/<network>/node.sock`, the
-    /// same node the pool already takes templates from.
+    /// The data directory upstream's engine needs to arrive at `socket_path`.
     ///
-    /// `None` when the network has no mapping in the upstream enum (Testnet3),
-    /// or when the socket cannot be reached: validation then stays off rather
-    /// than silently rejecting every declaration.
+    /// It derives `<dir>/<network>/node.sock` (no subdirectory on mainnet) and
+    /// takes no socket path of its own, so this reverses that derivation and
+    /// then checks it by rebuilding the path. A socket that no derivation can
+    /// produce — a different filename, a different layout — is a config error,
+    /// not something to paper over: connecting elsewhere, or nowhere, while the
+    /// log claims validation is on is exactly the silent failure worth avoiding.
+    pub(crate) fn data_dir_for_socket(
+        socket_path: &std::path::Path,
+        network: SriBitcoinNetwork,
+    ) -> Result<std::path::PathBuf, String> {
+        let strip_levels = match network {
+            SriBitcoinNetwork::Mainnet => 1, // <dir>/node.sock
+            _ => 2,                          // <dir>/<network>/node.sock
+        };
+        let mut dir = socket_path.to_path_buf();
+        for _ in 0..strip_levels {
+            if !dir.pop() {
+                return Err(format!(
+                    "{} is too short to be a bitcoin-core IPC socket path",
+                    socket_path.display()
+                ));
+            }
+        }
+        let rebuilt = match network {
+            SriBitcoinNetwork::Mainnet => dir.join("node.sock"),
+            SriBitcoinNetwork::Testnet4 => dir.join("testnet4").join("node.sock"),
+            SriBitcoinNetwork::Signet => dir.join("signet").join("node.sock"),
+            SriBitcoinNetwork::Regtest => dir.join("regtest").join("node.sock"),
+        };
+        if rebuilt != socket_path {
+            return Err(format!(
+                "bitcoin-core lays its IPC socket out as {}, but the config says {} — \
+                 upstream derives the path from a data directory and cannot be pointed \
+                 at an arbitrary one",
+                rebuilt.display(),
+                socket_path.display()
+            ));
+        }
+        Ok(dir)
+    }
+
+    /// Connect to bitcoin-core's job-declaration IPC. Normally the very socket
+    /// `[tdp] socket_path` already uses — validation is a second interface on
+    /// the one node.
+    ///
+    /// `Err` is a boot-stopping config error. `Ok(None)` means the network has
+    /// no mapping upstream (testnet3), where staying off beats rejecting every
+    /// declaration.
     pub(crate) async fn connect(
-        data_dir: std::path::PathBuf,
+        socket_path: std::path::PathBuf,
         network: bp_config::Network,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Option<Arc<dyn DeclaredJobValidator>> {
+    ) -> Result<Option<Arc<dyn DeclaredJobValidator>>, String> {
         let sri_network = match network {
             bp_config::Network::Mainnet => SriBitcoinNetwork::Mainnet,
             bp_config::Network::Testnet4 => SriBitcoinNetwork::Testnet4,
@@ -872,36 +915,32 @@ impl ProductionJobValidator {
                     "jdp: declared-job validation not available on testnet3 \
                      (upstream has no socket layout for it) — declarations stay trusted"
                 );
-                return None;
+                return Ok(None);
             }
         };
+        let data_dir = Self::data_dir_for_socket(&socket_path, sri_network.clone())?;
         // Core v31 is what the pool's TDP path already speaks.
         match BitcoinCoreIPCEngine::new(
             BitcoinCoreVersion::V31X,
             sri_network,
-            Some(data_dir.clone()),
+            Some(data_dir),
             cancel,
         )
         .await
         {
             Ok(engine) => {
                 info!(
-                    data_dir = %data_dir.display(),
+                    socket = %socket_path.display(),
                     "jdp: declared jobs are validated against bitcoin-core (SV2 §6.1)"
                 );
-                Some(Arc::new(Self {
+                Ok(Some(Arc::new(Self {
                     engine: Arc::new(engine),
-                }) as Arc<dyn DeclaredJobValidator>)
+                }) as Arc<dyn DeclaredJobValidator>))
             }
-            Err(err) => {
-                warn!(
-                    ?err,
-                    data_dir = %data_dir.display(),
-                    "jdp: could not reach bitcoin-core's job-declaration IPC — \
-                     declarations stay trusted"
-                );
-                None
-            }
+            Err(err) => Err(format!(
+                "cannot reach bitcoin-core's job-declaration IPC at {}: {err:?}",
+                socket_path.display()
+            )),
         }
     }
 }
@@ -1008,22 +1047,89 @@ mod jdp_validation_regtest {
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let validator = ProductionJobValidator::connect(
-            node.datadir_path().to_path_buf(),
+            node.ipc_socket_path(),
             bp_config::Network::Regtest,
             cancel.clone(),
         )
         .await;
 
+        let outcome = validator.as_ref().err().cloned().unwrap_or_default();
         assert!(
-            validator.is_some(),
-            "the validator must reach the node's job-declaration IPC at {}/regtest/node.sock — \
-             if this fails the socket layout or the Core version mapping is wrong, and \
-             production would silently fall back to trusting the JDC",
-            node.datadir_path().display()
+            matches!(validator, Ok(Some(_))),
+            "the validator must reach the node's job-declaration IPC at {} — if this \
+             fails the socket layout or the Core version mapping is wrong, and production \
+             would refuse to boot rather than run unvalidated: {outcome}",
+            node.ipc_socket_path().display()
         );
 
         cancel.cancel();
         node.shutdown().await.expect("regtest shutdown");
+    }
+}
+
+#[cfg(test)]
+mod jdp_validation_socket_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// The prod layout: one named docker volume at `/ipc`, mainnet, so upstream
+    /// derives `<dir>/node.sock` with no network subdirectory. Checked against
+    /// the live pool on 2026-08-03 — `[tdp] socket_path = "/ipc/node.sock"`.
+    #[test]
+    fn mainnet_socket_reverses_to_its_directory() {
+        assert_eq!(
+            ProductionJobValidator::data_dir_for_socket(
+                &PathBuf::from("/ipc/node.sock"),
+                SriBitcoinNetwork::Mainnet
+            ),
+            Ok(PathBuf::from("/ipc"))
+        );
+    }
+
+    /// Off mainnet upstream inserts the network directory, so the same data dir
+    /// implies a deeper socket path.
+    #[test]
+    fn non_mainnet_socket_strips_the_network_directory() {
+        assert_eq!(
+            ProductionJobValidator::data_dir_for_socket(
+                &PathBuf::from("/ipc/regtest/node.sock"),
+                SriBitcoinNetwork::Regtest
+            ),
+            Ok(PathBuf::from("/ipc"))
+        );
+    }
+
+    /// A socket upstream can never be pointed at must be refused, not
+    /// approximated. Silently connecting to `/var/run/bitcoind/node.sock` when
+    /// the operator wrote `bp-tdp.sock` would validate against the wrong thing
+    /// — or nothing — while the log says validation is on.
+    #[test]
+    fn a_socket_name_upstream_cannot_produce_is_refused() {
+        let err = ProductionJobValidator::data_dir_for_socket(
+            &PathBuf::from("/var/run/bitcoind/bp-tdp.sock"),
+            SriBitcoinNetwork::Mainnet,
+        )
+        .expect_err("a non-node.sock filename must not be accepted");
+        assert!(
+            err.contains("bp-tdp.sock"),
+            "the error names what was configured: {err}"
+        );
+        assert!(
+            err.contains("node.sock"),
+            "and what was expected instead: {err}"
+        );
+    }
+
+    /// The prod path on a non-mainnet network is a mismatch too: the same
+    /// `/ipc/node.sock` cannot serve testnet4, where upstream looks one level
+    /// deeper. Better to fail boot than to run unvalidated.
+    #[test]
+    fn the_mainnet_layout_is_refused_on_testnet4() {
+        assert!(ProductionJobValidator::data_dir_for_socket(
+            &PathBuf::from("/ipc/node.sock"),
+            SriBitcoinNetwork::Testnet4
+        )
+        .is_err());
     }
 }
 

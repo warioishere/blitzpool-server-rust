@@ -99,6 +99,10 @@ pub(crate) enum JdpSpawnError {
     },
     #[error(transparent)]
     Sv2(#[from] stratum_v2::StratumV2SpawnError),
+    /// `[sv2].jdp_validation_socket_path` names a socket the upstream engine
+    /// cannot be pointed at, or the node did not answer on it.
+    #[error("jdp validation socket unusable: {0}")]
+    ValidationSocket(String),
 }
 
 /// Spawn the JDP server when `[sv2].jdp_enabled` is true. The bridge
@@ -156,20 +160,21 @@ pub(crate) async fn spawn(
     });
 
     // SV2 §6.1: hand declared jobs to bitcoin-core for a real verdict when the
-    // operator points us at the node's data directory. Off → trusted, as before.
-    let job_validator = match cfg.sv2.jdp_validation_data_dir.clone() {
-        Some(data_dir) => {
-            crate::jdp_hooks::ProductionJobValidator::connect(
-                data_dir,
-                cfg.network,
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-        }
+    // operator points us at the node's IPC socket. Unset → trusted, as before.
+    // A configured-but-unusable socket stops boot: a pool that logs "validation
+    // on" while validating nothing is worse than one that refuses to start.
+    let job_validator = match cfg.sv2.jdp_validation_socket_path.clone() {
+        Some(socket_path) => crate::jdp_hooks::ProductionJobValidator::connect(
+            socket_path,
+            cfg.network,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .map_err(JdpSpawnError::ValidationSocket)?,
         None => {
             info!(
                 "jdp: declared jobs are NOT validated against bitcoin-core \
-                 (set `[sv2].jdp_validation_data_dir` to enable, SV2 §6.1)"
+                 (set `[sv2].jdp_validation_socket_path` to enable, SV2 §6.1)"
             );
             None
         }

@@ -1381,6 +1381,14 @@ fn print_jdp_error_help(err: &JdpSpawnError) {
                 addr.port(),
             );
         }
+        JdpSpawnError::ValidationSocket(detail) => {
+            eprintln!(
+                "hint: `[sv2] jdp_validation_socket_path` — {detail}\n\
+                 It is normally the SAME socket as `[tdp] socket_path`, since \
+                 declared-job validation is a second interface on the one node. \
+                 Unset it to keep running without validation."
+            );
+        }
         JdpSpawnError::Sv2(_) => {
             eprintln!(
                 "hint: JDP needs the same `[sv2].authority_privkey_hex` \
