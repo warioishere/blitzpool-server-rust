@@ -140,6 +140,41 @@ pub(crate) fn pool_outputs_of_coinbase(
         .collect()
 }
 
+/// Value-bearing coinbase outputs paying somebody who is neither the pool
+/// nor the miner the block was registered under.
+///
+/// This is what makes a missing booking visible on a mode that keeps no
+/// ledger. The Solo exemption below asks the miner's ADDRESS whether a
+/// ledger row was due — and the address is exactly the wrong witness: a
+/// job-declaring client whose address is Solo-gated can mine a coinbase
+/// that pays a SHARED distribution (it references the pool-wide payout
+/// list), and then those miners are owed a ledger entry while the finder's
+/// mode says none was due. The coinbase is the honest witness, and this
+/// check is the only place that holds it.
+///
+/// A genuine Solo coinbase pays the miner plus, at most, a fee marker — so
+/// this comes out empty and the exemption still stands.
+pub(crate) fn third_party_outputs_of_coinbase(
+    coinbase: &bp_bitcoin::DecodedTransaction,
+    markers: &PoolMarkers,
+    registered_miner: &str,
+) -> Vec<(String, u64)> {
+    coinbase
+        .vout
+        .iter()
+        .filter_map(|out| {
+            let address = out.script_pub_key.address.as_deref()?;
+            if markers.matches(address) || address == registered_miner {
+                return None;
+            }
+            let sats = btc_to_sats(out.value);
+            // A 0-value output pays nobody — §4 permits them after the
+            // distribution block (the witness commitment is one).
+            (sats > 0).then(|| (address.to_string(), sats))
+        })
+        .collect()
+}
+
 /// Core reports output values in BTC. Round rather than truncate: the value is
 /// a decimal that cannot always be represented exactly, so `x.99999999` is a
 /// float artefact of a whole number of sats, not a value below it.
@@ -331,7 +366,18 @@ async fn inspect_block(
     // Registered. Whether a missing payout row is a fault depends on the
     // mode: Solo pays in the coinbase and keeps no ledger, so it has none by
     // design. Only a mode that books can be missing a booking.
-    if !modes.keeps_a_ledger(&miner) {
+    //
+    // But the mode is read off the miner's ADDRESS, and that is not the same
+    // question as "was anybody owed a ledger entry for this block". A
+    // job-declaring client can reference a SHARED payout distribution while
+    // its own address is Solo-gated; its coinbase then pays those miners and
+    // the exemption would wave the block through. So the exemption needs
+    // BOTH: the mode keeps no ledger AND the coinbase paid nobody but the
+    // finder and the pool. Either one alone is a blind spot — and this is
+    // the widening direction, so no block that was checked before stops
+    // being checked (a one-miner PPLNS block still is, on the mode).
+    let third_parties = third_party_outputs_of_coinbase(&coinbase, markers, &miner);
+    if !modes.keeps_a_ledger(&miner) && third_parties.is_empty() {
         return Ok(None);
     }
     match bp_db::payout_recorded_at_height(pool, height as i32).await {
@@ -372,6 +418,63 @@ mod tests {
             txid: "ab".repeat(32),
             vout: outs,
         }
+    }
+
+    /// MONEY: the Solo exemption asks the miner's ADDRESS whether a ledger
+    /// row was due, and that is the wrong witness.
+    ///
+    /// A job-declaring client whose address is Solo-gated can reference the
+    /// pool-wide payout distribution and mine a coinbase that pays THOSE
+    /// miners. They are owed a ledger entry; the finder's mode says none was
+    /// due, so the exemption waved the block through and this check — the one
+    /// component that holds the coinbase — stayed silent. The coinbase is the
+    /// honest witness: it names who was actually paid.
+    #[test]
+    fn a_coinbase_paying_third_parties_is_not_a_solo_payout() {
+        const MINER: &str = "bc1qsolominer";
+        // A genuine Solo coinbase: the fee marker plus the finder, nobody
+        // else. Nothing for a ledger to record, so the exemption stands.
+        let solo = coinbase(vec![
+            out(Some("bc1qpoolfee"), 0.0000_0001),
+            out(Some(MINER), 3.125),
+        ]);
+        assert!(
+            third_party_outputs_of_coinbase(&solo, &markers(), MINER).is_empty(),
+            "a real Solo coinbase must stay exempt or every Solo block false-alarms"
+        );
+
+        // The Befund-2 shape: the same Solo-gated finder, but the coinbase
+        // pays a shared distribution's miners.
+        let shared = coinbase(vec![
+            out(Some("bc1qpoolfee"), 0.046875),
+            out(Some("bc1qpplnsminer1"), 2.0),
+            out(Some("bc1qpplnsminer2"), 1.07),
+            // §4 permits 0-value outputs after the distribution block; they
+            // pay nobody and must not count as a third party.
+            out(None, 0.0),
+            out(Some("bc1qopreturnish"), 0.0),
+        ]);
+        let third = third_party_outputs_of_coinbase(&shared, &markers(), MINER);
+        assert_eq!(
+            third.len(),
+            2,
+            "both paid strangers must be named, and neither 0-value output: {third:?}"
+        );
+        assert_eq!(third[0], ("bc1qpplnsminer1".to_string(), 200_000_000));
+        assert_eq!(third[1], ("bc1qpplnsminer2".to_string(), 107_000_000));
+    }
+
+    /// The finder itself is never a third party, whatever else the coinbase
+    /// pays — otherwise every ordinary Group-Solo block where the finder is
+    /// also a member would read as paying strangers.
+    #[test]
+    fn the_registered_miner_is_never_a_third_party() {
+        const MINER: &str = "bc1qfinder";
+        let cb = coinbase(vec![
+            out(Some("bc1qpoolfee"), 0.046875),
+            out(Some(MINER), 2.0),
+        ]);
+        assert!(third_party_outputs_of_coinbase(&cb, &markers(), MINER).is_empty());
     }
 
     /// A zero-fee deployment has no marker output, so the check cannot

@@ -139,6 +139,17 @@ pub fn record_pool_block_found() {
     counter!(POOL_BLOCKS_FOUND_TOTAL).increment(1);
 }
 
+/// Publish the two block-parking depths from the confirmation watcher's
+/// pass.
+///
+/// `unbookable` is the one to alert on: those blocks paid miners on-chain
+/// and never reached a ledger. Nothing else in the pool reads that store,
+/// so this gauge is the only standing signal that it is not empty.
+pub fn set_parked_block_counts(pending_apply: u64, unbookable: u64) {
+    gauge!(POOL_BLOCKS_PENDING_APPLY).set(pending_apply as f64);
+    gauge!(POOL_BLOCKS_UNBOOKABLE).set(unbookable as f64);
+}
+
 /// Record one aggregation-job run. `job_name` should be a stable
 /// string identifying the job (e.g. `"stats_sink_flush"`,
 /// `"pplns_dust_sweep"`, `"group_solo_round_reset"`).

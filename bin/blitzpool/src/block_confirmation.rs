@@ -36,8 +36,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::pending_blocks::{
-    load_pending_blocks, put_pending_at, remove_pending_at, remove_pending_block, PendingBlock,
-    PENDING_KEY, UNBOOKABLE_KEY,
+    count_pending_at, load_pending_blocks, put_pending_at, remove_pending_at, remove_pending_block,
+    PendingBlock, PENDING_KEY, UNBOOKABLE_KEY,
 };
 
 /// Fallback re-check cadence when the TDP stream is quiet. New blocks normally
@@ -92,6 +92,10 @@ pub(crate) fn spawn(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // consume the immediate first tick
 
+        // Last reported unbookable depth, so a standing non-zero count is
+        // logged on change instead of every pass.
+        let mut last_unbookable: Option<u64> = None;
+
         info!(
             confirmation_depth,
             tdp_driven = rx.is_some(),
@@ -105,12 +109,12 @@ pub(crate) fn spawn(
                 biased;
                 _ = cancel.cancelled() => break,
                 _ = tick.tick() => {
-                    reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth, settle.as_ref()).await;
+                    reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth, settle.as_ref(), &mut last_unbookable).await;
                 }
                 ev = next_tip_signal(&mut rx) => match ev {
                     // A new chain tip — re-check every parked block's depth.
                     Ok(TemplateUpdate::SetNewPrevHash(_)) => {
-                        reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth, settle.as_ref()).await;
+                        reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth, settle.as_ref(), &mut last_unbookable).await;
                     }
                     // NewTemplate / tx-data responses aren't new-block ticks.
                     Ok(_) => {}
@@ -220,6 +224,40 @@ async fn collect_confirmed(
 ///
 /// One loop for both modes: the parked blob carries the settlement
 /// inputs either way, and `group` decides which engine settles them.
+/// Publish how deep the two parking stores are, and say so in the log when
+/// the unbookable one CHANGES.
+///
+/// The gauge is the standing signal — `pool:unbookable_blocks` had no
+/// reader of any kind, so a block whose miners are owed a ledger entry left
+/// exactly one log line behind and then nothing. Logging only on a change
+/// keeps a standing non-zero count from becoming a line every pass, which
+/// is how a real one gets ignored.
+async fn report_parked_depths(conn: &mut ConnectionManager, last_unbookable: &mut Option<u64>) {
+    let pending = count_pending_at(conn, PENDING_KEY).await;
+    let unbookable = count_pending_at(conn, UNBOOKABLE_KEY).await;
+    let (Ok(pending), Ok(unbookable)) = (pending, unbookable) else {
+        // A Redis blip here costs one sample. Leave the last-reported
+        // value alone so the next successful pass still logs a change.
+        return;
+    };
+    bp_metrics::recorder::set_parked_block_counts(pending, unbookable);
+    if *last_unbookable != Some(unbookable) {
+        if unbookable > 0 {
+            error!(
+                unbookable,
+                pending,
+                unbookable_key = UNBOOKABLE_KEY,
+                "block-confirmation: blocks nothing can book automatically are parked — their \
+                 coinbases already paid miners on-chain and those miners have no ledger entry. \
+                 Each entry holds the frozen distribution needed to reprocess it."
+            );
+        } else if last_unbookable.is_some_and(|prev| prev > 0) {
+            info!("block-confirmation: the unbookable store is empty again");
+        }
+        *last_unbookable = Some(unbookable);
+    }
+}
+
 async fn reconcile(
     bitcoin_rpc: &BitcoinRpc,
     redis: &ConnectionManager,
@@ -228,6 +266,7 @@ async fn reconcile(
     confirmation_depth: u32,
     // See `spawn`: a gated apply IS a §10 settlement event.
     settle: Option<&crate::settlement::SettlementSignal>,
+    last_unbookable: &mut Option<u64>,
 ) {
     let depth = i64::from(confirmation_depth);
     let mut conn = redis.clone();
@@ -329,6 +368,10 @@ async fn reconcile(
             ),
         }
     }
+
+    // After the pass, not before: a block parked into the unbookable store
+    // by the loop above must show up in the same tick that put it there.
+    report_parked_depths(&mut conn, last_unbookable).await;
 }
 
 /// The two engines' errors, so one loop can treat them alike.

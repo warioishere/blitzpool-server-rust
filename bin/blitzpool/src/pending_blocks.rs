@@ -112,6 +112,20 @@ pub(crate) async fn remove_pending_block(
     remove_pending_at(conn, PENDING_KEY, block_hash).await
 }
 
+/// How many blocks are parked under `key`.
+///
+/// One `HLEN` — cheap enough to run every confirmation pass. It exists
+/// because [`UNBOOKABLE_KEY`] had no reader at all: the error that parks a
+/// block there promises the operator its distribution is preserved, and
+/// nothing ever said the store was non-empty. A count is the smallest
+/// honest answer to that.
+pub(crate) async fn count_pending_at(
+    conn: &mut ConnectionManager,
+    key: &str,
+) -> Result<u64, RedisError> {
+    conn.hlen(key).await
+}
+
 /// Load every parked block under `key`. A field whose JSON fails to parse
 /// (corrupt / schema-drifted) is skipped, its hash returned in the second
 /// tuple element so the caller can prune it.
