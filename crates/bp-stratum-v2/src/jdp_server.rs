@@ -890,64 +890,31 @@ async fn run_jdp_connection(
                         let JdpSessionEvent::TokenAllocated { miner_address, .. } = event else {
                             continue;
                         };
-                        let built = match hooks
-                            .distribution_source
-                            .build_for_miner(miner_address)
-                            .await
-                        {
-                            TailoredDistribution::Built(b) => *b,
-                            // PPLNS: the pool-wide push is this miner's
-                            // own accounting, nothing tailored to do.
-                            TailoredDistribution::PoolWide => continue,
-                            // Not the same thing. Fail closed rather
-                            // than let this session declare against the
-                            // PPLNS weights.
-                            TailoredDistribution::Unavailable => {
-                                warn!(
-                                    miner = miner_address.as_str(),
-                                    "jdp {session_id_hex} tailored distribution unavailable — \
-                                     refusing to fall back to the pool-wide distribution"
-                                );
-                                bridge
-                                    .write()
-                                    .expect("bridge RwLock poisoned")
-                                    .deny_pool_wide(session_id);
-                                continue;
-                            }
-                        };
-                        let Some(distribution_id) =
-                            hooks.distribution_source.next_distribution_id().await
-                        else {
-                            warn!(
-                                "jdp {session_id_hex} tailored publish skipped — \
-                                 distribution-id allocator unavailable"
-                            );
-                            continue;
-                        };
-                        let entry = entry_from_built(
-                            distribution_id,
-                            built,
-                            Some(miner_address.clone()),
-                            Some(session_id),
-                            now_ms(),
-                        );
-                        let wire = wire_from_entry(&entry);
-                        {
-                            let mut guard = bridge.write().expect("bridge RwLock poisoned");
-                            guard.publish_tailored(session_id, entry);
-                            // A later build succeeded — the session has
-                            // its own distribution again.
-                            guard.allow_pool_wide(session_id);
-                        }
-                        tailored_active = true;
-                        tailored_miner = Some(miner_address.clone());
-                        if let Err(err) = write_jdp_outbound_frames(
+                        // One implementation, shared with the §10-settlement
+                        // republish above. This used to be a second copy of
+                        // it, and the copy had already drifted: on a failed
+                        // `next_distribution_id` it skipped the publish
+                        // WITHOUT denying pool-wide, so a Solo or Group-Solo
+                        // session ended up with no tailored slot and no
+                        // denial — and `distribution_acceptance` then falls
+                        // back to the pool-wide slot, which is the PPLNS
+                        // window's. That session could declare a coinbase
+                        // paying PPLNS; for Solo the booking resolves the
+                        // mode from the miner's address and books nothing at
+                        // all, so the PPLNS miners are paid on-chain and
+                        // their ledger never hears about it.
+                        if republish_tailored(
+                            &hooks,
+                            &bridge,
                             &mut writer,
-                            vec![JdpOutboundFrame::SetPayoutDistribution(wire)],
+                            session_id,
+                            &session_id_hex,
+                            miner_address,
                         )
                         .await
                         {
-                            warn!("jdp {session_id_hex} tailored push write: {err:?}");
+                            tailored_active = true;
+                            tailored_miner = Some(miner_address.clone());
                         }
                     }
                 }

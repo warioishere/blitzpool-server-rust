@@ -297,27 +297,38 @@ impl JdpDeclaredJobRegistry {
         self.pool_wide_distribution.publish(Arc::new(entry), epoch);
     }
 
-    /// Publish a tailored distribution to one JDP session. On the
-    /// FIRST tailored publish, the session's grace slot is seeded with
-    /// the current pool-wide latest — the JDC may have a declaration
-    /// against the pool-wide distribution in flight while this push
-    /// travels (§7.2's honest race, cross-slot edition).
+    /// Publish a tailored distribution to one JDP session.
+    ///
+    /// The §7.2 grace slot holds only this session's OWN previous
+    /// tailored entry. It used to be seeded, on the first tailored
+    /// publish, with the current pool-wide latest — for an honest reason
+    /// (a JDC that pipelines `AllocateMiningJobToken` and
+    /// `DeclareMiningJob` may still be referencing the pool-wide
+    /// distribution it was pushed at `RequestExtensions`, before its
+    /// identity was known) and with a dishonest consequence.
+    ///
+    /// The pool-wide distribution is the PPLNS window's. A Solo or
+    /// Group-Solo session honouring it declares a coinbase that pays the
+    /// PPLNS window — and the seeded entry stayed in the acceptance
+    /// window for the whole session (nothing republishes a tailored
+    /// entry except a §10 settlement), so this was not a brief race but a
+    /// standing offer. A block found on such a job pays miners whose
+    /// accounting it does not belong to, and the booking then resolves
+    /// the mode from the miner's ADDRESS, so for Solo nothing is booked
+    /// at all: the PPLNS miners are paid on-chain and their ledger never
+    /// hears about it.
+    ///
+    /// The right answer to that race is the wire error the spec already
+    /// has: the session's own slot does not hold the pool-wide id, so it
+    /// resolves as `stale-payout-distribution` and the JDC re-declares
+    /// against the distribution it has just been sent. That costs one
+    /// round-trip at session start and cannot pay the wrong accounting.
     pub fn publish_tailored(&mut self, jdp_session_id: u32, entry: PayoutDistributionEntry) {
         let epoch = self.settlement_epoch;
-        let pool_wide_latest = self.pool_wide_distribution.latest.clone();
-        let slot = self
-            .tailored_distributions
+        self.tailored_distributions
             .entry(jdp_session_id)
-            .or_default();
-        let first_tailored = slot.latest.is_none();
-        slot.publish(Arc::new(entry), epoch);
-        // Seed AFTER publish — publish() slides latest into the grace
-        // slot, which on the first tailored push is empty; the grace
-        // entry the session actually needs is the pool-wide
-        // distribution it was declaring against until now.
-        if first_tailored {
-            slot.previous = pool_wide_latest;
-        }
+            .or_default()
+            .publish(Arc::new(entry), epoch);
     }
 
     /// The current pool-wide distribution, if one is USABLE (for the
@@ -870,23 +881,79 @@ mod tests {
         );
     }
 
-    /// `tailored slot: session resolves its own, first grace = pool-wide`
+    /// MONEY: a tailored session must NEVER resolve the pool-wide
+    /// distribution.
+    ///
+    /// The pool-wide distribution is the PPLNS window's. A tailored
+    /// session is Solo or Group-Solo, whose shares do not enter that
+    /// window — so a coinbase built against it pays miners this session's
+    /// accounting has nothing to do with. And the booking resolves the
+    /// mode from the miner's ADDRESS, so for Solo the block is booked
+    /// NOWHERE: the PPLNS miners are paid on-chain, their withheld ones
+    /// never get the credit, and the published ones are never debited.
+    ///
+    /// `publish_tailored` used to seed exactly that entry into the
+    /// session's §7.2 grace slot, for the honest in-flight-declaration
+    /// race — and since nothing republishes a tailored entry except a §10
+    /// settlement, it stayed acceptable for the WHOLE session, not for a
+    /// race. The test this replaces asserted the seeding as the contract.
+    ///
+    /// The race is answered by the wire error the spec has for it: the id
+    /// is not in this session's window, so the JDC is told
+    /// `stale-payout-distribution` and re-declares against the tailored
+    /// distribution it has just been sent.
     #[test]
-    fn tailored_slot_graces_the_pool_wide_it_replaced() {
+    fn a_tailored_session_cannot_resolve_the_pool_wide_distribution() {
         let mut reg = JdpDeclaredJobRegistry::new();
         reg.publish_pool_wide(distribution(1, None, None));
         reg.publish_tailored(7, distribution(2, Some(addr()), Some(7)));
         let scope = DistributionScope::JdpSession(7);
+        // Its own is accepted — the fixture is a live tailored session.
         assert_eq!(accepted_id(&reg.distribution_acceptance(2, scope)), Some(2));
-        // The pool-wide distribution the session saw pre-tailored
-        // stays acceptable (in-flight declaration race).
-        assert_eq!(accepted_id(&reg.distribution_acceptance(1, scope)), Some(1));
-        // Another session without a tailored slot uses pool-wide only.
-        let other = DistributionScope::JdpSession(9);
-        assert_eq!(accepted_id(&reg.distribution_acceptance(1, other)), Some(1));
+        // The PPLNS one is not, at any point in the session's life.
         assert_eq!(
-            reg.distribution_acceptance(2, other),
+            reg.distribution_acceptance(1, scope),
+            DistributionAcceptance::Stale,
+            "a Solo/Group-Solo session resolving the PPLNS distribution pays the wrong \
+             accounting, and for Solo the block is then booked nowhere"
+        );
+        // Nor after the pool-wide slot moves on, which is the state the
+        // seeded entry used to survive into.
+        reg.publish_pool_wide(distribution(3, None, None));
+        assert_eq!(
+            reg.distribution_acceptance(1, scope),
+            DistributionAcceptance::Stale
+        );
+        assert_eq!(
+            reg.distribution_acceptance(3, scope),
+            DistributionAcceptance::Stale
+        );
+
+        // A session with NO tailored slot is PPLNS and still uses
+        // pool-wide — this must not have become a blanket refusal.
+        let pplns = DistributionScope::JdpSession(9);
+        assert_eq!(accepted_id(&reg.distribution_acceptance(3, pplns)), Some(3));
+        assert_eq!(
+            reg.distribution_acceptance(2, pplns),
             DistributionAcceptance::Stale, // known, but not in THIS scope's window
+        );
+    }
+
+    /// A tailored session's own grace slot still works — the §7.2 window
+    /// is latest + previous of ITS OWN entries, and only the cross-scope
+    /// seed is gone.
+    #[test]
+    fn a_tailored_session_still_graces_its_own_previous_entry() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        reg.publish_pool_wide(distribution(1, None, None));
+        reg.publish_tailored(7, distribution(2, Some(addr()), Some(7)));
+        reg.publish_tailored(7, distribution(3, Some(addr()), Some(7)));
+        let scope = DistributionScope::JdpSession(7);
+        assert_eq!(accepted_id(&reg.distribution_acceptance(3, scope)), Some(3));
+        assert_eq!(
+            accepted_id(&reg.distribution_acceptance(2, scope)),
+            Some(2),
+            "the session's own previous tailored entry stays in the grace window"
         );
     }
 
