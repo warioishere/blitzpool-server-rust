@@ -455,6 +455,12 @@ impl WindowStore {
         })
     }
 
+    /// A cloned Redis handle for the shared build-and-snapshot path.
+    /// Mirrors `GroupRoundStore::connection_for_snapshot`.
+    pub fn connection_for_snapshot(&self) -> ConnectionManager {
+        self.conn.clone()
+    }
+
     /// Delete the snapshot key (after `on_block_found` consumed it).
     pub async fn delete_snapshot(&self) -> Result<(), RedisError> {
         let mut conn = self.conn.clone();

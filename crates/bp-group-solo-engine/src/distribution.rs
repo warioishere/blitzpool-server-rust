@@ -23,31 +23,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bp_coinbase_snapshot::{share_map_from_redis_hash, StoredWeightSnapshot};
+use bp_coinbase_snapshot::{
+    build_and_snapshot, share_map_from_redis_hash, BuildRequest, StoredWeightSnapshot,
+};
 use bp_common::{AddressId, Sats};
 use bp_db::{find_group, DbError};
 use bp_inflight_cache::InflightResultCache;
-use bp_pplns::{
-    build_weight_distribution, is_valid_payout_address, WeightBuildError, WeightDistribution,
-    WeightDistributionInput, WithheldValue,
-};
+use bp_pplns::{WeightBuildError, WeightDistribution, WithheldValue};
 use sqlx::PgPool;
 use thiserror::Error;
-use tracing::{error, warn};
+use tracing::warn;
 use uuid::Uuid;
 
-use crate::round::snapshot::{write_weight_snapshot, write_weight_snapshot_for};
+use crate::round::snapshot::write_weight_snapshot;
 use crate::round::{GroupRoundStore, RoundError};
 
 /// Default cache TTL for `DistributionBuilder::build` (30 s).
 pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(30);
-
-/// How often the payout-list snapshot write is retried before the job goes out
-/// without one. Kept small — this sits on the path that gates the first job
-/// after a template change.
-const SNAPSHOT_WRITE_RETRIES: u32 = 2;
-/// Backoff between those attempts, multiplied by the attempt number.
-const SNAPSHOT_WRITE_BACKOFF: Duration = Duration::from_millis(40);
 
 #[derive(Debug, Default, Error)]
 pub enum DistributionError {
@@ -217,160 +209,75 @@ async fn compute_distribution(
     let round_raw = round
         .read_payout_shares(&group_id.to_string(), mode, now_ms, window_ms)
         .await?;
-    let mut address_shares = share_map_from_redis_hash(
+    let address_shares = share_map_from_redis_hash(
         &round_raw,
         "group-solo distribution: skipping invalid address in round state",
     );
 
-    // 3. No ledger to read. Group-Solo carries no balances (see the
-    //    crate docs): every member is paid out of the block they mined,
-    //    or not at all. The empty map is what the shared weight builder
-    //    expects when a mode makes no promises across blocks.
-    let balances: HashMap<AddressId, Sats> = HashMap::new();
-
-    // Defensive sanitize (same as the PPLNS path): drop any address
-    // that isn't a parseable Bitcoin address before it reaches the
-    // coinbase builder. One unparseable round row would otherwise abort
-    // the whole group coinbase build in `bp-mining-job`.
-    let shares_before = address_shares.len();
-    address_shares.retain(|a, _| is_valid_payout_address(a.as_str()));
-    let dropped = shares_before - address_shares.len();
-    if dropped > 0 {
-        warn!(
-            %group_id,
-            dropped,
-            "group-solo distribution: dropped unparseable payout addresses before coinbase build"
-        );
-    }
-
-    // 4. Build inputs + call pure math. `bp_group_solo::build_group_solo_distribution`
-    //    Weight-native build (SV2 ext 0x0003 model): the round scores
-    //    project onto integer weights, and `pendingSats` and the
-    //    per-group finder bonus become weight boosts on their entries.
-    //    A member below `min_payout` — or beyond the blockspace cap —
-    //    is not published; its share goes to the members who are, who
-    //    settle the matching debt, so `weight_P` carries the fee alone.
+    // 3-5. No ledger to read: Group-Solo carries no balances (see the
+    //      crate docs), so the empty map is what the shared builder
+    //      expects from a mode that promises nothing across blocks.
+    //      Sanitize, project onto weights and persist the snapshot are
+    //      the one path both payout engines share.
     let fee_address = config
         .fee_address
         .as_ref()
         .ok_or(DistributionError::NoFeeAddress)?;
-    let distribution = build_weight_distribution(WeightDistributionInput {
-        address_shares: &address_shares,
-        balances: &balances,
-        fee_percent: config.fee_percent,
-        fee_address,
-        coinbase_weight_budget: config.coinbase_weight_budget,
-        min_payout_sats: Some(config.min_payout_sats),
-        finder_bonus_ppm,
-        finder_address: Some(finder_address),
-        reference_revenue_sats: block_reward_sats,
-        // Group-Solo: a member the coinbase cannot pay forfeits this
-        // block and their share falls to the pool output. Nobody is
-        // overpaid, so nothing has to be remembered until the next
-        // block — which is what lets this mode run without a ledger.
-        withheld_value: WithheldValue::ToPool,
-    })?;
-
-    // 5. Persist the settlement inputs under the weights fingerprint.
-    //    Nothing else writes that key, and because settlement books
-    //    `claim(T_actual) − paid` from the REAL coinbase, one snapshot
-    //    serves every job built from this distribution. The per-(group,
-    //    finder) key is written alongside for the manual reprocess path.
-    let snapshot = StoredWeightSnapshot::from_distribution(&distribution);
-    let payouts_fingerprint = distribution.fingerprint;
     let group_key = group_id.to_string();
-    // Neither write may fail the build. The distribution itself is correct and
-    // is about to become a coinbase; returning `Err` here sends
-    // `group_solo_payouts` into its solo fallback, and that miner is handed a
-    // job paying 100 % of the block to itself. Losing the snapshot costs a
-    // manual reprocess if a block lands on this job — losing the distribution
-    // costs the group the whole block.
     let mut conn_fp = round.connection_for_snapshot();
+    let built = build_and_snapshot(
+        BuildRequest {
+            address_shares,
+            balances: HashMap::new(),
+            fee_address,
+            fee_percent: config.fee_percent,
+            min_payout_sats: config.min_payout_sats,
+            coinbase_weight_budget: config.coinbase_weight_budget,
+            finder_bonus_ppm,
+            finder_address: Some(finder_address),
+            reference_revenue_sats: block_reward_sats,
+            // Group-Solo: a member the coinbase cannot pay forfeits this
+            // block and their share falls to the pool output. Nobody is
+            // overpaid, so nothing has to be remembered until the next
+            // block — which is what lets this mode run without a ledger.
+            withheld_value: WithheldValue::ToPool,
+            scope: "group-solo",
+        },
+        &mut conn_fp,
+        |fp| crate::round::snapshot::key_for_fingerprint(&group_key, fp),
+        config.snapshot_ttl_secs,
+    )
+    .await?;
+
+    // The per-(group, finder) key is written alongside for the manual
+    // reprocess path. Best-effort: the fingerprint key above is the one
+    // a booking resolves, and it alone decides `snapshot_written`.
+    let snapshot = StoredWeightSnapshot::from_distribution(&built.distribution);
     let mut conn_finder = round.connection_for_snapshot();
-    let (by_fingerprint, by_finder) = tokio::join!(
-        write_weight_snapshot_for_with_retry(
-            &mut conn_fp,
-            &group_key,
-            &payouts_fingerprint,
-            &snapshot,
-            config.snapshot_ttl_secs,
-        ),
-        write_weight_snapshot(
-            &mut conn_finder,
-            &group_key,
-            finder_address.as_str(),
-            &snapshot,
-            config.snapshot_ttl_secs,
-        ),
-    );
-    // The by-fingerprint write is the one a booking resolves, so it alone
-    // decides whether this build may be vouched for.
-    let snapshot_written = match by_fingerprint {
-        Ok(()) => true,
-        Err(err) => {
-            error!(
-                %err,
-                %group_id,
-                block_reward_sats,
-                fingerprint = %hex::encode(payouts_fingerprint),
-                "group-solo snapshot write failed after retries — the coinbase distribution \
-                 stands, but a block found on this job cannot be booked automatically and needs \
-                 operator reprocessing from the block's own coinbase"
-            );
-            false
-        }
-    };
-    if let Err(err) = by_finder {
+    if let Err(err) = write_weight_snapshot(
+        &mut conn_finder,
+        &group_key,
+        finder_address.as_str(),
+        &snapshot,
+        config.snapshot_ttl_secs,
+    )
+    .await
+    {
         warn!(%err, %group_id, "group-solo per-finder snapshot write failed");
     }
 
     Ok(DistributionResult {
         group_id,
         finder_address: finder_address.clone(),
-        distribution,
-        snapshot_written,
+        distribution: built.distribution,
+        snapshot_written: built.snapshot_written,
     })
-}
-
-/// Write the payout-list snapshot, retrying a transient Redis failure.
-///
-/// Two reasons this is worth retrying rather than logging once. The job it
-/// belongs to is about to go out to a miner, and a block found on it can only
-/// be booked from this key. And the write is `DEL` + `HSET` + `EXPIRE`: a
-/// failure in the middle leaves the key *deleted*, so a build that would have
-/// been a harmless no-op rewrite of an existing snapshot can destroy it. A
-/// re-run repairs exactly that.
-async fn write_weight_snapshot_for_with_retry(
-    conn: &mut redis::aio::ConnectionManager,
-    group_key: &str,
-    weights_fingerprint: &[u8; 32],
-    snapshot: &StoredWeightSnapshot,
-    ttl_secs: u32,
-) -> Result<(), redis::RedisError> {
-    let mut attempt = 0;
-    loop {
-        match write_weight_snapshot_for(conn, group_key, weights_fingerprint, snapshot, ttl_secs)
-            .await
-        {
-            Ok(()) => return Ok(()),
-            Err(err) if attempt < SNAPSHOT_WRITE_RETRIES => {
-                warn!(
-                    %err,
-                    group_id = group_key,
-                    attempt,
-                    "group-solo snapshot write failed — retrying"
-                );
-                attempt += 1;
-                tokio::time::sleep(SNAPSHOT_WRITE_BACKOFF * attempt).await;
-            }
-            Err(err) => return Err(err),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bp_pplns::{build_weight_distribution, WeightDistributionInput};
 
     #[test]
     fn distribution_config_from_engine_config_carries_fields() {

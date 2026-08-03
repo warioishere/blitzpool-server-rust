@@ -31,18 +31,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bp_coinbase_snapshot::{build_and_snapshot, BuildRequest};
 use bp_common::{AddressId, Sats};
 use bp_db::{find_pplns_balances_with_open_balance, DbError, PplnsBalanceRow};
-use bp_pplns::{
-    build_weight_distribution, is_valid_payout_address, WeightBuildError, WeightDistribution,
-    WeightDistributionInput,
-};
+use bp_pplns::{WeightBuildError, WeightDistribution};
 use sqlx::PgPool;
 use thiserror::Error;
-use tracing::warn;
 
 use crate::autoscale::LiveBudget;
-use crate::window::snapshot::StoredWeightSnapshot;
 use crate::window::{WindowError, WindowStore};
 use bp_coinbase_snapshot::share_map_from_redis_hash;
 use bp_inflight_cache::InflightResultCache;
@@ -278,42 +274,18 @@ async fn load_inputs(
     // 2. Read open-balance ledger rows from PG.
     let open_balance_rows = find_pplns_balances_with_open_balance(pool).await?;
 
-    // 3. Convert to bp_pplns inputs. Window addresses are raw strings
-    //    — strings that fail `AddressId` validation are skipped with a
-    //    warn (defensive: an upstream bug could have pushed an invalid
-    //    address into Redis; better to skip its share than fail the
-    //    whole distribution).
-    let mut address_shares = share_map_from_redis_hash(
-        &window_raw,
-        "pplns distribution: skipping invalid address in window — likely from a buggy upstream",
-    );
-    let mut balances = open_balance_rows_to_balance_map(&open_balance_rows);
-
-    // Defensive sanitize: drop any address that isn't a parseable
-    // Bitcoin address before it reaches the coinbase builder. A single
-    // unparseable window/ledger row (junk, migration artifact, or
-    // seed-test data such as `synthseed*`) otherwise aborts the entire
-    // coinbase build in `bp-mining-job` (its `address_to_script` is
-    // fail-the-whole-tx), blocking every miner's job. Dropping the row
-    // here is strictly safer — it's simply not paid this block and
-    // stays in the ledger. See `bp_pplns::is_valid_payout_address`.
-    let shares_before = address_shares.len();
-    let balances_before = balances.len();
-    address_shares.retain(|a, _| is_valid_payout_address(a.as_str()));
-    balances.retain(|a, _| is_valid_payout_address(a.as_str()));
-    let dropped = (shares_before - address_shares.len()) + (balances_before - balances.len());
-    if dropped > 0 {
-        warn!(
-            dropped,
-            shares_dropped = shares_before - address_shares.len(),
-            balances_dropped = balances_before - balances.len(),
-            "pplns distribution: dropped unparseable payout addresses before coinbase build"
-        );
-    }
-
+    // 3. Convert to bp_pplns inputs. Window addresses are raw strings —
+    //    ones that fail `AddressId` validation are skipped with a warn
+    //    (an upstream bug could have pushed an invalid address into
+    //    Redis; better to skip its share than fail the distribution).
+    //    Dropping addresses that parse but are not usable payout scripts
+    //    happens in the shared build.
     Ok(DistributionInputs {
-        address_shares,
-        balances,
+        address_shares: share_map_from_redis_hash(
+            &window_raw,
+            "pplns distribution: skipping invalid address in window — likely from a buggy upstream",
+        ),
+        balances: open_balance_rows_to_balance_map(&open_balance_rows),
     })
 }
 
@@ -325,72 +297,47 @@ async fn build_from_inputs(
     config: &DistributionConfig,
     reference_revenue_sats: u64,
 ) -> Result<DistributionResult, DistributionError> {
-    // 4. Weight-native build. Read the *live* budget here so a runtime
-    //    autoscaler change takes effect on the next build.
+    // 4-5. Sanitize, project onto weights, persist the snapshot — the
+    //      one path both payout engines share. The *live* budget is read
+    //      here so a runtime autoscaler change takes effect on the next
+    //      build.
     let fee_address = config
         .fee_address
         .as_ref()
         .ok_or(DistributionError::NoFeeAddress)?;
-    let distribution = build_weight_distribution(WeightDistributionInput {
-        address_shares: &inputs.address_shares,
-        balances: &inputs.balances,
-        fee_percent: config.fee_percent,
-        fee_address,
-        coinbase_weight_budget: config.coinbase_weight_budget.get(),
-        min_payout_sats: Some(config.min_payout_sats),
-        finder_bonus_ppm: 0, // finder-bonus is a Group-Solo feature
-        finder_address: None,
-        reference_revenue_sats,
-        // PPLNS keeps a withheld miner's share inside the miners' cut and
-        // remembers what it owes them in `pplns_balance`. That is the
-        // point of the mode — a small miner accumulates across blocks
-        // until they clear `min_payout` instead of forfeiting.
-        withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
-    })?;
+    let mut conn = window.connection_for_snapshot();
+    let built = build_and_snapshot(
+        BuildRequest {
+            address_shares: inputs.address_shares.clone(),
+            balances: inputs.balances.clone(),
+            fee_address,
+            fee_percent: config.fee_percent,
+            min_payout_sats: config.min_payout_sats,
+            coinbase_weight_budget: config.coinbase_weight_budget.get(),
+            finder_bonus_ppm: 0, // finder-bonus is a Group-Solo feature
+            finder_address: None,
+            reference_revenue_sats,
+            // PPLNS keeps a withheld miner's share inside the miners' cut
+            // and remembers what it owes them in `pplns_balance`. That is
+            // the point of the mode — a small miner accumulates across
+            // blocks until they clear `min_payout` instead of forfeiting.
+            withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
+            scope: "pplns",
+        },
+        &mut conn,
+        crate::window::snapshot_key_for,
+        config.snapshot_ttl_secs,
+    )
+    .await?;
 
     // Feed the autoscaler with this build's blockspace pressure.
     config
         .coinbase_weight_budget
-        .record_sample(distribution.budget_telemetry);
-
-    // 5. Persist the settlement inputs under the weights fingerprint.
-    // Nothing else writes this key, so it still holds THIS distribution
-    // when the block that mined it is found — and because settlement
-    // books `claim(T_actual) − paid` as a delta, the snapshot serves
-    // the pool's own templates and every JDC's job alike.
-    //
-    // A failed snapshot write must NOT fail the build. The distribution
-    // itself is correct and is about to become a coinbase; returning
-    // `Err` here sends `pplns_payouts` into its solo fallback, and that
-    // miner is handed a job paying 100 % of the block to itself. Losing
-    // the snapshot costs a manual reprocess if a block lands on this
-    // job — losing the distribution costs the pool's miners the whole
-    // block, irreversibly.
-    let snapshot = StoredWeightSnapshot::from_distribution(&distribution);
-    let snapshot_written = match window
-        .write_weight_snapshot_for(
-            &distribution.fingerprint,
-            &snapshot,
-            config.snapshot_ttl_secs,
-        )
-        .await
-    {
-        Ok(()) => true,
-        Err(err) => {
-            warn!(
-                %err,
-                reference_revenue_sats,
-                "PPLNS weight-snapshot write failed — the coinbase distribution stands, \
-                 but a block found on this job cannot be booked automatically and needs \
-                 operator reprocessing"
-            );
-            false
-        }
-    };
+        .record_sample(built.distribution.budget_telemetry);
 
     Ok(DistributionResult {
-        distribution,
-        snapshot_written,
+        distribution: built.distribution,
+        snapshot_written: built.snapshot_written,
     })
 }
 
@@ -405,6 +352,7 @@ fn open_balance_rows_to_balance_map(rows: &[PplnsBalanceRow]) -> HashMap<Address
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bp_pplns::{build_weight_distribution, WeightDistributionInput};
 
     #[test]
     fn distribution_config_from_engine_config_carries_fields() {

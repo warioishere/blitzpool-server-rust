@@ -29,6 +29,9 @@ redis = { workspace = true }
 # sqlx::Error variant on the shared LedgerError.
 sqlx = { workspace = true }
 
+# Backoff between snapshot-write retries.
+tokio = { workspace = true, features = ["time"] }
+
 # Observability + errors
 tracing = { workspace = true }
 thiserror = { workspace = true }

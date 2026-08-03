@@ -17,6 +17,7 @@
 
 pub mod actual;
 pub mod budget;
+pub mod build;
 pub mod ledger;
 pub mod snapshot;
 
@@ -27,6 +28,7 @@ use tracing::warn;
 
 pub use actual::ActualCoinbase;
 pub use budget::{read_coinbase_budget, write_coinbase_budget};
+pub use build::{build_and_snapshot, BuildRequest, BuiltDistribution};
 pub use ledger::{ApplyDistributionResult, LedgerError, PayoutRowType};
 pub use snapshot::{
     delete_snapshot, read_weight_snapshot, write_weight_snapshot, StoredWeightSnapshot,
