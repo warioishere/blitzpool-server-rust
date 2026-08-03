@@ -828,7 +828,7 @@ async fn two_blocks_in_sequence_both_accumulate() {
 #[tokio::test]
 async fn spawn_core_skips_crons_but_build_distribution_works() {
     let prefix = "test_engine_core_";
-    let (conn, pool) = match connect_or_skip(2, prefix).await {
+    let (conn, pool) = match connect_or_skip(11, prefix).await {
         Some(c) => c,
         None => return,
     };

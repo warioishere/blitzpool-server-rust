@@ -543,9 +543,17 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
 // be LOCAL. `CONFIG SET maxmemory 1` was used here originally and is
 // server-global: while it was in force, every other test writing to this
 // Redis — in this file and in other crates running concurrently — failed with
-// OOM. That was the whole flake. Occupying the snapshot key with the wrong
-// type reproduces the same shape (the write is rejected, reads still work) and
-// touches nothing but this test's own database.
+// OOM. That was the whole flake.
+//
+// Occupying the snapshot key with a wrong-typed value was the next attempt.
+// It cannot work: `write_weight_snapshot` issues `DEL` before its `HSET`, so
+// it clears the obstacle itself — and it aims at `pplns:snapshot:<fingerprint>`
+// anyway, not the bare prefix. Measured 2026-08-03: the write succeeded and
+// the test asserted nothing about its own subject.
+//
+// A read-only Redis ACL user is the injection that holds. It is scoped to
+// THIS connection, so concurrent tests are untouched, and it reproduces the
+// production shape exactly: reads keep working, every write is refused.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
@@ -562,25 +570,59 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
     seed_share(&window, ADDR_A, 60.0, 1_700_000_000_001).await;
     seed_share(&window, ADDR_B, 40.0, 1_700_000_000_002).await;
 
-    // `KEY_SNAPSHOT` is a hash; holding a string there makes the snapshot
-    // HSET fail with WRONGTYPE while every other key is untouched.
+    const ACL_USER: &str = "bp_test_readonly_snapshot";
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
     let client = Client::open(format!("{redis_base}/6")).expect("client");
     let mut admin = ConnectionManager::new(client).await.expect("admin conn");
-    redis::cmd("SET")
-        .arg(bp_pplns_engine::window::KEY_SNAPSHOT)
-        .arg("occupied-by-the-wrong-type")
+
+    // Everything except writes. `-@write` covers DEL/HSET/EXPIRE, so the
+    // snapshot write fails at its first command; HGETALL stays allowed.
+    if redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg(ACL_USER)
+        .arg("on")
+        .arg(">readonlypw")
+        .arg("~*")
+        .arg("&*")
+        .arg("+@all")
+        .arg("-@write")
         .query_async::<()>(&mut admin)
         .await
-        .expect("occupy the snapshot key");
+        .is_err()
+    {
+        eprintln!("redis ACL unavailable — skipping");
+        cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
+        return;
+    }
+
+    let ro_url = redis_base.replacen("redis://", &format!("redis://{ACL_USER}:readonlypw@"), 1);
+    let ro_client = Client::open(format!("{ro_url}/6")).expect("read-only client");
+    let ro_conn = ConnectionManager::new(ro_client)
+        .await
+        .expect("read-only conn");
+    let ro_builder = DistributionBuilder::new(
+        h.pool.clone(),
+        WindowStore::new(ro_conn, 4.0, 100, NetworkDifficulty::new(1_000_000.0)),
+        DistributionConfig::from_engine_config(&PplnsEngineConfig {
+            fee_address: Some(
+                AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap(),
+            ),
+            ..PplnsEngineConfig::default()
+        }),
+    );
 
     // Window read + ledger read still work; only the snapshot write is
     // rejected. The build must survive it.
-    let result = h
-        .builder
+    let result = ro_builder
         .build(312_500_000)
         .await
         .expect("a rejected snapshot write must not fail the distribution build");
+
+    assert!(
+        !result.snapshot_written,
+        "the read-only user must have rejected the snapshot write — without \
+         that this test never exercises its subject"
+    );
     assert!(
         result.distribution.published().count() >= 2,
         "the real PPLNS distribution must come back, not a solo fallback: {:?}",
@@ -595,10 +637,11 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
          leave only the requesting address"
     );
 
-    let _: () = redis::cmd("DEL")
-        .arg(bp_pplns_engine::window::KEY_SNAPSHOT)
+    let _: () = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(ACL_USER)
         .query_async(&mut admin)
         .await
-        .expect("release the snapshot key");
+        .expect("drop the read-only user");
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
 }
