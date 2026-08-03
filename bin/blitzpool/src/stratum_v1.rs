@@ -109,9 +109,7 @@ pub(crate) fn build_per_port_servers(
     )>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
-    settle: std::sync::Arc<
-        std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
-    >,
+    settle: crate::settlement::SettlementSignal,
 ) -> Result<Vec<Sv1PortServer>, StratumV1SpawnError> {
     let Some(tdp) = foundation.tdp.as_ref() else {
         warn!("stratum-v1: TDP missing (--skip-tdp); skipping SV1 server construction");

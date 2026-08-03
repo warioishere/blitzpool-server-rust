@@ -39,7 +39,7 @@
 //! TCP binding in 7.4c.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_bitcoin::BitcoinRpc;
@@ -194,17 +194,16 @@ pub(crate) struct BlockFoundApplier {
     /// reaches `confirmation_depth`. When absent (or no block hash), the
     /// PPLNS arm falls back to the immediate `on_block_found` apply.
     redis: Option<ConnectionManager>,
-    /// ext 0x0003 §10 settlement hook, shared with the JDP booking path
-    /// via a late-bound slot (the sinks are built before the JDP server
-    /// exists).
+    /// ext 0x0003 §10 settlement fan-out — see [`crate::settlement`].
     ///
     /// A settlement from ANY source invalidates every published payout
-    /// distribution — the published weights encode the pre-settlement
-    /// balances, so a 0x0003 JDC still mining them would pay out the
-    /// same balances a second time. Wiring this only to JDP-declared
-    /// blocks left every SV1/SV2 block silently skipping the
-    /// invalidation.
-    settle: Option<Arc<OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>>,
+    /// distribution: the published weights encode the pre-settlement
+    /// balances, so a 0x0003 JDC still mining them would pay those
+    /// balances a second time. Wiring it only to JDP-declared blocks left
+    /// every SV1/SV2 block skipping the invalidation; wiring it only
+    /// in-process left every block skipping it under the role split,
+    /// where the process that books is not the one holding the registry.
+    settle: Option<crate::settlement::SettlementSignal>,
 }
 
 impl TdpBlockSubmissionSink {
@@ -226,9 +225,9 @@ impl TdpBlockSubmissionSink {
     /// published payout distributions exactly like a JDP-declared one.
     pub(crate) fn with_settle_handle(
         mut self,
-        slot: Arc<OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>,
+        signal: crate::settlement::SettlementSignal,
     ) -> Self {
-        self.applier.settle = Some(slot);
+        self.applier.settle = Some(signal);
         self
     }
 
@@ -703,9 +702,9 @@ impl BlockFoundApplier {
     /// §10: a ledger settlement just happened. Invalidate every
     /// published payout distribution and force a fresh publish, so no
     /// JDC keeps declaring against weights this block already settled.
-    fn settle_distributions(&self) {
-        if let Some(handle) = self.settle.as_ref().and_then(|s| s.get()) {
-            handle.settle();
+    async fn settle_distributions(&self) {
+        if let Some(signal) = self.settle.as_ref() {
+            signal.settle().await;
         }
     }
 
@@ -865,7 +864,7 @@ impl BlockFoundApplier {
         };
         match applied {
             Ok((history_inserted, mode)) => {
-                self.settle_distributions();
+                self.settle_distributions().await;
                 info!(
                     address = address_str,
                     height,
@@ -1443,14 +1442,14 @@ mod tests {
             std::time::Duration::from_secs(3600),
         );
 
-        let slot = std::sync::Arc::new(std::sync::OnceLock::new());
-        let _ = slot.set(server.distribution_handle());
+        let signal = crate::settlement::SettlementSignal::local_only();
+        let _ = signal.registry_slot().set(server.distribution_handle());
 
         let applier = BlockFoundApplier {
-            settle: Some(slot),
+            settle: Some(signal),
             ..Default::default()
         };
-        applier.settle_distributions();
+        applier.settle_distributions().await;
 
         assert!(
             bridge.read().unwrap().current_pool_wide().is_none(),
@@ -1461,12 +1460,12 @@ mod tests {
     }
 
     /// No JDP server (the common deployment): settling is a no-op, not a
-    /// panic. The slot stays empty because nothing ever fills it.
-    #[test]
-    fn settling_without_a_jdp_server_is_a_no_op() {
+    /// panic. The signal is absent entirely because nothing wired one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn settling_without_a_jdp_server_is_a_no_op() {
         let applier = BlockFoundApplier::default();
         assert!(applier.settle.is_none());
-        applier.settle_distributions();
+        applier.settle_distributions().await;
     }
 
     /// The header stores `prevHash` little-endian (internal); the function must

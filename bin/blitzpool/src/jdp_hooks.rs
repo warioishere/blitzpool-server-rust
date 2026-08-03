@@ -58,7 +58,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use bitcoin::block::{Block, Header, Version as BlockVersion};
@@ -73,8 +73,8 @@ use bp_mining_job::PayoutEntry;
 use bp_stratum_v2::jdp::client::{parse_user_identifier_as_address, AllocateTokenContext};
 use bp_stratum_v2::jdp::dynamic_outputs::{encode_coinbase_outputs, DynamicOutput, PayoutBooking};
 use bp_stratum_v2::jdp_server::{
-    CurrentPrevHashProvider, DistributionInvalidationHandle, JdpAllocateResolver,
-    JdpBlockSubmissionSink, JdpServerHooks, PayoutDistributionSource, TemplateTxProvider,
+    CurrentPrevHashProvider, JdpAllocateResolver, JdpBlockSubmissionSink, JdpServerHooks,
+    PayoutDistributionSource, TemplateTxProvider,
 };
 use bp_stratum_v2::mining::submit::assemble_witness_coinbase;
 use bp_stratum_v2::tokens::Token;
@@ -103,7 +103,7 @@ pub(crate) fn build_jdp_hooks(
     orphan_submitblock_enabled: bool,
     ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
     distribution_source: Arc<dyn PayoutDistributionSource>,
-    settle: Arc<OnceLock<DistributionInvalidationHandle>>,
+    settle: crate::settlement::SettlementSignal,
     job_validator: Option<Arc<dyn DeclaredJobValidator>>,
 ) -> JdpServerHooks {
     let propagator: Option<Arc<dyn BlockPropagator>> = if orphan_submitblock_enabled {
@@ -592,7 +592,7 @@ pub(crate) struct ProductionJdpBlockSink {
     /// JDP server exists (the sink is built first). A booked block settles
     /// the distribution its coinbase paid — every published distribution
     /// is then invalidated and a fresh one force-published.
-    settle: Arc<OnceLock<DistributionInvalidationHandle>>,
+    settle: crate::settlement::SettlementSignal,
 }
 
 /// How many recently-booked block hashes are remembered for the repeat check.
@@ -710,9 +710,7 @@ impl ProductionJdpBlockSink {
             // §10: the booking IS the settlement event — the grace window
             // must not span it. Invalidate every published distribution and
             // force a fresh publish.
-            if let Some(handle) = self.settle.get() {
-                handle.settle();
-            }
+            self.settle.settle().await;
         } else {
             warn!(
                 miner = miner_address.as_str(),
@@ -1423,7 +1421,7 @@ mod tests {
             network: BitcoinNetwork::Regtest,
             propagator: propagator.map(|p| p as Arc<dyn BlockPropagator>),
             booker: booker.map(|b| b as Arc<dyn DeclaredBlockBooker>),
-            settle: Arc::new(OnceLock::new()),
+            settle: crate::settlement::SettlementSignal::local_only(),
             chain: Arc::new(FixedChain(chain)),
             booked: StdMutex::new(VecDeque::new()),
         }
@@ -1553,7 +1551,7 @@ mod tests {
                 to: moved_on,
             })),
             booker: Some(booker.clone()),
-            settle: Arc::new(OnceLock::new()),
+            settle: crate::settlement::SettlementSignal::local_only(),
             chain: Arc::new(chain),
             booked: StdMutex::new(VecDeque::new()),
         };

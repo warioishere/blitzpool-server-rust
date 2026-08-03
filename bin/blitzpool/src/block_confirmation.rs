@@ -76,14 +76,12 @@ pub(crate) fn spawn(
     pplns: Option<PplnsEngine>,
     group_solo: Option<GroupSoloEngine>,
     confirmation_depth: u32,
-    // ext 0x0003 §10 settlement hook — a gated apply IS a settlement,
-    // so the published payout distributions must be invalidated with
-    // it or a JDC keeps mining pre-settlement weights.
-    settle: Option<
-        std::sync::Arc<
-            std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
-        >,
-    >,
+    // ext 0x0003 §10 settlement fan-out — a gated apply IS a settlement,
+    // so the published payout distributions must be invalidated with it
+    // or a JDC keeps mining pre-settlement weights. This watcher runs on
+    // the `payout` role and the registry lives on `front`, which is
+    // exactly why it takes the signal and not a bare in-process handle.
+    settle: Option<crate::settlement::SettlementSignal>,
 ) -> BlockConfirmationHandle {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
@@ -229,11 +227,7 @@ async fn reconcile(
     group_solo: Option<&GroupSoloEngine>,
     confirmation_depth: u32,
     // See `spawn`: a gated apply IS a §10 settlement event.
-    settle: Option<
-        &std::sync::Arc<
-            std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
-        >,
-    >,
+    settle: Option<&crate::settlement::SettlementSignal>,
 ) {
     let depth = i64::from(confirmation_depth);
     let mut conn = redis.clone();
@@ -298,8 +292,8 @@ async fn reconcile(
 
         match applied {
             Ok(outcome) => {
-                if let Some(handle) = settle.and_then(|s| s.get()) {
-                    handle.settle();
+                if let Some(signal) = settle {
+                    signal.settle().await;
                 }
                 info!(
                     block_hash = %pb.block_hash,

@@ -15,6 +15,12 @@
 //! - **Consume + backstop** ([`spawn`]): the Front drains the stream (tail-start
 //!   — it warmed from the DB at boot) and rebuilds the matching cache, AND
 //!   rebuilds both on a periodic timer so a missed event self-heals.
+//!
+//! The same stream carries [`cache_kind::SETTLEMENT`], for the same
+//! reason and in the opposite direction: the SV2 ext-0x0003 payout
+//! registry lives on the Front, and the process that BOOKS a block
+//! (`payout`) is a different one. See [`crate::settlement`] — including
+//! why that kind is deliberately absent from the periodic backstop.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +34,7 @@ use bp_share_stream::{
 use redis::aio::ConnectionManager;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use bp_common::{AddressId, MiningMode};
 use bp_mining_mode::MiningModeResult;
@@ -97,6 +103,12 @@ pub(crate) fn spawn(
     group: SharedGroupService,
     blockparty: Option<Arc<dyn BlockpartyApi>>,
     gate: Arc<BlitzpoolModeGate>,
+    // The Front's JDP payout registry, once `jdp::spawn` has attached it.
+    // Empty on a Front without JDP enabled — a settlement then has nothing
+    // to invalidate here, which is correct, not a miss.
+    settle_registry: Arc<
+        std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
+    >,
 ) -> CacheSyncHandle {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
@@ -128,11 +140,13 @@ pub(crate) fn spawn(
                         }
                         let mut want_group = false;
                         let mut want_blockparty = false;
+                        let mut want_settlement = false;
                         let mut ids = Vec::with_capacity(batch.len());
                         for entry in &batch {
                             match entry.value.kind.as_str() {
                                 cache_kind::GROUP => want_group = true,
                                 cache_kind::BLOCKPARTY => want_blockparty = true,
+                                cache_kind::SETTLEMENT => want_settlement = true,
                                 other => warn!(kind = other, "cache-sync: unknown invalidation kind — ignored"),
                             }
                             ids.push(entry.id.clone());
@@ -143,6 +157,9 @@ pub(crate) fn spawn(
                         }
                         if want_blockparty {
                             rebuild_blockparty(blockparty.as_ref()).await;
+                        }
+                        if want_settlement {
+                            invalidate_payout_distributions(&settle_registry);
                         }
                         if let Err(err) = consumer.ack(&ids).await {
                             warn!(%err, "cache-sync: ack failed (will redeliver)");
@@ -158,6 +175,27 @@ pub(crate) fn spawn(
         info!("cache-sync: stopped");
     });
     CacheSyncHandle { task, cancel }
+}
+
+/// §10: a block settled on another process. Every payout distribution
+/// this Front published encodes pre-settlement ledger balances, so the
+/// acceptance window has to close on them now — a job-declaring client
+/// still declaring against them would pay those balances a second time.
+///
+/// Unlike the membership rebuilds this reads no database: the registry
+/// simply bumps its settlement epoch and the JDP publisher pushes a
+/// fresh distribution built from the post-settlement ledger.
+fn invalidate_payout_distributions(
+    registry: &Arc<std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>,
+) {
+    match registry.get() {
+        Some(handle) => {
+            handle.settle();
+            info!("cache-sync: settlement heard — published payout distributions invalidated");
+        }
+        // No JDP server on this process, so nothing published anything.
+        None => debug!("cache-sync: settlement heard but no payout registry here — ignored"),
+    }
 }
 
 async fn rebuild_group(group: &SharedGroupService, gate: &Arc<BlitzpoolModeGate>) {
@@ -270,5 +308,107 @@ mod tests {
             }
         }
         assert_eq!(kinds, vec!["group".to_string(), "blockparty".to_string()]);
+    }
+
+    /// MONEY / ext 0x0003 §10: a settlement must cross the process
+    /// boundary. Under the role split `payout` books the block and `front`
+    /// holds the payout registry, so the settling process has no local
+    /// handle — `.get()` returns `None` and the invalidation was silently
+    /// dropped. Every Stratum block in the production topology took that
+    /// path, and a job-declaring client would have kept declaring against
+    /// pre-settlement weights, paying those ledger balances twice.
+    ///
+    /// Both halves are real here: a settling process with NO registry
+    /// publishes, and a second process with one receives and invalidates.
+    #[tokio::test]
+    async fn a_settlement_on_one_process_invalidates_the_registry_on_another() {
+        use bp_stratum_v2::bridge::{JdpDeclaredJobRegistry, PayoutDistributionEntry};
+        use bp_stratum_v2::jdp::payout_distribution::WeightedOutput;
+        use bp_stratum_v2::jdp_server::{JdpServerHooks, StratumV2JdpServer};
+        use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
+
+        // DB 9: free in this test binary. Other crates' tests may still
+        // FLUSHDB it concurrently, so the publish+read below RETRIES —
+        // a wiped stream then costs a round, not a red test, while a
+        // broken mechanism still never produces an entry.
+        let Some(redis) = connect_redis_or_skip(9).await else {
+            eprintln!("redis unreachable — skipping settlement cross-process test");
+            return;
+        };
+
+        // ── The `front`: a JDP server with a published distribution ──
+        let bridge = Arc::new(std::sync::RwLock::new(JdpDeclaredJobRegistry::new()));
+        bridge
+            .write()
+            .unwrap()
+            .publish_pool_wide(PayoutDistributionEntry {
+                distribution_id: 1,
+                pool_payout: WeightedOutput {
+                    script_pubkey: vec![0x51],
+                    weight: 1,
+                },
+                payouts: vec![WeightedOutput {
+                    script_pubkey: vec![0x00, 0x14, 0xAA],
+                    weight: 100,
+                }],
+                dust_limits: vec![546],
+                additional_outputs: vec![],
+                reference_reward_sats: 312_500_000,
+                payouts_fingerprint: Some([1u8; 32]),
+                bookable: true,
+                owner: None,
+                jdp_session_id: None,
+                published_at_ms: 1_001,
+            });
+        let noise = NoiseConfig::parse_strings(
+            "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72",
+            "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n",
+            DEFAULT_CERT_VALIDITY,
+        )
+        .expect("noise config");
+        let server = StratumV2JdpServer::spawn(
+            noise,
+            JdpServerHooks::no_op(),
+            bridge.clone(),
+            Duration::from_secs(3600),
+        );
+        let front_registry: Arc<std::sync::OnceLock<_>> = Arc::new(std::sync::OnceLock::new());
+        let _ = front_registry.set(server.distribution_handle());
+        assert!(
+            bridge.read().unwrap().current_pool_wide().is_some(),
+            "precondition: the front has a live published distribution"
+        );
+
+        // ── The `payout` process: settles, holds NO registry ────────
+        let settling = crate::settlement::SettlementSignal::new(redis.clone());
+        assert!(
+            settling.registry_slot().get().is_none(),
+            "precondition: the settling process has no local registry — that is \
+             the whole reason this has to travel"
+        );
+        // ── The front's consumer drains it ──────────────────────────
+        let consumer: StreamConsumer<CacheInvalidation> =
+            StreamConsumer::new(redis, CACHE_INVALIDATION_STREAM_KEY, "front-verify", "c1");
+        consumer.ensure_group().await.expect("ensure_group");
+        let mut heard = false;
+        for _ in 0..5 {
+            settling.settle().await;
+            for entry in consumer.read_new(16, 500).await.expect("read_new") {
+                if entry.value.kind == cache_kind::SETTLEMENT {
+                    invalidate_payout_distributions(&front_registry);
+                    heard = true;
+                }
+            }
+            if heard {
+                break;
+            }
+        }
+        assert!(heard, "the settlement never reached the front's consumer");
+        assert!(
+            bridge.read().unwrap().current_pool_wide().is_none(),
+            "the front must have NO current distribution left — one that survives \
+             a settlement pays its pre-settlement balances a second time"
+        );
+        server.shutdown().await;
     }
 }

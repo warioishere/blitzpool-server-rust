@@ -130,9 +130,7 @@ pub(crate) async fn spawn(
     // ext 0x0003 §10: a block booked through a Stratum sink's immediate
     // apply must invalidate the published payout distributions exactly
     // like a JDP-declared one. Filled once the JDP server exists.
-    settle: std::sync::Arc<
-        std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
-    >,
+    settle: crate::settlement::SettlementSignal,
 ) -> Result<StratumHandles, StratumSpawnError> {
     if foundation.tdp.is_none() {
         warn!("stratum: TDP missing (--skip-tdp); skipping unified SV1+SV2 listener bind");

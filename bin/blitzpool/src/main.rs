@@ -65,6 +65,7 @@ mod redis_backup;
 mod rejected_consumer;
 mod runtime_diag;
 mod satellite_consumer;
+mod settlement;
 mod stratum;
 mod stratum_v1;
 mod stratum_v2;
@@ -554,14 +555,15 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // §10 settlement slot: filled once the JDP server exists, read by
-    // every path that settles the ledger so a non-JDP block invalidates the
-    // published payout distributions too. Created here, ahead of the Stratum
-    // listeners: their block sinks settle on the immediate (ungated) apply and
-    // need the same slot the confirmation watcher and the JDP sink get.
-    let settle_slot: std::sync::Arc<
-        std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
-    > = std::sync::Arc::new(std::sync::OnceLock::new());
+    // §10 settlement fan-out: every path that books a block tells the
+    // published payout distributions about it — the local JDP registry if
+    // this process has one, and the `cache:invalidate` stream so a registry
+    // on ANOTHER process hears it too. The second half is what the role
+    // split needs: `payout` books, `front` holds the registry. Created here,
+    // ahead of the Stratum listeners, because their block sinks settle on
+    // the immediate (ungated) apply and need the same signal the
+    // confirmation watcher and the JDP sink get. See `crate::settlement`.
+    let settle_signal = crate::settlement::SettlementSignal::new(handles.redis.clone());
 
     // Stratum listeners + share producer are the always-on front — front-only.
     let stratum = if is_front {
@@ -572,7 +574,7 @@ async fn main() -> ExitCode {
             &group_service,
             dispatcher.clone(),
             device_status_gate.clone(),
-            settle_slot.clone(),
+            settle_signal.clone(),
         )
         .await
         {
@@ -655,7 +657,7 @@ async fn main() -> ExitCode {
             engines.pplns.clone(),
             Some(engines.group_solo.clone()),
             depth,
-            Some(settle_slot.clone()),
+            Some(settle_signal.clone()),
         ))
     } else {
         None
@@ -879,6 +881,7 @@ async fn main() -> ExitCode {
             group_service.clone(),
             blockparty.as_ref().map(|bp| bp.service.clone()),
             engines.mode_gate.clone(),
+            settle_signal.registry_slot(),
         ))
     } else {
         None
@@ -999,7 +1002,7 @@ async fn main() -> ExitCode {
                     template_tx_cache,
                     jdp_ledger_booker,
                     handles.redis.clone(),
-                    settle_slot.clone(),
+                    settle_signal.clone(),
                 )
                 .await
                 {

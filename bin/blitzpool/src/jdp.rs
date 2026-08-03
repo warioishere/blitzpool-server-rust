@@ -26,7 +26,7 @@
 //! module's `spawn` returns an empty handle with a single `info!`
 //! log. JDP is off by default; operators flip it on deliberately.
 
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bitcoin::Network as BitcoinNetwork;
@@ -124,11 +124,12 @@ pub(crate) async fn spawn(
     // Allocator backing for the strictly-increasing ext 0x0003
     // `distribution_id` (spec §3.1).
     redis: redis::aio::ConnectionManager,
-    // §10 settlement slot, created by the caller because the block sinks
-    // are built before this server exists and need the SAME handle: a
-    // settlement from any source must invalidate the published
-    // distributions, not just a JDP-declared one.
-    settle_slot: Arc<OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>,
+    // §10 settlement fan-out, created by the caller because the block
+    // sinks are built before this server exists and must reach the SAME
+    // registry: a settlement from any source invalidates the published
+    // distributions, not just a JDP-declared one. This is also where the
+    // registry handle gets attached, so the signal can reach it locally.
+    settle: crate::settlement::SettlementSignal,
 ) -> Result<JdpHandles, JdpSpawnError> {
     if !cfg.sv2.jdp_enabled {
         info!("jdp: disabled (sv2.jdp_enabled = false)");
@@ -189,7 +190,7 @@ pub(crate) async fn spawn(
         cfg.sv2.jdp_orphan_submitblock,
         ledger_booker,
         distribution_source,
-        settle_slot.clone(),
+        settle.clone(),
         job_validator,
     );
 
@@ -199,7 +200,7 @@ pub(crate) async fn spawn(
             .unwrap_or(DEFAULT_DISTRIBUTION_INTERVAL_SECS),
     );
     let server = StratumV2JdpServer::spawn(noise, hooks, bridge, distribution_interval);
-    let _ = settle_slot.set(server.distribution_handle());
+    let _ = settle.registry_slot().set(server.distribution_handle());
 
     let bind_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
     let listener = TcpListener::bind(bind_addr)

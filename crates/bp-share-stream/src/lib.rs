@@ -97,6 +97,17 @@ pub struct CacheInvalidation {
 pub mod cache_kind {
     pub const GROUP: &str = "group";
     pub const BLOCKPARTY: &str = "blockparty";
+    /// A block was booked, so every published SV2 ext-0x0003 payout
+    /// distribution is stale (§10). Unlike the two above this asks the
+    /// Front to INVALIDATE, not to rebuild from the DB — the published
+    /// weights encode pre-settlement ledger balances, and a job-declaring
+    /// client still mining them would pay those balances a second time.
+    ///
+    /// It rides this stream because the settling process and the process
+    /// holding the JDP registry are different ones under the role split
+    /// (`payout` books, `front` publishes distributions), and this is the
+    /// channel that already crosses that boundary.
+    pub const SETTLEMENT: &str = "settlement";
 }
 
 #[derive(Debug, Error)]
