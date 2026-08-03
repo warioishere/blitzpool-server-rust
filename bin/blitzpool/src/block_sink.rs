@@ -39,7 +39,7 @@
 //! TCP binding in 7.4c.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bp_bitcoin::BitcoinRpc;
@@ -193,6 +193,17 @@ pub(crate) struct BlockFoundApplier {
     /// reaches `confirmation_depth`. When absent (or no block hash), the
     /// PPLNS arm falls back to the immediate `on_block_found` apply.
     redis: Option<ConnectionManager>,
+    /// ext 0x0003 §10 settlement hook, shared with the JDP booking path
+    /// via a late-bound slot (the sinks are built before the JDP server
+    /// exists).
+    ///
+    /// A settlement from ANY source invalidates every published payout
+    /// distribution — the published weights encode the pre-settlement
+    /// balances, so a 0x0003 JDC still mining them would pay out the
+    /// same balances a second time. Wiring this only to JDP-declared
+    /// blocks left every SV1/SV2 block silently skipping the
+    /// invalidation.
+    settle: Option<Arc<OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>>,
 }
 
 #[allow(dead_code)]
@@ -208,6 +219,17 @@ impl TdpBlockSubmissionSink {
             block_found_producer: None,
             network: bitcoin::Network::Bitcoin,
         }
+    }
+
+    /// Wire the ext 0x0003 §10 settlement hook onto this sink's applier,
+    /// so a block booked through the Stratum path invalidates the
+    /// published payout distributions exactly like a JDP-declared one.
+    pub(crate) fn with_settle_handle(
+        mut self,
+        slot: Arc<OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>,
+    ) -> Self {
+        self.applier.settle = Some(slot);
+        self
     }
 
     /// Set the address-display network used to decompose submitted
@@ -631,6 +653,16 @@ impl BlockFoundApplier {
             blockparty,
             dispatcher,
             redis,
+            settle: None,
+        }
+    }
+
+    /// §10: a ledger settlement just happened. Invalidate every
+    /// published payout distribution and force a fresh publish, so no
+    /// JDC keeps declaring against weights this block already settled.
+    fn settle_distributions(&self) {
+        if let Some(handle) = self.settle.as_ref().and_then(|s| s.get()) {
+            handle.settle();
         }
     }
 
@@ -775,14 +807,17 @@ impl BlockFoundApplier {
                     }
                 };
                 match immediate {
-                    Ok(outcome) => info!(
-                        address = address_str,
-                        height,
-                        reward_sats = reward,
-                        history_inserted = outcome.history_inserted,
-                        balances_affected = outcome.balances_affected,
-                        "block-found: PPLNS ledger applied (immediate)"
-                    ),
+                    Ok(outcome) => {
+                        self.settle_distributions();
+                        info!(
+                            address = address_str,
+                            height,
+                            reward_sats = reward,
+                            history_inserted = outcome.history_inserted,
+                            balances_affected = outcome.balances_affected,
+                            "block-found: PPLNS ledger applied (immediate)"
+                        )
+                    }
                     Err(err) => warn!(%err, address = address_str, height,
                         "block-found: PPLNS on_block_found failed"),
                 }
@@ -939,14 +974,17 @@ impl BlockFoundApplier {
             },
         };
         match applied {
-            Ok(outcome) => info!(
-                group_id = group_id_str,
-                height,
-                reward_sats = reward,
-                history_inserted = outcome.history_inserted,
-                balances_affected = outcome.balances_affected,
-                "block-found: Group-Solo ledger applied"
-            ),
+            Ok(outcome) => {
+                self.settle_distributions();
+                info!(
+                    group_id = group_id_str,
+                    height,
+                    reward_sats = reward,
+                    history_inserted = outcome.history_inserted,
+                    balances_affected = outcome.balances_affected,
+                    "block-found: Group-Solo ledger applied"
+                )
+            }
             Err(err) => warn!(%err, group_id = group_id_str, height,
                 "block-found: Group-Solo on_block_found failed"),
         }

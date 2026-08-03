@@ -161,6 +161,18 @@ pub struct BalanceWrite {
     /// this field existed carry no baseline, and applying the absolute
     /// is exactly what they have always done.
     pub balance_before: Option<Sats>,
+    /// The same baseline for `total_paid_sats`, which the upsert also
+    /// writes absolutely.
+    ///
+    /// `total_paid_sats` is frozen as `prev_total_paid + paid`. Without
+    /// a baseline to re-base onto, two blocks maturing in the same
+    /// reconcile pass make the second one's write REVERT the first's
+    /// increment, and the miner's lifetime-paid figure permanently
+    /// under-reports a block. The flush-before-freeze that is supposed
+    /// to prevent the overlap is explicitly best-effort.
+    ///
+    /// `None` = write the absolute (pre-field blobs).
+    pub total_paid_before: Option<Sats>,
 }
 
 #[cfg(test)]

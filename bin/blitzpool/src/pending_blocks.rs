@@ -31,6 +31,16 @@ use crate::pending_store::{load_pending, put_pending, remove_pending, PendingBlo
 /// Redis HASH holding every not-yet-confirmed PPLNS block-found.
 pub(crate) const PENDING_KEY: &str = "pplns:pending_blocks";
 
+/// Where a block goes when no automatic path can book it.
+///
+/// The frozen blob is the ONLY copy of what this block's coinbase paid
+/// every miner — the audit rows and balance writes computed at
+/// found-time. Deleting it on a terminal error turns "cannot book
+/// automatically" into "the payout record is gone", and the log line
+/// telling the operator to reprocess names a path that does not exist.
+/// Moving it here stops the retry loop without destroying the evidence.
+pub(crate) const UNBOOKABLE_KEY: &str = "pplns:unbookable_blocks";
+
 /// One frozen, not-yet-applied PPLNS block-found.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingBlock {
@@ -109,6 +119,7 @@ mod tests {
                     balance_sats: 0,
                     total_paid_sats: 5_000_000,
                     balance_before_sats: Some(5_000_000),
+                    total_paid_before_sats: None,
                 }],
             },
         };

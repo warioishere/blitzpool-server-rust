@@ -36,9 +36,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::pending_blocks::{remove_pending_block, PENDING_KEY};
-use crate::pending_group_solo_blocks::{remove_pending_group_solo_block, GS_PENDING_KEY};
-use crate::pending_store::{load_pending, remove_pending, PendingBlockRef};
+use crate::pending_blocks::{remove_pending_block, PENDING_KEY, UNBOOKABLE_KEY};
+use crate::pending_group_solo_blocks::{
+    remove_pending_group_solo_block, GS_PENDING_KEY, GS_UNBOOKABLE_KEY,
+};
+use crate::pending_store::{load_pending, put_pending, remove_pending, PendingBlockRef};
 
 /// Fallback re-check cadence when the TDP stream is quiet. New blocks normally
 /// drive the watcher via `SetNewPrevHash`; this just bounds the worst-case
@@ -76,6 +78,14 @@ pub(crate) fn spawn(
     pplns: Option<PplnsEngine>,
     group_solo: Option<GroupSoloEngine>,
     confirmation_depth: u32,
+    // ext 0x0003 §10 settlement hook — a gated apply IS a settlement,
+    // so the published payout distributions must be invalidated with
+    // it or a JDC keeps mining pre-settlement weights.
+    settle: Option<
+        std::sync::Arc<
+            std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
+        >,
+    >,
 ) -> BlockConfirmationHandle {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
@@ -99,12 +109,12 @@ pub(crate) fn spawn(
                 biased;
                 _ = cancel.cancelled() => break,
                 _ = tick.tick() => {
-                    reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth).await;
+                    reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth, settle.as_ref()).await;
                 }
                 ev = next_tip_signal(&mut rx) => match ev {
                     // A new chain tip — re-check every parked block's depth.
                     Ok(TemplateUpdate::SetNewPrevHash(_)) => {
-                        reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth).await;
+                        reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth, settle.as_ref()).await;
                     }
                     // NewTemplate / tx-data responses aren't new-block ticks.
                     Ok(_) => {}
@@ -217,6 +227,12 @@ async fn reconcile(
     pplns: Option<&PplnsEngine>,
     group_solo: Option<&GroupSoloEngine>,
     confirmation_depth: u32,
+    // See `spawn`: a gated apply IS a §10 settlement event.
+    settle: Option<
+        &std::sync::Arc<
+            std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
+        >,
+    >,
 ) {
     let depth = i64::from(confirmation_depth);
 
@@ -233,6 +249,9 @@ async fn reconcile(
         for pb in confirmed {
             match pplns.apply_prepared(&pb.prepared).await {
                 Ok(outcome) => {
+                    if let Some(handle) = settle.and_then(|s| s.get()) {
+                        handle.settle();
+                    }
                     info!(
                         block_hash = %pb.block_hash,
                         height = pb.prepared.block_height,
@@ -243,16 +262,26 @@ async fn reconcile(
                     let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
                 }
                 Err(err) if err.is_terminal() => {
+                    // Park, don't destroy: the frozen blob is the only
+                    // record of what this block paid every miner, and
+                    // there is no reprocess path that can rebuild it.
+                    let parked = put_pending(&mut conn, UNBOOKABLE_KEY, &pb.block_hash, &pb)
+                        .await
+                        .is_ok();
                     error!(
                         %err,
                         block_hash = %pb.block_hash,
                         height = pb.prepared.block_height,
+                        parked,
+                        unbookable_key = UNBOOKABLE_KEY,
                         "block-confirmation: PPLNS block cannot be booked automatically — \
-                         dropping it from the pending store instead of retrying forever; \
-                         the miners it paid are owed their ledger entry, reprocess from the \
-                         block's own coinbase"
+                         moved to the unbookable store instead of retrying forever; the \
+                         miners it paid are owed their ledger entry and the frozen \
+                         distribution is preserved there for a manual apply"
                     );
-                    let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+                    if parked {
+                        let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+                    }
                 }
                 Err(err) => warn!(
                     %err,
@@ -335,6 +364,9 @@ async fn reconcile(
             };
             match applied {
                 Ok(outcome) => {
+                    if let Some(handle) = settle.and_then(|s| s.get()) {
+                        handle.settle();
+                    }
                     info!(
                         block_hash = %pb.block_hash,
                         height = pb.block_height,
@@ -346,17 +378,24 @@ async fn reconcile(
                     let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
                 }
                 Err(err) if err.is_terminal() => {
+                    let parked = put_pending(&mut conn, GS_UNBOOKABLE_KEY, &pb.block_hash, &pb)
+                        .await
+                        .is_ok();
                     error!(
                         %err,
                         block_hash = %pb.block_hash,
                         height = pb.block_height,
                         group_id = %pb.group_id,
+                        parked,
+                        unbookable_key = GS_UNBOOKABLE_KEY,
                         "block-confirmation: Group-Solo block cannot be booked automatically — \
-                         dropping it from the pending store instead of retrying forever; the \
-                         members it paid are owed their ledger entry, reprocess from the \
-                         block's own coinbase"
+                         moved to the unbookable store instead of retrying forever; the \
+                         members it paid are owed their ledger entry and the frozen \
+                         distribution is preserved there for a manual apply"
                     );
-                    let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
+                    if parked {
+                        let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
+                    }
                 }
                 Err(err) => warn!(
                     %err,

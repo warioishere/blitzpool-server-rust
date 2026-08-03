@@ -221,6 +221,11 @@ pub struct PreparedBalanceWrite {
     /// they apply their absolute, exactly as they always did.
     #[serde(default)]
     pub balance_before_sats: Option<i64>,
+    /// Baseline for `total_paid_sats` — see
+    /// [`BalanceWrite::total_paid_before`]. `serde(default)` for blobs
+    /// frozen before the field existed.
+    #[serde(default)]
+    pub total_paid_before_sats: Option<i64>,
 }
 
 impl PreparedBlockFound {
@@ -255,6 +260,7 @@ impl PreparedBlockFound {
                     balance_sats: b.balance_sats.0,
                     total_paid_sats: b.total_paid_sats.0,
                     balance_before_sats: b.balance_before.map(|s| s.0),
+                    total_paid_before_sats: b.total_paid_before.map(|s| s.0),
                 })
                 .collect(),
         }
@@ -284,6 +290,7 @@ impl PreparedBlockFound {
                 balance_sats: Sats(b.balance_sats),
                 total_paid_sats: Sats(b.total_paid_sats),
                 balance_before: b.balance_before_sats.map(Sats),
+                total_paid_before: b.total_paid_before_sats.map(Sats),
             });
         }
         Ok((rows, balances))
@@ -645,27 +652,59 @@ impl PplnsEngine {
     ) -> Result<(), EngineError> {
         let rebasable: Vec<String> = balance_writes
             .iter()
-            .filter(|b| b.balance_before.is_some())
+            .filter(|b| b.balance_before.is_some() || b.total_paid_before.is_some())
             .map(|b| b.address.as_str().to_string())
             .collect();
         if rebasable.is_empty() {
             return Ok(());
         }
-        let current: HashMap<String, i64> =
+        let current: HashMap<String, (i64, i64)> =
             find_pplns_balances_for_addresses(&self.inner.pool, &rebasable)
                 .await?
                 .into_iter()
-                .map(|r| (r.address.as_str().to_string(), r.balance_sats.0))
+                .map(|r| {
+                    (
+                        r.address.as_str().to_string(),
+                        (r.balance_sats.0, r.total_paid_sats.0),
+                    )
+                })
                 .collect();
 
         for write in balance_writes.iter_mut() {
+            // A row absent now reads as (0, 0) — the sweep deletes a row
+            // it has zeroed, and re-basing onto 0 is what keeps that
+            // deletion standing.
+            let (now, now_total) = current
+                .get(write.address.as_str())
+                .copied()
+                .unwrap_or((0, 0));
+
+            // `totalPaidSats` is written absolutely by the same upsert,
+            // so it needs the same treatment: apply the block's OWN
+            // increment to whatever the row holds now. Without this a
+            // second block maturing in the same pass reverts the first
+            // one's increment and the lifetime-paid figure loses a block.
+            if let Some(before_total) = write.total_paid_before {
+                let paid_this_block = write.total_paid_sats.0 - before_total.0;
+                let rebased_total = now_total + paid_this_block;
+                if rebased_total != write.total_paid_sats.0 {
+                    warn!(
+                        address = write.address.as_str(),
+                        block_height,
+                        frozen_total_before = before_total.0,
+                        frozen_total_after = write.total_paid_sats.0,
+                        current_total = now_total,
+                        rebased_total,
+                        "pplns apply: totalPaidSats moved between freeze and apply — applying \
+                         this block's increment to the current row"
+                    );
+                    write.total_paid_sats = Sats(rebased_total);
+                }
+            }
+
             let Some(before) = write.balance_before else {
                 continue;
             };
-            // A row absent now reads as 0 — the sweep deletes a row it
-            // has zeroed, and re-basing onto 0 is what keeps that
-            // deletion standing.
-            let now = current.get(write.address.as_str()).copied().unwrap_or(0);
             if now == before.0 {
                 continue;
             }
@@ -977,6 +1016,7 @@ impl PplnsEngine {
                 address: addr_id,
                 balance_sats: Sats(current + delta),
                 total_paid_sats: Sats(prev_total_paid + paid as i64),
+                total_paid_before: Some(Sats(prev_total_paid)),
                 balance_before: Some(Sats(current)),
             });
         }
@@ -1021,6 +1061,7 @@ impl PplnsEngine {
                     address: addr_id,
                     balance_sats: Sats(current - *paid as i64),
                     total_paid_sats: Sats(prev_total_paid + *paid as i64),
+                    total_paid_before: Some(Sats(prev_total_paid)),
                     balance_before: Some(Sats(current)),
                 });
             }
@@ -1112,6 +1153,7 @@ impl PplnsEngine {
                 address: entry.address.clone(),
                 balance_sats: Sats(new_balance),
                 total_paid_sats: Sats(prev_total_paid + entry.sats.0),
+                total_paid_before: Some(Sats(prev_total_paid)),
                 balance_before: Some(Sats(
                     existing
                         .get(entry.address.as_str())
@@ -1146,6 +1188,7 @@ impl PplnsEngine {
                 balance_sats: Sats(resolved),
                 // No on-chain delta for pending rows.
                 total_paid_sats: Sats(prev_total_paid),
+                total_paid_before: Some(Sats(prev_total_paid)),
                 balance_before: Some(Sats(prev_balance)),
             });
         }

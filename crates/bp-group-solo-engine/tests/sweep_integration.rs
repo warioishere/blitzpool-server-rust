@@ -571,3 +571,99 @@ async fn sweep_never_cancels_across_groups() {
     cleanup_group(&pool, group_a).await;
     cleanup_group(&pool, group_b).await;
 }
+
+/// A dormant credit ABOVE `min_payout` is real, payable money — it is
+/// paid out on the group's next block whether or not that member is
+/// still mining, because a positive balance boosts wire weight with no
+/// shares required. Dormancy is measured on the member's last SHARE,
+/// and a small group can easily go a month without finding a block.
+///
+/// So the pair-cancel must not reach it. `Σ pendingSats` surviving the
+/// cancellation says nothing about the two individuals: the creditor
+/// would lose a 500 000-sat claim and the debtor would have an equal
+/// obligation forgiven.
+#[tokio::test]
+async fn sweep_never_cancels_a_pair_above_min_payout() {
+    let _guard = SWEEP_TEST_LOCK.lock().await;
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    wipe_leftover_test_state(&pool).await;
+
+    let group_id = Uuid::new_v4();
+    seed_group(&pool, group_id).await;
+    let stale = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    // A perfectly pairable credit/debit — both far above the 5 000-sat
+    // threshold. Unbounded, the sweep zeroed and DELETEd both.
+    seep_pair(&pool, group_id, 500_000, -500_000, stale).await;
+
+    let runner = GroupDustSweepRunner::new(pool.clone(), clock_at(2026, 5, 16), Sats(5_000), 30);
+    let stats = runner.sweep().await.expect("ok");
+
+    assert_eq!(
+        stats.pairs_closed, 0,
+        "a pair above min_payout must not be cancelled"
+    );
+    assert_eq!(stats.rows_absorbed, 0);
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT address, "pendingSats" FROM pplns_group_balance
+           WHERE "groupId" = $1 ORDER BY address"#,
+    )
+    .bind(group_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "both rows must survive the sweep, got {rows:?}"
+    );
+    // Ordered by address: "…_credit" sorts before "…_debit".
+    assert_eq!(rows[0].1, 500_000, "the credit must survive intact");
+    assert_eq!(rows[1].1, -500_000, "and so must the debit");
+
+    cleanup_group(&pool, group_id).await;
+}
+
+/// The dust band still pairs — the bound above is a ceiling, not an
+/// off-switch. Without this the previous test would also pass against
+/// a sweep that had lost pairing entirely.
+#[tokio::test]
+async fn sweep_still_cancels_a_pair_inside_the_dust_band() {
+    let _guard = SWEEP_TEST_LOCK.lock().await;
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    wipe_leftover_test_state(&pool).await;
+
+    let group_id = Uuid::new_v4();
+    seed_group(&pool, group_id).await;
+    let stale = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    seep_pair(&pool, group_id, 900, -900, stale).await;
+
+    let runner = GroupDustSweepRunner::new(pool.clone(), clock_at(2026, 5, 16), Sats(5_000), 30);
+    let stats = runner.sweep().await.expect("ok");
+
+    assert_eq!(
+        stats.pairs_closed, 2,
+        "both dust rows close against each other"
+    );
+    assert_eq!(stats.sats_paired, 900);
+    assert_eq!(group_pending_sum(&pool, group_id).await, 0);
+
+    cleanup_group(&pool, group_id).await;
+}
+
+/// Seed one credit + one debit in `group_id`, both dormant since `at`.
+async fn seep_pair(pool: &PgPool, group_id: Uuid, credit: i64, debit: i64, at: i64) {
+    seed_balance(pool, group_id, "test_grpsw_p_credit", credit, Some(at)).await;
+    seed_balance(pool, group_id, "test_grpsw_p_debit", debit, Some(at)).await;
+}

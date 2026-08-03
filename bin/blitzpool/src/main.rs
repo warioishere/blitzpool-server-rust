@@ -637,6 +637,14 @@ async fn main() -> ExitCode {
     // feed (a fast new-tip trigger) is optional: the Satellite has none and runs
     // on the fallback timer alone. (Blockparty is exempt — fixed-percentage
     // payouts recomputed from the DB, idempotent, nothing to drift.)
+    // §10 settlement slot: filled once the JDP server exists, read by
+    // every path that settles the ledger (Stratum block sinks and the
+    // confirmation watcher included) so a non-JDP block invalidates the
+    // published payout distributions too.
+    let settle_slot: std::sync::Arc<
+        std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>,
+    > = std::sync::Arc::new(std::sync::OnceLock::new());
+
     let block_confirmation = if is_accounting {
         let depth = cfg
             .pplns
@@ -650,6 +658,7 @@ async fn main() -> ExitCode {
             engines.pplns.clone(),
             Some(engines.group_solo.clone()),
             depth,
+            Some(settle_slot.clone()),
         ))
     } else {
         None
@@ -992,6 +1001,7 @@ async fn main() -> ExitCode {
                     template_tx_cache,
                     jdp_ledger_booker,
                     handles.redis.clone(),
+                    settle_slot.clone(),
                 )
                 .await
                 {

@@ -729,13 +729,19 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
     drop_harness(h).await;
 }
 
-/// Documents the hazard `gate_or_apply_pplns` prevents: preparing two
-/// blocks against the same pre-apply ledger and applying both makes the
-/// second ABSOLUTE balance write clobber the first block's delta — totals
-/// do NOT accumulate. The production flush keeps at most one block pending
-/// so this interleaving never occurs.
+/// Two blocks prepared against the SAME pre-apply ledger and applied
+/// back-to-back must both land — the second must not clobber the first.
+///
+/// This used to be a characterization test for the opposite: the apply
+/// re-based `balanceSats` onto the current row but wrote `totalPaidSats`
+/// as a frozen absolute, so block 2 reverted block 1's increment and a
+/// miner's lifetime-paid figure silently lost a block. The interleaving
+/// is supposed to be prevented by `gate_or_apply_pplns` flushing an
+/// earlier pending block first — but that flush is explicitly
+/// best-effort and freezes anyway when the Redis read or the earlier
+/// apply fails, so the ledger must not depend on it.
 #[tokio::test]
-async fn gated_two_prepares_against_same_ledger_clobber_without_flush() {
+async fn gated_two_prepares_against_same_ledger_both_accumulate() {
     let _serial = balance_table_lock().lock().await;
     let h = match spawn_or_skip(8, "test_gated_clobber_").await {
         Some(h) => h,
@@ -779,8 +785,9 @@ async fn gated_two_prepares_against_same_ledger_clobber_without_flush() {
         .await
         .expect("prepare 2");
 
-    // Apply both: both were computed against the pre-apply ledger, so
-    // block 2's writes clobber block 1's delta.
+    // Apply both. Each carries its own frozen baseline, so the apply
+    // lands the block's OWN increment on whatever the row holds now
+    // rather than the absolute it was frozen with.
     h.engine.apply_prepared(&p1).await.expect("apply 1");
     let t1 = miner_total_paid(&h.pool, MINER).await;
     h.engine.apply_prepared(&p2).await.expect("apply 2");
@@ -788,12 +795,11 @@ async fn gated_two_prepares_against_same_ledger_clobber_without_flush() {
 
     assert!(t1 > 0, "block 1 must credit the miner, got {t1}");
     assert_eq!(
-        t2, t1,
-        "without the flush, block 2's absolute write clobbers block 1's \
-         delta — totals don't accumulate (t1={t1}, t2={t2})"
+        t2,
+        t1 * 2,
+        "both blocks must accumulate into totalPaidSats even without the \
+         flush — block 2 must not revert block 1 (t1={t1}, t2={t2})"
     );
-    // Both audit rows still exist (distinct heights) — only the ledger
-    // balance/total was clobbered, proving it's a write-ordering hazard.
     let hist: (i64,) = sqlx::query_as(
         r#"SELECT count(*) FROM pplns_payout_history WHERE "blockHeight" = ANY($1)"#,
     )

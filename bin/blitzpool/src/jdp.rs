@@ -121,6 +121,11 @@ pub(crate) async fn spawn(
     // Allocator backing for the strictly-increasing ext 0x0003
     // `distribution_id` (spec §3.1).
     redis: redis::aio::ConnectionManager,
+    // §10 settlement slot, created by the caller because the block sinks
+    // are built before this server exists and need the SAME handle: a
+    // settlement from any source must invalidate the published
+    // distributions, not just a JDP-declared one.
+    settle_slot: Arc<OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>,
 ) -> Result<JdpHandles, JdpSpawnError> {
     if !cfg.sv2.jdp_enabled {
         info!("jdp: disabled (sv2.jdp_enabled = false)");
@@ -152,9 +157,6 @@ pub(crate) async fn spawn(
         fee_address,
     });
 
-    // The block sink is built before the server exists, but §10 settlement
-    // needs the server's invalidation handle — late-bound via this slot.
-    let settle_slot = Arc::new(OnceLock::new());
     let hooks = build_jdp_hooks(
         tdp,
         bitcoin_rpc,

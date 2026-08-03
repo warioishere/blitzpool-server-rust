@@ -22,6 +22,11 @@ use crate::pending_store::{put_pending, remove_pending, PendingBlockRef};
 /// Redis HASH holding every not-yet-confirmed Group-Solo block-found.
 pub(crate) const GS_PENDING_KEY: &str = "groupsolo:pending_blocks";
 
+/// Group-Solo counterpart of [`crate::pending_blocks::UNBOOKABLE_KEY`]:
+/// a block no automatic path can book is parked here rather than
+/// deleted, so the frozen distribution survives for the operator.
+pub(crate) const GS_UNBOOKABLE_KEY: &str = "groupsolo:unbookable_blocks";
+
 /// One frozen, not-yet-applied Group-Solo block-found.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingGroupSoloBlock {

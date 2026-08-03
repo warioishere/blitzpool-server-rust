@@ -499,10 +499,15 @@ pub async fn find_all_pplns_group_balances_for_group(
 /// signed with the weight model — an overpaid member owes the pool —
 /// so the sweep pair-cancels a dormant credit against a dormant debit
 /// before it absorbs anything, exactly as PPLNS does. Filtering to
-/// positive sub-`min_payout` rows here (as this used to) hides every
-/// debit from the pairing and leaves dormant debts standing forever;
-/// the dust threshold belongs to the caller, applied to what the
-/// pairing leaves.
+/// positive sub-`min_payout` rows here hides every debit from the
+/// pairing, so the threshold belongs to the caller.
+///
+/// ⚠️ The caller MUST still bound what it cancels. This query returns
+/// dormant rows of ANY size; `Σ pendingSats` surviving a pair-cancel
+/// does not make it safe for the two individuals, and a dormant credit
+/// above `min_payout` is still paid on the group's next block. See
+/// `GroupDustSweepRunner::cancel_pairs`, which pairs only inside the
+/// dust band.
 pub async fn find_pplns_group_balances_dormant(
     pool: &PgPool,
     cutoff_ms: i64,

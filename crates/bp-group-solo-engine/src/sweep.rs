@@ -139,6 +139,20 @@ impl<C: Clock> GroupDustSweepRunner<C> {
     /// `+X` and `−X` to zero together. That is the whole point — the
     /// pool is non-custodial, the satoshis already live on chain, and a
     /// sweep that retired one side alone would invent a claim.
+    ///
+    /// **Bounded to sub-`min_payout` rows on BOTH sides.** Σ being
+    /// preserved says nothing about the individuals: cancelling a
+    /// 500 000-sat dormant credit against a 500 000-sat dormant debit
+    /// extinguishes a real claim and forgives a real obligation. And a
+    /// dormant credit is not an abandoned one — dormancy is measured on
+    /// the MEMBER's last share, while a positive balance is paid out on
+    /// the group's next block whether or not that member is still
+    /// mining (it boosts wire weight with no shares required). Above the
+    /// payout threshold the money is owed and payable, so the sweep
+    /// leaves it alone; this is a dust sweep. Leaving a large dormant
+    /// debit standing costs nobody — the overpayment already happened
+    /// on chain and the row only shrinks that member's weight if they
+    /// come back.
     async fn cancel_pairs(
         &self,
         group_id: Uuid,
@@ -147,8 +161,12 @@ impl<C: Clock> GroupDustSweepRunner<C> {
         now: DateTime<Utc>,
         stats: &mut SweepStats,
     ) -> Vec<PplnsGroupBalanceRow> {
+        let min_payout = self.min_payout_sats.to_i64();
+        let (dust, mut oversized): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|r| r.pending_sats.0.abs() < min_payout);
         let (mut credits, mut debits): (Vec<_>, Vec<_>) =
-            rows.into_iter().partition(|r| r.pending_sats.0 > 0);
+            dust.into_iter().partition(|r| r.pending_sats.0 > 0);
         credits.sort_by_key(|r| std::cmp::Reverse(r.pending_sats.0));
         debits.sort_by_key(|r| r.pending_sats.0); // most-negative first
 
@@ -210,7 +228,11 @@ impl<C: Clock> GroupDustSweepRunner<C> {
                 j += 1;
             }
         }
-        credits.into_iter().chain(debits).collect()
+        // The oversized rows pass through untouched — the absorb pass
+        // filters them out too, so they simply stay on the ledger.
+        let mut left: Vec<PplnsGroupBalanceRow> = credits.into_iter().chain(debits).collect();
+        left.append(&mut oversized);
+        left
     }
 
     /// One pair-cancel TX: 2 audit rows + update-or-delete both balance
