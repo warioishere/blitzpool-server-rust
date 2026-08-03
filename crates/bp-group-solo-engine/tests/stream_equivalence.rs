@@ -52,6 +52,12 @@ fn share_seq(group_id: Uuid) -> Vec<SharedAcceptedShareOwned> {
 
 async fn spawn_engine(conn: ConnectionManager, pool: PgPool) -> GroupSoloEngine {
     let config = GroupSoloEngineConfig {
+        // Structural under §4 — the engine refuses to construct without a
+        // usable pool-output recipient, because a pool that starts without
+        // one pays every block to a single miner.
+        fee_address: Some(
+            bp_common::AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").expect("valid"),
+        ),
         ..GroupSoloEngineConfig::default()
     };
     GroupSoloEngine::spawn(config, conn, pool)

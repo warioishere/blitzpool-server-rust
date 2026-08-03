@@ -151,10 +151,18 @@ pub fn max_coinbase_outputs(budget: u32, has_fee_output: bool) -> u64 {
 
 /// Field-level validation error for the fee / min-payout / coinbase-budget
 /// knobs shared by the PPLNS and Group-Solo engine configs. Each engine maps
-/// this into its own `ConfigError` (via `From`) so the three identical checks
-/// — and their thresholds — live in exactly one place.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// this into its own `ConfigError` (via `From`) so the identical checks —
+/// and their thresholds — live in exactly one place.
+#[derive(Debug, Clone, PartialEq)]
 pub enum FeePayoutBudgetError {
+    /// No pool-output recipient configured. Structural under §4, not a
+    /// preference — see [`validate_fee_payout_budget`].
+    MissingFeeAddress,
+    /// A pool-output recipient was configured but is not a usable payout
+    /// address. `AddressId` only checks the SHAPE (ASCII, length), so a
+    /// typo'd address gets this far; the same silent failure as no
+    /// address at all, and likelier.
+    InvalidFeeAddress { value: String },
     /// `fee_percent` was non-finite or outside `[0.0, 100.0]`.
     InvalidFeePercent { value: f64 },
     /// `min_payout_sats` below the relay-policy dust floor.
@@ -165,15 +173,45 @@ pub enum FeePayoutBudgetError {
     WeightBudgetTooLow { value: u32, min: u32 },
 }
 
-/// Validate the three fee/payout/budget invariants both payout engines share.
+/// Validate the fee/payout/budget invariants both payout engines share.
 /// The thresholds (dust floor, budget-floor formula) live here so a change
-/// applies to every engine at once. Field order matches both engines' old
-/// inline checks so error precedence is unchanged.
+/// applies to every engine at once — and so neither engine can be handed a
+/// usable budget without also being handed a usable pool output.
+///
+/// **The fee address is checked FIRST because it is structural, not a
+/// preference.** §4 makes the pool output the residual
+/// (`pay_P = T − Σ pay`), so a distribution without one cannot exist:
+/// `build_weight_distribution` refuses, the payout resolver falls back to a
+/// solo coinbase, and that coinbase pays **100 % of the block to whichever
+/// miner happened to connect** — every block, indefinitely, with one
+/// `warn!` per job and no fingerprint, so the loss is not even booked.
+///
+/// That is the same outcome the [`MIN_COINBASE_WEIGHT_BUDGET`] floor below
+/// already refuses outright ("not a degraded pool, a pool that keeps the
+/// miners' money"); this was its other half, left open. The example config
+/// has always said a fee address is *required when the mode is enabled* —
+/// this is what makes that true rather than aspirational.
+///
+/// A boot that stops here costs the operator one config line. The failure
+/// it replaces costs a whole block and cannot be undone.
 pub fn validate_fee_payout_budget(
+    fee_address: Option<&str>,
     fee_percent: f64,
     min_payout_sats: i64,
     coinbase_weight_budget: u32,
 ) -> Result<(), FeePayoutBudgetError> {
+    let address = fee_address
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .ok_or(FeePayoutBudgetError::MissingFeeAddress)?;
+    // Shape is not enough. `AddressId` accepts any short ASCII string, so a
+    // typo'd address reaches the coinbase builder and fails there — the same
+    // silent 100 %-to-one-miner outcome, and likelier than an empty field.
+    if !is_valid_payout_address(address) {
+        return Err(FeePayoutBudgetError::InvalidFeeAddress {
+            value: address.to_string(),
+        });
+    }
     if !fee_percent.is_finite() || !(0.0..=100.0).contains(&fee_percent) {
         return Err(FeePayoutBudgetError::InvalidFeePercent { value: fee_percent });
     }
@@ -368,28 +406,73 @@ mod tests {
         assert_eq!(max_coinbase_outputs(COINBASE_BASE_WEIGHT, false), 1);
     }
 
+    /// A usable pool-output recipient, for the cases that are about
+    /// something else.
+    const FEE: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
+
     #[test]
     fn validate_fee_payout_budget_accepts_sane_values() {
         assert_eq!(
-            validate_fee_payout_budget(1.5, DEFAULT_MIN_PAYOUT_SATS as i64, 50_000),
+            validate_fee_payout_budget(Some(FEE), 1.5, DEFAULT_MIN_PAYOUT_SATS as i64, 50_000),
             Ok(())
+        );
+    }
+
+    /// MONEY: a pool with no usable fee address builds no distribution at
+    /// all, so every PPLNS / Group-Solo job falls back to a solo coinbase
+    /// paying 100 % of the block to whichever miner connected — silently,
+    /// indefinitely, and without a fingerprint, so nothing even books the
+    /// loss. It has to be refused at construction, exactly like the
+    /// weight-budget floor is.
+    #[test]
+    fn a_pool_without_a_usable_fee_address_is_refused() {
+        // Absent, empty and whitespace-only are the same operator mistake:
+        // `[pplns] fee_address = ""` is what a commented-out example leaves
+        // behind, and it parses to a present-but-blank string.
+        for missing in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                validate_fee_payout_budget(missing, 1.5, 5_000, 50_000),
+                Err(FeePayoutBudgetError::MissingFeeAddress),
+                "{missing:?} must be refused"
+            );
+        }
+        // Shape-valid but not a payout address. `AddressId` accepts this —
+        // it only checks ASCII + length — so without this check a typo'd
+        // address reaches `build_weight_distribution`, fails there, and
+        // produces the identical silent solo fallback.
+        let typo = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLX";
+        assert!(
+            bp_common::AddressId::new(typo).is_ok(),
+            "precondition: the shape check passes it, which is why this \
+             check has to exist"
+        );
+        assert_eq!(
+            validate_fee_payout_budget(Some(typo), 1.5, 5_000, 50_000),
+            Err(FeePayoutBudgetError::InvalidFeeAddress {
+                value: typo.to_string()
+            })
         );
     }
 
     #[test]
     fn validate_fee_payout_budget_rejects_in_field_order() {
-        // fee_percent checked first.
+        // fee_address checked first — it is structural, the rest are knobs.
         assert_eq!(
-            validate_fee_payout_budget(101.0, 5_000, 50_000),
+            validate_fee_payout_budget(None, 101.0, 5_000, 50_000),
+            Err(FeePayoutBudgetError::MissingFeeAddress)
+        );
+        // then fee_percent.
+        assert_eq!(
+            validate_fee_payout_budget(Some(FEE), 101.0, 5_000, 50_000),
             Err(FeePayoutBudgetError::InvalidFeePercent { value: 101.0 })
         );
         assert!(matches!(
-            validate_fee_payout_budget(f64::NAN, 5_000, 50_000),
+            validate_fee_payout_budget(Some(FEE), f64::NAN, 5_000, 50_000),
             Err(FeePayoutBudgetError::InvalidFeePercent { .. })
         ));
         // then min_payout dust floor.
         assert_eq!(
-            validate_fee_payout_budget(1.0, (DUST_LIMIT_SATS as i64) - 1, 50_000),
+            validate_fee_payout_budget(Some(FEE), 1.0, (DUST_LIMIT_SATS as i64) - 1, 50_000),
             Err(FeePayoutBudgetError::MinPayoutBelowDust {
                 value: (DUST_LIMIT_SATS as i64) - 1,
                 dust: DUST_LIMIT_SATS,
@@ -398,7 +481,7 @@ mod tests {
         // then budget floor.
         let too_low = MIN_COINBASE_WEIGHT_BUDGET - 1;
         assert_eq!(
-            validate_fee_payout_budget(1.0, 5_000, too_low),
+            validate_fee_payout_budget(Some(FEE), 1.0, 5_000, too_low),
             Err(FeePayoutBudgetError::WeightBudgetTooLow {
                 value: too_low,
                 min: MIN_COINBASE_WEIGHT_BUDGET
@@ -435,14 +518,14 @@ mod tests {
         assert!(old_floor < MIN_COINBASE_WEIGHT_BUDGET);
         for dead in [old_floor + 1, 700, 1_012, MIN_COINBASE_WEIGHT_BUDGET - 1] {
             assert!(
-                validate_fee_payout_budget(1.0, 5_000, dead).is_err(),
+                validate_fee_payout_budget(Some(FEE), 1.0, 5_000, dead).is_err(),
                 "budget {dead} publishes no miner output and must be refused"
             );
         }
         // And the floor itself is ACCEPTED — `min` is the smallest
         // usable value, not the largest rejected one.
         assert_eq!(
-            validate_fee_payout_budget(1.0, 5_000, MIN_COINBASE_WEIGHT_BUDGET),
+            validate_fee_payout_budget(Some(FEE), 1.0, 5_000, MIN_COINBASE_WEIGHT_BUDGET),
             Ok(())
         );
     }

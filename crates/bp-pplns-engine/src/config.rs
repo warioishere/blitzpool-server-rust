@@ -20,14 +20,24 @@ use bp_pplns::{
 
 /// PPLNS-engine construction knobs.
 ///
-/// All fields validated by [`PplnsEngineConfig::try_new`]; the [`Default`]
-/// impl returns values that pass validation and are tuned for mainnet
-/// operation.
+/// All fields validated by [`PplnsEngineConfig::try_new`]. [`Default`] is a
+/// field-filler for the `..Default::default()` spread, NOT a usable config:
+/// it leaves `fee_address` unset, which `try_new` refuses. There is no
+/// sensible default for the address a pool's fee is paid to, and defaulting
+/// it to "none" is exactly the shape that pays every block to one miner.
 #[derive(Debug, Clone)]
 pub struct PplnsEngineConfig {
-    /// Coinbase output that receives the pool fee. `None` ⇒ no fee
-    /// output (rare in production but supported — an empty
-    /// `PPLNS_FEE_ADDRESS` is treated as "fee suppressed").
+    /// Coinbase output that receives the pool fee — and, under the weight
+    /// model, the §4 residual `pay_P`. **Required**, and
+    /// [`Self::try_new`] refuses without it.
+    ///
+    /// It used to be documented as optional ("fee suppressed"). It never
+    /// was: `build_weight_distribution` cannot produce a distribution
+    /// without a pool output, so a pool that started without one served
+    /// every PPLNS job a solo coinbase paying the whole block to one
+    /// miner. The `Option` survives only because the type is threaded
+    /// through the reader's public `/api/pplns/fees` shape; construction
+    /// guarantees it is `Some`.
     pub fee_address: Option<AddressId>,
 
     /// Pool fee % as f64 (e.g. `1.5` for 1.5%). Must be `[0.0, 100.0]`.
@@ -157,6 +167,7 @@ impl PplnsEngineConfig {
         // the Group-Solo engine; the checks + thresholds live in bp-pplns and
         // map into this engine's ConfigError via `From` (field order preserved).
         validate_fee_payout_budget(
+            self.fee_address.as_ref().map(|a| a.as_str()),
             self.fee_percent,
             self.min_payout_sats.0,
             self.coinbase_weight_budget,
@@ -204,6 +215,17 @@ impl PplnsEngineConfig {
 /// Field-level validation errors for [`PplnsEngineConfig::try_new`].
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum ConfigError {
+    #[error(
+        "no fee_address configured — the pool output is structural under the \
+         weight model (SV2 ext 0x0003 §4). Without it every block of this mode \
+         falls back to a solo coinbase paying 100 % to one miner"
+    )]
+    MissingFeeAddress,
+    #[error(
+        "fee_address {value:?} is not a usable payout address — same effect as \
+         none at all: every block falls back to a solo coinbase"
+    )]
+    InvalidFeeAddress { value: String },
     #[error("fee_percent must be in [0.0, 100.0] and finite, got {value}")]
     InvalidFeePercent { value: f64 },
     #[error("min_payout_sats must be ≥ DUST_LIMIT_SATS ({dust}), got {value}")]
@@ -219,6 +241,10 @@ pub enum ConfigError {
 impl From<FeePayoutBudgetError> for ConfigError {
     fn from(e: FeePayoutBudgetError) -> Self {
         match e {
+            FeePayoutBudgetError::MissingFeeAddress => ConfigError::MissingFeeAddress,
+            FeePayoutBudgetError::InvalidFeeAddress { value } => {
+                ConfigError::InvalidFeeAddress { value }
+            }
             FeePayoutBudgetError::InvalidFeePercent { value } => {
                 ConfigError::InvalidFeePercent { value }
             }
@@ -237,17 +263,56 @@ mod tests {
     use bp_pplns::{COINBASE_BASE_WEIGHT, DUST_LIMIT_SATS};
 
     use super::*;
+    const TEST_FEE_ADDRESS: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
+
+    /// A config that differs from [`PplnsEngineConfig::default`] only in having a
+    /// usable pool-output recipient. The default deliberately does NOT —
+    /// see `the_default_config_is_refused_because_it_has_no_fee_address`.
+    fn valid() -> PplnsEngineConfig {
+        PplnsEngineConfig {
+            fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).expect("valid")),
+            ..PplnsEngineConfig::default()
+        }
+    }
+
+    /// The pool output is structural under §4, so there is no such thing
+    /// as a usable config without one — and a pool that boots without it
+    /// pays 100 % of every block to whichever miner connected.
+    #[test]
+    fn the_default_config_is_refused_because_it_has_no_fee_address() {
+        assert_eq!(
+            PplnsEngineConfig::default().try_new().unwrap_err(),
+            ConfigError::MissingFeeAddress
+        );
+    }
+
+    /// Shape-valid but unparseable is the same failure with a likelier
+    /// cause (a typo), and `AddressId` does not catch it.
+    #[test]
+    fn a_typo_in_the_fee_address_is_refused() {
+        let typo = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLX";
+        let cfg = PplnsEngineConfig {
+            fee_address: Some(AddressId::new(typo).expect("shape ok")),
+            ..PplnsEngineConfig::default()
+        };
+        assert_eq!(
+            cfg.try_new().unwrap_err(),
+            ConfigError::InvalidFeeAddress {
+                value: typo.to_string()
+            }
+        );
+    }
 
     #[test]
     fn default_validates_clean() {
-        PplnsEngineConfig::default().try_new().expect("default ok");
+        valid().try_new().expect("default ok");
     }
 
     #[test]
     fn fee_percent_negative_rejects() {
         let cfg = PplnsEngineConfig {
             fee_percent: -0.1,
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
@@ -259,7 +324,7 @@ mod tests {
     fn fee_percent_above_hundred_rejects() {
         let cfg = PplnsEngineConfig {
             fee_percent: 100.5,
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
@@ -271,7 +336,7 @@ mod tests {
     fn fee_percent_nan_rejects() {
         let cfg = PplnsEngineConfig {
             fee_percent: f64::NAN,
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         // NaN can't compare equal to NaN in the error variant; just
         // check the variant tag.
@@ -285,7 +350,7 @@ mod tests {
     fn min_payout_below_dust_limit_rejects() {
         let cfg = PplnsEngineConfig {
             min_payout_sats: Sats(545),
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
@@ -300,7 +365,7 @@ mod tests {
     fn min_payout_exactly_dust_limit_accepts() {
         let cfg = PplnsEngineConfig {
             min_payout_sats: Sats(DUST_LIMIT_SATS as i64),
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         cfg.try_new().expect("dust-limit exact ok");
     }
@@ -309,7 +374,7 @@ mod tests {
     fn weight_budget_below_minimum_rejects() {
         let cfg = PplnsEngineConfig {
             coinbase_weight_budget: COINBASE_BASE_WEIGHT,
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         let err = cfg.try_new().unwrap_err();
         assert!(matches!(err, ConfigError::WeightBudgetTooLow { .. }));
@@ -319,7 +384,7 @@ mod tests {
     fn window_factor_zero_rejects() {
         let cfg = PplnsEngineConfig {
             window_factor: 0.0,
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         assert!(matches!(
             cfg.try_new().unwrap_err(),
@@ -331,7 +396,7 @@ mod tests {
     fn window_factor_negative_rejects() {
         let cfg = PplnsEngineConfig {
             window_factor: -1.0,
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         assert!(matches!(
             cfg.try_new().unwrap_err(),
@@ -343,7 +408,7 @@ mod tests {
     fn window_factor_infinite_rejects() {
         let cfg = PplnsEngineConfig {
             window_factor: f64::INFINITY,
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         assert!(matches!(
             cfg.try_new().unwrap_err(),
@@ -355,7 +420,7 @@ mod tests {
     fn zero_snapshot_ttl_rejects() {
         let cfg = PplnsEngineConfig {
             snapshot_ttl_secs: 0,
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
@@ -369,7 +434,7 @@ mod tests {
     fn zero_trim_batch_size_rejects() {
         let cfg = PplnsEngineConfig {
             trim_batch_size: 0,
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         assert!(matches!(
             cfg.try_new().unwrap_err(),
@@ -383,7 +448,7 @@ mod tests {
     fn zero_abandoned_balance_days_rejects() {
         let cfg = PplnsEngineConfig {
             abandoned_balance_days: 0,
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         assert!(matches!(
             cfg.try_new().unwrap_err(),
@@ -395,7 +460,7 @@ mod tests {
 
     #[test]
     fn fee_suppressed_when_no_address() {
-        let cfg = PplnsEngineConfig::default();
+        let cfg = valid();
         assert!(cfg.fee_suppressed());
     }
 
@@ -404,17 +469,21 @@ mod tests {
         let cfg = PplnsEngineConfig {
             fee_address: Some(AddressId::new("bc1qexample0000000000000000000000").unwrap()),
             fee_percent: 0.0,
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         assert!(cfg.fee_suppressed());
     }
 
     #[test]
     fn fee_active_when_address_and_percent() {
+        // A REAL address: this used to read `bc1qexample000…`, which
+        // `AddressId` accepts and `bitcoin::Address` does not — so the test
+        // asserted that a config the coinbase builder cannot use validates
+        // cleanly.
         let cfg = PplnsEngineConfig {
-            fee_address: Some(AddressId::new("bc1qexample0000000000000000000000").unwrap()),
+            fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).unwrap()),
             fee_percent: 1.5,
-            ..PplnsEngineConfig::default()
+            ..valid()
         };
         assert!(!cfg.fee_suppressed());
         cfg.try_new().expect("active fee config validates");

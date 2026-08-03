@@ -63,6 +63,13 @@ async fn spawn_engine(conn: ConnectionManager, pool: PgPool) -> PplnsEngine {
     let config = PplnsEngineConfig {
         touch_flush_interval_secs: 3600,
         dust_sweep_enabled: false,
+        // Structural under §4 — the engine refuses to construct without a
+        // usable pool-output recipient, because a pool that starts without
+        // one pays every block to a single miner. Unused here (this test
+        // compares window state, not payouts).
+        fee_address: Some(
+            bp_common::AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").expect("valid"),
+        ),
         ..PplnsEngineConfig::default()
     };
     PplnsEngine::spawn(config, conn, pool, net_diff)

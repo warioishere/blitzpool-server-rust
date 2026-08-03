@@ -1874,7 +1874,13 @@ mod tests {
         );
         // …which is exactly why config validation has to refuse it.
         assert!(
-            validate_fee_payout_budget(1.5, 5_000, MIN_COINBASE_WEIGHT_BUDGET - 1).is_err(),
+            validate_fee_payout_budget(
+                Some("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"),
+                1.5,
+                5_000,
+                MIN_COINBASE_WEIGHT_BUDGET - 1
+            )
+            .is_err(),
             "a budget that publishes nothing must not pass validation"
         );
     }
