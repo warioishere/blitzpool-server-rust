@@ -38,7 +38,6 @@ pub(crate) enum GroupServiceSpawnError {
 
 /// Shared handle aggregate — clone the inner `Arc` to hand the same
 /// service to multiple consumers.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct SharedGroupService {
     pub(crate) service: Arc<GroupService<ProductionGroupServiceHooks>>,

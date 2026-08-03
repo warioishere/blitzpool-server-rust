@@ -49,12 +49,6 @@ pub const SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS: u16 = 0x0003;
 pub enum ExtensionsParseError {
     #[error("buffer truncated: needed {needed} more bytes at offset {offset}")]
     Truncated { offset: usize, needed: usize },
-    #[error("declared length {declared} exceeds remaining {remaining} at offset {offset}")]
-    LengthOverflow {
-        offset: usize,
-        declared: usize,
-        remaining: usize,
-    },
     #[error("invalid UTF-8 in string field at offset {offset}")]
     InvalidUtf8 { offset: usize },
 }

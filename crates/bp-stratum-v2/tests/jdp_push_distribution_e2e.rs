@@ -32,7 +32,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bitcoin::Network;
 use bp_common::AddressId;
 use bp_stratum_v2::bridge::{JdpDeclaredJobRegistry, PayoutDistributionEntry};
 use bp_stratum_v2::extensions::{
@@ -49,7 +48,6 @@ use bp_stratum_v2::jdp_server::{
 };
 use bp_stratum_v2::jdp_server_codec::EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION;
 use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
-use bp_stratum_v2::server::ServerConfig;
 use bp_stratum_v2::tokens::Token;
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::connect_with_noise;
@@ -200,7 +198,6 @@ async fn jdp_push_distribution_end_to_end() {
     hooks.block_submission_sink = sink.clone();
 
     let server = StratumV2JdpServer::spawn(
-        ServerConfig::defaults_for(Network::Regtest),
         noise_config,
         hooks,
         bridge.clone(),

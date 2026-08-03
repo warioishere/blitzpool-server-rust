@@ -328,7 +328,10 @@ async fn read_round_stats_returns_per_address_and_rejected() {
         .unwrap();
     store.record_reject(group, "bc1qa", 5.0).await.unwrap();
 
-    let stats = store.read_round_stats(group).await.unwrap();
+    let stats = store
+        .read_round_stats_for(group, PayoutMode::Prop, 0, 0)
+        .await
+        .unwrap();
     assert!((stats.total_shares - 100.0).abs() < 1e-9);
     assert!((stats.total_rejected - 5.0).abs() < 1e-9);
     assert_eq!(stats.per_address.len(), 2);

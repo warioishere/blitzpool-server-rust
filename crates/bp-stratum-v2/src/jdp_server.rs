@@ -75,7 +75,6 @@ use crate::jdp_server_codec::{
     decode_jdp_inbound, encode_jdp_outbound, encode_jdp_outbound_ext_0x0003, InboundJdpFrame,
 };
 use crate::noise::{accept_pool_noise, NoiseConfig, NoiseTcpWriteHalf};
-use crate::server::ServerConfig;
 use crate::server_codec::CodecError;
 use crate::tokens::Token;
 
@@ -341,11 +340,6 @@ pub struct StratumV2JdpServer {
 }
 
 struct Inner {
-    // Carried for future production wiring (pool_identifier, network,
-    // shutdown_drain_timeout). Currently only the cancel-token is
-    // consumed; suppress the dead-code warning explicitly.
-    #[allow(dead_code)]
-    server_config: Arc<ServerConfig>,
     noise_config: NoiseConfig,
     hooks: JdpServerHooks,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
@@ -383,7 +377,6 @@ impl DistributionInvalidationHandle {
 
 impl StratumV2JdpServer {
     pub fn spawn(
-        server_config: ServerConfig,
         noise_config: NoiseConfig,
         hooks: JdpServerHooks,
         bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
@@ -392,7 +385,6 @@ impl StratumV2JdpServer {
         let (dist_watch, _) = tokio::sync::watch::channel(0u64);
         let server = Self {
             inner: Arc::new(Inner {
-                server_config: Arc::new(server_config),
                 noise_config,
                 hooks,
                 bridge,
@@ -1286,7 +1278,6 @@ pub const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 mod tests {
     use super::*;
     use crate::jdp::client::AllocateMiningJobTokenInput;
-    use bitcoin::Network;
 
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
@@ -1356,7 +1347,6 @@ mod tests {
     async fn server_handle_is_cloneable_and_shutdown_idempotent() {
         let bridge = fresh_bridge();
         let server = StratumV2JdpServer::spawn(
-            ServerConfig::defaults_for(Network::Regtest),
             noise_cfg(),
             JdpServerHooks::no_op(),
             bridge,
@@ -1371,7 +1361,6 @@ mod tests {
     async fn allocate_session_ids_monotonic_per_handle() {
         let bridge = fresh_bridge();
         let server = StratumV2JdpServer::spawn(
-            ServerConfig::defaults_for(Network::Regtest),
             noise_cfg(),
             JdpServerHooks::no_op(),
             bridge,

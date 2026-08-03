@@ -3,8 +3,8 @@
 //! Confirmation watcher for confirmation-gated block-founds (PPLNS + Group-Solo).
 //!
 //! A found block parks its frozen payout in the Redis pending-store
-//! ([`crate::pending_blocks`] for PPLNS, [`crate::pending_group_solo_blocks`]
-//! for Group-Solo) instead of writing the ledger immediately. This task waits
+//! ([`crate::pending_blocks`] — one shape for both modes) instead of writing
+//! the ledger immediately. This task waits
 //! for each parked block to reach `confirmation_depth` confirmations, then
 //! applies it; a block that orphaned (or a non-chain-extending candidate, which
 //! never confirms) is discarded so the internal ledger never drifts. The
@@ -12,8 +12,8 @@
 //! gated. Blockparty is exempt: its payouts are fixed per-member percentages
 //! recomputed from the DB, so a replay/orphan can't drift anything.
 //!
-//! The per-block confirmation decision ([`classify_block`]) + the generic
-//! load/classify/discard pass ([`collect_confirmed`]) are shared across both
+//! The per-block confirmation decision ([`classify_block`]) + the
+//! load/classify/discard pass ([`collect_confirmed`]) run once for both
 //! modes; only the thin engine-specific apply loop differs.
 //!
 //! Trigger: the TDP `SetNewPrevHash` broadcast (a new chain tip → time to
@@ -29,15 +29,16 @@ use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_template_distribution::{TdpHandle, TemplateUpdate};
 use redis::aio::ConnectionManager;
-use serde::de::DeserializeOwned;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::pending_blocks::{remove_pending_block, PENDING_KEY, UNBOOKABLE_KEY};
-use crate::pending_store::{load_pending, put_pending, remove_pending, PendingBlockRef};
+use crate::pending_blocks::{
+    load_pending_blocks, put_pending_at, remove_pending_at, remove_pending_block, PendingBlock,
+    PENDING_KEY, UNBOOKABLE_KEY,
+};
 
 /// Fallback re-check cadence when the TDP stream is quiet. New blocks normally
 /// drive the watcher via `SetNewPrevHash`; this just bounds the worst-case
@@ -172,15 +173,15 @@ async fn classify_block(bitcoin_rpc: &BitcoinRpc, block_hash: &str, depth: i64) 
 /// Load every parked entry under `key`, prune unparsable ones, discard
 /// orphaned/gone ones, and return the CONFIRMED entries ready to apply (left in
 /// the store — the caller removes each after a successful apply, so a failed
-/// apply is retried next tick). The generic, engine-agnostic half of the pass.
-async fn collect_confirmed<T: DeserializeOwned + PendingBlockRef>(
+/// apply is retried next tick). The engine-agnostic half of the pass.
+async fn collect_confirmed(
     bitcoin_rpc: &BitcoinRpc,
     conn: &mut ConnectionManager,
     key: &str,
     depth: i64,
     label: &str,
-) -> Vec<T> {
-    let (pending, unparsable) = match load_pending::<T>(conn, key).await {
+) -> Vec<PendingBlock> {
+    let (pending, unparsable) = match load_pending_blocks(conn, key).await {
         Ok(v) => v,
         Err(err) => {
             warn!(%err, label, "block-confirmation: load pending failed; retry next tick");
@@ -189,27 +190,27 @@ async fn collect_confirmed<T: DeserializeOwned + PendingBlockRef>(
     };
     for hash in unparsable {
         warn!(label, block_hash = %hash, "block-confirmation: pruning unparsable pending entry");
-        let _ = remove_pending(conn, key, &hash).await;
+        let _ = remove_pending_at(conn, key, &hash).await;
     }
 
     let mut confirmed = Vec::new();
     for pb in pending {
-        match classify_block(bitcoin_rpc, pb.block_hash(), depth).await {
+        match classify_block(bitcoin_rpc, &pb.block_hash, depth).await {
             BlockStatus::Confirmed => confirmed.push(pb),
             BlockStatus::Orphaned => {
                 warn!(
                     label,
-                    block_hash = %pb.block_hash(),
-                    height = pb.block_height(),
+                    block_hash = %pb.block_hash,
+                    height = pb.block_height,
                     "block-confirmation: block orphaned / not on active chain — discarding frozen \
                      distribution (no on-chain payment occurred)"
                 );
-                let _ = remove_pending(conn, key, pb.block_hash()).await;
+                let _ = remove_pending_at(conn, key, &pb.block_hash).await;
             }
             BlockStatus::Maturing => {}
             BlockStatus::Unknown => warn!(
                 label,
-                block_hash = %pb.block_hash(),
+                block_hash = %pb.block_hash,
                 "block-confirmation: getblockheader failed; will retry next tick"
             ),
         }
@@ -236,14 +237,7 @@ async fn reconcile(
 ) {
     let depth = i64::from(confirmation_depth);
     let mut conn = redis.clone();
-    let confirmed = collect_confirmed::<crate::pending_blocks::PendingBlock>(
-        bitcoin_rpc,
-        &mut conn,
-        PENDING_KEY,
-        depth,
-        "pool",
-    )
-    .await;
+    let confirmed = collect_confirmed(bitcoin_rpc, &mut conn, PENDING_KEY, depth, "pool").await;
 
     for pb in confirmed {
         // Settlement is `claim − paid` against the block's OWN coinbase,
@@ -319,9 +313,7 @@ async fn reconcile(
             Err(err) if err.is_terminal() => {
                 // Park, don't destroy: the frozen blob is the only record
                 // of what this block paid every miner.
-                let parked = put_pending(&mut conn, UNBOOKABLE_KEY, &pb.block_hash, &pb)
-                    .await
-                    .is_ok();
+                let parked = put_pending_at(&mut conn, UNBOOKABLE_KEY, &pb).await.is_ok();
                 error!(
                     %err,
                     block_hash = %pb.block_hash,

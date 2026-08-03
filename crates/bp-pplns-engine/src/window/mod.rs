@@ -461,36 +461,6 @@ impl WindowStore {
         self.conn.clone()
     }
 
-    /// Delete the snapshot key (after `on_block_found` consumed it).
-    pub async fn delete_snapshot(&self) -> Result<(), RedisError> {
-        let mut conn = self.conn.clone();
-        snapshot::delete_snapshot(&mut conn, KEY_SNAPSHOT).await
-    }
-
-    /// Delete one fingerprint-keyed snapshot.
-    pub async fn delete_snapshot_for(
-        &self,
-        payouts_fingerprint: &[u8; 32],
-    ) -> Result<(), RedisError> {
-        let mut conn = self.conn.clone();
-        let key = snapshot_key_for(payouts_fingerprint);
-        snapshot::delete_snapshot(&mut conn, &key).await
-    }
-
-    /// Store a schema-2 weight snapshot under the weights fingerprint.
-    /// Same keyspace as the schema-1 snapshots (the schema field keeps
-    /// the parsers apart), so backup scope and TTL policy carry over.
-    pub async fn write_weight_snapshot_for(
-        &self,
-        weights_fingerprint: &[u8; 32],
-        snapshot: &snapshot::StoredWeightSnapshot,
-        ttl_seconds: u32,
-    ) -> Result<(), RedisError> {
-        let mut conn = self.conn.clone();
-        let key = snapshot_key_for(weights_fingerprint);
-        snapshot::write_weight_snapshot(&mut conn, &key, snapshot, ttl_seconds).await
-    }
-
     /// Read the schema-2 weight snapshot for one weights fingerprint.
     /// `None` when never written, expired, or a different schema.
     pub async fn read_weight_snapshot_for(

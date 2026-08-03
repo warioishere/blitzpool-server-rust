@@ -61,7 +61,6 @@ mod live_mode_marker;
 mod live_sessions;
 mod payout_resolver;
 mod pending_blocks;
-mod pending_store;
 mod redis_backup;
 mod rejected_consumer;
 mod runtime_diag;

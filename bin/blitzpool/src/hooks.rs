@@ -81,7 +81,6 @@ use crate::engines::EngineHandles;
 /// of whether `[smtp]` was configured). The `email_verification` +
 /// `push` fields keep `Arc<dyn _>` because `AppState` already
 /// stores those as trait objects.
-#[allow(dead_code)]
 pub(crate) struct ProductionHooks {
     pub(crate) email_verification: Arc<dyn EmailVerificationHooks>,
     pub(crate) invitation_email: Arc<SmtpInvitationEmailHooks>,
@@ -353,9 +352,9 @@ impl EmailHooks for SmtpInvitationEmailHooks {
 /// ping. The adapters live in the struct so Phase 7.7 can clone them
 /// into the `NotificationDispatcher` block-found / best-diff /
 /// device-status fan-out.
-#[allow(dead_code)]
 pub(crate) struct MultiChannelPushHooks {
     pub(crate) fcm: Option<Arc<FcmAdapter>>,
+    #[allow(dead_code)] // notifications fan-out — outside this scan's scope
     pub(crate) web_push: Option<Arc<WebPushAdapter>>,
 }
 
@@ -545,7 +544,6 @@ fn epoch_ms_to_utc(ms: i64) -> DateTime<Utc> {
 // import" because Phase 7.4 will use this for the verification
 // resend path. Kept here so the compile-time wiring confirms the
 // helper exists.
-#[allow(dead_code)]
 async fn _ensure_find_address_email_resolves(db: &Db, addr: &AddressId) {
     let _ = find_address_email(db.pool(), addr).await;
 }

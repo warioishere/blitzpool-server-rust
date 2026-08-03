@@ -58,7 +58,6 @@ use crate::stratum_v2::{self, StratumV2SpawnError};
 /// Long-lived stratum (SV1 + SV2) handle aggregate. Drop or call
 /// [`Self::shutdown`] to cancel every accept-loop + every
 /// per-connection task across both protocols.
-#[allow(dead_code)]
 pub(crate) struct StratumHandles {
     pub(crate) ports: Vec<u16>,
     listener_tasks: Vec<JoinHandle<()>>,
@@ -380,7 +379,6 @@ async fn peek_first_byte(socket: &TcpStream) -> std::io::Result<Option<u8>> {
 }
 
 // Silence the `Arc` import warning when no other module needs it.
-#[allow(dead_code)]
 fn _silence_arc<T>(_: Arc<T>) {}
 
 #[cfg(test)]

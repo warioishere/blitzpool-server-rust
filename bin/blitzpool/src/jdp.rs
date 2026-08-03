@@ -50,7 +50,6 @@ use crate::stratum_v2;
 /// `[sv2].jdp_payout_distribution_interval_secs` is unset.
 const DEFAULT_DISTRIBUTION_INTERVAL_SECS: u64 = 60;
 
-#[allow(dead_code)]
 pub(crate) struct JdpHandles {
     pub(crate) port: Option<u16>,
     listener_task: Option<JoinHandle<()>>,
@@ -133,7 +132,6 @@ pub(crate) async fn spawn(
     }
     let port = cfg.sv2.jdp_port.ok_or(JdpSpawnError::PortMissing)?;
     let noise = stratum_v2::build_noise_config(cfg)?;
-    let server_cfg = stratum_v2::build_server_config(cfg);
     let network = match cfg.network {
         bp_config::Network::Mainnet => BitcoinNetwork::Bitcoin,
         // testnet4 shares the `tb` HRP with testnet3 — rust-bitcoin
@@ -174,7 +172,7 @@ pub(crate) async fn spawn(
             .jdp_payout_distribution_interval_secs
             .unwrap_or(DEFAULT_DISTRIBUTION_INTERVAL_SECS),
     );
-    let server = StratumV2JdpServer::spawn(server_cfg, noise, hooks, bridge, distribution_interval);
+    let server = StratumV2JdpServer::spawn(noise, hooks, bridge, distribution_interval);
     let _ = settle_slot.set(server.distribution_handle());
 
     let bind_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();

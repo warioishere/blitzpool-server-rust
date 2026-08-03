@@ -86,7 +86,6 @@ use crate::boot::FoundationHandles;
 
 /// Long-lived engine + sink aggregate. Phase 7.4 + 7.5 thread this
 /// into the Stratum servers + cron schedules.
-#[allow(dead_code)]
 pub(crate) struct EngineHandles {
     pub(crate) pplns: Option<PplnsEngine>,
     pub(crate) group_solo: GroupSoloEngine,
@@ -454,7 +453,6 @@ impl BlitzpoolModeGate {
     /// refcount; last-write-wins on the mode itself (a re-authorize
     /// from the same address picks up any membership change since
     /// the previous connection).
-    #[allow(dead_code)]
     pub(crate) fn set_mode(&self, address: &str, result: MiningModeResult) {
         let mut guard = self.inner.lock().expect("mode-gate mutex poisoned");
         guard
@@ -475,7 +473,6 @@ impl BlitzpoolModeGate {
     /// `set_mode`'d is a no-op (defensive — a deregister event for an
     /// unauthorized session shouldn't reach here, but if it does, we
     /// just ignore it).
-    #[allow(dead_code)]
     pub(crate) fn clear_mode(&self, address: &str) {
         let mut guard = self.inner.lock().expect("mode-gate mutex poisoned");
         if let Some(entry) = guard.get_mut(address) {

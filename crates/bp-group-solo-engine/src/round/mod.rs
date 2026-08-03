@@ -4,7 +4,6 @@
 //!
 //! Key layout (`{groupId}` is the UUID of the `pplns_group` row):
 //!
-//! - `groupsolo:{groupId}:shares` — zset, score=counter, member=`addr:diff:ms`
 //! - `groupsolo:{groupId}:counter` — monotonic INCR counter
 //! - `groupsolo:{groupId}:total` — float string, Σ diff in round
 //! - `groupsolo:{groupId}:by-address` — hash `addr → diff` aggregate
@@ -22,7 +21,7 @@
 //! Two reset paths exist (PROP semantics; `Window` groups skip the per-block
 //! gate entirely):
 //!
-//! `reset_for_block_found` wipes shares, counter, total, by-address,
+//! `reset_for_block_found` wipes counter, total, by-address,
 //! rejected-shares, best-share, and all per-finder snapshots, but
 //! preserves `last-accepted-share-at` (PROP semantics: inactivity
 //! clock survives across blocks).
@@ -49,9 +48,6 @@ fn key(group_id: &str, suffix: &str) -> String {
     format!("groupsolo:{group_id}:{suffix}")
 }
 
-pub fn key_shares(group_id: &str) -> String {
-    key(group_id, "shares")
-}
 pub fn key_counter(group_id: &str) -> String {
     key(group_id, "counter")
 }
@@ -654,15 +650,6 @@ impl GroupRoundStore {
         Ok(v.as_deref().and_then(|s| s.parse().ok()))
     }
 
-    /// Composed view used by `/api/pplns/groups/:groupId/round-stats`.
-    /// PROP-only convenience — equivalent to [`Self::read_round_stats_for`]
-    /// with [`PayoutMode::Prop`]. Retained for callers/tests that don't carry
-    /// a mode (a PROP group's window args are irrelevant).
-    pub async fn read_round_stats(&self, group_id: &str) -> Result<RoundStats, RoundError> {
-        self.read_round_stats_for(group_id, PayoutMode::Prop, 0, 0)
-            .await
-    }
-
     /// Mode-aware composed view for `/api/pplns/groups/:groupId/round-stats`.
     /// In `Window` mode the per-address contribution is the trimmed sliding
     /// window; the rejected counters stay a plain running tally (they don't
@@ -752,7 +739,6 @@ mod tests {
 
     #[test]
     fn key_helpers_format_correctly() {
-        assert_eq!(key_shares("g1"), "groupsolo:g1:shares");
         assert_eq!(key_counter("g1"), "groupsolo:g1:counter");
         assert_eq!(key_total("g1"), "groupsolo:g1:total");
         assert_eq!(key_by_address("g1"), "groupsolo:g1:by-address");
@@ -781,8 +767,8 @@ mod tests {
     fn key_helpers_support_uuid_group_id() {
         let g = "550e8400-e29b-41d4-a716-446655440000";
         assert_eq!(
-            key_shares(g),
-            "groupsolo:550e8400-e29b-41d4-a716-446655440000:shares"
+            key_counter(g),
+            "groupsolo:550e8400-e29b-41d4-a716-446655440000:counter"
         );
     }
 

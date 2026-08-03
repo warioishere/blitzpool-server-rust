@@ -27,9 +27,7 @@
 //! **without a TTL** so the `volatile-lru` eviction policy (which only
 //! evicts keys that have an expiry) can never drop them.
 
-use redis::{aio::ConnectionManager, RedisError};
-
-use crate::pending_store::{put_pending, remove_pending, PendingBlockRef};
+use redis::{aio::ConnectionManager, AsyncCommands, RedisError};
 
 /// Redis HASH holding every not-yet-confirmed block-found.
 pub(crate) const PENDING_KEY: &str = "pool:pending_blocks";
@@ -73,21 +71,37 @@ pub(crate) struct PendingBlock {
     pub group: Option<PendingGroup>,
 }
 
-impl PendingBlockRef for PendingBlock {
-    fn block_hash(&self) -> &str {
-        &self.block_hash
-    }
-    fn block_height(&self) -> i32 {
-        self.block_height
-    }
+/// Persist a pending block under `key`, field = block hash (idempotent —
+/// the same hash overwrites). No TTL, so `volatile-lru` eviction (which
+/// only touches keys with an expiry) can never drop a pending apply
+/// inside the confirmation window.
+pub(crate) async fn put_pending_at(
+    conn: &mut ConnectionManager,
+    key: &str,
+    pending: &PendingBlock,
+) -> Result<(), RedisError> {
+    // Serialization can't fail for these plain types; treat a failure as a
+    // programming error rather than poisoning the call signature.
+    let json = serde_json::to_string(pending).expect("serialize pending block");
+    conn.hset::<_, _, _, ()>(key, &pending.block_hash, json)
+        .await
 }
 
-/// Persist a pending block (idempotent — the same hash overwrites).
+/// Persist a pending block in the not-yet-confirmed store.
 pub(crate) async fn put_pending_block(
     conn: &mut ConnectionManager,
     pending: &PendingBlock,
 ) -> Result<(), RedisError> {
-    put_pending(conn, PENDING_KEY, &pending.block_hash, pending).await
+    put_pending_at(conn, PENDING_KEY, pending).await
+}
+
+/// Drop a pending entry by hash under `key` (applied or orphaned). Idempotent.
+pub(crate) async fn remove_pending_at(
+    conn: &mut ConnectionManager,
+    key: &str,
+    block_hash: &str,
+) -> Result<(), RedisError> {
+    conn.hdel::<_, _, ()>(key, block_hash).await
 }
 
 /// Drop a pending block by hash (applied or orphaned). Idempotent.
@@ -95,7 +109,26 @@ pub(crate) async fn remove_pending_block(
     conn: &mut ConnectionManager,
     block_hash: &str,
 ) -> Result<(), RedisError> {
-    remove_pending(conn, PENDING_KEY, block_hash).await
+    remove_pending_at(conn, PENDING_KEY, block_hash).await
+}
+
+/// Load every parked block under `key`. A field whose JSON fails to parse
+/// (corrupt / schema-drifted) is skipped, its hash returned in the second
+/// tuple element so the caller can prune it.
+pub(crate) async fn load_pending_blocks(
+    conn: &mut ConnectionManager,
+    key: &str,
+) -> Result<(Vec<PendingBlock>, Vec<String>), RedisError> {
+    let map: std::collections::HashMap<String, String> = conn.hgetall(key).await?;
+    let mut ok = Vec::with_capacity(map.len());
+    let mut unparsable = Vec::new();
+    for (hash, json) in map {
+        match serde_json::from_str::<PendingBlock>(&json) {
+            Ok(v) => ok.push(v),
+            Err(_) => unparsable.push(hash),
+        }
+    }
+    Ok((ok, unparsable))
 }
 
 #[cfg(test)]
@@ -125,8 +158,6 @@ mod tests {
         assert_eq!(back.payouts_fingerprint, Some([7u8; 32]));
         let group = back.group.as_ref().expect("group context survives");
         assert_eq!(group.finder, "bcrt1qfinder");
-        assert_eq!(back.block_hash(), "00000000000000000001abcd");
-        assert_eq!(back.block_height(), 840_000);
     }
 
     /// A PPLNS blob carries no group context, and every optional field is

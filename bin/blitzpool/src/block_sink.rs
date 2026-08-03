@@ -134,7 +134,6 @@ pub(crate) struct BlockFoundEvent {
 /// step logs at INFO and continues. The TDP submit is the
 /// authoritative block-propagation path; engine + dispatcher are
 /// observability + accounting.
-#[allow(dead_code)]
 pub(crate) struct TdpBlockSubmissionSink {
     /// Default stream handle (PPLNS-autoscaled). Submission target for every
     /// PPLNS job, and the fallback when an alt stream isn't wired.
@@ -196,7 +195,6 @@ pub(crate) struct BlockFoundApplier {
     settle: Option<Arc<OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>>,
 }
 
-#[allow(dead_code)]
 impl TdpBlockSubmissionSink {
     pub(crate) fn new(tdp: TdpHandle) -> Self {
         Self {
@@ -214,6 +212,10 @@ impl TdpBlockSubmissionSink {
     /// Wire the ext 0x0003 §10 settlement hook onto this sink's applier,
     /// so a block booked through the Stratum path invalidates the
     /// published payout distributions exactly like a JDP-declared one.
+    // Never called: the §10 settle slot is wired on the gated
+    // (confirmation-watcher) path only, not on the sinks' immediate
+    // apply. Kept pending the decision to wire or drop it.
+    #[allow(dead_code)]
     pub(crate) fn with_settle_handle(
         mut self,
         slot: Arc<OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>,
@@ -349,7 +351,6 @@ impl TdpBlockSubmissionSink {
     /// Convenience: wrap in `Arc<dyn BlockSubmissionSink>` so the
     /// caller can drop it directly into `bp_stratum_v1::ServerHooks
     /// { block_sink, … }`.
-    #[allow(dead_code)]
     pub(crate) fn into_sv1_arc(self) -> Arc<dyn Sv1BlockSubmissionSink> {
         Arc::new(self)
     }
@@ -358,7 +359,6 @@ impl TdpBlockSubmissionSink {
     /// [`bp_stratum_v2::hooks::BlockSubmissionSink`] hook slot. The
     /// underlying sink is shape-identical; the SV2 trait just has a
     /// different `ShareAccept` shape.
-    #[allow(dead_code)]
     pub(crate) fn into_sv2_arc(self) -> Arc<dyn Sv2BlockSubmissionSink> {
         Arc::new(self)
     }

@@ -812,7 +812,6 @@ name = "bp-mining-job"
 version = "2.2.5"
 dependencies = [
  "bitcoin",
- "bp-common",
  "bp-regtest-harness",
  "bp-share",
  "bp-template-distribution",
@@ -1043,12 +1042,10 @@ dependencies = [
  "async-trait",
  "bitcoin",
  "bp-common",
- "bp-job-declaration",
  "bp-jobs-lifecycle",
  "bp-metrics",
  "bp-mining-job",
  "bp-mining-mode",
- "bp-pplns",
  "bp-regtest-harness",
  "bp-share",
  "bp-share-hook",
