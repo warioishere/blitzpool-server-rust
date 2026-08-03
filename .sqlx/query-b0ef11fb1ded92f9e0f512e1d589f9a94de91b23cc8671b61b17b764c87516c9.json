@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM pplns_balance WHERE address = $1 AND \"balanceSats\" = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b0ef11fb1ded92f9e0f512e1d589f9a94de91b23cc8671b61b17b764c87516c9"
+}

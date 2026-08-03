@@ -17,9 +17,28 @@
 use bp_common::{AddressId, Sats};
 use bp_pplns_engine::ledger::{
     apply_distribution, coinbase_row, pending_row, touch_buffer::flush_once,
-    touch_buffer::TouchBuffer, AuditRow, BalanceWrite, PayoutRowType,
+    touch_buffer::TouchBuffer, ApplyDistributionResult, AuditRow, BalanceWrite, PayoutRowType,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool};
+
+/// `apply_distribution` takes the caller's transaction now, because the
+/// balance read it settles against has to be locked in the same one (see
+/// the function's docs). These tests hand it their own, which is exactly
+/// what the engine does.
+async fn apply_in_tx(
+    pool: &PgPool,
+    block_height: i32,
+    rows: &[AuditRow],
+    balances: &[BalanceWrite],
+    now_ms: i64,
+) -> ApplyDistributionResult {
+    let mut tx = pool.begin().await.expect("begin");
+    let out = apply_distribution(&mut tx, block_height, rows, balances, now_ms)
+        .await
+        .expect("apply_distribution");
+    tx.commit().await.expect("commit");
+    out
+}
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
@@ -100,9 +119,7 @@ async fn apply_distribution_writes_history_and_balance() {
         },
     ];
 
-    let result = apply_distribution(&pool, block_height, &rows, &balances, 1_700_000_000_000)
-        .await
-        .expect("apply_distribution ok");
+    let result = apply_in_tx(&pool, block_height, &rows, &balances, 1_700_000_000_000).await;
     assert_eq!(result.history_inserted, 2);
     assert_eq!(result.balances_affected, 2);
 
@@ -155,18 +172,14 @@ async fn apply_distribution_replay_idempotent() {
         total_paid_sats: Sats(500_000),
     }];
 
-    let first = apply_distribution(&pool, block_height, &rows, &balances, 1_700_000_000_000)
-        .await
-        .expect("first call ok");
+    let first = apply_in_tx(&pool, block_height, &rows, &balances, 1_700_000_000_000).await;
     assert_eq!(first.history_inserted, 1);
 
     // Replay: same block_height + same address triggers the
     // (blockHeight, address) UNIQUE-collision-DO-NOTHING path. The balance
     // upsert is now SKIPPED (gated on a non-zero history insert), so a replay
     // can never double-count the accumulated totalPaidSats.
-    let second = apply_distribution(&pool, block_height, &rows, &balances, 1_700_000_060_000)
-        .await
-        .expect("replay ok");
+    let second = apply_in_tx(&pool, block_height, &rows, &balances, 1_700_000_060_000).await;
     assert_eq!(
         second.history_inserted, 0,
         "replay must not duplicate history rows"
@@ -242,9 +255,7 @@ async fn apply_distribution_mixed_row_types() {
         },
     ];
 
-    let result = apply_distribution(&pool, block_height, &rows, &balances, 1_700_000_000_000)
-        .await
-        .expect("apply ok");
+    let result = apply_in_tx(&pool, block_height, &rows, &balances, 1_700_000_000_000).await;
     assert_eq!(result.history_inserted, 3);
 
     // Verify ledger symmetry holds in the persisted state.
@@ -303,7 +314,7 @@ async fn coinbase_row_constructor_roundtrips_via_apply_distribution() {
     };
     let row = coinbase_row(&entry);
 
-    let result = apply_distribution(
+    let result = apply_in_tx(
         &pool,
         block_height,
         &[row],
@@ -314,8 +325,7 @@ async fn coinbase_row_constructor_roundtrips_via_apply_distribution() {
         }],
         1_700_000_000_000,
     )
-    .await
-    .expect("apply ok");
+    .await;
     assert_eq!(result.history_inserted, 1);
 
     let row: (String, i64, f32, String) = sqlx::query_as(
@@ -395,4 +405,85 @@ async fn touch_buffer_flush_once_empty_returns_zero() {
     let buf = TouchBuffer::new();
     let n = flush_once(&pool, &buf).await.expect("flush ok");
     assert_eq!(n, 0);
+}
+
+// ── The settlement must LOCK the balances it reads ──────────────────
+//
+// The block-found balance write is absolute (`current + delta`). If
+// `current` is read outside the transaction that writes it, anything
+// committing in between is silently undone — and there IS another writer,
+// the daily dust sweep, whose targets (open balance, no recent shares) are
+// exactly the balance-only entries a distribution carries.
+//
+// The read therefore happens inside the apply transaction under
+// `FOR UPDATE`. This proves the lock is really taken: a second connection
+// asking for the same row with a short `lock_timeout` must be refused.
+
+#[tokio::test]
+async fn the_settlement_read_locks_the_rows_it_will_write() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let address = "test_ledger_locked_addr";
+    let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
+        .bind(address)
+        .execute(&pool)
+        .await;
+    sqlx::query(
+        r#"INSERT INTO pplns_balance (address, "balanceSats", "totalPaidSats", "updatedAt")
+           VALUES ($1, 5000, 0, 0)"#,
+    )
+    .bind(address)
+    .execute(&pool)
+    .await
+    .expect("seed");
+
+    // Control FIRST: with nothing holding the row, the competing update
+    // succeeds — so a failure below is the lock and not a broken query.
+    assert!(
+        competing_update(&pool, address).await,
+        "precondition: an unlocked row IS updatable within the timeout"
+    );
+
+    let mut tx = pool.begin().await.expect("begin");
+    let locked = bp_db::find_pplns_balances_for_addresses_locked(&mut *tx, &[address.to_string()])
+        .await
+        .expect("locked read");
+    assert_eq!(locked.len(), 1, "precondition: the row was read");
+
+    assert!(
+        !competing_update(&pool, address).await,
+        "a row the settlement is about to write must be LOCKED — otherwise the \
+         dust sweep commits into the gap and its work is undone by the absolute \
+         write that follows"
+    );
+
+    tx.rollback().await.expect("rollback");
+    // And released again once the transaction ends.
+    assert!(
+        competing_update(&pool, address).await,
+        "the lock must not outlive the transaction"
+    );
+
+    let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
+        .bind(address)
+        .execute(&pool)
+        .await;
+}
+
+/// Try to take the row from a second connection with a short
+/// `lock_timeout`. `true` = got it, `false` = refused (55P03).
+async fn competing_update(pool: &PgPool, address: &str) -> bool {
+    let mut other = pool.begin().await.expect("begin competitor");
+    sqlx::query("SET LOCAL lock_timeout = '250ms'")
+        .execute(&mut *other)
+        .await
+        .expect("set lock_timeout");
+    let got = sqlx::query(r#"UPDATE pplns_balance SET "balanceSats" = 4000 WHERE address = $1"#)
+        .bind(address)
+        .execute(&mut *other)
+        .await
+        .is_ok();
+    let _ = other.rollback().await;
+    got
 }

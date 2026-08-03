@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pplns_balance SET \"balanceSats\" = $1\n           WHERE address = $2 AND \"balanceSats\" = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "be3d546bd2930bf1abc45f1b52bb2d354b7637eb5a5f924ae0e0bfc8156310ca"
+}

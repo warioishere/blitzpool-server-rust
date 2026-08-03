@@ -27,7 +27,6 @@ use bp_db::{
     PayoutHistoryInsert,
 };
 use bp_pplns::CoinbaseDistributionEntry;
-use sqlx::PgPool;
 
 pub use bp_db::TouchUpdate;
 // Shared with Group-Solo — one source of truth for the rowType wire
@@ -96,29 +95,40 @@ pub fn pending_row(address: AddressId, delta_sats: Sats) -> AuditRow {
 /// 2 999 → 5 998 sat, and a credit paid out twice is satoshis the other
 /// miners fund.
 ///
-/// Concurrent duplicate applies were never the danger — both derive
-/// their absolute write from the same `current`, so they converge. The
-/// danger is SEQUENTIAL replay, which is what the confirmation watcher
-/// produces when its post-apply `remove_pending_block` fails (its error
-/// is deliberately ignored) or the process dies in that window. A
-/// concurrent apply that read `current` late enough to see the first
-/// one's effect necessarily sees its history rows here too, because the
-/// balance read happens before this check.
+/// The danger is SEQUENTIAL replay, which is what the confirmation
+/// watcher produces when its post-apply `remove_pending_block` fails (its
+/// error is deliberately ignored) or the process dies in that window.
+/// Concurrent duplicates are handled by the row locks the caller takes
+/// before this runs — see below.
+///
+/// **Takes the caller's transaction rather than opening one.** The
+/// balance write is absolute (`current + delta`), so the `current` it was
+/// computed from has to be read UNDER `FOR UPDATE` in this same
+/// transaction — see
+/// [`bp_db::find_pplns_balances_for_addresses_locked`]. A caller that
+/// reads outside it hands the daily dust sweep a window in which its
+/// write is silently undone.
+///
+/// That ordering also hardens the gate below: locking the block's rows
+/// first means a second, concurrent apply of the same block blocks on
+/// them, and by the time it proceeds the first has committed its history
+/// rows — so the `SELECT` sees them. A plain read-committed `SELECT`
+/// alone would not.
 ///
 /// Caller (typically [`crate::hooks::PplnsBlockSubmissionSink`]) is
 /// responsible for:
 /// - reading the snapshot persisted at template-build time
-/// - mapping it to the audit-row list and absolute-balance list
-/// - calling this function inside the block-found re-entrancy lock
+/// - opening the transaction, locking the balance rows, and mapping the
+///   snapshot to the audit-row list and absolute-balance list
+/// - committing, and calling all of it inside the block-found
+///   re-entrancy lock
 pub async fn apply_distribution(
-    pool: &PgPool,
+    tx: &mut sqlx::PgConnection,
     block_height: i32,
     rows: &[AuditRow],
     balances: &[BalanceWrite],
     now_ms: i64,
 ) -> Result<ApplyDistributionResult, LedgerError> {
-    let mut tx = pool.begin().await?;
-
     if bp_db::pplns_block_already_booked(&mut *tx, block_height).await? {
         return Ok(ApplyDistributionResult {
             history_inserted: 0,
@@ -154,7 +164,6 @@ pub async fn apply_distribution(
     let history_inserted = bulk_insert_pplns_payout_history(&mut *tx, &history_rows).await?;
     let balances_affected = bulk_upsert_pplns_balances(&mut *tx, &balance_rows).await?;
 
-    tx.commit().await?;
     Ok(ApplyDistributionResult {
         history_inserted,
         balances_affected,

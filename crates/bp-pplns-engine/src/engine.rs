@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bp_common::{AddressId, InvalidAddressError, Sats};
-use bp_db::{find_pplns_balances_for_addresses, DbError, PplnsBalanceRow};
+use bp_db::{DbError, PplnsBalanceRow};
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use thiserror::Error;
@@ -460,25 +460,31 @@ impl PplnsEngine {
             );
         }
 
-        // 2. Settle. Every balance write is a DELTA onto the row as it
-        //    stands right now, so nothing has to be re-based — computing
-        //    here rather than at found-time is what removes that whole
-        //    problem. The window read only decides which addresses get a
-        //    0-sat late-arriver audit row; no satoshi depends on it.
+        // 2. Settle. The balance write is absolute (`current + delta`), so
+        //    `current` MUST be read under `FOR UPDATE` in the same
+        //    transaction that writes it — otherwise the daily dust sweep,
+        //    whose targets are exactly the balance-only entries a
+        //    distribution carries, can commit between the two and have its
+        //    work silently undone. The Redis window read stays OUTSIDE the
+        //    transaction: it only decides which addresses get a 0-sat
+        //    late-arriver audit row, and a Redis stall must not hold a PG
+        //    transaction open.
         let now_ms = chrono::Utc::now().timestamp_millis();
         let current_window = self.inner.window.read_window_by_address().await?;
-        let (audit_rows, balance_writes) = self
-            .build_writes_from_weight_snapshot(&snapshot, &current_window, actual)
-            .await?;
+        let addresses = Self::addresses_to_settle(&snapshot, actual);
 
-        let outcome = apply_distribution(
-            &self.inner.pool,
-            block_height,
-            &audit_rows,
-            &balance_writes,
-            now_ms,
-        )
-        .await?;
+        let mut tx = self.inner.pool.begin().await.map_err(LedgerError::from)?;
+        let existing: HashMap<String, PplnsBalanceRow> =
+            bp_db::find_pplns_balances_for_addresses_locked(&mut *tx, &addresses)
+                .await?
+                .into_iter()
+                .map(|r| (r.address.as_str().to_string(), r))
+                .collect();
+        let (audit_rows, balance_writes) =
+            Self::build_writes_from_weight_snapshot(&snapshot, &current_window, actual, &existing)?;
+        let outcome =
+            apply_distribution(&mut tx, block_height, &audit_rows, &balance_writes, now_ms).await?;
+        tx.commit().await.map_err(LedgerError::from)?;
 
         // The weight snapshot is NOT consumed: it legitimately serves
         // every block built from its distribution (settlement is a delta
@@ -494,6 +500,31 @@ impl PplnsEngine {
         Ok(outcome)
     }
 
+    /// Every address this block settles, in the order the balance rows
+    /// must be LOCKED.
+    ///
+    /// Sorted, and that is load-bearing: `FOR UPDATE` acquires row locks
+    /// in the order the plan emits them, so a stable ordering here (and
+    /// the matching `ORDER BY address` in the query) is what keeps two
+    /// transactions touching the same two rows from deadlocking. The set
+    /// used to come straight out of a `HashSet`, i.e. a different order
+    /// every run.
+    fn addresses_to_settle(
+        snapshot: &StoredWeightSnapshot,
+        actual: &ActualCoinbase,
+    ) -> Vec<String> {
+        let mut set: std::collections::HashSet<String> =
+            snapshot.entries.iter().map(|e| e.address.clone()).collect();
+        // Paid addresses outside the snapshot are settled too (they can
+        // only be 0-value script matches or operator surprises — logged
+        // in the builder — but the lifetime totals must not miss them).
+        set.extend(actual.paid_by_address.keys().cloned());
+        set.remove(&snapshot.fee_address);
+        let mut addresses: Vec<String> = set.into_iter().collect();
+        addresses.sort();
+        addresses
+    }
+
     /// The weight-model settlement: per snapshot entry compute the
     /// claim from the raw inputs (`claim_sats(score, S, fee, T)`), read
     /// what the coinbase actually paid the address, and book the
@@ -505,27 +536,18 @@ impl PplnsEngine {
     /// down; an overpaid miner (revenue drifted below the projection)
     /// books the overshoot as debt. The pool/fee output has no balance
     /// row — `T − Σ claims` is the pool's by construction.
-    async fn build_writes_from_weight_snapshot(
-        &self,
+    ///
+    /// Pure: `existing` comes in already read and LOCKED by the caller's
+    /// transaction. It used to do that read itself, from the pool and
+    /// outside the writing transaction, which is precisely the window the
+    /// dust sweep could commit into.
+    fn build_writes_from_weight_snapshot(
         snapshot: &StoredWeightSnapshot,
         current_window: &HashMap<String, f64>,
         actual: &ActualCoinbase,
+        existing: &HashMap<String, PplnsBalanceRow>,
     ) -> Result<(Vec<AuditRow>, Vec<BalanceWrite>), EngineError> {
         let t = actual.total_value_sats;
-        let mut address_set: std::collections::HashSet<String> =
-            snapshot.entries.iter().map(|e| e.address.clone()).collect();
-        // Paid addresses outside the snapshot get audit rows too (they
-        // can only be 0-value script matches or operator surprises —
-        // logged below — but the lifetime totals must not miss them).
-        address_set.extend(actual.paid_by_address.keys().cloned());
-        address_set.remove(&snapshot.fee_address);
-        let addresses: Vec<String> = address_set.into_iter().collect();
-        let existing: HashMap<String, PplnsBalanceRow> =
-            find_pplns_balances_for_addresses(&self.inner.pool, &addresses)
-                .await?
-                .into_iter()
-                .map(|r| (r.address.as_str().to_string(), r))
-                .collect();
 
         let mut audit_rows: Vec<AuditRow> = Vec::new();
         let mut balance_writes: Vec<BalanceWrite> = Vec::new();
