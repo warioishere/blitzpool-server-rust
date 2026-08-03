@@ -70,7 +70,7 @@ use bp_mining_job::{
     build_mining_job_from_tdp, merkle_root_from_coinbase, PayoutEntry, TdpCoinbaseTemplate,
     EXTRANONCE_SLOT_LEN,
 };
-use bp_pplns::{build_weight_distribution, WeightDistributionInput};
+use bp_pplns::{build_weight_distribution, WeightDistributionInput, WithheldValue};
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_share::Target;
 use bp_template_distribution::{TdpConfig, TdpHandle};
@@ -254,6 +254,7 @@ async fn run_trim_scenario(
         finder_bonus_ppm: 0,
         finder_address: None,
         reference_revenue_sats: REGTEST_BLOCK_REWARD_SATS,
+        withheld_value: WithheldValue::ToOtherMiners,
     })
     .expect("build_weight_distribution");
 

@@ -22,5 +22,5 @@ pub use weight::{
 };
 pub use weights::{
     build_weight_distribution, WeightBuildError, WeightDistribution, WeightDistributionInput,
-    WeightEntry, SCORE_PRECISION,
+    WeightEntry, WithheldValue, SCORE_PRECISION,
 };

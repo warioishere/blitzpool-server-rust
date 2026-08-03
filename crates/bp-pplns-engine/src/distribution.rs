@@ -341,6 +341,11 @@ async fn build_from_inputs(
         finder_bonus_ppm: 0, // finder-bonus is a Group-Solo feature
         finder_address: None,
         reference_revenue_sats,
+        // PPLNS keeps a withheld miner's share inside the miners' cut and
+        // remembers what it owes them in `pplns_balance`. That is the
+        // point of the mode — a small miner accumulates across blocks
+        // until they clear `min_payout` instead of forfeiting.
+        withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
     })?;
 
     // Feed the autoscaler with this build's blockspace pressure.
@@ -465,6 +470,7 @@ mod tests {
             finder_bonus_ppm: 0,
             finder_address: None,
             reference_revenue_sats: 312_500_000,
+            withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
         })
         .unwrap();
         let result = DistributionResult {

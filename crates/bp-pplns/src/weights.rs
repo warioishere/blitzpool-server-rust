@@ -93,12 +93,12 @@ pub struct WeightDistribution {
     /// entries (address asc). NOT the fingerprint order, which is by
     /// address (this one moves with the reference revenue).
     pub entries: Vec<WeightEntry>,
-    /// `weight_P` (§3.1): the pool output's weight — the fee over the
-    /// PUBLISHED weights, and nothing else. Not a repayment (that moves
-    /// between miners, since it is the other miners the debt is owed
-    /// to), and not a withheld entry's weight (that moves to the
-    /// published miners, who then owe it). Always ≥ 1 (the §4 residual
-    /// needs a live pool output).
+    /// `weight_P` (§3.1): the pool output's weight. Always carries the
+    /// fee, never a repayment (that moves between miners, since it is
+    /// the other miners the debt is owed to). Whether it also carries
+    /// what this build WITHHELD depends on
+    /// [`WeightDistributionInput::withheld_value`]. Always ≥ 1 (the §4
+    /// residual needs a live pool output).
     pub weight_p: u64,
     /// Pool fee in parts-per-million of revenue (1 % = 10 000 ppm).
     pub fee_ppm: u32,
@@ -160,6 +160,34 @@ impl WeightDistribution {
     }
 }
 
+/// Where the value of an entry that does NOT get a coinbase output goes.
+///
+/// An entry drops out of the coinbase two ways: its §4 amount falls below
+/// the pool's `min_payout`, or the blockspace cut folds it away. Either
+/// way its share of the block has to land somewhere, and that single
+/// choice is the difference between a payout model that needs a ledger
+/// and one that does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WithheldValue {
+    /// Spread over the miners who ARE published, who then owe the
+    /// withheld miner the difference. The value never leaves the miners'
+    /// cut, and the credit is repaid out of a later block — which is
+    /// exactly the promise `pplns_balance` exists to remember. PPLNS.
+    ToOtherMiners,
+    /// Left in the §4 residual, i.e. paid to the pool output. The
+    /// withheld miner is owed nothing afterwards and nobody was
+    /// overpaid, so there is no difference for a ledger to carry.
+    /// Every published miner is paid exactly their score share, unchanged
+    /// by who dropped out. Group-Solo.
+    ///
+    /// The pool earns more than its fee on such a block, deliberately.
+    /// Group-Solo rounds are short and the members are known to each
+    /// other; carrying a balance between rounds buys a case the operator
+    /// does not want at the price of the machinery that makes the pool
+    /// hard to reason about.
+    ToPool,
+}
+
 /// Inputs to one weight-distribution build.
 pub struct WeightDistributionInput<'a> {
     /// Diff-1-weighted share sum per miner (window / round scores).
@@ -201,6 +229,10 @@ pub struct WeightDistributionInput<'a> {
     /// bonus boosts. Must be non-zero (a pool with no template has
     /// nothing to distribute against).
     pub reference_revenue_sats: u64,
+    /// Who receives what an unpublished entry would have been paid.
+    /// See [`WithheldValue`] — this is the one knob that decides whether
+    /// the mode needs a ledger.
+    pub withheld_value: WithheldValue,
 }
 
 /// Why a weight distribution could not be built.
@@ -453,24 +485,35 @@ pub fn build_weight_distribution(
     //
     // `min_payout` decides who is PUBLISHED; it is deliberately not the
     // §3.1 `dust_limit` it used to be. A dust limit makes the JDC (and
-    // our own §4 build) prune the output, and `pay_P = T − Σpay` sweeps
-    // the pruned value into the POOL output — the pool holds satoshis
-    // it then credits the miner, and that credit is repaid out of a
-    // later block's miner cut, i.e. by the other miners. Withheld here
-    // instead, the value never leaves the miners' cut: the §4 split
-    // hands it to the miners who are published, and settlement books
-    // their overpayment as debt against the withheld miner's credit.
+    // our own §4 build) prune the output *after* the split is fixed,
+    // which is a different decision with a different recipient — see
+    // [`WithheldValue`] for where the value goes in each mode.
     //
-    // Smallest first, and a pass that only shrinks the published total:
-    // dropping an entry raises what every remaining entry is paid, so
-    // the first entry that clears the threshold clears it for every
-    // larger one behind it.
-    let mut published_total: u128 = entries.iter().map(|c| c.wire_weight as u128).sum();
+    // Smallest first, in both modes: what an entry is paid is
+    // monotonic in its wire weight, so the first entry that clears the
+    // threshold clears it for every larger one behind it.
+    let full_total: u128 = entries.iter().map(|c| c.wire_weight as u128).sum();
+    let mut published_total = full_total;
     for c in entries.iter_mut().rev() {
         if c.wire_weight == 0 {
             continue;
         }
-        if payout_at(c.wire_weight, published_total, fee_ppm, t_ref) >= min_payout {
+        // The denominator this entry's payout is measured against.
+        //
+        // `ToOtherMiners` shrinks it as entries drop: `W` follows the
+        // published set, so withholding one entry raises what every
+        // remaining one is paid.
+        //
+        // `ToPool` holds it at the full total: withheld weight stays in
+        // `W` (it is added to `weight_P` below), so what a published
+        // entry is paid does not move when another drops out. Measuring
+        // against the shrinking total here would withhold a miner whose
+        // real payout clears the threshold.
+        let basis = match input.withheld_value {
+            WithheldValue::ToOtherMiners => published_total,
+            WithheldValue::ToPool => full_total,
+        };
+        if payout_at(c.wire_weight, basis, fee_ppm, t_ref) >= min_payout {
             break;
         }
         published_total -= c.wire_weight as u128;
@@ -508,23 +551,38 @@ pub fn build_weight_distribution(
 
     // ── Pool weight ─────────────────────────────────────────────────
     //
-    // The FEE over the published weights, and nothing else. Because
-    // `W = P + weight_P` resolves to `P/(1 − f)`, the pool output is
-    // exactly `f·T` — however large the credits being repaid are, and
-    // however much this build withheld. Both of those are movements
-    // WITHIN the miners' cut, as they were before the weight model,
-    // never a discount or a premium on the pool's fee.
+    // In both modes this carries the FEE: `W = P + weight_P` resolves
+    // to `P/(1 − f)`, so the §4 residual pays the pool exactly `f·T` —
+    // however large the credits being repaid are. A repayment is a
+    // movement WITHIN the miners' cut, never a discount or a premium on
+    // the pool's fee.
     //
-    // Withheld weight must NOT be added here. §4 pays the pool output
-    // whatever the miner outputs leave, so weight parked in `weight_P`
-    // is cash the pool keeps against a claim it still owes — and the
-    // claim comes back out of the miners' cut on a later block, so the
-    // other miners fund it while the pool keeps the money. Leaving the
-    // weight out instead spreads the withheld entry's share over the
-    // published miners now, and settlement books that overpayment as
-    // the matching debt.
+    // Whether the WITHHELD weight is added on top is the whole
+    // difference between the two modes.
+    //
+    // `ToOtherMiners` leaves it out. §4 pays the pool output whatever
+    // the miner outputs leave, so weight parked in `weight_P` would be
+    // cash the pool keeps against a claim it still owes — and that claim
+    // comes back out of the miners' cut on a later block, so the other
+    // miners would fund it while the pool kept the money. Left out
+    // instead, the withheld entry's share spreads over the published
+    // miners now, and settlement books that overpayment as the matching
+    // debt.
+    //
+    // `ToPool` adds it, plus takes the fee over the FULL total rather
+    // than the published one. Together those give `W = P_all/(1−f)`, so
+    // every published miner is paid `w_i·(1−f)·T/P_all` — exactly what
+    // they would have been paid had nobody dropped out — and the whole
+    // withheld share falls into the §4 residual. Nobody is over- or
+    // underpaid, so there is nothing for a ledger to remember.
     let published_total: u128 = entries.iter().map(|c| c.wire_weight as u128).sum();
-    let weight_p = pool_weight_for(published_total, fee_ppm);
+    let weight_p = match input.withheld_value {
+        WithheldValue::ToOtherMiners => pool_weight_for(published_total, fee_ppm),
+        WithheldValue::ToPool => {
+            let withheld_total = (full_total - published_total).min(u64::MAX as u128) as u64;
+            pool_weight_for(full_total, fee_ppm).saturating_add(withheld_total)
+        }
+    };
 
     // Order can change where the cut zeroed wire weights mid-list:
     // restore the published-then-unpublished invariant (stable sort
@@ -610,6 +668,7 @@ mod tests {
             finder_bonus_ppm: 0,
             finder_address: None,
             reference_revenue_sats: 312_500_000,
+            withheld_value: WithheldValue::ToOtherMiners,
         }
     }
 
@@ -1024,6 +1083,16 @@ mod tests {
         claim: i64,
         delta: i64,
         balance_after: i64,
+    }
+
+    /// What the §4 vector pays each MINER address at revenue `t` — the
+    /// pool output (always first) excluded.
+    fn paid_map(d: &WeightDistribution, t: u64) -> HashMap<String, u64> {
+        let mut out: HashMap<String, u64> = HashMap::new();
+        for (address, sats) in d.payout_entries_at(t).expect("§4 vector").iter().skip(1) {
+            *out.entry(address.as_str().to_string()).or_insert(0) += *sats;
+        }
+        out
     }
 
     /// Settle a distribution against a coinbase that pays its §4 vector
@@ -1444,6 +1513,155 @@ mod tests {
             (pool_1 + pool_2 - 2 * fee_only).abs() <= 6,
             "pool took {pool_1} + {pool_2} where its fee is {fee_only} per block"
         );
+    }
+
+    // ── The same four tests, for a pool that keeps the overflow ──────
+    //
+    // Group-Solo makes the opposite choice: a member the coinbase cannot
+    // pay forfeits this block, and their share falls into the §4 residual
+    // — i.e. to the pool. Nobody is overpaid and nobody is owed, so there
+    // is nothing left for a ledger to remember between blocks, which is
+    // the entire reason Group-Solo can run without one.
+    //
+    // The property that has to hold for that claim to be true: the
+    // published members must be paid EXACTLY what they would have been
+    // paid had nobody dropped out. If withholding moved their payouts at
+    // all, the difference would be a debt again.
+
+    fn pool_keeps_overflow<'a>(
+        shares: &'a HashMap<AddressId, f64>,
+        balances: &'a HashMap<AddressId, Sats>,
+        fee_address: &'a AddressId,
+    ) -> WeightDistributionInput<'a> {
+        WeightDistributionInput {
+            withheld_value: WithheldValue::ToPool,
+            ..base_input(shares, balances, fee_address)
+        }
+    }
+
+    /// The load-bearing one. A1 and A2 are paid the same satoshi whether
+    /// A3 is withheld or not — so the coinbase owes them nothing and they
+    /// owe the pool nothing.
+    #[test]
+    fn withholding_does_not_move_the_other_members_payouts() {
+        const T: u64 = 312_500_000;
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+
+        // Same shares; the only difference is whether A3 clears the bar.
+        let shares = dust_fixture();
+        let withheld = build_weight_distribution(pool_keeps_overflow(&shares, &balances, &fee))
+            .expect("withheld build");
+        let mut all_published_input = pool_keeps_overflow(&shares, &balances, &fee);
+        all_published_input.min_payout_sats = Some(Sats(DUST_LIMIT_SATS as i64));
+        let all_published =
+            build_weight_distribution(all_published_input).expect("all-published build");
+
+        // The fixture has to actually withhold, or this proves nothing.
+        let a3 = withheld
+            .entries
+            .iter()
+            .find(|e| e.address.as_str() == A3)
+            .unwrap();
+        assert_eq!(a3.wire_weight, 0, "A3 must be below min_payout");
+        assert_eq!(withheld.published().count(), 2);
+        assert_eq!(all_published.published().count(), 3);
+
+        let paid_when_withheld = paid_map(&withheld, T);
+        let paid_when_published = paid_map(&all_published, T);
+        for a in [A1, A2] {
+            assert_eq!(
+                paid_when_withheld[a], paid_when_published[a],
+                "{a} must be paid the same whether or not A3 dropped out"
+            );
+        }
+    }
+
+    /// And the value A3 left behind goes to the pool — the one place
+    /// PPLNS refuses to put it.
+    #[test]
+    fn the_withheld_share_lands_in_the_pool_output() {
+        const T: u64 = 312_500_000;
+        let shares = dust_fixture();
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+        let d = build_weight_distribution(pool_keeps_overflow(&shares, &balances, &fee)).unwrap();
+
+        let withheld = withheld_payout(&d, T);
+        assert!(
+            (546..5_000).contains(&withheld),
+            "fixture must sit between the consensus floor and min_payout, got {withheld}"
+        );
+
+        let paid = d.payout_entries_at(T).expect("§4 vector");
+        assert_eq!(paid[0].0, fee, "pool output first");
+        let pool_pay = paid[0].1 as i64;
+        let fee_only = (T as i64 * d.fee_ppm as i64) / 1_000_000;
+        assert!(
+            (pool_pay - fee_only - withheld).abs() <= 1 + d.published().count() as i64,
+            "pool took {pool_pay}; its fee is {fee_only} and A3 left {withheld} behind"
+        );
+    }
+
+    /// Nothing to settle: every published member's claim equals what the
+    /// coinbase paid it, and the withheld member's claim is what the pool
+    /// kept — booked nowhere, by design.
+    #[test]
+    fn a_published_member_is_paid_exactly_its_claim() {
+        const T: u64 = 312_500_000;
+        let shares = dust_fixture();
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+        let d = build_weight_distribution(pool_keeps_overflow(&shares, &balances, &fee)).unwrap();
+        let settled = settle(&d, T);
+
+        for a in [A1, A2] {
+            assert!(
+                settled[a].delta.abs() <= 1,
+                "{a} was paid {} against a claim of {} — a difference a ledger \
+                 would have to carry",
+                settled[a].paid,
+                settled[a].claim
+            );
+        }
+        assert_eq!(settled[A3].paid, 0, "the withheld member is not paid");
+    }
+
+    /// The blockspace cut is the second way out of the coinbase, and it
+    /// has to land in the same place — a member cut for space must not
+    /// silently raise what everyone else is paid either.
+    #[test]
+    fn blockspace_trimming_also_pays_the_pool_not_the_other_members() {
+        const T: u64 = 312_500_000;
+        let shares = HashMap::from([(addr(A1), 3.0), (addr(A2), 2.0), (addr(A3), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+
+        let mut untrimmed = pool_keeps_overflow(&shares, &balances, &fee);
+        untrimmed.min_payout_sats = Some(Sats(DUST_LIMIT_SATS as i64));
+        let untrimmed = build_weight_distribution(untrimmed).expect("untrimmed");
+        assert_eq!(untrimmed.published().count(), 3);
+
+        // Budget for the fixed overhead plus two miner outputs.
+        let mut trimmed = pool_keeps_overflow(&shares, &balances, &fee);
+        trimmed.min_payout_sats = Some(Sats(DUST_LIMIT_SATS as i64));
+        trimmed.coinbase_weight_budget = COINBASE_BASE_WEIGHT
+            + BUDGET_SAFETY_MARGIN_WU
+            + COINBASE_WITNESS_COMMITMENT_WEIGHT
+            + 3 * COINBASE_OUTPUT_WEIGHT;
+        let trimmed = build_weight_distribution(trimmed).expect("trimmed");
+        assert_eq!(trimmed.published().count(), 2, "the cut must have fired");
+        assert_eq!(trimmed.budget_telemetry.trimmed_count, 1);
+
+        let paid_trimmed = paid_map(&trimmed, T);
+        let paid_untrimmed = paid_map(&untrimmed, T);
+        for (a, sats) in &paid_trimmed {
+            assert_eq!(
+                *sats, paid_untrimmed[a],
+                "{a} must be paid the same whether or not another member was \
+                 cut for blockspace"
+            );
+        }
     }
 
     /// `positive balance boosts the wire weight by balance·S/(pot − X)`

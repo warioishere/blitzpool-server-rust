@@ -822,6 +822,7 @@ mod tests {
             finder_bonus_ppm: 0,
             finder_address: None,
             reference_revenue_sats: 312_500_000,
+            withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
         })
         .unwrap();
         let s = StoredWeightSnapshot::from_distribution(&d);
@@ -871,6 +872,7 @@ mod tests {
                 finder_bonus_ppm: bonus_ppm,
                 finder_address: Some(&a1),
                 reference_revenue_sats: 312_500_000,
+                withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
             })
             .unwrap();
             let s = StoredWeightSnapshot::from_distribution(&d);

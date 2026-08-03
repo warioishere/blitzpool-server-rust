@@ -28,7 +28,7 @@ use bp_db::{find_group, find_pplns_group_balances_for_group, DbError, PplnsGroup
 use bp_inflight_cache::InflightResultCache;
 use bp_pplns::{
     build_weight_distribution, is_valid_payout_address, WeightBuildError, WeightDistribution,
-    WeightDistributionInput,
+    WeightDistributionInput, WithheldValue,
 };
 use sqlx::PgPool;
 use thiserror::Error;
@@ -265,6 +265,11 @@ async fn compute_distribution(
         finder_bonus_ppm,
         finder_address: Some(finder_address),
         reference_revenue_sats: block_reward_sats,
+        // Group-Solo: a member the coinbase cannot pay forfeits this
+        // block and their share falls to the pool output. Nobody is
+        // overpaid, so nothing has to be remembered until the next
+        // block — which is what lets this mode run without a ledger.
+        withheld_value: WithheldValue::ToPool,
     })?;
 
     // 5. Persist the settlement inputs under the weights fingerprint.
@@ -425,6 +430,7 @@ mod tests {
             finder_bonus_ppm: 160_000,
             finder_address: Some(&finder),
             reference_revenue_sats: 312_500_000,
+            withheld_value: WithheldValue::ToPool,
         })
         .unwrap();
         let r = DistributionResult {
