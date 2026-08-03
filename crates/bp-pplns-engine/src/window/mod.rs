@@ -12,8 +12,9 @@
 //!
 //! Storage is O(buckets × miners), not O(shares): shares aggregate per-address
 //! into fixed-size count buckets and the window trims whole oldest buckets.
-//! The Redis layout MUST match the TS pool's (same key names, same
-//! `floor(counter / bucket_shares)`) — they share Redis across the cutover.
+//! Bucket ids derive from the never-reset `pplns:counter`, which is what makes
+//! `bucket_shares` a boot-time-only value rather than a live knob — see the
+//! field of that name on [`WindowStore`].
 
 pub mod snapshot;
 
@@ -43,8 +44,11 @@ pub const KEY_WINDOW_BY_ADDRESS: &str = "pplns:window:by-address";
 pub const KEY_WINDOW_REBUILD: &str = "pplns:window:by-address:rebuild";
 /// Index zset of live bucket ids (score = id) for FIFO trim ordering.
 /// Each bucket is a hash `pplns:bucket:<id>` of address → Σdiff. Storage is
-/// O(buckets × miners) instead of O(shares). MUST match the TS pool's layout
-/// (same key names, same `floor(counter / bucket_shares)`) — they share Redis.
+/// O(buckets × miners) instead of O(shares).
+///
+/// Score = id = `floor(counter / bucket_shares)`, so FIFO order is only
+/// oldest-first while that value keeps growing — which it does as long as
+/// `bucket_shares` is left alone. See its field on [`WindowStore`].
 pub const KEY_BUCKETS: &str = "pplns:buckets";
 /// Coinbase distribution snapshot. See [`mod@snapshot`].
 pub const KEY_SNAPSHOT: &str = "pplns:snapshot";
@@ -58,7 +62,7 @@ pub fn bucket_key(bucket_id: &str) -> String {
     format!("pplns:bucket:{bucket_id}")
 }
 
-/// Default shares-per-bucket when not configured (`PPLNS_BUCKET_SHARES`).
+/// Default shares-per-bucket when `[pplns] bucket_shares` is not configured.
 pub const DEFAULT_BUCKET_SHARES: u64 = 10_000;
 
 /// How many recent `share_id`s the dedup set retains. Only un-acked
@@ -233,8 +237,29 @@ impl NetworkDifficulty {
 pub struct WindowStore {
     conn: ConnectionManager,
     window_factor: f64,
-    /// Shares per count-bucket (`floor(counter / bucket_shares)`). Must match
-    /// the TS pool's `PPLNS_BUCKET_SHARES` since they share Redis.
+    /// Shares per count-bucket. The id is `floor(counter / bucket_shares)`
+    /// over [`KEY_COUNTER`], which is only ever `INCR`'d — nothing in the tree
+    /// resets or deletes it.
+    ///
+    /// That makes this a boot-time-only value on a populated window, and the
+    /// two directions are not symmetric. **Raising it lowers every future id.**
+    /// With the counter at 1 000 000 and 10 000 shares per bucket the live ids
+    /// sit just under 100; doubling the divisor puts the next share in bucket
+    /// 50 — below the whole live set, so it is the next one [`TRIM_BATCH_LUA`]
+    /// drops, and every share appended after it goes the same way until the
+    /// counter reaches `bucket_shares × (live max id + 1)`. The aggregate stays
+    /// consistent (the trim decrements exactly what it dropped), but new work
+    /// stops accruing window weight for about a million shares. **Lowering it
+    /// is safe:** the new ids land above every existing bucket and the old ones
+    /// age out in order.
+    ///
+    /// So: change it only against an empty window, or downwards.
+    ///
+    /// This used to be pinned to the TS pool's `PPLNS_BUCKET_SHARES` because
+    /// both pools shared one Redis across the cutover. That pool is retired,
+    /// and nothing here reads a key it does not also write — a cold start
+    /// rebuilds [`KEY_WINDOW_BY_ADDRESS`] from the buckets — so the counter is
+    /// the only constraint left.
     bucket_shares: u64,
     net_diff: NetworkDifficulty,
 }
@@ -260,10 +285,11 @@ impl WindowStore {
         }
     }
 
-    /// `windowSize = factor × networkDifficulty`. Returns 0 if the
-    /// network-difficulty source hasn't been seeded yet (no TDP
-    /// template received), in which case `record_share` is a no-op
-    /// trim-wise.
+    /// `windowSize = factor × networkDifficulty`. Returns 0 while the
+    /// network-difficulty source holds no usable reading — see
+    /// [`NetworkDifficulty`] for who writes it, which is `getmininginfo`
+    /// on the payout role and never the TDP stream. A 0 makes
+    /// `record_share` a no-op trim-wise, so the window only grows.
     pub fn window_size(&self) -> f64 {
         let nd = self.net_diff.get();
         if !nd.is_finite() || nd <= 0.0 {

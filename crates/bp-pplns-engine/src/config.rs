@@ -89,13 +89,14 @@ pub struct PplnsEngineConfig {
     /// would only make the old race less visible, not correct.
     pub snapshot_ttl_secs: u32,
 
-    /// Trim batch size — legacy per-share trim tunable. No longer used by the
-    /// bucketed window (which trims whole buckets); kept for config compat.
-    pub trim_batch_size: u32,
-
-    /// Shares per count-bucket for the window (`PPLNS_BUCKET_SHARES`,
-    /// default 10000). MUST match the TS pool's value since they share Redis.
-    /// Higher = less memory + coarser trim; lower = more memory + finer.
+    /// Shares per count-bucket for the window (default 10000). Higher = less
+    /// Redis memory + coarser trim; lower = more memory + finer.
+    ///
+    /// Effectively a boot-time-only value on a populated window: the bucket
+    /// id is `floor(pplns:counter / bucket_shares)` over a counter nothing
+    /// ever resets, so raising it puts new shares in a bucket id *below* the
+    /// live set, where the trim drops them again. See `WindowStore`'s
+    /// `bucket_shares` field for the arithmetic and the safe direction.
     pub bucket_shares: u64,
 
     /// Touch-buffer flush interval. The hot path accumulates
@@ -146,7 +147,6 @@ impl Default for PplnsEngineConfig {
             coinbase_weight_budget: DEFAULT_COINBASE_WEIGHT_BUDGET,
             window_factor: 4.0,
             snapshot_ttl_secs: 1_200,
-            trim_batch_size: 100,
             bucket_shares: crate::window::DEFAULT_BUCKET_SHARES,
             touch_flush_interval_secs: 60,
             dust_sweep_enabled: true,
@@ -180,11 +180,6 @@ impl PplnsEngineConfig {
         if self.snapshot_ttl_secs == 0 {
             return Err(ConfigError::ZeroUnsignedField {
                 field: "snapshot_ttl_secs",
-            });
-        }
-        if self.trim_batch_size == 0 {
-            return Err(ConfigError::ZeroUnsignedField {
-                field: "trim_batch_size",
             });
         }
         if self.bucket_shares == 0 {
@@ -422,20 +417,6 @@ mod tests {
                 field: "snapshot_ttl_secs",
             }
         );
-    }
-
-    #[test]
-    fn zero_trim_batch_size_rejects() {
-        let cfg = PplnsEngineConfig {
-            trim_batch_size: 0,
-            ..valid()
-        };
-        assert!(matches!(
-            cfg.try_new().unwrap_err(),
-            ConfigError::ZeroUnsignedField {
-                field: "trim_batch_size",
-            }
-        ));
     }
 
     #[test]

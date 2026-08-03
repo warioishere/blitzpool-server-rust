@@ -718,3 +718,164 @@ async fn bucketed_window_matches_exact_per_share_window() {
         "proportion drift {max_pct_diff} pct points too large"
     );
 }
+
+// ── Test 13 + 14 — bucket_shares is not a live knob ──────────────────
+//
+// The bucket id is `floor(pplns:counter / bucket_shares)` over a counter
+// nothing resets, so the divisor decides where new work lands relative to
+// the buckets already in the FIFO index. These two pin both directions, so
+// the doc on `WindowStore::bucket_shares` is an executable claim and not a
+// comment: raising it strands new shares BELOW the live set (where the trim
+// eats them), lowering it does not.
+
+/// Fill a window until the trim is active and several buckets are live,
+/// then return the live bucket ids.
+async fn fill_until_trimming(
+    conn: &mut ConnectionManager,
+    store: &WindowStore,
+    shares: usize,
+) -> Vec<i64> {
+    for i in 0..shares {
+        store
+            .record_share(None, "bc1qfiller", 100.0, 1_700_000_000_000 + i as u64)
+            .await
+            .unwrap();
+    }
+    let ids: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    let ids: Vec<i64> = ids.iter().map(|s| s.parse().unwrap()).collect();
+    assert!(
+        ids.len() > 1 && ids[0] > 0,
+        "precondition: need several live buckets and an already-trimmed head, got {ids:?}"
+    );
+    ids
+}
+
+#[tokio::test]
+async fn raising_bucket_shares_strands_new_work_below_the_live_window() {
+    let mut conn = match connect_or_skip(6).await {
+        Some(c) => c,
+        None => return,
+    };
+    // window = 4 × 1250 = 5000, buckets of 10 × diff 100 = 1000 each, so the
+    // live set settles at ~5 buckets while the counter runs to 200.
+    let (store, _) = make_store(conn.clone(), 1250.0, 10);
+    let live = fill_until_trimming(&mut conn, &store, 200).await;
+    let live_min = *live.first().unwrap();
+    let live_max = *live.last().unwrap();
+
+    // Same Redis, same counter — only the divisor is bigger, as a restart
+    // with an edited config would do.
+    let (raised, raised_nd) = make_store(conn.clone(), 1250.0, 20);
+    let appended = raised
+        .record_share(None, "bc1qvictim", 100.0, 1_700_000_999_000)
+        .await
+        .unwrap();
+    assert!(appended, "must be a real append, not a dedup no-op");
+
+    let new_id = 201 / 20;
+    let index: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    let index: Vec<i64> = index.iter().map(|s| s.parse().unwrap()).collect();
+    assert!(
+        new_id < live_min,
+        "the raised divisor must place the new id below the live set: \
+         {new_id} vs live min {live_min}"
+    );
+    assert_eq!(
+        index.first().copied(),
+        Some(new_id),
+        "the new work must now be the HEAD of the FIFO, index is {index:?}"
+    );
+
+    // That head position is the whole defect. Shrink the window so exactly
+    // one trim fires, and the bucket it takes is the newest work rather than
+    // the oldest — while every bucket from the fill survives.
+    raised_nd.set(100.0);
+    raised
+        .record_share(None, "bc1qvictim", 100.0, 1_700_000_999_001)
+        .await
+        .unwrap();
+
+    let after: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    let after: Vec<i64> = after.iter().map(|s| s.parse().unwrap()).collect();
+    assert!(
+        !after.contains(&new_id),
+        "the trim should have taken the stranded head {new_id}, index is {after:?}"
+    );
+    assert!(
+        after.contains(&live_max),
+        "the OLDER bucket {live_max} must have outlived it, index is {after:?}"
+    );
+    let victim: Option<String> = conn
+        .hget(KEY_WINDOW_BY_ADDRESS, "bc1qvictim")
+        .await
+        .unwrap();
+    assert!(
+        victim.is_none(),
+        "the victim's work must be gone from the aggregate too, found {victim:?}"
+    );
+    let filler: String = conn
+        .hget(KEY_WINDOW_BY_ADDRESS, "bc1qfiller")
+        .await
+        .unwrap();
+    assert!(
+        filler.parse::<f64>().unwrap() > 0.0,
+        "the filler's older work must still count, got {filler}"
+    );
+}
+
+#[tokio::test]
+async fn lowering_bucket_shares_keeps_new_work_above_the_live_window() {
+    let mut conn = match connect_or_skip(15).await {
+        Some(c) => c,
+        None => return,
+    };
+    // Identical to the test above except for the direction of the change, so
+    // the pair is a control: same fill, same shrink, same two shares.
+    let (store, _) = make_store(conn.clone(), 1250.0, 10);
+    let live = fill_until_trimming(&mut conn, &store, 200).await;
+    let live_min = *live.first().unwrap();
+    let live_max = *live.last().unwrap();
+
+    let (lowered, lowered_nd) = make_store(conn.clone(), 1250.0, 5);
+    let appended = lowered
+        .record_share(None, "bc1qsurvivor", 100.0, 1_700_000_999_000)
+        .await
+        .unwrap();
+    assert!(appended, "must be a real append, not a dedup no-op");
+
+    let new_id = 201 / 5;
+    let index: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    let index: Vec<i64> = index.iter().map(|s| s.parse().unwrap()).collect();
+    assert!(
+        new_id > live_max,
+        "the lowered divisor must place the new id above the live set: \
+         {new_id} vs live max {live_max}"
+    );
+    assert_eq!(
+        index.last().copied(),
+        Some(new_id),
+        "the new work must be the TAIL of the FIFO, index is {index:?}"
+    );
+
+    lowered_nd.set(100.0);
+    lowered
+        .record_share(None, "bc1qsurvivor", 100.0, 1_700_000_999_001)
+        .await
+        .unwrap();
+
+    let after: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    let after: Vec<i64> = after.iter().map(|s| s.parse().unwrap()).collect();
+    assert!(
+        !after.contains(&live_min),
+        "the trim should have taken the genuinely OLDEST bucket {live_min}, \
+         index is {after:?}"
+    );
+    let survivor: String = conn
+        .hget(KEY_WINDOW_BY_ADDRESS, "bc1qsurvivor")
+        .await
+        .unwrap();
+    assert!(
+        (survivor.parse::<f64>().unwrap() - 200.0).abs() < 1e-9,
+        "the same two shares must still count here, got {survivor}"
+    );
+}

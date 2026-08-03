@@ -656,8 +656,12 @@ pub struct PplnsConfig {
     pub confirmation_depth: u32,
     /// Shares per count-bucket for the sliding window (default 10000). The
     /// window is stored as per-address buckets of this many shares; bigger =
-    /// less Redis memory + coarser trim, smaller = more memory + finer. MUST
-    /// match the TS pool's `PPLNS_BUCKET_SHARES` (they share Redis).
+    /// less Redis memory + coarser trim, smaller = more memory + finer.
+    ///
+    /// Not safe to raise on a live pool: the bucket id is derived from a Redis
+    /// counter that never resets, so a bigger divisor sends new shares to an
+    /// id below the live window, where the trim discards them. Raise it only
+    /// against an empty window; lowering it is harmless.
     #[serde(default = "default_bucket_shares")]
     pub bucket_shares: u64,
     /// Coinbase-budget autoscaler. **Absent** ⇒ the budget stays fixed at
