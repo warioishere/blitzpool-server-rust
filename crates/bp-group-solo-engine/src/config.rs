@@ -23,9 +23,15 @@ use bp_pplns::{
 /// Engine-wide construction knobs.
 #[derive(Debug, Clone)]
 pub struct GroupSoloEngineConfig {
-    /// Coinbase output that receives the pool fee. `None` ⇒ no fee
-    /// output. Group-Solo reuses the PPLNS-side fee env var
-    /// (`PPLNS_FEE_ADDRESS`) by convention.
+    /// Coinbase output that receives the pool fee — and, under the weight
+    /// model, the §4 residual `pay_P`. **Required**, and
+    /// [`Self::try_new`] refuses without it, exactly as the PPLNS engine
+    /// does (the check lives in the one shared
+    /// `bp_pplns::validate_fee_payout_budget`, so the two cannot drift).
+    ///
+    /// Resolved from `[group_fees].address` with a fallback to
+    /// `[pplns].fee_address`; a pool that sets neither cannot pay a
+    /// Group-Solo block correctly and will not boot.
     pub fee_address: Option<AddressId>,
 
     /// Pool fee % as f64 (`[0.0, 100.0]`). Reuses `PPLNS_FEE_PERCENT`
@@ -39,20 +45,23 @@ pub struct GroupSoloEngineConfig {
     /// `PPLNS_MIN_PAYOUT_SATS`.
     pub min_payout_sats: Sats,
 
-    /// Coinbase weight budget (WU). Must match `bitcoin.conf`
-    /// `blockreservedweight`. Reuses `PPLNS_COINBASE_WEIGHT_BUDGET`.
+    /// Coinbase weight budget (WU). Handed straight to bitcoin-core
+    /// over the Group-Solo TDP IPC stream — there is no `bitcoin.conf`
+    /// knob to keep in sync. Reuses `PPLNS_COINBASE_WEIGHT_BUDGET`;
+    /// floored at `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`.
     pub coinbase_weight_budget: u32,
 
     /// Per-(group, finder) snapshot TTL in seconds. Defaults to 1h.
     pub snapshot_ttl_secs: u32,
 
-    /// Whether the daily 03:00 UTC group-dust-sweep runs.
-    pub dust_sweep_enabled: bool,
-
-    /// Group-Solo legacy dust-sweep dormancy threshold (days).
-    /// Defaults to 30. Shorter than PPLNS's 90d because group balances
-    /// are all-positive and have no counterparty to wait for.
-    pub dormant_balance_days: u32,
+    /// Blocks between subsidy halvings on the network this pool runs
+    /// on — the input to the settlement gate's floor
+    /// (`bp_share::block_subsidy_sats`). NOT an operator knob: it is
+    /// derived from the configured network at boot, because regtest
+    /// halves every 150 blocks and the mainnet 210 000 would make
+    /// every regtest block past height 150 look like it had burned
+    /// part of its own subsidy.
+    pub subsidy_halving_interval: u32,
 }
 
 impl Default for GroupSoloEngineConfig {
@@ -63,8 +72,7 @@ impl Default for GroupSoloEngineConfig {
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
             coinbase_weight_budget: DEFAULT_COINBASE_WEIGHT_BUDGET,
             snapshot_ttl_secs: 3_600,
-            dust_sweep_enabled: true,
-            dormant_balance_days: 30,
+            subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
         }
     }
 }
@@ -78,6 +86,7 @@ impl GroupSoloEngineConfig {
         // the PPLNS engine; the checks + thresholds live in bp-pplns and map
         // into this engine's ConfigError via `From` (field order preserved).
         validate_fee_payout_budget(
+            self.fee_address.as_ref().map(|a| a.as_str()),
             self.fee_percent,
             self.min_payout_sats.0,
             self.coinbase_weight_budget,
@@ -87,23 +96,23 @@ impl GroupSoloEngineConfig {
                 field: "snapshot_ttl_secs",
             });
         }
-        if self.dormant_balance_days == 0 {
-            return Err(ConfigError::ZeroUnsignedField {
-                field: "dormant_balance_days",
-            });
-        }
         Ok(self)
-    }
-
-    /// `true` if the fee output is suppressed for this engine — either
-    /// no address configured or `fee_percent <= 0`.
-    pub fn fee_suppressed(&self) -> bool {
-        self.fee_address.is_none() || self.fee_percent <= 0.0
     }
 }
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum ConfigError {
+    #[error(
+        "no fee_address configured — the pool output is structural under the \
+         weight model (SV2 ext 0x0003 §4). Without it every block of this mode \
+         falls back to a solo coinbase paying 100 % to one miner"
+    )]
+    MissingFeeAddress,
+    #[error(
+        "fee_address {value:?} is not a usable payout address — same effect as \
+         none at all: every block falls back to a solo coinbase"
+    )]
+    InvalidFeeAddress { value: String },
     #[error("fee_percent must be in [0.0, 100.0] and finite, got {value}")]
     InvalidFeePercent { value: f64 },
     #[error("min_payout_sats must be ≥ DUST_LIMIT_SATS ({dust}), got {value}")]
@@ -117,6 +126,10 @@ pub enum ConfigError {
 impl From<FeePayoutBudgetError> for ConfigError {
     fn from(e: FeePayoutBudgetError) -> Self {
         match e {
+            FeePayoutBudgetError::MissingFeeAddress => ConfigError::MissingFeeAddress,
+            FeePayoutBudgetError::InvalidFeeAddress { value } => {
+                ConfigError::InvalidFeeAddress { value }
+            }
             FeePayoutBudgetError::InvalidFeePercent { value } => {
                 ConfigError::InvalidFeePercent { value }
             }
@@ -135,19 +148,56 @@ mod tests {
     use bp_pplns::{COINBASE_BASE_WEIGHT, DUST_LIMIT_SATS};
 
     use super::*;
+    const TEST_FEE_ADDRESS: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
+
+    /// A config that differs from [`GroupSoloEngineConfig::default`] only in having a
+    /// usable pool-output recipient. The default deliberately does NOT —
+    /// see `the_default_config_is_refused_because_it_has_no_fee_address`.
+    fn valid() -> GroupSoloEngineConfig {
+        GroupSoloEngineConfig {
+            fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).expect("valid")),
+            ..GroupSoloEngineConfig::default()
+        }
+    }
+
+    /// The pool output is structural under §4, so there is no such thing
+    /// as a usable config without one — and a pool that boots without it
+    /// pays 100 % of every block to whichever miner connected.
+    #[test]
+    fn the_default_config_is_refused_because_it_has_no_fee_address() {
+        assert_eq!(
+            GroupSoloEngineConfig::default().try_new().unwrap_err(),
+            ConfigError::MissingFeeAddress
+        );
+    }
+
+    /// Shape-valid but unparseable is the same failure with a likelier
+    /// cause (a typo), and `AddressId` does not catch it.
+    #[test]
+    fn a_typo_in_the_fee_address_is_refused() {
+        let typo = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLX";
+        let cfg = GroupSoloEngineConfig {
+            fee_address: Some(AddressId::new(typo).expect("shape ok")),
+            ..GroupSoloEngineConfig::default()
+        };
+        assert_eq!(
+            cfg.try_new().unwrap_err(),
+            ConfigError::InvalidFeeAddress {
+                value: typo.to_string()
+            }
+        );
+    }
 
     #[test]
     fn default_validates_clean() {
-        GroupSoloEngineConfig::default()
-            .try_new()
-            .expect("default ok");
+        valid().try_new().expect("default ok");
     }
 
     #[test]
     fn fee_percent_negative_rejects() {
         let cfg = GroupSoloEngineConfig {
             fee_percent: -0.1,
-            ..GroupSoloEngineConfig::default()
+            ..valid()
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
@@ -159,7 +209,7 @@ mod tests {
     fn fee_percent_above_hundred_rejects() {
         let cfg = GroupSoloEngineConfig {
             fee_percent: 105.0,
-            ..GroupSoloEngineConfig::default()
+            ..valid()
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
@@ -171,7 +221,7 @@ mod tests {
     fn fee_percent_nan_rejects() {
         let cfg = GroupSoloEngineConfig {
             fee_percent: f64::NAN,
-            ..GroupSoloEngineConfig::default()
+            ..valid()
         };
         match cfg.try_new().unwrap_err() {
             ConfigError::InvalidFeePercent { value } => assert!(value.is_nan()),
@@ -183,7 +233,7 @@ mod tests {
     fn min_payout_below_dust_rejects() {
         let cfg = GroupSoloEngineConfig {
             min_payout_sats: Sats(545),
-            ..GroupSoloEngineConfig::default()
+            ..valid()
         };
         assert!(matches!(
             cfg.try_new().unwrap_err(),
@@ -195,7 +245,7 @@ mod tests {
     fn min_payout_exactly_dust_accepts() {
         let cfg = GroupSoloEngineConfig {
             min_payout_sats: Sats(DUST_LIMIT_SATS as i64),
-            ..GroupSoloEngineConfig::default()
+            ..valid()
         };
         cfg.try_new().expect("dust-limit ok");
     }
@@ -204,7 +254,7 @@ mod tests {
     fn weight_budget_too_low_rejects() {
         let cfg = GroupSoloEngineConfig {
             coinbase_weight_budget: COINBASE_BASE_WEIGHT,
-            ..GroupSoloEngineConfig::default()
+            ..valid()
         };
         assert!(matches!(
             cfg.try_new().unwrap_err(),
@@ -216,7 +266,7 @@ mod tests {
     fn zero_snapshot_ttl_rejects() {
         let cfg = GroupSoloEngineConfig {
             snapshot_ttl_secs: 0,
-            ..GroupSoloEngineConfig::default()
+            ..valid()
         };
         assert_eq!(
             cfg.try_new().unwrap_err(),
@@ -226,51 +276,19 @@ mod tests {
         );
     }
 
+    /// A non-zero fee still validates. (The `fee_suppressed()` helper this
+    /// used to also assert on is gone: it answered "is there a fee output?"
+    /// with `fee_address.is_none() || fee_percent <= 0.0`, and §4 makes the
+    /// pool output structural at every fee. Nothing in production read it —
+    /// the same dead assumption that put `max_coinbase_outputs` one over.)
     #[test]
-    fn zero_dormant_balance_days_rejects() {
-        let cfg = GroupSoloEngineConfig {
-            dormant_balance_days: 0,
-            ..GroupSoloEngineConfig::default()
-        };
-        assert!(matches!(
-            cfg.try_new().unwrap_err(),
-            ConfigError::ZeroUnsignedField {
-                field: "dormant_balance_days",
-            }
-        ));
-    }
-
-    #[test]
-    fn fee_suppressed_when_no_address() {
-        let cfg = GroupSoloEngineConfig::default();
-        assert!(cfg.fee_suppressed());
-    }
-
-    #[test]
-    fn fee_suppressed_when_zero_percent() {
-        let cfg = GroupSoloEngineConfig {
-            fee_address: Some(AddressId::new("bc1qfee0000000000000000000000000").unwrap()),
-            fee_percent: 0.0,
-            ..GroupSoloEngineConfig::default()
-        };
-        assert!(cfg.fee_suppressed());
-    }
-
-    #[test]
-    fn fee_active_when_address_and_percent() {
-        let cfg = GroupSoloEngineConfig {
-            fee_address: Some(AddressId::new("bc1qfee0000000000000000000000000").unwrap()),
-            fee_percent: 2.0,
-            ..GroupSoloEngineConfig::default()
-        };
-        assert!(!cfg.fee_suppressed());
-        cfg.try_new().expect("active fee config validates");
-    }
-
-    #[test]
-    fn group_solo_default_dormant_days_is_30() {
-        // Confirms the divergence from PPLNS's 90d default — group
-        // balances have no counterparty to wait for.
-        assert_eq!(GroupSoloEngineConfig::default().dormant_balance_days, 30);
+    fn a_non_zero_fee_validates() {
+        GroupSoloEngineConfig {
+            fee_address: Some(AddressId::new(TEST_FEE_ADDRESS).unwrap()),
+            fee_percent: 1.5,
+            ..valid()
+        }
+        .try_new()
+        .expect("active fee config validates");
     }
 }

@@ -57,6 +57,45 @@ pub enum LedgerError {
     Db(#[from] DbError),
     #[error("sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
+    /// Height `block_height` already carries payout rows that do NOT match
+    /// what this apply would write — so a DIFFERENT block was booked at
+    /// this height and a reorg replaced it with the one being applied now.
+    ///
+    /// `pplns_payout_history` has no `blockHash` column and is UNIQUE on
+    /// `(blockHeight, address)`, so the ledger cannot hold both. This apply
+    /// therefore books nothing, and saying so as an error is the whole
+    /// point: the previous shape returned `Ok` with zero counts, which the
+    /// confirmation watcher read as success — it fired the settlement,
+    /// logged "payout history applied" and dropped the parked block. A
+    /// block whose coinbase paid miners on-chain vanished with it.
+    ///
+    /// Terminal by nature: the recorded rows will not change on a retry.
+    /// The caller parks the block in the unbookable store instead, where
+    /// the frozen distribution survives for an operator reprocess.
+    #[error(
+        "block height {block_height} already carries {booked_rows} payout rows from a different \
+         block; this apply would have written {incoming_rows} — the ledger keys payout history by \
+         height, so it cannot hold both"
+    )]
+    HeightBookedByAnotherBlock {
+        block_height: i32,
+        booked_rows: usize,
+        incoming_rows: usize,
+    },
+}
+
+impl LedgerError {
+    /// Would retrying this ever succeed?
+    ///
+    /// Only [`Self::HeightBookedByAnotherBlock`] is a verdict; the rest are
+    /// infrastructure and clear on their own. Kept here rather than in each
+    /// engine's `is_terminal` so the two cannot disagree about it.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            LedgerError::HeightBookedByAnotherBlock { .. } => true,
+            LedgerError::Db(_) | LedgerError::Sqlx(_) => false,
+        }
+    }
 }
 
 /// Row counts affected by one apply-distribution transaction.

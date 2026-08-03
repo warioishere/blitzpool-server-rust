@@ -18,6 +18,8 @@
 use std::sync::Arc;
 
 use bp_group_mgmt_engine::{GroupService, GroupServiceError};
+use bp_group_solo_engine::engine::GroupSoloEngine;
+use bp_pplns::max_coinbase_outputs;
 use thiserror::Error;
 use tracing::info;
 
@@ -36,7 +38,6 @@ pub(crate) enum GroupServiceSpawnError {
 
 /// Shared handle aggregate — clone the inner `Arc` to hand the same
 /// service to multiple consumers.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct SharedGroupService {
     pub(crate) service: Arc<GroupService<ProductionGroupServiceHooks>>,
@@ -45,14 +46,28 @@ pub(crate) struct SharedGroupService {
 /// Construct the production `GroupService`, warm the address cache,
 /// and return the shared aggregate. Failure to rebuild the cache is
 /// fatal — Stratum + API both depend on a hot cache at first share.
+///
+/// The member ceiling comes from the Group-Solo engine's coinbase weight
+/// budget, computed with the same [`max_coinbase_outputs`] the operator
+/// capacity alert and `GET /api/pplns/groups/coinbase-capacity` use, so
+/// what the UI shows and what a join is refused against are one number.
 pub(crate) async fn spawn(
     foundation: &FoundationHandles,
     production_hooks: &ProductionHooks,
+    group_solo: &GroupSoloEngine,
 ) -> Result<SharedGroupService, GroupServiceSpawnError> {
+    let cfg = group_solo.config();
+    let coinbase_max_members = max_coinbase_outputs(cfg.coinbase_weight_budget);
+    info!(
+        coinbase_weight_budget = cfg.coinbase_weight_budget,
+        coinbase_max_members,
+        "group-service: group member ceiling derived from the group-solo coinbase budget"
+    );
     let service = Arc::new(GroupService::new(
         foundation.db.pool().clone(),
         production_hooks.group_service.clone(),
         KICK_INACTIVITY_DAYS,
+        coinbase_max_members,
     ));
     info!("group-service: rebuilding address cache");
     service.rebuild_cache().await?;

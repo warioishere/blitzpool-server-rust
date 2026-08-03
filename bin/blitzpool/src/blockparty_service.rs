@@ -57,7 +57,6 @@ pub(crate) enum BlockpartySpawnError {
     InvalidFeeAddress(String),
 }
 
-#[allow(dead_code)]
 pub(crate) struct SharedBlockparty {
     pub(crate) service: Arc<dyn BlockpartyApi>,
     /// Membership reader — handed to `GroupService::set_blockparty_reader`

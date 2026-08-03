@@ -47,7 +47,9 @@ pub enum GroupServiceError {
     InvalidTimezone,
     #[error("invalid finderBonusSats (range / sub-minPayout)")]
     InvalidBonus,
-    #[error("invalid maxMembers (must be an integer >= 2 or null)")]
+    #[error(
+        "invalid maxMembers (must be null, or an integer between 2 and what the coinbase can pay)"
+    )]
     InvalidMaxMembers,
     #[error("group has reached its maximum number of members")]
     GroupFull,

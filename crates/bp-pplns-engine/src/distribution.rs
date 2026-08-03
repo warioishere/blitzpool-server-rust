@@ -20,30 +20,26 @@
 //!   Postgres ledger query, since neither depends on the reward.
 //!
 //! The second layer is what keeps a burst of unrelated callers cheap.
-//! The per-reward layer alone never dedups them: ext-0x0003 has every
-//! JDC report its own `available_payout_value`, so N simultaneous
-//! requests at a chain-tip change mean N distinct keys and, without the
-//! inputs layer, N window reads plus N ledger queries in the same few
-//! milliseconds.
+//! The per-reward layer alone never dedups them: SV1/SV2 job builds
+//! arrive with whatever template revenue their stream currently holds,
+//! so N simultaneous callers at a chain-tip change can mean N distinct
+//! keys and, without the inputs layer, N window reads plus N ledger
+//! queries in the same few milliseconds.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bp_coinbase_snapshot::{build_and_snapshot, BuildRequest};
 use bp_common::{AddressId, Sats};
-use bp_db::{find_pplns_balances_with_open_balance, DbError, PplnsBalanceRow};
-use bp_pplns::{
-    build_coinbase_distribution, is_valid_payout_address, CoinbaseDistributionEntry,
-    CoinbaseDistributionInput,
-};
-use bp_share::payouts_fingerprint_from_parts;
+use bp_db::{find_pplns_balances_with_open_balance, PplnsBalanceRow};
+use bp_pplns::{WeightBuildError, WeightDistribution};
 use sqlx::PgPool;
 use thiserror::Error;
-use tracing::warn;
+use tracing::error;
 
 use crate::autoscale::LiveBudget;
-use crate::window::snapshot::StoredSnapshot;
 use crate::window::{WindowError, WindowStore};
 use bp_coinbase_snapshot::share_map_from_redis_hash;
 use bp_inflight_cache::InflightResultCache;
@@ -67,16 +63,18 @@ pub enum DistributionError {
     LeaderDropped,
     #[error("window read: {0}")]
     Window(#[from] WindowError),
-    #[error("redis snapshot write: {0}")]
-    Snapshot(#[source] redis::RedisError),
-    #[error("db: {0}")]
-    Db(#[from] DbError),
     /// The shared window+ledger load failed. Carries the underlying
     /// error's message rather than the error itself: the inputs cache
     /// hands back an `Arc<DistributionError>` shared across all waiters,
     /// which can't be unwrapped back into an owned error.
     #[error("distribution inputs: {0}")]
     Inputs(String),
+    /// The weight model has no distribution without a pool-output
+    /// recipient — `pay_P` is structural (SV2 ext 0x0003 §4).
+    #[error("no fee address configured — the weight model requires the pool-output recipient")]
+    NoFeeAddress,
+    #[error("weight build: {0}")]
+    WeightBuild(#[from] WeightBuildError),
 }
 
 /// The part of a distribution build that does NOT depend on
@@ -99,44 +97,33 @@ pub struct DistributionInputs {
 /// the in-flight cache shares `Arc<DistributionResult>` across waiters.
 #[derive(Clone, Debug)]
 pub struct DistributionResult {
-    /// Coinbase output list, in coinbase order (matters for byte-equal
-    /// reconstruction at block-build time).
-    pub payouts: Vec<CoinbaseDistributionEntry>,
-    /// Every address that was in shares OR balances at build time.
-    pub considered_addresses: HashSet<AddressId>,
-    /// Absolute new ledger balances per address whose state changed.
-    /// Applied as absolute UPSERT in [`crate::ledger::apply_distribution`].
-    pub balance_after: HashMap<AddressId, Sats>,
-    /// `block_reward_sats` this distribution was built for. The
-    /// snapshot pins this so on-block-found can refuse to apply a
-    /// stale snapshot whose reward disagrees with the actual coinbase.
-    pub block_reward_sats: u64,
-    /// Identity of `payouts` + the reward it was built over — the key this
-    /// build's snapshot is stored under.
+    /// The weight-native distribution (SV2 ext 0x0003 model): entries
+    /// with settlement inputs + published wire weights, `weight_P`,
+    /// fee, dust limits, and the weights fingerprint. Every consumer
+    /// derives concrete satoshis from it via the §4 formula —
+    /// [`WeightDistribution::payout_entries_at`] for the pool's own
+    /// templates, the JDP publisher for `SetPayoutDistribution`.
+    pub distribution: WeightDistribution,
+    /// Did the schema-2 snapshot under `distribution.fingerprint`
+    /// actually get written?
     ///
-    /// It is NOT threaded onward from here: the Stratum job build derives the
-    /// same value independently from the `PayoutEntry` list it turns into the
-    /// coinbase and that list's template reward (`MiningJobCache`), and that
-    /// is what a found block carries.
-    /// The two derivations agreeing is what makes the block-found lookup hit —
-    /// `payouts_fingerprint` and `payouts_fingerprint_from_parts` share one
-    /// encoding for exactly that reason, and the regtest
-    /// `ledger_books_exactly_what_the_accepted_coinbase_paid` pins it.
-    ///
-    /// Exposed so callers (and tests) can name the key this distribution
-    /// landed under. See [`bp_share::payouts_fingerprint_from_parts`].
-    pub payouts_fingerprint: [u8; 32],
-    /// Did the snapshot under `payouts_fingerprint` actually get written?
-    ///
-    /// `false` means this build succeeded but its snapshot did not land, so
-    /// `payouts_fingerprint` names a key that does not exist. The distribution
-    /// is still correct and still becomes a coinbase — failing the build over a
-    /// lost snapshot would hand the miner a solo job paying itself the whole
-    /// block, which is far worse. But a caller that promises a found block will
-    /// be booked automatically MUST NOT make that promise on a `false`: the
-    /// booking would resolve a fingerprint to nothing and need an operator
-    /// reprocess anyway, after the pool already said it was covered.
+    /// `false` means this build succeeded but its snapshot did not
+    /// land, so the fingerprint names a key that does not exist. The
+    /// distribution is still correct and still becomes a coinbase —
+    /// failing the build over a lost snapshot would leave every miner in
+    /// it without a job. But a caller that promises a found block will be
+    /// booked automatically MUST NOT make that promise on a `false`.
     pub snapshot_written: bool,
+}
+
+impl DistributionResult {
+    /// The snapshot key this build landed under (see
+    /// [`bp_share::weights_fingerprint_from_parts`]). Threaded onto
+    /// every job built from this distribution — a found block carries
+    /// it back so settlement can read exactly these inputs.
+    pub fn payouts_fingerprint(&self) -> [u8; 32] {
+        self.distribution.fingerprint
+    }
 }
 
 /// Knobs for the distribution path. Built from
@@ -211,12 +198,16 @@ impl DistributionBuilder {
         self.inputs_loads.load(Ordering::Relaxed)
     }
 
-    /// Build the current PPLNS distribution for `block_reward_sats`.
-    /// Concurrent callers for the same reward share one compute; callers
-    /// for *different* rewards still share the window+ledger read.
+    /// Build the current PPLNS weight distribution against
+    /// `reference_revenue_sats` (the pool's current template value —
+    /// the projection base for balance boosts). Concurrent callers for
+    /// the same reference share one compute; callers for *different*
+    /// references still share the window+ledger read. Under the weight
+    /// model there is normally exactly ONE live reference at a time —
+    /// the reward-keyed cache is simply correct, not load-bearing.
     pub async fn build(
         &self,
-        block_reward_sats: u64,
+        reference_revenue_sats: u64,
     ) -> Result<Arc<DistributionResult>, Arc<DistributionError>> {
         let pool = self.pool.clone();
         let window = self.window.clone();
@@ -225,7 +216,7 @@ impl DistributionBuilder {
         let inputs_cache = self.inputs_cache.clone();
         let inputs_loads = self.inputs_loads.clone();
         self.cache
-            .get_or_compute(block_reward_sats, || async move {
+            .get_or_compute(reference_revenue_sats, || async move {
                 let inputs = inputs_cache
                     .get_or_compute((), || async move {
                         inputs_loads.fetch_add(1, Ordering::Relaxed);
@@ -233,14 +224,66 @@ impl DistributionBuilder {
                     })
                     .await
                     .map_err(|e| DistributionError::Inputs(e.to_string()))?;
-                build_from_inputs(&inputs, &window, &config, block_reward_sats).await
+                // No bootstrap claimant: this build is SHARED by every
+                // PPLNS miner (the cache is keyed by revenue alone), so
+                // there is no single miner it could name. An empty window
+                // therefore surfaces as `NoScoredMiners` — see
+                // [`Self::build_bootstrap`] for who resolves that.
+                build_from_inputs(&inputs, &window, &config, reference_revenue_sats, None).await
             })
             .await
     }
 
+    /// The empty-window answer for ONE asking miner.
+    ///
+    /// [`Self::build`] cannot give it: its result is shared across every
+    /// PPLNS connection (keyed by revenue only), and a distribution that
+    /// names one miner as the sole claimant must never be handed to
+    /// another. So the bootstrap build is per-miner and deliberately
+    /// UNCACHED at the distribution layer — it only runs while the window
+    /// holds no scored miner at all, which lasts until that miner's first
+    /// accepted share.
+    ///
+    /// The window+ledger `inputs_cache` IS still shared, because the read
+    /// does not depend on the claimant.
+    ///
+    /// Call this only after [`Self::build`] answered
+    /// [`bp_pplns::WeightBuildError::NoScoredMiners`]. Calling it
+    /// unconditionally would hand a miner the whole block on a window
+    /// that has other claimants in it.
+    pub async fn build_bootstrap(
+        &self,
+        reference_revenue_sats: u64,
+        claimant: &AddressId,
+    ) -> Result<Arc<DistributionResult>, Arc<DistributionError>> {
+        let pool = self.pool.clone();
+        let window_for_inputs = self.window.clone();
+        let inputs_loads = self.inputs_loads.clone();
+        let inputs = self
+            .inputs_cache
+            .get_or_compute((), || async move {
+                inputs_loads.fetch_add(1, Ordering::Relaxed);
+                load_inputs(&pool, &window_for_inputs).await
+            })
+            .await
+            .map_err(|e| Arc::new(DistributionError::Inputs(e.to_string())))?;
+        build_from_inputs(
+            &inputs,
+            &self.window,
+            &self.config,
+            reference_revenue_sats,
+            Some(claimant),
+        )
+        .await
+        .map(Arc::new)
+        .map_err(Arc::new)
+    }
+
     /// Invalidate the cache for a specific reward. Called by the
-    /// engine on hot-path state changes (a new accepted share landed,
-    /// a block was found, network difficulty changed).
+    /// engine on hot-path state changes: a new accepted share landed, or a
+    /// block was found. (A network-difficulty change is NOT one of them —
+    /// it moves the window's trim size, and the trim already runs inside
+    /// `record_share`, whose invalidation covers it.)
     ///
     /// Common pattern: `invalidate_all` (drops every cached reward)
     /// because the window changed for *any* reward, not just one.
@@ -269,137 +312,117 @@ impl DistributionBuilder {
 /// Steps 1-3: the reward-independent half of a build — read the window
 /// and the ledger, sanitize both. Shared by every concurrent build via
 /// [`DistributionBuilder::inputs_cache`].
+///
+/// **The two reads fail differently, on purpose.**
+///
+/// The window IS the shares. Without it there is nothing to distribute,
+/// nothing may be invented, and the caller must serve no job at all
+/// ([`bp_mining_job::ResolvedPayouts::none`]) — so a window error
+/// propagates.
+///
+/// The ledger is a set of PROMISES on top of that split, and a promise
+/// that cannot be read this second is not a promise that is lost. It
+/// still sits in `pplns_balance`, and a build without it is not
+/// approximate: every entry carries `balance_sats = 0`, so `X = 0`, no
+/// wire weight is boosted, and settlement recomputes the same zeros from
+/// the snapshot and books `delta ≈ 0`. The standing balances are not
+/// touched and are paid out of the next block instead. A block found
+/// during the outage pays correctly by score and is fully bookable.
+///
+/// That is worth the degradation because the alternative is severe and
+/// pool-wide: `record_share` writes only to Redis, so during a Postgres
+/// outage the share accounting is intact and every miner keeps earning —
+/// failing the build would blank the whole pool's jobs over a fault that
+/// costs nothing but a one-block delay in repayments. It is also not a
+/// new code path in the math: Group-Solo passes an empty balance map on
+/// every single build.
 async fn load_inputs(
     pool: &PgPool,
     window: &WindowStore,
 ) -> Result<DistributionInputs, DistributionError> {
-    // 1. Read window aggregate from Redis (HashMap<String, f64>).
+    // 1. Read window aggregate from Redis (HashMap<String, f64>). Hard.
     let window_raw = window.read_window_by_address().await?;
 
-    // 2. Read open-balance ledger rows from PG.
-    let open_balance_rows = find_pplns_balances_with_open_balance(pool).await?;
+    // 2. Read open-balance ledger rows from PG. Soft — see the docs above.
+    let balances = match find_pplns_balances_with_open_balance(pool).await {
+        Ok(rows) => open_balance_rows_to_balance_map(&rows),
+        Err(err) => {
+            error!(
+                %err,
+                "pplns distribution: ledger unreadable — building this distribution by SCORE \
+                 ONLY. Standing balances are untouched and are repaid from a later block; a \
+                 block found meanwhile still pays correctly and books. Fix the database."
+            );
+            HashMap::new()
+        }
+    };
 
-    // 3. Convert to bp_pplns inputs. Window addresses are raw strings
-    //    — strings that fail `AddressId` validation are skipped with a
-    //    warn (defensive: an upstream bug could have pushed an invalid
-    //    address into Redis; better to skip its share than fail the
-    //    whole distribution).
-    let mut address_shares = share_map_from_redis_hash(
-        &window_raw,
-        "pplns distribution: skipping invalid address in window — likely from a buggy upstream",
-    );
-    let mut balances = open_balance_rows_to_balance_map(&open_balance_rows);
-
-    // Defensive sanitize: drop any address that isn't a parseable
-    // Bitcoin address before it reaches the coinbase builder. A single
-    // unparseable window/ledger row (junk, migration artifact, or
-    // seed-test data such as `synthseed*`) otherwise aborts the entire
-    // coinbase build in `bp-mining-job` (its `address_to_script` is
-    // fail-the-whole-tx), blocking every miner's job. Dropping the row
-    // here is strictly safer — it's simply not paid this block and
-    // stays in the ledger. See `bp_pplns::is_valid_payout_address`.
-    let shares_before = address_shares.len();
-    let balances_before = balances.len();
-    address_shares.retain(|a, _| is_valid_payout_address(a.as_str()));
-    balances.retain(|a, _| is_valid_payout_address(a.as_str()));
-    let dropped = (shares_before - address_shares.len()) + (balances_before - balances.len());
-    if dropped > 0 {
-        warn!(
-            dropped,
-            shares_dropped = shares_before - address_shares.len(),
-            balances_dropped = balances_before - balances.len(),
-            "pplns distribution: dropped unparseable payout addresses before coinbase build"
-        );
-    }
-
+    // 3. Convert to bp_pplns inputs. Window addresses are raw strings —
+    //    ones that fail `AddressId` validation are skipped with a warn
+    //    (an upstream bug could have pushed an invalid address into
+    //    Redis; better to skip its share than fail the distribution).
+    //    Dropping addresses that parse but are not usable payout scripts
+    //    happens in the shared build.
     Ok(DistributionInputs {
-        address_shares,
+        address_shares: share_map_from_redis_hash(
+            &window_raw,
+            "pplns distribution: skipping invalid address in window — likely from a buggy upstream",
+        ),
         balances,
     })
 }
 
-/// Steps 4-5: scale the shared inputs to one concrete
-/// `block_reward_sats`, run the pure math, persist the snapshot.
+/// Steps 4-5: project the shared inputs into the weight model against
+/// the reference revenue, persist the schema-2 snapshot.
 async fn build_from_inputs(
     inputs: &DistributionInputs,
     window: &WindowStore,
     config: &DistributionConfig,
-    block_reward_sats: u64,
+    reference_revenue_sats: u64,
+    bootstrap_claimant: Option<&AddressId>,
 ) -> Result<DistributionResult, DistributionError> {
-    // 4. Build inputs + call pure math. Read the *live* budget here so a
-    //    runtime autoscaler change takes effect on the next build.
-    let input = CoinbaseDistributionInput {
-        address_shares: &inputs.address_shares,
-        balances: &inputs.balances,
-        block_reward_sats: Sats(block_reward_sats as i64),
-        fee_percent: config.fee_percent,
-        fee_address: config.fee_address.as_ref(),
-        coinbase_weight_budget: config.coinbase_weight_budget.get(),
-        suppress_matching_debits: false, // PPLNS uses signed-ledger pair-symmetry
-        min_payout_sats: Some(config.min_payout_sats),
-        finder_bonus_sats: None, // finder-bonus is a Group-Solo feature
-        finder_address: None,
-    };
-    let math = build_coinbase_distribution(input);
+    // 4-5. Sanitize, project onto weights, persist the snapshot — the
+    //      one path both payout engines share. The *live* budget is read
+    //      here so a runtime autoscaler change takes effect on the next
+    //      build.
+    let fee_address = config
+        .fee_address
+        .as_ref()
+        .ok_or(DistributionError::NoFeeAddress)?;
+    let mut conn = window.connection_for_snapshot();
+    let built = build_and_snapshot(
+        BuildRequest {
+            address_shares: inputs.address_shares.clone(),
+            balances: inputs.balances.clone(),
+            fee_address,
+            fee_percent: config.fee_percent,
+            min_payout_sats: config.min_payout_sats,
+            coinbase_weight_budget: config.coinbase_weight_budget.get(),
+            finder_bonus_ppm: 0, // finder-bonus is a Group-Solo feature
+            finder_address: None,
+            reference_revenue_sats,
+            // PPLNS keeps a withheld miner's share inside the miners' cut
+            // and remembers what it owes them in `pplns_balance`. That is
+            // the point of the mode — a small miner accumulates across
+            // blocks until they clear `min_payout` instead of forfeiting.
+            withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
+            bootstrap_claimant,
+            scope: "pplns",
+        },
+        &mut conn,
+        crate::window::snapshot_key_for,
+        config.snapshot_ttl_secs,
+    )
+    .await?;
 
-    // Feed the autoscaler: record this build's weight-budget pressure. The
-    // no-shares fallback carries no telemetry and is skipped.
-    if let Some(sample) = math.budget_telemetry {
-        config.coinbase_weight_budget.record_sample(sample);
-    }
-
-    // 5. Persist snapshot so on-block-found can replay deterministically.
-    // Records the ledger state this distribution was computed against, so the
-    // apply can write a delta instead of an absolute — see
-    // `StoredSnapshot::balance_before`.
-    let snapshot = StoredSnapshot::from_math_with_before(
-        &math.payouts,
-        block_reward_sats,
-        &math.considered_addresses,
-        &math.balance_after,
-        &inputs.balances,
-    );
-    // Keyed by the payout list it distributes — the only snapshot written.
-    // Nothing else writes this key, so it still holds THIS distribution when
-    // the block that mined it is found, however many other builds ran in
-    // between. A block-found that cannot name a key gets no distribution
-    // rather than a stranger's.
-    let payouts_fingerprint = payouts_fingerprint_from_parts(
-        block_reward_sats,
-        math.payouts
-            .iter()
-            .map(|p| (p.address.as_str(), p.sats.to_i64().max(0) as u64)),
-    );
-    // A failed snapshot write must NOT fail the build. The distribution
-    // itself is correct and is about to become a coinbase; returning `Err`
-    // here sends `pplns_payouts` into its solo fallback, and that miner is
-    // handed a job paying 100 % of the block to itself. Losing the snapshot
-    // costs a manual reprocess if a block lands on this job — losing the
-    // distribution costs the pool's miners the whole block, irreversibly.
-    let snapshot_written = match window
-        .write_snapshot_for(&payouts_fingerprint, &snapshot, config.snapshot_ttl_secs)
-        .await
-    {
-        Ok(()) => true,
-        Err(err) => {
-            warn!(
-                %err,
-                block_reward_sats,
-                "PPLNS snapshot write failed — the coinbase distribution stands, but a \
-                 block found on this job cannot be booked automatically and needs \
-                 operator reprocessing"
-            );
-            false
-        }
-    };
+    // Feed the autoscaler with this build's blockspace pressure.
+    config
+        .coinbase_weight_budget
+        .record_sample(built.distribution.budget_telemetry);
 
     Ok(DistributionResult {
-        payouts: math.payouts,
-        considered_addresses: math.considered_addresses,
-        balance_after: math.balance_after,
-        block_reward_sats,
-        payouts_fingerprint,
-        snapshot_written,
+        distribution: built.distribution,
+        snapshot_written: built.snapshot_written,
     })
 }
 
@@ -414,7 +437,7 @@ fn open_balance_rows_to_balance_map(rows: &[PplnsBalanceRow]) -> HashMap<Address
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bp_pplns::CoinbaseDistributionEntry;
+    use bp_pplns::{build_weight_distribution, WeightDistributionInput};
 
     #[test]
     fn distribution_config_from_engine_config_carries_fields() {
@@ -464,20 +487,31 @@ mod tests {
     fn distribution_result_is_cloneable() {
         // The InflightResultCache shares Arc<DistributionResult> across
         // waiters; verify the type composes.
+        let shares = HashMap::from([(
+            AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap(),
+            1.0,
+        )]);
+        let balances = HashMap::new();
+        let fee = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap();
+        let distribution = build_weight_distribution(WeightDistributionInput {
+            address_shares: &shares,
+            balances: &balances,
+            fee_percent: 1.5,
+            fee_address: &fee,
+            coinbase_weight_budget: 50_000,
+            min_payout_sats: Some(Sats(5_000)),
+            finder_bonus_ppm: 0,
+            finder_address: None,
+            reference_revenue_sats: 312_500_000,
+            withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
+        })
+        .unwrap();
         let result = DistributionResult {
-            payouts: vec![CoinbaseDistributionEntry {
-                address: AddressId::new("bc1qfoo").unwrap(),
-                percent: 100.0,
-                sats: Sats(1_000),
-            }],
-            considered_addresses: HashSet::new(),
-            balance_after: HashMap::new(),
-            block_reward_sats: 312_500_000,
-            payouts_fingerprint: [0u8; 32],
+            distribution,
             snapshot_written: true,
         };
         let cloned = result.clone();
-        assert_eq!(cloned.block_reward_sats, 312_500_000);
-        assert_eq!(cloned.payouts.len(), 1);
+        assert_eq!(cloned.distribution.reference_revenue_sats, 312_500_000);
+        assert_eq!(cloned.payouts_fingerprint(), result.payouts_fingerprint());
     }
 }

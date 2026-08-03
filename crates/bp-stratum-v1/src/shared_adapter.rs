@@ -193,6 +193,7 @@ mod tests {
             &template,
             "test",
             bp_mining_job::EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .expect("build job");
 

@@ -172,6 +172,7 @@ async fn blockparty_two_member_block_accepted_by_core_and_history_idempotent() {
         &coinbase_template,
         "blockparty-lifecycle-regtest",
         EXTRANONCE_SLOT_LEN,
+        [0u8; 32],
     )
     .expect("build_mining_job_from_tdp");
 

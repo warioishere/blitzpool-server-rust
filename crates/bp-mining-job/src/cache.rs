@@ -101,6 +101,9 @@ type JobKeyTuple<'a> = (
     &'a [u8], // coinbase_tx_outputs
     u32,      // coinbase_tx_outputs_count
     u32,      // coinbase_tx_locktime
+    [u8; 32], // payouts_fingerprint — identical entries derived from a
+              // DIFFERENT distribution must not share a job, or a found
+              // block would book against the wrong settlement snapshot
 );
 
 fn job_key_tuple<'a>(
@@ -109,6 +112,7 @@ fn job_key_tuple<'a>(
     template: &TdpCoinbaseTemplate<'a>,
     pool_identifier: &'a str,
     extranonce_slot_size: usize,
+    payouts_fingerprint: [u8; 32],
 ) -> JobKeyTuple<'a> {
     (
         network,
@@ -122,6 +126,7 @@ fn job_key_tuple<'a>(
         template.coinbase_tx_outputs,
         template.coinbase_tx_outputs_count,
         template.coinbase_tx_locktime,
+        payouts_fingerprint,
     )
 }
 
@@ -151,6 +156,7 @@ struct JobKey {
     coinbase_tx_outputs: Vec<u8>,
     coinbase_tx_outputs_count: u32,
     coinbase_tx_locktime: u32,
+    payouts_fingerprint: [u8; 32],
 }
 
 impl JobKey {
@@ -169,6 +175,7 @@ impl JobKey {
             coinbase_tx_outputs,
             coinbase_tx_outputs_count,
             coinbase_tx_locktime,
+            payouts_fingerprint,
         } = self;
         (
             *network,
@@ -182,6 +189,7 @@ impl JobKey {
             coinbase_tx_outputs.as_slice(),
             *coinbase_tx_outputs_count,
             *coinbase_tx_locktime,
+            *payouts_fingerprint,
         )
     }
 }
@@ -467,6 +475,7 @@ impl MiningJobCache {
         template: &TdpCoinbaseTemplate<'_>,
         pool_identifier: &str,
         extranonce_slot_size: usize,
+        payouts_fingerprint: [u8; 32],
     ) -> Result<Arc<MiningJob>, MiningJobError> {
         if payouts.is_empty() {
             return Err(MiningJobError::NoPayouts);
@@ -478,6 +487,7 @@ impl MiningJobCache {
             template,
             pool_identifier,
             extranonce_slot_size,
+            payouts_fingerprint,
         );
         let job_hash = hash_tuple(&lookup);
         let reward = template.coinbase_tx_value_remaining;
@@ -510,6 +520,7 @@ impl MiningJobCache {
                 coinbase_tx_outputs: template.coinbase_tx_outputs.to_vec(),
                 coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
                 coinbase_tx_locktime: template.coinbase_tx_locktime,
+                payouts_fingerprint,
             },
             // Leader build. Error precedence mirrors
             // build_mining_job_from_tdp: ScriptSigTooLong before
@@ -527,9 +538,7 @@ impl MiningJobCache {
                     &payout_outputs,
                     template,
                     extranonce_slot_size,
-                    // Only on a cache miss — a job hit never reaches this
-                    // closure, so the hash runs once per distinct job.
-                    crate::coinbase::payouts_fingerprint(reward, payouts),
+                    payouts_fingerprint,
                 )))
             },
         )?;
@@ -700,10 +709,11 @@ mod tests {
         let cache = MiningJobCache::new();
 
         let cached = cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
         let direct =
-            build_mining_job_from_tdp(Network::Bitcoin, &payouts, &tmpl, "BP", 12).unwrap();
+            build_mining_job_from_tdp(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
+                .unwrap();
 
         assert_eq!(cached.coinbase_prefix(), direct.coinbase_prefix());
         assert_eq!(cached.coinbase_suffix(), direct.coinbase_suffix());
@@ -717,10 +727,10 @@ mod tests {
         let cache = MiningJobCache::new();
 
         let first = cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
         let second = cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
 
         assert!(
@@ -750,7 +760,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let tmpl = template(&prefix, &outputs);
                     cache
-                        .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+                        .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
                         .unwrap()
                 })
             })
@@ -793,7 +803,7 @@ mod tests {
                         },
                     ];
                     cache
-                        .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+                        .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
                         .unwrap()
                 })
             })
@@ -827,10 +837,10 @@ mod tests {
         }];
 
         let job_a = cache
-            .get_or_build(Network::Bitcoin, &payouts_a, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts_a, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
         let job_b = cache
-            .get_or_build(Network::Bitcoin, &payouts_b, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts_b, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
 
         assert!(!Arc::ptr_eq(&job_a, &job_b));
@@ -852,10 +862,10 @@ mod tests {
         payouts_b[1].sats -= 1;
 
         let job_a = cache
-            .get_or_build(Network::Bitcoin, &payouts_a, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts_a, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
         let job_b = cache
-            .get_or_build(Network::Bitcoin, &payouts_b, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts_b, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
 
         assert!(!Arc::ptr_eq(&job_a, &job_b));
@@ -872,10 +882,10 @@ mod tests {
         let cache = MiningJobCache::new();
 
         let job_12 = cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
         let job_16 = cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 16)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 16, [0u8; 32])
             .unwrap();
 
         assert!(!Arc::ptr_eq(&job_12, &job_16));
@@ -889,7 +899,8 @@ mod tests {
         // Both must match their direct-build equivalents.
         for (job, slot) in [(&job_12, 12), (&job_16, 16)] {
             let direct =
-                build_mining_job_from_tdp(Network::Bitcoin, &payouts, &tmpl, "BP", slot).unwrap();
+                build_mining_job_from_tdp(Network::Bitcoin, &payouts, &tmpl, "BP", slot, [0u8; 32])
+                    .unwrap();
             assert_eq!(job.coinbase_prefix(), direct.coinbase_prefix());
             assert_eq!(job.coinbase_suffix(), direct.coinbase_suffix());
         }
@@ -907,10 +918,10 @@ mod tests {
         let cache = MiningJobCache::new();
 
         let job_a = cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl_a, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl_a, "BP", 12, [0u8; 32])
             .unwrap();
         let job_b = cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl_b, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl_b, "BP", 12, [0u8; 32])
             .unwrap();
 
         assert!(!Arc::ptr_eq(&job_a, &job_b));
@@ -938,12 +949,12 @@ mod tests {
         }];
 
         assert!(matches!(
-            build_mining_job_from_tdp(Network::Bitcoin, &bad, &tmpl, "BP", 12),
+            build_mining_job_from_tdp(Network::Bitcoin, &bad, &tmpl, "BP", 12, [0u8; 32]),
             Err(MiningJobError::ScriptSigTooLong(_))
         ));
         let cache = MiningJobCache::new();
         assert!(matches!(
-            cache.get_or_build(Network::Bitcoin, &bad, &tmpl, "BP", 12),
+            cache.get_or_build(Network::Bitcoin, &bad, &tmpl, "BP", 12, [0u8; 32]),
             Err(MiningJobError::ScriptSigTooLong(_))
         ));
     }
@@ -954,7 +965,7 @@ mod tests {
         let tmpl = template(&prefix, &outputs);
         let cache = MiningJobCache::new();
         assert!(matches!(
-            cache.get_or_build(Network::Bitcoin, &[], &tmpl, "BP", 12),
+            cache.get_or_build(Network::Bitcoin, &[], &tmpl, "BP", 12, [0u8; 32]),
             Err(MiningJobError::NoPayouts)
         ));
         assert_eq!(cache.stats(), MiningJobCacheStats::default());
@@ -972,7 +983,7 @@ mod tests {
         }];
         for _ in 0..2 {
             assert!(matches!(
-                cache.get_or_build(Network::Bitcoin, &bad, &tmpl, "BP", 12),
+                cache.get_or_build(Network::Bitcoin, &bad, &tmpl, "BP", 12, [0u8; 32]),
                 Err(MiningJobError::InvalidAddress(_))
             ));
         }
@@ -994,11 +1005,11 @@ mod tests {
             sats: REWARD,
         }];
         let job = cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
         // Regtest lookup with the same payouts must NOT return the
         // mainnet job — it fails the parse instead of hitting.
-        let regtest = cache.get_or_build(Network::Regtest, &payouts, &tmpl, "BP", 12);
+        let regtest = cache.get_or_build(Network::Regtest, &payouts, &tmpl, "BP", 12, [0u8; 32]);
         assert!(regtest.is_err());
         drop(job);
     }
@@ -1011,7 +1022,7 @@ mod tests {
         let cache = MiningJobCache::new();
 
         cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
         assert_eq!(cache.entry_counts(), (1, 1));
 
@@ -1025,7 +1036,7 @@ mod tests {
 
         // And a rebuilt entry works fine afterwards.
         let again = cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
         assert!(!again.coinbase_prefix().is_empty());
         assert_eq!(cache.stats().jobs_built, 2);
@@ -1044,7 +1055,7 @@ mod tests {
         let cache = MiningJobCache::new();
 
         cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
         let built_at = cache.sole_outputs_last_used();
 
@@ -1054,7 +1065,7 @@ mod tests {
 
         // Pure job-hit: identical key.
         cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
         assert_eq!(cache.stats().job_hits, 1, "second call must be a job-hit");
 
@@ -1077,10 +1088,10 @@ mod tests {
         let cache = MiningJobCache::new();
 
         cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl_a, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl_a, "BP", 12, [0u8; 32])
             .unwrap();
         cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl_b, "BP", 12)
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl_b, "BP", 12, [0u8; 32])
             .unwrap();
 
         let job_arcs = cache.jobs.map_keys(|k| k.payouts.clone());

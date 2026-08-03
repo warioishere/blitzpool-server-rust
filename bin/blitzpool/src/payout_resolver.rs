@@ -51,15 +51,15 @@ use bp_common::{AddressId, MiningMode, Sats};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 /// Re-exported so the wiring keeps one import path for the solo split.
 pub(crate) use bp_mining_job::SoloFeeConfig;
-use bp_mining_job::{solo_payouts, PayoutEntry};
+use bp_mining_job::{solo_payouts, PayoutEntry, ResolvedPayouts};
 use bp_pplns::CoinbaseDistributionEntry;
 use bp_pplns_engine::engine::PplnsEngine;
-use tracing::warn;
+use bp_stratum_v2::jdp_server::TailoredDistribution;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::engines::BlitzpoolModeGate;
 
-/// Server-wide solo dev-fee config (mirrors
 /// The single production [`PayoutResolver`] impl. Holds clones of the
 /// engines + the mode gate; cheap to clone (each field is internally
 /// `Arc` or already-clone-friendly).
@@ -107,7 +107,7 @@ impl ProductionPayoutResolver {
         &self,
         miner_address: &str,
         reward_sats: u64,
-    ) -> (Vec<PayoutEntry>, bool) {
+    ) -> (ResolvedPayouts, bool) {
         let result = self.mode_gate.lookup_mode(miner_address);
         let vouchable = books_without_a_snapshot(result.mode);
         match result.mode {
@@ -123,42 +123,39 @@ impl ProductionPayoutResolver {
                     .blockparty_pending_fee_route(miner_address, reward_sats)
                     .await
                 {
-                    return (route, vouchable);
+                    return (ResolvedPayouts::unsnapshotted(route), vouchable);
                 }
                 (
-                    solo_payouts(miner_address, &self.solo_fee, reward_sats),
+                    ResolvedPayouts::unsnapshotted(solo_payouts(
+                        miner_address,
+                        &self.solo_fee,
+                        reward_sats,
+                    )),
                     vouchable,
                 )
             }
             MiningMode::Pplns => self.pplns_payouts(miner_address, reward_sats).await,
             MiningMode::Blockparty => (
-                self.blockparty_payouts(miner_address, reward_sats, result.group_id.as_deref())
-                    .await,
+                ResolvedPayouts::unsnapshotted(
+                    self.blockparty_payouts(miner_address, reward_sats, result.group_id.as_deref())
+                        .await,
+                ),
                 vouchable,
             ),
             MiningMode::GroupSolo => {
                 let Some(gid_str) = result.group_id.as_deref() else {
-                    warn!(
+                    error!(
                         miner_address,
-                        "GroupSolo mode published WITHOUT a group_id; falling back to solo \
-                         payouts so the coinbase is at least spendable"
+                        "GroupSolo mode published WITHOUT a group_id; serving NO JOB"
                     );
-                    // A Group-Solo address on a solo list: the booking path would
-                    // look for a snapshot this list never had.
-                    return (
-                        solo_payouts(miner_address, &self.solo_fee, reward_sats),
-                        false,
-                    );
+                    return (ResolvedPayouts::none(), false);
                 };
                 let Ok(group_id) = Uuid::parse_str(gid_str) else {
-                    warn!(
+                    error!(
                         miner_address,
-                        gid_str, "GroupSolo group_id failed to parse as UUID; falling back to solo"
+                        gid_str, "GroupSolo group_id failed to parse as UUID; serving NO JOB"
                     );
-                    return (
-                        solo_payouts(miner_address, &self.solo_fee, reward_sats),
-                        false,
-                    );
+                    return (ResolvedPayouts::none(), false);
                 };
                 self.group_solo_payouts(miner_address, reward_sats, group_id)
                     .await
@@ -186,60 +183,135 @@ fn books_without_a_snapshot(mode: MiningMode) -> bool {
     }
 }
 
-impl ProductionPayoutResolver {
-    /// Resolve payouts and say whether the pool could book a block found on
-    /// them.
-    ///
-    /// The plain resolver hides its fallbacks by design: when an engine is
-    /// unreachable it hands back a solo split so the miner still gets a
-    /// spendable coinbase. That is right for building a job and wrong for
-    /// accounting — a fallback list has no distribution snapshot behind it, so
-    /// nothing could ever be booked against it. The ext-0x0003 path needs to
-    /// tell the two apart before it promises a JD-client's block is bookable.
-    ///
-    /// The question is per mode, because only two modes resolve a snapshot at
-    /// all. Answering it as "did an engine build this" would withhold the
-    /// promise from the two modes that need no snapshot — and the promise gates
-    /// far more than the snapshot lookup: without it no block-found is emitted
-    /// at all, so the durable `blocks_entity` row, the notification and the
-    /// Blockparty history row would all go missing for a block the pool served.
-    pub(crate) async fn resolve_payouts_reporting_source(
-        &self,
-        miner_address: &AddressId,
-        reward_sats: u64,
-    ) -> (Vec<PayoutEntry>, bool) {
-        // One build, both answers. Anything else lets the promise describe a
-        // different outcome than the list it is attached to.
-        self.resolve_internal(miner_address.as_str(), reward_sats)
-            .await
+/// Does the pool serve this mode a payout distribution over JDP at all?
+///
+/// **Blockparty does not get one.** A Blockparty group is a rental: the
+/// hashrate is pointed straight at an address and the pool splits the
+/// coinbase by fixed per-member percentages read from Postgres. A
+/// job-declaring client exists so a miner can pick its own transaction
+/// set, which a rental customer neither does nor wants — so there is
+/// nothing for JDP to add, and the pool does not offer it.
+///
+/// This is a REFUSAL, not an omission. The Blockparty arm of
+/// `build_for_miner` used to build a tailored distribution from the
+/// Blockparty allocator, so the whole path existed and any Blockparty
+/// admin pointing a JDC at the pool would have exercised it — untested
+/// money surface for a feature that is not offered. Answering
+/// `Unavailable` denies the session the pool-wide distribution too (see
+/// [`TailoredDistribution`]), so it can declare nothing at all rather
+/// than declare something the pool cannot account for.
+///
+/// A `match`, not an `if`: which modes JDP serves is exactly the kind of
+/// per-mode decision a fourth mode must not be able to fall out of.
+fn jdp_serves_a_distribution(mode: MiningMode) -> bool {
+    match mode {
+        MiningMode::Pplns | MiningMode::Solo | MiningMode::GroupSolo => true,
+        MiningMode::Blockparty => false,
     }
+}
 
+/// Did the build fail because NOTHING in the window holds a share?
+///
+/// Matched as its own condition because it is the one build failure that
+/// must not become "serve no job": the window fills only from accepted
+/// shares and shares come only from jobs, so refusing would leave a fresh
+/// window unable to ever start. Every OTHER failure keeps the no-job
+/// answer — a window that cannot be read may be full of miners whose
+/// claims are simply invisible right now, and handing the block to one
+/// connecting miner would rob all of them.
+///
+/// Group-Solo needs no equivalent here: its builder always carries the
+/// prospective finder as the claimant (its cache is keyed per-finder), so
+/// this verdict never reaches its arm.
+fn is_empty_share_window(err: &bp_pplns_engine::engine::EngineError) -> bool {
+    match err {
+        bp_pplns_engine::engine::EngineError::Distribution(inner) => matches!(
+            **inner,
+            bp_pplns_engine::distribution::DistributionError::WeightBuild(
+                bp_pplns::WeightBuildError::NoScoredMiners
+            )
+        ),
+        _ => false,
+    }
+}
+
+impl ProductionPayoutResolver {
     /// Second half of the pair: could a block found on this list be booked? See
     /// [`Self::resolve_internal`].
     async fn pplns_payouts(
         &self,
         miner_address: &str,
         reward_sats: u64,
-    ) -> (Vec<PayoutEntry>, bool) {
+    ) -> (ResolvedPayouts, bool) {
         let Some(pplns) = self.pplns.as_ref() else {
             // PPLNS mode was published into the gate but the engine
             // is disabled at this deployment — config inconsistency.
             // Fall back to solo + warn.
-            warn!(
+            error!(
                 miner_address,
-                "PPLNS mode in gate but `[pplns]` is absent from config; falling back to solo"
+                "PPLNS mode in gate but `[pplns]` is absent from config; serving NO JOB"
             );
-            return (
-                solo_payouts(miner_address, &self.solo_fee, reward_sats),
-                false,
-            );
+            return (ResolvedPayouts::none(), false);
         };
-        match pplns.build_distribution(reward_sats).await {
+        // The pool-wide build first. It is shared by every PPLNS
+        // connection, so it cannot name a claimant — an empty window comes
+        // back as `NoScoredMiners` and is answered per-miner below.
+        let built = match pplns.build_distribution(reward_sats).await {
+            Ok(result) => Some(result),
+            Err(err) if is_empty_share_window(&err) => {
+                // Nobody in the window holds a share. The distribution the
+                // weight model would otherwise produce pays the WHOLE
+                // block to the pool output, and serving no job at all
+                // would deadlock a fresh window: the window only fills
+                // from accepted shares, and shares only come from jobs.
+                // So this miner claims the block — nobody else has a claim
+                // to lose, and the pool still takes exactly its fee.
+                match AddressId::new(miner_address.to_string()) {
+                    Ok(claimant) => {
+                        match pplns
+                            .build_bootstrap_distribution(reward_sats, &claimant)
+                            .await
+                        {
+                            Ok(result) => Some(result),
+                            Err(err) => {
+                                error!(
+                                    %err,
+                                    miner_address,
+                                    reward_sats,
+                                    "PPLNS window holds no scored miner and the bootstrap build \
+                                     failed too; serving NO JOB"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        error!(
+                            %err,
+                            miner_address,
+                            "PPLNS window holds no scored miner and the asking address will not \
+                             parse; serving NO JOB"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    %err,
+                    miner_address,
+                    reward_sats,
+                    "PPLNS distribution build failed; serving NO JOB until it succeeds"
+                );
+                None
+            }
+        };
+        match built {
             // The build can succeed while its snapshot write does not — the
             // engine keeps the distribution on purpose, because failing it would
             // hand this miner the whole block. But the fingerprint then names a
             // key that does not exist, so there is nothing to vouch for.
-            Ok(result) => {
+            Some(result) => {
                 if !result.snapshot_written {
                     warn!(
                         miner_address,
@@ -248,20 +320,34 @@ impl ProductionPayoutResolver {
                          stands, a block found on it cannot be booked automatically"
                     );
                 }
-                (entries_to_payouts(&result.payouts), result.snapshot_written)
+                // The §4 evaluation at this template's revenue — the
+                // same formula a JDC runs with its own template value.
+                match result.distribution.payout_entries_at(reward_sats) {
+                    Ok(entries) => (
+                        ResolvedPayouts {
+                            entries: entries
+                                .into_iter()
+                                .map(|(address, sats)| PayoutEntry {
+                                    address: address.into_inner(),
+                                    sats,
+                                })
+                                .collect(),
+                            payouts_fingerprint: result.payouts_fingerprint(),
+                        },
+                        result.snapshot_written,
+                    ),
+                    Err(err) => {
+                        error!(
+                            %err,
+                            miner_address,
+                            reward_sats,
+                            "PPLNS §4 evaluation failed; serving NO JOB"
+                        );
+                        (ResolvedPayouts::none(), false)
+                    }
+                }
             }
-            Err(err) => {
-                warn!(
-                    %err,
-                    miner_address,
-                    reward_sats,
-                    "PPLNS distribution build failed; falling back to solo coinbase"
-                );
-                (
-                    solo_payouts(miner_address, &self.solo_fee, reward_sats),
-                    false,
-                )
-            }
+            None => (ResolvedPayouts::none(), false),
         }
     }
 
@@ -343,7 +429,7 @@ impl ProductionPayoutResolver {
         miner_address: &str,
         reward_sats: u64,
         group_id: Uuid,
-    ) -> (Vec<PayoutEntry>, bool) {
+    ) -> (ResolvedPayouts, bool) {
         // The finder is the miner connecting on this share path; the
         // Group-Solo engine bumps the finder's payout via the
         // `finder_bonus_sats` config knob when emitting the
@@ -351,14 +437,11 @@ impl ProductionPayoutResolver {
         let finder = match AddressId::new(miner_address.to_string()) {
             Ok(a) => a,
             Err(_) => {
-                warn!(
+                error!(
                     miner_address,
-                    "GroupSolo miner address failed AddressId parse; falling back to solo"
+                    "GroupSolo miner address failed AddressId parse; serving NO JOB"
                 );
-                return (
-                    solo_payouts(miner_address, &self.solo_fee, reward_sats),
-                    false,
-                );
+                return (ResolvedPayouts::none(), false);
             }
         };
         match self
@@ -376,20 +459,42 @@ impl ProductionPayoutResolver {
                          coinbase stands, a block found on it cannot be booked automatically"
                     );
                 }
-                (entries_to_payouts(&result.payouts), result.snapshot_written)
+                // The §4 evaluation at this template's revenue.
+                match result.distribution.payout_entries_at(reward_sats) {
+                    Ok(entries) => (
+                        ResolvedPayouts {
+                            entries: entries
+                                .into_iter()
+                                .map(|(address, sats)| PayoutEntry {
+                                    address: address.into_inner(),
+                                    sats,
+                                })
+                                .collect(),
+                            payouts_fingerprint: result.payouts_fingerprint(),
+                        },
+                        result.snapshot_written,
+                    ),
+                    Err(err) => {
+                        error!(
+                            %err,
+                            miner_address,
+                            %group_id,
+                            reward_sats,
+                            "Group-Solo §4 evaluation failed; serving NO JOB"
+                        );
+                        (ResolvedPayouts::none(), false)
+                    }
+                }
             }
             Err(err) => {
-                warn!(
+                error!(
                     %err,
                     miner_address,
                     %group_id,
                     reward_sats,
-                    "Group-Solo distribution build failed; falling back to solo coinbase"
+                    "Group-Solo distribution build failed; serving NO JOB until it succeeds"
                 );
-                (
-                    solo_payouts(miner_address, &self.solo_fee, reward_sats),
-                    false,
-                )
+                (ResolvedPayouts::none(), false)
             }
         }
     }
@@ -399,7 +504,7 @@ impl ProductionPayoutResolver {
 
 #[async_trait]
 impl bp_stratum_v1::PayoutResolver for ProductionPayoutResolver {
-    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> Vec<PayoutEntry> {
+    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
         // Building a job needs the list, not the accounting promise.
         self.resolve_internal(miner_address, reward_sats).await.0
     }
@@ -419,7 +524,7 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
         &self,
         miner_address: &AddressId,
         reward_sats: u64,
-    ) -> Vec<PayoutEntry> {
+    ) -> ResolvedPayouts {
         self.resolve_internal(miner_address.as_str(), reward_sats)
             .await
             .0
@@ -427,6 +532,267 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
 
     fn resolve_stream(&self, miner_address: &AddressId) -> bp_common::StreamKind {
         bp_common::StreamKind::for_mode(self.mode_gate.lookup_mode(miner_address.as_str()).mode)
+    }
+}
+
+// ─── Ext 0x0003 distribution source (push model) ──────────────────
+
+/// Production [`bp_stratum_v2::jdp_server::PayoutDistributionSource`]:
+/// builds the pool-wide PPLNS distribution for the publisher and
+/// tailored distributions (Solo / Group-Solo / Blockparty) once an
+/// allocate reveals a session's identity, and allocates the §3.1
+/// strictly-increasing `distribution_id` via Redis.
+pub(crate) struct ProductionDistributionSource {
+    pub(crate) resolver: Arc<ProductionPayoutResolver>,
+    pub(crate) tdp: bp_template_distribution::TdpHandle,
+    pub(crate) redis: Option<redis::aio::ConnectionManager>,
+    pub(crate) network: bitcoin::Network,
+    /// Pool-output recipient for tailored distributions whose own
+    /// allocator has no pool output (plain Solo without a dev fee).
+    pub(crate) fee_address: Option<AddressId>,
+}
+
+impl ProductionDistributionSource {
+    fn reference_revenue(&self) -> Option<u64> {
+        self.tdp
+            .current_snapshot()
+            .new_template
+            .as_ref()
+            .map(|t| t.coinbase_tx_value_remaining)
+    }
+
+    /// Lower a weight-native engine distribution into the wire shape.
+    fn lower_weight_distribution(
+        &self,
+        d: &bp_pplns::WeightDistribution,
+        fingerprint: Option<[u8; 32]>,
+        bookable: bool,
+    ) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
+        let script_of = |addr: &str| -> Option<Vec<u8>> {
+            bp_mining_job::address_to_script(self.network, addr)
+                .ok()
+                .map(|s| s.to_bytes())
+        };
+        let pool_script = script_of(d.fee_address.as_str())?;
+        let mut payouts = Vec::new();
+        let mut dust_limits = Vec::new();
+        for entry in d.published() {
+            // A published entry whose script fails to derive would shift
+            // every §4 position — fail the whole build instead.
+            let script = script_of(entry.address.as_str())?;
+            payouts.push(bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
+                script_pubkey: script,
+                weight: entry.wire_weight,
+            });
+            dust_limits.push(entry.dust_limit);
+        }
+        Some(bp_stratum_v2::jdp_server::BuiltPayoutDistribution {
+            pool_payout: bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
+                script_pubkey: pool_script,
+                weight: d.weight_p,
+            },
+            payouts,
+            dust_limits,
+            additional_outputs: Vec::new(),
+            reference_reward_sats: d.reference_revenue_sats,
+            payouts_fingerprint: fingerprint,
+            bookable,
+        })
+    }
+
+    /// Sats-at-reference as weights, for the modes with their own exact
+    /// allocators (Solo / Blockparty — they settle by recompute, no
+    /// snapshot). `entries` in §4 order WITHOUT a pool output; the pool
+    /// output script comes from `pool_script_addr`.
+    fn lower_exact_entries(
+        &self,
+        pool_addr: &str,
+        pool_weight: u64,
+        entries: &[(String, u64)],
+        reference_reward_sats: u64,
+    ) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
+        let script_of = |addr: &str| -> Option<Vec<u8>> {
+            bp_mining_job::address_to_script(self.network, addr)
+                .ok()
+                .map(|s| s.to_bytes())
+        };
+        let pool_script = script_of(pool_addr)?;
+        let mut payouts = Vec::new();
+        let mut dust_limits = Vec::new();
+        for (addr, sats) in entries {
+            if *sats == 0 {
+                continue;
+            }
+            payouts.push(bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
+                script_pubkey: script_of(addr)?,
+                weight: *sats,
+            });
+            dust_limits.push(bp_pplns::DUST_LIMIT_SATS as u32);
+        }
+        Some(bp_stratum_v2::jdp_server::BuiltPayoutDistribution {
+            pool_payout: bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
+                script_pubkey: pool_script,
+                weight: pool_weight.max(1),
+            },
+            payouts,
+            dust_limits,
+            additional_outputs: Vec::new(),
+            reference_reward_sats,
+            // Solo books nothing; Blockparty settles by its own
+            // recompute + history row — both without a snapshot.
+            payouts_fingerprint: None,
+            bookable: true,
+        })
+    }
+}
+
+#[async_trait]
+impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistributionSource {
+    async fn build_pool_wide(&self) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
+        let t_ref = self.reference_revenue()?;
+        let pplns = self.resolver.pplns.as_ref()?;
+        let result = match pplns.build_distribution(t_ref).await {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(%err, "jdp distribution source: PPLNS build failed — nothing to publish");
+                return None;
+            }
+        };
+        self.lower_weight_distribution(
+            &result.distribution,
+            Some(result.payouts_fingerprint()),
+            result.snapshot_written,
+        )
+    }
+
+    async fn build_for_miner(&self, miner_address: &AddressId) -> TailoredDistribution {
+        // Everything below `Pplns` is a mode whose shares do NOT enter
+        // the PPLNS window, so every failure path here returns
+        // `Unavailable`, never `PoolWide`. Serving the pool-wide
+        // distribution to such a miner pays its block to the PPLNS
+        // window and books it under the PPLNS fingerprint.
+        let lookup = self.resolver.mode_gate.lookup_mode(miner_address.as_str());
+        if lookup.mode == MiningMode::Pplns {
+            return TailoredDistribution::PoolWide;
+        }
+        // Decided by mode BEFORE anything is built, and by an exhaustive
+        // `match` (see [`jdp_serves_a_distribution`]) so a mode cannot fall
+        // out of it silently.
+        if !jdp_serves_a_distribution(lookup.mode) {
+            warn!(
+                miner = miner_address.as_str(),
+                mode = ?lookup.mode,
+                "jdp distribution source: this mode is not served over JDP — serving NO \
+                 distribution"
+            );
+            return TailoredDistribution::Unavailable;
+        }
+        let Some(t_ref) = self.reference_revenue() else {
+            warn!(
+                miner = miner_address.as_str(),
+                "jdp distribution source: no reference revenue yet — no tailored distribution"
+            );
+            return TailoredDistribution::Unavailable;
+        };
+        let built = match lookup.mode {
+            MiningMode::Pplns => unreachable!("handled above"),
+            MiningMode::GroupSolo => {
+                let Some(group_id) = lookup
+                    .group_id
+                    .as_deref()
+                    .and_then(|gid| Uuid::parse_str(gid).ok())
+                else {
+                    warn!(
+                        miner = miner_address.as_str(),
+                        "jdp distribution source: group-solo miner without a usable group id"
+                    );
+                    return TailoredDistribution::Unavailable;
+                };
+                match self
+                    .resolver
+                    .group_solo
+                    .build_distribution(group_id, t_ref, miner_address)
+                    .await
+                {
+                    Ok(result) => self.lower_weight_distribution(
+                        &result.distribution,
+                        Some(result.payouts_fingerprint()),
+                        result.snapshot_written,
+                    ),
+                    Err(err) => {
+                        warn!(%err, miner = miner_address.as_str(),
+                            "jdp distribution source: group-solo build failed — no tailored distribution");
+                        None
+                    }
+                }
+            }
+            MiningMode::Solo => {
+                let entries: Vec<(String, u64)> =
+                    solo_payouts(miner_address.as_str(), &self.resolver.solo_fee, t_ref)
+                        .into_iter()
+                        .map(|p| (p.address, p.sats))
+                        .collect();
+                // The dev-fee output doubles as pool_payout when set;
+                // otherwise the configured pool fee address anchors
+                // `weight_P` (weight 1 ≈ dust dilution, §4 residual).
+                match self.resolver.solo_fee.dev_fee_address.clone() {
+                    Some(dev) => {
+                        let dev_weight = entries
+                            .iter()
+                            .find(|(a, _)| *a == dev)
+                            .map(|(_, s)| *s)
+                            .unwrap_or(1);
+                        let miners: Vec<(String, u64)> =
+                            entries.into_iter().filter(|(a, _)| *a != dev).collect();
+                        self.lower_exact_entries(&dev, dev_weight, &miners, t_ref)
+                    }
+                    None => match self.fee_address.as_ref() {
+                        Some(fee) => self.lower_exact_entries(fee.as_str(), 1, &entries, t_ref),
+                        None => {
+                            warn!(miner = miner_address.as_str(),
+                                "jdp distribution source: solo miner but no pool fee address configured");
+                            None
+                        }
+                    },
+                }
+            }
+            MiningMode::Blockparty => {
+                unreachable!("refused by jdp_serves_a_distribution above")
+            }
+        };
+        match built {
+            Some(b) => TailoredDistribution::Built(Box::new(b)),
+            // `lower_*` failed (unusable address / weight overflow).
+            // Still not the pool-wide distribution's problem.
+            None => TailoredDistribution::Unavailable,
+        }
+    }
+
+    async fn next_distribution_id(&self) -> Option<u64> {
+        let mut conn = self.redis.clone()?;
+        // Atomic floor-to-wallclock + INCR: strictly increasing across
+        // restarts, Redis wipes and concurrent fronts (§3.1). Two calls
+        // in the same millisecond still differ (the INCR).
+        const LUA: &str = r#"
+            local v = redis.call('GET', KEYS[1])
+            if (not v) or (tonumber(v) < tonumber(ARGV[1])) then
+                redis.call('SET', KEYS[1], ARGV[1])
+            end
+            return redis.call('INCR', KEYS[1])
+        "#;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        match redis::Script::new(LUA)
+            .key("jdp:distribution_id")
+            .arg(now_ms)
+            .invoke_async::<i64>(&mut conn)
+            .await
+        {
+            Ok(id) => Some(id as u64),
+            Err(err) => {
+                warn!(%err, "jdp distribution source: distribution-id allocation failed");
+                None
+            }
+        }
     }
 }
 
@@ -480,6 +846,28 @@ mod tests {
         // the list, or booking would name a snapshot nobody wrote.
         assert!(!books_without_a_snapshot(MiningMode::Pplns));
         assert!(!books_without_a_snapshot(MiningMode::GroupSolo));
+    }
+
+    /// Which modes JDP serves, pinned as a mode→answer decision.
+    ///
+    /// Blockparty is the refusal: a rental points its hashrate at an address
+    /// and the pool splits the coinbase from Postgres, so a job-declaring
+    /// client adds nothing. Before this, `build_for_miner` built a tailored
+    /// distribution for it out of the Blockparty allocator — a reachable,
+    /// untested money path for a feature the pool does not offer.
+    ///
+    /// The other three must stay served, or JDP silently stops working for
+    /// them: PPLNS rides the pool-wide distribution, Solo and Group-Solo get
+    /// a tailored one.
+    #[test]
+    fn jdp_serves_every_mode_except_blockparty() {
+        assert!(!jdp_serves_a_distribution(MiningMode::Blockparty));
+        for served in [MiningMode::Pplns, MiningMode::Solo, MiningMode::GroupSolo] {
+            assert!(
+                jdp_serves_a_distribution(served),
+                "{served:?} must keep its JDP distribution — refusing it serves no job at all"
+            );
+        }
     }
 
     #[test]

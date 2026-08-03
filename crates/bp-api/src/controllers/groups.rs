@@ -27,7 +27,7 @@ use axum::{
     routing::{delete, get, patch, post},
     Extension, Router,
 };
-use bp_common::{AddressId, Sats};
+use bp_common::AddressId;
 use bp_db::PatchField;
 use bp_group_mgmt::group::{PayoutMode, RoundResetPreset};
 use bp_group_mgmt_engine::{
@@ -89,10 +89,6 @@ where
 
     let public_routes = Router::new()
         .route("/api/pplns/groups/public", get(list_public::<H, M>))
-        .route(
-            "/api/pplns/groups/finder-bonus-cap",
-            get(finder_bonus_cap::<H, M>),
-        )
         .route(
             "/api/pplns/groups/coinbase-capacity",
             get(coinbase_capacity::<H, M>),
@@ -310,8 +306,18 @@ where
     }))
 }
 
+/// `deny_unknown_fields` so a client writing the RETIRED
+/// `finderBonusSats` is told, instead of being lied to.
+///
+/// Every field is `#[serde(default)]` (that is the PATCH semantics —
+/// absent means untouched), so without this a body carrying only
+/// `{"finderBonusSats": ...}` deserializes to all-untouched and the
+/// handler answers 200 with a summary that has no such key. The admin
+/// sees a successful save that changed nothing, and nothing is logged.
+/// A pool deployed ahead of its UI hits exactly that, so the failure
+/// has to be loud.
 #[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateSettingsBody {
     /// `Some(value)` → set to value, `Some("clear")` interpreted via the
     /// patch helper. We just default to Untouched/Set semantics; clear
@@ -323,7 +329,7 @@ struct UpdateSettingsBody {
     #[serde(default)]
     timezone: Option<Option<String>>,
     #[serde(default)]
-    finder_bonus_sats: Option<Option<i64>>,
+    finder_bonus_ppm: Option<Option<i32>>,
     #[serde(default)]
     is_public: Option<bool>,
     #[serde(default)]
@@ -351,23 +357,11 @@ where
     M: EmailHooks + 'static,
 {
     let svc = require_group_service(&state)?;
-    // Set-time guard: a finder bonus above the current block subsidy is almost
-    // certainly a mistake (e.g. 2 BTC when the subsidy is 3.125 and a halving
-    // is near). The coinbase builder already clamps the bonus to the real
-    // reward, so this never breaks a payout — it's an early, clear rejection.
-    // Skipped when no bitcoin RPC is wired (the cap can't be determined).
-    if let Some(Some(bonus)) = body.finder_bonus_sats {
-        if bonus > 0 {
-            if let Some(cap) = current_subsidy_ceiling_sats(&state).await {
-                if bonus as u64 > cap {
-                    return Err(ApiError::GroupService {
-                        code: "finder-bonus-exceeds-subsidy",
-                        status: StatusCode::BAD_REQUEST,
-                    });
-                }
-            }
-        }
-    }
+    // The bonus is a FRACTION of the miner cut now, so it cannot exceed
+    // the block by construction — the old "is this more sats than the
+    // subsidy?" guard (and its bitcoin-RPC lookup) has nothing left to
+    // catch. What remains is the plain range check, which the service
+    // layer's validator owns.
     let preset = match &body.preset {
         None => PatchField::Untouched,
         Some(None) => PatchField::Clear,
@@ -382,7 +376,7 @@ where
         preset,
         interval_days: lift_patch(&body.interval_days, |d| *d),
         timezone: lift_patch(&body.timezone, |t| t.clone()),
-        finder_bonus_sats: lift_patch(&body.finder_bonus_sats, |s| Sats(*s)),
+        finder_bonus_ppm: lift_patch(&body.finder_bonus_ppm, |p| *p),
         is_public: match body.is_public {
             None => PatchField::Untouched,
             Some(v) => PatchField::Set(v),
@@ -400,64 +394,23 @@ where
     Ok(Json(GroupSummary::from(row)))
 }
 
-/// Block subsidy in sats for `height` on `network`, per the standard halving
-/// schedule (regtest halves every 150 blocks, every other network every
-/// 210_000). Fee-independent — the pure coinbase subsidy. Shared with the
-/// next-block-reward endpoint (info.rs) to split coinbasevalue into
-/// subsidy + fees.
+/// Block subsidy in sats for `height` on `network`.
+///
+/// A thin network→interval mapping over [`bp_share::block_subsidy_sats`],
+/// which owns the halving math. Settlement gates on that same function
+/// (a coinbase paying less than its own subsidy is refused), so a second
+/// copy of the rule here is a copy that can drift from the one deciding
+/// whether a block gets booked.
+///
+/// Regtest halves every 150 blocks, every other network every 210 000.
+/// Heights beyond `i32` cannot describe a real block; they clamp, and
+/// the shared function answers 0 for them anyway.
 pub(crate) fn block_subsidy_sats(height: u64, network: bitcoin::Network) -> u64 {
-    let interval: u64 = match network {
-        bitcoin::Network::Regtest => 150,
-        _ => 210_000,
+    let interval = match network {
+        bitcoin::Network::Regtest => bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
+        _ => bp_share::SUBSIDY_HALVING_INTERVAL,
     };
-    let halvings = height / interval;
-    if halvings >= 64 {
-        return 0;
-    }
-    (50u64 * 100_000_000) >> halvings
-}
-
-/// Current finder-bonus ceiling: the subsidy of the next block (chain tip + 1).
-/// `None` when no bitcoin RPC is wired or the height read fails — the caller
-/// then skips the set-time check (the coinbase builder still clamps the bonus).
-async fn current_subsidy_ceiling_sats<H, M>(state: &SharedState<H, M>) -> Option<u64>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let rpc = state.bitcoin_rpc.as_ref()?;
-    let tip = rpc.get_block_count().await.ok()?;
-    Some(block_subsidy_sats(tip + 1, state.network))
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FinderBonusCap {
-    /// Next-block height the subsidy is computed for.
-    height: u64,
-    /// Max sensible finder bonus = current block subsidy, in sats. The UI
-    /// surfaces this as the input ceiling + hint.
-    subsidy_sats: u64,
-}
-
-/// `GET /api/pplns/groups/finder-bonus-cap` — the current block subsidy, so the
-/// admin UI can cap the finder-bonus input + show the limit.
-async fn finder_bonus_cap<H, M>(
-    State(state): State<SharedState<H, M>>,
-) -> Result<Json<FinderBonusCap>, ApiError>
-where
-    H: GroupServiceHooks + 'static,
-    M: EmailHooks + 'static,
-{
-    let rpc = state
-        .bitcoin_rpc
-        .as_ref()
-        .ok_or(ApiError::Unavailable("bitcoin-rpc not wired"))?;
-    let height = rpc.get_block_count().await? + 1;
-    Ok(Json(FinderBonusCap {
-        height,
-        subsidy_sats: block_subsidy_sats(height, state.network),
-    }))
+    bp_share::block_subsidy_sats(height.min(i32::MAX as u64) as i32, interval)
 }
 
 #[derive(Serialize)]
@@ -494,14 +447,15 @@ where
         .as_ref()
         .ok_or(ApiError::Unavailable("group-solo not wired"))?;
     let cfg = engine.config();
-    let has_fee_output = cfg.fee_address.is_some() && cfg.fee_percent > 0.0;
     Ok(Json(GroupCoinbaseCapacity {
-        max_members: bp_pplns_engine::max_coinbase_outputs(
-            cfg.coinbase_weight_budget,
-            has_fee_output,
-        ),
+        max_members: bp_pplns_engine::max_coinbase_outputs(cfg.coinbase_weight_budget),
         weight_budget: cfg.coinbase_weight_budget,
-        has_fee_output,
+        // Constant now, and the field's documented meaning is what became
+        // constant: §4 makes the pool output structural, so a slot is
+        // reserved at every fee. It used to report `false` for a 0 %-fee
+        // pool, which is precisely where the ceiling was one too high.
+        // Kept on the wire because the UI declares it; drop both together.
+        has_fee_output: true,
     }))
 }
 
@@ -799,7 +753,7 @@ struct GroupSummary {
     round_reset_preset: Option<String>,
     round_reset_interval_days: Option<i32>,
     round_reset_timezone: Option<String>,
-    finder_bonus_sats: i64,
+    finder_bonus_ppm: i32,
     last_round_reset_at: Option<String>,
     /// Computed next-reset wall-clock (ISO), derived from the preset +
     /// timezone + interval by [`compute_next_reset_at`]. `None` when the
@@ -841,7 +795,7 @@ impl From<bp_db::PplnsGroupRow> for GroupSummary {
             round_reset_preset: r.round_reset_preset,
             round_reset_interval_days: r.round_reset_interval_days,
             round_reset_timezone: r.round_reset_timezone,
-            finder_bonus_sats: r.finder_bonus_sats.map(|s| s.to_i64()).unwrap_or(0),
+            finder_bonus_ppm: r.finder_bonus_ppm.unwrap_or(0),
             last_round_reset_at: r
                 .last_round_reset_at
                 .map(crate::time_range::format_slot_label),
@@ -2242,6 +2196,39 @@ mod tests {
         s.map(|v| v == "1" || v == "true").unwrap_or(false)
     }
 
+    /// A settings PATCH from a pre-proportion UI must be REFUSED, not
+    /// silently no-op'd. Without `deny_unknown_fields` this body
+    /// deserializes to all-untouched and the caller gets a 200 for a
+    /// save that changed nothing.
+    #[test]
+    fn settings_patch_refuses_the_retired_finder_bonus_sats() {
+        let old_ui = r#"{"finderBonusSats": 50000000}"#;
+        assert!(
+            serde_json::from_str::<UpdateSettingsBody>(old_ui).is_err(),
+            "a bonus write in the retired unit must fail loudly, not report success"
+        );
+    }
+
+    /// The shapes the current UI actually sends — full and partial —
+    /// must all still deserialize, so the guard above cannot quietly
+    /// break the admin page it is meant to protect.
+    #[test]
+    fn settings_patch_accepts_every_shape_the_ui_sends() {
+        for body in [
+            r#"{"preset":"daily","intervalDays":null,"timezone":"Europe/Zurich",
+                "finderBonusPpm":32000,"resetRoundOnBlock":true}"#,
+            r#"{"maxMembers":25}"#,
+            r#"{"isPublic":true}"#,
+            r#"{"finderBonusPpm":null}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<UpdateSettingsBody>(body).is_ok(),
+                "current-UI payload must still parse: {body}"
+            );
+        }
+    }
+
     #[test]
     fn include_decided_accepts_one_and_true() {
         assert!(parse_include_decided(Some("1")));
@@ -2370,7 +2357,7 @@ mod tests {
             round_reset_preset: None,
             round_reset_interval_days: None,
             round_reset_timezone: None,
-            finder_bonus_sats: 0,
+            finder_bonus_ppm: 0,
             last_round_reset_at: None,
             next_reset_at: None,
             is_public: false,
@@ -2404,7 +2391,7 @@ mod tests {
             round_reset_preset: None,
             round_reset_interval_days: None,
             round_reset_timezone: None,
-            finder_bonus_sats: 0,
+            finder_bonus_ppm: 0,
             last_round_reset_at: None,
             next_reset_at: None,
             is_public: true,
@@ -2526,7 +2513,7 @@ mod tests {
                 round_reset_preset: None,
                 round_reset_interval_days: None,
                 round_reset_timezone: None,
-                finder_bonus_sats: 0,
+                finder_bonus_ppm: 0,
                 last_round_reset_at: None,
                 next_reset_at: None,
                 is_public: true,

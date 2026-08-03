@@ -9,7 +9,7 @@
 //! sensible defaults.
 
 use async_trait::async_trait;
-use bp_common::{AddressId, Sats};
+use bp_common::AddressId;
 use bp_db::PplnsGroupRow;
 use uuid::Uuid;
 
@@ -22,11 +22,6 @@ pub trait GroupServiceHooks: Send + Sync {
     /// kick-inactivity check uses this; `None` means "never mined" and
     /// the caller falls back to `joined_at`.
     async fn last_active_for_member(&self, group_id: Uuid, address: &AddressId) -> Option<i64>;
-
-    /// Pool-wide minimum payout threshold in sats. Used to reject
-    /// finder-bonus values below dust floor. Implementations should
-    /// return the pool's effective dust limit.
-    fn min_payout_sats(&self) -> Sats;
 
     /// Best-effort Redis cleanup after a member-kick. Receives the
     /// kicked address + the surviving member list (snapshot taken
@@ -75,9 +70,6 @@ pub trait MembershipChangeNotifier: Send + Sync {
 }
 
 /// Sentinel for tests + early wiring: every hook does nothing.
-/// `min_payout_sats` returns 1000 sats — enough for kick /
-/// round-reset paths to compute, but most tests override the
-/// per-call paths instead of relying on this constant.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopHooks;
 
@@ -85,10 +77,6 @@ pub struct NoopHooks;
 impl GroupServiceHooks for NoopHooks {
     async fn last_active_for_member(&self, _group_id: Uuid, _address: &AddressId) -> Option<i64> {
         None
-    }
-
-    fn min_payout_sats(&self) -> Sats {
-        Sats(1000)
     }
 
     async fn on_member_removed(

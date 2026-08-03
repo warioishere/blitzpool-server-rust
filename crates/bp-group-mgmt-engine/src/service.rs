@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use bp_common::{AddressId, Sats};
+use bp_common::AddressId;
 use bp_db::{PatchField, PplnsGroupMemberRow, PplnsGroupRow, RoundResetConfigPatch};
 use bp_group_mgmt::{
     constants::{MIN_MEMBERS_ACTIVE, MS_PER_DAY},
@@ -48,7 +48,7 @@ pub struct UpdateRoundResetSettings {
     pub preset: PatchField<RoundResetPreset>,
     pub interval_days: PatchField<u32>,
     pub timezone: PatchField<String>,
-    pub finder_bonus_sats: PatchField<Sats>,
+    pub finder_bonus_ppm: PatchField<i32>,
     pub is_public: PatchField<bool>,
     pub reset_round_on_block: PatchField<bool>,
     pub max_members: PatchField<i32>,
@@ -61,6 +61,19 @@ pub struct GroupService<H: GroupServiceHooks> {
     hooks: Arc<H>,
     address_cache: AddressCache,
     kick_inactivity_days: u32,
+    /// How many payout outputs the Group-Solo coinbase weight budget
+    /// can carry — the HARD member ceiling, above the operator's own
+    /// optional `maxMembers`.
+    ///
+    /// A group that outgrows its coinbase does not fail loudly: the
+    /// distribution's blockspace cut silently drops the members that no
+    /// longer fit, and they are paid nothing for that block. Refusing
+    /// the join instead keeps that case unreachable by construction,
+    /// which is what lets Group-Solo run without a ledger to carry the
+    /// difference. Derived from `[group_fees].coinbase_weight_budget`,
+    /// which is a fixed TOML value — unlike PPLNS, nothing rescales it
+    /// at runtime, so a cap checked against it cannot go stale.
+    coinbase_max_members: u64,
     /// Cross-mode collision reader. When wired, `create_group` and
     /// `add_member_without_admin` refuse addresses already in a
     /// Blockparty. Deployments without Blockparty leave it unset
@@ -80,14 +93,47 @@ impl<H: GroupServiceHooks> GroupService<H> {
     /// Wire a fresh service. The caller should call [`Self::rebuild_cache`]
     /// once at startup so the in-memory cache is hot before the stratum
     /// layer starts serving share submits.
-    pub fn new(pool: PgPool, hooks: Arc<H>, kick_inactivity_days: u32) -> Self {
+    ///
+    /// `coinbase_max_members` is the ceiling derived from the Group-Solo
+    /// coinbase weight budget (`bp_pplns::max_coinbase_outputs`). It is a
+    /// constructor argument rather than a setter on purpose: a group that
+    /// can outgrow its coinbase is the one thing the ledger-free payout
+    /// model has no answer for, so there must be no way to wire the
+    /// service without it.
+    pub fn new(
+        pool: PgPool,
+        hooks: Arc<H>,
+        kick_inactivity_days: u32,
+        coinbase_max_members: u64,
+    ) -> Self {
         Self {
             pool,
             hooks,
             address_cache: AddressCache::new(),
             kick_inactivity_days,
+            coinbase_max_members,
             blockparty_reader: Arc::new(std::sync::OnceLock::new()),
             change_notifier: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// The hard member ceiling this service enforces — how many payout
+    /// outputs the Group-Solo coinbase can carry.
+    pub fn coinbase_max_members(&self) -> u64 {
+        self.coinbase_max_members
+    }
+
+    /// The cap that actually applies to a group: the operator's own
+    /// `maxMembers` when set, never above what the coinbase can carry.
+    ///
+    /// `NULL` means "no operator limit", not "no limit" — the coinbase
+    /// ceiling still applies, so legacy rows are covered without a
+    /// migration.
+    fn effective_member_cap(&self, group_max_members: Option<i32>) -> i64 {
+        let coinbase_cap = self.coinbase_max_members.min(i64::MAX as u64) as i64;
+        match group_max_members {
+            Some(v) => (v as i64).min(coinbase_cap),
+            None => coinbase_cap,
         }
     }
 
@@ -321,11 +367,19 @@ impl<H: GroupServiceHooks> GroupService<H> {
         self.assert_not_in_blockparty(&normalized).await?;
 
         // Member cap — the single chokepoint every add path funnels through
-        // (directed invite, open invite link, approved join request). NULL =
-        // no limit. Enforced server-side so a UI-only block can't be bypassed.
-        let max_members = bp_db::find_group(&self.pool, group_id)
-            .await?
-            .and_then(|g| g.max_members);
+        // (directed invite, open invite link, approved join request).
+        // Enforced server-side so a UI-only block can't be bypassed.
+        //
+        // Two ceilings, and the lower one wins: the operator's own
+        // `maxMembers` (optional) and how many outputs the Group-Solo
+        // coinbase can carry (always). The second is not a preference —
+        // past it the blockspace cut drops members from the coinbase and
+        // they earn nothing for that block.
+        let max_members = self.effective_member_cap(
+            bp_db::find_group(&self.pool, group_id)
+                .await?
+                .and_then(|g| g.max_members),
+        );
 
         let now = now_ms();
         // DB-side atomic: insert member + recompute active in one TX —
@@ -335,12 +389,10 @@ impl<H: GroupServiceHooks> GroupService<H> {
         // the flag (the group would silently route no shares despite
         // having ≥ MIN_MEMBERS_ACTIVE members).
         let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
-        if let Some(max) = max_members {
-            // Count inside the TX so a concurrent add can't slip past the cap.
-            let current = bp_db::count_pplns_group_members_for_group(&mut *tx, group_id).await?;
-            if current >= max as i64 {
-                return Err(GroupServiceError::GroupFull); // tx rolls back on drop
-            }
+        // Count inside the TX so a concurrent add can't slip past the cap.
+        let current = bp_db::count_pplns_group_members_for_group(&mut *tx, group_id).await?;
+        if current >= max_members {
+            return Err(GroupServiceError::GroupFull); // tx rolls back on drop
         }
         let member = bp_db::insert_pplns_group_member(
             &mut *tx,
@@ -500,11 +552,17 @@ impl<H: GroupServiceHooks> GroupService<H> {
             }
         }
 
-        // maxMembers: null clears the cap, a positive integer >= 2 (the group
-        // member floor) sets it. Setting below the current count is allowed —
-        // no one is kicked, growth is just frozen.
+        // maxMembers: null clears the OPERATOR's cap, a positive integer >= 2
+        // (the group member floor) sets it. Setting below the current count is
+        // allowed — no one is kicked, growth is just frozen.
+        //
+        // The upper bound is the coinbase ceiling, not a round number: a
+        // `maxMembers` above it would be a promise the coinbase cannot keep,
+        // and clearing the field does not lift it either (see
+        // `effective_member_cap`). The UI reads the same number from
+        // `GET /api/pplns/groups/coinbase-capacity`.
         if let PatchField::Set(v) = &settings.max_members {
-            if *v < 2 || *v > 100_000 {
+            if *v < 2 || (*v as i64) > self.effective_member_cap(None) {
                 return Err(GroupServiceError::InvalidMaxMembers);
             }
         }
@@ -512,7 +570,7 @@ impl<H: GroupServiceHooks> GroupService<H> {
         // Build the resolved config we'd see after the PATCH applies —
         // needed for the cross-field validation that follows.
         let resolved = resolve_after_patch(&group, &settings);
-        validate_resolved_round_reset(&resolved, self.hooks.min_payout_sats())?;
+        validate_resolved_round_reset(&resolved)?;
 
         let patch = settings_to_db_patch(settings);
         let now = now_ms();
@@ -576,27 +634,24 @@ fn resolve_after_patch(
         PatchField::Clear => None,
         PatchField::Set(tz) => Some(tz.clone()),
     };
-    let finder_bonus_sats = match &settings.finder_bonus_sats {
-        PatchField::Untouched => current.finder_bonus_sats.unwrap_or(Sats(0)),
-        PatchField::Clear => Sats(0),
+    let finder_bonus_ppm = match &settings.finder_bonus_ppm {
+        PatchField::Untouched => current.finder_bonus_ppm.unwrap_or(0),
+        PatchField::Clear => 0,
         PatchField::Set(b) => *b,
     };
     RoundResetConfig {
         preset,
         interval_days,
         timezone,
-        finder_bonus_sats,
+        finder_bonus_ppm,
     }
 }
 
 /// Validate the post-patch config. Combines the pure-math validators
 /// from `bp-group-mgmt::group::validate_round_reset` with an IANA TZ
 /// check the pure crate deliberately leaves to the service layer.
-fn validate_resolved_round_reset(
-    resolved: &RoundResetConfig,
-    min_payout: Sats,
-) -> Result<(), GroupServiceError> {
-    bp_group_mgmt::group::validate_round_reset(resolved, min_payout).map_err(|e| {
+fn validate_resolved_round_reset(resolved: &RoundResetConfig) -> Result<(), GroupServiceError> {
+    bp_group_mgmt::group::validate_round_reset(resolved).map_err(|e| {
         use bp_group_mgmt::group::RoundResetError;
         match e {
             RoundResetError::IntervalWithoutCustomPreset
@@ -604,8 +659,7 @@ fn validate_resolved_round_reset(
             RoundResetError::MissingTimezone | RoundResetError::IntervalRequiredForCustom => {
                 GroupServiceError::IncompleteSchedule
             }
-            RoundResetError::FinderBonusOutOfRange(_)
-            | RoundResetError::FinderBonusSubMinPayout { .. } => GroupServiceError::InvalidBonus,
+            RoundResetError::FinderBonusOutOfRange(_) => GroupServiceError::InvalidBonus,
         }
     })?;
     // IANA TZ check happens here (service layer owns the TZ DB).
@@ -626,7 +680,7 @@ fn settings_to_db_patch(s: UpdateRoundResetSettings) -> RoundResetConfigPatch {
         // hour_local is hard-coded to 0 on every PATCH —
         // calendar resets fire at midnight local time, always.
         hour_local: PatchField::Set(0),
-        finder_bonus_sats: s.finder_bonus_sats.map_set(|sats| sats.to_i64()),
+        finder_bonus_ppm: s.finder_bonus_ppm,
         is_public: s.is_public,
         reset_round_on_block: s.reset_round_on_block,
         max_members: s.max_members,

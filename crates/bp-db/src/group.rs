@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Group-Solo group, members, balances, history, invitations, join-requests.
+//! Group-Solo group, members, history, invitations, join-requests.
 //!
 //! - `pplns_group` — group config (UUID PK)
 //! - `pplns_group_member` — auto-id row, UNIQUE on address (one membership per address pool-wide)
-//! - `pplns_group_balance` — composite PK (address, groupId)
 //! - `pplns_group_block_history` — UNIQUE (groupId, blockHeight, address)
 //! - `pplns_group_invitation` — token PK + status FSM
 //! - `pplns_group_join_request` — UUID PK + status FSM
@@ -41,10 +40,15 @@ pub struct PplnsGroupRow {
     pub round_reset_timezone: Option<String>,
     #[sqlx(rename = "lastRoundResetAt")]
     pub last_round_reset_at: Option<i64>,
-    /// Optional absolute-sats bonus emitted as its own coinbase output
-    /// to the block-finder when the group's round produces a block.
+    /// RETIRED: the fixed-satoshi finder bonus. Kept one release so the
+    /// ppm conversion (migration 0009) stays auditable; nothing reads it.
     #[sqlx(rename = "finderBonusSats")]
     pub finder_bonus_sats: Option<Sats>,
+    /// Finder bonus as a fraction of the miner cut, in parts-per-million.
+    /// A proportion rather than an amount, so §4 pays it exactly at every
+    /// template revenue — including a job-declaring client's own.
+    #[sqlx(rename = "finderBonusPpm")]
+    pub finder_bonus_ppm: Option<i32>,
     #[sqlx(rename = "roundResetPreset")]
     pub round_reset_preset: Option<String>,
     #[sqlx(rename = "isPublic")]
@@ -82,6 +86,7 @@ pub async fn find_group(pool: &PgPool, id: Uuid) -> Result<Option<PplnsGroupRow>
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
             "finderBonusSats" AS "finder_bonus_sats?: Sats",
+            "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
@@ -175,45 +180,6 @@ pub async fn find_pplns_group_members_for_group(
 }
 
 #[derive(Clone, Debug, FromRow)]
-pub struct PplnsGroupBalanceRow {
-    pub address: AddressId,
-    #[sqlx(rename = "groupId")]
-    pub group_id: Uuid,
-    #[sqlx(rename = "pendingSats")]
-    pub pending_sats: Sats,
-    #[sqlx(rename = "totalPaidSats")]
-    pub total_paid_sats: Sats,
-    #[sqlx(rename = "updatedAt")]
-    pub updated_at: i64,
-    #[sqlx(rename = "lastAcceptedShareAt")]
-    pub last_accepted_share_at: Option<i64>,
-}
-
-pub async fn find_group_balance(
-    pool: &PgPool,
-    address: &AddressId,
-    group_id: Uuid,
-) -> Result<Option<PplnsGroupBalanceRow>, DbError> {
-    sqlx::query_as!(
-        PplnsGroupBalanceRow,
-        r#"SELECT
-            address AS "address!: AddressId",
-            "groupId" AS "group_id!",
-            "pendingSats" AS "pending_sats!: Sats",
-            "totalPaidSats" AS "total_paid_sats!: Sats",
-            "updatedAt" AS "updated_at!",
-            "lastAcceptedShareAt" AS "last_accepted_share_at?"
-           FROM pplns_group_balance
-           WHERE address = $1 AND "groupId" = $2 LIMIT 1"#,
-        address.as_str(),
-        group_id
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::from)
-}
-
-#[derive(Clone, Debug, FromRow)]
 pub struct PplnsGroupBlockHistoryRow {
     pub id: i32,
     #[sqlx(rename = "groupId")]
@@ -291,78 +257,12 @@ pub async fn find_recent_group_block_history(
     .map_err(DbError::from)
 }
 
-// ── Group-Solo bulk writes ──────────────────────────────────────────
+// ── Group-Solo payout-history writes ────────────────────────────────
 //
-// Consumer: `bp-group-solo-engine::ledger::apply_distribution` writes
-// both `pplns_group_block_history` (audit log) and `pplns_group_balance`
-// (unsigned-pending ledger) inside one PG transaction. Dust-sweep
-// + scheduled-reset + member-kick paths use the single-row helpers.
-
-/// Absolute upsert into `pplns_group_balance` — sets each row's
-/// `pendingSats`, `totalPaidSats`, `updatedAt`, and (optionally)
-/// `lastAcceptedShareAt` to the caller-provided values. Idempotent.
-///
-/// Composite PK is `(address, groupId)` so the same `address` can
-/// belong to different groups simultaneously (e.g. an admin's address
-/// in multiple groups they administer).
-#[derive(Clone, Debug)]
-pub struct GroupBalanceUpsert {
-    pub address: String,
-    pub group_id: Uuid,
-    pub pending_sats: i64,
-    pub total_paid_sats: i64,
-    pub updated_at_ms: i64,
-    /// When `Some`, the column is also overwritten. When `None`, the
-    /// existing value is preserved on UPDATE / set to NULL on INSERT.
-    /// When `Some`, `applyDistribution` writes
-    /// `lastAcceptedShareAt = now` on every touched row.
-    pub last_accepted_share_at_ms: Option<i64>,
-}
-
-pub async fn bulk_upsert_pplns_group_balances<'e, E>(
-    executor: E,
-    rows: &[GroupBalanceUpsert],
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    if rows.is_empty() {
-        return Ok(0);
-    }
-    let addresses: Vec<String> = rows.iter().map(|r| r.address.clone()).collect();
-    let group_ids: Vec<Uuid> = rows.iter().map(|r| r.group_id).collect();
-    let pending: Vec<i64> = rows.iter().map(|r| r.pending_sats).collect();
-    let totals: Vec<i64> = rows.iter().map(|r| r.total_paid_sats).collect();
-    let updated: Vec<i64> = rows.iter().map(|r| r.updated_at_ms).collect();
-    // For `lastAcceptedShareAt` we need a parallel array carrying
-    // NULL for slots where the caller didn't specify one. sqlx's
-    // `Option<i64>` array round-trips as PG `bigint[]` with NULLs.
-    let last_at: Vec<Option<i64>> = rows.iter().map(|r| r.last_accepted_share_at_ms).collect();
-
-    let result = sqlx::query!(
-        r#"INSERT INTO pplns_group_balance
-             (address, "groupId", "pendingSats", "totalPaidSats", "updatedAt", "lastAcceptedShareAt")
-           SELECT * FROM UNNEST(
-             $1::text[], $2::uuid[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[]
-           )
-           ON CONFLICT (address, "groupId") DO UPDATE
-           SET "pendingSats"          = EXCLUDED."pendingSats",
-               "totalPaidSats"        = EXCLUDED."totalPaidSats",
-               "updatedAt"            = EXCLUDED."updatedAt",
-               "lastAcceptedShareAt"  = COALESCE(EXCLUDED."lastAcceptedShareAt",
-                                                 pplns_group_balance."lastAcceptedShareAt")"#,
-        &addresses,
-        &group_ids,
-        &pending,
-        &totals,
-        &updated,
-        &last_at as &[Option<i64>],
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
+// Consumer: `bp_group_solo_engine::history::apply_distribution` writes
+// one block's `pplns_group_block_history` rows inside one PG
+// transaction. There is no balance table behind it — Group-Solo pays
+// what the coinbase pays and owes nothing afterwards.
 
 /// Bulk-insert block-history rows for one block-found. `ON CONFLICT
 /// ("groupId", "blockHeight", address) DO NOTHING` gates replays.
@@ -424,192 +324,6 @@ where
     .await
     .map_err(DbError::from)?;
     Ok(result.rows_affected())
-}
-
-/// All `pplns_group_balance` rows for one group with a positive
-/// `pendingSats`. Consumed by `bp-group-solo-engine::distribution`
-/// when building a payout distribution — every member with an open
-/// pending claim is folded into the math.
-pub async fn find_pplns_group_balances_for_group(
-    pool: &PgPool,
-    group_id: Uuid,
-) -> Result<Vec<PplnsGroupBalanceRow>, DbError> {
-    sqlx::query_as!(
-        PplnsGroupBalanceRow,
-        r#"SELECT
-            address AS "address!: AddressId",
-            "groupId" AS "group_id!",
-            "pendingSats" AS "pending_sats!: Sats",
-            "totalPaidSats" AS "total_paid_sats!: Sats",
-            "updatedAt" AS "updated_at!",
-            "lastAcceptedShareAt" AS "last_accepted_share_at?"
-           FROM pplns_group_balance
-           WHERE "groupId" = $1 AND "pendingSats" > 0"#,
-        group_id,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::from)
-}
-
-/// EVERY `pplns_group_balance` row for one group, including those with
-/// `pendingSats = 0`. Consumed by `bp-group-solo-engine`'s block-found
-/// apply to read each touched member's prior `totalPaidSats` so the
-/// lifetime total accumulates. The `pendingSats > 0` filter on
-/// [`find_pplns_group_balances_for_group`] is wrong for this use: a
-/// member fully paid on-chain (pending = 0) would otherwise be invisible,
-/// and their `totalPaidSats` would be overwritten with the current block
-/// instead of summed across blocks.
-pub async fn find_all_pplns_group_balances_for_group(
-    pool: &PgPool,
-    group_id: Uuid,
-) -> Result<Vec<PplnsGroupBalanceRow>, DbError> {
-    sqlx::query_as!(
-        PplnsGroupBalanceRow,
-        r#"SELECT
-            address AS "address!: AddressId",
-            "groupId" AS "group_id!",
-            "pendingSats" AS "pending_sats!: Sats",
-            "totalPaidSats" AS "total_paid_sats!: Sats",
-            "updatedAt" AS "updated_at!",
-            "lastAcceptedShareAt" AS "last_accepted_share_at?"
-           FROM pplns_group_balance
-           WHERE "groupId" = $1"#,
-        group_id,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::from)
-}
-
-/// Dust-sweep candidate rows: positive `pendingSats` below the
-/// caller's `min_payout` floor, and `lastAcceptedShareAt` older than
-/// `cutoff_ms`. Group-Solo's sweep is single-sided (no pair-cancel),
-/// so this is the entire candidate set.
-pub async fn find_pplns_group_balances_dormant(
-    pool: &PgPool,
-    min_payout: i64,
-    cutoff_ms: i64,
-) -> Result<Vec<PplnsGroupBalanceRow>, DbError> {
-    sqlx::query_as!(
-        PplnsGroupBalanceRow,
-        r#"SELECT
-            address AS "address!: AddressId",
-            "groupId" AS "group_id!",
-            "pendingSats" AS "pending_sats!: Sats",
-            "totalPaidSats" AS "total_paid_sats!: Sats",
-            "updatedAt" AS "updated_at!",
-            "lastAcceptedShareAt" AS "last_accepted_share_at?"
-           FROM pplns_group_balance
-           WHERE "pendingSats" > 0
-             AND "pendingSats" < $1
-             AND "lastAcceptedShareAt" IS NOT NULL
-             AND "lastAcceptedShareAt" < $2"#,
-        min_payout,
-        cutoff_ms,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::from)
-}
-
-/// Single-row UPDATE of `pendingSats` for one (address, groupId).
-/// Preserves `totalPaidSats` and `updatedAt`. Used by the member-kick
-/// redistribution path where survivors get their balance increased.
-pub async fn update_pplns_group_balance_pending_sats<'e, E>(
-    executor: E,
-    address: &AddressId,
-    group_id: Uuid,
-    new_pending_sats: Sats,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let result = sqlx::query!(
-        r#"UPDATE pplns_group_balance
-           SET "pendingSats" = $1
-           WHERE address = $2 AND "groupId" = $3"#,
-        new_pending_sats.to_i64(),
-        address.as_str(),
-        group_id,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
-/// DELETE one (address, groupId) row. Used by dust-sweep when the
-/// pending balance gets absorbed + by member-kick admin flow.
-pub async fn delete_pplns_group_balance<'e, E>(
-    executor: E,
-    address: &AddressId,
-    group_id: Uuid,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let result = sqlx::query!(
-        r#"DELETE FROM pplns_group_balance WHERE address = $1 AND "groupId" = $2"#,
-        address.as_str(),
-        group_id,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
-/// DELETE all balance rows for one group. Used by the scheduled
-/// round-reset cron's full-wipe path + dissolve-group admin flow.
-pub async fn delete_pplns_group_balances_for_group<'e, E>(
-    executor: E,
-    group_id: Uuid,
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let result = sqlx::query!(
-        r#"DELETE FROM pplns_group_balance WHERE "groupId" = $1"#,
-        group_id,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
-/// Upsert-increment: add `delta_sats` to `pendingSats` for
-/// (address, groupId). Inserts a new row if none exists. Used by the
-/// member-kick redistribution flow to credit remaining members with
-/// the kicked member's accumulated pending balance.
-pub async fn add_pplns_group_balance_pending<'e, E>(
-    executor: E,
-    address: &AddressId,
-    group_id: Uuid,
-    delta_sats: i64,
-    now_ms: i64,
-) -> Result<(), DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    sqlx::query!(
-        r#"INSERT INTO pplns_group_balance
-               (address, "groupId", "pendingSats", "totalPaidSats", "updatedAt", "lastAcceptedShareAt")
-           VALUES ($1, $2, $3, 0, $4, $4)
-           ON CONFLICT (address, "groupId") DO UPDATE
-           SET "pendingSats" = pplns_group_balance."pendingSats" + EXCLUDED."pendingSats",
-               "lastAcceptedShareAt" = EXCLUDED."lastAcceptedShareAt",
-               "updatedAt" = EXCLUDED."updatedAt""#,
-        address.as_str(),
-        group_id,
-        delta_sats,
-        now_ms,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(())
 }
 
 /// DELETE all `pplns_group_block_history` rows for one group. Called
@@ -788,6 +502,7 @@ where
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
             "finderBonusSats" AS "finder_bonus_sats?: Sats",
+            "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
@@ -831,6 +546,7 @@ pub async fn find_pplns_group_by_name_not_dissolved(
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
             "finderBonusSats" AS "finder_bonus_sats?: Sats",
+            "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
@@ -865,6 +581,7 @@ pub async fn list_active_pplns_groups(pool: &PgPool) -> Result<Vec<PplnsGroupRow
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
             "finderBonusSats" AS "finder_bonus_sats?: Sats",
+            "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
@@ -969,7 +686,7 @@ pub struct RoundResetConfigPatch {
     pub interval_days: PatchField<i32>,
     pub timezone: PatchField<String>,
     pub hour_local: PatchField<i32>,
-    pub finder_bonus_sats: PatchField<i64>,
+    pub finder_bonus_ppm: PatchField<i32>,
     pub is_public: PatchField<bool>,
     pub reset_round_on_block: PatchField<bool>,
     pub max_members: PatchField<i32>,
@@ -1004,7 +721,7 @@ pub async fn update_pplns_group_round_reset_config(
     let (interval_write, interval_clear, interval_value) = patch_triple_i32(&patch.interval_days);
     let (tz_write, tz_clear, tz_value) = patch_triple_str(&patch.timezone);
     let (hour_write, hour_clear, hour_value) = patch_triple_i32(&patch.hour_local);
-    let (bonus_write, bonus_clear, bonus_value) = patch_triple_i64(&patch.finder_bonus_sats);
+    let (bonus_write, bonus_clear, bonus_value) = patch_triple_i32(&patch.finder_bonus_ppm);
     let (public_write, _public_clear, public_value) = patch_triple_bool(&patch.is_public);
     let (reset_on_block_write, _reset_on_block_clear, reset_on_block_value) =
         patch_triple_bool(&patch.reset_round_on_block);
@@ -1018,7 +735,7 @@ pub async fn update_pplns_group_round_reset_config(
              "roundResetIntervalDays" = CASE WHEN $5  THEN (CASE WHEN $6  THEN NULL::int      ELSE $7::int      END) ELSE "roundResetIntervalDays" END,
              "roundResetTimezone"     = CASE WHEN $8  THEN (CASE WHEN $9  THEN NULL::varchar  ELSE $10::varchar END) ELSE "roundResetTimezone"     END,
              "roundResetHourLocal"    = CASE WHEN $11 THEN (CASE WHEN $12 THEN NULL::int      ELSE $13::int     END) ELSE "roundResetHourLocal"    END,
-             "finderBonusSats"        = CASE WHEN $14 THEN (CASE WHEN $15 THEN NULL::bigint   ELSE $16::bigint  END) ELSE "finderBonusSats"        END,
+             "finderBonusPpm"         = CASE WHEN $14 THEN (CASE WHEN $15 THEN NULL::int      ELSE $16::int     END) ELSE "finderBonusPpm"         END,
              "isPublic"               = CASE WHEN $17 THEN $18 ELSE "isPublic" END,
              "resetRoundOnBlock"      = CASE WHEN $19 THEN $20 ELSE "resetRoundOnBlock" END,
              "maxMembers"             = CASE WHEN $21 THEN (CASE WHEN $22 THEN NULL::int ELSE $23::int END) ELSE "maxMembers" END,
@@ -1038,6 +755,7 @@ pub async fn update_pplns_group_round_reset_config(
             "roundResetTimezone" AS "round_reset_timezone?",
             "lastRoundResetAt" AS "last_round_reset_at?",
             "finderBonusSats" AS "finder_bonus_sats?: Sats",
+            "finderBonusPpm" AS "finder_bonus_ppm?",
             "roundResetPreset" AS "round_reset_preset?",
             "isPublic" AS "is_public!",
             "resetRoundOnBlock" AS "reset_round_on_block!",
@@ -1081,13 +799,6 @@ fn patch_triple_str(f: &PatchField<String>) -> (bool, bool, String) {
     }
 }
 fn patch_triple_i32(f: &PatchField<i32>) -> (bool, bool, i32) {
-    match f {
-        PatchField::Untouched => (false, false, 0),
-        PatchField::Clear => (true, true, 0),
-        PatchField::Set(v) => (true, false, *v),
-    }
-}
-fn patch_triple_i64(f: &PatchField<i64>) -> (bool, bool, i64) {
     match f {
         PatchField::Untouched => (false, false, 0),
         PatchField::Clear => (true, true, 0),

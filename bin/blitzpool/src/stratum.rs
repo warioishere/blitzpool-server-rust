@@ -58,7 +58,6 @@ use crate::stratum_v2::{self, StratumV2SpawnError};
 /// Long-lived stratum (SV1 + SV2) handle aggregate. Drop or call
 /// [`Self::shutdown`] to cancel every accept-loop + every
 /// per-connection task across both protocols.
-#[allow(dead_code)]
 pub(crate) struct StratumHandles {
     pub(crate) ports: Vec<u16>,
     listener_tasks: Vec<JoinHandle<()>>,
@@ -128,6 +127,10 @@ pub(crate) async fn spawn(
         Arc<crate::device_status_gate::Gate>,
         crate::device_status_gate::SubscribedAddresses,
     )>,
+    // ext 0x0003 §10: a block booked through a Stratum sink's immediate
+    // apply must invalidate the published payout distributions exactly
+    // like a JDP-declared one. Filled once the JDP server exists.
+    settle: crate::settlement::SettlementSignal,
 ) -> Result<StratumHandles, StratumSpawnError> {
     if foundation.tdp.is_none() {
         warn!("stratum: TDP missing (--skip-tdp); skipping unified SV1+SV2 listener bind");
@@ -180,6 +183,7 @@ pub(crate) async fn spawn(
         gate.clone(),
         Arc::clone(&live_sessions),
         job_cache.clone(),
+        settle.clone(),
     )?;
     let noise_config = stratum_v2::build_noise_config(cfg)?;
     let bridge = stratum_v2::build_bridge();
@@ -195,6 +199,7 @@ pub(crate) async fn spawn(
         gate,
         Arc::clone(&live_sessions),
         job_cache,
+        settle,
     );
 
     // Pair SV1 + SV2 servers by port. Both builders enumerate ports
@@ -380,7 +385,6 @@ async fn peek_first_byte(socket: &TcpStream) -> std::io::Result<Option<u8>> {
 }
 
 // Silence the `Arc` import warning when no other module needs it.
-#[allow(dead_code)]
 fn _silence_arc<T>(_: Arc<T>) {}
 
 #[cfg(test)]

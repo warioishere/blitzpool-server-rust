@@ -116,9 +116,6 @@ pub(crate) struct CapacityMonitorParams {
     /// The configured coinbase weight budget — used to derive
     /// `max_coinbase_outputs`.
     pub coinbase_budget: u32,
-    /// Whether the PPLNS fee output is present (consumes one output
-    /// slot from the capacity ceiling).
-    pub has_fee_output: bool,
 }
 
 // ─── Capacity monitor helpers ────────────────────────────────────
@@ -706,7 +703,7 @@ fn spawn_capacity_monitor(
 ) -> JoinHandle<()> {
     use std::collections::HashMap;
     tokio::spawn(async move {
-        let max = max_coinbase_outputs(params.coinbase_budget, params.has_fee_output);
+        let max = max_coinbase_outputs(params.coinbase_budget);
         let checker = CapacityChecker {
             coinbase_budget: params.coinbase_budget,
             env_var: "PPLNS_COINBASE_WEIGHT_BUDGET".to_string(),

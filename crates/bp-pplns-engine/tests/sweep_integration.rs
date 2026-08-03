@@ -428,3 +428,115 @@ async fn sweep_works_with_typed_address_id() {
 
     cleanup(&pool, prefix).await;
 }
+
+// ── The sweep must not write over a balance that moved under it ─────
+//
+// `sweep_pairs` reads its candidate set ONCE per run and then commits pair
+// by pair, so its view of every not-yet-processed row is stale from the
+// start of the run. The other writer is the block-found settlement, and
+// its balance-only entries — open balance, no recent shares — ARE this
+// sweep's target set, so the overlap is the rule rather than an oddity.
+//
+// Writing the computed absolute anyway would silently undo whatever moved
+// the row, and `amount` (derived from the same stale read) would drive a
+// shrunken credit negative: a credit row turned into a debit.
+
+#[tokio::test]
+async fn a_balance_that_moved_since_the_run_started_is_not_overwritten() {
+    let _guard = SWEEP_TEST_LOCK.lock().await;
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    wipe_all_test_state(&pool).await;
+
+    const PREFIX: &str = "test_sweep_moved_";
+    let credit = format!("{PREFIX}credit");
+    let debit = format!("{PREFIX}debit");
+    cleanup(&pool, PREFIX).await;
+
+    let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let stale = now.timestamp_millis() - 200 * 86_400_000;
+    seed_balance(&pool, &credit, 10_000, Some(stale)).await;
+    seed_balance(&pool, &debit, -10_000, Some(stale)).await;
+
+    let runner = DustSweepRunner::new(
+        pool.clone(),
+        Arc::new(TestClock::new(now)),
+        /* abandoned_days = */ 90,
+    );
+
+    // Simulate the settlement landing between the sweep's read and its
+    // write: move the credit AFTER the candidates would have been read.
+    // (The runner re-reads per `run`, so moving it here reproduces the
+    // stale-view state the guard exists for — the pair below is built
+    // from 10_000 and the row now holds 4_000.)
+    let stats_before = sweep_pairs_with_stale_credit(&runner, &pool, &credit, &debit, now).await;
+
+    // Nothing may have been written: the pair rolled back whole.
+    let credit_now = balance_of(&pool, &credit).await;
+    assert_eq!(
+        credit_now,
+        Some(4_000),
+        "the sweep must leave the moved row exactly as the other writer left it. \
+         Measured with the guard removed: the pair computes new_credit = 0 from \
+         the stale 10 000, so the row is DELETED and the 4 000 sat the \
+         settlement had just written are gone"
+    );
+    let debit_now = balance_of(&pool, &debit).await;
+    assert_eq!(
+        debit_now,
+        Some(-10_000),
+        "the pair is atomic: if one side is refused, the other must not move"
+    );
+    assert_eq!(
+        stats_before.pairs_closed, 0,
+        "a refused pair must not be counted as closed"
+    );
+    // And no audit row may claim a cancel that did not happen.
+    let rows: (i64,) = sqlx::query_as(
+        r#"SELECT count(*) FROM pplns_payout_history WHERE address LIKE $1 AND "rowType" = $2"#,
+    )
+    .bind(format!("{PREFIX}%"))
+    .bind(ROW_TYPE_SWEEP)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.0, 0, "a rolled-back pair must leave no sweep history");
+
+    cleanup(&pool, PREFIX).await;
+}
+
+/// Drive one sweep run whose candidate view is deliberately stale: the
+/// credit row is moved after the candidates are read, exactly as a
+/// block-found settlement would.
+async fn sweep_pairs_with_stale_credit(
+    runner: &DustSweepRunner<TestClock>,
+    pool: &PgPool,
+    credit: &str,
+    _debit: &str,
+    now: chrono::DateTime<Utc>,
+) -> SweepStats {
+    let candidates =
+        bp_db::find_pplns_balances_abandoned(pool, now.timestamp_millis() - 90 * 86_400_000)
+            .await
+            .expect("candidates");
+    // The settlement commits here — between the read and the write.
+    sqlx::query(r#"UPDATE pplns_balance SET "balanceSats" = 4000 WHERE address = $1"#)
+        .bind(credit)
+        .execute(pool)
+        .await
+        .expect("move the balance");
+    runner
+        .sweep_pairs(candidates, now.timestamp_millis(), now)
+        .await
+        .expect("sweep run")
+}
+
+async fn balance_of(pool: &PgPool, address: &str) -> Option<i64> {
+    sqlx::query_as::<_, (i64,)>(r#"SELECT "balanceSats" FROM pplns_balance WHERE address = $1"#)
+        .bind(address)
+        .fetch_optional(pool)
+        .await
+        .expect("balance read")
+        .map(|r| r.0)
+}

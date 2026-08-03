@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Production JDP hooks — Phase 7.4d.4.
+//! Production JDP hooks.
 //!
-//! Replaces the four `JdpServerHooks::no_op()` placeholders so a
+//! Replaces the `JdpServerHooks::no_op()` placeholders so a
 //! Job-Declaration-Client can actually go through the
 //! `AllocateMiningJobToken` → `DeclareMiningJob` →
 //! `ProvideMissingTransactions` → `PushSolution` choreography against
-//! a real pool template + real block submission to bitcoin-core.
+//! a real pool template + real block submission to bitcoin-core. The
+//! fifth hook slot — the ext 0x0003 `PayoutDistributionSource` — is
+//! wired by `jdp::spawn` from
+//! [`crate::payout_resolver::ProductionDistributionSource`], not here.
 //!
-//! ## The four hooks
+//! ## The hooks built here
 //!
 //! 1. **[`ProductionJdpAllocateResolver`]** — parses the JDC's
-//!    `user_identifier` as a BTC address, calls into
-//!    [`bp_mining_mode::ModeResolver`]-equivalent (via the same
+//!    `user_identifier` as a BTC address and resolves the token's
+//!    coinbase outputs via the same
 //!    [`crate::payout_resolver::ProductionPayoutResolver`] the SV1/SV2
-//!    mining paths use), and encodes the resolved single-output
-//!    coinbase as a consensus-serialised `Vec<TxOut>` blob through
+//!    mining paths use, consensus-serialised through
 //!    [`bp_stratum_v2::jdp::dynamic_outputs::encode_coinbase_outputs`].
-//!    Pre-7.4d.4 was a stub returning `[0x00]`; production rejects
+//!    With ext 0x0003 negotiated the outputs are empty per spec §2 —
+//!    the pushed payout distribution replaces them. Production rejects
 //!    JDC connections with unparseable identifiers (the spec says
 //!    "JDS MAY accept any identifier"; we choose to require a parseable
 //!    BTC address — typical JDC operators run their own dev-fee
@@ -45,8 +48,9 @@
 //!    both things that want it. First the **orphan-protection
 //!    redundancy** resubmit via [`BitcoinRpc::submit_block`]: the JDC
 //!    also submits via its own TDP connection, so the pool-side submit
-//!    is a hot-path Anti-Orphan measure consistent with the SV2 spec
-//!    §6.4.9 "JDS SHOULD propagate". Then the payout ledger, which
+//!    is the pool's half of the redundancy §6.4.9 asks for ("JDS MUST
+//!    attempt to reconstruct and propagate the block" — a MUST, not a
+//!    SHOULD). Then the payout ledger, which
 //!    books the block only once its header proves work against the
 //!    pool's OWN target and tip. Either half can be switched off
 //!    (`[sv2].jdp_orphan_submitblock`, no ledger fan-out wired) without
@@ -66,16 +70,11 @@ use bitcoin::{BlockHash, Network as BitcoinNetwork, TxMerkleNode};
 use bp_bitcoin::BitcoinRpc;
 use bp_common::{AddressId, Sats};
 use bp_mining_job::PayoutEntry;
-use bp_stratum_v2::jdp::client::{
-    parse_user_identifier_as_address, AllocateTokenContext, PayoutOutputsResolution,
-};
-use bp_stratum_v2::jdp::dynamic_outputs::{
-    coinbase_outputs_fit_reservation, encode_coinbase_outputs, fold_residual_to_exact_sum,
-    DynamicOutput, PayoutBooking,
-};
+use bp_stratum_v2::jdp::client::{parse_user_identifier_as_address, AllocateTokenContext};
+use bp_stratum_v2::jdp::dynamic_outputs::{encode_coinbase_outputs, DynamicOutput, PayoutBooking};
 use bp_stratum_v2::jdp_server::{
     CurrentPrevHashProvider, JdpAllocateResolver, JdpBlockSubmissionSink, JdpServerHooks,
-    PayoutOutputsResolver, TemplateTxProvider,
+    PayoutDistributionSource, TemplateTxProvider,
 };
 use bp_stratum_v2::mining::submit::assemble_witness_coinbase;
 use bp_stratum_v2::tokens::Token;
@@ -94,6 +93,7 @@ use crate::payout_resolver::ProductionPayoutResolver;
 /// TDP connection and the pool only reports the block. Source:
 /// `[sv2].jdp_orphan_submitblock` in the TOML. `ledger_booker` switches
 /// the other half, independently.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_jdp_hooks(
     tdp: TdpHandle,
     bitcoin_rpc: BitcoinRpc,
@@ -102,18 +102,21 @@ pub(crate) fn build_jdp_hooks(
     network: BitcoinNetwork,
     orphan_submitblock_enabled: bool,
     ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
+    distribution_source: Arc<dyn PayoutDistributionSource>,
+    settle: crate::settlement::SettlementSignal,
+    job_validator: Option<Arc<dyn DeclaredJobValidator>>,
 ) -> JdpServerHooks {
     let propagator: Option<Arc<dyn BlockPropagator>> = if orphan_submitblock_enabled {
         info!(
-            "jdp: orphan-protection submitblock RPC ENABLED \
-             (`[sv2].jdp_orphan_submitblock = true`)"
+            "jdp: pool-side block propagation ENABLED (submitblock RPC) — \
+             the pool's half of the §6.4.9 redundancy"
         );
         Some(Arc::new(bitcoin_rpc))
     } else {
         info!(
-            "jdp: orphan-protection submitblock RPC DISABLED — JDC is sole \
-             block propagator (set `[sv2].jdp_orphan_submitblock = true` to enable \
-             pool-side resubmit for commercial JDC deployments)"
+            "jdp: pool-side block propagation DISABLED \
+             (`[sv2].jdp_orphan_submitblock = false`) — the JDC is the sole \
+             propagator, so the pool does not do what §6.4.9 asks of a JDS"
         );
         None
     };
@@ -127,23 +130,22 @@ pub(crate) fn build_jdp_hooks(
         booker: ledger_booker.map(|b| b as Arc<dyn DeclaredBlockBooker>),
         chain: Arc::new(tdp.clone()),
         booked: StdMutex::new(VecDeque::new()),
+        network,
+        settle,
     });
     JdpServerHooks {
         allocate_resolver: Arc::new(ProductionJdpAllocateResolver {
-            payout_resolver: payout_resolver.clone(),
+            payout_resolver,
             tdp: tdp.clone(),
             network,
         }),
         template_tx_provider: Arc::new(TdpTemplateTxProvider {
             cache: template_tx_cache,
         }),
-        prev_hash_provider: Arc::new(TdpCurrentPrevHashProvider { tdp: tdp.clone() }),
+        prev_hash_provider: Arc::new(TdpCurrentPrevHashProvider { tdp }),
         block_submission_sink: block_sink,
-        payout_outputs_resolver: Arc::new(ProductionPayoutOutputsResolver {
-            payout_resolver,
-            tdp,
-            network,
-        }),
+        distribution_source,
+        job_validator,
     }
 }
 
@@ -161,8 +163,19 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         &self,
         user_identifier: &str,
         _remote_addr: &str,
+        payout_distribution_negotiated: bool,
     ) -> Option<AllocateTokenContext> {
         let miner_address = parse_user_identifier_as_address(user_identifier)?;
+
+        // ext 0x0003 negotiated ⇒ the published payout distribution
+        // replaces the base §6.4.3 output semantics and §2 REQUIRES
+        // `coinbase_tx_outputs` to be empty — don't build outputs at all.
+        if payout_distribution_negotiated {
+            return Some(AllocateTokenContext {
+                miner_address,
+                coinbase_outputs: Vec::new(),
+            });
+        }
 
         // Reward estimate for the upcoming block — read the latest TDP
         // template's `coinbase_tx_value_remaining`. If TDP hasn't seen
@@ -188,41 +201,35 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         )
         .await;
 
-        if payouts.is_empty() {
+        if payouts.entries.is_empty() {
             warn!(
                 user_identifier,
                 "JDP allocate: PayoutResolver returned empty payouts; using single-output fallback"
             );
             return Some(AllocateTokenContext {
                 miner_address: miner_address.clone(),
-                coinbase_outputs: solo_fallback_outputs(&miner_address, self.network),
+                coinbase_outputs: solo_fallback_outputs(&miner_address, self.network)?,
             });
         }
 
         // Convert each PayoutEntry to a DynamicOutput, placing the exact
         // per-output sats the distributor already computed verbatim — no
         // percent re-derivation (see `payouts_to_dynamic_outputs`).
-        let outputs = payouts_to_dynamic_outputs(&payouts);
+        let outputs = payouts_to_dynamic_outputs(&payouts.entries);
         match encode_coinbase_outputs(self.network, &outputs) {
             Ok(bytes) => Some(AllocateTokenContext {
                 miner_address,
                 coinbase_outputs: bytes,
             }),
             Err(err) => {
+                // Refuse the allocate outright. An unencodable output set
+                // must not degrade into a bogus 1-byte blob the JDC would
+                // size its coinbase reservation from.
                 warn!(
                     %err,
-                    user_identifier, "JDP allocate: encode_coinbase_outputs failed; falling back"
+                    user_identifier, "JDP allocate: encode_coinbase_outputs failed; refusing"
                 );
-                Some(AllocateTokenContext {
-                    miner_address: AddressId::new(
-                        payouts
-                            .first()
-                            .map(|p| p.address.clone())
-                            .unwrap_or_default(),
-                    )
-                    .ok()?,
-                    coinbase_outputs: vec![0u8],
-                })
+                None
             }
         }
     }
@@ -255,14 +262,15 @@ fn payouts_to_dynamic_outputs(payouts: &[PayoutEntry]) -> Vec<DynamicOutput> {
 
 /// Last-ditch fallback: a single 100%-to-miner output, no fee
 /// allocation. Used when the PayoutResolver returns nothing
-/// (shouldn't happen in production — but ensures the JDC always
-/// receives a parseable token rather than an `AllocateMiningJobToken.Error`).
-fn solo_fallback_outputs(miner: &AddressId, network: BitcoinNetwork) -> Vec<u8> {
+/// (shouldn't happen in production). `None` when even that single
+/// output cannot be encoded — the allocate is then refused rather than
+/// answered with a blob the JDC would mis-size its reservation from.
+fn solo_fallback_outputs(miner: &AddressId, network: BitcoinNetwork) -> Option<Vec<u8>> {
     let outputs = vec![DynamicOutput {
         address: miner.clone(),
         sats: Sats(312_500_000),
     }];
-    encode_coinbase_outputs(network, &outputs).unwrap_or(vec![0u8])
+    encode_coinbase_outputs(network, &outputs).ok()
 }
 
 // ─── 2. TdpTemplateTxProvider ────────────────────────────────────
@@ -270,9 +278,10 @@ fn solo_fallback_outputs(miner: &AddressId, network: BitcoinNetwork) -> Vec<u8> 
 /// Production tx-provider: pulls the newest template's
 /// `wtxid → raw_witness_tx` map from the long-lived
 /// [`TemplateTxCache`] when present. The cache is gated on
-/// `[sv2].jdp_orphan_submitblock = true` (see `main.rs`); in default
-/// mode (orphan-resubmit off) the cache is `None` and snapshot returns
-/// an empty map — the JDC then fills in via the standard
+/// `[sv2].jdp_orphan_submitblock` (see `main.rs`), which now defaults to
+/// on — the pool needs the raw txs to rebuild a JDC block it propagates.
+/// With the switch off the cache is `None` and snapshot returns an empty
+/// map; the JDC then fills in every tx via the standard
 /// `ProvideMissingTransactions` round-trip.
 ///
 /// A cache-miss with the cache present means either the cache hasn't
@@ -353,47 +362,6 @@ impl BlockPropagator for BitcoinRpc {
 /// Shortest byte count that can hold a transaction's version + locktime, which
 /// is what the witness-form assembly indexes against.
 const MIN_COINBASE_LEN: usize = 8;
-
-/// How far a JD-client's reported payout value may sit from what the pool's own
-/// template says, in either direction, and still be booked automatically.
-///
-/// Separate from the `revenue-too-large` ceiling on purpose. That one decides
-/// whether a coinbase gets built at all and is generous, because a client
-/// whose mempool is fuller than the pool's really does pay more and refusing
-/// it would break honest mining. This one decides whether the pool writes a
-/// number into its ledger, where being generous means crediting miners for
-/// money the block never paid — and in a non-custodial pool that credit is
-/// what the next block's coinbase pays out.
-///
-/// The margin covers ordinary mempool divergence between two nodes; anything
-/// beyond it is served but not vouched for, and the chain→ledger check reports
-/// the block if it turns out to have been real.
-const BOOKABLE_DIVERGENCE_DIVISOR: u64 = 4;
-
-/// The most a client may report and still be booked.
-fn bookable_ceiling(pool_template_value: u64) -> u64 {
-    pool_template_value.saturating_add(pool_template_value / BOOKABLE_DIVERGENCE_DIVISOR)
-}
-
-/// The least it may report and still be booked.
-///
-/// A ceiling alone leaves the gate open in the direction that costs the most.
-/// `available_payout_value` is what the client hands the pool to distribute, and
-/// it is free to keep the rest — so an understated value is not malformed, it is
-/// a client keeping more. But booking one settles the whole PPLNS window or group
-/// round against it: report a few thousand sats for a block paying 3.125 BTC and
-/// the round is closed out, balances written and reset, for pocket change. The
-/// coinbase is still served; only the promise is withheld.
-fn bookable_floor(pool_template_value: u64) -> u64 {
-    pool_template_value.saturating_sub(pool_template_value / BOOKABLE_DIVERGENCE_DIVISOR)
-}
-
-/// Is the client's reported payout value close enough to the pool's own template
-/// to be written into the ledger?
-fn reported_value_is_bookable(available_payout_value: u64, pool_template_value: u64) -> bool {
-    available_payout_value >= bookable_floor(pool_template_value)
-        && available_payout_value <= bookable_ceiling(pool_template_value)
-}
 
 /// What the pool's own node says the next block must satisfy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -486,6 +454,7 @@ impl ChainView for TdpHandle {
 /// it in-process, gets discarded as a duplicate.
 #[async_trait]
 pub(crate) trait DeclaredBlockBooker: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     async fn book(
         &self,
         miner_address: String,
@@ -494,6 +463,7 @@ pub(crate) trait DeclaredBlockBooker: Send + Sync {
         block_hash: String,
         block_data: String,
         payouts_fingerprint: [u8; 32],
+        actual_coinbase: Option<bp_coinbase_snapshot::ActualCoinbase>,
     ) -> bool;
 }
 
@@ -507,6 +477,7 @@ impl DeclaredBlockBooker for crate::block_sink::TdpBlockSubmissionSink {
         block_hash: String,
         block_data: String,
         payouts_fingerprint: [u8; 32],
+        actual_coinbase: Option<bp_coinbase_snapshot::ActualCoinbase>,
     ) -> bool {
         self.book_declared_block_found(
             miner_address,
@@ -515,6 +486,7 @@ impl DeclaredBlockBooker for crate::block_sink::TdpBlockSubmissionSink {
             block_hash,
             block_data,
             payouts_fingerprint,
+            actual_coinbase,
         )
         .await
     }
@@ -613,6 +585,14 @@ pub(crate) struct ProductionJdpBlockSink {
     /// twice. Bounded — only the newest few matter, a repeat arrives right
     /// after the original.
     booked: StdMutex<VecDeque<[u8; 32]>>,
+    /// Address-display network for decomposing the block's coinbase into
+    /// per-address payments (the weight-model settlement input).
+    network: BitcoinNetwork,
+    /// ext 0x0003 §10 settlement hook, filled in by `jdp::spawn` once the
+    /// JDP server exists (the sink is built first). A booked block settles
+    /// the distribution its coinbase paid — every published distribution
+    /// is then invalidated and a fresh one force-published.
+    settle: crate::settlement::SettlementSignal,
 }
 
 /// How many recently-booked block hashes are remembered for the repeat check.
@@ -701,18 +681,36 @@ impl ProductionJdpBlockSink {
             );
             return;
         }
+        // The block's own coinbase is the settlement ground truth —
+        // `claim − paid` is booked from what it ACTUALLY pays. The
+        // recorded reward is that coinbase's total; the distribution's
+        // reference revenue is only the fallback when the block has no
+        // parseable coinbase (which `block_is_proven` all but excludes).
+        let actual = block
+            .txdata
+            .first()
+            .map(|cb| bp_coinbase_snapshot::ActualCoinbase::from_coinbase(cb, self.network));
+        let reward_sats = actual
+            .as_ref()
+            .map(|a| a.total_value_sats)
+            .unwrap_or(booking.reference_reward_sats);
         let booked = booker
             .book(
                 miner_address.as_str().to_string(),
                 hex::encode(new_token.0),
-                booking.block_reward_sats,
+                reward_sats,
                 hash.to_string(),
                 serialize_hex(&block.header),
                 booking.payouts_fingerprint,
+                actual,
             )
             .await;
         if booked {
             self.remember_booked(hash.to_byte_array());
+            // §10: the booking IS the settlement event — the grace window
+            // must not span it. Invalidate every published distribution and
+            // force a fresh publish.
+            self.settle.settle().await;
         } else {
             warn!(
                 miner = miner_address.as_str(),
@@ -799,299 +797,338 @@ impl JdpBlockSubmissionSink for ProductionJdpBlockSink {
     }
 }
 
-// ─── 5. ProductionPayoutOutputsResolver (ext 0x0003) ────────────────
-
-/// Production resolver for ext 0x0003 `RequestPayoutOutputs` —
-/// PPLNS / Group-Solo non-custodial multi-output coinbases.
-///
-/// The JDC sends `RequestPayoutOutputs(token, available_payout_value)`
-/// per declared job; we re-route through the same
-/// [`ProductionPayoutResolver`] that drives the SV1/SV2-mining +
-/// AllocateMiningJobToken paths. Difference vs. AllocateMiningJobToken:
-/// the resolver is invoked **per job** with the JDC-reported
-/// `available_payout_value`, so PPLNS distributions reflect the actual
-/// block reward (no estimate drift; see spec §1).
-///
-/// **Solo mode**: when the extension is NOT negotiated, the
-/// AllocateMiningJobToken single-output path applies unchanged. We
-/// still service ext 0x0003 requests in solo mode (the JDC may
-/// negotiate the extension regardless of pool's payout model) — we
-/// emit a single 100 %-to-miner output, equivalent to what the JDC
-/// would derive from the AllocateMiningJobToken fallback.
-///
-/// **No stale check here**: spec §4 makes freshness a *validator-side*
-/// property — the JDS rejects a stale/superseded payout set at
-/// declare-time (single-use tracking in `PayoutOutputsTracker`), not at
-/// request-time. There is no `prev_hash` on the wire to compare.
-///
-/// **Exact-sum (spec §2.2)**: the returned set MUST sum to exactly
-/// `available_payout_value`. We fold the floor-rounding + sub-dust
-/// residual into the largest output via [`fold_residual_to_exact_sum`].
-///
-/// **Revenue plausibility** (internal guard): we use the current
-/// template's `coinbase_tx_value_remaining` as the upper bound + a 2×
-/// tolerance for mempool fee spikes. Higher values trigger
-/// `revenue-too-large`.
-pub(crate) struct ProductionPayoutOutputsResolver {
-    payout_resolver: Arc<ProductionPayoutResolver>,
-    tdp: TdpHandle,
-    network: BitcoinNetwork,
-}
-
-#[async_trait]
-impl PayoutOutputsResolver for ProductionPayoutOutputsResolver {
-    async fn resolve_payout_outputs(
-        &self,
-        miner_address: &AddressId,
-        committed_outputs: &[u8],
-        available_payout_value: u64,
-        request_id: u32,
-    ) -> PayoutOutputsResolution {
-        use bp_stratum_v2::extensions::payout_outputs_error_codes;
-
-        // ── Revenue plausibility (internal guard) ───────────────────
-        //
-        // ONE snapshot for both gates below. TDP rotates it continuously (every
-        // tip, and on mempool growth), so two reads can hand the serve gate and
-        // the bookable band different templates — and then a request can pass
-        // the first against a template the second no longer holds.
-        let pool_template_value = self
-            .tdp
-            .current_snapshot()
-            .new_template
-            .as_ref()
-            .map(|t| t.coinbase_tx_value_remaining);
-        if let Some(template_value) = pool_template_value {
-            // 2× tolerance for mempool fee variance; rejects clearly
-            // implausible (>2× current template value).
-            let ceiling = template_value.saturating_mul(2);
-            if available_payout_value > ceiling {
-                warn!(
-                    request_id,
-                    address = miner_address.as_str(),
-                    available_payout_value,
-                    ceiling,
-                    "ext 0x0003: available_payout_value exceeds 2× current-template ceiling"
-                );
-                return PayoutOutputsResolution::Error {
-                    request_id,
-                    error_code: payout_outputs_error_codes::REVENUE_TOO_LARGE.to_string(),
-                };
-            }
-        }
-
-        // ── Compute the FRESH per-job distribution (spec §1, §5) ──────
-        //
-        // The accuracy win of ext 0x0003 is computing the output set per
-        // job from current pool state and the JDC-reported
-        // `available_payout_value` — recipients AND amounts both reflect
-        // the moment of the request, not the token-time estimate.
-        let (payouts, pool_can_book) = self
-            .payout_resolver
-            .resolve_payouts_reporting_source(miner_address, available_payout_value)
-            .await;
-        if payouts.is_empty() {
-            warn!(
-                request_id,
-                address = miner_address.as_str(),
-                "ext 0x0003: PayoutResolver returned empty payouts — internal error"
-            );
-            return PayoutOutputsResolution::Error {
-                request_id,
-                error_code: payout_outputs_error_codes::INTERNAL.to_string(),
-            };
-        }
-        // Σ MUST equal available_payout_value (spec §2.2): fold the
-        // floor-rounding + dropped-sub-dust residual into the largest
-        // kept output. An empty result means everything was sub-dust —
-        // we can't build a set summing to a positive value.
-        // The pool's own accounting identity for this distribution — the key
-        // its snapshot was just stored under. Computed from the resolver's
-        // list, before the wire lowering below can touch it.
-        let payouts_fingerprint =
-            bp_mining_job::payouts_fingerprint(available_payout_value, &payouts);
-        let mut outputs = payouts_to_dynamic_outputs(&payouts);
-        if outputs.is_empty() {
-            warn!(
-                request_id,
-                address = miner_address.as_str(),
-                "ext 0x0003: every payout was sub-dust — cannot construct a valid output set"
-            );
-            return PayoutOutputsResolution::Error {
-                request_id,
-                error_code: payout_outputs_error_codes::INTERNAL.to_string(),
-            };
-        }
-        fold_residual_to_exact_sum(&mut outputs, available_payout_value as i64);
-        // Only vouch for booking when the set going out is the distribution
-        // that was snapshotted. The lowering drops sub-dust entries and the
-        // fold moves the residual onto the largest output; either would make
-        // the block pay something other than what the snapshot records, and
-        // booking that would be the drift this whole mechanism exists to
-        // remove. Both are no-ops while the distributor consumes the whole
-        // reward and its floor is the dust limit — if that ever stops holding,
-        // the block is reported and left for an operator instead.
-        // A fallback list has no distribution snapshot behind it — vouching for
-        // one would send an operator chasing a fingerprint that resolves to
-        // nothing. The coinbase is still correct and still goes out; it just
-        // cannot be booked automatically.
-        // The reward that goes into the ledger is a number the JD-client
-        // reported. The guard above keeps a wildly wrong one from producing a
-        // coinbase at all, but its tolerance is deliberately generous — a
-        // client with a fuller mempool legitimately pays more than the pool's
-        // own template says. Booking cannot be that generous: an overstated
-        // value makes the pool credit miners for money the block never paid,
-        // and they are paid that credit out of the NEXT block, which is real.
-        // So the promise is withheld outside a narrow band even where the
-        // coinbase is still served.
-        let value_is_bookable = match pool_template_value {
-            Some(pool_value) => {
-                let ok = reported_value_is_bookable(available_payout_value, pool_value);
-                if !ok {
-                    warn!(
-                        request_id,
-                        address = miner_address.as_str(),
-                        available_payout_value,
-                        pool_template_value = pool_value,
-                        bookable_floor = bookable_floor(pool_value),
-                        bookable_ceiling = bookable_ceiling(pool_value),
-                        "ext 0x0003: reported payout value sits outside the band the pool's own \
-                         template can account for — the coinbase still goes out, but a block \
-                         found on it will not be booked automatically"
-                    );
-                }
-                ok
-            }
-            // No template of our own to compare against — no basis to promise.
-            // Said as its own case: claiming the value was out of band would
-            // name a comparison that never happened, and `tracing` drops a
-            // `None` field entirely, so the line would not even show that the
-            // template was what was missing.
-            None => {
-                warn!(
-                    request_id,
-                    address = miner_address.as_str(),
-                    available_payout_value,
-                    "ext 0x0003: the pool has no template of its own yet, so the reported payout \
-                     value cannot be checked against anything — the coinbase still goes out, but \
-                     a block found on it will not be booked automatically"
-                );
-                false
-            }
-        };
-        if !pool_can_book {
-            warn!(
-                request_id,
-                address = miner_address.as_str(),
-                "ext 0x0003: this payout set is not one the pool could book against — the list \
-                 did not come from the engine that would have to resolve it, or that engine's \
-                 snapshot did not land — a block found on it will be reported but not booked"
-            );
-        }
-        // Each reason warns for itself above, so this arm speaks only for the
-        // one that has no other voice. Blaming the lowering for all three sent
-        // an operator to the dust floor and the residual fold when the actual
-        // cause was the value band or a missing engine.
-        let outputs_still_match = outputs_match_payouts(&outputs, &payouts);
-        if !outputs_still_match {
-            warn!(
-                request_id,
-                address = miner_address.as_str(),
-                "ext 0x0003: issued output set differs from the distribution it came from \
-                 (sub-dust drop or residual fold) — a block found on it will be reported \
-                 but not booked"
-            );
-        }
-        let booking = if pool_can_book && value_is_bookable && outputs_still_match {
-            Some(PayoutBooking {
-                payouts_fingerprint,
-                block_reward_sats: available_payout_value,
-            })
-        } else {
-            None
-        };
-        let bytes = match encode_coinbase_outputs(self.network, &outputs) {
-            Ok(b) => b,
-            Err(err) => {
-                warn!(
-                    %err,
-                    request_id,
-                    address = miner_address.as_str(),
-                    "ext 0x0003: encode_coinbase_outputs failed"
-                );
-                return PayoutOutputsResolution::Error {
-                    request_id,
-                    error_code: payout_outputs_error_codes::INTERNAL.to_string(),
-                };
-            }
-        };
-
-        // ── Size guard against the token's reserved coinbase space (§6) ──
-        //
-        // The JDC sized its Template-Provider `coinbase_output_max_additional_size`
-        // reservation from the serialized size of this token's
-        // `AllocateMiningJobToken.Success.coinbase_tx_outputs` (= `committed_outputs`)
-        // and cannot grow it mid-job. Normally the fresh set fits — per-job
-        // `available_payout_value` ≤ the token-time block-reward estimate, so it
-        // has ≤ recipients. It exceeds only when the payout window grew (or the
-        // coinbase budget was raised) since the token was issued; then we
-        // return `coinbase-size-budget-exceeded` so the JDC obtains a larger
-        // token rather than building a coinbase that overflows its reservation.
-        if !coinbase_outputs_fit_reservation(&bytes, committed_outputs) {
-            warn!(
-                request_id,
-                address = miner_address.as_str(),
-                fresh_bytes = bytes.len(),
-                reserved_bytes = committed_outputs.len(),
-                "ext 0x0003: per-job set outgrew the token's reserved coinbase size"
-            );
-            return PayoutOutputsResolution::Error {
-                request_id,
-                error_code: payout_outputs_error_codes::COINBASE_SIZE_BUDGET_EXCEEDED.to_string(),
-            };
-        }
-
-        PayoutOutputsResolution::Success {
-            request_id,
-            outputs: bytes,
-            booking,
-        }
-    }
-}
-
 /// Report what the pool can say about a JDC-found block's payouts.
 ///
 /// The distinction it draws is the one that decides whether anything is
-/// booked: a block whose declared coinbase was proven to pay the pool's issued
-/// set can be booked from that distribution, while one without that proof must
-/// not be booked from anything.
+/// booked: a block whose declared coinbase was validated positionally against
+/// a published payout distribution (ext 0x0003 §7.1) can be settled from that
+/// distribution's snapshot, while one without that proof must not be booked
+/// from anything.
 fn log_booking_status(miner_address: &AddressId, booking: Option<PayoutBooking>) {
     match booking {
         Some(b) => info!(
             miner = miner_address.as_str(),
-            block_reward_sats = b.block_reward_sats,
+            distribution_id = b.distribution_id,
+            reference_reward_sats = b.reference_reward_sats,
             fingerprint = %hex::encode(b.payouts_fingerprint),
-            "JDP block-found: coinbase proven to pay the pool's issued payout set"
+            "JDP block-found: coinbase validated against a published payout distribution"
         ),
         None => warn!(
             miner = miner_address.as_str(),
             "JDP block-found: no proof this coinbase pays a pool distribution \
-             (base-protocol declaration, or the issued set was altered) — NOT bookable"
+             (base-protocol declaration, or validation failed) — NOT bookable"
         ),
     }
 }
 
-/// `true` when the wire output set is entry-for-entry the distribution it was
-/// lowered from — same order, same addresses, same sats.
-///
-/// The lowering may drop sub-dust entries and the residual fold may move sats
-/// onto the largest output. Either makes the block pay something the pool's
-/// snapshot does not record, so it must not be booked.
-fn outputs_match_payouts(outputs: &[DynamicOutput], payouts: &[PayoutEntry]) -> bool {
-    outputs.len() == payouts.len()
-        && outputs.iter().zip(payouts).all(|(out, p)| {
-            out.address.as_str() == p.address && out.sats.to_i64().max(0) as u64 == p.sats
-        })
+// ─── 6. ProductionJobValidator (SV2 §6.1, node-side validation) ───────
+//
+// SRI's own JDS library owns the hard part: a dedicated thread running the
+// !Send Cap'n-Proto client against bitcoin-core's `job_declaration_protocol`
+// IPC interface, where `checkBlock` gives a real consensus verdict on a
+// declared job. We hold it and translate between its SV2 wire types and the
+// pool's own decoded shapes.
+//
+// Note this is a DIFFERENT core interface than the one the pool already uses:
+// templates and block submission ride `template_distribution_protocol` on the
+// same `node.sock`. Nothing here replaces that path.
+
+use bitcoin_core_sv2::runtime_api::BitcoinCoreVersion;
+use bp_stratum_v2::jdp_server::{DeclaredJobToValidate, DeclaredJobValidator, JobVerdict};
+use jd_server_sv2::job_declarator::job_validation::{
+    bitcoin_core_ipc::BitcoinCoreIPCEngine, DeclareMiningJobResult, JobValidationEngine,
+};
+use stratum_apps::tp_type::BitcoinNetwork as SriBitcoinNetwork;
+use stratum_core::job_declaration_sv2::{
+    DeclareMiningJob as Sv2DeclareMiningJob,
+    ProvideMissingTransactionsSuccess as Sv2ProvideMissingTransactionsSuccess,
+};
+
+pub(crate) struct ProductionJobValidator {
+    engine: Arc<BitcoinCoreIPCEngine>,
+}
+
+impl ProductionJobValidator {
+    /// The data directory upstream's engine needs to arrive at `socket_path`.
+    ///
+    /// It derives `<dir>/<network>/node.sock` (no subdirectory on mainnet) and
+    /// takes no socket path of its own, so this reverses that derivation and
+    /// then checks it by rebuilding the path. A socket that no derivation can
+    /// produce — a different filename, a different layout — is a config error,
+    /// not something to paper over: connecting elsewhere, or nowhere, while the
+    /// log claims validation is on is exactly the silent failure worth avoiding.
+    pub(crate) fn data_dir_for_socket(
+        socket_path: &std::path::Path,
+        network: SriBitcoinNetwork,
+    ) -> Result<std::path::PathBuf, String> {
+        let strip_levels = match network {
+            SriBitcoinNetwork::Mainnet => 1, // <dir>/node.sock
+            _ => 2,                          // <dir>/<network>/node.sock
+        };
+        let mut dir = socket_path.to_path_buf();
+        for _ in 0..strip_levels {
+            if !dir.pop() {
+                return Err(format!(
+                    "{} is too short to be a bitcoin-core IPC socket path",
+                    socket_path.display()
+                ));
+            }
+        }
+        let rebuilt = match network {
+            SriBitcoinNetwork::Mainnet => dir.join("node.sock"),
+            SriBitcoinNetwork::Testnet4 => dir.join("testnet4").join("node.sock"),
+            SriBitcoinNetwork::Signet => dir.join("signet").join("node.sock"),
+            SriBitcoinNetwork::Regtest => dir.join("regtest").join("node.sock"),
+        };
+        if rebuilt != socket_path {
+            return Err(format!(
+                "bitcoin-core lays its IPC socket out as {}, but the config says {} — \
+                 upstream derives the path from a data directory and cannot be pointed \
+                 at an arbitrary one",
+                rebuilt.display(),
+                socket_path.display()
+            ));
+        }
+        Ok(dir)
+    }
+
+    /// Connect to bitcoin-core's job-declaration IPC. Normally the very socket
+    /// `[tdp] socket_path` already uses — validation is a second interface on
+    /// the one node.
+    ///
+    /// `Err` is a boot-stopping config error. `Ok(None)` means the network has
+    /// no mapping upstream (testnet3), where staying off beats rejecting every
+    /// declaration.
+    pub(crate) async fn connect(
+        socket_path: std::path::PathBuf,
+        network: bp_config::Network,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<Arc<dyn DeclaredJobValidator>>, String> {
+        let sri_network = match network {
+            bp_config::Network::Mainnet => SriBitcoinNetwork::Mainnet,
+            bp_config::Network::Testnet4 => SriBitcoinNetwork::Testnet4,
+            bp_config::Network::Regtest => SriBitcoinNetwork::Regtest,
+            bp_config::Network::Testnet => {
+                warn!(
+                    "jdp: declared-job validation not available on testnet3 \
+                     (upstream has no socket layout for it) — declarations stay trusted"
+                );
+                return Ok(None);
+            }
+        };
+        let data_dir = Self::data_dir_for_socket(&socket_path, sri_network.clone())?;
+        // Core v31 is what the pool's TDP path already speaks.
+        match BitcoinCoreIPCEngine::new(
+            BitcoinCoreVersion::V31X,
+            sri_network,
+            Some(data_dir),
+            cancel,
+        )
+        .await
+        {
+            Ok(engine) => {
+                info!(
+                    socket = %socket_path.display(),
+                    "jdp: declared jobs are validated against bitcoin-core (SV2 §6.1)"
+                );
+                Ok(Some(Arc::new(Self {
+                    engine: Arc::new(engine),
+                }) as Arc<dyn DeclaredJobValidator>))
+            }
+            Err(err) => Err(format!(
+                "cannot reach bitcoin-core's job-declaration IPC at {}: {err:?}",
+                socket_path.display()
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl DeclaredJobValidator for ProductionJobValidator {
+    async fn validate_declaration(&self, job: DeclaredJobToValidate<'_>) -> JobVerdict {
+        // Rebuild the SV2 message the engine expects. Every field comes
+        // straight from the frame the JDC sent; `mining_job_token` and
+        // `excess_data` are not part of the consensus question, so a
+        // placeholder token and empty excess keep the shape valid without
+        // pretending to carry meaning.
+        let wtxids: Vec<stratum_core::binary_sv2::U256<'static>> = job
+            .wtxid_list
+            .iter()
+            .map(|w| stratum_core::binary_sv2::U256::from(*w))
+            .collect();
+        let Ok(wtxid_list) = stratum_core::binary_sv2::Seq064K::new(wtxids) else {
+            warn!("jdp: wtxid list too long to validate — rejecting");
+            return JobVerdict::Rejected("invalid-job-declaration".to_string());
+        };
+        let (Ok(mining_job_token), Ok(prefix), Ok(suffix), Ok(excess_data)) = (
+            vec![0u8; 8].try_into(),
+            job.coinbase_tx_prefix.to_vec().try_into(),
+            job.coinbase_tx_suffix.to_vec().try_into(),
+            Vec::new().try_into(),
+        ) else {
+            warn!("jdp: declared coinbase does not fit the SV2 wire shape — rejecting");
+            return JobVerdict::Rejected("invalid-coinbase-tx".to_string());
+        };
+        let declare = Sv2DeclareMiningJob {
+            request_id: 0,
+            mining_job_token,
+            version: job.version,
+            coinbase_tx_prefix: prefix,
+            coinbase_tx_suffix: suffix,
+            wtxid_list,
+            excess_data,
+        };
+
+        // Hand over every raw transaction we already hold, so the node only
+        // reports what is genuinely missing rather than everything.
+        let provided: Vec<stratum_core::binary_sv2::B016M<'static>> = job
+            .known_raw_txs
+            .iter()
+            .filter_map(|tx| tx.clone().try_into().ok())
+            .collect();
+        let provide =
+            stratum_core::binary_sv2::Seq064K::new(provided)
+                .ok()
+                .map(|transaction_list| Sv2ProvideMissingTransactionsSuccess {
+                    request_id: 0,
+                    transaction_list,
+                });
+
+        match self
+            .engine
+            .handle_declare_mining_job(job.session_id as usize, declare, provide)
+            .await
+        {
+            DeclareMiningJobResult::Success => JobVerdict::Accepted,
+            DeclareMiningJobResult::Error(code) => JobVerdict::Rejected(code.to_string()),
+            // The node still lacks transactions we could not supply. The
+            // pool's own ProvideMissingTransactions round-trip fetches them
+            // from the JDC; the second leg asks again with the full set.
+            DeclareMiningJobResult::MissingTransactions(_) => JobVerdict::NeedsTransactions,
+        }
+    }
+}
+
+#[cfg(test)]
+mod jdp_validation_regtest {
+    use super::*;
+
+    /// The §6.1 validator must reach a REAL bitcoin-core over its
+    /// job-declaration IPC. Everything this asserts is a deployment fact that
+    /// unit tests cannot see: that the socket really is
+    /// `<data_dir>/regtest/node.sock` (upstream derives it, we only hand over
+    /// the data dir), that `BitcoinCoreVersion::V31X` matches the node we run,
+    /// and that our network mapping lands on the right subdirectory.
+    ///
+    /// Skipped with a warning when `bitcoin-node` is absent — same policy as
+    /// every other regtest here.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::print_stderr)]
+    async fn validator_connects_to_a_real_node_over_the_jdp_ipc() {
+        let cfg = bp_regtest_harness::RegtestConfig::default();
+        if !cfg.is_available() {
+            eprintln!(
+                "skipping JDP-validation regtest — bitcoin-node not found at {} \
+                 (set BITCOIN_NODE_PATH to override)",
+                cfg.bitcoin_node_path.display()
+            );
+            return;
+        }
+        let node = bp_regtest_harness::RegtestNode::start_with(cfg)
+            .await
+            .expect("regtest start");
+        // Core v31 blocks IPC work while IBD is active; a short chain of
+        // recent blocks exits it.
+        node.generate_to_self(101)
+            .await
+            .expect("mine 101 blocks for IBD-exit");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let validator = ProductionJobValidator::connect(
+            node.ipc_socket_path(),
+            bp_config::Network::Regtest,
+            cancel.clone(),
+        )
+        .await;
+
+        let outcome = validator.as_ref().err().cloned().unwrap_or_default();
+        assert!(
+            matches!(validator, Ok(Some(_))),
+            "the validator must reach the node's job-declaration IPC at {} — if this \
+             fails the socket layout or the Core version mapping is wrong, and production \
+             would refuse to boot rather than run unvalidated: {outcome}",
+            node.ipc_socket_path().display()
+        );
+
+        cancel.cancel();
+        node.shutdown().await.expect("regtest shutdown");
+    }
+}
+
+#[cfg(test)]
+mod jdp_validation_socket_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// The prod layout: one named docker volume at `/ipc`, mainnet, so upstream
+    /// derives `<dir>/node.sock` with no network subdirectory. Checked against
+    /// the live pool on 2026-08-03 — `[tdp] socket_path = "/ipc/node.sock"`.
+    #[test]
+    fn mainnet_socket_reverses_to_its_directory() {
+        assert_eq!(
+            ProductionJobValidator::data_dir_for_socket(
+                &PathBuf::from("/ipc/node.sock"),
+                SriBitcoinNetwork::Mainnet
+            ),
+            Ok(PathBuf::from("/ipc"))
+        );
+    }
+
+    /// Off mainnet upstream inserts the network directory, so the same data dir
+    /// implies a deeper socket path.
+    #[test]
+    fn non_mainnet_socket_strips_the_network_directory() {
+        assert_eq!(
+            ProductionJobValidator::data_dir_for_socket(
+                &PathBuf::from("/ipc/regtest/node.sock"),
+                SriBitcoinNetwork::Regtest
+            ),
+            Ok(PathBuf::from("/ipc"))
+        );
+    }
+
+    /// A socket upstream can never be pointed at must be refused, not
+    /// approximated. Silently connecting to `/var/run/bitcoind/node.sock` when
+    /// the operator wrote `bp-tdp.sock` would validate against the wrong thing
+    /// — or nothing — while the log says validation is on.
+    #[test]
+    fn a_socket_name_upstream_cannot_produce_is_refused() {
+        let err = ProductionJobValidator::data_dir_for_socket(
+            &PathBuf::from("/var/run/bitcoind/bp-tdp.sock"),
+            SriBitcoinNetwork::Mainnet,
+        )
+        .expect_err("a non-node.sock filename must not be accepted");
+        assert!(
+            err.contains("bp-tdp.sock"),
+            "the error names what was configured: {err}"
+        );
+        assert!(
+            err.contains("node.sock"),
+            "and what was expected instead: {err}"
+        );
+    }
+
+    /// The prod path on a non-mainnet network is a mismatch too: the same
+    /// `/ipc/node.sock` cannot serve testnet4, where upstream looks one level
+    /// deeper. Better to fail boot than to run unvalidated.
+    #[test]
+    fn the_mainnet_layout_is_refused_on_testnet4() {
+        assert!(ProductionJobValidator::data_dir_for_socket(
+            &PathBuf::from("/ipc/node.sock"),
+            SriBitcoinNetwork::Testnet4
+        )
+        .is_err());
+    }
 }
 
 #[cfg(test)]
@@ -1247,60 +1284,6 @@ mod tests {
         .is_none());
     }
 
-    /// The value the pool books is a number the client reported. Serving a
-    /// coinbase may be generous about it; crediting miners may not, because
-    /// that credit is paid out of the next real block.
-    #[test]
-    fn the_bookable_band_is_tighter_than_the_serve_ceiling() {
-        let template = 312_500_000u64;
-        // Ordinary mempool divergence between two nodes stays bookable.
-        assert!(reported_value_is_bookable(
-            template + template / 10,
-            template
-        ));
-        assert!(reported_value_is_bookable(
-            template - template / 10,
-            template
-        ));
-        assert_eq!(bookable_ceiling(template), 390_625_000);
-        // The serve ceiling is 2x; that is far outside what may be booked.
-        assert!(
-            template * 2 > bookable_ceiling(template),
-            "a claim the coinbase path still tolerates must not be bookable"
-        );
-        // No overflow / underflow at absurd inputs.
-        assert!(bookable_ceiling(u64::MAX) >= u64::MAX / 2);
-        assert_eq!(bookable_floor(0), 0);
-    }
-
-    /// The band has to close in BOTH directions. An understated value is not a
-    /// malformed one — the client keeps the rest — but booking it settles the
-    /// whole PPLNS window or group round against that number. A few thousand
-    /// sats reported for a block paying 3.125 BTC would close the round out for
-    /// pocket change.
-    #[test]
-    fn an_understated_payout_value_is_not_bookable() {
-        let template = 312_500_000u64;
-        assert!(
-            !reported_value_is_bookable(10_000, template),
-            "a tip-sized report must not settle a whole round"
-        );
-        assert!(!reported_value_is_bookable(0, template));
-        assert!(
-            !reported_value_is_bookable(template / 2, template),
-            "keeping half the block is legal, but it is not what the pool books"
-        );
-        // Just inside the floor stays bookable, so honest divergence is unaffected.
-        assert!(reported_value_is_bookable(
-            bookable_floor(template),
-            template
-        ));
-        assert!(!reported_value_is_bookable(
-            bookable_floor(template) - 1,
-            template
-        ));
-    }
-
     // ── ProductionJdpBlockSink ──────────────────────────────────────
 
     #[derive(Default)]
@@ -1343,6 +1326,7 @@ mod tests {
             block_hash: String,
             _: String,
             fp: [u8; 32],
+            _: Option<bp_coinbase_snapshot::ActualCoinbase>,
         ) -> bool {
             self.booked.lock().unwrap().push((reward, fp));
             self.hashes.lock().unwrap().push(block_hash);
@@ -1434,8 +1418,10 @@ mod tests {
         chain: Option<ChainDemands>,
     ) -> ProductionJdpBlockSink {
         ProductionJdpBlockSink {
+            network: BitcoinNetwork::Regtest,
             propagator: propagator.map(|p| p as Arc<dyn BlockPropagator>),
             booker: booker.map(|b| b as Arc<dyn DeclaredBlockBooker>),
+            settle: crate::settlement::SettlementSignal::local_only(),
             chain: Arc::new(FixedChain(chain)),
             booked: StdMutex::new(VecDeque::new()),
         }
@@ -1476,8 +1462,9 @@ mod tests {
 
     fn a_booking() -> PayoutBooking {
         PayoutBooking {
+            distribution_id: 7,
             payouts_fingerprint: [0x11; 32],
-            block_reward_sats: 5_000_000_000,
+            reference_reward_sats: 5_000_000_000,
         }
     }
 
@@ -1558,11 +1545,13 @@ mod tests {
         let chain = MovingChain::at(easy);
         let booker = Arc::new(RecordingBooker::default());
         let sink = ProductionJdpBlockSink {
+            network: BitcoinNetwork::Regtest,
             propagator: Some(Arc::new(PropagatorThatMovesTheTip {
                 chain: chain.clone(),
                 to: moved_on,
             })),
             booker: Some(booker.clone()),
+            settle: crate::settlement::SettlementSignal::local_only(),
             chain: Arc::new(chain),
             booked: StdMutex::new(VecDeque::new()),
         };
@@ -1897,54 +1886,6 @@ mod tests {
         );
     }
 
-    fn entry(address: &str, sats: u64) -> PayoutEntry {
-        PayoutEntry {
-            address: address.to_string(),
-            sats,
-        }
-    }
-
-    /// The pool only vouches for a block when the set it hands the JDC IS the
-    /// distribution its snapshot records.
-    #[test]
-    fn outputs_match_payouts_accepts_an_untouched_lowering() {
-        let payouts = vec![
-            entry("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 5_000),
-            entry("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 7_000),
-        ];
-        let outputs = payouts_to_dynamic_outputs(&payouts);
-        assert!(outputs_match_payouts(&outputs, &payouts));
-    }
-
-    /// A dropped sub-dust entry means the block pays fewer recipients than the
-    /// snapshot books — no vouching.
-    #[test]
-    fn outputs_match_payouts_rejects_a_dropped_sub_dust_entry() {
-        let payouts = vec![
-            entry("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 5_000),
-            entry("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 100),
-        ];
-        let outputs = payouts_to_dynamic_outputs(&payouts);
-        assert!(
-            !outputs_match_payouts(&outputs, &payouts),
-            "the 100-sat entry is below the dust floor and gets dropped"
-        );
-    }
-
-    /// A folded residual means the block pays one recipient more than the
-    /// snapshot books — no vouching.
-    #[test]
-    fn outputs_match_payouts_rejects_a_folded_residual() {
-        let payouts = vec![
-            entry("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 5_000),
-            entry("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 7_000),
-        ];
-        let mut outputs = payouts_to_dynamic_outputs(&payouts);
-        // Distribution summed to 12_000; the JDC asked to pay out 12_500.
-        fold_residual_to_exact_sum(&mut outputs, 12_500);
-        assert!(!outputs_match_payouts(&outputs, &payouts));
-    }
-
     #[test]
     fn payouts_to_dynamic_outputs_drops_sub_dust() {
         let payouts = vec![
@@ -1993,8 +1934,7 @@ mod tests {
     #[test]
     fn solo_fallback_outputs_encodes_for_valid_address() {
         let addr = AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").expect("valid");
-        let bytes = solo_fallback_outputs(&addr, BitcoinNetwork::Regtest);
-        // Not the `[0x00]` empty-sentinel — actual encoded output.
+        let bytes = solo_fallback_outputs(&addr, BitcoinNetwork::Regtest).expect("encodes");
         assert!(bytes.len() > 1);
     }
 }

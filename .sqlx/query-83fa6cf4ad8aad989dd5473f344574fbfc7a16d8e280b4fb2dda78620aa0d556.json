@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address, \"paidSats\" AS paid_sats\n             FROM pplns_payout_history\n            WHERE \"blockHeight\" = $1 AND \"paidSats\" <> 0\n            ORDER BY address",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "paid_sats",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "83fa6cf4ad8aad989dd5473f344574fbfc7a16d8e280b4fb2dda78620aa0d556"
+}

@@ -26,7 +26,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bitcoin::Network;
 use bp_common::StreamKind;
-use bp_mining_job::PayoutEntry;
+use bp_mining_job::{PayoutEntry, ResolvedPayouts};
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_stratum_v1::{
     BlockSubmissionSink, PayoutResolver, PortConfig, ServerConfig, ServerHooks, ShareAccept,
@@ -53,8 +53,8 @@ struct GroupSoloResolver {
 
 #[async_trait]
 impl PayoutResolver for GroupSoloResolver {
-    async fn resolve_payouts(&self, _miner_address: &str, _reward_sats: u64) -> Vec<PayoutEntry> {
-        self.payouts.clone()
+    async fn resolve_payouts(&self, _miner_address: &str, _reward_sats: u64) -> ResolvedPayouts {
+        ResolvedPayouts::unsnapshotted(self.payouts.clone())
     }
 
     fn resolve_stream(&self, _miner_address: &str) -> StreamKind {

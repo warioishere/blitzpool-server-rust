@@ -81,6 +81,7 @@ use bp_vardiff::SystemClock;
 use stratum_core::binary_sv2::GetSize;
 use stratum_core::codec_sv2::StandardSv2Frame;
 use stratum_core::framing_sv2::framing::Frame;
+use stratum_core::mining_sv2::MESSAGE_TYPE_SET_CUSTOM_MINING_JOB;
 use stratum_core::parsers_sv2::{
     message_type_to_name, parse_message_frame_with_tlvs, AnyMessage, IsSv2Message,
 };
@@ -91,6 +92,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::bridge::JdpDeclaredJobRegistry;
+use crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS;
 use crate::extranonce::ExtranonceAllocator;
 use crate::hooks::MiningServerHooks;
 use crate::mining::client::{
@@ -636,10 +638,22 @@ async fn run_mining_connection(
                 };
                 let payload_len = sv2_frame.payload().len();
                 let header_msg_type = header.msg_type();
+                // §2: a 0x0003 reference from a session that never
+                // negotiated the extension MUST be rejected — so the TLV
+                // has to be SEEN, not silently filtered away with the
+                // rest of the un-negotiated tail. Widen the filter for
+                // the one message that carries it; the handler enforces
+                // the gate.
+                let mut tlv_extensions = state.negotiated_extensions.clone();
+                if header_msg_type == MESSAGE_TYPE_SET_CUSTOM_MINING_JOB
+                    && !tlv_extensions.contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
+                {
+                    tlv_extensions.push(SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
+                }
                 let (any_message, tlvs) = match parse_message_frame_with_tlvs(
                     header,
                     sv2_frame.payload(),
-                    &state.negotiated_extensions,
+                    &tlv_extensions,
                 ) {
                     Ok(parsed) => parsed,
                     Err(err) => {
@@ -688,6 +702,14 @@ async fn run_mining_connection(
                         }
                         submit.tail_tlvs = tail;
                     }
+                }
+                // ext 0x0003 §6: the `distribution_id` TLV rides on the
+                // base SetCustomMiningJob frame (captured unconditionally
+                // above; the handler enforces the negotiation gate).
+                if let InboundMiningFrame::SetCustomMiningJob(ref mut custom) = inbound {
+                    custom.distribution_id = tlvs
+                        .as_deref()
+                        .and_then(crate::extensions::parse_distribution_id_tlv);
                 }
                 // Per-share SubmitSharesExtended trace, gated by
                 // share_logs — would flood at production hashrate
@@ -1057,10 +1079,10 @@ fn channel_alloc_key(session_id: u32, channel_id: u32) -> u64 {
 ///   block-change between job-send and share-submit can't reclassify an
 ///   in-flight share's block-candidacy.
 /// - **SetCustomMiningJob**: queries the bridge for the
-///   `mining_job_token` and passes the resolved miner address (or
-///   `None`) plus the issued payout set to the handler; the
-///   cross-check + payout validation happen inside the handler, and
-///   the payout set is single-use-consumed here on success.
+///   `mining_job_token` and resolves the job's `distribution_id` TLV
+///   against the distribution registry (`MinerAddress` scope); the
+///   cross-checks + §7.1 payout validation happen inside the handler.
+///   Distributions are multi-use — nothing is consumed on success.
 pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
     state: &mut MiningSessionState<C>,
     inbound: InboundMiningFrame,
@@ -1120,36 +1142,33 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
             handle_submit_shares_extended(state, &input, now_ms)
         }
         InboundMiningFrame::SetCustomMiningJob(input) => {
-            let (bridge_job, payout_set) = {
+            let (bridge_job, distribution) = {
                 let guard = bridge.read().expect("bridge RwLock poisoned");
                 (
                     // Slim projection (address + declared tip) — the handler
                     // doesn't need the (potentially large) declared-job payload.
                     guard.job_ref(&input.mining_job_token),
-                    guard.lookup_payout_set(&input.mining_job_token).cloned(),
+                    // §7.2 acceptance for the referenced distribution.
+                    // Mining connections carry no JDP session id, so
+                    // tailored entries resolve by the channel's address.
+                    input.distribution_id.map(|id| {
+                        let scope = match state.address.as_ref() {
+                            Some(addr) => crate::bridge::DistributionScope::MinerAddress(addr),
+                            None => crate::bridge::DistributionScope::JdpSession(0),
+                        };
+                        guard.distribution_acceptance(id, scope)
+                    }),
                 )
             };
-            let outcome = handle_set_custom_mining_job(
+            // Distributions are multi-use (ext 0x0003 push model) —
+            // nothing to consume on acceptance.
+            handle_set_custom_mining_job(
                 state,
                 &input,
                 bridge_job.as_ref(),
-                payout_set.as_ref(),
+                distribution.as_ref(),
                 now_ms,
-            );
-            // ext 0x0003 single-use (spec §4): once the custom job is
-            // accepted, consume the payout set so it can't back a second job.
-            if payout_set.is_some()
-                && outcome
-                    .outbound
-                    .iter()
-                    .any(|f| matches!(f, OutboundFrame::SetCustomMiningJobSuccess { .. }))
-            {
-                bridge
-                    .write()
-                    .expect("bridge RwLock poisoned")
-                    .consume_payout_set(&input.mining_job_token);
-            }
-            outcome
+            )
         }
     }
 }
@@ -1261,13 +1280,23 @@ async fn resolve_template_mining_job_inputs(
     let Some(addr) = address else {
         return Ok(None);
     };
-    let payouts = hooks
+    let resolved = hooks
         .payout_resolver
         .resolve_payouts(addr, template.coinbase_tx_value_remaining)
         .await;
+    // An empty list is the resolver saying "serve no job" — its
+    // distribution could not be built, and the alternative it used to
+    // reach for was a coinbase paying this one miner the whole block.
+    // Same answer as an unlocked address: no job inputs, so no
+    // NewMiningJob goes out and the channel keeps hashing what it holds.
+    // SV1 reads an empty list the same way (`build_notify_for_template`).
+    if resolved.is_none() {
+        return Ok(None);
+    }
     Ok(Some(MiningJobInputs {
         network: server_config.network,
-        payouts,
+        payouts: resolved.entries,
+        payouts_fingerprint: resolved.payouts_fingerprint,
         pool_identifier: server_config.pool_identifier.clone(),
         coinbase_prefix: template.coinbase_prefix.clone(),
         coinbase_tx_version: template.coinbase_tx_version,
@@ -1943,6 +1972,67 @@ mod tests {
         assert!(out.is_none(), "no address → no MiningJobInputs");
     }
 
+    /// MONEY: an empty payout list is the resolver saying "serve no job"
+    /// because its distribution could not be built. It used to answer that
+    /// with a solo coinbase paying the connecting miner the whole block,
+    /// so a transient Postgres or Redis fault cost every other miner in
+    /// the window the block. No job at all is the only safe answer, and
+    /// the channel simply keeps hashing what it already holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_template_mining_job_inputs_returns_none_when_the_resolver_serves_no_job() {
+        struct NoJobResolver;
+        #[async_trait::async_trait]
+        impl crate::hooks::PayoutResolver for NoJobResolver {
+            async fn resolve_payouts(
+                &self,
+                _: &AddressId,
+                _: u64,
+            ) -> bp_mining_job::ResolvedPayouts {
+                bp_mining_job::ResolvedPayouts::none()
+            }
+            fn resolve_stream(&self, _: &AddressId) -> bp_common::StreamKind {
+                bp_common::StreamKind::Pplns
+            }
+        }
+        let cfg = server_cfg();
+        let mut hooks = MiningServerHooks::no_op();
+        hooks.payout_resolver = Arc::new(NoJobResolver);
+        let template = active_template_fixture();
+        let addr = Some(AddressId::new(ADDR.to_string()).unwrap());
+
+        let out = resolve_template_mining_job_inputs(
+            &addr,
+            &cfg,
+            &template,
+            &hooks,
+            &Arc::new(MiningJobCache::new()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.is_none(),
+            "an empty payout list must produce NO job inputs — building one \
+             would put an unpayable coinbase on the wire"
+        );
+
+        // Control: the SAME call with the default resolver DOES produce
+        // inputs, so the assertion above cannot pass for some unrelated
+        // reason (a missing address, a bad template).
+        let out = resolve_template_mining_job_inputs(
+            &addr,
+            &cfg,
+            &template,
+            &MiningServerHooks::no_op(),
+            &Arc::new(MiningJobCache::new()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.is_some(),
+            "precondition: a resolver that DOES return a list still yields job inputs"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_template_mining_job_inputs_runs_resolver_and_builds() {
         let cfg = server_cfg();
@@ -2156,16 +2246,17 @@ mod tests {
         assert!(s.channels.is_empty());
     }
 
-    /// ext 0x0003 single-use end-to-end: dispatching a `SetCustomMiningJob`
-    /// whose coinbase carries the bridge-registered payout set succeeds and
-    /// the IO layer consumes the set; a second dispatch with the same token
-    /// is rejected `stale-payout-outputs`.
+    /// ext 0x0003 end-to-end through dispatch: the §6 `distribution_id`
+    /// TLV resolves against the bridge (miner-address scope on a mining
+    /// connection) and a §4-conformant coinbase is accepted. Distributions
+    /// are multi-use — a second job referencing the same id passes too —
+    /// until a §10 settlement invalidation turns the same reference into
+    /// `stale-payout-distribution`.
     #[test]
-    fn dispatch_set_custom_mining_job_consumes_payout_set_single_use() {
-        use crate::jdp::dynamic_outputs::{encode_coinbase_outputs, DynamicOutput};
+    fn dispatch_set_custom_mining_job_resolves_distribution_multi_use() {
+        use crate::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
         use crate::mining::client::SetCustomMiningJobInput;
         use crate::tokens::Token;
-        use bp_common::{AddressId, Sats};
 
         let mut s = fresh_test_session();
         let alloc = Mutex::new(ExtranonceAllocator::new_default());
@@ -2181,9 +2272,22 @@ mod tests {
             device_id: "d".to_string(),
         });
         let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
+        // §2 gate: 0x0003 must be negotiated on the MINING connection for
+        // the TLV to be honoured.
+        let negotiate =
+            InboundMiningFrame::RequestExtensions(crate::extensions::RequestExtensions {
+                request_id: 1,
+                requested_extensions: vec![
+                    crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
+                ],
+            });
+        let _ = dispatch_inbound_frame(&mut s, negotiate, &alloc, &bridge, 0);
+        assert!(s
+            .negotiated_extensions
+            .contains(&crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS));
         let open = InboundMiningFrame::OpenExtendedMiningChannel(
             crate::mining::client::OpenExtendedMiningChannelInput {
-                request_id: 1,
+                request_id: 2,
                 user_identity: format!("{ADDR}.w"),
                 nominal_hash_rate: 1_000_000.0,
                 max_target: [0xFF; 32],
@@ -2194,32 +2298,44 @@ mod tests {
         let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
         let cid = s.primary_channel.expect("extended channel opened");
 
-        // Pool commits a single payout output to the channel's miner.
-        let committed = encode_coinbase_outputs(
-            Network::Regtest,
-            &[DynamicOutput {
-                address: AddressId::new(ADDR.to_string()).unwrap(),
-                sats: Sats(600),
-            }],
-        )
-        .unwrap();
-        let token = Token([7u8; 16]);
-        bridge.write().unwrap().register_payout_set(
-            token,
-            crate::bridge::IssuedPayoutSet {
-                outputs: committed.clone(),
-                miner_address: AddressId::new(ADDR.to_string()).unwrap(),
-                jdp_session_id: 1,
-                registered_at_ms: 0,
-                issued_prev_hash: Some([0xAB; 32]), // matches the job's prev_hash → fresh
-                used: false,
+        // Pool-wide distribution: one weight-9 miner slot behind a
+        // weight-1 pool output.
+        let entry = crate::bridge::PayoutDistributionEntry {
+            distribution_id: 5,
+            pool_payout: WeightedOutput {
+                script_pubkey: vec![0x51],
+                weight: 1,
             },
+            payouts: vec![WeightedOutput {
+                script_pubkey: vec![0x00, 0x14, 0xAA],
+                weight: 9,
+            }],
+            dust_limits: vec![1],
+            additional_outputs: vec![],
+            reference_reward_sats: 312_500_000,
+            payouts_fingerprint: Some([0x5A; 32]),
+            bookable: true,
+            owner: None,
+            jdp_session_id: None,
+            published_at_ms: 0,
+        };
+        // §4-conformant coinbase outputs for the published weights.
+        let conformant = bitcoin::consensus::serialize(
+            &compute_payout_vector(
+                &entry.pool_payout,
+                &entry.payouts,
+                &entry.dust_limits,
+                &entry.additional_outputs,
+                312_500_000,
+            )
+            .unwrap(),
         );
+        bridge.write().unwrap().publish_pool_wide(entry);
 
         let make_input = |req: u32| SetCustomMiningJobInput {
             channel_id: cid,
             request_id: req,
-            mining_job_token: token,
+            mining_job_token: Token([7u8; 16]),
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             min_ntime: 0x6500_0001,
@@ -2227,46 +2343,49 @@ mod tests {
             coinbase_tx_version: 2,
             coinbase_prefix: vec![0x03, 0xC8, 0x00],
             coinbase_tx_input_n_sequence: 0xFFFF_FFFF,
-            coinbase_tx_outputs: committed.clone(),
+            coinbase_tx_outputs: conformant.clone(),
             coinbase_tx_locktime: 0,
             merkle_path: vec![[0x11; 32]],
+            distribution_id: Some(5),
         };
 
-        // First: carries the committed output → accept + consume.
-        let out1 = dispatch_inbound_frame(
-            &mut s,
-            InboundMiningFrame::SetCustomMiningJob(make_input(1)),
-            &alloc,
-            &bridge,
-            0,
-        );
-        assert!(matches!(
-            out1.outbound[0],
-            crate::mining::client::OutboundFrame::SetCustomMiningJobSuccess { .. }
-        ));
-        assert!(
-            bridge
-                .read()
-                .unwrap()
-                .lookup_payout_set(&token)
-                .unwrap()
-                .used,
-            "payout set must be consumed after a successful custom job"
-        );
+        // First AND second reference: both accepted — nothing is
+        // consumed (many jobs of one tip legitimately share one
+        // distribution).
+        for req in 1..=2u32 {
+            let out = dispatch_inbound_frame(
+                &mut s,
+                InboundMiningFrame::SetCustomMiningJob(make_input(req)),
+                &alloc,
+                &bridge,
+                0,
+            );
+            assert!(
+                matches!(
+                    out.outbound[0],
+                    crate::mining::client::OutboundFrame::SetCustomMiningJobSuccess { .. }
+                ),
+                "reference {req} must be accepted (multi-use)"
+            );
+        }
 
-        // Second: same token, now consumed → stale-payout-outputs.
-        let out2 = dispatch_inbound_frame(
+        // §10: a settlement invalidates every published distribution.
+        bridge.write().unwrap().invalidate_all_distributions();
+        let out = dispatch_inbound_frame(
             &mut s,
-            InboundMiningFrame::SetCustomMiningJob(make_input(2)),
+            InboundMiningFrame::SetCustomMiningJob(make_input(3)),
             &alloc,
             &bridge,
             0,
         );
-        match &out2.outbound[0] {
+        match &out.outbound[0] {
             crate::mining::client::OutboundFrame::SetCustomMiningJobError {
                 error_code, ..
             } => {
-                assert_eq!(error_code, crate::mining::client::ERR_STALE_PAYOUT_OUTPUTS);
+                assert_eq!(
+                    error_code,
+                    crate::mining::client::ERR_STALE_PAYOUT_DISTRIBUTION
+                );
             }
             other => panic!("expected stale error, got {other:?}"),
         }

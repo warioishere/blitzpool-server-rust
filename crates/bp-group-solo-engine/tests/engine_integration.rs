@@ -6,6 +6,7 @@
 //! End-to-end integration tests for `GroupSoloEngine` against
 //! docker-Redis + docker-PG.
 
+use bp_coinbase_snapshot::StoredWeightSnapshot;
 use bp_common::AddressId;
 use bp_group_solo_engine::config::GroupSoloEngineConfig;
 use bp_group_solo_engine::engine::{EngineError, GroupSoloEngine};
@@ -16,15 +17,25 @@ use uuid::Uuid;
 const REDIS_URL: &str = "redis://127.0.0.1:16379";
 const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 
+/// Pool-output recipient. The weight model has no distribution without
+/// one (§4: `pay_P` is structural), and it must be DISTINCT from every
+/// miner address the tests use — a fee address doubling as a member
+/// entry is skipped by the settlement.
+const FEE_ADDR: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
+
 struct Harness {
     engine: GroupSoloEngine,
     pool: PgPool,
     group_id: Uuid,
 }
 
-async fn spawn_or_skip(redis_db: u8, finder_bonus_sats: Option<i64>) -> Option<Harness> {
+async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Harness> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
+    // Fold this binary's local number into its own DB range — see
+    // `bp_test_support::redis_db`.
+    let redis_db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_ENGINE, redis_db).await;
     let redis_url = format!("{redis_base}/{redis_db}");
 
     let pool = match tokio::time::timeout(
@@ -77,13 +88,13 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_sats: Option<i64>) -> Option<H
     // That was the flake.
 
     let group_id = Uuid::new_v4();
-    seed_group(&pool, group_id, finder_bonus_sats).await;
+    seed_group(&pool, group_id, finder_bonus_ppm).await;
 
     // dust_sweep + per-group reset crons run in background — we
     // disable dust_sweep to avoid interference; per-group reset
     // crons load none (no preset on seeded group).
     let config = GroupSoloEngineConfig {
-        dust_sweep_enabled: false,
+        fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
         ..GroupSoloEngineConfig::default()
     };
     let engine = match GroupSoloEngine::spawn(config, conn, pool.clone()).await {
@@ -101,23 +112,59 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_sats: Option<i64>) -> Option<H
     })
 }
 
-async fn seed_group(pool: &PgPool, group_id: Uuid, finder_bonus_sats: Option<i64>) {
+async fn seed_group(pool: &PgPool, group_id: Uuid, finder_bonus_ppm: Option<i32>) {
     // Seed with resetRoundOnBlock = true so the existing tests that assert the
     // round wipes after a block keep exercising that path. The default-false
     // (no-reset) behavior has its own dedicated test.
+    //
+    // The bonus column MUST be the one the engine reads (`finderBonusPpm`, see
+    // distribution.rs). Seeding the retired `finderBonusSats` leaves the engine
+    // reading NULL → zero bonus, which silently turns every bonus test in this
+    // file into a no-bonus test that still passes.
     sqlx::query(
         r#"INSERT INTO pplns_group
              (id, name, "creatorAddress", "adminTokenHash", active,
-              "createdAt", "updatedAt", "isPublic", "finderBonusSats", "resetRoundOnBlock")
+              "createdAt", "updatedAt", "isPublic", "finderBonusPpm", "resetRoundOnBlock")
            VALUES ($1, $2, 'test_eng_creator', $3, true, 0, 0, false, $4, true)"#,
     )
     .bind(group_id)
     .bind(format!("test-group-{group_id}"))
     .bind(format!("hash-{group_id}"))
-    .bind(finder_bonus_sats)
+    .bind(finder_bonus_ppm)
     .execute(pool)
     .await
     .expect("seed group");
+}
+
+/// Guard the PREMISE of a bonus test.
+///
+/// The drift tests below assert that the ledger settles flat — which a
+/// distribution carrying NO bonus does just as happily. That makes them
+/// blind to the one mistake that actually disables the feature: seeding
+/// the wrong bonus column, so the engine reads NULL. Asserting the
+/// finder's share of the score space first means those tests fail loudly
+/// when their own fixture stops carrying a bonus.
+///
+/// On an even split with a bonus of fraction `f`, the finder ends up
+/// holding `f + (1 − f)/2` of the score space.
+fn assert_finder_score_fraction(
+    distribution: &bp_pplns::WeightDistribution,
+    finder: &AddressId,
+    expected: f64,
+) {
+    let total: u64 = distribution.entries.iter().map(|e| e.score_weight).sum();
+    let finder_weight = distribution
+        .entries
+        .iter()
+        .find(|e| e.address.as_str() == finder.as_str())
+        .map(|e| e.score_weight)
+        .expect("the finder must be in the distribution");
+    let got = finder_weight as f64 / total as f64;
+    assert!(
+        (got - expected).abs() < 1e-6,
+        "the fixture must actually carry the finder bonus: expected the \
+         finder at {expected} of the score space, got {got}"
+    );
 }
 
 async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
@@ -138,6 +185,33 @@ async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
 async fn drop_harness(h: Harness) {
     h.engine.shutdown();
     cleanup_group(&h.pool, h.group_id).await;
+}
+
+/// A coinbase that pays EXACTLY the distribution's §4 vector at
+/// revenue `t` — the pool output first, then the kept miner outputs.
+/// What every honestly-built Group-Solo job produces; settlement then
+/// books `claim − paid` per address from it (small integer-rounding
+/// deltas between the claim formula and the §4 weight path are
+/// expected and correct).
+fn actual_paying_exactly(
+    dist: &bp_group_solo_engine::distribution::DistributionResult,
+    t: u64,
+) -> bp_coinbase_snapshot::ActualCoinbase {
+    let entries = dist
+        .distribution
+        .payout_entries_at(t)
+        .expect("§4 payout vector");
+    let mut paid_by_address = std::collections::HashMap::new();
+    for (address, sats) in entries.iter().skip(1) {
+        *paid_by_address
+            .entry(address.as_str().to_string())
+            .or_insert(0u64) += sats;
+    }
+    bp_coinbase_snapshot::ActualCoinbase {
+        paid_by_address,
+        pool_paid_sats: entries[0].1,
+        total_value_sats: t,
+    }
 }
 
 // ── Test 1 — record_share appears in reader.round_stats ─────────────
@@ -184,10 +258,20 @@ async fn build_distribution_returns_payouts_after_shares() {
         .build_distribution(h.group_id, 312_500_000, &a)
         .await
         .expect("ok");
-    assert_eq!(result.block_reward_sats, 312_500_000);
-    assert!(!result.payouts.is_empty());
-    assert!(result.considered_addresses.contains(&a));
-    assert!(result.considered_addresses.contains(&b));
+    // Weight model: concrete sats come from `payout_entries_at`; the
+    // build itself carries the §4 weights + the reference revenue.
+    assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
+    assert!(result.distribution.published().count() > 0);
+    for addr in [&a, &b] {
+        assert!(
+            result
+                .distribution
+                .entries
+                .iter()
+                .any(|e| e.address == *addr),
+            "share-holder must be in the distribution entries"
+        );
+    }
 
     drop_harness(h).await;
 }
@@ -205,16 +289,27 @@ async fn on_block_found_applies_distribution_and_resets_round() {
         .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
         .await
         .unwrap();
-    let _result = h
+    let result = h
         .engine
         .build_distribution(h.group_id, 312_500_000, &finder)
         .await
         .expect("ok");
 
+    // The build only writes schema-2 (weight) snapshots now, so the
+    // block settles via the scaled path: `claim − paid` from the real
+    // §4 coinbase, resolved by the job's weights fingerprint.
     let block_height = 9_995_001;
+    let actual = actual_paying_exactly(&result, 312_500_000);
     let outcome = h
         .engine
-        .on_block_found(h.group_id, block_height, 312_500_000, &finder)
+        .on_block_found(
+            h.group_id,
+            block_height,
+            &actual,
+            &finder,
+            None,
+            Some(result.payouts_fingerprint()),
+        )
         .await
         .expect("ok");
     assert!(outcome.history_inserted >= 1);
@@ -239,18 +334,127 @@ async fn on_block_found_applies_distribution_and_resets_round() {
     drop_harness(h).await;
 }
 
+// ── Overpayment must be recorded as debt, not forgiven ─────────────
+//
+// A JD-client computes its coinbase amounts against ITS OWN template
+// revenue. That used to matter: the finder bonus was a fixed satoshi
+// promise carried as a weight, so §4 paid `bonus · T/t_ref` and a
+// richer block overpaid the finder by the difference — real satoshis,
+// recoverable only by booking a debt and clawing it back next block.
+//
+// The bonus is a PROPORTION now. A weight is exact at every revenue,
+// for every payer, so there is nothing left to overpay and nothing to
+// claw back. These two tests pin that: the same fixtures that used to
+// produce a 5M and a 15M debt now settle flat.
+
+#[tokio::test]
+async fn a_richer_block_leaves_nobody_owing() {
+    // 16 % finder bonus — what the old 50M-sat carve-out came to.
+    let h = match spawn_or_skip(12, Some(160_000)).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
+    const T_REF: u64 = 312_500_000;
+    // What the JD-client's own template actually paid: 20 % richer.
+    const T_ACTUAL: u64 = 375_000_000;
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, h.group_id, other.as_str(), 100.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+    let result = h
+        .engine
+        .build_distribution(h.group_id, T_REF, &finder)
+        .await
+        .expect("build");
+    // 16 % bonus on an even two-way split → finder holds 0.16 + 0.42.
+    assert_finder_score_fraction(&result.distribution, &finder, 0.58);
+
+    h.engine
+        .on_block_found(
+            h.group_id,
+            9_995_401,
+            &actual_paying_exactly(&result, T_ACTUAL),
+            &finder,
+            None,
+            Some(result.payouts_fingerprint()),
+        )
+        .await
+        .expect("apply");
+
+    // Both members are paid their exact §4 share of the RICHER block.
+    // Under the fixed-sats bonus the finder was overpaid ~5M here and
+    // the other member underpaid the mirror amount, and only a ledger
+    // could have put that right afterwards.
+    let paid = actual_paying_exactly(&result, T_ACTUAL);
+    let history = read_block_history(&h.pool, h.group_id, 9_995_401).await;
+    for who in [&finder, &other] {
+        let on_chain = paid
+            .paid_by_address
+            .get(who.as_str())
+            .copied()
+            .expect("member must be paid on a 20 %-richer block") as i64;
+        assert_eq!(
+            history.get(who.as_str()).copied(),
+            Some(on_chain),
+            "{} history row must transcribe the coinbase exactly",
+            who.as_str()
+        );
+    }
+    // And nothing was owed afterwards, because nothing can be.
+    assert_eq!(count_group_balance_rows(&h.pool, h.group_id).await, 0);
+
+    drop_harness(h).await;
+}
+
+/// `address → paidSats` from the payout history of one block. This is
+/// the whole record Group-Solo keeps of a found block: there is no
+/// balance table behind it.
+async fn read_block_history(
+    pool: &PgPool,
+    group_id: Uuid,
+    block_height: i32,
+) -> std::collections::HashMap<String, i64> {
+    sqlx::query_as::<_, (String, i64)>(
+        r#"SELECT address, "paidSats" FROM pplns_group_block_history
+           WHERE "groupId" = $1 AND "blockHeight" = $2"#,
+    )
+    .bind(group_id)
+    .bind(block_height)
+    .fetch_all(pool)
+    .await
+    .expect("read history")
+    .into_iter()
+    .collect()
+}
+
+/// How many `pplns_group_balance` rows this group has. Group-Solo writes
+/// none — asserting zero is the sharpest statement of "no ledger", and
+/// it fails loudly if a balance write ever creeps back in.
+async fn count_group_balance_rows(pool: &PgPool, group_id: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
+        .bind(group_id)
+        .fetch_one(pool)
+        .await
+        .expect("count balances")
+}
+
 // ── Test 3b — snapshot-carried apply survives a Redis snapshot overwrite ──
 //
 // The Core/Satellite split race: the per-(group, finder) Redis snapshot is
 // overwritten by continuous template rebuilds before the async apply runs. The
-// fix carries the exact snapshot in the block-found event and applies it via
-// `on_block_found_with_snapshot`, never re-reading Redis. This test freezes a
-// snapshot, then simulates the churn (a later `build_distribution` with a
-// DIFFERENT reward overwrites the Redis key) — the old `on_block_found` would
-// hit `SnapshotRewardMismatch`, but the snapshot-carried apply still succeeds
-// against the frozen distribution.
+// fix carries the exact weight snapshot in the block-found event and applies it
+// via `on_block_found_scaled(…, Some(snapshot), …)`, never re-reading Redis.
+// This test freezes a snapshot, then simulates the churn (more shares + a later
+// `build_distribution` overwrite the per-finder Redis key) — the
+// snapshot-carried apply still settles the frozen job-time inputs.
 #[tokio::test]
-async fn on_block_found_with_snapshot_survives_redis_overwrite() {
+async fn snapshot_carried_apply_survives_redis_overwrite() {
     let h = match spawn_or_skip(11, None).await {
         Some(h) => h,
         None => return,
@@ -271,17 +475,19 @@ async fn on_block_found_with_snapshot_survives_redis_overwrite() {
         .await
         .expect("job-time build ok");
 
-    // Core stamps that exact distribution into the event.
+    // Core stamps that exact weight snapshot into the event.
     let frozen = h
         .engine
-        .snapshot_for_block_found(h.group_id, reward, &finder, &job.payouts_fingerprint)
+        .weight_snapshot_for_block_found(h.group_id, &finder, &job.payouts_fingerprint())
         .await
         .expect("freeze snapshot ok");
-    assert_eq!(frozen.block_reward_sats, reward);
+    assert_eq!(frozen.reference_revenue_sats, reward);
 
     // Template churn: more shares + a DIFFERENT reward rebuild overwrites the
-    // per-(group, finder) Redis snapshot key with a stale (for this block)
-    // reward — exactly what breaks the old Redis-read apply in the split.
+    // per-(group, finder) Redis snapshot key with a moved round (under the
+    // weight model the moved SCORES are the poison — the settlement identity
+    // hashes inputs, so the churned build lands under a different fingerprint
+    // and the per-finder key no longer matches this block's job).
     h.engine
         .record_share(None, h.group_id, finder.as_str(), 50.0, 1_700_000_000_002)
         .await
@@ -291,11 +497,20 @@ async fn on_block_found_with_snapshot_survives_redis_overwrite() {
         .await
         .expect("churn rebuild ok");
 
-    // The snapshot-carried apply ignores Redis and applies the frozen one.
+    // The snapshot-carried scaled apply ignores Redis and settles the frozen
+    // inputs against the block's real §4 coinbase.
     let block_height = 9_995_010;
+    let actual = actual_paying_exactly(&job, reward);
     let outcome = h
         .engine
-        .on_block_found_with_snapshot(h.group_id, block_height, reward, &finder, frozen.into())
+        .on_block_found(
+            h.group_id,
+            block_height,
+            &actual,
+            &finder,
+            Some(frozen),
+            Some(job.payouts_fingerprint()),
+        )
         .await
         .expect("snapshot-carried apply must succeed despite the Redis overwrite");
     assert!(outcome.history_inserted >= 1);
@@ -332,7 +547,7 @@ async fn on_block_found_with_snapshot_survives_redis_overwrite() {
 // (`--test-threads=1`), which the shared PG/Redis already requires.
 #[tokio::test]
 async fn block_found_resolves_the_job_time_distribution_not_a_rebuild() {
-    let h = match spawn_or_skip(11, None).await {
+    let h = match spawn_or_skip(13, None).await {
         Some(h) => h,
         None => return,
     };
@@ -362,25 +577,29 @@ async fn block_found_resolves_the_job_time_distribution_not_a_rebuild() {
         .unwrap();
 
     // What a rebuild answers with now. If this matched the job-time split the
-    // test would prove nothing, so pin that the round really moved.
+    // test would prove nothing, so pin that the round really moved. Under the
+    // weight model the settlement identity hashes the INPUTS (scores,
+    // balances, …), so a moved round means a different fingerprint.
     let rebuilt = h
         .engine
         .build_distribution(h.group_id, reward, &a)
         .await
         .expect("rebuild ok");
     assert_ne!(
-        rebuilt.payouts, job.payouts,
+        rebuilt.payouts_fingerprint(),
+        job.payouts_fingerprint(),
         "the share must have moved the round, else this test proves nothing"
     );
 
     let snap = h
         .engine
-        .snapshot_for_block_found(h.group_id, reward, &a, &job.payouts_fingerprint)
+        .weight_snapshot_for_block_found(h.group_id, &a, &job.payouts_fingerprint())
         .await
         .expect("the job's own distribution must resolve");
     assert_eq!(
-        snap.distribution, job.payouts,
-        "block-found must book what the winning job's coinbase pays"
+        snap,
+        StoredWeightSnapshot::from_distribution(&job.distribution),
+        "block-found must book the settlement inputs the winning job's coinbase was built from"
     );
 
     drop_harness(h).await;
@@ -397,7 +616,7 @@ async fn block_found_resolves_the_job_time_distribution_not_a_rebuild() {
 // Shares Redis db 11; the suite runs serially (`--test-threads=1`).
 #[tokio::test]
 async fn an_unknown_payout_list_resolves_to_nothing() {
-    let h = match spawn_or_skip(11, None).await {
+    let h = match spawn_or_skip(16, None).await {
         Some(h) => h,
         None => return,
     };
@@ -416,93 +635,12 @@ async fn an_unknown_payout_list_resolves_to_nothing() {
 
     let err = h
         .engine
-        .snapshot_for_block_found(h.group_id, reward, &finder, &[0x11u8; 32])
+        .weight_snapshot_for_block_found(h.group_id, &finder, &[0x11u8; 32])
         .await
         .expect_err("an unknown payout list must not resolve to some other distribution");
     assert!(
         matches!(err, EngineError::SnapshotMissingForPayouts { .. }),
         "expected SnapshotMissingForPayouts, got {err:?}"
-    );
-
-    drop_harness(h).await;
-}
-
-// ── Test 3b3 — a ledger change between job and apply survives ────────
-//
-// The snapshot is now built when the job is issued and applied when a block is
-// found on it — under the confirmation gate that is hours later. Writing its
-// `balance_after` as an absolute would roll back whatever moved `pendingSats`
-// in between (a kick redistribution, a dust sweep, another block). The snapshot
-// records the state it was computed against, so the apply writes the DELTA.
-//
-// Shares Redis db 11; the suite runs serially (`--test-threads=1`).
-#[tokio::test]
-async fn apply_preserves_a_ledger_change_made_after_the_job_was_built() {
-    let h = match spawn_or_skip(11, None).await {
-        Some(h) => h,
-        None => return,
-    };
-    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
-    let reward = 312_500_000;
-
-    // A member with a pending balance that this block will not pay out (no
-    // shares this round → no coinbase output, carried forward instead).
-    sqlx::query(
-        r#"INSERT INTO pplns_group_balance
-             ("groupId", address, "pendingSats", "totalPaidSats", "updatedAt")
-           VALUES ($1, $2, 4_000, 0, 0)"#,
-    )
-    .bind(h.group_id)
-    .bind(other.as_str())
-    .execute(&h.pool)
-    .await
-    .expect("seed pending balance");
-
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
-        .await
-        .unwrap();
-    let job = h
-        .engine
-        .build_distribution(h.group_id, reward, &finder)
-        .await
-        .expect("job-time build ok");
-    let snap = h
-        .engine
-        .snapshot_for_block_found(h.group_id, reward, &finder, &job.payouts_fingerprint)
-        .await
-        .expect("lookup ok");
-
-    // Between job issue and apply, something else moves the ledger — a kick
-    // redistribution, a sweep, an admin adjustment. Here: +1_000 sats.
-    sqlx::query(
-        r#"UPDATE pplns_group_balance SET "pendingSats" = "pendingSats" + 1_000
-           WHERE "groupId" = $1 AND address = $2"#,
-    )
-    .bind(h.group_id)
-    .bind(other.as_str())
-    .execute(&h.pool)
-    .await
-    .expect("move the ledger");
-
-    h.engine
-        .on_block_found_with_snapshot(h.group_id, 9_995_020, reward, &finder, snap.into())
-        .await
-        .expect("apply ok");
-
-    let after = h
-        .engine
-        .reader()
-        .balance(h.group_id, other.as_str())
-        .await
-        .expect("ok")
-        .expect("row")
-        .pending_sats;
-    assert_eq!(
-        after, 5_000,
-        "the +1_000 made after the job was built must survive the apply \
-         (absolute write would have restored 4_000)"
     );
 
     drop_harness(h).await;
@@ -518,7 +656,7 @@ async fn apply_preserves_a_ledger_change_made_after_the_job_was_built() {
 // Shares Redis db 11; the suite runs serially (`--test-threads=1`).
 #[tokio::test]
 async fn apply_deletes_only_the_payout_list_it_booked() {
-    let h = match spawn_or_skip(11, None).await {
+    let h = match spawn_or_skip(17, None).await {
         Some(h) => h,
         None => return,
     };
@@ -554,31 +692,34 @@ async fn apply_deletes_only_the_payout_list_it_booked() {
         .await
         .expect("build B");
     assert_ne!(
-        booked.payouts_fingerprint, still_live.payouts_fingerprint,
+        booked.payouts_fingerprint(),
+        still_live.payouts_fingerprint(),
         "the two jobs must carry different payout lists, else this proves nothing"
     );
 
-    let snap = h
-        .engine
-        .snapshot_for_block_found(h.group_id, reward, &finder, &booked.payouts_fingerprint)
-        .await
-        .expect("lookup ok");
     h.engine
-        .on_block_found_with_snapshot(h.group_id, 9_995_021, reward, &finder, snap.into())
+        .on_block_found(
+            h.group_id,
+            9_995_021,
+            &actual_paying_exactly(&booked, reward),
+            &finder,
+            None,
+            Some(booked.payouts_fingerprint()),
+        )
         .await
         .expect("apply ok");
 
     // The booked one is gone — a redelivered event must not book it twice.
     assert!(
         h.engine
-            .snapshot_for_block_found(h.group_id, reward, &finder, &booked.payouts_fingerprint)
+            .weight_snapshot_for_block_found(h.group_id, &finder, &booked.payouts_fingerprint())
             .await
             .is_err(),
         "the applied block's own payout list must be consumed"
     );
     // The other live job is untouched.
     h.engine
-        .snapshot_for_block_found(h.group_id, reward, &finder, &still_live.payouts_fingerprint)
+        .weight_snapshot_for_block_found(h.group_id, &finder, &still_live.payouts_fingerprint())
         .await
         .expect("a live job's distribution must survive another block's apply");
 
@@ -607,12 +748,20 @@ async fn on_block_found_keeps_round_when_reset_flag_false() {
         .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
         .await
         .unwrap();
-    h.engine
+    let dist = h
+        .engine
         .build_distribution(h.group_id, 312_500_000, &finder)
         .await
         .expect("ok");
     h.engine
-        .on_block_found(h.group_id, 9_997_001, 312_500_000, &finder)
+        .on_block_found(
+            h.group_id,
+            9_997_001,
+            &actual_paying_exactly(&dist, 312_500_000),
+            &finder,
+            None,
+            Some(dist.payouts_fingerprint()),
+        )
         .await
         .expect("ok");
 
@@ -645,7 +794,7 @@ async fn on_block_found_keeps_round_when_reset_flag_false() {
 // history dedupes via its UNIQUE; the balance apply is gated on a non-zero
 // history insert so the second apply is a no-op on the balance.
 #[tokio::test]
-async fn duplicate_block_found_does_not_double_balance() {
+async fn duplicate_block_found_does_not_double_the_history() {
     let h = match spawn_or_skip(15, None).await {
         Some(h) => h,
         None => return,
@@ -665,42 +814,45 @@ async fn duplicate_block_found_does_not_double_balance() {
         .expect("job-time build ok");
     let snap = h
         .engine
-        .snapshot_for_block_found(h.group_id, reward, &finder, &job.payouts_fingerprint)
+        .weight_snapshot_for_block_found(h.group_id, &finder, &job.payouts_fingerprint())
         .await
         .expect("snapshot");
+    let actual = actual_paying_exactly(&job, reward);
 
     // First apply.
     h.engine
-        .on_block_found_with_snapshot(h.group_id, height, reward, &finder, snap.clone().into())
+        .on_block_found(
+            h.group_id,
+            height,
+            &actual,
+            &finder,
+            Some(snap.clone()),
+            Some(job.payouts_fingerprint()),
+        )
         .await
         .expect("apply 1");
-    let after_first = h
-        .engine
-        .reader()
-        .balance(h.group_id, finder.as_str())
-        .await
-        .expect("ok")
-        .expect("row")
-        .total_paid_sats;
-    assert!(after_first > 0);
+    let after_first = read_block_history(&h.pool, h.group_id, height).await;
+    assert_eq!(after_first.len(), 1, "one member, one history row");
+    assert!(after_first[finder.as_str()] > 0);
 
     // Replay the SAME block-found (duplicate event).
     h.engine
-        .on_block_found_with_snapshot(h.group_id, height, reward, &finder, snap.into())
+        .on_block_found(
+            h.group_id,
+            height,
+            &actual,
+            &finder,
+            Some(snap),
+            Some(job.payouts_fingerprint()),
+        )
         .await
         .expect("apply 2 (replay) must not error");
-    let after_replay = h
-        .engine
-        .reader()
-        .balance(h.group_id, finder.as_str())
-        .await
-        .expect("ok")
-        .expect("row")
-        .total_paid_sats;
+    let after_replay = read_block_history(&h.pool, h.group_id, height).await;
 
     assert_eq!(
         after_first, after_replay,
-        "replayed block-found must not double-count totalPaidSats"
+        "a replayed block-found must leave the payout history exactly as the first \
+         delivery wrote it"
     );
 
     // Exactly one history row for the (group, height) survived.
@@ -732,24 +884,29 @@ async fn on_block_found_re_entrancy_guard_per_group() {
         .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
         .await
         .unwrap();
-    h.engine
+    let dist = h
+        .engine
         .build_distribution(h.group_id, 312_500_000, &finder)
         .await
         .expect("ok");
+    let fp = dist.payouts_fingerprint();
+    let actual = actual_paying_exactly(&dist, 312_500_000);
 
     let engine1 = h.engine.clone();
     let engine2 = h.engine.clone();
     let gid = h.group_id;
     let finder1 = finder.clone();
     let finder2 = finder.clone();
+    let actual1 = actual.clone();
+    let actual2 = actual;
     let task1 = tokio::spawn(async move {
         engine1
-            .on_block_found(gid, 9_995_002, 312_500_000, &finder1)
+            .on_block_found(gid, 9_995_002, &actual1, &finder1, None, Some(fp))
             .await
     });
     let task2 = tokio::spawn(async move {
         engine2
-            .on_block_found(gid, 9_995_002, 312_500_000, &finder2)
+            .on_block_found(gid, 9_995_002, &actual2, &finder2, None, Some(fp))
             .await
     });
 
@@ -777,111 +934,6 @@ async fn on_block_found_re_entrancy_guard_per_group() {
     drop_harness(h).await;
 }
 
-// ── Test 5 — reader.balance reads PG row ───────────────────────────
-
-#[tokio::test]
-async fn reader_balance_returns_row_after_block_found() {
-    let h = match spawn_or_skip(4, None).await {
-        Some(h) => h,
-        None => return,
-    };
-    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
-        .await
-        .unwrap();
-    h.engine
-        .build_distribution(h.group_id, 312_500_000, &finder)
-        .await
-        .expect("ok");
-    h.engine
-        .on_block_found(h.group_id, 9_995_003, 312_500_000, &finder)
-        .await
-        .expect("ok");
-
-    let bal = h
-        .engine
-        .reader()
-        .balance(h.group_id, finder.as_str())
-        .await
-        .expect("ok")
-        .expect("balance row exists");
-    assert!(bal.total_paid_sats > 0, "finder received coinbase output");
-
-    drop_harness(h).await;
-}
-
-// ── Test 5b — totalPaidSats accumulates across blocks ──────────────
-//
-// A member fully paid on-chain has `pendingSats = 0`. The block-found apply
-// must still see their prior `totalPaidSats` to accumulate it — earlier it
-// read balances filtered on `pendingSats > 0`, so a paid member was invisible
-// and their lifetime total got overwritten with the latest block instead of
-// summed. Two finder-only blocks must leave `totalPaidSats == 2x` one block.
-#[tokio::test]
-async fn total_paid_sats_accumulates_across_blocks() {
-    let h = match spawn_or_skip(13, None).await {
-        Some(h) => h,
-        None => return,
-    };
-    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    let reward = 312_500_000;
-
-    // Block 1.
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
-        .await
-        .unwrap();
-    h.engine
-        .build_distribution(h.group_id, reward, &finder)
-        .await
-        .expect("ok");
-    h.engine
-        .on_block_found(h.group_id, 9_996_001, reward, &finder)
-        .await
-        .expect("block 1 ok");
-    let after_one = h
-        .engine
-        .reader()
-        .balance(h.group_id, finder.as_str())
-        .await
-        .expect("ok")
-        .expect("balance row")
-        .total_paid_sats;
-    assert!(after_one > 0, "finder paid on block 1");
-
-    // Block 2 — round was reset by block 1, so re-seed a share. The finder's
-    // pending is now 0, so the pending-filtered read would have hidden them.
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 2)
-        .await
-        .unwrap();
-    h.engine
-        .build_distribution(h.group_id, reward, &finder)
-        .await
-        .expect("ok");
-    h.engine
-        .on_block_found(h.group_id, 9_996_002, reward, &finder)
-        .await
-        .expect("block 2 ok");
-    let after_two = h
-        .engine
-        .reader()
-        .balance(h.group_id, finder.as_str())
-        .await
-        .expect("ok")
-        .expect("balance row")
-        .total_paid_sats;
-
-    assert_eq!(
-        after_two,
-        after_one * 2,
-        "totalPaidSats must accumulate (block1 + block2), not overwrite with the latest block"
-    );
-
-    drop_harness(h).await;
-}
-
 // ── Test 6 — manual_reset triggers full wipe ───────────────────────
 
 #[tokio::test]
@@ -890,17 +942,6 @@ async fn manual_reset_wipes_group_state() {
         Some(h) => h,
         None => return,
     };
-    // Seed via PG so the balance row outlives the round (Variant-B
-    // semantics: scheduled reset wipes balance rows too).
-    sqlx::query(
-        r#"INSERT INTO pplns_group_balance
-             (address, "groupId", "pendingSats", "totalPaidSats", "updatedAt")
-           VALUES ('test_eng_reset_a', $1, 5_000, 0, 0)"#,
-    )
-    .bind(h.group_id)
-    .execute(&h.pool)
-    .await
-    .unwrap();
     h.engine
         .record_share(None, h.group_id, "test_eng_reset_a", 50.0, 1)
         .await
@@ -909,17 +950,9 @@ async fn manual_reset_wipes_group_state() {
     let fired = h.engine.manual_reset(h.group_id).await.expect("ok");
     assert!(fired);
 
-    // Round + balance both wiped.
+    // The round is what a reset wipes — there is nothing else to wipe.
     let stats = h.engine.reader().round_stats(h.group_id).await.expect("ok");
     assert_eq!(stats.total_shares, 0.0);
-
-    let bal_count: (i64,) =
-        sqlx::query_as(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
-            .bind(h.group_id)
-            .fetch_one(&h.pool)
-            .await
-            .unwrap();
-    assert_eq!(bal_count.0, 0);
 
     drop_harness(h).await;
 }
@@ -947,21 +980,20 @@ async fn record_reject_updates_round_rejected_total() {
     drop_harness(h).await;
 }
 
-// ── Test 9 — finder bonus + finder shares merge into one row ───────
+// ── Test 9 — finder bonus + finder shares land in ONE row ──────────
 //
-// Regression guard. When a group has `finderBonusSats` set AND the
-// finder also has shares this round, `build_coinbase_distribution`
-// emits the finder address twice — a dedicated bonus output plus the
-// finder's proportional share output (both valid on-chain TxOuts). The
-// ledger write keys on `(address, groupId)`, so it must MERGE the two
-// into a single upsert row; otherwise Postgres aborts the whole
-// `apply_distribution` TX with "ON CONFLICT DO UPDATE command cannot
-// affect row a second time", leaving the on-chain payout unrecorded in
-// the pool's books. Pre-fix this test fails at `on_block_found`.
+// When a group has `finderBonusPpm` set AND the finder also has shares
+// this round, the §4 weight model folds the bonus into the finder's
+// single weight — one coinbase output, one ledger upsert per address by
+// construction. (The old model emitted a dedicated bonus output plus a
+// proportional output and had to MERGE them, or Postgres aborted the
+// apply TX on the duplicate `(address, groupId)` key.) This pins the
+// new invariant: single bonus-inclusive output, correctly booked.
 #[tokio::test]
 async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
-    let bonus: i64 = 5_000_000;
-    let h = match spawn_or_skip(8, Some(bonus)).await {
+    // 1.6 % of the miner cut — what the old 5M-sat bonus came to.
+    const BONUS_PPM: i32 = 16_000;
+    let h = match spawn_or_skip(8, Some(BONUS_PPM)).await {
         Some(h) => h,
         None => return,
     };
@@ -985,44 +1017,73 @@ async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
         .await
         .expect("build_distribution ok");
 
-    // Sanity: the raw distribution lists the finder more than once
-    // (bonus + proportional) — the exact condition the merge guards.
-    let finder_entries = result
-        .payouts
+    // §4 folds the finder bonus into the finder's SINGLE weight — one
+    // output per address by construction, so the duplicate-output merge
+    // the old model needed has nothing left to merge. What remains to
+    // pin: exactly one finder output, sitting visibly ABOVE pro-rata
+    // (the folded bonus), and the ledger crediting exactly that.
+    let entries = result
+        .distribution
+        .payout_entries_at(reward)
+        .expect("§4 payout vector");
+    let finder_outputs: Vec<u64> = entries
         .iter()
-        .filter(|p| p.address == finder)
-        .count();
-    assert!(
-        finder_entries >= 2,
-        "expected finder as bonus + proportional output, got {finder_entries}"
+        .filter(|(a, _)| *a == finder)
+        .map(|(_, s)| *s)
+        .collect();
+    assert_eq!(
+        finder_outputs.len(),
+        1,
+        "finder must appear in EXACTLY one §4 output (bonus folded into the weight)"
     );
-    // The summed sats the ledger must credit the finder.
-    let expected_finder_sats: i64 = result
-        .payouts
+    let finder_sats = finder_outputs[0];
+    let other_sats = entries
         .iter()
-        .filter(|p| p.address == finder)
-        .map(|p| p.sats.0)
-        .sum();
+        .find(|(a, _)| *a == other)
+        .map(|(_, s)| *s)
+        .expect("peer must be paid");
+    // Pin the ARITHMETIC, not just the direction. `finder > other · 7/3`
+    // is satisfied by two satoshis of integer-division rounding, so it
+    // passes just as happily with no bonus at all — which is exactly the
+    // failure a mis-seeded harness produces.
+    //
+    // The bonus is a share of the miner cut taken off the top; the rest
+    // splits 70/30. The two miner outputs ARE the miner cut, so deriving
+    // the pot from them keeps this independent of the pool fee.
+    let pot = (finder_sats + other_sats) as u128;
+    let bonus_sats = pot * BONUS_PPM as u128 / 1_000_000;
+    let expected_finder = bonus_sats + (pot - bonus_sats) * 7 / 10;
+    let drift = (finder_sats as i128) - (expected_finder as i128);
+    assert!(
+        drift.abs() <= 4,
+        "finder output must be bonus + 70 % of the remainder: \
+         expected ≈{expected_finder}, got {finder_sats} (off by {drift}; \
+         pot={pot}, bonus={bonus_sats}). A zero bonus lands ~{} short.",
+        bonus_sats * 3 / 10
+    );
+    let expected_finder_sats = finder_sats as i64;
 
     let block_height = 9_995_008;
     let outcome = h
         .engine
-        .on_block_found(h.group_id, block_height, reward, &finder)
+        .on_block_found(
+            h.group_id,
+            block_height,
+            &actual_paying_exactly(&result, reward),
+            &finder,
+            None,
+            Some(result.payouts_fingerprint()),
+        )
         .await
-        .expect("on_block_found must not abort on duplicate finder output");
+        .expect("on_block_found ok");
     assert!(outcome.history_inserted >= 1);
 
-    // Exactly one balance row for the finder, carrying the SUMMED sats.
-    let bal = h
-        .engine
-        .reader()
-        .balance(h.group_id, finder.as_str())
-        .await
-        .expect("ok")
-        .expect("finder balance row exists");
+    // The history records that single bonus-inclusive output verbatim.
+    let history = read_block_history(&h.pool, h.group_id, block_height).await;
     assert_eq!(
-        bal.total_paid_sats, expected_finder_sats,
-        "finder totalPaidSats must equal bonus + proportional share merged"
+        history.get(finder.as_str()).copied(),
+        Some(expected_finder_sats),
+        "the finder's history row must be the single bonus-inclusive output"
     );
 
     // Exactly one history coinbase row for the finder for this block.
@@ -1099,6 +1160,7 @@ fn reset_row(
         round_reset_timezone: timezone.map(str::to_string),
         last_round_reset_at: None,
         finder_bonus_sats: None,
+        finder_bonus_ppm: None,
         round_reset_preset: preset.map(str::to_string),
         is_public: false,
         reset_round_on_block: false,
@@ -1192,11 +1254,11 @@ async fn spawn_core_skips_startup_reset_crons() {
         Some(p) => p,
         None => return,
     };
-    let full_conn = match connect_redis_or_skip(10).await {
+    let full_conn = match connect_redis_or_skip(20).await {
         Some(c) => c,
         None => return,
     };
-    let core_conn = match connect_redis_or_skip(11).await {
+    let core_conn = match connect_redis_or_skip(21).await {
         Some(c) => c,
         None => return,
     };
@@ -1206,7 +1268,8 @@ async fn spawn_core_skips_startup_reset_crons() {
     seed_group_with_daily_reset(&pool, group_id).await;
 
     let config = || GroupSoloEngineConfig {
-        dust_sweep_enabled: false,
+        // §4: the weight model requires the pool-output recipient.
+        fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
         ..GroupSoloEngineConfig::default()
     };
 
@@ -1238,9 +1301,13 @@ async fn spawn_core_skips_startup_reset_crons() {
         .build_distribution(group_id, 312_500_000, &addr)
         .await
         .expect("build_distribution ok");
-    assert_eq!(result.block_reward_sats, 312_500_000);
-    assert!(!result.payouts.is_empty());
-    assert!(result.considered_addresses.contains(&addr));
+    assert_eq!(result.distribution.reference_revenue_sats, 312_500_000);
+    assert!(result.distribution.published().count() > 0);
+    assert!(result
+        .distribution
+        .entries
+        .iter()
+        .any(|e| e.address == addr));
 
     full.shutdown();
     core.shutdown();
@@ -1269,6 +1336,8 @@ async fn connect_pg_or_skip() -> Option<PgPool> {
 /// Connect a flushed Redis logical DB, or `None` to skip.
 async fn connect_redis_or_skip(redis_db: u8) -> Option<ConnectionManager> {
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
+    let redis_db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_ENGINE, redis_db).await;
     let client = Client::open(format!("{redis_base}/{redis_db}")).ok()?;
     let mut conn = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -1297,7 +1366,7 @@ async fn seed_group_with_daily_reset(pool: &PgPool, group_id: Uuid) {
     sqlx::query(
         r#"INSERT INTO pplns_group
              (id, name, "creatorAddress", "adminTokenHash", active,
-              "createdAt", "updatedAt", "isPublic", "finderBonusSats",
+              "createdAt", "updatedAt", "isPublic", "finderBonusPpm",
               "roundResetPreset", "roundResetTimezone")
            VALUES ($1, $2, 'test_core_creator', $3, true, 0, 0, false, NULL,
                    'daily', 'UTC')"#,
@@ -1320,7 +1389,7 @@ async fn seed_group_with_daily_reset(pool: &PgPool, group_id: Uuid) {
 // now-relative timestamps so the record-path and read-path trims agree.
 #[tokio::test]
 async fn window_mode_record_path_trims_aged_buckets() {
-    let h = match spawn_or_skip(12, None).await {
+    let h = match spawn_or_skip(18, None).await {
         Some(h) => h,
         None => return,
     };
@@ -1438,6 +1507,157 @@ async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
         (stats.per_address.get("bc1qnew").copied().unwrap_or(0.0) - 60.0).abs() < 1e-9,
         "fresh share present in the window"
     );
+
+    drop_harness(h).await;
+}
+
+// ── The settlement gate: subsidy, not the reference revenue ────────
+//
+// `overpayment_is_booked_as_debt_and_recovered_next_block` above pins
+// the +20 % case. Anything past ±25 % used to be refused outright, and
+// refusing meant the block's balances stayed exactly as they were —
+// so the credits its coinbase had already paid were paid a second time
+// out of the next block's miner cut. The claims come from the block's
+// own coinbase and are right at any revenue; only a coinbase paying
+// less than the block's own subsidy is still refused.
+//
+// Heights sit in the current subsidy epoch (4 halvings → 312 500 000
+// sats) so the gate is genuinely exercised.
+
+/// A Group-Solo block paying far outside the band must still book, and
+/// the finder's bonus overshoot must land as debt just as it does
+/// inside the band — the arithmetic does not change at the boundary.
+#[tokio::test]
+async fn a_group_block_far_off_the_reference_is_still_booked() {
+    let h = match spawn_or_skip(19, Some(160_000)).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
+    const T_REF: u64 = 312_500_000;
+    // 1.6 × the projection base — far outside the ±25 % band, and well
+    // above the block subsidy, so only the alarm fires.
+    const T_ACTUAL: u64 = 500_000_000;
+    let height: i32 = 840_801;
+    assert!(
+        !bp_share::reward_within_band(T_REF, T_ACTUAL),
+        "the fixture must actually sit outside the settlement band"
+    );
+
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, h.group_id, other.as_str(), 100.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+    let result = h
+        .engine
+        .build_distribution(h.group_id, T_REF, &finder)
+        .await
+        .expect("build");
+    // 16 % bonus on an even two-way split → finder holds 0.16 + 0.42.
+    assert_finder_score_fraction(&result.distribution, &finder, 0.58);
+
+    // THE REGRESSION: this returned `SnapshotRewardMismatch` and booked
+    // nothing at all.
+    h.engine
+        .on_block_found(
+            h.group_id,
+            height,
+            &actual_paying_exactly(&result, T_ACTUAL),
+            &finder,
+            None,
+            Some(result.payouts_fingerprint()),
+        )
+        .await
+        .expect("a block off the reference revenue must still book");
+
+    // Both members are paid their exact share even 1.6× off the
+    // reference. Every weight is a proportion, so there is no
+    // satoshi-denominated promise left to project wrong — and nothing
+    // is owed afterwards at any revenue.
+    let paid = actual_paying_exactly(&result, T_ACTUAL);
+    let history = read_block_history(&h.pool, h.group_id, height).await;
+    for who in [&finder, &other] {
+        let on_chain = paid
+            .paid_by_address
+            .get(who.as_str())
+            .copied()
+            .expect("member must be paid") as i64;
+        assert_eq!(
+            history.get(who.as_str()).copied(),
+            Some(on_chain),
+            "{} history row must transcribe the coinbase at 1.6× the reference",
+            who.as_str()
+        );
+    }
+    assert_eq!(count_group_balance_rows(&h.pool, h.group_id).await, 0);
+
+    drop_harness(h).await;
+}
+
+/// The one thing Group-Solo settlement still refuses: a coinbase paying
+/// less than the block's own subsidy destroyed money it was entitled
+/// to — and it must not be retried forever by the confirmation watcher.
+#[tokio::test]
+async fn a_group_coinbase_below_the_block_subsidy_is_refused() {
+    let h = match spawn_or_skip(4, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+    const T_REF: u64 = 312_500_000;
+    let height: i32 = 840_802;
+    let subsidy = bp_share::block_subsidy_sats(height, bp_share::SUBSIDY_HALVING_INTERVAL);
+    assert_eq!(subsidy, 312_500_000, "fixture height must be in epoch 4");
+
+    h.engine
+        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    let result = h
+        .engine
+        .build_distribution(h.group_id, T_REF, &finder)
+        .await
+        .expect("build");
+
+    let err = h
+        .engine
+        .on_block_found(
+            h.group_id,
+            height,
+            &actual_paying_exactly(&result, subsidy - 1),
+            &finder,
+            None,
+            Some(result.payouts_fingerprint()),
+        )
+        .await
+        .expect_err("a coinbase below the subsidy must not book");
+    assert!(
+        matches!(
+            err,
+            bp_group_solo_engine::engine::EngineError::RevenueBelowSubsidy { .. }
+        ),
+        "expected RevenueBelowSubsidy, got {err}"
+    );
+    assert!(
+        err.is_terminal(),
+        "the confirmation watcher must drop this rather than retry it every tick"
+    );
+
+    let booked: i64 = sqlx::query_scalar(
+        r#"SELECT count(*) FROM pplns_group_block_history
+           WHERE "groupId" = $1 AND "blockHeight" = $2"#,
+    )
+    .bind(h.group_id)
+    .bind(height)
+    .fetch_one(&h.pool)
+    .await
+    .expect("count");
+    assert_eq!(booked, 0, "nothing may be booked for a burned block");
 
     drop_harness(h).await;
 }

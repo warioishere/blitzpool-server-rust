@@ -108,13 +108,32 @@ pub async fn found_block_miner_at_height(
 ///
 /// Solo blocks legitimately have no row here: they pay directly in the
 /// coinbase and keep no ledger. Callers must not treat their absence as a
-/// miss without first checking the mode.
+/// miss without first checking that the coinbase paid nobody else.
+///
+/// **A row is not an accounting.** Every clause requires a row that moved
+/// VALUE, because a block can produce rows that account for nothing. The
+/// PPLNS apply writes a 0-sat `pending` row for every address that is live
+/// in the window but absent from the block's distribution ("late
+/// arrivers"), so a distribution that paid nobody at all still leaves rows
+/// behind — measured on a block whose coinbase paid 100 % to the pool
+/// output: no miner claim, no miner payment, and a `history_inserted`
+/// greater than zero. Under a plain `EXISTS` that block reads as booked
+/// and this check, which exists to find exactly that, stays silent.
 pub async fn payout_recorded_at_height(pool: &PgPool, height: i32) -> Result<bool, DbError> {
     let found = sqlx::query_scalar!(
         r#"SELECT (
-             EXISTS (SELECT 1 FROM pplns_payout_history WHERE "blockHeight" = $1)
-             OR EXISTS (SELECT 1 FROM pplns_group_block_history WHERE "blockHeight" = $1)
-             OR EXISTS (SELECT 1 FROM blockparty_block_history WHERE "blockHeight" = $1)
+             EXISTS (
+               SELECT 1 FROM pplns_payout_history
+               WHERE "blockHeight" = $1 AND "paidSats" <> 0
+             )
+             OR EXISTS (
+               SELECT 1 FROM pplns_group_block_history
+               WHERE "blockHeight" = $1 AND "paidSats" <> 0
+             )
+             OR EXISTS (
+               SELECT 1 FROM blockparty_block_history
+               WHERE "blockHeight" = $1 AND "coinbaseValueSats" <> 0
+             )
            ) AS "exists!""#,
         height,
     )

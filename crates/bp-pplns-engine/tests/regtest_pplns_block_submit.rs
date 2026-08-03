@@ -166,61 +166,51 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
         .build_distribution(reward_sats)
         .await
         .expect("build_distribution");
-    // Bit-exact shape: 3 seeded miners + fee_address configured →
-    // exactly 4 coinbase outputs (1 fee + 3 share outputs).
+    // The §4 evaluation at this template's revenue. Bit-exact shape:
+    // 3 seeded miners + the pool output → exactly 4 coinbase outputs
+    // (pool/fee first, then the share outputs).
+    let entries = dist
+        .distribution
+        .payout_entries_at(reward_sats)
+        .expect("§4 payout vector");
     assert_eq!(
-        dist.payouts.len(),
+        entries.len(),
         4,
-        "expected exactly 4 payouts (fee + 3 member shares) — got {}: {:?}",
-        dist.payouts.len(),
-        dist.payouts
+        "expected exactly 4 payouts (pool + 3 member shares) — got {}: {:?}",
+        entries.len(),
+        entries
             .iter()
-            .map(|p| (p.address.as_str(), p.sats.0))
+            .map(|(a, s)| (a.as_str(), *s))
             .collect::<Vec<_>>(),
     );
-    let fee_entries: Vec<&_> = dist
-        .payouts
-        .iter()
-        .filter(|p| p.address.as_str() == addr_fee)
-        .collect();
     assert_eq!(
-        fee_entries.len(),
-        1,
-        "fee address must appear in exactly one output"
+        entries[0].0.as_str(),
+        addr_fee,
+        "the pool output leads the §4 order"
     );
     for miner in [&addr_alice, &addr_bob, &addr_charlie] {
-        let n = dist
-            .payouts
-            .iter()
-            .filter(|p| p.address.as_str() == miner)
-            .count();
+        let n = entries.iter().filter(|(a, _)| a.as_str() == *miner).count();
         assert_eq!(
             n, 1,
             "miner {miner} must appear in exactly one output (got {n})"
         );
     }
-    // Sanity-check the sat sums: total of distribution outputs must
-    // equal the reward we asked for, otherwise bitcoin-core would
+    // Sanity-check the sat sums: the §4 vector consumes exactly the
+    // revenue (pay_P absorbs rounding), otherwise bitcoin-core would
     // reject with `bad-cb-amount` regardless of any other math.
-    let total_payout_sats: i64 = dist.payouts.iter().map(|p| p.sats.0).sum();
+    let total_payout_sats: u64 = entries.iter().map(|(_, s)| *s).sum();
     assert_eq!(
-        total_payout_sats as u64, reward_sats,
+        total_payout_sats, reward_sats,
         "distribution sat sums must equal reward — math drift would be \
          silently caught here before the coinbase even goes to core"
     );
 
-    // ── Convert engine payouts → bp-mining-job PayoutEntry ────────
-    //
-    // `MiningJob` re-derives sat values from `percent × reward`
-    // internally; passing percent here keeps the two layers in sync
-    // (any rounding drift between engine and mining-job would show
-    // up as `bad-cb-amount` on submit).
-    let payouts: Vec<PayoutEntry> = dist
-        .payouts
+    // ── Convert §4 entries → bp-mining-job PayoutEntry ────────────
+    let payouts: Vec<PayoutEntry> = entries
         .iter()
-        .map(|p| PayoutEntry {
-            address: p.address.as_str().to_string(),
-            sats: p.sats.0 as u64,
+        .map(|(a, s)| PayoutEntry {
+            address: a.as_str().to_string(),
+            sats: *s,
         })
         .collect();
 
@@ -362,11 +352,13 @@ async fn pplns_block_with_real_txs_nonempty_merkle_path_accepted_by_core() {
         .await
         .expect("build_distribution");
     let payouts: Vec<PayoutEntry> = dist
-        .payouts
+        .distribution
+        .payout_entries_at(reward_sats)
+        .expect("§4 payout vector")
         .iter()
-        .map(|p| PayoutEntry {
-            address: p.address.as_str().to_string(),
-            sats: p.sats.0 as u64,
+        .map(|(a, s)| PayoutEntry {
+            address: a.as_str().to_string(),
+            sats: *s,
         })
         .collect();
 
@@ -476,6 +468,7 @@ async fn mine_and_submit(
         &coinbase_template,
         pool_identifier,
         EXTRANONCE_SLOT_LEN,
+        [0u8; 32],
     )
     .expect("build_mining_job_from_tdp");
 
@@ -601,18 +594,20 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
         .build_distribution(reward_sats)
         .await
         .expect("build_distribution");
-    let fingerprint = dist.payouts_fingerprint;
+    let fingerprint = dist.payouts_fingerprint();
     let payouts: Vec<PayoutEntry> = dist
-        .payouts
+        .distribution
+        .payout_entries_at(reward_sats)
+        .expect("§4 payout vector")
         .iter()
-        .map(|p| PayoutEntry {
-            address: p.address.as_str().to_string(),
-            sats: p.sats.0 as u64,
+        .map(|(a, s)| PayoutEntry {
+            address: a.as_str().to_string(),
+            sats: *s,
         })
         .collect();
 
-    // The engine and the job must agree on the identity of the payout list,
-    // otherwise the block-found lookup would miss and silently fall back.
+    // The job carries the fingerprint the resolver handed it — the
+    // identity a found block books through.
     let coinbase_template = coinbase_template_from(&template);
     let job = build_mining_job_from_tdp(
         Network::Regtest,
@@ -620,19 +615,23 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
         &coinbase_template,
         "pplns-ledger-regtest",
         EXTRANONCE_SLOT_LEN,
+        fingerprint,
     )
     .expect("build_mining_job_from_tdp");
     assert_eq!(
         job.payouts_fingerprint(),
         &fingerprint,
-        "engine-side and job-side fingerprints must be byte-identical"
+        "the job must carry the distribution's fingerprint verbatim"
     );
 
-    // ── A later build displaces any shared snapshot ──────────────
-    let _jdc = engine
+    // ── A later build at a drifted reference shares the SAME
+    //    snapshot (the fingerprint hashes settlement inputs, not
+    //    amounts) — it must not disturb the booking below. ─────────
+    let jdc_style = engine
         .build_distribution(reward_sats - 997)
         .await
         .expect("jdc-style build");
+    assert_eq!(jdc_style.payouts_fingerprint(), fingerprint);
 
     let (height, witness_coinbase) = mine_and_submit(
         &node,
@@ -644,22 +643,22 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
     )
     .await;
 
-    // ── Book it, using the fingerprint the job carried ───────────
-    let prepared = engine
-        .prepare_block_found_for(height as i32, reward_sats, Some(fingerprint))
-        .await
-        .expect(
-            "the mined job's own distribution must still resolve — the later \
-             build displaced only the shared key",
-        );
-    engine
-        .apply_prepared(&prepared)
-        .await
-        .expect("apply_prepared");
-
-    // ── The ledger must match the coinbase the chain accepted ────
+    // ── Book it from the REAL accepted coinbase, using the
+    //    fingerprint the job carried ─────────────────────────────
     let coinbase_tx = bitcoin::Transaction::consensus_decode(&mut witness_coinbase.as_slice())
         .expect("submitted coinbase must decode");
+    let actual = bp_coinbase_snapshot::ActualCoinbase::from_coinbase(
+        &coinbase_tx,
+        bitcoin::Network::Regtest,
+    );
+    assert_eq!(actual.total_value_sats, reward_sats);
+    let _prepared = engine
+        .on_block_found(height as i32, &actual, None, Some(fingerprint))
+        .await
+        .expect("the mined job's own distribution must resolve for booking");
+    // (apply happens inside on_block_found now)
+
+    // ── The ledger must match the coinbase the chain accepted ────
     let rows: Vec<(String, i64)> = sqlx::query_as(
         r#"SELECT address, "paidSats" FROM pplns_payout_history
            WHERE "blockHeight" = $1 AND "rowType" = 'coinbase'"#,

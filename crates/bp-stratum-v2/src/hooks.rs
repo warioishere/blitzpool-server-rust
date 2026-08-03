@@ -48,7 +48,7 @@
 use std::sync::Arc;
 
 use bp_common::{AddressId, StreamKind};
-use bp_mining_job::PayoutEntry;
+use bp_mining_job::{PayoutEntry, ResolvedPayouts};
 use bp_share::Difficulty;
 
 use crate::mining::submit::{RejectReason, ShareAccept};
@@ -62,22 +62,20 @@ use crate::mining::submit::{RejectReason, ShareAccept};
 /// [`crate::mining::client::apply_template_broadcast`].
 ///
 /// Production impl runs the service-layer mode-resolver
-/// ([`bp_mining_mode::ModeResolver`]) + builds the per-mode
-/// distribution ([`bp_pplns::build_coinbase_distribution`] /
-/// [`bp_group_solo::build_group_solo_distribution`] / single-output
-/// solo). Tests use [`NoOpHooks`] returning a single 100%-to-self
-/// entry.
+/// ([`bp_mining_mode::ModeResolver`]) + evaluates the per-mode
+/// distribution (PPLNS/Group-Solo: the SV2 ext 0x0003 §4 weight
+/// formula at this reward; Blockparty / single-output solo: their own
+/// exact allocators). Tests use [`NoOpHooks`] returning a single
+/// 100%-to-self entry.
 #[async_trait::async_trait]
 pub trait PayoutResolver: Send + Sync {
     /// Resolve the payout list for a given connection's locked
-    /// address + reward (in sats). Each entry carries its exact output
-    /// sats (summing to ≤ reward); `bp_mining_job::build_mining_job_from_tdp`
-    /// places them verbatim and sweeps any shortfall onto `outs[0]`.
-    async fn resolve_payouts(
-        &self,
-        miner_address: &AddressId,
-        reward_sats: u64,
-    ) -> Vec<PayoutEntry>;
+    /// address + reward (in sats), together with the fingerprint of
+    /// the distribution it came from (zeroed = books without a
+    /// snapshot). Each entry carries its exact output sats;
+    /// `bp_mining_job::build_mining_job_from_tdp` places them verbatim.
+    async fn resolve_payouts(&self, miner_address: &AddressId, reward_sats: u64)
+        -> ResolvedPayouts;
 
     /// Which TDP template stream a connection with this address mines on —
     /// resolved once at OpenChannel and fixed. Default `Default`
@@ -240,11 +238,11 @@ impl PayoutResolver for NoOpHooks {
         &self,
         miner_address: &AddressId,
         reward_sats: u64,
-    ) -> Vec<PayoutEntry> {
-        vec![PayoutEntry {
+    ) -> ResolvedPayouts {
+        ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
             address: miner_address.as_str().to_string(),
             sats: reward_sats,
-        }]
+        }])
     }
 }
 
@@ -382,14 +380,14 @@ pub mod test_support {
             &self,
             miner_address: &AddressId,
             reward_sats: u64,
-        ) -> Vec<PayoutEntry> {
+        ) -> ResolvedPayouts {
             if let Some(ref custom) = *self.payouts_override.lock().expect("poisoned") {
-                return custom.clone();
+                return ResolvedPayouts::unsnapshotted(custom.clone());
             }
-            vec![PayoutEntry {
+            ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
                 address: miner_address.as_str().to_string(),
                 sats: reward_sats,
-            }]
+            }])
         }
     }
 
@@ -547,8 +545,9 @@ mod tests {
     async fn no_op_hooks_default_payouts_to_self() {
         let hooks = NoOpHooks;
         let payouts = hooks.resolve_payouts(&make_addr(), 5_000_000_000).await;
-        assert_eq!(payouts.len(), 1);
-        assert_eq!(payouts[0].sats, 5_000_000_000);
+        assert_eq!(payouts.entries.len(), 1);
+        assert_eq!(payouts.entries[0].sats, 5_000_000_000);
+        assert_eq!(payouts.payouts_fingerprint, [0u8; 32]);
     }
 
     #[tokio::test]
@@ -633,7 +632,7 @@ mod tests {
             },
         ]);
         let payouts = hooks.resolve_payouts(&make_addr(), 5_000_000_000).await;
-        assert_eq!(payouts.len(), 2);
-        assert_eq!(payouts[0].address, "p1");
+        assert_eq!(payouts.entries.len(), 2);
+        assert_eq!(payouts.entries[0].address, "p1");
     }
 }

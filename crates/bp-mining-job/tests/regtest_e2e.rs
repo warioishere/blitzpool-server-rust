@@ -155,6 +155,7 @@ async fn run_block_acceptance_case(payouts: Vec<PayoutEntry>, pool_identifier: &
         &coinbase_template,
         pool_identifier,
         EXTRANONCE_SLOT_LEN,
+        [0u8; 32],
     )
     .expect("build_mining_job_from_tdp must succeed");
 
@@ -365,6 +366,7 @@ async fn coinbase_with_all_5_address_types_accepted_by_core() {
         &coinbase_template,
         "all5",
         EXTRANONCE_SLOT_LEN,
+        [0u8; 32],
     )
     .expect("build_mining_job_from_tdp must succeed for all 5 address types");
 

@@ -59,14 +59,14 @@ mod jdp_hooks;
 mod listeners;
 mod live_mode_marker;
 mod live_sessions;
+mod network_difficulty;
 mod payout_resolver;
 mod pending_blocks;
-mod pending_group_solo_blocks;
-mod pending_store;
 mod redis_backup;
 mod rejected_consumer;
 mod runtime_diag;
 mod satellite_consumer;
+mod settlement;
 mod stratum;
 mod stratum_v1;
 mod stratum_v2;
@@ -470,15 +470,16 @@ async fn main() -> ExitCode {
         )
     });
 
-    let group_service = match group_service::spawn(&handles, &production_hooks).await {
-        Ok(g) => g,
-        Err(err) => {
-            tracing::error!(%err, "group-service spawn failed");
-            eprintln!("blitzpool: {err}");
-            print_group_service_error_help(&err);
-            return ExitCode::from(7);
-        }
-    };
+    let group_service =
+        match group_service::spawn(&handles, &production_hooks, &engines.group_solo).await {
+            Ok(g) => g,
+            Err(err) => {
+                tracing::error!(%err, "group-service spawn failed");
+                eprintln!("blitzpool: {err}");
+                print_group_service_error_help(&err);
+                return ExitCode::from(7);
+            }
+        };
 
     let blockparty = match blockparty_service::spawn(&cfg, &handles, &group_service).await {
         Ok(bp) => bp,
@@ -555,6 +556,16 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // §10 settlement fan-out: every path that books a block tells the
+    // published payout distributions about it — the local JDP registry if
+    // this process has one, and the `cache:invalidate` stream so a registry
+    // on ANOTHER process hears it too. The second half is what the role
+    // split needs: `payout` books, `front` holds the registry. Created here,
+    // ahead of the Stratum listeners, because their block sinks settle on
+    // the immediate (ungated) apply and need the same signal the
+    // confirmation watcher and the JDP sink get. See `crate::settlement`.
+    let settle_signal = crate::settlement::SettlementSignal::new(handles.redis.clone());
+
     // Stratum listeners + share producer are the always-on front — front-only.
     let stratum = if is_front {
         match stratum::spawn(
@@ -564,6 +575,7 @@ async fn main() -> ExitCode {
             &group_service,
             dispatcher.clone(),
             device_status_gate.clone(),
+            settle_signal.clone(),
         )
         .await
         {
@@ -603,11 +615,6 @@ async fn main() -> ExitCode {
                 .as_ref()
                 .map(|e| e.coinbase_budget().get())
                 .unwrap_or(DEFAULT_COINBASE_WEIGHT_BUDGET),
-            has_fee_output: engines
-                .pplns
-                .as_ref()
-                .map(|e| e.config().fee_address.is_some())
-                .unwrap_or(false),
         };
         let crons = crons::spawn(
             &handles,
@@ -637,6 +644,7 @@ async fn main() -> ExitCode {
     // feed (a fast new-tip trigger) is optional: the Satellite has none and runs
     // on the fallback timer alone. (Blockparty is exempt — fixed-percentage
     // payouts recomputed from the DB, idempotent, nothing to drift.)
+
     let block_confirmation = if is_accounting {
         let depth = cfg
             .pplns
@@ -650,6 +658,7 @@ async fn main() -> ExitCode {
             engines.pplns.clone(),
             Some(engines.group_solo.clone()),
             depth,
+            Some(settle_signal.clone()),
         ))
     } else {
         None
@@ -661,6 +670,21 @@ async fn main() -> ExitCode {
     // process (single owner of the money window) with its own Redis connection
     // so the SCAN/DUMP burst never touches the share hot-path. Restore is never
     // automatic — see `--restore-redis-state`.
+    // Keep the PPLNS window's trim size on the CURRENT network difficulty.
+    // Payout role only: the window is trimmed inside `record_share`, which
+    // only that process runs, and it is the only reader of the value. The
+    // RPC (not the TDP stream) is the source because this process has no
+    // TDP feed — see `crate::network_difficulty`.
+    let _net_diff_refresh = match (cfg.has_role(Role::Payout), engines.pplns.as_ref()) {
+        (true, Some(pplns)) => Some(crate::network_difficulty::spawn_refresh_task(
+            handles.bitcoin_rpc.clone(),
+            pplns.window().network_difficulty(),
+            crate::network_difficulty::REFRESH_INTERVAL,
+        )),
+        // No PPLNS engine ⇒ no window to trim. Any other role never trims.
+        _ => None,
+    };
+
     let _redis_state_backup = if cfg.has_role(Role::Payout) {
         let backup_redis = handles
             .dedicated_redis(&cfg.redis, "redis-state-backup")
@@ -873,6 +897,7 @@ async fn main() -> ExitCode {
             group_service.clone(),
             blockparty.as_ref().map(|bp| bp.service.clone()),
             engines.mode_gate.clone(),
+            settle_signal.registry_slot(),
         ))
     } else {
         None
@@ -937,9 +962,10 @@ async fn main() -> ExitCode {
                         },
                         engines.blockparty.clone(),
                     ));
-                // Spawn the JDP template-tx cache only when the pool needs the
-                // txs (`jdp_orphan_submitblock = true` → reconstruct the full
-                // block + `submitblock`). Spawn it BEFORE jdp::spawn so its
+                // Spawn the JDP template-tx cache when the pool needs the txs
+                // (`jdp_orphan_submitblock` → reconstruct the full block +
+                // `submitblock`); on by default, so this normally runs. Spawn
+                // it BEFORE jdp::spawn so its
                 // broadcast subscription registers before the first NewTemplate
                 // (see `feedback-tdp-initial-template-drain`).
                 let template_tx_cache: Option<
@@ -963,6 +989,7 @@ async fn main() -> ExitCode {
                 let jdp_ledger_booker = {
                     let mut sink =
                         crate::block_sink::TdpBlockSubmissionSink::new(tdp_handle.clone())
+                            .with_network(crate::stratum_v2::config_network_to_bitcoin(cfg.network))
                             .with_fanout(
                                 engines.mode_gate.clone(),
                                 engines.pplns.clone(),
@@ -990,6 +1017,8 @@ async fn main() -> ExitCode {
                     jdp_payout_resolver,
                     template_tx_cache,
                     jdp_ledger_booker,
+                    handles.redis.clone(),
+                    settle_signal.clone(),
                 )
                 .await
                 {
@@ -1364,6 +1393,14 @@ fn print_jdp_error_help(err: &JdpSpawnError) {
                 "hint: couldn't bind JDP listener on {addr} — port {} \
                  already in use? Check with `ss -tlnp`.",
                 addr.port(),
+            );
+        }
+        JdpSpawnError::ValidationSocket(detail) => {
+            eprintln!(
+                "hint: `[sv2] jdp_validation_socket_path` — {detail}\n\
+                 It is normally the SAME socket as `[tdp] socket_path`, since \
+                 declared-job validation is a second interface on the one node. \
+                 Unset it to keep running without validation."
             );
         }
         JdpSpawnError::Sv2(_) => {

@@ -27,9 +27,11 @@
 //! log. JDP is off by default; operators flip it on deliberately.
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bitcoin::Network as BitcoinNetwork;
 use bp_bitcoin::BitcoinRpc;
+use bp_common::AddressId;
 use bp_config::AppConfig;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::jdp_server::StratumV2JdpServer;
@@ -41,10 +43,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::jdp_hooks::build_jdp_hooks;
-use crate::payout_resolver::ProductionPayoutResolver;
+use crate::payout_resolver::{ProductionDistributionSource, ProductionPayoutResolver};
 use crate::stratum_v2;
 
-#[allow(dead_code)]
+/// Default `SetPayoutDistribution` republish cadence when
+/// `[sv2].jdp_payout_distribution_interval_secs` is unset.
+const DEFAULT_DISTRIBUTION_INTERVAL_SECS: u64 = 60;
+
 pub(crate) struct JdpHandles {
     pub(crate) port: Option<u16>,
     listener_task: Option<JoinHandle<()>>,
@@ -94,12 +99,17 @@ pub(crate) enum JdpSpawnError {
     },
     #[error(transparent)]
     Sv2(#[from] stratum_v2::StratumV2SpawnError),
+    /// `[sv2].jdp_validation_socket_path` names a socket the upstream engine
+    /// cannot be pointed at, or the node did not answer on it.
+    #[error("jdp validation socket unusable: {0}")]
+    ValidationSocket(String),
 }
 
 /// Spawn the JDP server when `[sv2].jdp_enabled` is true. The bridge
 /// is shared with the SV2 mining servers via [`stratum_v2::build_bridge`]
 /// so `DeclareMiningJob`-issued tokens route to the correct mining
 /// channel on `SetCustomMiningJob`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn(
     cfg: &AppConfig,
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
@@ -111,6 +121,15 @@ pub(crate) async fn spawn(
     // proven to pay. `None` on a deployment with no ledger fan-out wired —
     // such a block is then reported but not booked.
     ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
+    // Allocator backing for the strictly-increasing ext 0x0003
+    // `distribution_id` (spec §3.1).
+    redis: redis::aio::ConnectionManager,
+    // §10 settlement fan-out, created by the caller because the block
+    // sinks are built before this server exists and must reach the SAME
+    // registry: a settlement from any source invalidates the published
+    // distributions, not just a JDP-declared one. This is also where the
+    // registry handle gets attached, so the signal can reach it locally.
+    settle: crate::settlement::SettlementSignal,
 ) -> Result<JdpHandles, JdpSpawnError> {
     if !cfg.sv2.jdp_enabled {
         info!("jdp: disabled (sv2.jdp_enabled = false)");
@@ -118,7 +137,6 @@ pub(crate) async fn spawn(
     }
     let port = cfg.sv2.jdp_port.ok_or(JdpSpawnError::PortMissing)?;
     let noise = stratum_v2::build_noise_config(cfg)?;
-    let server_cfg = stratum_v2::build_server_config(cfg);
     let network = match cfg.network {
         bp_config::Network::Mainnet => BitcoinNetwork::Bitcoin,
         // testnet4 shares the `tb` HRP with testnet3 — rust-bitcoin
@@ -126,6 +144,43 @@ pub(crate) async fn spawn(
         bp_config::Network::Testnet | bp_config::Network::Testnet4 => BitcoinNetwork::Testnet,
         bp_config::Network::Regtest => BitcoinNetwork::Regtest,
     };
+    // ext 0x0003 payout-distribution source: same resolver + engines the
+    // allocate path uses, so the published weight distribution and the
+    // pool's own coinbase always agree. The fee address anchors tailored
+    // distributions whose mode has no pool output of its own.
+    let fee_address = cfg
+        .pplns
+        .as_ref()
+        .and_then(|p| AddressId::new(p.fee_address.clone()).ok());
+    let distribution_source = Arc::new(ProductionDistributionSource {
+        resolver: payout_resolver.clone(),
+        tdp: tdp.clone(),
+        redis: Some(redis),
+        network,
+        fee_address,
+    });
+
+    // SV2 §6.1: hand declared jobs to bitcoin-core for a real verdict when the
+    // operator points us at the node's IPC socket. Unset → trusted, as before.
+    // A configured-but-unusable socket stops boot: a pool that logs "validation
+    // on" while validating nothing is worse than one that refuses to start.
+    let job_validator = match cfg.sv2.jdp_validation_socket_path.clone() {
+        Some(socket_path) => crate::jdp_hooks::ProductionJobValidator::connect(
+            socket_path,
+            cfg.network,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .map_err(JdpSpawnError::ValidationSocket)?,
+        None => {
+            info!(
+                "jdp: declared jobs are NOT validated against bitcoin-core \
+                 (set `[sv2].jdp_validation_socket_path` to enable, SV2 §6.1)"
+            );
+            None
+        }
+    };
+
     let hooks = build_jdp_hooks(
         tdp,
         bitcoin_rpc,
@@ -134,9 +189,18 @@ pub(crate) async fn spawn(
         network,
         cfg.sv2.jdp_orphan_submitblock,
         ledger_booker,
+        distribution_source,
+        settle.clone(),
+        job_validator,
     );
 
-    let server = StratumV2JdpServer::spawn(server_cfg, noise, hooks, bridge);
+    let distribution_interval = Duration::from_secs(
+        cfg.sv2
+            .jdp_payout_distribution_interval_secs
+            .unwrap_or(DEFAULT_DISTRIBUTION_INTERVAL_SECS),
+    );
+    let server = StratumV2JdpServer::spawn(noise, hooks, bridge, distribution_interval);
+    let _ = settle.registry_slot().set(server.distribution_handle());
 
     let bind_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
     let listener = TcpListener::bind(bind_addr)

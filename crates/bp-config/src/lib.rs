@@ -518,7 +518,7 @@ pub struct StratumConfig {
     pub vardiff_silence_easing_enabled: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sv2Config {
     /// 32-byte secp256k1 authority private key in hex. When absent
@@ -538,18 +538,67 @@ pub struct Sv2Config {
     pub jdp_enabled: bool,
     #[serde(default)]
     pub jdp_port: Option<u16>,
-    /// JDP block-found orphan-protection redundancy switch.
-    /// `false` (default): on `PushSolution` the pool **logs only** —
-    /// JDC is responsible for propagating the block via its own
-    /// `TdpHandle::submit_solution` path. SRI's reference pool does
-    /// the same.
-    /// `true`: pool additionally reconstructs the block + submits via
-    /// `bitcoind submitblock` RPC — anti-orphan redundancy for
-    /// production pools that serve
-    /// commercial JDCs. Off by default because most deployments
-    /// don't run JDC traffic — flip on when JDPs are in active use.
-    #[serde(default)]
+    /// Pool-side block resubmit over JSON-RPC — the ONLY way the pool can
+    /// meet §6.4.9 ("When receiving `PushSolution`, JDS MUST attempt to
+    /// reconstruct and propagate the block") on Bitcoin Core v31.
+    ///
+    /// Routing it through Core's job-declaration IPC instead would be the
+    /// natural home for it — that interface already holds the declaration it
+    /// validated. It cannot be done yet: v31's JDP interface has no
+    /// `submitSolution`, and its `handle_push_solution` is an explicit stub
+    /// ("Not yet implemented — deliberately left as a stub for future work").
+    /// Verified against bitcoin_core_sv2 v0.5.0 (sv2-apps v0.7.0) on
+    /// 2026-08-03. It arrives with Core v32 via sv2-apps#593; do not wire it
+    /// before then, the call would silently do nothing.
+    ///
+    /// `true` (default): reconstruct the block and submit it via `bitcoind
+    /// submitblock`. Costs one RPC per found block — the node answers
+    /// "duplicate" when the JDC's copy already arrived, which is the normal
+    /// case and is harmless.
+    /// `false`: log only. The JDC still propagates through its own node, so
+    /// the block travels either way; the pool just stops contributing the
+    /// second path that shrinks the orphan window.
+    #[serde(default = "default_true")]
     pub jdp_orphan_submitblock: bool,
+    /// bitcoin-core IPC socket for declared-job validation (SV2 §6.1). Same
+    /// shape as `[tdp] socket_path`, and normally the SAME socket — validation
+    /// is a second interface on the one node, not a second node.
+    ///
+    /// When set, every declared Custom Job goes to bitcoin-core's
+    /// `job_declaration_protocol` interface for a real `checkBlock` verdict
+    /// instead of being accepted on the JDC's word. Unset (default) keeps
+    /// declarations trusted.
+    ///
+    /// Upstream's engine takes a data DIRECTORY and derives
+    /// `<dir>/<network>/node.sock` itself (no subdirectory on mainnet), so the
+    /// path given here must be one that derivation can produce. Boot checks it
+    /// and refuses to start on a mismatch — the alternative is connecting
+    /// somewhere else, or nowhere, while the log says validation is on.
+    #[serde(default)]
+    pub jdp_validation_socket_path: Option<PathBuf>,
+    /// Republish cadence (seconds) for the ext 0x0003 payout
+    /// distribution push (`SetPayoutDistribution`). The publisher also
+    /// fires immediately on settlement invalidation; the timer only
+    /// bounds how stale a published distribution may grow between
+    /// blocks. Default 60.
+    #[serde(default)]
+    pub jdp_payout_distribution_interval_secs: Option<u64>,
+}
+
+impl Default for Sv2Config {
+    /// A config with no `[sv2]` section at all must land on the same values a
+    /// present-but-empty one would. `#[derive(Default)]` would not: serde's
+    /// per-field defaults only run while deserializing a table that exists, so
+    /// every `default = "…"` field would silently fall back to the type's own
+    /// zero. `jdp_orphan_submitblock` is the one where that matters — off means
+    /// the pool stops doing what §6.4.9 asks of a JDS.
+    fn default() -> Self {
+        // Deserialize an empty table rather than list fields: "no section" is
+        // then the same answer as "empty section" BY CONSTRUCTION, including
+        // for every field added later. Cannot fail — an empty table is exactly
+        // what a config omitting `[sv2]` hands to serde anyway.
+        toml::from_str("").expect("empty [sv2] table applies every serde default")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -569,9 +618,12 @@ pub struct PplnsConfig {
     /// dust-sweep never pad this — the fee output equals exactly
     /// this percentage.
     pub fee_percent: f64,
-    /// Coinbase weight budget in WU — **must match** `bitcoin.conf
-    /// blockreservedweight`. Lower budget → fewer payout recipients
-    /// per block but more tx-fee room.
+    /// Coinbase weight budget in WU. Handed straight to bitcoin-core
+    /// over the TDP IPC stream (`tdp_constraint_for_budget`) — there is
+    /// no `bitcoin.conf blockreservedweight` to keep in sync. Lower
+    /// budget → fewer payout recipients per block but more tx-fee room;
+    /// floored at `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`, below which
+    /// nothing is publishable and the pool would take every block.
     pub coinbase_weight_budget: u32,
     /// VarDiff floor for the PPLNS port (sub-ASIC hardware gate).
     pub min_difficulty: u64,
@@ -604,8 +656,12 @@ pub struct PplnsConfig {
     pub confirmation_depth: u32,
     /// Shares per count-bucket for the sliding window (default 10000). The
     /// window is stored as per-address buckets of this many shares; bigger =
-    /// less Redis memory + coarser trim, smaller = more memory + finer. MUST
-    /// match the TS pool's `PPLNS_BUCKET_SHARES` (they share Redis).
+    /// less Redis memory + coarser trim, smaller = more memory + finer.
+    ///
+    /// Not safe to raise on a live pool: the bucket id is derived from a Redis
+    /// counter that never resets, so a bigger divisor sends new shares to an
+    /// id below the live window, where the trim discards them. Raise it only
+    /// against an empty window; lowering it is harmless.
     #[serde(default = "default_bucket_shares")]
     pub bucket_shares: u64,
     /// Coinbase-budget autoscaler. **Absent** ⇒ the budget stays fixed at
@@ -835,15 +891,6 @@ pub struct GroupFeesConfig {
     /// 0 sats), not validity — raise it before onboarding larger groups.
     #[serde(default = "default_group_solo_coinbase_weight_budget")]
     pub coinbase_weight_budget: u32,
-    /// Enable the daily 03:00 UTC Group-Solo dust-sweep cron (deletes dormant
-    /// `pplns_group_balance` rows below `min_payout_sats`). Manual sweeps via
-    /// admin trigger still work when false.
-    #[serde(default = "default_true")]
-    pub dust_sweep_enabled: bool,
-    /// Inactivity cutoff (days) at which a `pplns_group_balance` row becomes
-    /// eligible for the dormant-row sweep.
-    #[serde(default = "default_dormant_days")]
-    pub dormant_balance_days: u32,
 }
 
 impl Default for GroupFeesConfig {
@@ -852,8 +899,6 @@ impl Default for GroupFeesConfig {
             address: None,
             percent: None,
             coinbase_weight_budget: default_group_solo_coinbase_weight_budget(),
-            dust_sweep_enabled: true,
-            dormant_balance_days: default_dormant_days(),
         }
     }
 }
@@ -1104,9 +1149,6 @@ fn default_confirmation_depth() -> u32 {
 }
 fn default_bucket_shares() -> u64 {
     10_000
-}
-fn default_dormant_days() -> u32 {
-    30
 }
 fn default_capacity_threshold() -> f64 {
     0.8
@@ -1379,13 +1421,14 @@ mod tests {
         assert_eq!(c.abandoned_balance_days, 45);
     }
 
+    /// Group-Solo has no ledger and therefore no dust sweep. `[group_fees]`
+    /// is `deny_unknown_fields`, so a config still carrying the retired keys
+    /// fails the boot instead of quietly ignoring them — same rule as the
+    /// `[solo]` keys above.
     #[test]
-    fn group_fees_sweep_overrides_propagate_from_toml() {
-        let c: GroupFeesConfig =
-            toml::from_str("dust_sweep_enabled = false\ndormant_balance_days = 14")
-                .expect("parses");
-        assert!(!c.dust_sweep_enabled);
-        assert_eq!(c.dormant_balance_days, 14);
+    fn group_fees_rejects_the_retired_sweep_keys() {
+        assert!(toml::from_str::<GroupFeesConfig>("dust_sweep_enabled = false").is_err());
+        assert!(toml::from_str::<GroupFeesConfig>("dormant_balance_days = 14").is_err());
     }
 
     #[test]
@@ -1541,12 +1584,18 @@ mod tests {
         assert!(cfg.notifications.fcm.is_none());
         assert!(cfg.smtp.is_none());
         assert_eq!(cfg.solo.coinbase_weight_budget, 4_000);
-        // Group-Solo sweep config lives on [group_fees] now.
-        assert!(cfg.group_fees.dust_sweep_enabled);
-        assert_eq!(cfg.group_fees.dormant_balance_days, 30);
         assert_eq!(cfg.aggregation.pool_stats_interval_ms, 600_000);
         // [tdp] staleness threshold defaults to 120s when unset.
         assert_eq!(cfg.tdp.staleness_threshold_secs, 120);
+        // §6.4.9 makes propagating a pushed solution a MUST for the JDS, and
+        // JSON-RPC is the only route Core v31 offers. A config that says
+        // nothing must therefore leave it ON — flipping this default back to
+        // false silently stops the pool contributing its half of the
+        // anti-orphan redundancy.
+        assert!(
+            cfg.sv2.jdp_orphan_submitblock,
+            "pool-side block propagation must default to on"
+        );
     }
 
     #[test]

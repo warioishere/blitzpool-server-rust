@@ -10,20 +10,23 @@
 //! cleanly via `eprintln!` if the URL is unreachable. Group-ids are
 //! kept unique per test so within-DB tests don't interfere either.
 
-use bp_common::{AddressId, Sats};
 use bp_group_mgmt::group::PayoutMode;
 use bp_group_solo_engine::round::{
     key_applied, key_best_share, key_by_address, key_counter, key_last_accepted_share_at,
     key_rejected_shares, key_total, key_window_buckets, snapshot, GroupRoundStore,
     WINDOW_BUCKET_MS,
 };
-use bp_pplns::CoinbaseDistributionEntry;
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 
 const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
 
 async fn connect_or_skip(test_db: u8) -> Option<ConnectionManager> {
     let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+    // Fold this binary's local number into its own DB range — see
+    // `bp_test_support::redis_db`. Without it every binary's 0..15
+    // land on the same 16 databases and FLUSHDB each other mid-run.
+    let test_db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_ROUND, test_db).await;
     let url = format!("{base}/{test_db}");
     let client = match Client::open(url.clone()) {
         Ok(c) => c,
@@ -98,13 +101,14 @@ async fn record_share_writes_all_keys() {
         .parse()
         .unwrap();
     assert_eq!(last_at, 1_700_000_000_000);
-    let counter_v: u64 = conn
-        .get::<_, String>(key_counter(group))
-        .await
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert_eq!(counter_v, 1);
+    // This call passes `None` for the share_id, so no dedup marker is
+    // written — the marker's scoring is pinned in
+    // `record_share_is_idempotent_per_share_id`.
+    let counter_exists: bool = conn.exists(key_counter(group)).await.unwrap();
+    assert!(
+        !counter_exists,
+        "the per-group counter is legacy and must no longer be written"
+    );
 }
 
 // ── Test 2 — record_reject increments per-address rejected ─────────
@@ -195,12 +199,26 @@ async fn reset_for_block_found_preserves_last_accepted_share_at() {
 
     assert!(!total_exists, "total wiped");
     assert!(!by_addr_exists, "by-address wiped");
-    assert!(!counter_exists, "counter wiped");
+    assert!(!counter_exists, "the legacy counter key is cleared");
     assert!(!best_exists, "best-share wiped");
-    assert!(!applied_exists, "dedup zset wiped with the round");
     assert!(
         last_at_exists,
         "last-accepted-share-at preserved across block-found reset"
+    );
+    // MONEY: the dedup set must OUTLIVE the reset.
+    //
+    // The satellite dispatches a batch of up to 256 shares and only then
+    // ACKs it. If a reset lands in that gap, a redelivery (process death
+    // mid-batch, or a failed ack) finds no markers and REAPPLIES those
+    // shares into the fresh round — work already accounted for in the round
+    // that was just wiped, credited a second time to whoever was in the
+    // batch. Right after a reset the round is empty, so they can dominate
+    // it. PPLNS never had this hole: `pplns:applied` is scored by a
+    // monotonic counter and is never reset.
+    assert!(
+        applied_exists,
+        "the dedup zset must survive a round reset, or an un-ACKed satellite \
+         batch is reapplied into the fresh round"
     );
 }
 
@@ -231,7 +249,14 @@ async fn reset_full_wipes_everything_including_last_accepted() {
     let applied_exists: bool = conn.exists(key_applied(group)).await.unwrap();
     assert!(!last_at_exists, "last-accepted-share-at wiped");
     assert!(!rejected_exists, "rejected-shares wiped");
-    assert!(!applied_exists, "dedup zset wiped on full reset");
+    // Even a full (calendar) reset leaves the dedup set alone — see
+    // `reset_for_block_found_preserves_last_accepted_share_at`. A calendar
+    // reset discards the round's work deliberately; reapplying an un-ACKed
+    // batch into the fresh one would hand those miners an unearned start.
+    assert!(
+        applied_exists,
+        "the dedup zset must survive a full reset too"
+    );
 }
 
 // ── Test 6 — best-share only updates on improvement ────────────────
@@ -330,7 +355,10 @@ async fn read_round_stats_returns_per_address_and_rejected() {
         .unwrap();
     store.record_reject(group, "bc1qa", 5.0).await.unwrap();
 
-    let stats = store.read_round_stats(group).await.unwrap();
+    let stats = store
+        .read_round_stats_for(group, PayoutMode::Prop, 0, 0)
+        .await
+        .unwrap();
     assert!((stats.total_shares - 100.0).abs() < 1e-9);
     assert!((stats.total_rejected - 5.0).abs() < 1e-9);
     assert_eq!(stats.per_address.len(), 2);
@@ -346,32 +374,35 @@ async fn snapshot_roundtrip_per_group_and_finder() {
     };
     let group = "g_snap1";
     let finder = "bc1qfinder";
-    let snap = snapshot::StoredSnapshot {
-        balance_before: Vec::new(),
-        distribution: vec![CoinbaseDistributionEntry {
-            address: AddressId::new("bc1qminer").unwrap(),
-            percent: 100.0,
-            sats: Sats(312_500_000),
+    let snap = bp_coinbase_snapshot::StoredWeightSnapshot {
+        entries: vec![bp_coinbase_snapshot::WeightSnapshotEntry {
+            address: "bc1qminer".to_string(),
+            score_weight: 1_000_000_000_000,
+            balance_sats: 0,
+            wire_weight: 1_000_000_000_000,
+            dust_limit: 546,
         }],
-        block_reward_sats: 312_500_000,
-        considered_addresses: vec!["bc1qminer".to_string()],
-        balance_after: vec![("bc1qminer".to_string(), 0)],
+        score_total: 1_000_000_000_000,
+        weight_p: 15_228_426_395,
+        fee_ppm: 15_000,
+        fee_address: "bc1qfee".to_string(),
+        reference_revenue_sats: 312_500_000,
     };
 
-    snapshot::write_snapshot(&mut conn, group, finder, &snap, 60)
+    snapshot::write_weight_snapshot(&mut conn, group, finder, &snap, 60)
         .await
         .expect("write ok");
-    let parsed = snapshot::read_snapshot(&mut conn, group, finder)
+    let parsed = snapshot::read_weight_snapshot(&mut conn, group, finder)
         .await
         .expect("read ok")
         .expect("present");
-    assert_eq!(parsed.block_reward_sats, 312_500_000);
-    assert_eq!(parsed.distribution.len(), 1);
+    assert_eq!(parsed.reference_revenue_sats, 312_500_000);
+    assert_eq!(parsed.entries.len(), 1);
 
     snapshot::delete_snapshot(&mut conn, group, finder)
         .await
         .expect("delete ok");
-    assert!(snapshot::read_snapshot(&mut conn, group, finder)
+    assert!(snapshot::read_weight_snapshot(&mut conn, group, finder)
         .await
         .unwrap()
         .is_none());
@@ -386,21 +417,28 @@ async fn delete_all_snapshots_for_group_scans_and_deletes() {
         None => return,
     };
     let group = "g_snap_del";
-    let snap = snapshot::StoredSnapshot {
-        balance_before: Vec::new(),
-        distribution: vec![],
-        block_reward_sats: 100,
-        considered_addresses: vec![],
-        balance_after: vec![],
+    let snap = bp_coinbase_snapshot::StoredWeightSnapshot {
+        entries: vec![bp_coinbase_snapshot::WeightSnapshotEntry {
+            address: "bc1qminer".to_string(),
+            score_weight: 1_000_000_000_000,
+            balance_sats: 0,
+            wire_weight: 1_000_000_000_000,
+            dust_limit: 546,
+        }],
+        score_total: 1_000_000_000_000,
+        weight_p: 15_228_426_395,
+        fee_ppm: 15_000,
+        fee_address: "bc1qfee".to_string(),
+        reference_revenue_sats: 312_500_000,
     };
     // Write snapshots for 3 different finders.
     for finder in &["bc1qf1", "bc1qf2", "bc1qf3"] {
-        snapshot::write_snapshot(&mut conn, group, finder, &snap, 60)
+        snapshot::write_weight_snapshot(&mut conn, group, finder, &snap, 60)
             .await
             .unwrap();
     }
     // Plus one snapshot for an UNRELATED group — must survive.
-    snapshot::write_snapshot(&mut conn, "g_other", "bc1qf1", &snap, 60)
+    snapshot::write_weight_snapshot(&mut conn, "g_other", "bc1qf1", &snap, 60)
         .await
         .unwrap();
 
@@ -411,15 +449,17 @@ async fn delete_all_snapshots_for_group_scans_and_deletes() {
 
     // Confirm: target group's snapshots gone, other group's survives.
     for finder in &["bc1qf1", "bc1qf2", "bc1qf3"] {
-        assert!(snapshot::read_snapshot(&mut conn, group, finder)
+        assert!(snapshot::read_weight_snapshot(&mut conn, group, finder)
             .await
             .unwrap()
             .is_none());
     }
-    assert!(snapshot::read_snapshot(&mut conn, "g_other", "bc1qf1")
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        snapshot::read_weight_snapshot(&mut conn, "g_other", "bc1qf1")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 // ── Test 11 — multiple groups are isolated ─────────────────────────
@@ -513,6 +553,99 @@ async fn record_share_is_idempotent_per_share_id() {
     assert!(
         (by - 200.0).abs() < 1e-9,
         "by-address must also exclude the dup"
+    );
+
+    // The marker is scored by the SHARE'S OWN accept time, not by a
+    // per-group counter. That is exactly what lets the set outlive a round
+    // reset — a counter-scored set had to be wiped with the counter.
+    let score: f64 = conn
+        .zscore(key_applied(group), "ep1:0")
+        .await
+        .expect("marker present");
+    assert_eq!(score, 1_700_000_000_000.0);
+}
+
+// ── The dedup marker must outlive a round reset ────────────────────
+//
+// MONEY. The satellite dispatches a batch of up to 256 shares to the sinks
+// and only ACKs the whole batch afterwards. A reset landing in that gap used
+// to delete the dedup markers with the round, so a redelivery — process
+// death mid-batch, which is every unclean restart, or a failed ack — found
+// no marker and REAPPLIED those shares into the fresh round. That is work
+// already accounted for in the round that was just wiped, credited a second
+// time; and right after a reset the round is empty, so a redelivered batch
+// can dominate it.
+//
+// PPLNS never had this hole (`pplns:applied` is scored by a monotonic
+// counter and is never reset), which is what made it an asymmetry between
+// two implementations of one contract rather than a shared limitation.
+
+#[tokio::test]
+async fn a_redelivered_share_is_still_deduped_across_a_round_reset() {
+    let conn = match connect_or_skip(16).await {
+        Some(c) => c,
+        None => return,
+    };
+    let store = GroupRoundStore::new(conn.clone());
+    let group = "g_dedup_reset";
+    let addr = "bc1qfoo";
+
+    // The satellite applies a share…
+    assert!(store
+        .record_share(Some("ep9:7"), group, addr, 100.0, 1_700_000_000_000)
+        .await
+        .expect("ok"));
+    // …a block is found for the group and the round is wiped…
+    store.reset_for_block_found(group).await.unwrap();
+    // …and only now does the batch get redelivered (the ack never landed).
+    let replay = store
+        .record_share(Some("ep9:7"), group, addr, 100.0, 1_700_000_000_000)
+        .await
+        .expect("ok");
+    assert!(
+        !replay,
+        "a share redelivered after a reset must STILL be a deduped no-op"
+    );
+
+    let mut conn = conn;
+    // The fresh round must be untouched by the replay — not carrying the
+    // previous round's work.
+    let total_exists: bool = conn.exists(key_total(group)).await.unwrap();
+    assert!(
+        !total_exists,
+        "the redelivery must not resurrect the wiped round's total"
+    );
+    let by_exists: bool = conn.exists(key_by_address(group)).await.unwrap();
+    assert!(
+        !by_exists,
+        "nor its by-address aggregate — that is the double credit"
+    );
+
+    // And the same holds for the calendar reset, which discards a round's
+    // work deliberately.
+    store.reset_full(group).await.unwrap();
+    assert!(
+        !store
+            .record_share(Some("ep9:7"), group, addr, 100.0, 1_700_000_000_000)
+            .await
+            .expect("ok"),
+        "a full reset must not re-open the redelivery either"
+    );
+
+    // A genuinely new share still lands, so this is dedup and not a freeze.
+    assert!(store
+        .record_share(Some("ep9:8"), group, addr, 42.0, 1_700_000_000_001)
+        .await
+        .expect("ok"));
+    let by: f64 = conn
+        .hget::<_, _, String>(key_by_address(group), addr)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (by - 42.0).abs() < 1e-9,
+        "only the new share counts, got {by}"
     );
 }
 

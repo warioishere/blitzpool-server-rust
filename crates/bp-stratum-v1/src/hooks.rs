@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bp_mining_job::PayoutEntry;
+use bp_mining_job::{PayoutEntry, ResolvedPayouts};
 
 use bp_common::StreamKind;
 
@@ -60,7 +60,9 @@ use crate::submit::{RejectReason, ShareAccept};
 /// shape was wrong).
 #[async_trait]
 pub trait PayoutResolver: Send + Sync {
-    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> Vec<PayoutEntry>;
+    /// Resolve the payout list plus the fingerprint of the
+    /// distribution it came from (zeroed = books without a snapshot).
+    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts;
 
     /// Which TDP template stream a connection with this address mines on —
     /// resolved once at `mining.authorize` and fixed for the session. The
@@ -274,11 +276,11 @@ impl DeviceStatusSink for NoOpHooks {
 
 #[async_trait]
 impl PayoutResolver for NoOpHooks {
-    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> Vec<PayoutEntry> {
-        vec![PayoutEntry {
+    async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
+        ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
             address: miner_address.to_string(),
             sats: reward_sats,
-        }]
+        }])
     }
 }
 
@@ -404,11 +406,11 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl PayoutResolver for RecordingHooks {
-        async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> Vec<PayoutEntry> {
-            vec![PayoutEntry {
+        async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
+            ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
                 address: miner_address.to_string(),
                 sats: reward_sats,
-            }]
+            }])
         }
     }
 

@@ -97,6 +97,17 @@ pub struct CacheInvalidation {
 pub mod cache_kind {
     pub const GROUP: &str = "group";
     pub const BLOCKPARTY: &str = "blockparty";
+    /// A block was booked, so every published SV2 ext-0x0003 payout
+    /// distribution is stale (§10). Unlike the two above this asks the
+    /// Front to INVALIDATE, not to rebuild from the DB — the published
+    /// weights encode pre-settlement ledger balances, and a job-declaring
+    /// client still mining them would pay those balances a second time.
+    ///
+    /// It rides this stream because the settling process and the process
+    /// holding the JDP registry are different ones under the role split
+    /// (`payout` books, `front` publishes distributions), and this is the
+    /// channel that already crosses that boundary.
+    pub const SETTLEMENT: &str = "settlement";
 }
 
 #[derive(Debug, Error)]
@@ -762,6 +773,11 @@ mod tests {
     const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
 
     async fn connect_or_skip(db: u8) -> Option<ConnectionManager> {
+        // Fold this binary's local number into its own DB range —
+        // see `bp_test_support::redis_db`. Two binaries both using
+        // 0..15 flush each other mid-run.
+        let db =
+            bp_test_support::redis_db_in_range(bp_test_support::redis_db::SHARE_STREAM, db).await;
         let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
         let url = format!("{base}/{db}");
         let client = Client::open(url).ok()?;
@@ -795,6 +811,11 @@ mod tests {
     /// head-of-line-block a deferred `XADD` sharing the same multiplexed
     /// connection.
     async fn connect_peer(db: u8) -> Option<ConnectionManager> {
+        // MUST fold identically to `connect_or_skip` — this opens a SECOND
+        // connection to the same logical DB, and a producer and consumer on
+        // different databases simply never see each other.
+        let db =
+            bp_test_support::redis_db_in_range(bp_test_support::redis_db::SHARE_STREAM, db).await;
         let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
         let url = format!("{base}/{db}");
         let client = Client::open(url).ok()?;
@@ -1100,7 +1121,6 @@ mod tests {
 
     #[tokio::test]
     async fn producing_sink_publishes_each_accepted_share() {
-        // DBs 0–15 only (valkey default `databases 16`); keep ≤ 15.
         let Some(consumer_conn) = connect_or_skip(11).await else {
             return;
         };

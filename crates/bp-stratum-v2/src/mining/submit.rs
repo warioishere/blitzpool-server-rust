@@ -1322,6 +1322,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .expect("ok");
         let enonce1 = [0xAA; 4];
@@ -1351,13 +1352,14 @@ mod tests {
     // ── ext 0x0002 Worker-ID TLV resolution in validate_submit_extended ──
 
     fn worker_id_tlv_bytes(user_identity: &str) -> Vec<u8> {
-        // Hand-built wire-form TLV: [ext_type 0x0002 BE][field_type 0x01]
-        // [length BE16][value bytes]. Mirrors ext 0x0002 §1.1.
+        // Hand-built wire-form TLV: [ext_type 0x0002 LE][field_type 0x01]
+        // [length LE16][value bytes]. Mirrors ext 0x0002 §1.1 with the
+        // SV2 U16 little-endian convention (§3.4.3).
         let value = user_identity.as_bytes();
         let mut tlv = Vec::with_capacity(5 + value.len());
-        tlv.extend_from_slice(&0x0002u16.to_be_bytes());
+        tlv.extend_from_slice(&0x0002u16.to_le_bytes());
         tlv.push(0x01);
-        tlv.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        tlv.extend_from_slice(&(value.len() as u16).to_le_bytes());
         tlv.extend_from_slice(value);
         tlv
     }

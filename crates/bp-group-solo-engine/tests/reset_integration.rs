@@ -22,6 +22,11 @@ const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 async fn connect_or_skip(redis_db: u8) -> Option<(PgPool, ConnectionManager)> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
+    // Fold this binary's local number into its own DB range — see
+    // `bp_test_support::redis_db`. Without it every binary's 0..15
+    // land on the same 16 databases and FLUSHDB each other mid-run.
+    let redis_db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_RESET, redis_db).await;
     let redis_url = format!("{redis_base}/{redis_db}");
 
     let pool = match tokio::time::timeout(
@@ -115,19 +120,6 @@ async fn seed_group_custom(
     .expect("seed group");
 }
 
-async fn seed_balance(pool: &PgPool, group_id: Uuid, address: &str, pending: i64) {
-    sqlx::query(
-        r#"INSERT INTO pplns_group_balance (address, "groupId", "pendingSats", "totalPaidSats", "updatedAt")
-           VALUES ($1, $2, $3, 0, 0)"#,
-    )
-    .bind(address)
-    .bind(group_id)
-    .bind(pending)
-    .execute(pool)
-    .await
-    .expect("seed balance");
-}
-
 async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
     let _ = sqlx::query(r#"DELETE FROM pplns_group_block_history WHERE "groupId" = $1"#)
         .bind(group_id)
@@ -164,7 +156,6 @@ async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
     };
     let group_id = Uuid::new_v4();
     seed_group(&pool, group_id, None).await;
-    seed_balance(&pool, group_id, "test_reset_a", 5_000).await;
 
     let round = GroupRoundStore::new(conn);
     let group_key = group_id.to_string();
@@ -174,16 +165,17 @@ async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
         .await
         .unwrap();
     let mut snap_conn = round.connection_for_snapshot();
-    snapshot::write_snapshot(
+    snapshot::write_weight_snapshot(
         &mut snap_conn,
         &group_key,
         "test_reset_finder",
-        &snapshot::StoredSnapshot {
-            balance_before: Vec::new(),
-            distribution: vec![],
-            block_reward_sats: 100,
-            considered_addresses: vec![],
-            balance_after: vec![],
+        &bp_coinbase_snapshot::StoredWeightSnapshot {
+            entries: vec![],
+            score_total: 0,
+            weight_p: 1,
+            fee_ppm: 15_000,
+            fee_address: "bc1qfee".to_string(),
+            reference_revenue_sats: 312_500_000,
         },
         60,
     )
@@ -199,20 +191,11 @@ async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
     assert!(round.read_by_address(&group_key).await.unwrap().is_empty());
     let mut snap_conn = round.connection_for_snapshot();
     assert!(
-        snapshot::read_snapshot(&mut snap_conn, &group_key, "test_reset_finder")
+        snapshot::read_weight_snapshot(&mut snap_conn, &group_key, "test_reset_finder")
             .await
             .unwrap()
             .is_none()
     );
-
-    // PG balance wiped.
-    let bal_count: (i64,) =
-        sqlx::query_as(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
-            .bind(group_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(bal_count.0, 0);
 
     // lastRoundResetAt stamped to clock's now_ms.
     let last: (Option<i64>,) =
@@ -358,8 +341,6 @@ async fn reset_one_group_does_not_affect_another() {
     let group_b = Uuid::new_v4();
     seed_group(&pool, group_a, None).await;
     seed_group(&pool, group_b, None).await;
-    seed_balance(&pool, group_a, "test_iso_a", 1_000).await;
-    seed_balance(&pool, group_b, "test_iso_b", 2_000).await;
 
     let round = GroupRoundStore::new(conn);
     round
@@ -381,14 +362,6 @@ async fn reset_one_group_does_not_affect_another() {
         .await
         .unwrap()
         .is_empty());
-    let bal_a: (i64,) =
-        sqlx::query_as(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
-            .bind(group_a)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(bal_a.0, 0);
-
     // Group B: untouched.
     assert_eq!(
         round
@@ -398,14 +371,6 @@ async fn reset_one_group_does_not_affect_another() {
             .len(),
         1
     );
-    let bal_b: (i64,) =
-        sqlx::query_as(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
-            .bind(group_b)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(bal_b.0, 1);
-
     cleanup_group(&pool, group_a).await;
     cleanup_group(&pool, group_b).await;
 }

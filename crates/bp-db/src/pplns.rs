@@ -55,47 +55,60 @@ pub async fn find_pplns_balances_abandoned(
     .map_err(DbError::from)
 }
 
-/// DELETE one `pplns_balance` row by address. Returns the affected
-/// row count (0 if missing, 1 on success). Used by the dust-sweep
-/// when a pair-cancel zeros the balance — the row is fully removed
-/// from the ledger.
-pub async fn delete_pplns_balance<'e, E>(executor: E, address: &AddressId) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let result = sqlx::query!(
-        r#"DELETE FROM pplns_balance WHERE address = $1"#,
-        address.as_str(),
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
-/// Single-column UPDATE of `balanceSats` for one address.
+/// Guarded single-column UPDATE of `balanceSats`: writes `new_balance`
+/// **only if** the row still holds `expected`. Returns `false` when it
+/// does not — the row moved since the caller read it, and the absolute
+/// value it computed would silently undo whatever moved it.
 ///
-/// Distinct from [`bulk_upsert_pplns_balances`] because the dust-sweep
-/// reduces a balance toward zero (or the remainder side of a pair)
-/// without touching `totalPaidSats` or `updatedAt` — those are
-/// preserved at their existing values.
-pub async fn update_pplns_balance_sats<'e, E>(
+/// The dust sweep needs this because it reads its whole candidate set
+/// ONCE per run and then commits pair by pair, so its view of every
+/// not-yet-processed row is stale from the start of the run. The other
+/// writer is the block-found settlement, which locks the rows it settles
+/// (`find_pplns_balances_for_addresses_locked`); this is the matching
+/// half from the sweep's side, where locking the whole candidate set for
+/// the length of a run would be worse than the race.
+pub async fn update_pplns_balance_sats_if_unchanged<'e, E>(
     executor: E,
     address: &AddressId,
-    new_balance_sats: Sats,
-) -> Result<u64, DbError>
+    expected: Sats,
+    new_balance: Sats,
+) -> Result<bool, DbError>
 where
     E: sqlx::PgExecutor<'e>,
 {
     let result = sqlx::query!(
-        r#"UPDATE pplns_balance SET "balanceSats" = $1 WHERE address = $2"#,
-        new_balance_sats.to_i64(),
+        r#"UPDATE pplns_balance SET "balanceSats" = $1
+           WHERE address = $2 AND "balanceSats" = $3"#,
+        new_balance.0,
         address.as_str(),
+        expected.0,
     )
     .execute(executor)
     .await
     .map_err(DbError::from)?;
-    Ok(result.rows_affected())
+    Ok(result.rows_affected() > 0)
+}
+
+/// Guarded DELETE — same contract as
+/// [`update_pplns_balance_sats_if_unchanged`], for the case where the
+/// swept balance lands on exactly 0 and the row goes away.
+pub async fn delete_pplns_balance_if_unchanged<'e, E>(
+    executor: E,
+    address: &AddressId,
+    expected: Sats,
+) -> Result<bool, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let result = sqlx::query!(
+        r#"DELETE FROM pplns_balance WHERE address = $1 AND "balanceSats" = $2"#,
+        address.as_str(),
+        expected.0,
+    )
+    .execute(executor)
+    .await
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// All `pplns_balance` rows with a non-zero `balanceSats` (open
@@ -141,12 +154,55 @@ pub async fn find_pplns_balance(
     .map_err(DbError::from)
 }
 
+/// Bulk-load `pplns_balance` rows for a set of addresses **inside a
+/// transaction, with the rows locked** (`FOR UPDATE`).
+///
+/// The block-found settlement is a read-modify-write: it reads
+/// `balanceSats`, adds its delta and writes the sum back absolutely. With
+/// the read outside the writing transaction, anything that touched the row
+/// in between is silently undone — and there IS another writer, the daily
+/// dust sweep, whose target set (open balance, no recent shares) is
+/// exactly the balance-only entries every distribution carries.
+///
+/// `ORDER BY address` is not cosmetic. `FOR UPDATE` locks rows as the plan
+/// emits them, and the `LockRows` node sits above the `Sort`, so the
+/// ordering fixes the lock ACQUISITION order. Without it two transactions
+/// touching the same two rows from different directions deadlock, and
+/// Postgres aborts one of them. Every other locker of this table must take
+/// its rows in the same ascending-address order.
+pub async fn find_pplns_balances_for_addresses_locked<'e, E>(
+    executor: E,
+    addresses: &[String],
+) -> Result<Vec<PplnsBalanceRow>, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as!(
+        PplnsBalanceRow,
+        r#"SELECT
+            address AS "address!: AddressId",
+            "balanceSats" AS "balance_sats!: Sats",
+            "totalPaidSats" AS "total_paid_sats!: Sats",
+            "updatedAt" AS "updated_at!",
+            "lastAcceptedShareAt" AS "last_accepted_share_at?"
+           FROM pplns_balance
+           WHERE address = ANY($1::text[])
+           ORDER BY address
+           FOR UPDATE"#,
+        addresses
+    )
+    .fetch_all(executor)
+    .await
+    .map_err(DbError::from)
+}
+
 /// Bulk-load `pplns_balance` rows for a set of addresses in one round
-/// trip (`address = ANY(...)`). Used by `apply_distribution`'s
-/// snapshot→writes mapping on the block-found path to replace a
-/// per-address `find_pplns_balance` N+1. Addresses with no row are
-/// simply absent from the result; order is unspecified (callers index
-/// by address).
+/// trip (`address = ANY(...)`), UNLOCKED. Addresses with no row are simply
+/// absent from the result; order is unspecified (callers index by address).
+///
+/// Read-only callers only. Anything that reads a balance in order to write
+/// it back must use [`find_pplns_balances_for_addresses_locked`] inside the
+/// writing transaction.
 pub async fn find_pplns_balances_for_addresses(
     pool: &PgPool,
     addresses: &[String],
@@ -369,6 +425,43 @@ where
     .await
     .map_err(DbError::from)?;
     Ok(result.rows_affected())
+}
+
+/// The VALUE-BEARING payout rows already recorded at `block_height`, as
+/// `(address, paidSats)` sorted for comparison.
+///
+/// This is what tells a harmless replay apart from a second, DIFFERENT
+/// block at the same height. `pplns_payout_history` has no `blockHash`
+/// column and is UNIQUE on `(blockHeight, address)`, so height is the only
+/// identity a booked block has, so a plain `EXISTS` on the height cannot
+/// say WHICH block it saw. That is what this replaces.
+///
+/// Rows with `paidSats = 0` are excluded on purpose: those are the
+/// "late arriver" rows the apply writes for addresses live in the window
+/// but absent from the distribution, and the window moves between attempts.
+/// Including them would make every legitimate replay look like a different
+/// block. What remains is block-determined — the coinbase payments and the
+/// non-zero settlement deltas both follow from the found block's own
+/// coinbase and its frozen snapshot — so it is identical on a replay of the
+/// same block and differs for another one.
+pub async fn pplns_booked_value_rows_at_height<'e, E>(
+    executor: E,
+    block_height: i32,
+) -> Result<Vec<(String, i64)>, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let rows = sqlx::query!(
+        r#"SELECT address, "paidSats" AS paid_sats
+             FROM pplns_payout_history
+            WHERE "blockHeight" = $1 AND "paidSats" <> 0
+            ORDER BY address"#,
+        block_height,
+    )
+    .fetch_all(executor)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows.into_iter().map(|r| (r.address, r.paid_sats)).collect())
 }
 
 /// Bulk-insert payout-history rows for one block. `ON CONFLICT

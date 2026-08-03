@@ -109,6 +109,7 @@ pub(crate) fn build_per_port_servers(
     )>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
+    settle: crate::settlement::SettlementSignal,
 ) -> Result<Vec<Sv1PortServer>, StratumV1SpawnError> {
     let Some(tdp) = foundation.tdp.as_ref() else {
         warn!("stratum-v1: TDP missing (--skip-tdp); skipping SV1 server construction");
@@ -125,6 +126,7 @@ pub(crate) fn build_per_port_servers(
     // notification dispatcher, in addition to the existing TDP
     // submit_solution path.
     let mut sink = TdpBlockSubmissionSink::new(tdp.clone())
+        .with_network(config_network_to_bitcoin(cfg.network))
         .with_alt_streams(foundation.alt_tdp.clone())
         .with_fanout(
             engines.mode_gate.clone(),
@@ -135,7 +137,8 @@ pub(crate) fn build_per_port_servers(
         )
         .with_blockparty(engines.blockparty.clone())
         .with_pool(foundation.db.pool().clone())
-        .with_redis(foundation.redis.clone());
+        .with_redis(foundation.redis.clone())
+        .with_settle_handle(settle);
     // The front routes block-found events to the stream — the payout Satellite
     // applies the ledger and the notify Satellite fans out the push. A front
     // always produces (front + payout can't share a process; see the boot

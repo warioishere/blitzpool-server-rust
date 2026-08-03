@@ -12,8 +12,9 @@
 //!
 //! Storage is O(buckets × miners), not O(shares): shares aggregate per-address
 //! into fixed-size count buckets and the window trims whole oldest buckets.
-//! The Redis layout MUST match the TS pool's (same key names, same
-//! `floor(counter / bucket_shares)`) — they share Redis across the cutover.
+//! Bucket ids derive from the never-reset `pplns:counter`, which is what makes
+//! `bucket_shares` a boot-time-only value rather than a live knob — see the
+//! field of that name on [`WindowStore`].
 
 pub mod snapshot;
 
@@ -24,6 +25,7 @@ use std::sync::Arc;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisError};
 use thiserror::Error;
+use tracing::warn;
 
 // ── Redis keys ───────────────────────────────────────────────────────
 
@@ -42,8 +44,11 @@ pub const KEY_WINDOW_BY_ADDRESS: &str = "pplns:window:by-address";
 pub const KEY_WINDOW_REBUILD: &str = "pplns:window:by-address:rebuild";
 /// Index zset of live bucket ids (score = id) for FIFO trim ordering.
 /// Each bucket is a hash `pplns:bucket:<id>` of address → Σdiff. Storage is
-/// O(buckets × miners) instead of O(shares). MUST match the TS pool's layout
-/// (same key names, same `floor(counter / bucket_shares)`) — they share Redis.
+/// O(buckets × miners) instead of O(shares).
+///
+/// Score = id = `floor(counter / bucket_shares)`, so FIFO order is only
+/// oldest-first while that value keeps growing — which it does as long as
+/// `bucket_shares` is left alone. See its field on [`WindowStore`].
 pub const KEY_BUCKETS: &str = "pplns:buckets";
 /// Coinbase distribution snapshot. See [`mod@snapshot`].
 pub const KEY_SNAPSHOT: &str = "pplns:snapshot";
@@ -57,7 +62,7 @@ pub fn bucket_key(bucket_id: &str) -> String {
     format!("pplns:bucket:{bucket_id}")
 }
 
-/// Default shares-per-bucket when not configured (`PPLNS_BUCKET_SHARES`).
+/// Default shares-per-bucket when `[pplns] bucket_shares` is not configured.
 pub const DEFAULT_BUCKET_SHARES: u64 = 10_000;
 
 /// How many recent `share_id`s the dedup set retains. Only un-acked
@@ -74,27 +79,52 @@ const DEDUP_KEEP: i64 = 100_000;
 /// Never drops the newest (currently-filling) bucket: stops when only one
 /// bucket remains, so the window holds at most one bucket above the target
 /// (the bucket-granular overshoot). Decrements by-address by exactly the
-/// dropped bucket's per-address contribution, hDel-ing any address that hits
-/// ~0 so the aggregate doesn't retain dead zero-fields. Returns 1 when a
-/// bucket was dropped, 0 when at/under the window (or <2 buckets) — the
-/// caller loops until it sees 0.
+/// dropped bucket's per-address contribution.
+///
+/// Returns `{dropped, underflowed}` — `dropped` is 1 when a bucket went and
+/// 0 when the window is at/under target (or has <2 buckets), so the caller
+/// loops until it sees 0. `underflowed` counts the addresses the decrement
+/// would have driven BELOW zero.
+///
+/// The second number exists because an underflow is not a rounding artefact
+/// and must not be cleaned up silently. The aggregate is a sum of
+/// non-negative difficulties, so a decrement can only exceed it if the
+/// bucket holds a share the aggregate never received — which the
+/// `DUMP`-per-key backup can produce: it captures `window:by-address` and
+/// the `bucket:*` hashes at different instants, so a restore can hand the
+/// trim a bucket that is ahead of the aggregate (see
+/// `blitzpool::redis_backup`).
+///
+/// Both the near-zero and the negative case `HDEL` the field, and that is
+/// the point: `read_window_by_address` filters `diff > 0`, so a field left
+/// sitting at a negative value drops the address out of the window
+/// ENTIRELY — silently unpaid until it earns its way back. Removing it is
+/// the same outcome, but the count makes it visible.
 const TRIM_BATCH_LUA: &str = r#"
 local total = tonumber(redis.call('GET', KEYS[1]) or '0') or 0
-if total <= tonumber(ARGV[1]) then return 0 end
+if total <= tonumber(ARGV[1]) then return {0, 0} end
 local oldest = redis.call('ZRANGE', KEYS[3], 0, 1)
-if #oldest < 2 then return 0 end
+if #oldest < 2 then return {0, 0} end
 local bucket_id = oldest[1]
 local bkey = 'pplns:bucket:' .. bucket_id
 local flat = redis.call('HGETALL', bkey)
 local removed = 0
+local underflowed = 0
 for i = 1, #flat, 2 do
     local addr = flat[i]
     local d = tonumber(flat[i + 1]) or 0
     if d ~= 0 then
         removed = removed + d
         local rem = tonumber(redis.call('HINCRBYFLOAT', KEYS[2], addr, -d))
-        if rem and math.abs(rem) < 1e-9 then
-            redis.call('HDEL', KEYS[2], addr)
+        if rem then
+            if rem < -1e-9 then
+                underflowed = underflowed + 1
+            end
+            -- Near-zero (f64 drift) AND negative (aggregate/bucket skew)
+            -- both leave nothing payable behind.
+            if rem < 1e-9 then
+                redis.call('HDEL', KEYS[2], addr)
+            end
         end
     end
 end
@@ -103,7 +133,7 @@ redis.call('ZREM', KEYS[3], bucket_id)
 if removed ~= 0 then
     redis.call('INCRBYFLOAT', KEYS[1], -removed)
 end
-return 1
+return {1, underflowed}
 "#;
 
 /// Atomic, optionally-idempotent append of one accepted share into its count
@@ -152,13 +182,30 @@ pub enum WindowError {
 
 // ── Network difficulty view ──────────────────────────────────────────
 
-/// Thread-safe shared view of the pool's current `networkDifficulty`,
-/// as published by the TDP template stream.
+/// Thread-safe shared view of the pool's current `networkDifficulty`.
 ///
 /// Backed by `Arc<AtomicU64>` over `f64::to_bits`/`f64::from_bits`,
-/// so reads + writes are lock-free across worker threads. Initial
-/// value is 0; the engine refuses to trim or build distributions
-/// until the first template lands.
+/// so reads + writes are lock-free across worker threads.
+///
+/// **Who writes it, and why it is not the TDP stream.** This value is read
+/// by exactly one thing: [`WindowStore::window_size`], which only
+/// [`WindowStore::trim_window`] calls, which only
+/// [`WindowStore::record_share`] calls. That path runs on the process that
+/// consumes the accepted-share stream — the `payout` role — and that
+/// process has no TDP feed at all. So it is seeded from `getmininginfo` at
+/// boot and refreshed from the same RPC on a timer by the binary (see
+/// `blitzpool::network_difficulty`).
+///
+/// The doc here used to say "as published by the TDP template stream", and
+/// [`Self::set`] was never called from anywhere: the window was sized to
+/// the difficulty at process start and frozen there for the process's whole
+/// life. `window_factor` then meant "x times the difficulty at the last
+/// restart" rather than the current one, so a long-running payout process
+/// trimmed to a window that spanned steadily fewer blocks than configured.
+///
+/// A zero or negative value makes `window_size` return 0, which disables
+/// trimming entirely — so a failed reading must never be written. The
+/// refresher's guard is what keeps that from happening.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkDifficulty {
     bits: Arc<AtomicU64>,
@@ -190,8 +237,29 @@ impl NetworkDifficulty {
 pub struct WindowStore {
     conn: ConnectionManager,
     window_factor: f64,
-    /// Shares per count-bucket (`floor(counter / bucket_shares)`). Must match
-    /// the TS pool's `PPLNS_BUCKET_SHARES` since they share Redis.
+    /// Shares per count-bucket. The id is `floor(counter / bucket_shares)`
+    /// over [`KEY_COUNTER`], which is only ever `INCR`'d — nothing in the tree
+    /// resets or deletes it.
+    ///
+    /// That makes this a boot-time-only value on a populated window, and the
+    /// two directions are not symmetric. **Raising it lowers every future id.**
+    /// With the counter at 1 000 000 and 10 000 shares per bucket the live ids
+    /// sit just under 100; doubling the divisor puts the next share in bucket
+    /// 50 — below the whole live set, so it is the next one [`TRIM_BATCH_LUA`]
+    /// drops, and every share appended after it goes the same way until the
+    /// counter reaches `bucket_shares × (live max id + 1)`. The aggregate stays
+    /// consistent (the trim decrements exactly what it dropped), but new work
+    /// stops accruing window weight for about a million shares. **Lowering it
+    /// is safe:** the new ids land above every existing bucket and the old ones
+    /// age out in order.
+    ///
+    /// So: change it only against an empty window, or downwards.
+    ///
+    /// This used to be pinned to the TS pool's `PPLNS_BUCKET_SHARES` because
+    /// both pools shared one Redis across the cutover. That pool is retired,
+    /// and nothing here reads a key it does not also write — a cold start
+    /// rebuilds [`KEY_WINDOW_BY_ADDRESS`] from the buckets — so the counter is
+    /// the only constraint left.
     bucket_shares: u64,
     net_diff: NetworkDifficulty,
 }
@@ -217,10 +285,11 @@ impl WindowStore {
         }
     }
 
-    /// `windowSize = factor × networkDifficulty`. Returns 0 if the
-    /// network-difficulty source hasn't been seeded yet (no TDP
-    /// template received), in which case `record_share` is a no-op
-    /// trim-wise.
+    /// `windowSize = factor × networkDifficulty`. Returns 0 while the
+    /// network-difficulty source holds no usable reading — see
+    /// [`NetworkDifficulty`] for who writes it, which is `getmininginfo`
+    /// on the payout role and never the TDP stream. A 0 makes
+    /// `record_share` a no-op trim-wise, so the window only grows.
     pub fn window_size(&self) -> f64 {
         let nd = self.net_diff.get();
         if !nd.is_finite() || nd <= 0.0 {
@@ -301,13 +370,28 @@ impl WindowStore {
         // active bucket remains) → done.
         let trim = redis::Script::new(TRIM_BATCH_LUA);
         loop {
-            let dropped: i64 = trim
+            let (dropped, underflowed): (i64, i64) = trim
                 .key(KEY_WINDOW_TOTAL)
                 .key(KEY_WINDOW_BY_ADDRESS)
                 .key(KEY_BUCKETS)
                 .arg(window_size)
                 .invoke_async(conn)
                 .await?;
+            if underflowed > 0 {
+                // Not a rounding artefact: the bucket held more for an
+                // address than the aggregate ever received. The addresses
+                // are dropped (a negative field is unpayable anyway — the
+                // read filters `> 0`), but somebody has to hear about it,
+                // because the likely cause is a restored backup whose
+                // aggregate and buckets were captured at different instants.
+                warn!(
+                    underflowed,
+                    "pplns window trim: the aggregate went negative for {underflowed} \
+                     address(es) — bucket and aggregate disagree, which a per-key Redis \
+                     restore can produce. Those addresses are out of the window until they \
+                     earn back into it."
+                );
+            }
             if dropped == 0 {
                 break;
             }
@@ -455,104 +539,30 @@ impl WindowStore {
         })
     }
 
-    /// Snapshot accessor — convenience around [`snapshot::write_snapshot`].
+    /// A cloned Redis handle for the shared build-and-snapshot path.
+    /// Mirrors `GroupRoundStore::connection_for_snapshot`.
+    pub fn connection_for_snapshot(&self) -> ConnectionManager {
+        self.conn.clone()
+    }
+
+    /// The live network-difficulty view this store trims against.
     ///
-    /// Writes the shared [`KEY_SNAPSHOT`] key, which every distribution build
-    /// overwrites. Prefer [`Self::write_snapshot_for`]: a block-found needs the
-    /// distribution its own coinbase was built from, and this key only ever
-    /// holds the most recent build's.
-    pub async fn write_snapshot(
+    /// Handed out so the process that owns a Bitcoin RPC can keep it
+    /// current — see [`NetworkDifficulty`]. `Arc`-backed, so the clone and
+    /// this store observe the same value.
+    pub fn network_difficulty(&self) -> NetworkDifficulty {
+        self.net_diff.clone()
+    }
+
+    /// Read the schema-2 weight snapshot for one weights fingerprint.
+    /// `None` when never written, expired, or a different schema.
+    pub async fn read_weight_snapshot_for(
         &self,
-        snapshot: &snapshot::StoredSnapshot,
-        ttl_seconds: u32,
-    ) -> Result<(), RedisError> {
+        weights_fingerprint: &[u8; 32],
+    ) -> Result<Option<snapshot::StoredWeightSnapshot>, RedisError> {
         let mut conn = self.conn.clone();
-        snapshot::write_snapshot(&mut conn, KEY_SNAPSHOT, snapshot, ttl_seconds).await
-    }
-
-    /// Snapshot reader — convenience around [`snapshot::read_snapshot`].
-    /// Reads the shared key; see [`Self::write_snapshot`].
-    pub async fn read_snapshot(&self) -> Result<Option<snapshot::ParsedSnapshot>, RedisError> {
-        let mut conn = self.conn.clone();
-        snapshot::read_snapshot(&mut conn, KEY_SNAPSHOT).await
-    }
-
-    /// Delete the snapshot key (after `on_block_found` consumed it).
-    pub async fn delete_snapshot(&self) -> Result<(), RedisError> {
-        let mut conn = self.conn.clone();
-        snapshot::delete_snapshot(&mut conn, KEY_SNAPSHOT).await
-    }
-
-    /// Store a snapshot under the fingerprint of the payout list it
-    /// distributes. Concurrent builds for different rewards — and the
-    /// ext-0x0003 payout requests Job-Declaration clients make with their own
-    /// value — then no longer overwrite each other, and a block-found can ask
-    /// for exactly the distribution its coinbase was built from.
-    pub async fn write_snapshot_for(
-        &self,
-        payouts_fingerprint: &[u8; 32],
-        snapshot: &snapshot::StoredSnapshot,
-        ttl_seconds: u32,
-    ) -> Result<(), RedisError> {
-        let mut conn = self.conn.clone();
-        let key = snapshot_key_for(payouts_fingerprint);
-        snapshot::write_snapshot(&mut conn, &key, snapshot, ttl_seconds).await
-    }
-
-    /// Read the snapshot for one payout-list fingerprint. `None` when it was
-    /// never written or has since expired.
-    pub async fn read_snapshot_for(
-        &self,
-        payouts_fingerprint: &[u8; 32],
-    ) -> Result<Option<snapshot::ParsedSnapshot>, RedisError> {
-        let mut conn = self.conn.clone();
-        let key = snapshot_key_for(payouts_fingerprint);
-        snapshot::read_snapshot(&mut conn, &key).await
-    }
-
-    /// Delete one fingerprint-keyed snapshot.
-    pub async fn delete_snapshot_for(
-        &self,
-        payouts_fingerprint: &[u8; 32],
-    ) -> Result<(), RedisError> {
-        let mut conn = self.conn.clone();
-        let key = snapshot_key_for(payouts_fingerprint);
-        snapshot::delete_snapshot(&mut conn, &key).await
-    }
-
-    /// Drop **every** fingerprint-keyed snapshot, returning how many were
-    /// removed.
-    ///
-    /// A snapshot's `balance_after` is an ABSOLUTE ledger state, valid only
-    /// against the ledger it was computed from. Applying a block moves that
-    /// ledger, so every snapshot built before it is stale — the same reason
-    /// the apply drops the in-process distribution cache. Keeping them would
-    /// let a later block freeze absolute balances that silently undo the pay-
-    /// down the applied block's coinbase already made; a block whose snapshot
-    /// is gone fails loudly instead, which is what the pre-fingerprint code
-    /// did.
-    ///
-    /// This is also what reclaims the keyspace: builds write one key each, and
-    /// nothing else removes them.
-    pub async fn delete_all_fingerprinted_snapshots(&self) -> Result<usize, RedisError> {
-        let mut conn = self.conn.clone();
-        // The pattern carries the `:` separator, so the shared `pplns:snapshot`
-        // key is not matched — it has its own lifecycle.
-        let pattern = format!("{KEY_SNAPSHOT}:*");
-        let keys: Vec<String> = {
-            let mut iter = conn.scan_match::<_, String>(&pattern).await?;
-            let mut found = Vec::new();
-            while let Some(k) = iter.next_item().await {
-                found.push(k);
-            }
-            found
-        };
-        if keys.is_empty() {
-            return Ok(0);
-        }
-        let mut conn = self.conn.clone();
-        conn.del::<_, ()>(&keys).await?;
-        Ok(keys.len())
+        let key = snapshot_key_for(weights_fingerprint);
+        snapshot::read_weight_snapshot(&mut conn, &key).await
     }
 }
 

@@ -348,7 +348,7 @@ async fn round_reset_config_patch_applies_per_field() {
         interval_days: PatchField::Untouched,
         timezone: PatchField::Set("Europe/Berlin".into()),
         hour_local: PatchField::Set(0),
-        finder_bonus_sats: PatchField::Set(50_000),
+        finder_bonus_ppm: PatchField::Set(160_000),
         is_public: PatchField::Set(true),
         reset_round_on_block: PatchField::Set(true),
         max_members: PatchField::Set(10),
@@ -360,7 +360,7 @@ async fn round_reset_config_patch_applies_per_field() {
     assert_eq!(row1.round_reset_preset.as_deref(), Some("daily"));
     assert_eq!(row1.round_reset_timezone.as_deref(), Some("Europe/Berlin"));
     assert_eq!(row1.round_reset_hour_local, Some(0));
-    assert_eq!(row1.finder_bonus_sats.map(|s| s.to_i64()), Some(50_000));
+    assert_eq!(row1.finder_bonus_ppm, Some(160_000));
     assert!(row1.is_public);
     assert!(row1.reset_round_on_block);
     assert_eq!(row1.max_members, Some(10));
@@ -371,7 +371,7 @@ async fn round_reset_config_patch_applies_per_field() {
         interval_days: PatchField::Clear,
         timezone: PatchField::Untouched,
         hour_local: PatchField::Untouched,
-        finder_bonus_sats: PatchField::Clear,
+        finder_bonus_ppm: PatchField::Clear,
         is_public: PatchField::Untouched,
         reset_round_on_block: PatchField::Untouched,
         max_members: PatchField::Untouched,

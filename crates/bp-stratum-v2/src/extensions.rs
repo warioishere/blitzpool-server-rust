@@ -10,9 +10,9 @@
 //!   piggy-backed on `SubmitSharesExtended` (extension_type stays
 //!   0x0000). See [`encode_worker_id_tlv`], [`parse_worker_id_tlv`],
 //!   [`resolve_share_worker_name_from_tlv`].
-//! - **0x0003 Non-Custodial Pool Payouts** —
-//!   [`RequestPayoutOutputs`] / [`RequestPayoutOutputsSuccess`] /
-//!   [`RequestPayoutOutputsError`].
+//! - **0x0003 Non-Custodial Payouts** (push model) —
+//!   [`SetPayoutDistribution`] (JDS→JDC) + the `distribution_id` TLV
+//!   on `DeclareMiningJob` / `SetCustomMiningJob`.
 //!
 //! Frames for 0x0001 and 0x0003 messages set `extension_type` to the
 //! extension's identifier (NOT 0x0000), because both extensions
@@ -21,10 +21,12 @@
 //! `extension_type = 0x0000`.
 //!
 //! Body fields use the standard SV2 little-endian encoding. **TLV
-//! headers (only used by 0x0002) are big-endian** per spec §3.4.3 wire
-//! example, even though §3.1 prose says LE — the on-wire example is
-//! the canonical form and matches every other interop. Worker-ID has a
-//! 32-byte cap on `user_identity` (spec §1.1).
+//! headers are little-endian too**: §3.4.3 types the header fields as
+//! U16/U8, and U16 is little-endian everywhere in SV2. (The 0x0002
+//! spec's §2 wire example shows the extension type as `00 02`, which
+//! contradicts the base data-type convention — the example is the
+//! error, not the rule.) Worker-ID has a 32-byte cap on
+//! `user_identity` (spec §1.1).
 
 // ── Spec constants ─────────────────────────────────────────────────
 
@@ -47,12 +49,6 @@ pub const SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS: u16 = 0x0003;
 pub enum ExtensionsParseError {
     #[error("buffer truncated: needed {needed} more bytes at offset {offset}")]
     Truncated { offset: usize, needed: usize },
-    #[error("declared length {declared} exceeds remaining {remaining} at offset {offset}")]
-    LengthOverflow {
-        offset: usize,
-        declared: usize,
-        remaining: usize,
-    },
     #[error("invalid UTF-8 in string field at offset {offset}")]
     InvalidUtf8 { offset: usize },
 }
@@ -71,8 +67,8 @@ pub enum WorkerIdEncodeError {
 // We keep these in-file rather than depend on `stratum_core::binary_sv2`
 // because the SV2 spec pins exact byte sequences and we want the
 // Rust tests to assert against the same fixtures with no abstraction
-// drift. Everything is straight-line LE for SV2 body fields and BE for
-// TLV headers (per spec §3.4.3).
+// drift. Everything is straight-line LE — body fields and TLV headers
+// alike (§3.4.3 types TLV headers as U16/U8, and U16 is LE in SV2).
 
 struct Reader<'a> {
     buf: &'a [u8],
@@ -110,15 +106,6 @@ impl<'a> Reader<'a> {
         self.pos += 8;
         Ok(v)
     }
-    fn read_b0_255(&mut self) -> Result<Vec<u8>, ExtensionsParseError> {
-        self.need(1)?;
-        let len = self.buf[self.pos] as usize;
-        self.pos += 1;
-        self.need(len)?;
-        let v = self.buf[self.pos..self.pos + len].to_vec();
-        self.pos += len;
-        Ok(v)
-    }
     fn read_b0_64k(&mut self) -> Result<Vec<u8>, ExtensionsParseError> {
         let len = self.read_u16_le()? as usize;
         self.need(len)?;
@@ -126,16 +113,27 @@ impl<'a> Reader<'a> {
         self.pos += len;
         Ok(v)
     }
-    fn read_str0_255(&mut self) -> Result<String, ExtensionsParseError> {
-        let off = self.pos;
-        let bytes = self.read_b0_255()?;
-        String::from_utf8(bytes).map_err(|_| ExtensionsParseError::InvalidUtf8 { offset: off })
-    }
     fn read_seq0_64k_u16(&mut self) -> Result<Vec<u16>, ExtensionsParseError> {
         let count = self.read_u16_le()? as usize;
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
             out.push(self.read_u16_le()?);
+        }
+        Ok(out)
+    }
+    fn read_seq0_64k_u32(&mut self) -> Result<Vec<u32>, ExtensionsParseError> {
+        let count = self.read_u16_le()? as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(self.read_u32_le()?);
+        }
+        Ok(out)
+    }
+    fn read_seq0_64k_b0_64k(&mut self) -> Result<Vec<Vec<u8>>, ExtensionsParseError> {
+        let count = self.read_u16_le()? as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(self.read_b0_64k()?);
         }
         Ok(out)
     }
@@ -150,24 +148,30 @@ fn write_u32_le(dst: &mut Vec<u8>, v: u32) {
 fn write_u64_le(dst: &mut Vec<u8>, v: u64) {
     dst.extend_from_slice(&v.to_le_bytes());
 }
-fn write_b0_255(dst: &mut Vec<u8>, bytes: &[u8]) {
-    debug_assert!(bytes.len() <= 255);
-    dst.push(bytes.len() as u8);
-    dst.extend_from_slice(bytes);
-}
 fn write_b0_64k(dst: &mut Vec<u8>, bytes: &[u8]) {
     debug_assert!(bytes.len() <= u16::MAX as usize);
     write_u16_le(dst, bytes.len() as u16);
     dst.extend_from_slice(bytes);
-}
-fn write_str0_255(dst: &mut Vec<u8>, s: &str) {
-    write_b0_255(dst, s.as_bytes());
 }
 fn write_seq0_64k_u16(dst: &mut Vec<u8>, items: &[u16]) {
     debug_assert!(items.len() <= u16::MAX as usize);
     write_u16_le(dst, items.len() as u16);
     for &v in items {
         write_u16_le(dst, v);
+    }
+}
+fn write_seq0_64k_u32(dst: &mut Vec<u8>, items: &[u32]) {
+    debug_assert!(items.len() <= u16::MAX as usize);
+    write_u16_le(dst, items.len() as u16);
+    for &v in items {
+        write_u32_le(dst, v);
+    }
+}
+fn write_seq0_64k_b0_64k(dst: &mut Vec<u8>, items: &[Vec<u8>]) {
+    debug_assert!(items.len() <= u16::MAX as usize);
+    write_u16_le(dst, items.len() as u16);
+    for item in items {
+        write_b0_64k(dst, item);
     }
 }
 
@@ -260,133 +264,126 @@ impl RequestExtensionsError {
     }
 }
 
-// ── 0x0003 Non-Custodial Pool Payouts ──────────────────────────────
+// ── 0x0003 Non-Custodial Payouts (push model) ──────────────────────
 
-/// `RequestPayoutOutputs` — JDC → JDS (spec §2.1).
-/// Frame: `extension_type = 0x0003`, `msg_type = 0x00`.
+/// TLV field-type for `distribution_id` on `DeclareMiningJob` /
+/// `SetCustomMiningJob` (ext 0x0003 §6).
+pub const SV2_FIELD_TYPE_DISTRIBUTION_ID: u8 = 0x01;
+
+/// `SetPayoutDistribution` — JDS → JDC (ext 0x0003 §3.1).
+/// Frame: `extension_type = 0x0003`, `msg_type = 0x00`, channel bit 0.
 ///
-/// No `prev_hash` on the wire: payout freshness is resolved by the
-/// validating party from its own accounting state (single-use payout
-/// sets, see spec §4), not signalled per-request by the JDC.
+/// MUST be the first message the JDS sends after `SetupConnection.Success`
+/// and `RequestExtensions.Success`; re-sent (with a higher
+/// `distribution_id`) whenever the pool updates the distribution.
+/// Amount fields inside `pool_payout` / `payouts` carry relative
+/// WEIGHTS, not satoshis — the JDC derives amounts per §4.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestPayoutOutputs {
-    pub request_id: u32,
-    pub mining_job_token: Vec<u8>, // B0_255
-    /// Amount, in satoshis, the returned output set MUST distribute
-    /// (spec §2.1). The JDC derives it from `coinbase_tx_value_remaining`
-    /// after accounting for any outputs it adds itself.
-    pub available_payout_value: u64,
+pub struct SetPayoutDistribution {
+    /// Strictly increasing, universal across all connections of this
+    /// pool (§3.1).
+    pub distribution_id: u64,
+    /// Consensus-serialized `TxOut`; amount field = `weight_P` (non-0).
+    /// Locking script MUST be pool-controlled.
+    pub pool_payout: Vec<u8>, // B0_64K
+    /// Consensus-serialized `TxOut`s; amount fields = weights (non-0).
+    pub payouts: Vec<Vec<u8>>, // SEQ0_64K[B0_64K]
+    /// Per-`payouts[i]` dust limit in satoshis; same length as `payouts`.
+    pub dust_limits: Vec<u32>, // SEQ0_64K[U32]
+    /// Consensus-serialized `TxOut`s the pool appends (e.g. OP_RETURN);
+    /// amount fields MUST be 0.
+    pub additional_outputs: Vec<Vec<u8>>, // SEQ0_64K[B0_64K]
 }
 
-impl RequestPayoutOutputs {
-    pub fn deserialize(buf: &[u8]) -> Result<Self, ExtensionsParseError> {
-        let mut r = Reader::new(buf);
-        let request_id = r.read_u32_le()?;
-        let mining_job_token = r.read_b0_255()?;
-        let available_payout_value = r.read_u64_le()?;
-        Ok(Self {
-            request_id,
-            mining_job_token,
-            available_payout_value,
-        })
-    }
-
+impl SetPayoutDistribution {
     pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + 1 + self.mining_job_token.len() + 8);
-        write_u32_le(&mut out, self.request_id);
-        write_b0_255(&mut out, &self.mining_job_token);
-        write_u64_le(&mut out, self.available_payout_value);
-        out
-    }
-}
-
-/// `RequestPayoutOutputs.Success` — JDS → JDC (spec §2.2).
-/// Frame: `extension_type = 0x0003`, `msg_type = 0x01`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestPayoutOutputsSuccess {
-    pub request_id: u32,
-    /// Consensus-serialized `Vec<TxOut>` (varint count + per-output
-    /// `{value_le8, varint_script_len, script_pub_key}`).
-    pub coinbase_tx_outputs: Vec<u8>,
-}
-
-impl RequestPayoutOutputsSuccess {
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(6 + self.coinbase_tx_outputs.len());
-        write_u32_le(&mut out, self.request_id);
-        write_b0_64k(&mut out, &self.coinbase_tx_outputs);
+        let payload_len: usize = 8
+            + (2 + self.pool_payout.len())
+            + 2
+            + self.payouts.iter().map(|p| 2 + p.len()).sum::<usize>()
+            + 2
+            + self.dust_limits.len() * 4
+            + 2
+            + self
+                .additional_outputs
+                .iter()
+                .map(|p| 2 + p.len())
+                .sum::<usize>();
+        let mut out = Vec::with_capacity(payload_len);
+        write_u64_le(&mut out, self.distribution_id);
+        write_b0_64k(&mut out, &self.pool_payout);
+        write_seq0_64k_b0_64k(&mut out, &self.payouts);
+        write_seq0_64k_u32(&mut out, &self.dust_limits);
+        write_seq0_64k_b0_64k(&mut out, &self.additional_outputs);
         out
     }
 
+    /// Needed by our tests standing in for a JDC (and by any future
+    /// client-side use); the JDS itself only serializes.
     pub fn deserialize(buf: &[u8]) -> Result<Self, ExtensionsParseError> {
         let mut r = Reader::new(buf);
-        let request_id = r.read_u32_le()?;
-        let coinbase_tx_outputs = r.read_b0_64k()?;
+        let distribution_id = r.read_u64_le()?;
+        let pool_payout = r.read_b0_64k()?;
+        let payouts = r.read_seq0_64k_b0_64k()?;
+        let dust_limits = r.read_seq0_64k_u32()?;
+        let additional_outputs = r.read_seq0_64k_b0_64k()?;
         Ok(Self {
-            request_id,
-            coinbase_tx_outputs,
+            distribution_id,
+            pool_payout,
+            payouts,
+            dust_limits,
+            additional_outputs,
         })
     }
 }
 
-/// `RequestPayoutOutputs.Error` — JDS → JDC (spec §2.3).
-/// Frame: `extension_type = 0x0003`, `msg_type = 0x02`.
-///
-/// `error_code` is a free `STR0_255`; the spec only mandates that the
-/// JDS return this message when it cannot construct an output set that
-/// both sums to `available_payout_value` and fits the token's coinbase
-/// reservation. The symbolic codes below are our own internal vocabulary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestPayoutOutputsError {
-    pub request_id: u32,
-    pub error_code: String,
+/// Error-code vocabulary for the push-model 0x0003 extension (§7.3),
+/// emitted on `DeclareMiningJob.Error` / `SetCustomMiningJob.Error`.
+pub mod payout_distribution_error_codes {
+    /// §7.3 — the referenced `distribution_id` is not accepted: too
+    /// old (outside the grace window), unknown, or invalidated by a
+    /// settlement event (§10).
+    pub const STALE_PAYOUT_DISTRIBUTION: &str = "stale-payout-distribution";
+    /// §7.3 — the declared coinbase outputs violate §4 (recomputed
+    /// vector mismatch, non-0-value trailing output, missing/mis-typed
+    /// `distribution_id` TLV where the extension is negotiated).
+    pub const INVALID_PAYOUT_DISTRIBUTION: &str = "invalid-payout-distribution";
 }
 
-/// Error-code vocabulary for the 0x0003 extension.
-///
-/// `STALE_PAYOUT_OUTPUTS` is the only spec-named code (§4): it is a
-/// *job-declaration* rejection code (`DeclareMiningJob.Error` /
-/// `SetCustomMiningJob.Error`), signalling the JDC to request a fresh
-/// payout output set — NOT a `RequestPayoutOutputs.Error` code. The
-/// rest are internal codes we emit on `RequestPayoutOutputs.Error`.
-pub mod payout_outputs_error_codes {
-    /// Spec §4 — job rejected because its payout output set is stale,
-    /// superseded, unknown, or already used. The JDC SHOULD re-request.
-    pub const STALE_PAYOUT_OUTPUTS: &str = "stale-payout-outputs";
-    pub const INVALID_MINING_JOB_TOKEN: &str = "invalid-mining-job-token";
-    pub const REVENUE_TOO_LARGE: &str = "revenue-too-large";
-    pub const COINBASE_SIZE_BUDGET_EXCEEDED: &str = "coinbase-size-budget-exceeded";
-    pub const INTERNAL: &str = "internal";
+/// Extract the ext 0x0003 `distribution_id` from parsed trailing TLVs
+/// (§6: Type `0x0003`/`0x01`, length 8, value U64-LE). Returns `None`
+/// when absent or malformed — the caller decides whether a missing
+/// TLV is an error (it is, when the extension was negotiated).
+pub fn parse_distribution_id_tlv(tlvs: &[stratum_core::parsers_sv2::Tlv]) -> Option<u64> {
+    tlvs.iter().find_map(|tlv| {
+        (tlv.r#type.extension_type == SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS
+            && tlv.r#type.field_type == SV2_FIELD_TYPE_DISTRIBUTION_ID
+            && tlv.value.len() == 8)
+            .then(|| u64::from_le_bytes(tlv.value[..8].try_into().unwrap()))
+    })
 }
 
-impl RequestPayoutOutputsError {
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(5 + self.error_code.len());
-        write_u32_le(&mut out, self.request_id);
-        write_str0_255(&mut out, &self.error_code);
-        out
-    }
-
-    pub fn deserialize(buf: &[u8]) -> Result<Self, ExtensionsParseError> {
-        let mut r = Reader::new(buf);
-        let request_id = r.read_u32_le()?;
-        let error_code = r.read_str0_255()?;
-        Ok(Self {
-            request_id,
-            error_code,
-        })
-    }
+/// Encode the `distribution_id` TLV in wire form (§6) — used by tests
+/// standing in for a JDC.
+pub fn encode_distribution_id_tlv(distribution_id: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(13);
+    buf.extend_from_slice(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS.to_le_bytes());
+    buf.push(SV2_FIELD_TYPE_DISTRIBUTION_ID);
+    buf.extend_from_slice(&8u16.to_le_bytes());
+    buf.extend_from_slice(&distribution_id.to_le_bytes());
+    buf
 }
 
 // ── 0x0002 Worker-ID TLV ───────────────────────────────────────────
 
 /// Encode a Worker-ID TLV, ready to be appended to `SubmitSharesExtended`.
 ///
-/// Wire shape (TLV header is **big-endian** per §3.4.3, value is UTF-8):
-/// `[Type: ext_type U16-BE | field_type U8] [Length U16-BE] [UTF-8 bytes]`.
+/// Wire shape (TLV header fields are U16/U8 per §3.4.3, so the U16s
+/// are **little-endian** like every SV2 integer; value is UTF-8):
+/// `[Type: ext_type U16-LE | field_type U8] [Length U16-LE] [UTF-8 bytes]`.
 ///
-/// Spec wire example for `"Worker_001"` (§2):
-/// `00 02 01 00 0A 57 6F 72 6B 65 72 5F 30 30 31`.
+/// `"Worker_001"` therefore encodes as
+/// `02 00 01 0A 00 57 6F 72 6B 65 72 5F 30 30 31`.
 pub fn encode_worker_id_tlv(user_identity: &str) -> Result<Vec<u8>, WorkerIdEncodeError> {
     let value = user_identity.as_bytes();
     if value.is_empty() {
@@ -399,9 +396,9 @@ pub fn encode_worker_id_tlv(user_identity: &str) -> Result<Vec<u8>, WorkerIdEnco
         });
     }
     let mut buf = Vec::with_capacity(5 + value.len());
-    buf.extend_from_slice(&SV2_EXTENSION_TYPE_WORKER_ID.to_be_bytes()); // 2 bytes BE
+    buf.extend_from_slice(&SV2_EXTENSION_TYPE_WORKER_ID.to_le_bytes());
     buf.push(SV2_FIELD_TYPE_USER_IDENTITY);
-    buf.extend_from_slice(&(value.len() as u16).to_be_bytes()); // 2 bytes BE
+    buf.extend_from_slice(&(value.len() as u16).to_le_bytes());
     buf.extend_from_slice(value);
     Ok(buf)
 }
@@ -411,7 +408,7 @@ pub fn encode_worker_id_tlv(user_identity: &str) -> Result<Vec<u8>, WorkerIdEnco
 /// `user_identity` string, or `None` if no 0x0002 TLV is present.
 ///
 /// Unknown TLVs are skipped per ext 0x0001 §3 (receivers MUST ignore
-/// unexpected TLVs). Same big-endian header convention as 0x0003.
+/// unexpected TLVs). Little-endian header per the SV2 U16 convention.
 ///
 /// Returns `None` on malformed TLV (truncated header / value, length
 /// cap exceeded). Callers SHOULD treat a malformed TLV the same as
@@ -420,9 +417,9 @@ pub fn encode_worker_id_tlv(user_identity: &str) -> Result<Vec<u8>, WorkerIdEnco
 pub fn parse_worker_id_tlv(tail: &[u8]) -> Option<String> {
     let mut o = 0;
     while o + 5 <= tail.len() {
-        let ext_type = u16::from_be_bytes([tail[o], tail[o + 1]]);
+        let ext_type = u16::from_le_bytes([tail[o], tail[o + 1]]);
         let field_type = tail[o + 2];
-        let length = u16::from_be_bytes([tail[o + 3], tail[o + 4]]) as usize;
+        let length = u16::from_le_bytes([tail[o + 3], tail[o + 4]]) as usize;
         let value_start = o + 5;
         let value_end = value_start.checked_add(length)?;
         if value_end > tail.len() {
@@ -584,124 +581,140 @@ mod tests {
         assert_eq!(parsed, original);
     }
 
-    // ── 0x0003 RequestPayoutOutputs ────────────────────────────────
+    // ── 0x0003 SetPayoutDistribution (push model) ──────────────────
 
-    /// `round-trips request_id, token, available_payout_value`
-    #[test]
-    fn request_payout_outputs_roundtrip() {
-        let original = RequestPayoutOutputs {
-            request_id: 0xdeadbeef,
-            mining_job_token: b"jdp-token-42".to_vec(),
-            available_payout_value: 312_500_000, // 3.125 BTC in sats
-        };
-
-        let wire = original.serialize();
-        let parsed = RequestPayoutOutputs::deserialize(&wire).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    /// `wire layout: U32-LE request_id, B0_255 token, U64-LE available_payout_value`
-    #[test]
-    fn request_payout_outputs_wire_layout() {
-        let token = vec![0xde, 0xad];
-        let wire = RequestPayoutOutputs {
-            request_id: 0x01020304,
-            mining_job_token: token.clone(),
-            available_payout_value: 0x0000_0000_9988_7766,
+    fn sample_distribution() -> SetPayoutDistribution {
+        SetPayoutDistribution {
+            distribution_id: 42,
+            pool_payout: vec![0xAA; 30],
+            payouts: vec![vec![0x01; 31], vec![0x02; 33]],
+            dust_limits: vec![546, 5_000],
+            additional_outputs: vec![vec![0x6A, 0x00]],
         }
-        .serialize();
-        // 4 (U32) + 1 (token len prefix) + 2 (token bytes) + 8 (U64) = 15
-        assert_eq!(wire.len(), 15);
-        assert_eq!(&wire[0..4], &[0x04, 0x03, 0x02, 0x01]);
-        assert_eq!(wire[4], 0x02);
-        assert_eq!(&wire[5..7], token.as_slice());
-        assert_eq!(
-            &wire[7..15],
-            &[0x66, 0x77, 0x88, 0x99, 0x00, 0x00, 0x00, 0x00]
-        );
     }
 
-    /// `round-trips request_id and consensus-serialized outputs` (Success)
+    /// `SetPayoutDistribution round-trips`
     #[test]
-    fn request_payout_outputs_success_roundtrip() {
-        let coinbase_tx_outputs = vec![
-            0x01, // VarInt count = 1
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // U64 value = 0
-            0x00, // VarInt script_len = 0
+    fn set_payout_distribution_roundtrip() {
+        let msg = sample_distribution();
+        let bytes = msg.serialize();
+        assert_eq!(SetPayoutDistribution::deserialize(&bytes).unwrap(), msg);
+    }
+
+    /// `SetPayoutDistribution wire layout (§3.1 field order, all LE)`
+    #[test]
+    fn set_payout_distribution_wire_layout() {
+        let msg = SetPayoutDistribution {
+            distribution_id: 0x0102030405060708,
+            pool_payout: vec![0xAA, 0xBB],
+            payouts: vec![vec![0xCC]],
+            dust_limits: vec![546],
+            additional_outputs: vec![],
+        };
+        let bytes = msg.serialize();
+        let expected = [
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // distribution_id LE
+            0x02, 0x00, 0xAA, 0xBB, // pool_payout B0_64K
+            0x01, 0x00, // payouts count
+            0x01, 0x00, 0xCC, // payouts[0] B0_64K
+            0x01, 0x00, // dust_limits count
+            0x22, 0x02, 0x00, 0x00, // 546 U32-LE
+            0x00, 0x00, // additional_outputs count
         ];
-        let original = RequestPayoutOutputsSuccess {
-            request_id: 7,
-            coinbase_tx_outputs,
+        assert_eq!(bytes, expected);
+    }
+
+    /// `truncated buffers refuse to parse`
+    #[test]
+    fn set_payout_distribution_truncated_refuses() {
+        let bytes = sample_distribution().serialize();
+        for cut in [0, 7, 9, bytes.len() - 1] {
+            assert!(
+                SetPayoutDistribution::deserialize(&bytes[..cut]).is_err(),
+                "cut at {cut} must not parse"
+            );
+        }
+    }
+
+    /// `empty payouts + dust_limits are legal (pool-only distribution)`
+    #[test]
+    fn set_payout_distribution_pool_only_roundtrip() {
+        let msg = SetPayoutDistribution {
+            distribution_id: 1,
+            pool_payout: vec![0xAA; 30],
+            payouts: vec![],
+            dust_limits: vec![],
+            additional_outputs: vec![],
         };
-        let parsed = RequestPayoutOutputsSuccess::deserialize(&original.serialize()).unwrap();
-        assert_eq!(parsed, original);
+        let bytes = msg.serialize();
+        assert_eq!(SetPayoutDistribution::deserialize(&bytes).unwrap(), msg);
     }
 
-    /// `wire layout: U32-LE request_id followed by B0_64K outputs`
+    /// `distribution_id TLV round-trips through the upstream Tlv codec`
     #[test]
-    fn request_payout_outputs_success_wire_layout() {
-        let outputs = vec![0xAA, 0xBB, 0xCC];
-        let wire = RequestPayoutOutputsSuccess {
-            request_id: 0x42,
-            coinbase_tx_outputs: outputs.clone(),
-        }
-        .serialize();
-        // 4 (U32) + 2 (B0_64K len prefix) + 3 (outputs) = 9
-        assert_eq!(wire.len(), 9);
-        assert_eq!(&wire[0..4], &[0x42, 0x00, 0x00, 0x00]);
-        assert_eq!(&wire[4..6], &[0x03, 0x00]);
-        assert_eq!(&wire[6..9], outputs.as_slice());
-    }
-
-    /// `round-trips each defined error code`
-    #[test]
-    fn request_payout_outputs_error_roundtrip() {
-        use payout_outputs_error_codes::*;
-        for code in [
-            STALE_PAYOUT_OUTPUTS,
-            INVALID_MINING_JOB_TOKEN,
-            REVENUE_TOO_LARGE,
-            COINBASE_SIZE_BUDGET_EXCEEDED,
-            INTERNAL,
-        ] {
-            let wire = RequestPayoutOutputsError {
-                request_id: 1,
-                error_code: code.to_string(),
-            }
-            .serialize();
-            let parsed = RequestPayoutOutputsError::deserialize(&wire).unwrap();
-            assert_eq!(parsed.request_id, 1);
-            assert_eq!(parsed.error_code, code);
-        }
-    }
-
-    /// `wire layout: U32-LE request_id followed by STR0_255 error_code`
-    #[test]
-    fn request_payout_outputs_error_wire_layout() {
-        let wire = RequestPayoutOutputsError {
-            request_id: 0xCAFEBABE,
-            error_code: "stale-payout-outputs".to_string(),
-        }
-        .serialize();
-        // 4 (U32) + 1 (STR len prefix) + 20 ("stale-payout-outputs") = 25
-        assert_eq!(wire.len(), 25);
-        assert_eq!(&wire[0..4], &[0xBE, 0xBA, 0xFE, 0xCA]);
-        assert_eq!(wire[4], 20);
+    fn distribution_id_tlv_roundtrip_via_reference_codec() {
+        use stratum_core::parsers_sv2::Tlv;
+        let wire = encode_distribution_id_tlv(0xDEADBEEF00C0FFEE);
+        let parsed = Tlv::decode(&wire).expect("reference decode");
         assert_eq!(
-            std::str::from_utf8(&wire[5..25]).unwrap(),
-            "stale-payout-outputs"
+            parse_distribution_id_tlv(std::slice::from_ref(&parsed)),
+            Some(0xDEADBEEF00C0FFEE)
         );
+        // And the reference encoder produces our exact bytes.
+        assert_eq!(parsed.encode().unwrap(), wire);
+    }
+
+    /// `wrong length or foreign TLVs yield None`
+    #[test]
+    fn distribution_id_tlv_rejects_malformed() {
+        use stratum_core::parsers_sv2::Tlv;
+        let short = Tlv::new(0x0003, 0x01, vec![0x01, 0x02]);
+        assert_eq!(parse_distribution_id_tlv(&[short]), None);
+        let foreign = Tlv::new(0x0002, 0x01, vec![0u8; 8]);
+        assert_eq!(parse_distribution_id_tlv(&[foreign]), None);
+        let wrong_field = Tlv::new(0x0003, 0x02, vec![0u8; 8]);
+        assert_eq!(parse_distribution_id_tlv(&[wrong_field]), None);
+        assert_eq!(parse_distribution_id_tlv(&[]), None);
+    }
+
+    /// `finds the distribution_id among other negotiated TLVs`
+    #[test]
+    fn distribution_id_tlv_found_among_others() {
+        use stratum_core::parsers_sv2::Tlv;
+        let worker = Tlv::new(0x0002, 0x01, b"rig1".to_vec());
+        let dist = Tlv::decode(&encode_distribution_id_tlv(7)).unwrap();
+        assert_eq!(parse_distribution_id_tlv(&[worker, dist]), Some(7));
     }
 
     // ── 0x0002 Worker-ID TLV ───────────────────────────────────────
 
-    /// `matches the spec wire example: "Worker_001"`
+    /// `wire layout: "Worker_001" with little-endian TLV header`
     #[test]
-    fn worker_id_tlv_matches_spec_wire_example() {
+    fn worker_id_tlv_wire_layout_is_little_endian() {
         let tlv = encode_worker_id_tlv("Worker_001").unwrap();
-        // Per extensions/0x0002-worker-specific-hashrate-tracking.md §2:
-        //   00 02 01 00 0A 57 6F 72 6B 65 72 5F 30 30 31
-        assert_eq!(hex::encode(&tlv), "000201000a576f726b65725f303031");
+        // §3.4.3 types the header as U16|U8 + U16 — U16 is LE in SV2.
+        // (The 0x0002 spec's §2 example shows `00 02 …`, contradicting
+        // the base data-type convention; the example is wrong.)
+        assert_eq!(hex::encode(&tlv), "0200010a00576f726b65725f303031");
+    }
+
+    /// `wire-compatible with the reference TLV codec (parsers_sv2)`
+    #[test]
+    fn worker_id_tlv_matches_reference_codec() {
+        use stratum_core::parsers_sv2::Tlv;
+        let reference = Tlv::new(
+            SV2_EXTENSION_TYPE_WORKER_ID,
+            SV2_FIELD_TYPE_USER_IDENTITY,
+            b"Worker_001".to_vec(),
+        )
+        .encode()
+        .expect("reference encode");
+        assert_eq!(encode_worker_id_tlv("Worker_001").unwrap(), reference);
+        // And the reverse: reference-encoded bytes parse on our side.
+        assert_eq!(
+            parse_worker_id_tlv(&reference).as_deref(),
+            Some("Worker_001")
+        );
     }
 
     /// `round-trips arbitrary UTF-8`
@@ -730,8 +743,8 @@ mod tests {
     /// `parser returns null on > 32 byte declared length (malformed)`
     #[test]
     fn worker_id_tlv_parser_rejects_oversized_length() {
-        // Forge a TLV header claiming length=33.
-        let mut buf = vec![0x00, 0x02, 0x01, 0x00, 0x21];
+        // Forge a TLV header claiming length=33 (0x21 LE).
+        let mut buf = vec![0x02, 0x00, 0x01, 0x21, 0x00];
         buf.extend(std::iter::repeat_n(0x41u8, 33));
         assert_eq!(parse_worker_id_tlv(&buf), None);
     }
@@ -740,9 +753,9 @@ mod tests {
     #[test]
     fn worker_id_tlv_returns_none_when_absent() {
         assert_eq!(parse_worker_id_tlv(&[]), None);
-        // An unrelated TLV (extType=0x0099 BE).
+        // An unrelated TLV (extType=0x0099 LE).
         assert_eq!(
-            parse_worker_id_tlv(&[0x00, 0x99, 0x01, 0x00, 0x01, 0x42]),
+            parse_worker_id_tlv(&[0x99, 0x00, 0x01, 0x01, 0x00, 0x42]),
             None
         );
     }
@@ -750,8 +763,8 @@ mod tests {
     /// `skips unknown leading TLVs and finds the 0x0002 one`
     #[test]
     fn worker_id_tlv_skips_unknown_leading_tlvs() {
-        // Unknown TLV first (ext=0x0099, field=0x01, len=4, value=0x00000000), then 0x0002.
-        let unknown = [0x00, 0x99, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00];
+        // Unknown TLV first (ext=0x0099 LE, field=0x01, len=4, value=0x00000000), then 0x0002.
+        let unknown = [0x99, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
         let ours = encode_worker_id_tlv("rig42").unwrap();
         let mut buf = unknown.to_vec();
         buf.extend_from_slice(&ours);
@@ -827,8 +840,8 @@ mod tests {
     /// `malformed TLV (truncated) → channel default, share remains accountable`
     #[test]
     fn resolve_malformed_truncated_tlv() {
-        // Truncated 0x0002 TLV: claims length=10 but only 5 bytes follow.
-        let malformed = [0x00, 0x02, 0x01, 0x00, 0x0a, 0x41, 0x42, 0x43, 0x44, 0x45];
+        // Truncated 0x0002 TLV: claims length=10 (LE) but only 5 bytes follow.
+        let malformed = [0x02, 0x00, 0x01, 0x0a, 0x00, 0x41, 0x42, 0x43, 0x44, 0x45];
         assert_eq!(resolve(&malformed, true), "default");
     }
 }

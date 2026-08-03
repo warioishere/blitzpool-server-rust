@@ -15,7 +15,9 @@
 //! Each engine keeps only its mode-specific wrappers (PPLNS: a fixed
 //! key; Group-Solo: per-(group, finder) keys + SCAN cleanup).
 
+pub mod actual;
 pub mod budget;
+pub mod build;
 pub mod ledger;
 pub mod snapshot;
 
@@ -24,10 +26,14 @@ use std::collections::HashMap;
 use bp_common::AddressId;
 use tracing::warn;
 
+pub use actual::ActualCoinbase;
 pub use budget::{read_coinbase_budget, write_coinbase_budget};
+pub use build::{build_and_snapshot, BuildRequest, BuiltDistribution};
 pub use ledger::{ApplyDistributionResult, LedgerError, PayoutRowType};
 pub use snapshot::{
-    delete_snapshot, read_snapshot, write_snapshot, ParsedSnapshot, StoredSnapshot,
+    delete_snapshot, read_weight_snapshot, read_weight_snapshot_with_retry,
+    resolve_snapshot_for_block_found, write_weight_snapshot, StoredWeightSnapshot,
+    WeightSnapshotEntry,
 };
 
 /// Convert a Redis per-address share aggregate (`address → diff-1 sum`,

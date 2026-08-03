@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use bitcoin::Network;
 use bp_mining_job::{
-    address_to_script, normalize_btc_address, MiningJobCache, PayoutEntry, TdpCoinbaseTemplate,
+    address_to_script, normalize_btc_address, MiningJobCache, ResolvedPayouts, TdpCoinbaseTemplate,
     EXTRANONCE_SLOT_LEN,
 };
 
@@ -687,7 +687,7 @@ pub fn apply_vardiff_check<C: Clock>(
     registry: &Arc<JobRegistry>,
     job_cache: &MiningJobCache,
     current_template: Option<&Arc<ActiveSV1Template>>,
-    payouts: &[PayoutEntry],
+    payouts: &ResolvedPayouts,
     now_ms: u64,
 ) -> HandlerOutcome {
     let mut out = HandlerOutcome::default();
@@ -770,7 +770,7 @@ pub fn apply_new_template<C: Clock>(
     registry: &Arc<JobRegistry>,
     job_cache: &MiningJobCache,
     template: &Arc<ActiveSV1Template>,
-    payouts: &[PayoutEntry],
+    payouts: &ResolvedPayouts,
     clean_jobs: bool,
     now_ms: u64,
 ) -> HandlerOutcome {
@@ -816,19 +816,19 @@ fn build_and_register_notify<C: Clock>(
     registry: &Arc<JobRegistry>,
     job_cache: &MiningJobCache,
     template: &Arc<ActiveSV1Template>,
-    payouts: &[PayoutEntry],
+    payouts: &ResolvedPayouts,
     clean_jobs: bool,
     now_ms: u64,
 ) -> Option<Vec<u8>> {
-    if payouts.is_empty() {
+    if payouts.entries.is_empty() {
         return None;
     }
 
-    state.no_fee = payouts.len() == 1
+    state.no_fee = payouts.entries.len() == 1
         && state
             .authorization
             .as_ref()
-            .is_some_and(|a| payouts[0].address == a.address);
+            .is_some_and(|a| payouts.entries[0].address == a.address);
 
     let tdp_template = TdpCoinbaseTemplate {
         coinbase_prefix: &template.coinbase_prefix,
@@ -845,10 +845,11 @@ fn build_and_register_notify<C: Clock>(
     let mining_job = job_cache
         .get_or_build(
             state.network,
-            payouts,
+            &payouts.entries,
             &tdp_template,
             &server_config.pool_identifier,
             EXTRANONCE_SLOT_LEN,
+            payouts.payouts_fingerprint,
         )
         .ok()?;
 
@@ -882,6 +883,7 @@ mod tests {
     use crate::frame::RpcId;
     use crate::notify::ActiveSV1Template;
     use bp_common::MiningMode;
+    use bp_mining_job::PayoutEntry;
     use bp_vardiff::TestClock;
 
     // ── Fixtures ──────────────────────────────────────────────────────
@@ -934,6 +936,64 @@ mod tests {
     fn fresh_state(clock: TestClock, port: &PortConfig) -> SessionState<Arc<TestClock>> {
         let clock = Arc::new(clock);
         SessionState::new(clock, &server_config(), port, "abcd1234".to_string())
+    }
+
+    /// MONEY: an empty payout list is the resolver saying "serve no job"
+    /// because its distribution could not be built. Answering it with a
+    /// coinbase would mean paying this one miner the whole block, so a
+    /// transient Postgres or Redis fault would cost every other miner in
+    /// the window their share. No `mining.notify` goes out and the miner
+    /// keeps hashing the job it holds.
+    ///
+    /// This pins the OUTCOME, not one guard. Measured: deleting the early
+    /// return below leaves the test green, because `MiningJobCache` and
+    /// `build_payout_outputs` refuse an empty list too — three layers deep.
+    /// With all three gone it does fail, on the `outputs[0]` index panic in
+    /// the coinbase builder. The outcome is what the no-job policy depends
+    /// on, so the outcome is what is asserted.
+    #[test]
+    fn no_notify_is_built_when_the_resolver_serves_no_job() {
+        let port = solo_port(1.0);
+        let mut state = fresh_state(TestClock::new(0), &port);
+        let template = mineable_template();
+        let cache = MiningJobCache::new();
+
+        let out = build_and_register_notify(
+            &mut state,
+            &server_config(),
+            &port,
+            &empty_registry(),
+            &cache,
+            &template,
+            &ResolvedPayouts::none(),
+            true,
+            0,
+        );
+        assert!(
+            out.is_none(),
+            "an empty payout list must produce NO mining.notify"
+        );
+
+        // Control: the same call with a real list DOES produce one, so the
+        // assertion above cannot pass for an unrelated reason.
+        let out = build_and_register_notify(
+            &mut state,
+            &server_config(),
+            &port,
+            &empty_registry(),
+            &cache,
+            &template,
+            &ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
+                address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+                sats: 5_000_000_000,
+            }]),
+            true,
+            0,
+        );
+        assert!(
+            out.is_some(),
+            "precondition: a resolvable list still yields a mining.notify"
+        );
     }
 
     fn template_for_regtest() -> ActiveSV1Template {
@@ -1022,11 +1082,11 @@ mod tests {
     /// the handlers built this internally; post-7.4d the caller
     /// supplies it (the IO-layer connection loop async-resolves via
     /// [`crate::hooks::PayoutResolver`]).
-    fn solo_payouts_fixture(addr: &str) -> Vec<PayoutEntry> {
-        vec![PayoutEntry {
+    fn solo_payouts_fixture(addr: &str) -> ResolvedPayouts {
+        ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
             address: addr.to_string(),
             sats: 5_000_000_000,
-        }]
+        }])
     }
 
     // ── 3 destroy spec cases ────────────────────────────────────────
@@ -1386,7 +1446,7 @@ mod tests {
             &reg,
             &MiningJobCache::new(),
             None,
-            &[],
+            &ResolvedPayouts::unsnapshotted(vec![]),
             1_000,
         );
         assert!(out.outbound_frames.is_empty());
@@ -1442,7 +1502,7 @@ mod tests {
             &empty_registry(),
             &MiningJobCache::new(),
             Some(&mineable_template()),
-            &[],
+            &ResolvedPayouts::unsnapshotted(vec![]),
             clock.now_ms(),
         );
         let frame = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
@@ -1473,7 +1533,7 @@ mod tests {
                 &empty_registry(),
                 &MiningJobCache::new(),
                 None,
-                &[],
+                &ResolvedPayouts::unsnapshotted(vec![]),
                 clock.now_ms(),
             );
             assert!(out.outbound_frames.is_empty());
@@ -1493,7 +1553,7 @@ mod tests {
             &empty_registry(),
             &MiningJobCache::new(),
             Some(&mineable_template()),
-            &[],
+            &ResolvedPayouts::unsnapshotted(vec![]),
             clock.now_ms(),
         );
         assert!(
@@ -1519,7 +1579,7 @@ mod tests {
             &empty_registry(),
             &MiningJobCache::new(),
             Some(&mineable_template()),
-            &[],
+            &ResolvedPayouts::unsnapshotted(vec![]),
             clock.now_ms(),
         );
         let frame = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
@@ -1563,7 +1623,7 @@ mod tests {
             &empty_registry(),
             &MiningJobCache::new(),
             Some(&mineable_template()),
-            &[],
+            &ResolvedPayouts::unsnapshotted(vec![]),
             clock.now_ms(),
         );
         assert!(

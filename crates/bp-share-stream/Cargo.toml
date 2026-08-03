@@ -29,4 +29,7 @@ tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+# Shared test helpers — notably the per-binary Redis DB ranges that keep
+# concurrent tests from FLUSHDB-ing each other.
+bp-test-support = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

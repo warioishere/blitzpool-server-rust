@@ -3,7 +3,7 @@
 //! Per-connection JDP-token store. Tokens are opaque 16-byte
 //! identifiers the JDS hands to a JDC on
 //! `AllocateMiningJobToken`. The JDC then references them in
-//! `RequestPayoutOutputs` (ext 0x0003) and `DeclareMiningJob`. Each
+//! `DeclareMiningJob` and `SetCustomMiningJob`. Each
 //! token has a 1 h TTL (SV2 spec 6.4.2 — "the JDC SHOULD use the token
 //! within a reasonable amount of time") and the pool rate-limits
 //! allocations to one per 1 s per connection (spec 6.4.2 — "rate

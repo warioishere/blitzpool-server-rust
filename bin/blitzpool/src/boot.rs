@@ -50,7 +50,6 @@ use tracing::{info, warn};
 // and clone individual handles internally. `FoundationHandles`
 // itself is NOT `Clone` because `GeoIpServiceHandle` owns an
 // exclusive shutdown `oneshot` and can't satisfy the bound.
-#[allow(dead_code)]
 pub(crate) struct FoundationHandles {
     pub(crate) db: Db,
     pub(crate) redis: ConnectionManager,

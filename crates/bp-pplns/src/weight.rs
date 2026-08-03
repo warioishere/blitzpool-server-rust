@@ -36,6 +36,41 @@ pub const COINBASE_WITNESS_COMMITMENT_WEIGHT: u32 = 188;
 /// varint growth past 65 535 outputs).
 pub const BUDGET_SAFETY_MARGIN_WU: u32 = 200;
 
+/// The smallest coinbase weight budget that can publish a single miner
+/// output — everything `build_weight_distribution`'s blockspace cut
+/// reserves before it appends the first one, plus that output at its
+/// worst-case type.
+///
+/// Below this the cut publishes NOTHING, and §4 makes the pool output
+/// the residual (`pay_P = T − Σpay`), so the pool takes the entire
+/// block while every miner books their full claim as credit against
+/// coins it already holds. That is why this is a hard config floor and
+/// not a warning: a budget under it is not a degraded pool, it is a
+/// pool that keeps the miners' money.
+///
+/// The worst-case output weight ([`COINBASE_OUTPUT_WEIGHT`], P2TR /
+/// P2WSH) is deliberate — the guarantee has to hold whatever address
+/// types the miners bring. A P2WPKH-only population physically fits at
+/// 1012, but nothing stops one P2TR miner from joining.
+pub const MIN_COINBASE_WEIGHT_BUDGET: u32 = COINBASE_BASE_WEIGHT
+    + BUDGET_SAFETY_MARGIN_WU
+    + COINBASE_WITNESS_COMMITMENT_WEIGHT
+    + COINBASE_OUTPUT_WEIGHT // the pool output — structural under §4
+    + COINBASE_OUTPUT_WEIGHT; // one miner output, worst-case type
+
+/// Hard cap on the Group-Solo finder bonus, in parts-per-million of
+/// the miner cut (50 %).
+///
+/// A typo guard, not a policy: half the pot to one member already
+/// makes the proportional split nearly meaningless. Chosen ABOVE the
+/// 32 % that the previous 1-BTC sats cap worked out to against a
+/// 3.125-BTC block, so converting an existing configuration can never
+/// silently clamp it down.
+///
+/// Must stay below 1 000 000: the bonus weight is `S·ppm/(1e6 − ppm)`
+/// and the divisor has to remain positive.
+pub const MAX_FINDER_BONUS_PPM: u32 = 500_000;
+
 /// Resolve the operational minimum-payout setting from raw env input.
 /// Clamped to ≥ DUST_LIMIT_SATS (Bitcoin Core relay policy floor).
 pub fn resolve_min_payout_sats(raw: Option<&str>) -> Sats {
@@ -97,17 +132,31 @@ pub fn output_weight_for_address(address: &str) -> u32 {
 /// weight budget can hold. Pessimistic on purpose: assumes every output is
 /// the heaviest standard address type (P2TR / P2WSH = `COINBASE_OUTPUT_WEIGHT`),
 /// so real P2WPKH-heavy populations fit *more* than this. The fixed coinbase
-/// overhead is reserved first — structural base, the budget safety margin, the
-/// segwit-commitment OP_RETURN, and (when `has_fee_output`) the one pool-fee
-/// output. Returns at least 1 even on a degenerate sub-overhead budget.
-pub fn max_coinbase_outputs(budget: u32, has_fee_output: bool) -> u64 {
-    let fee_w = if has_fee_output {
-        COINBASE_OUTPUT_WEIGHT
-    } else {
-        0
-    };
-    let fixed =
-        COINBASE_BASE_WEIGHT + BUDGET_SAFETY_MARGIN_WU + COINBASE_WITNESS_COMMITMENT_WEIGHT + fee_w;
+/// overhead is reserved first — structural base, the budget safety margin,
+/// the segwit-commitment OP_RETURN and the pool output. Returns at least 1
+/// even on a degenerate sub-overhead budget.
+///
+/// **The pool output is reserved unconditionally**, matching what
+/// `build_weight_distribution`'s blockspace cut actually does. This used to
+/// take a `has_fee_output` flag, left over from a model where a 0 % fee
+/// meant no fee output. §4 ended that: `pay_P` is the residual, so
+/// `pool_weight_for` floors at 1 and `payout_entries_at` emits the pool
+/// output at every fee — a 0 % fee just makes it small, not absent. With
+/// the flag `false` this returned ONE MORE than the cut can publish, so
+/// `GroupService` admitted a member the coinbase then folded away, and
+/// under `WithheldValue::ToPool` their whole share went to the pool. That
+/// is exactly the ledger-free invariant `coinbase_max_members` exists to
+/// hold.
+///
+/// The flag had also drifted across its three callers — two derived it as
+/// `fee_address.is_some() && fee_percent > 0.0`, the capacity cron as
+/// `fee_address.is_some()` alone. Removing it makes all three agree by
+/// construction.
+pub fn max_coinbase_outputs(budget: u32) -> u64 {
+    let fixed = COINBASE_BASE_WEIGHT
+        + BUDGET_SAFETY_MARGIN_WU
+        + COINBASE_WITNESS_COMMITMENT_WEIGHT
+        + COINBASE_OUTPUT_WEIGHT; // the pool output — structural under §4
     if budget <= fixed {
         return 1;
     }
@@ -116,27 +165,67 @@ pub fn max_coinbase_outputs(budget: u32, has_fee_output: bool) -> u64 {
 
 /// Field-level validation error for the fee / min-payout / coinbase-budget
 /// knobs shared by the PPLNS and Group-Solo engine configs. Each engine maps
-/// this into its own `ConfigError` (via `From`) so the three identical checks
-/// — and their thresholds — live in exactly one place.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// this into its own `ConfigError` (via `From`) so the identical checks —
+/// and their thresholds — live in exactly one place.
+#[derive(Debug, Clone, PartialEq)]
 pub enum FeePayoutBudgetError {
+    /// No pool-output recipient configured. Structural under §4, not a
+    /// preference — see [`validate_fee_payout_budget`].
+    MissingFeeAddress,
+    /// A pool-output recipient was configured but is not a usable payout
+    /// address. `AddressId` only checks the SHAPE (ASCII, length), so a
+    /// typo'd address gets this far; the same silent failure as no
+    /// address at all, and likelier.
+    InvalidFeeAddress { value: String },
     /// `fee_percent` was non-finite or outside `[0.0, 100.0]`.
     InvalidFeePercent { value: f64 },
     /// `min_payout_sats` below the relay-policy dust floor.
     MinPayoutBelowDust { value: i64, dust: u64 },
-    /// `coinbase_weight_budget` at/below the structural floor (base + margin).
+    /// `coinbase_weight_budget` below [`MIN_COINBASE_WEIGHT_BUDGET`] —
+    /// too small to publish even one miner output, which would hand the
+    /// pool every block. `min` is the smallest ACCEPTED value.
     WeightBudgetTooLow { value: u32, min: u32 },
 }
 
-/// Validate the three fee/payout/budget invariants both payout engines share.
+/// Validate the fee/payout/budget invariants both payout engines share.
 /// The thresholds (dust floor, budget-floor formula) live here so a change
-/// applies to every engine at once. Field order matches both engines' old
-/// inline checks so error precedence is unchanged.
+/// applies to every engine at once — and so neither engine can be handed a
+/// usable budget without also being handed a usable pool output.
+///
+/// **The fee address is checked FIRST because it is structural, not a
+/// preference.** §4 makes the pool output the residual
+/// (`pay_P = T − Σ pay`), so a distribution without one cannot exist:
+/// `build_weight_distribution` refuses, the payout resolver falls back to a
+/// solo coinbase, and that coinbase pays **100 % of the block to whichever
+/// miner happened to connect** — every block, indefinitely, with one
+/// `warn!` per job and no fingerprint, so the loss is not even booked.
+///
+/// That is the same outcome the [`MIN_COINBASE_WEIGHT_BUDGET`] floor below
+/// already refuses outright ("not a degraded pool, a pool that keeps the
+/// miners' money"); this was its other half, left open. The example config
+/// has always said a fee address is *required when the mode is enabled* —
+/// this is what makes that true rather than aspirational.
+///
+/// A boot that stops here costs the operator one config line. The failure
+/// it replaces costs a whole block and cannot be undone.
 pub fn validate_fee_payout_budget(
+    fee_address: Option<&str>,
     fee_percent: f64,
     min_payout_sats: i64,
     coinbase_weight_budget: u32,
 ) -> Result<(), FeePayoutBudgetError> {
+    let address = fee_address
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .ok_or(FeePayoutBudgetError::MissingFeeAddress)?;
+    // Shape is not enough. `AddressId` accepts any short ASCII string, so a
+    // typo'd address reaches the coinbase builder and fails there — the same
+    // silent 100 %-to-one-miner outcome, and likelier than an empty field.
+    if !is_valid_payout_address(address) {
+        return Err(FeePayoutBudgetError::InvalidFeeAddress {
+            value: address.to_string(),
+        });
+    }
     if !fee_percent.is_finite() || !(0.0..=100.0).contains(&fee_percent) {
         return Err(FeePayoutBudgetError::InvalidFeePercent { value: fee_percent });
     }
@@ -146,14 +235,16 @@ pub fn validate_fee_payout_budget(
             dust: DUST_LIMIT_SATS,
         });
     }
-    // The pure-math layer adds BUDGET_SAFETY_MARGIN_WU to the base weight
-    // before subtracting outputs; require at least that floor so callers
-    // can't configure a budget that rejects every payout list.
-    let min_budget = COINBASE_BASE_WEIGHT + BUDGET_SAFETY_MARGIN_WU;
-    if coinbase_weight_budget <= min_budget {
+    // Enough budget for at least one miner output, or the distribution
+    // publishes nothing and the §4 residual hands the pool the whole
+    // block. This used to check `base + margin` alone — 528 — which is
+    // less than the blockspace cut's own fixed reservation, so every
+    // budget from 529 to 1059 passed validation and then published no
+    // outputs at all. See [`MIN_COINBASE_WEIGHT_BUDGET`].
+    if coinbase_weight_budget < MIN_COINBASE_WEIGHT_BUDGET {
         return Err(FeePayoutBudgetError::WeightBudgetTooLow {
             value: coinbase_weight_budget,
-            min: min_budget,
+            min: MIN_COINBASE_WEIGHT_BUDGET,
         });
     }
     Ok(())
@@ -308,59 +399,156 @@ mod tests {
         assert_eq!(output_weight_for_address(""), 0);
     }
 
+    /// The pool output costs one member slot, always.
+    ///
+    /// This replaces a test that compared the old `has_fee_output` flag
+    /// against itself (`without_fee == with_fee + 1`). It could not fail
+    /// while the flag existed, and it never looked at what the builder
+    /// reserves — so it cemented the very off-by-one it was meant to
+    /// guard. The real guarantee is cross-checked against
+    /// `build_weight_distribution` in
+    /// `weights::tests::the_member_ceiling_is_what_the_blockspace_cut_publishes`.
     #[test]
-    fn max_outputs_reserves_one_slot_for_the_fee_output() {
-        // With a fee output present, exactly one fewer member output fits —
-        // the fee output costs the same worst-case slot as any miner output.
-        let with_fee = max_coinbase_outputs(50_000, true);
-        let without_fee = max_coinbase_outputs(50_000, false);
-        assert_eq!(
-            without_fee,
-            with_fee + 1,
-            "the reserved fee output must cost exactly one member slot"
-        );
+    fn max_outputs_reserves_a_slot_for_the_pool_output() {
+        let fixed =
+            COINBASE_BASE_WEIGHT + BUDGET_SAFETY_MARGIN_WU + COINBASE_WITNESS_COMMITMENT_WEIGHT;
+        // One worst-case output of headroom above the non-pool overhead
+        // still fits NO member: that slot is the pool's.
+        assert_eq!(max_coinbase_outputs(fixed + COINBASE_OUTPUT_WEIGHT), 1);
+        // Two, and exactly one member fits.
+        assert_eq!(max_coinbase_outputs(fixed + 2 * COINBASE_OUTPUT_WEIGHT), 1);
+        assert_eq!(max_coinbase_outputs(fixed + 3 * COINBASE_OUTPUT_WEIGHT), 2);
     }
 
     #[test]
     fn max_outputs_degenerate_budget_returns_at_least_one() {
         // Budget at/below the fixed overhead can't fit any member but never
         // reports zero capacity.
-        assert_eq!(max_coinbase_outputs(0, true), 1);
-        assert_eq!(max_coinbase_outputs(COINBASE_BASE_WEIGHT, false), 1);
+        assert_eq!(max_coinbase_outputs(0), 1);
+        assert_eq!(max_coinbase_outputs(COINBASE_BASE_WEIGHT), 1);
     }
+
+    /// A usable pool-output recipient, for the cases that are about
+    /// something else.
+    const FEE: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 
     #[test]
     fn validate_fee_payout_budget_accepts_sane_values() {
         assert_eq!(
-            validate_fee_payout_budget(1.5, DEFAULT_MIN_PAYOUT_SATS as i64, 50_000),
+            validate_fee_payout_budget(Some(FEE), 1.5, DEFAULT_MIN_PAYOUT_SATS as i64, 50_000),
             Ok(())
+        );
+    }
+
+    /// MONEY: a pool with no usable fee address builds no distribution at
+    /// all, so every PPLNS / Group-Solo job falls back to a solo coinbase
+    /// paying 100 % of the block to whichever miner connected — silently,
+    /// indefinitely, and without a fingerprint, so nothing even books the
+    /// loss. It has to be refused at construction, exactly like the
+    /// weight-budget floor is.
+    #[test]
+    fn a_pool_without_a_usable_fee_address_is_refused() {
+        // Absent, empty and whitespace-only are the same operator mistake:
+        // `[pplns] fee_address = ""` is what a commented-out example leaves
+        // behind, and it parses to a present-but-blank string.
+        for missing in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                validate_fee_payout_budget(missing, 1.5, 5_000, 50_000),
+                Err(FeePayoutBudgetError::MissingFeeAddress),
+                "{missing:?} must be refused"
+            );
+        }
+        // Shape-valid but not a payout address. `AddressId` accepts this —
+        // it only checks ASCII + length — so without this check a typo'd
+        // address reaches `build_weight_distribution`, fails there, and
+        // produces the identical silent solo fallback.
+        let typo = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLX";
+        assert!(
+            bp_common::AddressId::new(typo).is_ok(),
+            "precondition: the shape check passes it, which is why this \
+             check has to exist"
+        );
+        assert_eq!(
+            validate_fee_payout_budget(Some(typo), 1.5, 5_000, 50_000),
+            Err(FeePayoutBudgetError::InvalidFeeAddress {
+                value: typo.to_string()
+            })
         );
     }
 
     #[test]
     fn validate_fee_payout_budget_rejects_in_field_order() {
-        // fee_percent checked first.
+        // fee_address checked first — it is structural, the rest are knobs.
         assert_eq!(
-            validate_fee_payout_budget(101.0, 5_000, 50_000),
+            validate_fee_payout_budget(None, 101.0, 5_000, 50_000),
+            Err(FeePayoutBudgetError::MissingFeeAddress)
+        );
+        // then fee_percent.
+        assert_eq!(
+            validate_fee_payout_budget(Some(FEE), 101.0, 5_000, 50_000),
             Err(FeePayoutBudgetError::InvalidFeePercent { value: 101.0 })
         );
         assert!(matches!(
-            validate_fee_payout_budget(f64::NAN, 5_000, 50_000),
+            validate_fee_payout_budget(Some(FEE), f64::NAN, 5_000, 50_000),
             Err(FeePayoutBudgetError::InvalidFeePercent { .. })
         ));
         // then min_payout dust floor.
         assert_eq!(
-            validate_fee_payout_budget(1.0, (DUST_LIMIT_SATS as i64) - 1, 50_000),
+            validate_fee_payout_budget(Some(FEE), 1.0, (DUST_LIMIT_SATS as i64) - 1, 50_000),
             Err(FeePayoutBudgetError::MinPayoutBelowDust {
                 value: (DUST_LIMIT_SATS as i64) - 1,
                 dust: DUST_LIMIT_SATS,
             })
         );
         // then budget floor.
-        let min = COINBASE_BASE_WEIGHT + BUDGET_SAFETY_MARGIN_WU;
+        let too_low = MIN_COINBASE_WEIGHT_BUDGET - 1;
         assert_eq!(
-            validate_fee_payout_budget(1.0, 5_000, min),
-            Err(FeePayoutBudgetError::WeightBudgetTooLow { value: min, min })
+            validate_fee_payout_budget(Some(FEE), 1.0, 5_000, too_low),
+            Err(FeePayoutBudgetError::WeightBudgetTooLow {
+                value: too_low,
+                min: MIN_COINBASE_WEIGHT_BUDGET
+            })
+        );
+    }
+
+    /// The floor has to be the number the BUILDER needs, not a smaller
+    /// one that merely looks structural.
+    ///
+    /// It used to be `base + margin` = 528, while the blockspace cut
+    /// reserves `base + witness commitment + pool output` = 688 out of
+    /// `budget − margin` before it appends the first miner output. Every
+    /// budget from 529 to 1059 therefore passed validation and then
+    /// published nothing at all — and §4 makes the pool output the
+    /// residual, so the pool took the entire block while every miner
+    /// booked their full claim as credit against coins it already held.
+    #[test]
+    fn budget_floor_is_what_the_blockspace_cut_actually_reserves() {
+        // Exactly the cut's own arithmetic, spelled out independently.
+        let cut_reserves =
+            COINBASE_BASE_WEIGHT + COINBASE_WITNESS_COMMITMENT_WEIGHT + COINBASE_OUTPUT_WEIGHT;
+        let smallest_that_fits_one_output =
+            cut_reserves + COINBASE_OUTPUT_WEIGHT + BUDGET_SAFETY_MARGIN_WU;
+        assert_eq!(
+            MIN_COINBASE_WEIGHT_BUDGET, smallest_that_fits_one_output,
+            "the floor must track the cut's reservation, not a looser guess"
+        );
+        assert_eq!(MIN_COINBASE_WEIGHT_BUDGET, 1_060);
+
+        // The old floor sat inside the dead zone — pin that it is now
+        // rejected, or this whole class of config comes back.
+        let old_floor = COINBASE_BASE_WEIGHT + BUDGET_SAFETY_MARGIN_WU;
+        assert!(old_floor < MIN_COINBASE_WEIGHT_BUDGET);
+        for dead in [old_floor + 1, 700, 1_012, MIN_COINBASE_WEIGHT_BUDGET - 1] {
+            assert!(
+                validate_fee_payout_budget(Some(FEE), 1.0, 5_000, dead).is_err(),
+                "budget {dead} publishes no miner output and must be refused"
+            );
+        }
+        // And the floor itself is ACCEPTED — `min` is the smallest
+        // usable value, not the largest rejected one.
+        assert_eq!(
+            validate_fee_payout_budget(Some(FEE), 1.0, 5_000, MIN_COINBASE_WEIGHT_BUDGET),
+            Ok(())
         );
     }
 

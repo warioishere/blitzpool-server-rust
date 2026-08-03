@@ -148,7 +148,7 @@ pub(crate) fn build_server_config(cfg: &AppConfig) -> Sv2ServerConfig {
     sc
 }
 
-fn config_network_to_bitcoin(n: bp_config::Network) -> BitcoinNetwork {
+pub(crate) fn config_network_to_bitcoin(n: bp_config::Network) -> BitcoinNetwork {
     match n {
         bp_config::Network::Mainnet => BitcoinNetwork::Bitcoin,
         // testnet4 shares the `tb` HRP + address byte set with
@@ -183,6 +183,7 @@ pub(crate) fn build_per_port_servers(
     )>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     job_cache: Arc<bp_mining_job::MiningJobCache>,
+    settle: crate::settlement::SettlementSignal,
 ) -> Vec<Sv2PortServer> {
     let Some(tdp) = foundation.tdp.as_ref() else {
         warn!("stratum-v2: TDP missing (--skip-tdp); skipping SV2 server construction");
@@ -202,6 +203,7 @@ pub(crate) fn build_per_port_servers(
     // `coinbase_tx_value_remaining`, so the engine ledger-write fires for
     // SV2-found blocks just like SV1; the dispatcher notification fires too.
     let mut sink = crate::block_sink::TdpBlockSubmissionSink::new(tdp.clone())
+        .with_network(network)
         .with_alt_streams(foundation.alt_tdp.clone())
         .with_fanout(
             mode_gate.clone(),
@@ -212,7 +214,8 @@ pub(crate) fn build_per_port_servers(
         )
         .with_blockparty(engines.blockparty.clone())
         .with_pool(foundation.db.pool().clone())
-        .with_redis(foundation.redis.clone());
+        .with_redis(foundation.redis.clone())
+        .with_settle_handle(settle);
     // The front routes block-found events to the stream — the payout Satellite
     // applies the ledger and the notify Satellite fans out the push. A front
     // always produces (front + payout can't share a process; see the boot
@@ -438,12 +441,14 @@ mod tests {
                 vardiff_silence_easing_enabled: false,
             },
             sv2: Sv2Config {
+                jdp_validation_socket_path: None,
                 authority_privkey_hex: privkey,
                 ed25519_authority_seed_hex: None,
                 cert_signed_part: None,
                 jdp_enabled: false,
                 jdp_port: None,
                 jdp_orphan_submitblock: false,
+                jdp_payout_distribution_interval_secs: None,
             },
             debug: Default::default(),
             pplns: Some(PplnsConfig {

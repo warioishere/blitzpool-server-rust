@@ -40,8 +40,6 @@
 //! JDP wire-codec is a separate module (`jdp_server_codec.rs`) that
 //! lands with `jdp_server.rs`.
 
-use bp_common::AddressId;
-use bp_share::Difficulty;
 use stratum_core::common_messages_sv2::{
     SetupConnection as Sv2SetupConnection, SetupConnectionError as Sv2SetupConnError,
     SetupConnectionSuccess as Sv2SetupConnSuccess,
@@ -98,19 +96,6 @@ pub enum CodecError {
     /// downstream string handling).
     #[error("invalid UTF-8: {0}")]
     InvalidUtf8(String),
-    /// An address failed [`AddressId`]'s shape validation. Mainly
-    /// guards the `user_identity` field on OpenChannel.
-    #[error("invalid address: {0}")]
-    InvalidAddress(String),
-    /// Outbound payload exceeds the variant's wire-length cap (e.g.
-    /// a coinbase suffix > 64KB). Production wiring shouldn't hit
-    /// this — TDP coinbases are well under the cap.
-    #[error("outbound payload too large: {field} = {got}, max {max}")]
-    PayloadTooLarge {
-        field: &'static str,
-        got: usize,
-        max: usize,
-    },
     /// Outbound frame variant doesn't yet have a wire-codec
     /// implementation. Placeholder during the iterative build-out;
     /// disappears once every variant is covered.
@@ -331,6 +316,8 @@ fn decode_set_custom_mining_job(
     m: Sv2SetCustomMiningJob<'static>,
 ) -> Result<SetCustomMiningJobInput, CodecError> {
     Ok(SetCustomMiningJobInput {
+        // §6 TLV — IO-layer-extracted from the frame's trailing TLVs.
+        distribution_id: None,
         channel_id: m.channel_id,
         request_id: m.request_id,
         mining_job_token: token_from_bytes(m.token.as_bytes())?,
@@ -659,23 +646,6 @@ fn seq_from_merkle_path(
 
 fn str0255(s: String) -> Result<stratum_core::binary_sv2::Str0255<'static>, CodecError> {
     s.try_into().map_err(CodecError::from_conv)
-}
-
-/// Validate that `user_identity` parses as an `AddressId`. Used by
-/// the per-connection task when it wants to short-circuit on bogus
-/// addresses before calling `handle_open_*` (which would also
-/// reject, but the codec-level check produces a cleaner log line).
-pub fn validate_user_identity_as_address(user_identity: &str) -> Result<AddressId, CodecError> {
-    AddressId::new(user_identity.to_string())
-        .map_err(|e| CodecError::InvalidAddress(format!("{e:?}")))
-}
-
-/// Convert the channel's `session_difficulty` to the wire `max_target`
-/// 32-byte form. Helper that's symmetric to `difficulty_to_target`
-/// in [`bp_share`] — exposed so the per-connection task can build
-/// `SetTarget` frames without re-importing the conversion.
-pub fn difficulty_to_max_target(d: Difficulty) -> [u8; 32] {
-    bp_share::difficulty_to_target(d).to_le_bytes()
 }
 
 #[cfg(test)]

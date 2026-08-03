@@ -37,6 +37,18 @@ pub const POOL_MINERS_ACTIVE: &str = "pool_miners_active";
 pub const POOL_BLOCKS_FOUND_TOTAL: &str = "pool_blocks_found_total";
 pub const POOL_SHARE_DIFFICULTY: &str = "pool_share_difficulty";
 
+/// Found blocks parked awaiting `confirmation_depth` before their ledger
+/// apply. Normal to be non-zero briefly; a value that does not fall is a
+/// block whose apply keeps failing.
+pub const POOL_BLOCKS_PENDING_APPLY: &str = "pool_blocks_pending_apply";
+/// Found blocks no automatic path could book, parked for the operator.
+///
+/// **This one should be zero.** Every entry is a block whose coinbase paid
+/// miners on-chain and whose ledger entry they never got. Nothing else
+/// reads that store, so without this gauge the only trace is a log line
+/// that scrolls away.
+pub const POOL_BLOCKS_UNBOOKABLE: &str = "pool_blocks_unbookable";
+
 /// Share-difficulty histogram buckets (raw difficulty, not seconds).
 pub const POOL_SHARE_DIFFICULTY_BUCKETS: &[f64] =
     &[1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0];

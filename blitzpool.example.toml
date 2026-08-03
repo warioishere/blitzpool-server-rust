@@ -256,7 +256,10 @@ submit_latency = false
 # Shares per count-bucket for the sliding window (default 10000). The window
 # is stored as per-address buckets of this many shares instead of one entry
 # per share; bigger = less Redis memory + coarser trim, smaller = more memory
-# + finer. MUST match the TS pool's PPLNS_BUCKET_SHARES (they share Redis).
+# + finer. Do NOT raise this on a running pool: the bucket id comes from a
+# Redis counter that never resets, so a bigger divisor sends new shares to an
+# id below the live window and the trim throws them away again. Raise it only
+# against an empty window (lowering it is harmless).
 # bucket_shares = 10000
 # Daily 03:00 UTC abandoned-pair sweep on pplns_balance.
 # dust_sweep_enabled = true
@@ -322,9 +325,13 @@ submit_latency = false
 # members beyond the budget are rolled into the pool fee. Under-sizing costs
 # fairness (trimmed members get 0 sats), not validity.
 # coinbase_weight_budget = 10000
-# Daily 03:00 UTC dormant-row sweep on pplns_group_balance.
-# dust_sweep_enabled = true
-# dormant_balance_days = 30
+#
+# This value is ALSO the hard member cap: a group cannot grow past what the
+# budget can pay (`max_coinbase_outputs`), and a join beyond it is refused.
+# Group-Solo keeps no ledger — a member the coinbase cannot pay forfeits the
+# block and their share goes to the pool output — so the cap is what keeps
+# that from ever happening. 10000 WU ≈ 52 members; raise BOTH this and the
+# operator's own `maxMembers` to grow a group.
 
 # ───────────────────────────────────────────────────────────────
 # Blockparty mode (optional — leave the whole [blockparty] table out

@@ -3,8 +3,8 @@
 //! Confirmation watcher for confirmation-gated block-founds (PPLNS + Group-Solo).
 //!
 //! A found block parks its frozen payout in the Redis pending-store
-//! ([`crate::pending_blocks`] for PPLNS, [`crate::pending_group_solo_blocks`]
-//! for Group-Solo) instead of writing the ledger immediately. This task waits
+//! ([`crate::pending_blocks`] — one shape for both modes) instead of writing
+//! the ledger immediately. This task waits
 //! for each parked block to reach `confirmation_depth` confirmations, then
 //! applies it; a block that orphaned (or a non-chain-extending candidate, which
 //! never confirms) is discarded so the internal ledger never drifts. The
@@ -12,8 +12,8 @@
 //! gated. Blockparty is exempt: its payouts are fixed per-member percentages
 //! recomputed from the DB, so a replay/orphan can't drift anything.
 //!
-//! The per-block confirmation decision ([`classify_block`]) + the generic
-//! load/classify/discard pass ([`collect_confirmed`]) are shared across both
+//! The per-block confirmation decision ([`classify_block`]) + the
+//! load/classify/discard pass ([`collect_confirmed`]) run once for both
 //! modes; only the thin engine-specific apply loop differs.
 //!
 //! Trigger: the TDP `SetNewPrevHash` broadcast (a new chain tip → time to
@@ -29,16 +29,16 @@ use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_template_distribution::{TdpHandle, TemplateUpdate};
 use redis::aio::ConnectionManager;
-use serde::de::DeserializeOwned;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-use crate::pending_blocks::{remove_pending_block, PENDING_KEY};
-use crate::pending_group_solo_blocks::{remove_pending_group_solo_block, GS_PENDING_KEY};
-use crate::pending_store::{load_pending, remove_pending, PendingBlockRef};
+use crate::pending_blocks::{
+    count_pending_at, load_pending_blocks, put_pending_at, remove_pending_at, remove_pending_block,
+    PendingBlock, PENDING_KEY, UNBOOKABLE_KEY,
+};
 
 /// Fallback re-check cadence when the TDP stream is quiet. New blocks normally
 /// drive the watcher via `SetNewPrevHash`; this just bounds the worst-case
@@ -76,6 +76,12 @@ pub(crate) fn spawn(
     pplns: Option<PplnsEngine>,
     group_solo: Option<GroupSoloEngine>,
     confirmation_depth: u32,
+    // ext 0x0003 §10 settlement fan-out — a gated apply IS a settlement,
+    // so the published payout distributions must be invalidated with it
+    // or a JDC keeps mining pre-settlement weights. This watcher runs on
+    // the `payout` role and the registry lives on `front`, which is
+    // exactly why it takes the signal and not a bare in-process handle.
+    settle: Option<crate::settlement::SettlementSignal>,
 ) -> BlockConfirmationHandle {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
@@ -85,6 +91,10 @@ pub(crate) fn spawn(
         let mut tick = tokio::time::interval(FALLBACK_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // consume the immediate first tick
+
+        // Last reported unbookable depth, so a standing non-zero count is
+        // logged on change instead of every pass.
+        let mut last_unbookable: Option<u64> = None;
 
         info!(
             confirmation_depth,
@@ -99,12 +109,12 @@ pub(crate) fn spawn(
                 biased;
                 _ = cancel.cancelled() => break,
                 _ = tick.tick() => {
-                    reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth).await;
+                    reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth, settle.as_ref(), &mut last_unbookable).await;
                 }
                 ev = next_tip_signal(&mut rx) => match ev {
                     // A new chain tip — re-check every parked block's depth.
                     Ok(TemplateUpdate::SetNewPrevHash(_)) => {
-                        reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth).await;
+                        reconcile(&bitcoin_rpc, &redis, pplns.as_ref(), group_solo.as_ref(), confirmation_depth, settle.as_ref(), &mut last_unbookable).await;
                     }
                     // NewTemplate / tx-data responses aren't new-block ticks.
                     Ok(_) => {}
@@ -165,15 +175,15 @@ async fn classify_block(bitcoin_rpc: &BitcoinRpc, block_hash: &str, depth: i64) 
 /// Load every parked entry under `key`, prune unparsable ones, discard
 /// orphaned/gone ones, and return the CONFIRMED entries ready to apply (left in
 /// the store — the caller removes each after a successful apply, so a failed
-/// apply is retried next tick). The generic, engine-agnostic half of the pass.
-async fn collect_confirmed<T: DeserializeOwned + PendingBlockRef>(
+/// apply is retried next tick). The engine-agnostic half of the pass.
+async fn collect_confirmed(
     bitcoin_rpc: &BitcoinRpc,
     conn: &mut ConnectionManager,
     key: &str,
     depth: i64,
     label: &str,
-) -> Vec<T> {
-    let (pending, unparsable) = match load_pending::<T>(conn, key).await {
+) -> Vec<PendingBlock> {
+    let (pending, unparsable) = match load_pending_blocks(conn, key).await {
         Ok(v) => v,
         Err(err) => {
             warn!(%err, label, "block-confirmation: load pending failed; retry next tick");
@@ -182,27 +192,27 @@ async fn collect_confirmed<T: DeserializeOwned + PendingBlockRef>(
     };
     for hash in unparsable {
         warn!(label, block_hash = %hash, "block-confirmation: pruning unparsable pending entry");
-        let _ = remove_pending(conn, key, &hash).await;
+        let _ = remove_pending_at(conn, key, &hash).await;
     }
 
     let mut confirmed = Vec::new();
     for pb in pending {
-        match classify_block(bitcoin_rpc, pb.block_hash(), depth).await {
+        match classify_block(bitcoin_rpc, &pb.block_hash, depth).await {
             BlockStatus::Confirmed => confirmed.push(pb),
             BlockStatus::Orphaned => {
                 warn!(
                     label,
-                    block_hash = %pb.block_hash(),
-                    height = pb.block_height(),
+                    block_hash = %pb.block_hash,
+                    height = pb.block_height,
                     "block-confirmation: block orphaned / not on active chain — discarding frozen \
                      distribution (no on-chain payment occurred)"
                 );
-                let _ = remove_pending(conn, key, pb.block_hash()).await;
+                let _ = remove_pending_at(conn, key, &pb.block_hash).await;
             }
             BlockStatus::Maturing => {}
             BlockStatus::Unknown => warn!(
                 label,
-                block_hash = %pb.block_hash(),
+                block_hash = %pb.block_hash,
                 "block-confirmation: getblockheader failed; will retry next tick"
             ),
         }
@@ -210,104 +220,174 @@ async fn collect_confirmed<T: DeserializeOwned + PendingBlockRef>(
     confirmed
 }
 
-/// One reconciliation pass over both stores.
+/// One reconciliation pass over the pending store.
+///
+/// One loop for both modes: the parked blob carries the settlement
+/// inputs either way, and `group` decides which engine settles them.
+/// Publish how deep the two parking stores are, and say so in the log when
+/// the unbookable one CHANGES.
+///
+/// The gauge is the standing signal — `pool:unbookable_blocks` had no
+/// reader of any kind, so a block whose miners are owed a ledger entry left
+/// exactly one log line behind and then nothing. Logging only on a change
+/// keeps a standing non-zero count from becoming a line every pass, which
+/// is how a real one gets ignored.
+async fn report_parked_depths(conn: &mut ConnectionManager, last_unbookable: &mut Option<u64>) {
+    let pending = count_pending_at(conn, PENDING_KEY).await;
+    let unbookable = count_pending_at(conn, UNBOOKABLE_KEY).await;
+    let (Ok(pending), Ok(unbookable)) = (pending, unbookable) else {
+        // A Redis blip here costs one sample. Leave the last-reported
+        // value alone so the next successful pass still logs a change.
+        return;
+    };
+    bp_metrics::recorder::set_parked_block_counts(pending, unbookable);
+    if *last_unbookable != Some(unbookable) {
+        if unbookable > 0 {
+            error!(
+                unbookable,
+                pending,
+                unbookable_key = UNBOOKABLE_KEY,
+                "block-confirmation: blocks nothing can book automatically are parked — their \
+                 coinbases already paid miners on-chain and those miners have no ledger entry. \
+                 Each entry holds the frozen distribution needed to reprocess it."
+            );
+        } else if last_unbookable.is_some_and(|prev| prev > 0) {
+            info!("block-confirmation: the unbookable store is empty again");
+        }
+        *last_unbookable = Some(unbookable);
+    }
+}
+
 async fn reconcile(
     bitcoin_rpc: &BitcoinRpc,
     redis: &ConnectionManager,
     pplns: Option<&PplnsEngine>,
     group_solo: Option<&GroupSoloEngine>,
     confirmation_depth: u32,
+    // See `spawn`: a gated apply IS a §10 settlement event.
+    settle: Option<&crate::settlement::SettlementSignal>,
+    last_unbookable: &mut Option<u64>,
 ) {
     let depth = i64::from(confirmation_depth);
+    let mut conn = redis.clone();
+    let confirmed = collect_confirmed(bitcoin_rpc, &mut conn, PENDING_KEY, depth, "pool").await;
 
-    if let Some(pplns) = pplns {
-        let mut conn = redis.clone();
-        let confirmed = collect_confirmed::<crate::pending_blocks::PendingBlock>(
-            bitcoin_rpc,
-            &mut conn,
-            PENDING_KEY,
-            depth,
-            "PPLNS",
-        )
-        .await;
-        for pb in confirmed {
-            match pplns.apply_prepared(&pb.prepared).await {
-                Ok(outcome) => {
-                    info!(
+    for pb in confirmed {
+        // Settlement is `claim − paid` against the block's OWN coinbase,
+        // so its payments are not optional: without them there is
+        // nothing to settle against and the block is an operator
+        // reprocess.
+        let Some(actual) = pb.actual_coinbase.clone() else {
+            error!(
+                block_hash = %pb.block_hash,
+                height = pb.block_height,
+                "block-confirmation: parked block carries no parsed coinbase — discarding, \
+                 reprocess from the block's own coinbase"
+            );
+            let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+            continue;
+        };
+
+        let applied = match (&pb.group, pplns, group_solo) {
+            (Some(group), _, Some(engine)) => {
+                let (Ok(group_uuid), Ok(finder)) = (
+                    uuid::Uuid::parse_str(&group.group_id),
+                    AddressId::new(group.finder.clone()),
+                ) else {
+                    error!(
                         block_hash = %pb.block_hash,
-                        height = pb.prepared.block_height,
-                        history_inserted = outcome.history_inserted,
-                        balances_affected = outcome.balances_affected,
-                        "block-confirmation: confirmed → PPLNS ledger applied"
+                        group_id = %group.group_id,
+                        "block-confirmation: parked Group-Solo block has an unusable group id \
+                         or finder — discarding"
                     );
                     let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+                    continue;
+                };
+                engine
+                    .on_block_found(
+                        group_uuid,
+                        pb.block_height,
+                        &actual,
+                        &finder,
+                        pb.weight_snapshot.clone(),
+                        pb.payouts_fingerprint,
+                    )
+                    .await
+                    .map_err(SettleError::GroupSolo)
+            }
+            (None, Some(engine), _) => engine
+                .on_block_found(
+                    pb.block_height,
+                    &actual,
+                    pb.weight_snapshot.clone(),
+                    pb.payouts_fingerprint,
+                )
+                .await
+                .map_err(SettleError::Pplns),
+            // The engine this block belongs to is not wired on this
+            // process. Leave it parked — another process may own it.
+            _ => continue,
+        };
+
+        match applied {
+            Ok(outcome) => {
+                if let Some(signal) = settle {
+                    signal.settle().await;
                 }
-                Err(err) => warn!(
+                info!(
+                    block_hash = %pb.block_hash,
+                    height = pb.block_height,
+                    group = pb.group.as_ref().map(|g| g.group_id.as_str()).unwrap_or("-"),
+                    history_inserted = outcome.history_inserted,
+                    "block-confirmation: confirmed → payout history applied"
+                );
+                let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+            }
+            Err(err) if err.is_terminal() => {
+                // Park, don't destroy: the frozen blob is the only record
+                // of what this block paid every miner.
+                let parked = put_pending_at(&mut conn, UNBOOKABLE_KEY, &pb).await.is_ok();
+                error!(
                     %err,
                     block_hash = %pb.block_hash,
-                    "block-confirmation: PPLNS apply_prepared failed; will retry next tick"
-                ),
+                    height = pb.block_height,
+                    parked,
+                    unbookable_key = UNBOOKABLE_KEY,
+                    "block-confirmation: block cannot be booked automatically — moved to the \
+                     unbookable store instead of retrying forever; the miners it paid are owed \
+                     their ledger entry and the frozen distribution is preserved there"
+                );
+                if parked {
+                    let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
+                }
             }
+            Err(err) => warn!(
+                %err,
+                block_hash = %pb.block_hash,
+                "block-confirmation: apply failed; will retry next tick"
+            ),
         }
     }
 
-    if let Some(group_solo) = group_solo {
-        let mut conn = redis.clone();
-        let confirmed =
-            collect_confirmed::<crate::pending_group_solo_blocks::PendingGroupSoloBlock>(
-                bitcoin_rpc,
-                &mut conn,
-                GS_PENDING_KEY,
-                depth,
-                "Group-Solo",
-            )
-            .await;
-        for pb in confirmed {
-            let group_uuid = match uuid::Uuid::parse_str(&pb.group_id) {
-                Ok(u) => u,
-                Err(err) => {
-                    warn!(%err, block_hash = %pb.block_hash, group_id = %pb.group_id,
-                        "block-confirmation: Group-Solo group_id not a UUID — discarding");
-                    let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
-                    continue;
-                }
-            };
-            let finder = match AddressId::new(pb.finder.clone()) {
-                Ok(a) => a,
-                Err(err) => {
-                    warn!(%err, block_hash = %pb.block_hash, finder = %pb.finder,
-                        "block-confirmation: Group-Solo finder not a valid address — discarding");
-                    let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
-                    continue;
-                }
-            };
-            match group_solo
-                .on_block_found_with_snapshot(
-                    group_uuid,
-                    pb.block_height,
-                    pb.block_reward_sats,
-                    &finder,
-                    pb.snapshot.clone().into(),
-                )
-                .await
-            {
-                Ok(outcome) => {
-                    info!(
-                        block_hash = %pb.block_hash,
-                        height = pb.block_height,
-                        group_id = %pb.group_id,
-                        history_inserted = outcome.history_inserted,
-                        balances_affected = outcome.balances_affected,
-                        "block-confirmation: confirmed → Group-Solo ledger applied"
-                    );
-                    let _ = remove_pending_group_solo_block(&mut conn, &pb.block_hash).await;
-                }
-                Err(err) => warn!(
-                    %err,
-                    block_hash = %pb.block_hash,
-                    "block-confirmation: Group-Solo apply failed; will retry next tick"
-                ),
-            }
+    // After the pass, not before: a block parked into the unbookable store
+    // by the loop above must show up in the same tick that put it there.
+    report_parked_depths(&mut conn, last_unbookable).await;
+}
+
+/// The two engines' errors, so one loop can treat them alike.
+#[derive(Debug, thiserror::Error)]
+enum SettleError {
+    #[error(transparent)]
+    Pplns(bp_pplns_engine::engine::EngineError),
+    #[error(transparent)]
+    GroupSolo(bp_group_solo_engine::engine::EngineError),
+}
+
+impl SettleError {
+    fn is_terminal(&self) -> bool {
+        match self {
+            SettleError::Pplns(e) => e.is_terminal(),
+            SettleError::GroupSolo(e) => e.is_terminal(),
         }
     }
 }

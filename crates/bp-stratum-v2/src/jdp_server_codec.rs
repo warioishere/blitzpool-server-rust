@@ -10,19 +10,17 @@
 //!
 //! ## Scope
 //!
-//! - **Inbound** (7 variants): SetupConnection (common), RequestExtensions
+//! - **Inbound** (6 variants): SetupConnection (common), RequestExtensions
 //!   (ext 0x0001), AllocateMiningJobToken, DeclareMiningJob,
-//!   ProvideMissingTransactionsSuccess, PushSolution, and
-//!   RequestPayoutOutputs (ext 0x0003 via the raw-bytes
-//!   [`decode_jdp_inbound_ext_0x0003`] pre-decoder — `stratum-core::AnyMessage`
-//!   doesn't carry it, so the IO layer dispatches by `extension_type`
-//!   in the frame header).
-//! - **Outbound** (10 variants): SetupConnection Success/Error,
+//!   ProvideMissingTransactionsSuccess and PushSolution. Ext 0x0003 has
+//!   no inbound message — the payout distribution is server-push only.
+//! - **Outbound** (9 variants): SetupConnection Success/Error,
 //!   RequestExtensions Success/Error, AllocateMiningJobTokenSuccess,
 //!   DeclareMiningJob Success/Error, ProvideMissingTransactions, and
-//!   RequestPayoutOutputs Success/Error (ext 0x0003 via the raw-bytes
-//!   [`encode_jdp_outbound_ext_0x0003`] pre-encoder, written into a
-//!   `Sv2Frame::from_bytes_unchecked` with the manually-assembled
+//!   SetPayoutDistribution (ext 0x0003 via the raw-bytes
+//!   [`encode_jdp_outbound_ext_0x0003`] pre-encoder —
+//!   `stratum-core::AnyMessage` doesn't carry it, so it is written into
+//!   a `Sv2Frame::from_bytes_unchecked` with the manually-assembled
 //!   6-byte header).
 //!
 //! ## Notes
@@ -51,16 +49,10 @@ use stratum_core::parsers_sv2::{
     AnyMessage, CommonMessages, Extensions, ExtensionsNegotiation, JobDeclaration,
 };
 
-use crate::extensions::{
-    RequestExtensions as LocalRequestExtensions, RequestPayoutOutputs as WireRequestPayoutOutputs,
-    RequestPayoutOutputsError as WireRequestPayoutOutputsError,
-    RequestPayoutOutputsSuccess as WireRequestPayoutOutputsSuccess,
-    SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
-};
+use crate::extensions::RequestExtensions as LocalRequestExtensions;
 use crate::jdp::client::{
     AllocateMiningJobTokenInput, DeclareMiningJobInput, JdpOutboundFrame,
-    ProvideMissingTransactionsSuccessInput, PushSolutionInput, RequestPayoutOutputsInput,
-    SetupConnectionInput,
+    ProvideMissingTransactionsSuccessInput, PushSolutionInput, SetupConnectionInput,
 };
 use crate::server_codec::CodecError;
 use crate::tokens::Token;
@@ -75,69 +67,15 @@ pub enum InboundJdpFrame {
     DeclareMiningJob(DeclareMiningJobInput),
     ProvideMissingTransactionsSuccess(ProvideMissingTransactionsSuccessInput),
     PushSolution(PushSolutionInput),
-    /// ext 0x0003 §2.1 `RequestPayoutOutputs` — JDC → JDS. Not in
-    /// `stratum-core::AnyMessage`, decoded via the raw-bytes path
-    /// [`decode_jdp_inbound_ext_0x0003`] before the AnyMessage parser.
-    RequestPayoutOutputs(RequestPayoutOutputsInput),
 }
 
 // ── decode_jdp_inbound ──────────────────────────────────────────────
 
-/// ext 0x0003 §3 message types (channel_msg bit always unset).
-pub const EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS: u8 = 0x00;
-pub const EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS_SUCCESS: u8 = 0x01;
-pub const EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS_ERROR: u8 = 0x02;
-
-/// Raw-bytes decoder for ext 0x0003 inbound frames. Returns
-/// `Ok(Some(_))` when the (extension_type, message_type) pair
-/// identifies an ext 0x0003 frame this codec knows how to parse,
-/// `Ok(None)` otherwise (caller falls through to the standard
-/// `decode_jdp_inbound`).
-///
-/// The IO layer MUST call this **before** `parse_message_frame_with_tlvs`,
-/// because `stratum-core::AnyMessage` doesn't carry the ext 0x0003
-/// variants and the upstream parser would error on the unknown
-/// `extension_type`.
-pub fn decode_jdp_inbound_ext_0x0003(
-    extension_type: u16,
-    message_type: u8,
-    payload: &[u8],
-) -> Result<Option<InboundJdpFrame>, CodecError> {
-    if extension_type != SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS {
-        return Ok(None);
-    }
-    match message_type {
-        EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS => {
-            let wire = WireRequestPayoutOutputs::deserialize(payload).map_err(|e| {
-                CodecError::Conversion(format!("ext 0x0003 RequestPayoutOutputs: {e:?}"))
-            })?;
-            // mining_job_token is B0_255 on the wire, but every token the
-            // JDS ever issues is exactly TOKEN_LEN bytes. Reject any other
-            // length rather than pad/truncate — a truncated >TOKEN_LEN
-            // token could otherwise alias a different valid token's prefix.
-            if wire.mining_job_token.len() != crate::tokens::TOKEN_LEN {
-                return Err(CodecError::Conversion(format!(
-                    "ext 0x0003 RequestPayoutOutputs: token len {} != {}",
-                    wire.mining_job_token.len(),
-                    crate::tokens::TOKEN_LEN
-                )));
-            }
-            let mut token_bytes = [0u8; crate::tokens::TOKEN_LEN];
-            token_bytes.copy_from_slice(&wire.mining_job_token);
-            Ok(Some(InboundJdpFrame::RequestPayoutOutputs(
-                RequestPayoutOutputsInput {
-                    request_id: wire.request_id,
-                    mining_job_token: Token(token_bytes),
-                    available_payout_value: wire.available_payout_value,
-                },
-            )))
-        }
-        // 0x01 + 0x02 are JDS → JDC (Success / Error) — not expected inbound.
-        other => Err(CodecError::Conversion(format!(
-            "ext 0x0003 unknown / outbound-only msg_type 0x{other:02x}"
-        ))),
-    }
-}
+/// ext 0x0003 §8 message type: `SetPayoutDistribution` (JDS → JDC,
+/// channel_msg bit unset). The push model defines no inbound ext-0x0003
+/// frames — the `distribution_id` reference arrives as a §6 TLV on the
+/// base-protocol `DeclareMiningJob` / `SetCustomMiningJob` frames.
+pub const EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION: u8 = 0x00;
 
 pub fn decode_jdp_inbound(msg: AnyMessage<'static>) -> Result<Option<InboundJdpFrame>, CodecError> {
     match msg {
@@ -226,6 +164,9 @@ fn decode_declare(m: Sv2DeclareMiningJob<'static>) -> Result<DeclareMiningJobInp
         wtxid_list.push(bytes_to_32(b)?);
     }
     Ok(DeclareMiningJobInput {
+        // §6 TLV — extracted by the IO layer from the frame's trailing
+        // TLVs, not part of the base-message decode.
+        distribution_id: None,
         request_id: m.request_id,
         mining_job_token: token_from_bytes(m.mining_job_token.as_bytes())?,
         version: m.version,
@@ -373,16 +314,13 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
                 .into_static(),
             ),
         )),
-        // RequestPayoutOutputs Success/Error are ext 0x0003 — not in
-        // `AnyMessage`. The JDP-server per-connection task takes them
-        // through [`encode_jdp_outbound_ext_0x0003`] (raw-bytes path)
-        // BEFORE falling back to this AnyMessage path.
-        JdpOutboundFrame::RequestPayoutOutputsSuccess { .. }
-        | JdpOutboundFrame::RequestPayoutOutputsError { .. } => {
-            Err(CodecError::EncodeUnimplemented(
-                "ext 0x0003 must go via encode_jdp_outbound_ext_0x0003",
-            ))
-        }
+        // SetPayoutDistribution is ext 0x0003 — not in `AnyMessage`.
+        // The JDP-server per-connection task takes it through
+        // [`encode_jdp_outbound_ext_0x0003`] (raw-bytes path) BEFORE
+        // falling back to this AnyMessage path.
+        JdpOutboundFrame::SetPayoutDistribution(_) => Err(CodecError::EncodeUnimplemented(
+            "ext 0x0003 must go via encode_jdp_outbound_ext_0x0003",
+        )),
     }
 }
 
@@ -396,31 +334,8 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<AnyMessage<'static
 /// `(extension_type=0x0003, message_type, msg_length=payload.len())`.
 pub fn encode_jdp_outbound_ext_0x0003(frame: &JdpOutboundFrame) -> Option<(u8, Vec<u8>)> {
     match frame {
-        JdpOutboundFrame::RequestPayoutOutputsSuccess {
-            request_id,
-            coinbase_outputs,
-        } => {
-            let wire = WireRequestPayoutOutputsSuccess {
-                request_id: *request_id,
-                coinbase_tx_outputs: coinbase_outputs.clone(),
-            };
-            Some((
-                EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS_SUCCESS,
-                wire.serialize(),
-            ))
-        }
-        JdpOutboundFrame::RequestPayoutOutputsError {
-            request_id,
-            error_code,
-        } => {
-            let wire = WireRequestPayoutOutputsError {
-                request_id: *request_id,
-                error_code: error_code.clone(),
-            };
-            Some((
-                EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS_ERROR,
-                wire.serialize(),
-            ))
+        JdpOutboundFrame::SetPayoutDistribution(msg) => {
+            Some((EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION, msg.serialize()))
         }
         _ => None,
     }
@@ -677,13 +592,17 @@ mod tests {
     }
 
     #[test]
-    fn encode_request_payout_outputs_returns_unimplemented() {
+    fn encode_set_payout_distribution_returns_unimplemented_on_anymessage_path() {
         // ext 0x0003 lands in a separate codec path; the standard
         // codec rejects with EncodeUnimplemented.
-        let frame = JdpOutboundFrame::RequestPayoutOutputsSuccess {
-            request_id: 1,
-            coinbase_outputs: vec![],
-        };
+        let frame =
+            JdpOutboundFrame::SetPayoutDistribution(crate::extensions::SetPayoutDistribution {
+                distribution_id: 1,
+                pool_payout: vec![0xAA; 30],
+                payouts: vec![],
+                dust_limits: vec![],
+                additional_outputs: vec![],
+            });
         match encode_jdp_outbound(frame) {
             Err(CodecError::EncodeUnimplemented(s)) => {
                 assert!(s.contains("ext 0x0003"));
@@ -708,151 +627,31 @@ mod tests {
         assert!(decode_jdp_inbound(msg).unwrap().is_none());
     }
 
-    // ── ext 0x0003 codec round-trips ────────────────────────────────
+    // ── ext 0x0003 codec (push model) ───────────────────────────────
 
     #[test]
-    fn ext_0x0003_inbound_decoder_parses_request_payout_outputs() {
-        // Hand-build the wire payload: u32 request_id LE + B0_255 token
-        // + u64 available_payout_value (NO prev_hash).
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&42u32.to_le_bytes()); // request_id
-        payload.push(16); // mining_job_token length (B0_255)
-        let token_bytes: [u8; 16] = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
-            0xff, 0x00,
-        ];
-        payload.extend_from_slice(&token_bytes);
-        payload.extend_from_slice(&5_000_000_000u64.to_le_bytes()); // available_payout_value
-
-        let frame = decode_jdp_inbound_ext_0x0003(
-            0x0003,
-            EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS,
-            &payload,
-        )
-        .expect("decoder must accept")
-        .expect("must produce a frame");
-
-        match frame {
-            InboundJdpFrame::RequestPayoutOutputs(input) => {
-                assert_eq!(input.request_id, 42);
-                assert_eq!(input.mining_job_token.0, token_bytes);
-                assert_eq!(input.available_payout_value, 5_000_000_000);
-            }
-            other => panic!("expected RequestPayoutOutputs, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ext_0x0003_inbound_decoder_rejects_wrong_token_length() {
-        // request_id + B0_255 token of length 15 (≠ TOKEN_LEN) + value.
-        for bad_len in [0u8, 15, 17] {
-            let mut payload = Vec::new();
-            payload.extend_from_slice(&1u32.to_le_bytes());
-            payload.push(bad_len);
-            payload.extend(std::iter::repeat_n(0xAAu8, bad_len as usize));
-            payload.extend_from_slice(&5_000_000_000u64.to_le_bytes());
-            let r = decode_jdp_inbound_ext_0x0003(
-                0x0003,
-                EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS,
-                &payload,
-            );
-            assert!(
-                r.is_err(),
-                "token len {bad_len} must be rejected, not padded"
-            );
-        }
-    }
-
-    #[test]
-    fn ext_0x0003_inbound_decoder_returns_none_for_other_extensions() {
-        let payload = vec![0u8; 16];
-        let r = decode_jdp_inbound_ext_0x0003(0x0001, 0x00, &payload).unwrap();
-        assert!(r.is_none(), "0x0001 frame must not match the 0x0003 path");
-    }
-
-    #[test]
-    fn ext_0x0003_inbound_decoder_rejects_outbound_only_msg_types() {
-        let payload = vec![0u8; 16];
-        for outbound_only in [
-            EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS_SUCCESS,
-            EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS_ERROR,
-        ] {
-            let r = decode_jdp_inbound_ext_0x0003(0x0003, outbound_only, &payload);
-            assert!(
-                r.is_err(),
-                "outbound-only msg_type 0x{outbound_only:02x} must error inbound"
-            );
-        }
-    }
-
-    #[test]
-    fn ext_0x0003_outbound_encoder_serializes_success_frame() {
-        let frame = JdpOutboundFrame::RequestPayoutOutputsSuccess {
-            request_id: 99,
-            coinbase_outputs: vec![0xde, 0xad, 0xbe, 0xef],
+    fn ext_0x0003_outbound_encoder_serializes_set_payout_distribution() {
+        let msg = crate::extensions::SetPayoutDistribution {
+            distribution_id: 42,
+            pool_payout: vec![0xAA; 30],
+            payouts: vec![vec![0x01; 31]],
+            dust_limits: vec![546],
+            additional_outputs: vec![],
         };
         let (msg_type, payload) =
-            encode_jdp_outbound_ext_0x0003(&frame).expect("encoder must accept Success");
-        assert_eq!(msg_type, EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS_SUCCESS);
-        // Wire layout: u32 request_id LE + B0_64K (u16 LE len) + bytes.
-        assert_eq!(&payload[0..4], &99u32.to_le_bytes());
-        assert_eq!(&payload[4..6], &4u16.to_le_bytes()); // outputs len
-        assert_eq!(&payload[6..10], &[0xde, 0xad, 0xbe, 0xef]);
+            encode_jdp_outbound_ext_0x0003(&JdpOutboundFrame::SetPayoutDistribution(msg.clone()))
+                .expect("ext 0x0003 frame");
+        assert_eq!(msg_type, EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION);
+        let parsed = crate::extensions::SetPayoutDistribution::deserialize(&payload).unwrap();
+        assert_eq!(parsed, msg);
     }
 
     #[test]
-    fn ext_0x0003_outbound_encoder_serializes_error_frame() {
-        let frame = JdpOutboundFrame::RequestPayoutOutputsError {
-            request_id: 7,
-            error_code: "stale-payout-outputs".to_string(),
-        };
-        let (msg_type, payload) =
-            encode_jdp_outbound_ext_0x0003(&frame).expect("encoder must accept Error");
-        assert_eq!(msg_type, EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS_ERROR);
-        assert_eq!(&payload[0..4], &7u32.to_le_bytes());
-        // STR0_255 with 20-byte length prefix.
-        assert_eq!(payload[4], 20);
-        assert_eq!(&payload[5..25], b"stale-payout-outputs");
-    }
-
-    #[test]
-    fn ext_0x0003_outbound_encoder_returns_none_for_non_ext_frames() {
+    fn ext_0x0003_outbound_encoder_returns_none_for_base_frames() {
         let frame = JdpOutboundFrame::SetupConnectionSuccess {
             used_version: 2,
             flags: 0,
         };
         assert!(encode_jdp_outbound_ext_0x0003(&frame).is_none());
-    }
-
-    #[test]
-    fn ext_0x0003_roundtrip_inbound_decode_matches_wire_serialize() {
-        use crate::extensions::RequestPayoutOutputs as Wire;
-        let original = Wire {
-            request_id: 12345,
-            mining_job_token: vec![0xa1; 16],
-            available_payout_value: 9_876_543_210,
-        };
-        let bytes = original.serialize();
-        let frame = decode_jdp_inbound_ext_0x0003(
-            0x0003,
-            EXT_0X0003_MSG_TYPE_REQUEST_PAYOUT_OUTPUTS,
-            &bytes,
-        )
-        .unwrap()
-        .unwrap();
-        match frame {
-            InboundJdpFrame::RequestPayoutOutputs(input) => {
-                assert_eq!(input.request_id, original.request_id);
-                assert_eq!(
-                    &input.mining_job_token.0[..],
-                    &original.mining_job_token[..]
-                );
-                assert_eq!(
-                    input.available_payout_value,
-                    original.available_payout_value
-                );
-            }
-            _ => panic!("wrong variant"),
-        }
     }
 }

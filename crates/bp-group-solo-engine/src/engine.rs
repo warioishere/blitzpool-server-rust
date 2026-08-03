@@ -4,8 +4,7 @@
 //! service-engine.
 //!
 //! Owns the Postgres pool, Redis-backed `GroupRoundStore`,
-//! `DistributionBuilder` (with its in-flight cache),
-//! `GroupDustSweepRunner` (daily 03:00 UTC dust-sweep cron), and
+//! `DistributionBuilder` (with its in-flight cache), and
 //! `GroupResetRunner` plus its per-group calendar-aligned cron
 //! tasks.
 //!
@@ -16,12 +15,11 @@
 //!   mode = Group-Solo + group_id for the address.
 //! - `build_distribution` — called by the template-build path with
 //!   the prospective finder's address.
-//! - `on_block_found` — called when a Group-Solo finder wins a
-//!   block. Reads the snapshot persisted at template-build time,
-//!   applies the ledger TX, resets the round (Variant A —
-//!   preserves `lastAcceptedShareAt`), drops all per-finder
-//!   snapshots, invalidates the distribution cache.
-//! - `manual_sweep` / `manual_reset` — admin-triggerable wrappers.
+//! - `on_block_found` — called when a Group-Solo finder wins a block.
+//!   Writes the payout history from the block's OWN coinbase, resets
+//!   the round (Variant A — preserves `lastAcceptedShareAt`), drops
+//!   the group's snapshots, invalidates the distribution cache.
+//! - `manual_reset` — admin-triggerable wrapper.
 //! - `shutdown` — flips the cancel watch so background tasks exit.
 
 use std::collections::{HashMap, HashSet};
@@ -30,36 +28,27 @@ use std::time::{Duration, Instant};
 
 use bp_common::{AddressId, InvalidAddressError, Sats};
 use bp_cron_utils::SystemClock;
-use bp_db::{
-    find_all_pplns_group_balances_for_group, find_group, DbError, PplnsGroupBalanceRow,
-    PplnsGroupRow,
-};
+use bp_db::{find_group, DbError, PplnsGroupRow};
 use bp_group_mgmt::group::{window_duration_ms, PayoutMode, RoundResetPreset};
-use bp_pplns::CoinbaseDistributionEntry;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::sync::{watch, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::config::{ConfigError, GroupSoloEngineConfig};
 use crate::distribution::{
     DistributionBuilder, DistributionConfig, DistributionError, DistributionResult,
 };
-use crate::ledger::{
-    apply_distribution, coinbase_row, pending_row, ApplyDistributionResult, AuditRow, BalanceWrite,
-    LedgerError,
+use crate::history::{
+    apply_distribution, ApplyDistributionResult, AuditRow, GroupPayoutRowType, LedgerError,
 };
 use crate::reset::{spawn_per_group_task, GroupResetRunner, ResetError, ResetSchedule};
-use bp_share::payouts_fingerprint_from_parts;
 
-use crate::round::snapshot::{
-    delete_all_for_group, delete_snapshot_for, ParsedSnapshot, StoredSnapshot,
-};
+use crate::round::snapshot::{delete_all_for_group, delete_snapshot_for};
 use crate::round::{GroupRoundStore, RoundError, WINDOW_BUCKET_MS};
-use crate::sweep::{spawn_daily_task, GroupDustSweepRunner, SweepError, SweepStats};
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -71,10 +60,8 @@ pub enum EngineError {
     Round(#[from] RoundError),
     #[error("db: {0}")]
     Db(#[from] DbError),
-    #[error("ledger: {0}")]
+    #[error("payout history: {0}")]
     Ledger(#[from] LedgerError),
-    #[error("sweep: {0}")]
-    Sweep(#[from] SweepError),
     #[error("reset: {0}")]
     Reset(#[from] ResetError),
     #[error("distribution: {0}")]
@@ -94,17 +81,55 @@ pub enum EngineError {
         finder_address: String,
     },
     #[error(
-        "snapshot reward mismatch for group {group_id}: snapshot={snapshot_reward} block={actual_reward}"
+        "group {group_id} block {block_height} coinbase pays {actual_reward} sats, less than \
+         the {subsidy} sat subsidy the block was entitled to — it forfeited money, so nothing \
+         about it is trustworthy enough to book unattended"
     )]
-    SnapshotRewardMismatch {
+    RevenueBelowSubsidy {
         group_id: Uuid,
-        snapshot_reward: u64,
+        block_height: i32,
         actual_reward: u64,
+        subsidy: u64,
     },
     #[error("on_block_found already in flight for group {group_id}")]
     BlockFoundInProgress { group_id: Uuid },
     #[error("invalid address in snapshot: {0}")]
     Address(#[from] InvalidAddressError),
+}
+
+impl EngineError {
+    /// Would retrying this ever succeed?
+    ///
+    /// The confirmation watcher re-applies a pending block on every
+    /// tick and only drops it once the apply returns `Ok`. That is
+    /// right for a database blip and wrong for a verdict: a snapshot
+    /// that expired, a coinbase that burned its own subsidy or an
+    /// address that will not parse produce the SAME failure forever,
+    /// so retrying them is an infinite loop that hides the block
+    /// behind a repeating warning instead of surfacing it once.
+    ///
+    /// Terminal here does not mean the block is lost — it means no
+    /// automatic path can book it, and the operator reprocess reads
+    /// the block's own coinbase off the chain rather than the parked
+    /// blob.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            EngineError::Config(_)
+            | EngineError::SnapshotMissing { .. }
+            | EngineError::SnapshotMissingForPayouts { .. }
+            | EngineError::RevenueBelowSubsidy { .. }
+            | EngineError::Address(_) => true,
+            // Infrastructure, and the per-group in-flight guard — all
+            // of these clear on their own.
+            EngineError::Redis(_)
+            | EngineError::Round(_)
+            | EngineError::Db(_)
+            | EngineError::Ledger(_)
+            | EngineError::Reset(_)
+            | EngineError::Distribution(_)
+            | EngineError::BlockFoundInProgress { .. } => false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -116,7 +141,6 @@ struct Inner {
     pool: PgPool,
     round: GroupRoundStore,
     distribution_builder: DistributionBuilder,
-    sweep_runner: GroupDustSweepRunner<SystemClock>,
     reset_runner: GroupResetRunner<SystemClock>,
     config: GroupSoloEngineConfig,
     cancel_tx: watch::Sender<bool>,
@@ -157,14 +181,6 @@ struct CachedGroupMode {
 /// effect within a minute (and the mode never changes), cheap enough that the
 /// hot share path almost always hits the cache.
 const MODE_CACHE_TTL: Duration = Duration::from_secs(60);
-
-/// How often the block-found snapshot read is retried before the block is given
-/// up on. That read is the only thing standing between a found block and its
-/// booking, and the caller does not retry — a connection reset mid-reconnect
-/// would otherwise cost the block.
-const SNAPSHOT_READ_RETRIES: u32 = 3;
-/// Backoff between those attempts, multiplied by the attempt number.
-const SNAPSHOT_READ_BACKOFF: Duration = Duration::from_millis(80);
 
 /// Decide whether a windowed share in `bucket_id` should trigger a trim, given
 /// the highest bucket already trimmed (`watermark`, `None` if never). Trim on
@@ -228,9 +244,9 @@ fn spawn_reset_task(runner: GroupResetRunner<SystemClock>, schedule: ResetSchedu
 }
 
 impl GroupSoloEngine {
-    /// Validate config, wire dependencies, spawn the dust-sweep
-    /// background task, and spawn a per-group calendar-reset cron
-    /// for every active group with a configured preset.
+    /// Validate config, wire dependencies, and spawn a per-group
+    /// calendar-reset cron for every active group with a configured
+    /// preset.
     pub async fn spawn(
         config: GroupSoloEngineConfig,
         redis: ConnectionManager,
@@ -239,13 +255,12 @@ impl GroupSoloEngine {
         Self::spawn_inner(config, redis, pool, true).await
     }
 
-    /// Core-mode constructor: same wiring, but *without* the background
-    /// crons (dust-sweep + per-group round-reset). The Core only reads
-    /// the round window and builds distributions (`build_distribution`,
-    /// which still writes the snapshot key); all ledger-mutating and
-    /// round-resetting crons run on the Satellite. `record_share` is
-    /// unaffected and unused on the Core (the share path produces to the
-    /// stream instead).
+    /// Core-mode constructor: same wiring, but *without* the per-group
+    /// round-reset cron. The Core only reads the round window and builds
+    /// distributions (`build_distribution`, which still writes the
+    /// snapshot key); the round-resetting cron runs on the Satellite.
+    /// `record_share` is unaffected and unused on the Core (the share
+    /// path produces to the stream instead).
     pub async fn spawn_core(
         config: GroupSoloEngineConfig,
         redis: ConnectionManager,
@@ -265,28 +280,16 @@ impl GroupSoloEngine {
         let dist_cfg = DistributionConfig::from_engine_config(&config);
         let distribution_builder = DistributionBuilder::new(pool.clone(), round.clone(), dist_cfg);
         let clock = Arc::new(SystemClock);
-        let sweep_runner = GroupDustSweepRunner::new(
-            pool.clone(),
-            clock.clone(),
-            config.min_payout_sats,
-            config.dormant_balance_days,
-        );
         let reset_runner = GroupResetRunner::new(pool.clone(), round.clone(), clock.clone());
 
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
 
-        // Core mode (`background_tasks == false`) skips both crons: the
-        // dust-sweep writes the ledger and the per-group round-reset
-        // mutates rounds — both are the Satellite's job. `reset_tasks`
-        // stays empty so `reschedule_group` remains a safe no-op-add.
+        // Core mode (`background_tasks == false`) skips the cron: the
+        // per-group round-reset mutates rounds, which is the Satellite's
+        // job. `reset_tasks` stays empty so `reschedule_group` remains a
+        // safe no-op-add.
         let mut reset_tasks: HashMap<Uuid, ResetTask> = HashMap::new();
         if background_tasks {
-            std::mem::drop(spawn_daily_task(
-                sweep_runner.clone(),
-                config.dust_sweep_enabled,
-                cancel_rx.clone(),
-            ));
-
             // Spawn a per-group reset cron for every active group with a
             // configured preset, retaining each task (with its own cancel) so a
             // later `reschedule_group` can re-arm a single group at runtime.
@@ -299,8 +302,6 @@ impl GroupSoloEngine {
         info!(
             min_payout_sats = config.min_payout_sats.0,
             fee_percent = config.fee_percent,
-            dust_sweep_enabled = config.dust_sweep_enabled,
-            dormant_balance_days = config.dormant_balance_days,
             background_tasks,
             "group-solo-engine spawned"
         );
@@ -310,7 +311,6 @@ impl GroupSoloEngine {
                 pool,
                 round,
                 distribution_builder,
-                sweep_runner,
                 reset_runner,
                 config,
                 cancel_tx,
@@ -568,143 +568,64 @@ impl GroupSoloEngine {
             .map_err(EngineError::Distribution)
     }
 
-    /// Look up the distribution the found block's coinbase actually pays and
-    /// return it as a [`StoredSnapshot`], so the Core can stamp it into the
-    /// block-found event.
+    /// Look up the WEIGHT snapshot the found block's coinbase was built
+    /// from, so the Core can stamp it into the block-found event.
     ///
-    /// `payouts_fingerprint` is the identity of the winning job's payout list,
-    /// carried on the job the share was built on. The build that produced that
-    /// list stored its snapshot under it, and nothing else writes that key.
+    /// `weights_fingerprint` is the identity of the winning job's payout
+    /// list, carried on the job the share was built on. The build that
+    /// produced that list stored its snapshot under it, and nothing else
+    /// writes that key.
     ///
-    /// It must NOT rebuild the distribution here. `record_share` invalidates
-    /// the in-flight cache, so a single share landing between job issue and
-    /// block-found makes a rebuild run against a moved round — measured on a
-    /// two-member group as 187.5 M/125 M at job time versus 31.25 M/281.25 M at
-    /// block-found. The coinbase pays the first pair, and because a fresh build
-    /// carries the correct reward by construction, no reward check would ever
-    /// catch the second being booked. Missing snapshot → typed error, so the
-    /// block is booked by an operator rather than booked wrong.
-    pub async fn snapshot_for_block_found(
+    /// It must NOT rebuild the distribution here. `record_share`
+    /// invalidates the in-flight cache, so a single share landing between
+    /// job issue and block-found makes a rebuild run against a moved
+    /// round — measured on a two-member group as 187.5 M/125 M at job
+    /// time versus 31.25 M/281.25 M at block-found. The coinbase pays the
+    /// first pair. Missing snapshot → typed error, so the block is booked
+    /// by an operator rather than booked wrong.
+    pub async fn weight_snapshot_for_block_found(
         &self,
         group_id: Uuid,
-        block_reward_sats: u64,
         finder_address: &AddressId,
-        payouts_fingerprint: &[u8; 32],
-    ) -> Result<StoredSnapshot, EngineError> {
+        weights_fingerprint: &[u8; 32],
+    ) -> Result<bp_coinbase_snapshot::StoredWeightSnapshot, EngineError> {
         let mut conn = self.inner.round.connection_for_snapshot();
         let group_key = group_id.to_string();
-        // Retry a transient Redis failure rather than discarding the block.
-        // This read is now the only thing standing between a found block and
-        // its booking, and the caller has no retry of its own. A genuinely
-        // missing snapshot (Ok(None)) is NOT retried — it will not appear.
-        let mut attempt = 0;
-        let snapshot = loop {
-            match crate::round::snapshot::read_snapshot_for(
-                &mut conn,
-                &group_key,
-                payouts_fingerprint,
-            )
-            .await
-            {
-                Ok(Some(s)) => break s,
-                Ok(None) => {
-                    return Err(EngineError::SnapshotMissingForPayouts {
-                        group_id,
-                        finder_address: finder_address.as_str().to_string(),
-                    })
-                }
-                Err(e) if attempt < SNAPSHOT_READ_RETRIES => {
-                    warn!(
-                        error = %e,
-                        %group_id,
-                        attempt,
-                        "group-solo snapshot read failed — retrying before giving up on the block"
-                    );
-                    attempt += 1;
-                    tokio::time::sleep(SNAPSHOT_READ_BACKOFF * attempt).await;
-                }
-                Err(e) => return Err(EngineError::Redis(e)),
-            }
-        };
-        if snapshot.block_reward_sats != block_reward_sats {
-            return Err(EngineError::SnapshotRewardMismatch {
-                group_id,
-                snapshot_reward: snapshot.block_reward_sats,
-                actual_reward: block_reward_sats,
-            });
-        }
-        Ok(snapshot.into())
+        bp_coinbase_snapshot::resolve_snapshot_for_block_found(
+            &mut conn,
+            |fp| crate::round::snapshot::key_for_fingerprint(&group_key, fp),
+            weights_fingerprint,
+            "group-solo",
+        )
+        .await?
+        .ok_or_else(|| EngineError::SnapshotMissingForPayouts {
+            group_id,
+            finder_address: finder_address.as_str().to_string(),
+        })
     }
 
-    /// Apply a Group-Solo found block, reading the distribution snapshot from
-    /// the per-(group, finder) Redis key.
+    /// Apply a Group-Solo found block: write its payout history from the
+    /// block's OWN coinbase, then move the round on.
     ///
-    /// **Not on the automatic path, and NOT the way to reprocess a block.**
-    /// That key is last-writer-wins: by the time an apply runs it holds
-    /// whichever template rebuild wrote last, which is a split against the
-    /// round as it is *now*, not the one the block's coinbase paid. Booking it
-    /// is silent — the reward matches, so the mismatch check passes — and that
-    /// is the exact drift the fingerprint lookup exists to remove. A block
-    /// whose payout-list snapshot is gone has to be reprocessed from its own
-    /// coinbase, which is the only surviving record of what it paid.
+    /// There is no settlement step. Group-Solo publishes every member it
+    /// can pay and lets the rest fall to the pool output
+    /// ([`bp_pplns::WithheldValue::ToPool`]), so a published member is
+    /// paid exactly their claim and a withheld one is owed nothing. What
+    /// the coinbase paid is the whole truth, and these rows record it.
     ///
-    /// What it is still good for: applying the current distribution when that
-    /// IS what the coinbase pays, which is what the tests exercise. Per-group
-    /// re-entrancy guard; idempotent across restarts via the
+    /// `snapshot` is therefore only used for the sanity checks below —
+    /// the amounts come from `actual`. Per-group re-entrancy guard;
+    /// idempotent across restarts via the
     /// `(groupId, blockHeight, address)` UNIQUE constraint.
     pub async fn on_block_found(
         &self,
         group_id: Uuid,
         block_height: i32,
-        block_reward_sats: u64,
+        actual: &bp_coinbase_snapshot::ActualCoinbase,
         finder_address: &AddressId,
+        snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+        weights_fingerprint: Option<[u8; 32]>,
     ) -> Result<ApplyDistributionResult, EngineError> {
-        self.guarded_block_found(
-            group_id,
-            block_height,
-            block_reward_sats,
-            finder_address,
-            None,
-        )
-        .await
-    }
-
-    /// Apply a Group-Solo found block from a snapshot carried in the
-    /// block-found event (the Core froze it at the block-found instant — exact
-    /// reward, freshest round). Race-free: no Redis snapshot read, so the
-    /// continuous template-rebuild overwrites can't strip it out from under
-    /// the async Satellite apply. Same re-entrancy guard + idempotency as
-    /// [`Self::on_block_found`].
-    pub async fn on_block_found_with_snapshot(
-        &self,
-        group_id: Uuid,
-        block_height: i32,
-        block_reward_sats: u64,
-        finder_address: &AddressId,
-        snapshot: ParsedSnapshot,
-    ) -> Result<ApplyDistributionResult, EngineError> {
-        self.guarded_block_found(
-            group_id,
-            block_height,
-            block_reward_sats,
-            finder_address,
-            Some(snapshot),
-        )
-        .await
-    }
-
-    /// Shared re-entrancy guard around the apply. `snapshot == None` reads it
-    /// from Redis (fallback); `Some` uses the event-carried one.
-    async fn guarded_block_found(
-        &self,
-        group_id: Uuid,
-        block_height: i32,
-        block_reward_sats: u64,
-        finder_address: &AddressId,
-        snapshot: Option<ParsedSnapshot>,
-    ) -> Result<ApplyDistributionResult, EngineError> {
-        // Per-group re-entrancy gate. `tokio::Mutex` because the
-        // critical section is async.
         {
             let mut in_flight = self.inner.block_found_in_progress.lock().await;
             if in_flight.contains(&group_id) {
@@ -716,12 +637,12 @@ impl GroupSoloEngine {
             .on_block_found_inner(
                 group_id,
                 block_height,
-                block_reward_sats,
+                actual,
                 finder_address,
                 snapshot,
+                weights_fingerprint,
             )
             .await;
-        // Release the guard regardless of outcome.
         self.inner
             .block_found_in_progress
             .lock()
@@ -734,27 +655,39 @@ impl GroupSoloEngine {
         &self,
         group_id: Uuid,
         block_height: i32,
-        block_reward_sats: u64,
+        actual: &bp_coinbase_snapshot::ActualCoinbase,
         finder_address: &AddressId,
-        snapshot: Option<ParsedSnapshot>,
+        snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+        weights_fingerprint: Option<[u8; 32]>,
     ) -> Result<ApplyDistributionResult, EngineError> {
         let group_key = group_id.to_string();
 
-        // 1. Snapshot source: the event-carried one (frozen by the front at
-        //    block-found, race-free) when present, else read the per-(group,
-        //    finder) Redis key (fallback). A missing Redis snapshot is the
-        //    operator's job — surface a typed error.
+        // 1. Snapshot source: event-carried, else the fingerprint key,
+        //    else the per-(group, finder) key (tests / manual path).
         let snapshot = match snapshot {
             Some(s) => s,
             None => {
                 let mut conn = self.inner.round.connection_for_snapshot();
-                crate::round::snapshot::read_snapshot(
-                    &mut conn,
-                    &group_key,
-                    finder_address.as_str(),
-                )
-                .await?
-                .ok_or(EngineError::SnapshotMissing {
+                let read = match weights_fingerprint.filter(|fp| fp != &[0u8; 32]) {
+                    Some(fp) => {
+                        bp_coinbase_snapshot::resolve_snapshot_for_block_found(
+                            &mut conn,
+                            |fp| crate::round::snapshot::key_for_fingerprint(&group_key, fp),
+                            &fp,
+                            "group-solo",
+                        )
+                        .await?
+                    }
+                    None => {
+                        crate::round::snapshot::read_weight_snapshot(
+                            &mut conn,
+                            &group_key,
+                            finder_address.as_str(),
+                        )
+                        .await?
+                    }
+                };
+                read.ok_or(EngineError::SnapshotMissing {
                     group_id,
                     finder_address: finder_address.as_str().to_string(),
                     block_height,
@@ -762,29 +695,45 @@ impl GroupSoloEngine {
             }
         };
 
-        if snapshot.block_reward_sats != block_reward_sats {
-            warn!(
+        // The one hard gate: a coinbase that pays less than its own
+        // subsidy destroyed money it was entitled to. Nothing healthy
+        // produces that — not mempool drift, not a stale projection
+        // base, not a job-declaring client's own template.
+        let subsidy =
+            bp_share::block_subsidy_sats(block_height, self.inner.config.subsidy_halving_interval);
+        if actual.total_value_sats < subsidy {
+            error!(
                 %group_id,
-                snapshot_reward = snapshot.block_reward_sats,
-                actual_reward = block_reward_sats,
+                subsidy,
+                actual_reward = actual.total_value_sats,
                 block_height,
-                "group-solo snapshot reward mismatch — deleting stale snapshot, caller must retry"
+                "group-solo block coinbase pays less than the block subsidy — refusing to book"
             );
-            let mut conn = self.inner.round.connection_for_snapshot();
-            if let Err(e) = delete_all_for_group(&mut conn, &group_key).await {
-                warn!(%group_id, error = %e, "delete_all_for_group failed during mismatch cleanup");
-            }
-            return Err(EngineError::SnapshotRewardMismatch {
+            return Err(EngineError::RevenueBelowSubsidy {
                 group_id,
-                snapshot_reward: snapshot.block_reward_sats,
-                actual_reward: block_reward_sats,
+                block_height,
+                actual_reward: actual.total_value_sats,
+                subsidy,
             });
         }
+        // Drift off the projection base is an ALARM, not a gate. The
+        // rows below are transcribed from the block's own coinbase, so
+        // they are right at any revenue — the reference is only what the
+        // distribution happened to be built against.
+        if !bp_share::reward_within_band(snapshot.reference_revenue_sats, actual.total_value_sats) {
+            warn!(
+                %group_id,
+                reference_reward = snapshot.reference_revenue_sats,
+                actual_reward = actual.total_value_sats,
+                block_height,
+                "group-solo block revenue far off the distribution's reference — booking it from \
+                 the real coinbase, but the job source is worth a look"
+            );
+        }
 
-        // 2. Resolve the group's payout mode + reset gate from a single row
-        //    read (reused for the mode-aware round read AND the reset decision
-        //    below). A failed read defaults to PROP + no reset (safe: never
-        //    silently wipe accumulated shares, never window-trim blind).
+        // 2. Mode + reset gate (one row read), and the round state for
+        //    the sharesInRound audit fields. Read BEFORE any reset wipes
+        //    it; in Window mode this trims + reads the sliding window.
         let now_ms = chrono::Utc::now().timestamp_millis();
         let (mode, window_ms, reset_on_block) = match find_group(&self.inner.pool, group_id).await {
             Ok(Some(g)) => {
@@ -798,10 +747,6 @@ impl GroupSoloEngine {
                 (PayoutMode::Prop, 0, false)
             }
         };
-
-        // Read current round state for sharesInRound / totalSharesInRound
-        // fields on audit rows (Group-Solo-specific). Done BEFORE any reset
-        // wipes it. In Window mode this trims + reads the sliding window.
         let round_by_addr = self
             .inner
             .round
@@ -810,28 +755,25 @@ impl GroupSoloEngine {
         let total_shares_in_round: f64 = round_by_addr.values().sum();
         let total_shares_i64 = total_shares_in_round.round() as i64;
 
-        let (audit_rows, balance_writes) = self
-            .build_writes_from_snapshot(group_id, &snapshot, &round_by_addr, total_shares_i64)
-            .await?;
+        let audit_rows = history_rows_from_coinbase(
+            group_id,
+            &snapshot,
+            actual,
+            &round_by_addr,
+            total_shares_i64,
+        );
 
-        // 3. Apply the ledger TX.
+        // 3. Write the history, 4. move the round on, 5. drop the
+        //    snapshots this block consumed, 6. drop the build cache.
         let outcome = apply_distribution(
             &self.inner.pool,
             group_id,
             block_height,
             &audit_rows,
-            &balance_writes,
             now_ms,
         )
         .await?;
 
-        // 4. Reset the round. Window-mode groups NEVER block-reset — the
-        //    sliding window self-trims by age, so wiping it would drop the
-        //    continuous "last N days" distribution. PROP groups reset only when
-        //    they opted into per-block reset (`resetRoundOnBlock`); default
-        //    false accumulates across blocks until a calendar/manual reset.
-        //    Variant A preserves `last-accepted-share-at` for inactivity
-        //    tracking. (Mode + flag resolved once in step 2.)
         if mode == PayoutMode::Window {
             info!(%group_id,
                 "group-solo: window mode — no per-block round reset (window self-trims by age)");
@@ -845,11 +787,6 @@ impl GroupSoloEngine {
                  round accumulates until calendar/manual reset");
         }
 
-        // 5. Drop the per-finder snapshots (all stale once the round resets)
-        //    and the ONE payout-list key this block consumed, so a redelivered
-        //    event books nothing instead of booking twice. Every other live
-        //    job keeps its key: a second block found before the next template
-        //    rebuild must still resolve. The rest are bounded by their TTL.
         let mut conn = self.inner.round.connection_for_snapshot();
         if let Err(e) = delete_all_for_group(&mut conn, &group_key).await {
             warn!(
@@ -858,195 +795,100 @@ impl GroupSoloEngine {
                 "delete_all_snapshots_for_group failed — non-fatal, TTL fallback"
             );
         }
-        let applied_fingerprint = payouts_fingerprint_from_parts(
-            snapshot.block_reward_sats,
-            snapshot
-                .distribution
-                .iter()
-                .map(|p| (p.address.as_str(), p.sats.to_i64().max(0) as u64)),
-        );
-        if let Err(e) = delete_snapshot_for(&mut conn, &group_key, &applied_fingerprint).await {
-            warn!(
-                %group_id,
-                error = %e,
-                "delete_snapshot_for failed — non-fatal, TTL fallback"
-            );
+        if let Some(fp) = weights_fingerprint {
+            if let Err(e) = delete_snapshot_for(&mut conn, &group_key, &fp).await {
+                warn!(
+                    %group_id,
+                    error = %e,
+                    "delete_snapshot_for failed — non-fatal, TTL fallback"
+                );
+            }
         }
-
-        // 6. Drop the distribution cache.
         self.inner.distribution_builder.invalidate_all();
 
         info!(
             %group_id,
             block_height,
             history_inserted = outcome.history_inserted,
-            balances_affected = outcome.balances_affected,
             "group-solo on_block_found applied"
         );
         Ok(outcome)
     }
+}
 
-    async fn build_writes_from_snapshot(
-        &self,
-        group_id: Uuid,
-        snapshot: &ParsedSnapshot,
-        round_by_addr: &HashMap<String, f64>,
-        total_shares_in_round: i64,
-    ) -> Result<(Vec<AuditRow>, Vec<BalanceWrite>), EngineError> {
-        // Pre-load existing balance rows for considered addresses so
-        // we can compute new `totalPaidSats = existing + on_chain`
-        // without N+1 reads. Read ALL rows (incl. `pendingSats = 0`): a
-        // member fully paid on-chain has pending 0, and the pending-filtered
-        // read would hide them, so their lifetime `totalPaidSats` would be
-        // overwritten with the current block instead of accumulated.
-        let existing_rows: Vec<PplnsGroupBalanceRow> =
-            find_all_pplns_group_balances_for_group(&self.inner.pool, group_id).await?;
-        let existing: HashMap<String, PplnsGroupBalanceRow> = existing_rows
-            .into_iter()
-            .map(|r| (r.address.as_str().to_string(), r))
-            .collect();
+/// Transcribe one block's coinbase into payout-history rows.
+///
+/// The amounts come from `actual` — the block's own coinbase — and
+/// nothing else. The snapshot contributes only the fee address (whose
+/// output is the pool's, not a member's) and the member list used to
+/// flag a payment the pool cannot account for. `round_by_addr` supplies
+/// the PROP-round detail the UI shows next to each amount.
+///
+/// One row per paid address. A member the coinbase did not pay gets no
+/// row: under [`bp_pplns::WithheldValue::ToPool`] they are owed nothing,
+/// so there is nothing to record.
+fn history_rows_from_coinbase(
+    group_id: Uuid,
+    snapshot: &bp_coinbase_snapshot::StoredWeightSnapshot,
+    actual: &bp_coinbase_snapshot::ActualCoinbase,
+    round_by_addr: &HashMap<String, f64>,
+    total_shares_in_round: i64,
+) -> Vec<AuditRow> {
+    let t = actual.total_value_sats;
+    let mut rows: Vec<AuditRow> = Vec::new();
 
-        let mut audit_rows: Vec<AuditRow> = Vec::new();
-        let mut balance_writes: Vec<BalanceWrite> = Vec::new();
-        let mut coinbase_addresses: HashSet<String> = HashSet::new();
-
-        // The distribution can name the same address more than once:
-        // Group-Solo emits the finder both as a dedicated bonus output
-        // AND as their proportional share output. Both are valid on-chain
-        // TxOuts, but the ledger keys on (address, groupId) — Postgres
-        // rejects a second ON CONFLICT hit for the same key in one upsert,
-        // and the history table's (groupId, blockHeight, address) UNIQUE
-        // would silently drop the duplicate. Merge per-address (summing
-        // sats + percent) so each address yields exactly one audit +
-        // balance write. Order is kept stable for deterministic output.
-        let mut order: Vec<String> = Vec::new();
-        let mut merged: HashMap<String, CoinbaseDistributionEntry> = HashMap::new();
-        for entry in &snapshot.distribution {
-            let addr_str = entry.address.as_str().to_string();
-            match merged.get_mut(&addr_str) {
-                Some(acc) => {
-                    acc.sats = Sats(acc.sats.0 + entry.sats.0);
-                    acc.percent += entry.percent;
-                }
-                None => {
-                    order.push(addr_str.clone());
-                    merged.insert(addr_str, entry.clone());
-                }
-            }
+    for (addr_str, paid) in &actual.paid_by_address {
+        if *paid == 0 || *addr_str == snapshot.fee_address {
+            // The pool output is the pool's fee plus whatever the
+            // distribution withheld. It is not a member payout and does
+            // not belong in a member's payout history.
+            continue;
         }
-
-        for addr_str in &order {
-            let entry = &merged[addr_str];
-            let shares_in_round = round_by_addr
-                .get(addr_str)
-                .map(|f| f.round() as i64)
-                .unwrap_or(0);
-            audit_rows.push(coinbase_row(entry, shares_in_round, total_shares_in_round));
-            coinbase_addresses.insert(addr_str.clone());
-
-            let new_balance = Self::resolve_new_balance(group_id, snapshot, &existing, addr_str);
-            let prev_total_paid = existing
-                .get(addr_str)
-                .map(|r| r.total_paid_sats.0)
-                .unwrap_or(0);
-            balance_writes.push(BalanceWrite {
-                address: entry.address.clone(),
-                pending_sats: Sats(new_balance),
-                total_paid_sats: Sats(prev_total_paid + entry.sats.0),
-            });
-        }
-
-        // Pending rows: balance_after entries that didn't get a
-        // coinbase output (sub-dust accumulators).
-        for addr_str in snapshot.balance_after.keys() {
-            if coinbase_addresses.contains(addr_str) {
-                continue;
-            }
-            let addr_id = AddressId::new(addr_str.clone())?;
-            let prev_balance = existing
-                .get(addr_str)
-                .map(|r| r.pending_sats.0)
-                .unwrap_or(0);
-            let resolved = Self::resolve_new_balance(group_id, snapshot, &existing, addr_str);
-            audit_rows.push(pending_row(addr_id.clone(), Sats(resolved - prev_balance)));
-
-            let prev_total_paid = existing
-                .get(addr_str)
-                .map(|r| r.total_paid_sats.0)
-                .unwrap_or(0);
-            balance_writes.push(BalanceWrite {
-                address: addr_id,
-                pending_sats: Sats(resolved),
-                total_paid_sats: Sats(prev_total_paid),
-            });
-        }
-
-        Ok((audit_rows, balance_writes))
-    }
-
-    /// The `pendingSats` this distribution intends for `address`.
-    ///
-    /// The snapshot is built when the job is issued and applied when a block is
-    /// found on it — under the confirmation gate that is hours later. Anything
-    /// that moved the ledger in between (a kick redistribution, a dust sweep,
-    /// another block of the same group) must survive, so when the snapshot
-    /// recorded the state it was computed against, apply the DELTA it intends
-    /// to the CURRENT row rather than its absolute.
-    ///
-    /// **Clamped at zero.** Group-Solo is the unsigned model — the distributor
-    /// runs with `suppress_matching_debits`, `balance_after` is documented as
-    /// never negative, and the column carries no constraint that would stop a
-    /// negative from being stored. A member whose credit was absorbed by the
-    /// dust sweep, or redistributed away by a kick, after the job was built has
-    /// `current < before`, and the raw delta would push them below zero. That
-    /// would be a debit, which the next build would fold into
-    /// `target = raw_fair + balance_old` and quietly reduce their next payout —
-    /// signed-ledger behaviour in the one payout mode designed without it. The
-    /// chain paid them more than the books can express; the books say zero and
-    /// the log says why.
-    ///
-    /// Falls back to the absolute for snapshots written before `balance_before`
-    /// existed — same behaviour as before, no worse.
-    fn resolve_new_balance(
-        group_id: Uuid,
-        snapshot: &ParsedSnapshot,
-        existing: &HashMap<String, PplnsGroupBalanceRow>,
-        address: &str,
-    ) -> i64 {
-        let current = existing.get(address).map(|r| r.pending_sats.0).unwrap_or(0);
-        let Some(after) = snapshot.balance_after.get(address).copied() else {
-            // Not in balance_after → this distribution does not change it.
-            return current;
-        };
-        let Some(before) = snapshot.balance_before.get(address).copied() else {
-            return after;
-        };
-        let resolved = current + (after - before);
-        if resolved < 0 {
+        let Ok(address) = AddressId::new(addr_str.clone()) else {
             warn!(
                 %group_id,
-                address,
-                current,
-                snapshot_before = before,
-                snapshot_after = after,
-                "group-solo: this block's coinbase paid an address more credit than it still \
-                 holds (swept or redistributed since the job was built) — booking 0 rather than \
-                 a debit the unsigned model cannot carry"
+                address = %addr_str,
+                paid,
+                "group-solo history: coinbase paid an unparseable address — skipping the row"
             );
-            return 0;
+            continue;
+        };
+        if !snapshot.entries.iter().any(|e| &e.address == addr_str) {
+            // Cannot happen for value outputs under positional
+            // validation. Record it anyway — the chain paid it, so the
+            // history has to show it — but say so loudly.
+            warn!(
+                %group_id,
+                address = %addr_str,
+                paid,
+                "group-solo history: coinbase paid an address outside the distribution"
+            );
         }
-        resolved
+        rows.push(AuditRow {
+            address,
+            paid_sats: Sats(*paid as i64),
+            percent: if t > 0 {
+                (*paid as f64 / t as f64 * 100.0) as f32
+            } else {
+                0.0
+            },
+            shares_in_round: round_by_addr
+                .get(addr_str)
+                .map(|f| f.round() as i64)
+                .unwrap_or(0),
+            total_shares_in_round,
+            row_type: GroupPayoutRowType::Coinbase,
+        });
     }
 
-    /// Run one manual dust-sweep tick.
-    pub async fn manual_sweep(&self) -> Result<SweepStats, EngineError> {
-        self.inner
-            .sweep_runner
-            .sweep()
-            .await
-            .map_err(EngineError::from)
-    }
+    // `paid_by_address` iterates a map; the history table is keyed
+    // `(groupId, blockHeight, address)` and a caller comparing two runs
+    // should see the same order.
+    rows.sort_by(|a, b| a.address.as_str().cmp(b.address.as_str()));
+    rows
+}
 
+impl GroupSoloEngine {
     /// Manually trigger a scheduled reset for `group_id`. Returns
     /// `Ok(true)` if the reset fired, `Ok(false)` if it was
     /// debounce-skipped or custom-elapsed-gated.
@@ -1151,88 +993,6 @@ const _SHUTDOWN_HOOK_DOC: Duration = Duration::from_secs(0);
 mod tests {
     use super::*;
 
-    fn snapshot_with(after: &[(&str, i64)], before: &[(&str, i64)]) -> ParsedSnapshot {
-        ParsedSnapshot {
-            distribution: vec![],
-            block_reward_sats: 312_500_000,
-            considered_addresses: HashSet::new(),
-            balance_after: after.iter().map(|(a, v)| ((*a).to_string(), *v)).collect(),
-            balance_before: before.iter().map(|(a, v)| ((*a).to_string(), *v)).collect(),
-        }
-    }
-
-    fn existing_with(rows: &[(&str, i64)]) -> HashMap<String, PplnsGroupBalanceRow> {
-        rows.iter()
-            .map(|(a, v)| {
-                (
-                    (*a).to_string(),
-                    PplnsGroupBalanceRow {
-                        group_id: Uuid::nil(),
-                        address: AddressId::new((*a).to_string()).unwrap(),
-                        pending_sats: Sats(*v),
-                        total_paid_sats: Sats(0),
-                        updated_at: 0,
-                        last_accepted_share_at: None,
-                    },
-                )
-            })
-            .collect()
-    }
-
-    /// The whole point of `balance_before`: a credit that moved between job
-    /// build and apply must survive, so the block contributes its own movement
-    /// rather than restoring the ledger it was computed against.
-    #[test]
-    fn resolve_new_balance_applies_the_delta_to_the_current_row() {
-        let snap = snapshot_with(&[("bc1qa", 7_000)], &[("bc1qa", 4_000)]);
-        let existing = existing_with(&[("bc1qa", 5_000)]);
-        // +3_000 intended, current is 5_000 → 8_000, NOT the snapshot's 7_000.
-        assert_eq!(
-            GroupSoloEngine::resolve_new_balance(Uuid::nil(), &snap, &existing, "bc1qa"),
-            8_000
-        );
-    }
-
-    /// Group-Solo is the unsigned model. A member whose credit the dust sweep
-    /// absorbed (or a kick redistributed) after the job was built has
-    /// `current < before`, and the raw delta would leave them holding a debit
-    /// the next distribution would silently deduct from.
-    #[test]
-    fn resolve_new_balance_never_goes_negative() {
-        let snap = snapshot_with(&[("bc1qa", 0)], &[("bc1qa", 5_000)]);
-        // The sweep took the 5_000 before this block was applied.
-        let existing = existing_with(&[("bc1qa", 0)]);
-        assert_eq!(
-            GroupSoloEngine::resolve_new_balance(Uuid::nil(), &snap, &existing, "bc1qa"),
-            0,
-            "raw delta would be -5_000"
-        );
-    }
-
-    /// Snapshots written before `balance_before` existed carry none, and must
-    /// keep behaving exactly as they did — absolute.
-    #[test]
-    fn resolve_new_balance_falls_back_to_the_absolute_without_a_before() {
-        let snap = snapshot_with(&[("bc1qa", 7_000)], &[]);
-        let existing = existing_with(&[("bc1qa", 5_000)]);
-        assert_eq!(
-            GroupSoloEngine::resolve_new_balance(Uuid::nil(), &snap, &existing, "bc1qa"),
-            7_000
-        );
-    }
-
-    /// An address the distribution does not touch keeps what it has — the apply
-    /// must not zero a row just because it read it.
-    #[test]
-    fn resolve_new_balance_leaves_untouched_addresses_alone() {
-        let snap = snapshot_with(&[("bc1qa", 7_000)], &[("bc1qa", 4_000)]);
-        let existing = existing_with(&[("bc1qb", 2_500)]);
-        assert_eq!(
-            GroupSoloEngine::resolve_new_balance(Uuid::nil(), &snap, &existing, "bc1qb"),
-            2_500
-        );
-    }
-
     #[test]
     fn engine_error_carries_source_variants() {
         fn _from_db(e: DbError) -> EngineError {
@@ -1242,9 +1002,6 @@ mod tests {
             EngineError::from(e)
         }
         fn _from_ledger(e: LedgerError) -> EngineError {
-            EngineError::from(e)
-        }
-        fn _from_sweep(e: SweepError) -> EngineError {
             EngineError::from(e)
         }
         fn _from_reset(e: ResetError) -> EngineError {
@@ -1307,19 +1064,5 @@ mod tests {
         let s = format!("{e}");
         assert!(s.contains("bc1qfinder"));
         assert!(s.contains("9999"));
-    }
-
-    #[test]
-    fn snapshot_reward_mismatch_carries_both_rewards() {
-        let g = Uuid::new_v4();
-        let e = EngineError::SnapshotRewardMismatch {
-            group_id: g,
-            snapshot_reward: 312_500_000,
-            actual_reward: 300_000_000,
-        };
-        let s = format!("{e}");
-        assert!(s.contains("312500000"), "snapshot reward in message");
-        assert!(s.contains("300000000"), "actual reward in message");
-        assert!(s.contains(&g.to_string()), "group id in message");
     }
 }

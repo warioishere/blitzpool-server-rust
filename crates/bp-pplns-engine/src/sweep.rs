@@ -40,8 +40,9 @@ use std::time::Duration;
 use bp_common::{AddressId, Sats};
 use bp_cron_utils::BlockHeightGen;
 use bp_db::{
-    bulk_insert_pplns_payout_history, delete_pplns_balance, find_pplns_balances_abandoned,
-    update_pplns_balance_sats, DbError, PayoutHistoryInsert, PplnsBalanceRow,
+    bulk_insert_pplns_payout_history, delete_pplns_balance_if_unchanged,
+    find_pplns_balances_abandoned, update_pplns_balance_sats_if_unchanged, DbError,
+    PayoutHistoryInsert, PplnsBalanceRow,
 };
 use chrono::DateTime;
 use chrono::Utc;
@@ -117,8 +118,11 @@ impl<C: Clock> DustSweepRunner<C> {
 
     /// Algorithm split out so tests can feed synthetic candidates
     /// without seeding PG (the integration tests still exercise the
-    /// full PG path).
-    async fn sweep_pairs(
+    /// full PG path). Public for exactly that: an integration test lives
+    /// in its own binary and cannot reach a private item, and the case
+    /// worth testing here — a candidate list that is already stale when
+    /// the pairing runs — is only reachable by supplying the list.
+    pub async fn sweep_pairs(
         &self,
         candidates: Vec<PplnsBalanceRow>,
         now_ms: i64,
@@ -165,6 +169,8 @@ impl<C: Clock> DustSweepRunner<C> {
                 .apply_pair_tx(
                     &credit_addr,
                     &debit_addr,
+                    Sats(credit_balance),
+                    Sats(debit_balance),
                     Sats(new_credit),
                     Sats(new_debit),
                     amount,
@@ -173,7 +179,19 @@ impl<C: Clock> DustSweepRunner<C> {
                 )
                 .await
             {
-                Ok(()) => {
+                // A row moved since the run started — the pair rolled back
+                // whole. Leave both alone; the next run reads fresh values.
+                Ok(false) => {
+                    warn!(
+                        credit = credit_addr.as_str(),
+                        debit = debit_addr.as_str(),
+                        "pplns-sweep: a balance moved since the run started — pair skipped"
+                    );
+                    i += 1;
+                    j += 1;
+                    continue;
+                }
+                Ok(true) => {
                     credits[i].balance_sats = Sats(new_credit);
                     debits[j].balance_sats = Sats(new_debit);
                     stats.pairs_closed += 2;
@@ -213,17 +231,38 @@ impl<C: Clock> DustSweepRunner<C> {
 
     /// One pair-cancel TX: insert 2 audit rows + update-or-delete both
     /// balance rows. Both writes commit or both roll back.
+    ///
+    /// Returns `Ok(false)` when a row no longer holds the value this pair
+    /// was computed from — the whole transaction rolls back and the caller
+    /// leaves the pair alone.
+    ///
+    /// **Why the guard.** `sweep_pairs` reads its candidate set ONCE per
+    /// run and then commits pair by pair, updating only its in-memory
+    /// copy, so its view of every not-yet-processed row is stale from the
+    /// start of the run. Writing the computed absolute anyway would
+    /// silently undo whatever moved the row — and the other writer is the
+    /// block-found settlement, whose balance-only entries ARE this sweep's
+    /// target set (open balance, no recent shares). `amount` also comes
+    /// from that stale read, so a shrunken credit would be driven negative:
+    /// a credit row turned into a debit, which is worse than a lost update.
+    ///
+    /// **Lock order.** Both rows are touched smallest-address-first, the
+    /// same order `bp_db::find_pplns_balances_for_addresses_locked` takes
+    /// them in. Two transactions grabbing the same two rows from opposite
+    /// ends deadlock, and Postgres resolves that by aborting one.
     #[allow(clippy::too_many_arguments)] // scalar args are tightly coupled; grouping struct adds boilerplate
     async fn apply_pair_tx(
         &self,
         credit_addr: &AddressId,
         debit_addr: &AddressId,
+        old_credit: Sats,
+        old_debit: Sats,
         new_credit: Sats,
         new_debit: Sats,
         amount: i64,
         block_height: i32,
         now_ms: i64,
-    ) -> Result<(), SweepError> {
+    ) -> Result<bool, SweepError> {
         let mut tx = self.pool.begin().await?;
 
         bulk_insert_pplns_payout_history(
@@ -249,19 +288,30 @@ impl<C: Clock> DustSweepRunner<C> {
         )
         .await?;
 
-        if new_credit.0 == 0 {
-            delete_pplns_balance(&mut *tx, credit_addr).await?;
-        } else {
-            update_pplns_balance_sats(&mut *tx, credit_addr, new_credit).await?;
-        }
-        if new_debit.0 == 0 {
-            delete_pplns_balance(&mut *tx, debit_addr).await?;
-        } else {
-            update_pplns_balance_sats(&mut *tx, debit_addr, new_debit).await?;
+        // Ascending address order — see the lock-order note above.
+        let mut sides = [
+            (credit_addr, old_credit, new_credit),
+            (debit_addr, old_debit, new_debit),
+        ];
+        sides.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        for (addr, expected, new_balance) in sides {
+            let applied = if new_balance.0 == 0 {
+                delete_pplns_balance_if_unchanged(&mut *tx, addr, expected).await?
+            } else {
+                update_pplns_balance_sats_if_unchanged(&mut *tx, addr, expected, new_balance)
+                    .await?
+            };
+            if !applied {
+                // Someone settled this row since the run started. Roll the
+                // pair back whole — including its two audit rows, which
+                // would otherwise claim a cancel that did not happen.
+                drop(tx);
+                return Ok(false);
+            }
         }
 
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 }
 

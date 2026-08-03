@@ -25,11 +25,9 @@
 
 use std::collections::HashMap;
 
-use bp_common::{AddressId, Sats};
-use bp_pplns::CoinbaseDistributionEntry;
 use bp_pplns_engine::window::{
-    bucket_key, snapshot::StoredSnapshot, NetworkDifficulty, WindowStore, KEY_APPLIED, KEY_BUCKETS,
-    KEY_WINDOW_BY_ADDRESS, KEY_WINDOW_TOTAL,
+    bucket_key, NetworkDifficulty, WindowStore, KEY_APPLIED, KEY_BUCKETS, KEY_WINDOW_BY_ADDRESS,
+    KEY_WINDOW_TOTAL,
 };
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 
@@ -39,6 +37,11 @@ const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
 /// keyspace. Returns `None` (test should skip) if the URL is unreachable.
 async fn connect_or_skip(test_db: u8) -> Option<ConnectionManager> {
     let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+    // Fold this binary's local number into its own DB range — see
+    // `bp_test_support::redis_db`. Without it every binary's 0..15
+    // land on the same 16 databases and FLUSHDB each other mid-run.
+    let test_db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_WINDOW, test_db).await;
     let url = format!("{base}/{test_db}");
     let client = match Client::open(url.clone()) {
         Ok(c) => c,
@@ -233,6 +236,158 @@ async fn trim_window_drops_oldest_over_window_size() {
     assert!((by["bc1q5"] - 1.0).abs() < 1e-9);
 }
 
+// ── The snapshot write is all-or-nothing ────────────────────────────
+//
+// It used to be three round trips — `DEL`, `HSET`, `EXPIRE` — and between the
+// first two the snapshot DID NOT EXIST. That window is the one case
+// `read_weight_snapshot_with_retry` deliberately does not retry: it takes
+// `Ok(None)` at face value because "a genuinely missing snapshot will not
+// appear", which is true of an expired key and false of this one. Both sides
+// run on the front — the template build writes, the Stratum block-found path
+// reads — so a block found in that window is parked with no settlement
+// inputs. A single script closes it.
+//
+// The race itself cannot be pinned in a test that is not flaky; atomicity is
+// structural (one `Script` invocation). What IS deterministic is the reason
+// the `DEL` has to stay inside it, and that is what this asserts: a rewrite
+// with FEWER entries must not leave the longer one's fields behind, or the
+// parser reads a truncated entry list as a longer one.
+
+#[tokio::test]
+async fn rewriting_a_snapshot_with_fewer_entries_leaves_no_stale_fields() {
+    use bp_coinbase_snapshot::{
+        read_weight_snapshot, write_weight_snapshot, StoredWeightSnapshot, WeightSnapshotEntry,
+    };
+
+    let mut conn = match connect_or_skip(14).await {
+        Some(c) => c,
+        None => return,
+    };
+    let key = "pplns:snapshot:fp:test_atomic_rewrite";
+    let _: () = conn.del(key).await.unwrap();
+
+    let entry = |addr: &str, score: u64| WeightSnapshotEntry {
+        address: addr.to_string(),
+        score_weight: score,
+        balance_sats: 0,
+        wire_weight: score,
+        dust_limit: 546,
+    };
+    let mut snap = StoredWeightSnapshot {
+        entries: vec![
+            entry("bc1qaaa", 500_000_000_000),
+            entry("bc1qbbb", 300_000_000_000),
+            entry("bc1qccc", 200_000_000_000),
+        ],
+        weight_p: 15_228_426_395,
+        fee_ppm: 15_000,
+        fee_address: "bc1qfee".to_string(),
+        reference_revenue_sats: 312_500_000,
+        score_total: 1_000_000_000_000,
+    };
+    write_weight_snapshot(&mut conn, key, &snap, 600)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_weight_snapshot(&mut conn, key).await.unwrap().as_ref(),
+        Some(&snap)
+    );
+
+    // Rewrite with ONE entry. `e1_*` / `e2_*` must be gone.
+    snap.entries.truncate(1);
+    snap.score_total = 500_000_000_000;
+    write_weight_snapshot(&mut conn, key, &snap, 600)
+        .await
+        .unwrap();
+
+    let back = read_weight_snapshot(&mut conn, key)
+        .await
+        .unwrap()
+        .expect("the rewritten snapshot is readable");
+    assert_eq!(
+        back, snap,
+        "the shorter rewrite must replace the snapshot, not overlay it"
+    );
+    let leftover: Option<String> = conn.hget(key, "e1_addr").await.unwrap();
+    assert!(
+        leftover.is_none(),
+        "field from the longer snapshot survived: {leftover:?} — with entry_count \
+         back at 1 the parser would not read it, but the next LONGER rewrite \
+         would inherit it"
+    );
+    // And the TTL landed, or the key would outlive its job forever.
+    let ttl: i64 = conn.ttl(key).await.unwrap();
+    assert!(ttl > 0 && ttl <= 600, "ttl = {ttl}");
+
+    let _: () = conn.del(key).await.unwrap();
+}
+
+// ── An aggregate/bucket skew must not leave a NEGATIVE window entry ─
+//
+// MONEY. The aggregate is a sum of non-negative difficulties, so a trim can
+// only decrement past zero if a bucket holds more for an address than the
+// aggregate ever received. The `DUMP`-per-key Redis backup produces exactly
+// that: it captures `window:by-address` and the `bucket:*` hashes at
+// DIFFERENT instants, so a restore can hand the trim a bucket that is ahead
+// of the aggregate.
+//
+// The old trim only `HDEL`ed a field within 1e-9 of zero, so a materially
+// negative one was left sitting there — and `read_window_by_address` filters
+// `diff > 0`, which drops that address out of the window ENTIRELY. Silently
+// unpaid until it earns its way back in. The field is removed either way now
+// (a negative is unpayable), but the trim counts the underflows so the
+// operator hears about the skew instead of it passing as a clean trim.
+
+#[tokio::test]
+async fn a_bucket_ahead_of_the_aggregate_does_not_strand_a_negative_entry() {
+    let mut conn = match connect_or_skip(13).await {
+        Some(c) => c,
+        None => return,
+    };
+    // window_size = 4.0 × 1.0 = 4.0, one share per bucket.
+    let (store, _) = make_store(conn.clone(), 1.0, 1);
+
+    for i in 1..=4 {
+        store
+            .record_share(None, &format!("bc1q{i}"), 1.0, 1_700_000_000_000 + i)
+            .await
+            .unwrap();
+    }
+    // Forge the restore skew: the aggregate holds LESS for bc1q1 than its
+    // bucket does. This is the state a per-key restore can produce.
+    let _: () = conn
+        .hset(KEY_WINDOW_BY_ADDRESS, "bc1q1", "0.25")
+        .await
+        .unwrap();
+    let before = store.read_window_by_address().await.unwrap();
+    assert!(
+        (before["bc1q1"] - 0.25).abs() < 1e-9,
+        "precondition: the aggregate must be BEHIND the bucket's 1.0"
+    );
+
+    // A fifth share pushes the window over and trims bc1q1's bucket, whose
+    // 1.0 exceeds the 0.25 the aggregate holds.
+    store
+        .record_share(None, "bc1q5", 1.0, 1_700_000_000_005)
+        .await
+        .unwrap();
+
+    // The field must be GONE, not sitting at -0.75.
+    let raw: Option<String> = conn.hget(KEY_WINDOW_BY_ADDRESS, "bc1q1").await.unwrap();
+    assert!(
+        raw.is_none(),
+        "the underflowed entry must be removed, found {raw:?} — a negative field \
+         reads as absent to the payout path anyway, so leaving it only hides the skew"
+    );
+    let by = store.read_window_by_address().await.unwrap();
+    assert!(!by.contains_key("bc1q1"));
+    // And the trim did not take anyone else down with it.
+    assert!(
+        (by["bc1q5"] - 1.0).abs() < 1e-9,
+        "the fresh share survives: {by:?}"
+    );
+}
+
 // ── Test 5 — read_window_by_address falls back to summing buckets ───
 
 #[tokio::test]
@@ -290,66 +445,6 @@ async fn record_share_with_zero_network_difficulty_does_not_trim() {
         (total - 10.0).abs() < 1e-9,
         "no shares trimmed, total={total}"
     );
-}
-
-// ── Test 7 — snapshot roundtrip ─────────────────────────────────────
-
-#[tokio::test]
-async fn snapshot_roundtrip_via_window_store() {
-    let conn = match connect_or_skip(6).await {
-        Some(c) => c,
-        None => return,
-    };
-    let (store, _) = make_store(conn, 1_000_000.0, 10_000);
-
-    let addr_a = AddressId::new("bc1qcredit0000000000000000000000").unwrap();
-    let addr_b = AddressId::new("bc1qdebit00000000000000000000000".to_string()).unwrap();
-
-    let snapshot = StoredSnapshot {
-        balance_before: Vec::new(),
-        distribution: vec![
-            CoinbaseDistributionEntry {
-                address: addr_a.clone(),
-                percent: 60.0,
-                sats: Sats(187_500_000),
-            },
-            CoinbaseDistributionEntry {
-                address: addr_b.clone(),
-                percent: 40.0,
-                sats: Sats(125_000_000),
-            },
-        ],
-        block_reward_sats: 312_500_000,
-        considered_addresses: vec![
-            "bc1qcredit0000000000000000000000".to_string(),
-            "bc1qdebit00000000000000000000000".to_string(),
-            "bc1qlatearrival00000000000000000".to_string(),
-        ],
-        balance_after: vec![
-            ("bc1qcredit0000000000000000000000".to_string(), 5_000),
-            ("bc1qdebit00000000000000000000000".to_string(), -5_000),
-        ],
-    };
-
-    store.write_snapshot(&snapshot, 60).await.expect("write ok");
-
-    let parsed = store
-        .read_snapshot()
-        .await
-        .expect("read ok")
-        .expect("snapshot present");
-
-    assert_eq!(parsed.block_reward_sats, 312_500_000);
-    assert_eq!(parsed.distribution.len(), 2);
-    assert_eq!(parsed.distribution[0].sats.0, 187_500_000);
-    assert_eq!(parsed.distribution[1].sats.0, 125_000_000);
-    assert_eq!(parsed.considered_addresses.len(), 3);
-    let credit = parsed.balance_after["bc1qcredit0000000000000000000000"];
-    let debit = parsed.balance_after["bc1qdebit00000000000000000000000"];
-    assert_eq!(credit + debit, 0, "signed-ledger pair must sum to zero");
-
-    store.delete_snapshot().await.expect("delete ok");
-    assert!(store.read_snapshot().await.unwrap().is_none());
 }
 
 // ── Test 8 — incremental aggregate stays in sync with the buckets ───
@@ -621,5 +716,166 @@ async fn bucketed_window_matches_exact_per_share_window() {
     assert!(
         max_pct_diff < 1.0,
         "proportion drift {max_pct_diff} pct points too large"
+    );
+}
+
+// ── Test 13 + 14 — bucket_shares is not a live knob ──────────────────
+//
+// The bucket id is `floor(pplns:counter / bucket_shares)` over a counter
+// nothing resets, so the divisor decides where new work lands relative to
+// the buckets already in the FIFO index. These two pin both directions, so
+// the doc on `WindowStore::bucket_shares` is an executable claim and not a
+// comment: raising it strands new shares BELOW the live set (where the trim
+// eats them), lowering it does not.
+
+/// Fill a window until the trim is active and several buckets are live,
+/// then return the live bucket ids.
+async fn fill_until_trimming(
+    conn: &mut ConnectionManager,
+    store: &WindowStore,
+    shares: usize,
+) -> Vec<i64> {
+    for i in 0..shares {
+        store
+            .record_share(None, "bc1qfiller", 100.0, 1_700_000_000_000 + i as u64)
+            .await
+            .unwrap();
+    }
+    let ids: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    let ids: Vec<i64> = ids.iter().map(|s| s.parse().unwrap()).collect();
+    assert!(
+        ids.len() > 1 && ids[0] > 0,
+        "precondition: need several live buckets and an already-trimmed head, got {ids:?}"
+    );
+    ids
+}
+
+#[tokio::test]
+async fn raising_bucket_shares_strands_new_work_below_the_live_window() {
+    let mut conn = match connect_or_skip(6).await {
+        Some(c) => c,
+        None => return,
+    };
+    // window = 4 × 1250 = 5000, buckets of 10 × diff 100 = 1000 each, so the
+    // live set settles at ~5 buckets while the counter runs to 200.
+    let (store, _) = make_store(conn.clone(), 1250.0, 10);
+    let live = fill_until_trimming(&mut conn, &store, 200).await;
+    let live_min = *live.first().unwrap();
+    let live_max = *live.last().unwrap();
+
+    // Same Redis, same counter — only the divisor is bigger, as a restart
+    // with an edited config would do.
+    let (raised, raised_nd) = make_store(conn.clone(), 1250.0, 20);
+    let appended = raised
+        .record_share(None, "bc1qvictim", 100.0, 1_700_000_999_000)
+        .await
+        .unwrap();
+    assert!(appended, "must be a real append, not a dedup no-op");
+
+    let new_id = 201 / 20;
+    let index: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    let index: Vec<i64> = index.iter().map(|s| s.parse().unwrap()).collect();
+    assert!(
+        new_id < live_min,
+        "the raised divisor must place the new id below the live set: \
+         {new_id} vs live min {live_min}"
+    );
+    assert_eq!(
+        index.first().copied(),
+        Some(new_id),
+        "the new work must now be the HEAD of the FIFO, index is {index:?}"
+    );
+
+    // That head position is the whole defect. Shrink the window so exactly
+    // one trim fires, and the bucket it takes is the newest work rather than
+    // the oldest — while every bucket from the fill survives.
+    raised_nd.set(100.0);
+    raised
+        .record_share(None, "bc1qvictim", 100.0, 1_700_000_999_001)
+        .await
+        .unwrap();
+
+    let after: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    let after: Vec<i64> = after.iter().map(|s| s.parse().unwrap()).collect();
+    assert!(
+        !after.contains(&new_id),
+        "the trim should have taken the stranded head {new_id}, index is {after:?}"
+    );
+    assert!(
+        after.contains(&live_max),
+        "the OLDER bucket {live_max} must have outlived it, index is {after:?}"
+    );
+    let victim: Option<String> = conn
+        .hget(KEY_WINDOW_BY_ADDRESS, "bc1qvictim")
+        .await
+        .unwrap();
+    assert!(
+        victim.is_none(),
+        "the victim's work must be gone from the aggregate too, found {victim:?}"
+    );
+    let filler: String = conn
+        .hget(KEY_WINDOW_BY_ADDRESS, "bc1qfiller")
+        .await
+        .unwrap();
+    assert!(
+        filler.parse::<f64>().unwrap() > 0.0,
+        "the filler's older work must still count, got {filler}"
+    );
+}
+
+#[tokio::test]
+async fn lowering_bucket_shares_keeps_new_work_above_the_live_window() {
+    let mut conn = match connect_or_skip(15).await {
+        Some(c) => c,
+        None => return,
+    };
+    // Identical to the test above except for the direction of the change, so
+    // the pair is a control: same fill, same shrink, same two shares.
+    let (store, _) = make_store(conn.clone(), 1250.0, 10);
+    let live = fill_until_trimming(&mut conn, &store, 200).await;
+    let live_min = *live.first().unwrap();
+    let live_max = *live.last().unwrap();
+
+    let (lowered, lowered_nd) = make_store(conn.clone(), 1250.0, 5);
+    let appended = lowered
+        .record_share(None, "bc1qsurvivor", 100.0, 1_700_000_999_000)
+        .await
+        .unwrap();
+    assert!(appended, "must be a real append, not a dedup no-op");
+
+    let new_id = 201 / 5;
+    let index: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    let index: Vec<i64> = index.iter().map(|s| s.parse().unwrap()).collect();
+    assert!(
+        new_id > live_max,
+        "the lowered divisor must place the new id above the live set: \
+         {new_id} vs live max {live_max}"
+    );
+    assert_eq!(
+        index.last().copied(),
+        Some(new_id),
+        "the new work must be the TAIL of the FIFO, index is {index:?}"
+    );
+
+    lowered_nd.set(100.0);
+    lowered
+        .record_share(None, "bc1qsurvivor", 100.0, 1_700_000_999_001)
+        .await
+        .unwrap();
+
+    let after: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    let after: Vec<i64> = after.iter().map(|s| s.parse().unwrap()).collect();
+    assert!(
+        !after.contains(&live_min),
+        "the trim should have taken the genuinely OLDEST bucket {live_min}, \
+         index is {after:?}"
+    );
+    let survivor: String = conn
+        .hget(KEY_WINDOW_BY_ADDRESS, "bc1qsurvivor")
+        .await
+        .unwrap();
+    assert!(
+        (survivor.parse::<f64>().unwrap() - 200.0).abs() < 1e-9,
+        "the same two shares must still count here, got {survivor}"
     );
 }

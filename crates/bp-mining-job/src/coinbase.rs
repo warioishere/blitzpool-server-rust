@@ -49,15 +49,54 @@ impl PayoutEntry {
     }
 }
 
-/// Identity of the payout list a coinbase was built from — the
-/// [`PayoutEntry`] form of [`bp_share::payouts_fingerprint_from_parts`],
-/// where the encoding and the rationale live. `block_reward_sats` is the
-/// reward the list was distributed over (the template's coinbase value).
-pub fn payouts_fingerprint(block_reward_sats: u64, payouts: &[PayoutEntry]) -> [u8; 32] {
-    bp_share::payouts_fingerprint_from_parts(
-        block_reward_sats,
-        payouts.iter().map(|p| (p.address.as_str(), p.sats)),
-    )
+/// A resolved payout list plus the identity of the distribution it was
+/// derived from — what a `PayoutResolver` hands the job build.
+///
+/// Under the weight model the fingerprint is a property of the
+/// DISTRIBUTION (settlement inputs), not of the concrete satoshi list:
+/// the same distribution yields different sats at different template
+/// revenues, and they all settle through one snapshot. It therefore
+/// travels WITH the entries instead of being derived from them.
+/// A zeroed fingerprint means "books without a snapshot" (Solo /
+/// Blockparty, which settle by their own recompute paths).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPayouts {
+    pub entries: Vec<PayoutEntry>,
+    pub payouts_fingerprint: [u8; 32],
+}
+
+impl ResolvedPayouts {
+    /// A list that books without a settlement snapshot (zeroed
+    /// fingerprint): Solo and Blockparty, plus every fallback path.
+    pub fn unsnapshotted(entries: Vec<PayoutEntry>) -> Self {
+        Self {
+            entries,
+            payouts_fingerprint: [0u8; 32],
+        }
+    }
+
+    /// **No payout list at all — serve no job.**
+    ///
+    /// The answer for a mode whose distribution could not be built. The
+    /// alternative a resolver reaches for is a solo list, and for PPLNS or
+    /// Group-Solo that is not a degraded answer but a wrong one: it pays
+    /// the whole block to whichever miner happened to connect, so a
+    /// transient Postgres or Redis fault would cost every OTHER miner the
+    /// block. Withholding the job costs the one miner some hashing time
+    /// and nobody else anything.
+    ///
+    /// Both protocols already read an empty list this way: SV1's
+    /// `build_notify_for_template` sends no `mining.notify`, SV2's
+    /// `resolve_template_mining_job_inputs` yields no job inputs. The
+    /// miner keeps hashing whatever job it holds.
+    pub fn none() -> Self {
+        Self::unsnapshotted(Vec::new())
+    }
+
+    /// Is this "serve no job"?
+    pub fn is_none(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// The block-template fields needed for coinbase construction.
@@ -220,12 +259,21 @@ pub enum MiningJobError {
 /// and a non-final `nSequence` (`0xfffffffe`). The TDP path
 /// ([`build_mining_job_from_tdp`]) instead passes through Core's
 /// `NewTemplate` values, which a BIP-54-aware node already sets compliantly.
+///
+/// `payouts_fingerprint` identifies the DISTRIBUTION this coinbase was
+/// built from, so a block found on it can be settled against the right
+/// snapshot. It is passed in rather than derived: the same distribution
+/// legitimately yields different satoshi vectors at different template
+/// revenues, so nothing about the concrete payout list identifies it.
+/// `[0u8; 32]` means "no settlement behind this job" — what a caller
+/// that only wants the coinbase bytes (a preview) passes.
 pub fn build_mining_job(
     network: Network,
     payouts: &[PayoutEntry],
     template: &CoinbaseTemplate,
     pool_identifier: &str,
     extranonce_slot_size: usize,
+    payouts_fingerprint: [u8; 32],
 ) -> Result<MiningJob, MiningJobError> {
     if payouts.is_empty() {
         return Err(MiningJobError::NoPayouts);
@@ -276,7 +324,7 @@ pub fn build_mining_job(
         coinbase_suffix,
         coinbase_prefix_hex,
         coinbase_suffix_hex,
-        payouts_fingerprint: payouts_fingerprint(template.coinbase_value_sats, payouts),
+        payouts_fingerprint,
     })
 }
 
@@ -343,6 +391,7 @@ pub fn build_mining_job_from_tdp(
     template: &TdpCoinbaseTemplate<'_>,
     pool_identifier: &str,
     extranonce_slot_size: usize,
+    payouts_fingerprint: [u8; 32],
 ) -> Result<MiningJob, MiningJobError> {
     if payouts.is_empty() {
         return Err(MiningJobError::NoPayouts);
@@ -366,7 +415,7 @@ pub fn build_mining_job_from_tdp(
         &payout_outputs,
         template,
         extranonce_slot_size,
-        payouts_fingerprint(template.coinbase_tx_value_remaining, payouts),
+        payouts_fingerprint,
     ))
 }
 
@@ -623,109 +672,6 @@ fn encode_varint(buf: &mut Vec<u8>, n: u64) {
     }
 }
 
-#[cfg(test)]
-mod fingerprint_tests {
-    use super::*;
-
-    fn entry(address: &str, sats: u64) -> PayoutEntry {
-        PayoutEntry {
-            address: address.to_string(),
-            sats,
-        }
-    }
-
-    const REWARD: u64 = 100_000;
-
-    #[test]
-    fn same_payout_list_yields_same_fingerprint() {
-        let a = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
-        let b = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
-        assert_eq!(
-            payouts_fingerprint(REWARD, &a),
-            payouts_fingerprint(REWARD, &b)
-        );
-    }
-
-    /// Two builds at different rewards must never share a snapshot key,
-    /// however similar their payout lists. Reachable whenever a list does
-    /// not imply its reward — an empty one, or one leaving sats unclaimed.
-    #[test]
-    fn a_different_reward_changes_the_fingerprint() {
-        let payouts = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
-        assert_ne!(
-            payouts_fingerprint(REWARD, &payouts),
-            payouts_fingerprint(REWARD + 1, &payouts)
-        );
-        let empty: Vec<PayoutEntry> = Vec::new();
-        assert_ne!(
-            payouts_fingerprint(REWARD, &empty),
-            payouts_fingerprint(REWARD + 1, &empty)
-        );
-    }
-
-    /// Coinbase output order is part of what was mined, so it is part of the
-    /// identity — the same amounts in a different order are a different
-    /// coinbase and must not share a snapshot.
-    #[test]
-    fn order_changes_the_fingerprint() {
-        let a = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
-        let b = vec![entry("bc1qbob", 40_000), entry("bc1qalice", 60_000)];
-        assert_ne!(
-            payouts_fingerprint(REWARD, &a),
-            payouts_fingerprint(REWARD, &b)
-        );
-    }
-
-    /// A single satoshi of drift is a different distribution — this is the
-    /// case that separates a stale snapshot from the live one.
-    #[test]
-    fn one_sat_difference_changes_the_fingerprint() {
-        let a = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
-        let b = vec![entry("bc1qalice", 60_001), entry("bc1qbob", 39_999)];
-        assert_ne!(
-            payouts_fingerprint(REWARD, &a),
-            payouts_fingerprint(REWARD, &b)
-        );
-    }
-
-    /// The length prefix is what stops two adjacent addresses from aliasing
-    /// against a differently-split pair with the same concatenation.
-    #[test]
-    fn address_boundaries_cannot_alias() {
-        let a = vec![entry("ab", 1), entry("c", 1)];
-        let b = vec![entry("a", 1), entry("bc", 1)];
-        assert_ne!(
-            payouts_fingerprint(REWARD, &a),
-            payouts_fingerprint(REWARD, &b)
-        );
-    }
-
-    #[test]
-    fn empty_list_is_stable_and_distinct_from_a_zero_payout() {
-        let empty: Vec<PayoutEntry> = Vec::new();
-        assert_eq!(
-            payouts_fingerprint(REWARD, &empty),
-            payouts_fingerprint(REWARD, &[])
-        );
-        assert_ne!(
-            payouts_fingerprint(REWARD, &empty),
-            payouts_fingerprint(REWARD, &[entry("", 0)])
-        );
-    }
-
-    /// The two entry points must agree byte-for-byte — the write side hashes
-    /// the distributor's entries, the job side hashes `PayoutEntry`s.
-    #[test]
-    fn parts_entry_point_matches_the_slice_entry_point() {
-        let payouts = vec![entry("bc1qalice", 60_000), entry("bc1qbob", 40_000)];
-        let from_parts = bp_share::payouts_fingerprint_from_parts(
-            REWARD,
-            payouts.iter().map(|p| (p.address.as_str(), p.sats)),
-        );
-        assert_eq!(payouts_fingerprint(REWARD, &payouts), from_parts);
-    }
-}
-
 /// [`bp_stratum_v1::client::solo_payouts`]'s inputs).
 #[derive(Clone, Debug)]
 pub struct SoloFeeConfig {
@@ -871,7 +817,14 @@ mod tests {
     fn build_rejects_empty_payouts() {
         let template = template_with_height(100);
         assert!(matches!(
-            build_mining_job(Network::Bitcoin, &[], &template, "BP", EXTRANONCE_SLOT_LEN),
+            build_mining_job(
+                Network::Bitcoin,
+                &[],
+                &template,
+                "BP",
+                EXTRANONCE_SLOT_LEN,
+                [0u8; 32]
+            ),
             Err(MiningJobError::NoPayouts)
         ));
     }
@@ -886,6 +839,7 @@ mod tests {
             &template,
             "Blitzpool",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
         assert!(!job.coinbase_prefix().is_empty());
@@ -902,6 +856,7 @@ mod tests {
             &template,
             "Blitzpool",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -922,6 +877,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -965,6 +921,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1036,6 +993,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1067,6 +1025,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1108,6 +1067,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1145,6 +1105,7 @@ mod tests {
             &template,
             &long_id,
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1235,7 +1196,8 @@ mod tests {
             coinbase_tx_locktime: 42,
         };
         let job =
-            build_mining_job_from_tdp(Network::Bitcoin, &payouts, &template, "BP", slot).unwrap();
+            build_mining_job_from_tdp(Network::Bitcoin, &payouts, &template, "BP", slot, [0u8; 32])
+                .unwrap();
 
         // Reference oracle = the pre-refactor "build full, then slice" path.
         let script_sig = checked_tdp_scriptsig(template.coinbase_prefix, "BP", slot).unwrap();
@@ -1304,7 +1266,14 @@ mod tests {
             coinbase_tx_locktime: 0,
         };
         assert!(matches!(
-            build_mining_job_from_tdp(Network::Bitcoin, &[], &template, "BP", EXTRANONCE_SLOT_LEN),
+            build_mining_job_from_tdp(
+                Network::Bitcoin,
+                &[],
+                &template,
+                "BP",
+                EXTRANONCE_SLOT_LEN,
+                [0u8; 32]
+            ),
             Err(MiningJobError::NoPayouts)
         ));
     }
@@ -1328,6 +1297,7 @@ mod tests {
             &template,
             "Blitzpool",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1379,6 +1349,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1423,6 +1394,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1465,6 +1437,7 @@ mod tests {
             &template,
             &long_id,
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .expect("must succeed by dropping the identifier");
 
@@ -1501,6 +1474,7 @@ mod tests {
             &template,
             "Blitzpool",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1535,6 +1509,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1566,6 +1541,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 
@@ -1611,6 +1587,7 @@ mod tests {
             &template,
             "BP",
             EXTRANONCE_SLOT_LEN,
+            [0u8; 32],
         )
         .unwrap();
 

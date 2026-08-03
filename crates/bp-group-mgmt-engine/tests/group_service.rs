@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bp_common::{AddressId, Sats};
+use bp_common::AddressId;
 use bp_db::PatchField;
 use bp_group_mgmt::group::{PayoutMode, RoundResetPreset};
 use bp_group_mgmt_engine::{
@@ -24,6 +24,11 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
+
+/// Coinbase member ceiling for tests that are not about the ceiling —
+/// high enough to stay out of the way. The cap itself is exercised by
+/// the dedicated tests below.
+const TEST_COINBASE_CAP: u64 = 10_000;
 
 async fn connect_or_skip() -> Option<PgPool> {
     let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
@@ -55,17 +60,15 @@ struct TestHooksState {
     member_removed: Vec<(Uuid, String, Vec<String>)>,
     group_dissolved: Vec<Uuid>,
     round_reset_applied: Vec<Uuid>,
-    min_payout: i64,
 }
 
 #[derive(Clone, Default, Debug)]
 struct TestHooks(Arc<Mutex<TestHooksState>>);
 
 impl TestHooks {
-    fn new(min_payout: i64, last_active: Option<i64>) -> Self {
+    fn new(last_active: Option<i64>) -> Self {
         Self(Arc::new(Mutex::new(TestHooksState {
             last_active,
-            min_payout,
             ..Default::default()
         })))
     }
@@ -76,7 +79,6 @@ impl TestHooks {
             member_removed: g.member_removed.clone(),
             group_dissolved: g.group_dissolved.clone(),
             round_reset_applied: g.round_reset_applied.clone(),
-            min_payout: g.min_payout,
         }
     }
 }
@@ -85,9 +87,6 @@ impl TestHooks {
 impl GroupServiceHooks for TestHooks {
     async fn last_active_for_member(&self, _group_id: Uuid, _address: &AddressId) -> Option<i64> {
         self.0.lock().unwrap().last_active
-    }
-    fn min_payout_sats(&self) -> Sats {
-        Sats(self.0.lock().unwrap().min_payout)
     }
     async fn on_member_removed(&self, group_id: Uuid, kicked: &AddressId, remaining: &[AddressId]) {
         self.0.lock().unwrap().member_removed.push((
@@ -123,8 +122,8 @@ async fn create_group_happy_path_returns_token_and_seeds_creator() {
         Some(p) => p,
         None => return,
     };
-    let hooks = TestHooks::new(1000, None);
-    let svc = GroupService::new(pool.clone(), Arc::new(hooks.clone()), 14);
+    let hooks = TestHooks::new(None);
+    let svc = GroupService::new(pool.clone(), Arc::new(hooks.clone()), 14, TEST_COINBASE_CAP);
     let name = format!("test-create-{}", Uuid::new_v4());
     let creator = format!("bc1qcreator{}", Uuid::new_v4().simple());
     let result = svc.create_group(&name, &creator).await.expect("create");
@@ -146,8 +145,8 @@ async fn create_group_defaults_to_prop_mode() {
         Some(p) => p,
         None => return,
     };
-    let hooks = TestHooks::new(1000, None);
-    let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14);
+    let hooks = TestHooks::new(None);
+    let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14, TEST_COINBASE_CAP);
     let name = format!("test-mode-default-{}", Uuid::new_v4());
     let creator = format!("bc1qpropdef{}", Uuid::new_v4().simple());
     let result = svc.create_group(&name, &creator).await.expect("create");
@@ -162,8 +161,8 @@ async fn create_group_with_window_mode_persists_window() {
         Some(p) => p,
         None => return,
     };
-    let hooks = TestHooks::new(1000, None);
-    let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14);
+    let hooks = TestHooks::new(None);
+    let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14, TEST_COINBASE_CAP);
     let name = format!("test-mode-window-{}", Uuid::new_v4());
     let creator = format!("bc1qwindow{}", Uuid::new_v4().simple());
     let result = svc
@@ -190,7 +189,12 @@ async fn create_group_rejects_invalid_name() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let err = svc
         .create_group("ab", "bc1qx")
         .await
@@ -210,7 +214,12 @@ async fn create_group_rejects_duplicate_name() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let name = format!("dup-{}", Uuid::new_v4());
     let first = svc
         .create_group(&name, &format!("bc1qfirst{}", Uuid::new_v4().simple()))
@@ -230,7 +239,12 @@ async fn create_group_rejects_address_already_in_group() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let shared_addr = format!("bc1qshared{}", Uuid::new_v4().simple());
     let g1 = svc
         .create_group(&format!("a-{}", Uuid::new_v4()), &shared_addr)
@@ -252,7 +266,12 @@ async fn group_active_from_creation_and_stays_after_add() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let creator = format!("bc1qcr{}", Uuid::new_v4().simple());
     let new_member = format!("bc1qnew{}", Uuid::new_v4().simple());
     let g = svc
@@ -280,7 +299,12 @@ async fn add_member_rejects_address_in_other_group() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let g1_creator = format!("bc1qg1cr{}", Uuid::new_v4().simple());
     let g2_creator = format!("bc1qg2cr{}", Uuid::new_v4().simple());
     let shared = format!("bc1qshared{}", Uuid::new_v4().simple());
@@ -312,7 +336,12 @@ async fn require_admin_token_rejects_invalid() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let g = svc
         .create_group(
             &format!("auth-{}", Uuid::new_v4()),
@@ -347,7 +376,12 @@ async fn remove_member_creator_rejected() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let creator = format!("bc1qrmc{}", Uuid::new_v4().simple());
     let g = svc
         .create_group(&format!("rm-{}", Uuid::new_v4()), &creator)
@@ -368,8 +402,13 @@ async fn remove_member_inactivity_guard_then_kick_succeeds() {
         None => return,
     };
     // First with last_active = now (still active): expect StillActive
-    let hooks_active = TestHooks::new(1000, Some(now_ms()));
-    let svc_active = GroupService::new(pool.clone(), Arc::new(hooks_active.clone()), 14);
+    let hooks_active = TestHooks::new(Some(now_ms()));
+    let svc_active = GroupService::new(
+        pool.clone(),
+        Arc::new(hooks_active.clone()),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let creator = format!("bc1qrmkc{}", Uuid::new_v4().simple());
     let target = format!("bc1qrmkt{}", Uuid::new_v4().simple());
     let g = svc_active
@@ -387,8 +426,13 @@ async fn remove_member_inactivity_guard_then_kick_succeeds() {
     assert!(matches!(err, GroupServiceError::MemberStillActive { .. }));
 
     // Now with last_active 30 days ago: kick succeeds.
-    let hooks_old = TestHooks::new(1000, Some(now_ms() - 30 * 86_400_000));
-    let svc_old = GroupService::new(pool.clone(), Arc::new(hooks_old.clone()), 14);
+    let hooks_old = TestHooks::new(Some(now_ms() - 30 * 86_400_000));
+    let svc_old = GroupService::new(
+        pool.clone(),
+        Arc::new(hooks_old.clone()),
+        14,
+        TEST_COINBASE_CAP,
+    );
     svc_old
         .remove_member(g.group.id, &target, Some(&g.admin_token))
         .await
@@ -411,8 +455,8 @@ async fn remove_member_keeps_group_active_down_to_creator() {
         None => return,
     };
     // last_active = 30 days ago so the kick-inactivity guard passes.
-    let hooks = TestHooks::new(1000, Some(now_ms() - 30 * 86_400_000));
-    let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14);
+    let hooks = TestHooks::new(Some(now_ms() - 30 * 86_400_000));
+    let svc = GroupService::new(pool.clone(), Arc::new(hooks), 14, TEST_COINBASE_CAP);
     let creator = format!("bc1qrmact_c{}", Uuid::new_v4().simple());
     let member = format!("bc1qrmact_m{}", Uuid::new_v4().simple());
     let g = svc
@@ -444,7 +488,12 @@ async fn transfer_creator_rotates_role_and_token() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let old_creator = format!("bc1qtcold{}", Uuid::new_v4().simple());
     let new_creator = format!("bc1qtcnew{}", Uuid::new_v4().simple());
     let g = svc
@@ -500,7 +549,12 @@ async fn transfer_creator_rejects_non_member() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let g = svc
         .create_group(
             &format!("tcnm-{}", Uuid::new_v4()),
@@ -525,8 +579,8 @@ async fn update_round_reset_config_applies_and_fires_hook() {
         Some(p) => p,
         None => return,
     };
-    let hooks = TestHooks::new(1000, None);
-    let svc = GroupService::new(pool.clone(), Arc::new(hooks.clone()), 14);
+    let hooks = TestHooks::new(None);
+    let svc = GroupService::new(pool.clone(), Arc::new(hooks.clone()), 14, TEST_COINBASE_CAP);
     let g = svc
         .create_group(
             &format!("rr-{}", Uuid::new_v4()),
@@ -542,7 +596,7 @@ async fn update_round_reset_config_applies_and_fires_hook() {
                 preset: PatchField::Set(RoundResetPreset::Weekly),
                 interval_days: PatchField::Untouched,
                 timezone: PatchField::Set("Europe/Berlin".into()),
-                finder_bonus_sats: PatchField::Set(Sats(50_000)),
+                finder_bonus_ppm: PatchField::Set(160_000),
                 is_public: PatchField::Set(true),
                 reset_round_on_block: PatchField::Untouched,
                 max_members: PatchField::Untouched,
@@ -553,7 +607,7 @@ async fn update_round_reset_config_applies_and_fires_hook() {
         .expect("update");
     assert_eq!(row.round_reset_preset.as_deref(), Some("weekly"));
     assert_eq!(row.round_reset_timezone.as_deref(), Some("Europe/Berlin"));
-    assert_eq!(row.finder_bonus_sats.map(|s| s.to_i64()), Some(50_000));
+    assert_eq!(row.finder_bonus_ppm, Some(160_000));
     assert!(row.is_public);
     let snap = hooks.snapshot();
     assert_eq!(snap.round_reset_applied, vec![g.group.id]);
@@ -566,7 +620,12 @@ async fn update_round_reset_rejects_invalid_timezone() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let g = svc
         .create_group(
             &format!("rrbad-{}", Uuid::new_v4()),
@@ -591,12 +650,17 @@ async fn update_round_reset_rejects_invalid_timezone() {
 }
 
 #[tokio::test]
-async fn update_round_reset_rejects_sub_min_payout_bonus() {
+async fn update_round_reset_rejects_a_bonus_past_the_ppm_cap() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(10_000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let g = svc
         .create_group(
             &format!("rrlow-{}", Uuid::new_v4()),
@@ -608,13 +672,13 @@ async fn update_round_reset_rejects_sub_min_payout_bonus() {
         .update_round_reset_config(
             g.group.id,
             UpdateRoundResetSettings {
-                finder_bonus_sats: PatchField::Set(Sats(100)),
+                finder_bonus_ppm: PatchField::Set(900_000),
                 ..Default::default()
             },
             Some(&g.admin_token),
         )
         .await
-        .expect_err("low bonus");
+        .expect_err("bonus past the ppm cap");
     assert!(matches!(err, GroupServiceError::InvalidBonus));
     cleanup_group(&pool, g.group.id).await;
 }
@@ -627,8 +691,8 @@ async fn dissolve_group_removes_members_and_marks_row() {
         Some(p) => p,
         None => return,
     };
-    let hooks = TestHooks::new(1000, None);
-    let svc = GroupService::new(pool.clone(), Arc::new(hooks.clone()), 14);
+    let hooks = TestHooks::new(None);
+    let svc = GroupService::new(pool.clone(), Arc::new(hooks.clone()), 14, TEST_COINBASE_CAP);
     let g = svc
         .create_group(
             &format!("diss-{}", Uuid::new_v4()),
@@ -668,7 +732,12 @@ async fn address_cache_reflects_membership_changes() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let creator = format!("bc1qcc{}", Uuid::new_v4().simple());
     let cache_addr = AddressId::new(creator.to_lowercase()).unwrap();
     let g = svc
@@ -711,7 +780,12 @@ async fn address_cache_rebuild_skips_invalid_address_member() {
         Some(p) => p,
         None => return,
     };
-    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(1000, None)), 14);
+    let svc = GroupService::new(
+        pool.clone(),
+        Arc::new(TestHooks::new(None)),
+        14,
+        TEST_COINBASE_CAP,
+    );
     let creator = format!("bc1qok{}", Uuid::new_v4().simple());
     let good_addr = AddressId::new(creator.to_lowercase()).unwrap();
     let g = svc
@@ -752,6 +826,138 @@ async fn address_cache_rebuild_skips_invalid_address_member() {
             .await
             .unwrap();
     assert_eq!(cnt, 2, "group should hold the good + the bad member rows");
+
+    cleanup_group(&pool, g.group.id).await;
+}
+
+// ─── coinbase member ceiling ─────────────────────────────────────────────
+//
+// Group-Solo pays every member a coinbase output and carries no ledger to
+// settle what the coinbase could not pay. So the ceiling is not a policy
+// knob: past it the distribution's blockspace cut drops members and they
+// earn nothing for that block, with nothing left to record the difference.
+// These tests pin that the join path — not the UI — is where that is
+// refused.
+
+/// A group with `maxMembers = NULL` is NOT uncapped. The column only ever
+/// expressed the operator's own, tighter limit; the coinbase ceiling
+/// applies regardless, which is what covers every group that predates the
+/// cap without a migration.
+#[tokio::test]
+async fn null_max_members_still_stops_at_the_coinbase_ceiling() {
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    // Ceiling 2: the creator plus exactly one more.
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14, 2);
+    let g = svc
+        .create_group(
+            &format!("cap-null-{}", Uuid::new_v4()),
+            &format!("bc1qcapnull{}", Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("g");
+    assert_eq!(
+        g.group.max_members, None,
+        "precondition: the operator set no limit of their own"
+    );
+
+    svc.add_member_without_admin(g.group.id, &format!("bc1qcapa{}", Uuid::new_v4().simple()))
+        .await
+        .expect("second member fits under a ceiling of 2");
+    let err = svc
+        .add_member_without_admin(g.group.id, &format!("bc1qcapb{}", Uuid::new_v4().simple()))
+        .await
+        .expect_err("third member does not fit in the coinbase");
+    assert!(matches!(err, GroupServiceError::GroupFull));
+
+    cleanup_group(&pool, g.group.id).await;
+}
+
+/// The operator's own `maxMembers` still wins when it is the tighter of
+/// the two — the ceiling raises no limit, it only lowers.
+#[tokio::test]
+async fn operator_max_members_still_binds_below_the_ceiling() {
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14, 50);
+    let g = svc
+        .create_group(
+            &format!("cap-op-{}", Uuid::new_v4()),
+            &format!("bc1qcapop{}", Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("g");
+    svc.update_round_reset_config(
+        g.group.id,
+        UpdateRoundResetSettings {
+            max_members: PatchField::Set(2),
+            ..Default::default()
+        },
+        Some(&g.admin_token),
+    )
+    .await
+    .expect("set a tighter operator cap");
+
+    svc.add_member_without_admin(g.group.id, &format!("bc1qcapc{}", Uuid::new_v4().simple()))
+        .await
+        .expect("second member fits under an operator cap of 2");
+    let err = svc
+        .add_member_without_admin(g.group.id, &format!("bc1qcapd{}", Uuid::new_v4().simple()))
+        .await
+        .expect_err("operator cap reached well below the coinbase ceiling");
+    assert!(matches!(err, GroupServiceError::GroupFull));
+
+    cleanup_group(&pool, g.group.id).await;
+}
+
+/// `maxMembers` used to be validated against a round 100 000. That number
+/// has nothing to do with what a coinbase can pay, so an admin could set a
+/// cap the pool could never honour and only find out on a found block.
+#[tokio::test]
+async fn max_members_above_the_coinbase_ceiling_is_refused() {
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let svc = GroupService::new(pool.clone(), Arc::new(TestHooks::new(None)), 14, 52);
+    let g = svc
+        .create_group(
+            &format!("cap-patch-{}", Uuid::new_v4()),
+            &format!("bc1qcappatch{}", Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("g");
+
+    let err = svc
+        .update_round_reset_config(
+            g.group.id,
+            UpdateRoundResetSettings {
+                max_members: PatchField::Set(53),
+                ..Default::default()
+            },
+            Some(&g.admin_token),
+        )
+        .await
+        .expect_err("one past the ceiling");
+    assert!(matches!(err, GroupServiceError::InvalidMaxMembers));
+
+    // ...and exactly at the ceiling is fine.
+    let row = svc
+        .update_round_reset_config(
+            g.group.id,
+            UpdateRoundResetSettings {
+                max_members: PatchField::Set(52),
+                ..Default::default()
+            },
+            Some(&g.admin_token),
+        )
+        .await
+        .expect("at the ceiling");
+    assert_eq!(row.max_members, Some(52));
 
     cleanup_group(&pool, g.group.id).await;
 }

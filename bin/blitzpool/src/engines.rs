@@ -86,7 +86,6 @@ use crate::boot::FoundationHandles;
 
 /// Long-lived engine + sink aggregate. Phase 7.4 + 7.5 thread this
 /// into the Stratum servers + cron schedules.
-#[allow(dead_code)]
 pub(crate) struct EngineHandles {
     pub(crate) pplns: Option<PplnsEngine>,
     pub(crate) group_solo: GroupSoloEngine,
@@ -224,7 +223,7 @@ async fn spawn_pplns(
         info!("pplns: disabled (no [pplns] table in config)");
         return Ok(None);
     };
-    let engine_cfg = to_pplns_engine_config(toml_cfg)?;
+    let engine_cfg = to_pplns_engine_config(toml_cfg, cfg.network)?;
     let net_diff = bootstrap_network_difficulty(handles).await;
     info!(
         net_diff = %net_diff.get(),
@@ -244,7 +243,25 @@ async fn spawn_pplns(
     Ok(Some(engine))
 }
 
-fn to_pplns_engine_config(cfg: &TomlPplnsConfig) -> Result<PplnsEngineConfig, EngineError> {
+/// Blocks between subsidy halvings for the configured network. The
+/// settlement gate refuses to book a coinbase paying less than the
+/// block's own subsidy, so this has to be the network's real schedule:
+/// regtest halves every 150 blocks, and feeding it the mainnet 210 000
+/// would make every regtest block past height 150 look like it had
+/// burned money and stop the harnesses booking anything.
+fn subsidy_halving_interval(network: bp_config::Network) -> u32 {
+    match network {
+        bp_config::Network::Regtest => bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
+        bp_config::Network::Mainnet
+        | bp_config::Network::Testnet
+        | bp_config::Network::Testnet4 => bp_share::SUBSIDY_HALVING_INTERVAL,
+    }
+}
+
+fn to_pplns_engine_config(
+    cfg: &TomlPplnsConfig,
+    network: bp_config::Network,
+) -> Result<PplnsEngineConfig, EngineError> {
     let fee_address = if cfg.fee_address.trim().is_empty() {
         None
     } else {
@@ -263,6 +280,7 @@ fn to_pplns_engine_config(cfg: &TomlPplnsConfig) -> Result<PplnsEngineConfig, En
         dust_sweep_enabled: cfg.dust_sweep_enabled,
         abandoned_balance_days: cfg.abandoned_balance_days,
         bucket_shares: cfg.bucket_shares,
+        subsidy_halving_interval: subsidy_halving_interval(network),
         ..PplnsEngineConfig::default()
     };
     let validated = base.try_new()?;
@@ -297,13 +315,11 @@ async fn spawn_group_solo(
     let engine_cfg = to_group_solo_engine_config(cfg)?;
     info!(
         fee_percent = engine_cfg.fee_percent,
-        dust_sweep_enabled = engine_cfg.dust_sweep_enabled,
-        core,
-        "group-solo: spawning engine"
+        core, "group-solo: spawning engine"
     );
     let redis = handles.redis.clone();
     let pool = handles.db.pool().clone();
-    // Core runs read-only (no dust-sweep / per-group round-reset crons).
+    // Core runs read-only (no per-group round-reset cron).
     let engine = if core {
         GroupSoloEngine::spawn_core(engine_cfg, redis, pool).await?
     } else {
@@ -328,8 +344,7 @@ fn to_group_solo_engine_config(cfg: &AppConfig) -> Result<GroupSoloEngineConfig,
         // larger than bitcoin-core reserved and rejects the block. Mirrors the
         // PPLNS engine↔default-stream coupling.
         coinbase_weight_budget: cfg.group_fees.coinbase_weight_budget,
-        dust_sweep_enabled: cfg.group_fees.dust_sweep_enabled,
-        dormant_balance_days: cfg.group_fees.dormant_balance_days,
+        subsidy_halving_interval: subsidy_halving_interval(cfg.network),
         // The `min_payout_sats` floor is shared between PPLNS + Group-
         // Solo: both engines read the same value. When `[pplns]` is
         // configured we reuse its value; otherwise the engine's own
@@ -438,7 +453,6 @@ impl BlitzpoolModeGate {
     /// refcount; last-write-wins on the mode itself (a re-authorize
     /// from the same address picks up any membership change since
     /// the previous connection).
-    #[allow(dead_code)]
     pub(crate) fn set_mode(&self, address: &str, result: MiningModeResult) {
         let mut guard = self.inner.lock().expect("mode-gate mutex poisoned");
         guard
@@ -459,7 +473,6 @@ impl BlitzpoolModeGate {
     /// `set_mode`'d is a no-op (defensive — a deregister event for an
     /// unauthorized session shouldn't reach here, but if it does, we
     /// just ignore it).
-    #[allow(dead_code)]
     pub(crate) fn clear_mode(&self, address: &str) {
         let mut guard = self.inner.lock().expect("mode-gate mutex poisoned");
         if let Some(entry) = guard.get_mut(address) {
@@ -749,6 +762,60 @@ mod tests {
     use bp_common::MiningMode;
     use bp_share_stream::AcceptedShareConsumer;
 
+    /// The settlement gate refuses to book a coinbase paying less than
+    /// the block's own subsidy, so this mapping decides whether the
+    /// pool's own regtests can book anything at all: regtest halves
+    /// every 150 blocks, and the harnesses mine well past that. Handing
+    /// the engines the mainnet 210 000 would over-state the subsidy by
+    /// 4× at height 500 and refuse every block they find.
+    #[test]
+    fn regtest_gets_its_own_halving_schedule() {
+        assert_eq!(
+            subsidy_halving_interval(bp_config::Network::Regtest),
+            bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL
+        );
+        for net in [
+            bp_config::Network::Mainnet,
+            bp_config::Network::Testnet,
+            bp_config::Network::Testnet4,
+        ] {
+            assert_eq!(
+                subsidy_halving_interval(net),
+                bp_share::SUBSIDY_HALVING_INTERVAL,
+                "{net:?} shares the mainnet schedule"
+            );
+        }
+        // The concrete consequence, at a height a regtest harness reaches.
+        let regtest = bp_share::block_subsidy_sats(
+            500,
+            subsidy_halving_interval(bp_config::Network::Regtest),
+        );
+        assert_eq!(regtest, 625_000_000, "3 halvings in on regtest");
+        assert!(
+            regtest
+                < bp_share::block_subsidy_sats(
+                    500,
+                    subsidy_halving_interval(bp_config::Network::Mainnet)
+                ),
+            "the mainnet schedule would over-state it and gate the block"
+        );
+    }
+
+    /// Both engines must carry the same schedule — a Group-Solo block
+    /// and a PPLNS block on the same node cannot disagree about what
+    /// their own subsidy was.
+    #[test]
+    fn both_engine_configs_default_to_the_mainnet_schedule() {
+        assert_eq!(
+            PplnsEngineConfig::default().subsidy_halving_interval,
+            bp_share::SUBSIDY_HALVING_INTERVAL
+        );
+        assert_eq!(
+            bp_group_solo_engine::config::GroupSoloEngineConfig::default().subsidy_halving_interval,
+            bp_share::SUBSIDY_HALVING_INTERVAL
+        );
+    }
+
     /// Enough config to reach the engine builders. Deliberately WITHOUT
     /// `[pplns]` — that is the shape under test.
     const NO_PPLNS_CFG: &str = r#"
@@ -938,6 +1005,11 @@ mod tests {
     /// Connect a flushed Redis logical DB, or `None` to skip (Redis
     /// unavailable / CI without services).
     async fn connect_redis_or_skip(db: u8) -> Option<redis::aio::ConnectionManager> {
+        // Fold this binary's local number into its own DB range —
+        // see `bp_test_support::redis_db`. Two binaries both using
+        // 0..15 flush each other mid-run.
+        let db =
+            bp_test_support::redis_db_in_range(bp_test_support::redis_db::BLITZPOOL_BIN, db).await;
         let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
         let client = redis::Client::open(format!("{base}/{db}")).ok()?;
         let mut conn = match tokio::time::timeout(

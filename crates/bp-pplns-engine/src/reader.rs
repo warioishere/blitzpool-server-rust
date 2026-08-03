@@ -273,5 +273,4 @@ impl ReaderView<'_> {
 }
 
 // Silence "unused" if Sats import isn't needed elsewhere.
-#[allow(dead_code)]
 fn _force_sats(_: Sats) {}

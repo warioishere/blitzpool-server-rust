@@ -44,7 +44,6 @@ pub(crate) enum ApiServerError {
 /// Long-lived handle returned by [`spawn`] — drop to cancel the
 /// listener task, or `await` the inner `JoinHandle` to surface a
 /// panic from inside the server.
-#[allow(dead_code)]
 pub(crate) struct ApiServerHandle {
     pub(crate) addr: SocketAddr,
     pub(crate) join: JoinHandle<()>,

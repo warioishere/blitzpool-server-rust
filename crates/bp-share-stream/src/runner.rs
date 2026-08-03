@@ -254,6 +254,11 @@ mod tests {
     }
 
     async fn connect_or_skip(db: u8) -> Option<ConnectionManager> {
+        // Fold this binary's local number into its own DB range —
+        // see `bp_test_support::redis_db`. Two binaries both using
+        // 0..15 flush each other mid-run.
+        let db =
+            bp_test_support::redis_db_in_range(bp_test_support::redis_db::SHARE_STREAM, db).await;
         let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
         let client = Client::open(format!("{base}/{db}")).ok()?;
         let mut conn = match tokio::time::timeout(

@@ -3,19 +3,13 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for the Group-Solo bulk-write primitives.
+//! Integration tests for the Group-Solo payout-history write path.
 //!
 //! Gated on docker-PG at `postgres://postgres:postgres@localhost:15433/public_pool`.
 //! Tests use TX-rollback isolation so parallel runs don't interfere
 //! and the schema-loaded container stays clean.
 
-use bp_common::{AddressId, Sats};
-use bp_db::{
-    bulk_insert_pplns_group_block_history, bulk_upsert_pplns_group_balances,
-    delete_pplns_group_balance, delete_pplns_group_balances_for_group,
-    find_pplns_group_balances_for_group, update_pplns_group_balance_pending_sats,
-    GroupBalanceUpsert, GroupPayoutHistoryInsert,
-};
+use bp_db::{bulk_insert_pplns_group_block_history, GroupPayoutHistoryInsert};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
 
@@ -64,123 +58,6 @@ async fn seed_group_in_tx(
     .execute(&mut **tx)
     .await
     .expect("seed group");
-}
-
-#[tokio::test]
-async fn bulk_upsert_group_balances_inserts_then_updates_absolute() {
-    let pool = match connect_or_skip().await {
-        Some(p) => p,
-        None => return,
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    let group_id = Uuid::new_v4();
-    seed_group_in_tx(&mut tx, group_id, "test_grp_creator").await;
-
-    let initial = vec![
-        GroupBalanceUpsert {
-            address: "test_grp_a".to_string(),
-            group_id,
-            pending_sats: 5_000,
-            total_paid_sats: 0,
-            updated_at_ms: 1_700_000_000_000,
-            last_accepted_share_at_ms: Some(1_700_000_000_000),
-        },
-        GroupBalanceUpsert {
-            address: "test_grp_b".to_string(),
-            group_id,
-            pending_sats: 3_000,
-            total_paid_sats: 0,
-            updated_at_ms: 1_700_000_000_000,
-            last_accepted_share_at_ms: None,
-        },
-    ];
-    let inserted = bulk_upsert_pplns_group_balances(&mut *tx, &initial)
-        .await
-        .expect("ok");
-    assert_eq!(inserted, 2);
-
-    // Update with new values; last_accepted preserved when None.
-    let updated = vec![GroupBalanceUpsert {
-        address: "test_grp_a".to_string(),
-        group_id,
-        pending_sats: 0, // paid out
-        total_paid_sats: 5_000,
-        updated_at_ms: 1_700_000_060_000,
-        last_accepted_share_at_ms: None, // COALESCE preserves existing
-    }];
-    bulk_upsert_pplns_group_balances(&mut *tx, &updated)
-        .await
-        .expect("ok");
-
-    let row: (i64, i64, Option<i64>) = sqlx::query_as(
-        r#"SELECT "pendingSats", "totalPaidSats", "lastAcceptedShareAt"
-           FROM pplns_group_balance
-           WHERE address = 'test_grp_a' AND "groupId" = $1"#,
-    )
-    .bind(group_id)
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    assert_eq!(row.0, 0, "pendingSats absolute-updated to 0");
-    assert_eq!(row.1, 5_000, "totalPaidSats absolute-updated to 5000");
-    assert_eq!(
-        row.2,
-        Some(1_700_000_000_000),
-        "lastAcceptedShareAt preserved (None overwrite COALESCEs)"
-    );
-
-    tx.rollback().await.unwrap();
-}
-
-#[tokio::test]
-async fn bulk_upsert_group_balances_overwrites_last_accepted_when_some() {
-    let pool = match connect_or_skip().await {
-        Some(p) => p,
-        None => return,
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    let group_id = Uuid::new_v4();
-    seed_group_in_tx(&mut tx, group_id, "test_grp_overwrite").await;
-
-    bulk_upsert_pplns_group_balances(
-        &mut *tx,
-        &[GroupBalanceUpsert {
-            address: "test_grp_o1".to_string(),
-            group_id,
-            pending_sats: 1_000,
-            total_paid_sats: 0,
-            updated_at_ms: 0,
-            last_accepted_share_at_ms: Some(1_700_000_000_000),
-        }],
-    )
-    .await
-    .unwrap();
-
-    bulk_upsert_pplns_group_balances(
-        &mut *tx,
-        &[GroupBalanceUpsert {
-            address: "test_grp_o1".to_string(),
-            group_id,
-            pending_sats: 2_000,
-            total_paid_sats: 500,
-            updated_at_ms: 1_700_000_060_000,
-            last_accepted_share_at_ms: Some(1_700_000_999_000),
-        }],
-    )
-    .await
-    .unwrap();
-
-    let last: (Option<i64>,) = sqlx::query_as(
-        r#"SELECT "lastAcceptedShareAt" FROM pplns_group_balance
-           WHERE address = 'test_grp_o1' AND "groupId" = $1"#,
-    )
-    .bind(group_id)
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    assert_eq!(last.0, Some(1_700_000_999_000));
-
-    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
@@ -244,291 +121,6 @@ async fn bulk_insert_group_block_history_idempotent_on_unique() {
 }
 
 #[tokio::test]
-async fn find_group_balances_for_group_returns_only_positive_pending() {
-    let pool = match connect_or_skip().await {
-        Some(p) => p,
-        None => return,
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    let group_id = Uuid::new_v4();
-    seed_group_in_tx(&mut tx, group_id, "test_grp_find_c").await;
-
-    bulk_upsert_pplns_group_balances(
-        &mut *tx,
-        &[
-            GroupBalanceUpsert {
-                address: "test_grp_f_a".to_string(),
-                group_id,
-                pending_sats: 5_000,
-                total_paid_sats: 0,
-                updated_at_ms: 0,
-                last_accepted_share_at_ms: None,
-            },
-            GroupBalanceUpsert {
-                address: "test_grp_f_b".to_string(),
-                group_id,
-                pending_sats: 0, // settled — should not appear
-                total_paid_sats: 100_000,
-                updated_at_ms: 0,
-                last_accepted_share_at_ms: None,
-            },
-            GroupBalanceUpsert {
-                address: "test_grp_f_c".to_string(),
-                group_id,
-                pending_sats: 3_000,
-                total_paid_sats: 0,
-                updated_at_ms: 0,
-                last_accepted_share_at_ms: None,
-            },
-        ],
-    )
-    .await
-    .unwrap();
-
-    let rows = find_pplns_group_balances_for_group(&pool, group_id)
-        .await
-        .expect("ok");
-    // Note: rows visible from `pool` (uncommitted) — won't include
-    // the seeded rows because the seeding TX hasn't committed.
-    // Reframe: drop the rollback below and assert via the TX-bound
-    // executor. We'll just count via the TX directly.
-    let _ = rows;
-    let count: (i64,) = sqlx::query_as(
-        r#"SELECT count(*) FROM pplns_group_balance
-           WHERE "groupId" = $1 AND "pendingSats" > 0"#,
-    )
-    .bind(group_id)
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    assert_eq!(count.0, 2, "only the two positive-pending rows");
-
-    tx.rollback().await.unwrap();
-}
-
-#[tokio::test]
-async fn find_group_balances_dormant_filters_by_min_payout_and_cutoff() {
-    let pool = match connect_or_skip().await {
-        Some(p) => p,
-        None => return,
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    let group_id = Uuid::new_v4();
-    seed_group_in_tx(&mut tx, group_id, "test_grp_dormant_c").await;
-
-    let now_ms = 1_710_000_000_000_i64;
-    let stale_ts = now_ms - 60 * 86_400_000; // 60d ago
-    let fresh_ts = now_ms - 86_400_000;
-    let cutoff = now_ms - 30 * 86_400_000; // 30d dormancy
-
-    bulk_upsert_pplns_group_balances(
-        &mut *tx,
-        &[
-            // dust + stale → candidate
-            GroupBalanceUpsert {
-                address: "test_grp_d_stale_dust".to_string(),
-                group_id,
-                pending_sats: 1_000,
-                total_paid_sats: 0,
-                updated_at_ms: 0,
-                last_accepted_share_at_ms: Some(stale_ts),
-            },
-            // dust + fresh → NOT a candidate (within cutoff)
-            GroupBalanceUpsert {
-                address: "test_grp_d_fresh_dust".to_string(),
-                group_id,
-                pending_sats: 1_000,
-                total_paid_sats: 0,
-                updated_at_ms: 0,
-                last_accepted_share_at_ms: Some(fresh_ts),
-            },
-            // above-payout + stale → NOT a candidate (≥ min_payout)
-            GroupBalanceUpsert {
-                address: "test_grp_d_above".to_string(),
-                group_id,
-                pending_sats: 10_000,
-                total_paid_sats: 0,
-                updated_at_ms: 0,
-                last_accepted_share_at_ms: Some(stale_ts),
-            },
-            // dust + NULL timestamp → NOT a candidate
-            GroupBalanceUpsert {
-                address: "test_grp_d_null".to_string(),
-                group_id,
-                pending_sats: 1_000,
-                total_paid_sats: 0,
-                updated_at_ms: 0,
-                last_accepted_share_at_ms: None,
-            },
-        ],
-    )
-    .await
-    .unwrap();
-
-    // Use TX-bound executor for the SELECT so we can see the
-    // uncommitted seed rows. The pool-bound `find_pplns_group_balances_dormant`
-    // wouldn't see them; assert via a raw query on the same TX.
-    let candidates: Vec<(String,)> = sqlx::query_as(
-        r#"SELECT address FROM pplns_group_balance
-           WHERE "pendingSats" > 0 AND "pendingSats" < $1
-             AND "lastAcceptedShareAt" IS NOT NULL
-             AND "lastAcceptedShareAt" < $2
-           ORDER BY address"#,
-    )
-    .bind(5_000_i64)
-    .bind(cutoff)
-    .fetch_all(&mut *tx)
-    .await
-    .unwrap();
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].0, "test_grp_d_stale_dust");
-
-    tx.rollback().await.unwrap();
-}
-
-#[tokio::test]
-async fn update_group_balance_pending_sats_preserves_total_paid() {
-    let pool = match connect_or_skip().await {
-        Some(p) => p,
-        None => return,
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    let group_id = Uuid::new_v4();
-    seed_group_in_tx(&mut tx, group_id, "test_grp_upd_c").await;
-
-    bulk_upsert_pplns_group_balances(
-        &mut *tx,
-        &[GroupBalanceUpsert {
-            address: "test_grp_u_a".to_string(),
-            group_id,
-            pending_sats: 1_000,
-            total_paid_sats: 99_000,
-            updated_at_ms: 1_700_000_000_000,
-            last_accepted_share_at_ms: Some(1_700_000_000_000),
-        }],
-    )
-    .await
-    .unwrap();
-
-    let addr_id = AddressId::new("test_grp_u_a").unwrap();
-    let affected =
-        update_pplns_group_balance_pending_sats(&mut *tx, &addr_id, group_id, Sats(2_500))
-            .await
-            .unwrap();
-    assert_eq!(affected, 1);
-
-    let row: (i64, i64, i64) = sqlx::query_as(
-        r#"SELECT "pendingSats", "totalPaidSats", "updatedAt"
-           FROM pplns_group_balance
-           WHERE address = $1 AND "groupId" = $2"#,
-    )
-    .bind(addr_id.as_str())
-    .bind(group_id)
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    assert_eq!(row.0, 2_500);
-    assert_eq!(row.1, 99_000, "totalPaidSats preserved");
-    assert_eq!(row.2, 1_700_000_000_000, "updatedAt preserved");
-
-    tx.rollback().await.unwrap();
-}
-
-#[tokio::test]
-async fn delete_group_balance_removes_one_row() {
-    let pool = match connect_or_skip().await {
-        Some(p) => p,
-        None => return,
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    let group_id = Uuid::new_v4();
-    seed_group_in_tx(&mut tx, group_id, "test_grp_del_c").await;
-
-    bulk_upsert_pplns_group_balances(
-        &mut *tx,
-        &[GroupBalanceUpsert {
-            address: "test_grp_del_a".to_string(),
-            group_id,
-            pending_sats: 5_000,
-            total_paid_sats: 0,
-            updated_at_ms: 0,
-            last_accepted_share_at_ms: None,
-        }],
-    )
-    .await
-    .unwrap();
-
-    let addr_id = AddressId::new("test_grp_del_a").unwrap();
-    let affected = delete_pplns_group_balance(&mut *tx, &addr_id, group_id)
-        .await
-        .unwrap();
-    assert_eq!(affected, 1);
-
-    let count: (i64,) = sqlx::query_as(
-        r#"SELECT count(*) FROM pplns_group_balance
-           WHERE address = $1 AND "groupId" = $2"#,
-    )
-    .bind(addr_id.as_str())
-    .bind(group_id)
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    assert_eq!(count.0, 0);
-
-    tx.rollback().await.unwrap();
-}
-
-#[tokio::test]
-async fn delete_group_balances_for_group_wipes_all_rows() {
-    let pool = match connect_or_skip().await {
-        Some(p) => p,
-        None => return,
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    let group_id = Uuid::new_v4();
-    seed_group_in_tx(&mut tx, group_id, "test_grp_wipe_c").await;
-
-    bulk_upsert_pplns_group_balances(
-        &mut *tx,
-        &[
-            GroupBalanceUpsert {
-                address: "test_grp_w_a".to_string(),
-                group_id,
-                pending_sats: 1_000,
-                total_paid_sats: 0,
-                updated_at_ms: 0,
-                last_accepted_share_at_ms: None,
-            },
-            GroupBalanceUpsert {
-                address: "test_grp_w_b".to_string(),
-                group_id,
-                pending_sats: 2_000,
-                total_paid_sats: 0,
-                updated_at_ms: 0,
-                last_accepted_share_at_ms: None,
-            },
-        ],
-    )
-    .await
-    .unwrap();
-
-    let affected = delete_pplns_group_balances_for_group(&mut *tx, group_id)
-        .await
-        .unwrap();
-    assert_eq!(affected, 2);
-
-    let count: (i64,) =
-        sqlx::query_as(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
-            .bind(group_id)
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-    assert_eq!(count.0, 0);
-
-    tx.rollback().await.unwrap();
-}
-
-#[tokio::test]
 async fn update_group_last_reset_at_stamps_timestamp() {
     let pool = match connect_or_skip().await {
         Some(p) => p,
@@ -555,9 +147,10 @@ async fn update_group_last_reset_at_stamps_timestamp() {
 }
 
 #[tokio::test]
-async fn apply_distribution_atomicity_rollback_undoes_both_writes() {
-    // Verifies the contract bp-group-solo-engine's
-    // `apply_distribution` will rely on.
+async fn apply_distribution_rollback_undoes_the_history_write() {
+    // The contract `bp_group_solo_engine::history::apply_distribution`
+    // relies on: a block's payout history commits as one unit or not at
+    // all, so a redelivery never finds a half-written block.
     let pool = match connect_or_skip().await {
         Some(p) => p,
         None => return,
@@ -566,19 +159,6 @@ async fn apply_distribution_atomicity_rollback_undoes_both_writes() {
     let group_id = Uuid::new_v4();
     seed_group_in_tx(&mut tx, group_id, "test_grp_atomic_c").await;
 
-    bulk_upsert_pplns_group_balances(
-        &mut *tx,
-        &[GroupBalanceUpsert {
-            address: "test_grp_atomic_a".to_string(),
-            group_id,
-            pending_sats: 1234,
-            total_paid_sats: 5678,
-            updated_at_ms: 0,
-            last_accepted_share_at_ms: None,
-        }],
-    )
-    .await
-    .unwrap();
     bulk_insert_pplns_group_block_history(
         &mut *tx,
         &[GroupPayoutHistoryInsert {
@@ -599,16 +179,6 @@ async fn apply_distribution_atomicity_rollback_undoes_both_writes() {
     tx.rollback().await.unwrap();
 
     // Outside TX: nothing visible.
-    let balance_count: (i64,) = sqlx::query_as(
-        r#"SELECT count(*) FROM pplns_group_balance
-           WHERE address = 'test_grp_atomic_a' AND "groupId" = $1"#,
-    )
-    .bind(group_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(balance_count.0, 0);
-
     let history_count: (i64,) = sqlx::query_as(
         r#"SELECT count(*) FROM pplns_group_block_history WHERE "blockHeight" = 9999998"#,
     )
