@@ -938,6 +938,64 @@ mod tests {
         SessionState::new(clock, &server_config(), port, "abcd1234".to_string())
     }
 
+    /// MONEY: an empty payout list is the resolver saying "serve no job"
+    /// because its distribution could not be built. Answering it with a
+    /// coinbase would mean paying this one miner the whole block, so a
+    /// transient Postgres or Redis fault would cost every other miner in
+    /// the window their share. No `mining.notify` goes out and the miner
+    /// keeps hashing the job it holds.
+    ///
+    /// This pins the OUTCOME, not one guard. Measured: deleting the early
+    /// return below leaves the test green, because `MiningJobCache` and
+    /// `build_payout_outputs` refuse an empty list too — three layers deep.
+    /// With all three gone it does fail, on the `outputs[0]` index panic in
+    /// the coinbase builder. The outcome is what the no-job policy depends
+    /// on, so the outcome is what is asserted.
+    #[test]
+    fn no_notify_is_built_when_the_resolver_serves_no_job() {
+        let port = solo_port(1.0);
+        let mut state = fresh_state(TestClock::new(0), &port);
+        let template = mineable_template();
+        let cache = MiningJobCache::new();
+
+        let out = build_and_register_notify(
+            &mut state,
+            &server_config(),
+            &port,
+            &empty_registry(),
+            &cache,
+            &template,
+            &ResolvedPayouts::none(),
+            true,
+            0,
+        );
+        assert!(
+            out.is_none(),
+            "an empty payout list must produce NO mining.notify"
+        );
+
+        // Control: the same call with a real list DOES produce one, so the
+        // assertion above cannot pass for an unrelated reason.
+        let out = build_and_register_notify(
+            &mut state,
+            &server_config(),
+            &port,
+            &empty_registry(),
+            &cache,
+            &template,
+            &ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
+                address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+                sats: 5_000_000_000,
+            }]),
+            true,
+            0,
+        );
+        assert!(
+            out.is_some(),
+            "precondition: a resolvable list still yields a mining.notify"
+        );
+    }
+
     fn template_for_regtest() -> ActiveSV1Template {
         let mut active = ActiveSV1Template {
             template_id: 1,

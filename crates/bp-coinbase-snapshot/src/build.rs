@@ -77,11 +77,11 @@ pub struct BuiltDistribution {
 /// Sanitize, build, persist.
 ///
 /// A failed snapshot write does NOT fail the build. The distribution is
-/// correct and is about to become a coinbase; returning `Err` here sends
-/// the caller into its solo fallback, and that miner is handed a job
-/// paying the whole block to itself. Losing the snapshot costs a manual
-/// reprocess if a block lands on this job — losing the distribution
-/// costs the miners the block.
+/// correct and is about to become a coinbase; returning `Err` here would
+/// leave the miner with no job at all until the write recovers. Losing
+/// the snapshot costs a manual reprocess if a block lands on this job —
+/// losing the distribution costs every miner in it their hashing time,
+/// over a Redis fault that changed nothing about who is owed what.
 ///
 /// `snapshot_key` names the Redis key for a given fingerprint. It is a
 /// closure rather than a ready-made key because the fingerprint only

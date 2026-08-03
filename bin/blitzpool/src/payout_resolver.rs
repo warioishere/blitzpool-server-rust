@@ -55,7 +55,7 @@ use bp_mining_job::{solo_payouts, PayoutEntry, ResolvedPayouts};
 use bp_pplns::CoinbaseDistributionEntry;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_stratum_v2::jdp_server::TailoredDistribution;
-use tracing::warn;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::engines::BlitzpoolModeGate;
@@ -144,35 +144,18 @@ impl ProductionPayoutResolver {
             ),
             MiningMode::GroupSolo => {
                 let Some(gid_str) = result.group_id.as_deref() else {
-                    warn!(
+                    error!(
                         miner_address,
-                        "GroupSolo mode published WITHOUT a group_id; falling back to solo \
-                         payouts so the coinbase is at least spendable"
+                        "GroupSolo mode published WITHOUT a group_id; serving NO JOB"
                     );
-                    // A Group-Solo address on a solo list: the booking path would
-                    // look for a snapshot this list never had.
-                    return (
-                        ResolvedPayouts::unsnapshotted(solo_payouts(
-                            miner_address,
-                            &self.solo_fee,
-                            reward_sats,
-                        )),
-                        false,
-                    );
+                    return (ResolvedPayouts::none(), false);
                 };
                 let Ok(group_id) = Uuid::parse_str(gid_str) else {
-                    warn!(
+                    error!(
                         miner_address,
-                        gid_str, "GroupSolo group_id failed to parse as UUID; falling back to solo"
+                        gid_str, "GroupSolo group_id failed to parse as UUID; serving NO JOB"
                     );
-                    return (
-                        ResolvedPayouts::unsnapshotted(solo_payouts(
-                            miner_address,
-                            &self.solo_fee,
-                            reward_sats,
-                        )),
-                        false,
-                    );
+                    return (ResolvedPayouts::none(), false);
                 };
                 self.group_solo_payouts(miner_address, reward_sats, group_id)
                     .await
@@ -212,18 +195,11 @@ impl ProductionPayoutResolver {
             // PPLNS mode was published into the gate but the engine
             // is disabled at this deployment — config inconsistency.
             // Fall back to solo + warn.
-            warn!(
+            error!(
                 miner_address,
-                "PPLNS mode in gate but `[pplns]` is absent from config; falling back to solo"
+                "PPLNS mode in gate but `[pplns]` is absent from config; serving NO JOB"
             );
-            return (
-                ResolvedPayouts::unsnapshotted(solo_payouts(
-                    miner_address,
-                    &self.solo_fee,
-                    reward_sats,
-                )),
-                false,
-            );
+            return (ResolvedPayouts::none(), false);
         };
         match pplns.build_distribution(reward_sats).await {
             // The build can succeed while its snapshot write does not — the
@@ -256,38 +232,24 @@ impl ProductionPayoutResolver {
                         result.snapshot_written,
                     ),
                     Err(err) => {
-                        warn!(
+                        error!(
                             %err,
                             miner_address,
                             reward_sats,
-                            "PPLNS §4 evaluation failed; falling back to solo coinbase"
+                            "PPLNS §4 evaluation failed; serving NO JOB"
                         );
-                        (
-                            ResolvedPayouts::unsnapshotted(solo_payouts(
-                                miner_address,
-                                &self.solo_fee,
-                                reward_sats,
-                            )),
-                            false,
-                        )
+                        (ResolvedPayouts::none(), false)
                     }
                 }
             }
             Err(err) => {
-                warn!(
+                error!(
                     %err,
                     miner_address,
                     reward_sats,
-                    "PPLNS distribution build failed; falling back to solo coinbase"
+                    "PPLNS distribution build failed; serving NO JOB until it succeeds"
                 );
-                (
-                    ResolvedPayouts::unsnapshotted(solo_payouts(
-                        miner_address,
-                        &self.solo_fee,
-                        reward_sats,
-                    )),
-                    false,
-                )
+                (ResolvedPayouts::none(), false)
             }
         }
     }
@@ -378,18 +340,11 @@ impl ProductionPayoutResolver {
         let finder = match AddressId::new(miner_address.to_string()) {
             Ok(a) => a,
             Err(_) => {
-                warn!(
+                error!(
                     miner_address,
-                    "GroupSolo miner address failed AddressId parse; falling back to solo"
+                    "GroupSolo miner address failed AddressId parse; serving NO JOB"
                 );
-                return (
-                    ResolvedPayouts::unsnapshotted(solo_payouts(
-                        miner_address,
-                        &self.solo_fee,
-                        reward_sats,
-                    )),
-                    false,
-                );
+                return (ResolvedPayouts::none(), false);
             }
         };
         match self
@@ -423,40 +378,26 @@ impl ProductionPayoutResolver {
                         result.snapshot_written,
                     ),
                     Err(err) => {
-                        warn!(
+                        error!(
                             %err,
                             miner_address,
                             %group_id,
                             reward_sats,
-                            "Group-Solo §4 evaluation failed; falling back to solo coinbase"
+                            "Group-Solo §4 evaluation failed; serving NO JOB"
                         );
-                        (
-                            ResolvedPayouts::unsnapshotted(solo_payouts(
-                                miner_address,
-                                &self.solo_fee,
-                                reward_sats,
-                            )),
-                            false,
-                        )
+                        (ResolvedPayouts::none(), false)
                     }
                 }
             }
             Err(err) => {
-                warn!(
+                error!(
                     %err,
                     miner_address,
                     %group_id,
                     reward_sats,
-                    "Group-Solo distribution build failed; falling back to solo coinbase"
+                    "Group-Solo distribution build failed; serving NO JOB until it succeeds"
                 );
-                (
-                    ResolvedPayouts::unsnapshotted(solo_payouts(
-                        miner_address,
-                        &self.solo_fee,
-                        reward_sats,
-                    )),
-                    false,
-                )
+                (ResolvedPayouts::none(), false)
             }
         }
     }

@@ -1284,6 +1284,15 @@ async fn resolve_template_mining_job_inputs(
         .payout_resolver
         .resolve_payouts(addr, template.coinbase_tx_value_remaining)
         .await;
+    // An empty list is the resolver saying "serve no job" — its
+    // distribution could not be built, and the alternative it used to
+    // reach for was a coinbase paying this one miner the whole block.
+    // Same answer as an unlocked address: no job inputs, so no
+    // NewMiningJob goes out and the channel keeps hashing what it holds.
+    // SV1 reads an empty list the same way (`build_notify_for_template`).
+    if resolved.is_none() {
+        return Ok(None);
+    }
     Ok(Some(MiningJobInputs {
         network: server_config.network,
         payouts: resolved.entries,
@@ -1961,6 +1970,67 @@ mod tests {
         .await
         .unwrap();
         assert!(out.is_none(), "no address → no MiningJobInputs");
+    }
+
+    /// MONEY: an empty payout list is the resolver saying "serve no job"
+    /// because its distribution could not be built. It used to answer that
+    /// with a solo coinbase paying the connecting miner the whole block,
+    /// so a transient Postgres or Redis fault cost every other miner in
+    /// the window the block. No job at all is the only safe answer, and
+    /// the channel simply keeps hashing what it already holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_template_mining_job_inputs_returns_none_when_the_resolver_serves_no_job() {
+        struct NoJobResolver;
+        #[async_trait::async_trait]
+        impl crate::hooks::PayoutResolver for NoJobResolver {
+            async fn resolve_payouts(
+                &self,
+                _: &AddressId,
+                _: u64,
+            ) -> bp_mining_job::ResolvedPayouts {
+                bp_mining_job::ResolvedPayouts::none()
+            }
+            fn resolve_stream(&self, _: &AddressId) -> bp_common::StreamKind {
+                bp_common::StreamKind::Pplns
+            }
+        }
+        let cfg = server_cfg();
+        let mut hooks = MiningServerHooks::no_op();
+        hooks.payout_resolver = Arc::new(NoJobResolver);
+        let template = active_template_fixture();
+        let addr = Some(AddressId::new(ADDR.to_string()).unwrap());
+
+        let out = resolve_template_mining_job_inputs(
+            &addr,
+            &cfg,
+            &template,
+            &hooks,
+            &Arc::new(MiningJobCache::new()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.is_none(),
+            "an empty payout list must produce NO job inputs — building one \
+             would put an unpayable coinbase on the wire"
+        );
+
+        // Control: the SAME call with the default resolver DOES produce
+        // inputs, so the assertion above cannot pass for some unrelated
+        // reason (a missing address, a bad template).
+        let out = resolve_template_mining_job_inputs(
+            &addr,
+            &cfg,
+            &template,
+            &MiningServerHooks::no_op(),
+            &Arc::new(MiningJobCache::new()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.is_some(),
+            "precondition: a resolver that DOES return a list still yields job inputs"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

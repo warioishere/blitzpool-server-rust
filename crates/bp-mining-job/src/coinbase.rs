@@ -74,6 +74,29 @@ impl ResolvedPayouts {
             payouts_fingerprint: [0u8; 32],
         }
     }
+
+    /// **No payout list at all — serve no job.**
+    ///
+    /// The answer for a mode whose distribution could not be built. The
+    /// alternative a resolver reaches for is a solo list, and for PPLNS or
+    /// Group-Solo that is not a degraded answer but a wrong one: it pays
+    /// the whole block to whichever miner happened to connect, so a
+    /// transient Postgres or Redis fault would cost every OTHER miner the
+    /// block. Withholding the job costs the one miner some hashing time
+    /// and nobody else anything.
+    ///
+    /// Both protocols already read an empty list this way: SV1's
+    /// `build_notify_for_template` sends no `mining.notify`, SV2's
+    /// `resolve_template_mining_job_inputs` yields no job inputs. The
+    /// miner keeps hashing whatever job it holds.
+    pub fn none() -> Self {
+        Self::unsnapshotted(Vec::new())
+    }
+
+    /// Is this "serve no job"?
+    pub fn is_none(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// The block-template fields needed for coinbase construction.

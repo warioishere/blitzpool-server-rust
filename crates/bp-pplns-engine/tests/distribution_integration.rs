@@ -526,18 +526,21 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
         "test_dist_inputs_" => 14,
         "test_dist_fp_" => 15,
         "test_dist_oom_" => 6,
+        "test_dist_nopg_" => 5,
+        "test_dist_nowin_" => 7,
         other => panic!("unknown test prefix: {other}"),
     }
 }
 
 // ── A failed snapshot write must not collapse the distribution ──────
 //
-// `pplns_payouts` turns any `build_distribution` error into `solo_payouts`,
-// so a build that returns `Err` hands that miner a job whose coinbase pays
-// 100 % of the block to itself. A Redis blip on the snapshot write must
-// therefore not fail the build: the distribution is correct and is about to
-// become a coinbase. Losing the snapshot costs a reprocess; losing the
-// distribution costs the pool's miners the block, on-chain and irreversibly.
+// `pplns_payouts` turns any `build_distribution` error into "serve no job",
+// so a build that returns `Err` leaves every miner in the window without one
+// until it recovers. A Redis blip on the snapshot write must therefore not
+// fail the build: the distribution is correct and is about to become a
+// coinbase. Losing the snapshot costs a reprocess; losing the distribution
+// costs the pool's miners their hashing time over a fault that changed
+// nothing about who is owed what.
 //
 // The write is made to fail for real, not mocked — but the injection has to
 // be LOCAL. `CONFIG SET maxmemory 1` was used here originally and is
@@ -644,4 +647,193 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
         .await
         .expect("drop the read-only user");
     cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
+}
+
+// ── The two input reads must fail differently ───────────────────────
+//
+// `load_inputs` reads the window from Redis and the open-balance ledger
+// from Postgres, and the two are not interchangeable.
+//
+// The window IS the shares: without it there is nothing to distribute and
+// nothing may be invented, so the build fails and the resolver serves no
+// job. The ledger is a set of PROMISES on top of that split, and a promise
+// that cannot be read right now is not a promise that is lost — it still
+// sits in `pplns_balance`. Failing the build over it would blank every
+// PPLNS job in the pool during a Postgres fault that costs nothing but a
+// one-block delay in repayments, while `record_share` (Redis only) keeps
+// crediting every miner correctly throughout.
+//
+// The pair below pins both halves, with a control on each so neither can
+// pass for an unrelated reason.
+
+/// A `PgPool` that will never connect. Used to make the ledger read fail
+/// for real rather than mocking the decision away.
+fn unreachable_pool() -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(300))
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/nope")
+        .expect("a lazily-connected pool parses its url")
+}
+
+#[tokio::test]
+async fn an_unreadable_ledger_degrades_to_a_score_only_distribution() {
+    let h = match connect_or_skip(5, "test_dist_nopg_").await {
+        Some(h) => h,
+        None => return,
+    };
+    // Own pair, per the rule above: these appear nowhere else that writes
+    // `pplns_balance`. Reusing another test's addresses had this test
+    // deleting its own seeded balance out from under itself.
+    const ADDR_A: &str = "bc1q307hujcervvdfr73ntlam2f7w65j6gs9zcnf39";
+    const ADDR_B: &str = "bc1qywnf55acqpxr0lekg2gmy2s46pzxqze99j0u9y";
+    const REWARD: u64 = 312_500_000;
+    const OWED: i64 = 1_000_000;
+    cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
+
+    let window = build_window(&h).await;
+    seed_share(&window, ADDR_A, 60.0, 1_700_000_000_001).await;
+    seed_share(&window, ADDR_B, 40.0, 1_700_000_000_002).await;
+    seed_open_balance(&h.pool, ADDR_A, OWED, 0).await;
+
+    // ── Control: with the ledger readable, the promise is IN the build ──
+    let normal = h.builder.build(REWARD).await.expect("build with ledger");
+    let a_id = AddressId::new(ADDR_A).unwrap();
+    let a_normal = normal
+        .distribution
+        .entries
+        .iter()
+        .find(|e| e.address == a_id)
+        .expect("the owed miner is in the distribution");
+    assert_eq!(
+        a_normal.balance_sats, OWED,
+        "precondition: a readable ledger puts the promise in the snapshot inputs"
+    );
+    assert!(
+        a_normal.wire_weight > a_normal.score_weight,
+        "precondition: the promise BOOSTS the published weight ({} vs score {}) —          without this the degraded case below would be indistinguishable",
+        a_normal.wire_weight,
+        a_normal.score_weight
+    );
+
+    // ── Subject: same window, ledger unreachable ────────────────────
+    let degraded_builder = DistributionBuilder::new(
+        unreachable_pool(),
+        build_window(&h).await,
+        DistributionConfig::from_engine_config(&PplnsEngineConfig {
+            fee_address: Some(
+                AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap(),
+            ),
+            ..PplnsEngineConfig::default()
+        }),
+    );
+    let degraded = degraded_builder.build(REWARD).await.expect(
+        "an unreadable ledger must NOT fail the build — every PPLNS miner \
+                 would lose their job over a fault that costs one block of delay",
+    );
+
+    assert_eq!(
+        degraded.distribution.extras_total, 0,
+        "a score-only distribution promises nothing"
+    );
+    for entry in &degraded.distribution.entries {
+        assert_eq!(
+            entry.balance_sats,
+            0,
+            "{} must carry no promise when the ledger could not be read",
+            entry.address.as_str()
+        );
+        assert_eq!(
+            entry.wire_weight,
+            entry.score_weight,
+            "{} must be published at its pure score weight",
+            entry.address.as_str()
+        );
+    }
+    // Both miners are still paid — this is a real distribution, not a
+    // stand-in, and a block found on it settles from its own snapshot.
+    for addr in [ADDR_A, ADDR_B] {
+        let id = AddressId::new(addr).unwrap();
+        assert!(
+            degraded.distribution.published().any(|e| e.address == id),
+            "{addr} must still be paid by score"
+        );
+    }
+    assert!(
+        degraded.snapshot_written,
+        "the degraded distribution is bookable like any other"
+    );
+
+    // And the ledger row is untouched: the promise waits for a later block.
+    let still_owed: (i64,) =
+        sqlx::query_as(r#"SELECT "balanceSats" FROM pplns_balance WHERE address = $1"#)
+            .bind(ADDR_A)
+            .fetch_one(&h.pool)
+            .await
+            .expect("balance row");
+    assert_eq!(
+        still_owed.0, OWED,
+        "the unread promise must survive — it is repaid from a later block"
+    );
+
+    cleanup_addresses(&h.pool, &[ADDR_A, ADDR_B]).await;
+}
+
+#[tokio::test]
+async fn an_unreadable_window_fails_the_build_instead_of_degrading() {
+    let h = match connect_or_skip(7, "test_dist_nowin_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const ADDR: &str = "bc1qy5jzxu2u6jeps9duq8fgdxuacjan93vy6yg4j8";
+    const REWARD: u64 = 312_500_000;
+    cleanup_addresses(&h.pool, &[ADDR]).await;
+
+    let window = build_window(&h).await;
+    seed_share(&window, ADDR, 100.0, 1_700_000_000_001).await;
+
+    // Control: it builds while the window is readable.
+    h.builder
+        .build(REWARD)
+        .await
+        .expect("precondition: the build works before the window is broken");
+
+    // Break the window read for real: overwrite the aggregate HASH with a
+    // STRING, so `HGETALL` answers WRONGTYPE. Deterministic, and local to
+    // this test's Redis DB — unlike a server-global knob.
+    let mut raw = raw_conn(&h).await;
+    let _: () = redis::cmd("SET")
+        .arg(bp_pplns_engine::window::KEY_WINDOW_BY_ADDRESS)
+        .arg("not-a-hash")
+        .query_async(&mut raw)
+        .await
+        .expect("clobber the window key");
+    h.builder.invalidate_all();
+
+    let err = h.builder.build(REWARD).await.expect_err(
+        "an unreadable window must FAIL the build — there are no shares \
+                     to distribute, and inventing a distribution would pay the wrong \
+                     miners",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("window read"),
+        "the failure must name the window, not be some other error: {msg}"
+    );
+
+    let _: () = redis::cmd("DEL")
+        .arg(bp_pplns_engine::window::KEY_WINDOW_BY_ADDRESS)
+        .query_async(&mut raw)
+        .await
+        .expect("drop the clobbered key");
+    cleanup_addresses(&h.pool, &[ADDR]).await;
+}
+
+/// A raw connection to the same Redis DB the harness chose — for the
+/// tests that need to corrupt a key rather than go through `WindowStore`.
+async fn raw_conn(h: &Harness) -> ConnectionManager {
+    let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
+    let db = redis_db_for_prefix(&h.address_prefix);
+    let client = Client::open(format!("{redis_base}/{db}")).expect("client");
+    ConnectionManager::new(client).await.expect("conn")
 }

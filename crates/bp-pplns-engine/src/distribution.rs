@@ -33,10 +33,11 @@ use std::time::Duration;
 
 use bp_coinbase_snapshot::{build_and_snapshot, BuildRequest};
 use bp_common::{AddressId, Sats};
-use bp_db::{find_pplns_balances_with_open_balance, DbError, PplnsBalanceRow};
+use bp_db::{find_pplns_balances_with_open_balance, PplnsBalanceRow};
 use bp_pplns::{WeightBuildError, WeightDistribution};
 use sqlx::PgPool;
 use thiserror::Error;
+use tracing::error;
 
 use crate::autoscale::LiveBudget;
 use crate::window::{WindowError, WindowStore};
@@ -62,10 +63,6 @@ pub enum DistributionError {
     LeaderDropped,
     #[error("window read: {0}")]
     Window(#[from] WindowError),
-    #[error("redis snapshot write: {0}")]
-    Snapshot(#[source] redis::RedisError),
-    #[error("db: {0}")]
-    Db(#[from] DbError),
     /// The shared window+ledger load failed. Carries the underlying
     /// error's message rather than the error itself: the inputs cache
     /// hands back an `Arc<DistributionError>` shared across all waiters,
@@ -113,10 +110,9 @@ pub struct DistributionResult {
     /// `false` means this build succeeded but its snapshot did not
     /// land, so the fingerprint names a key that does not exist. The
     /// distribution is still correct and still becomes a coinbase —
-    /// failing the build over a lost snapshot would hand the miner a
-    /// solo job paying itself the whole block, which is far worse. But
-    /// a caller that promises a found block will be booked
-    /// automatically MUST NOT make that promise on a `false`.
+    /// failing the build over a lost snapshot would leave every miner in
+    /// it without a job. But a caller that promises a found block will be
+    /// booked automatically MUST NOT make that promise on a `false`.
     pub snapshot_written: bool,
 }
 
@@ -264,15 +260,50 @@ impl DistributionBuilder {
 /// Steps 1-3: the reward-independent half of a build — read the window
 /// and the ledger, sanitize both. Shared by every concurrent build via
 /// [`DistributionBuilder::inputs_cache`].
+///
+/// **The two reads fail differently, on purpose.**
+///
+/// The window IS the shares. Without it there is nothing to distribute,
+/// nothing may be invented, and the caller must serve no job at all
+/// ([`bp_mining_job::ResolvedPayouts::none`]) — so a window error
+/// propagates.
+///
+/// The ledger is a set of PROMISES on top of that split, and a promise
+/// that cannot be read this second is not a promise that is lost. It
+/// still sits in `pplns_balance`, and a build without it is not
+/// approximate: every entry carries `balance_sats = 0`, so `X = 0`, no
+/// wire weight is boosted, and settlement recomputes the same zeros from
+/// the snapshot and books `delta ≈ 0`. The standing balances are not
+/// touched and are paid out of the next block instead. A block found
+/// during the outage pays correctly by score and is fully bookable.
+///
+/// That is worth the degradation because the alternative is severe and
+/// pool-wide: `record_share` writes only to Redis, so during a Postgres
+/// outage the share accounting is intact and every miner keeps earning —
+/// failing the build would blank the whole pool's jobs over a fault that
+/// costs nothing but a one-block delay in repayments. It is also not a
+/// new code path in the math: Group-Solo passes an empty balance map on
+/// every single build.
 async fn load_inputs(
     pool: &PgPool,
     window: &WindowStore,
 ) -> Result<DistributionInputs, DistributionError> {
-    // 1. Read window aggregate from Redis (HashMap<String, f64>).
+    // 1. Read window aggregate from Redis (HashMap<String, f64>). Hard.
     let window_raw = window.read_window_by_address().await?;
 
-    // 2. Read open-balance ledger rows from PG.
-    let open_balance_rows = find_pplns_balances_with_open_balance(pool).await?;
+    // 2. Read open-balance ledger rows from PG. Soft — see the docs above.
+    let balances = match find_pplns_balances_with_open_balance(pool).await {
+        Ok(rows) => open_balance_rows_to_balance_map(&rows),
+        Err(err) => {
+            error!(
+                %err,
+                "pplns distribution: ledger unreadable — building this distribution by SCORE \
+                 ONLY. Standing balances are untouched and are repaid from a later block; a \
+                 block found meanwhile still pays correctly and books. Fix the database."
+            );
+            HashMap::new()
+        }
+    };
 
     // 3. Convert to bp_pplns inputs. Window addresses are raw strings —
     //    ones that fail `AddressId` validation are skipped with a warn
@@ -285,7 +316,7 @@ async fn load_inputs(
             &window_raw,
             "pplns distribution: skipping invalid address in window — likely from a buggy upstream",
         ),
-        balances: open_balance_rows_to_balance_map(&open_balance_rows),
+        balances,
     })
 }
 
