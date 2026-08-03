@@ -25,8 +25,8 @@
 //! - Redis-backed round-state mirror (`groupsolo:{groupId}:*` keys) →
 //!   service-wiring crate.
 //! - Snapshot persistence + per-finder snapshot keys → service-wiring.
-//! - DB transactions for `pplns_group_block_history` /
-//!   `pplns_group_balance` writes → `bp-db` writes + service-wiring.
+//! - DB transactions for `pplns_group_block_history` writes → `bp-db`
+//!   writes + service-wiring.
 //! - `InflightResultCache` for distribution dedup → reusable utility in a
 //!   later session.
 //! - Reentrancy guard / scheduled round reset / removal cleanup → caller

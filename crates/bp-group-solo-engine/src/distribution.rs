@@ -3,12 +3,13 @@
 //! `DistributionBuilder` — production-side wrapper around
 //! `bp_group_solo::build_group_solo_distribution`.
 //!
-//! Reads the group's round state from Redis (`by-address` hash),
-//! the group's open balances from Postgres, and the group's
-//! per-group config row (`finder_bonus_ppm`) from the
-//! `pplns_group` table. Calls the pure-math distribution builder
-//! with `suppress_matching_debits = true` (Group-Solo never goes
-//! negative), then persists a per-(group, finder) snapshot.
+//! Reads the group's round state from Redis (`by-address` hash) and
+//! the group's per-group config row (`finder_bonus_ppm`) from the
+//! `pplns_group` table, calls the shared weight builder with
+//! [`WithheldValue::ToPool`], then persists a per-(group, finder)
+//! snapshot.
+//!
+//! There is no ledger read: Group-Solo owes nothing between blocks.
 //!
 //! Concurrent callers for the same `(group_id, block_reward_sats,
 //! finder_address)` triple share one compute via the in-flight cache
@@ -24,7 +25,7 @@ use std::time::Duration;
 
 use bp_coinbase_snapshot::{share_map_from_redis_hash, StoredWeightSnapshot};
 use bp_common::{AddressId, Sats};
-use bp_db::{find_group, find_pplns_group_balances_for_group, DbError, PplnsGroupBalanceRow};
+use bp_db::{find_group, DbError};
 use bp_inflight_cache::InflightResultCache;
 use bp_pplns::{
     build_weight_distribution, is_valid_payout_address, WeightBuildError, WeightDistribution,
@@ -221,25 +222,23 @@ async fn compute_distribution(
         "group-solo distribution: skipping invalid address in round state",
     );
 
-    // 3. Open balances for this group from PG.
-    let balance_rows = find_pplns_group_balances_for_group(pool, group_id).await?;
-    let mut balances = balance_rows_to_balance_map(&balance_rows);
+    // 3. No ledger to read. Group-Solo carries no balances (see the
+    //    crate docs): every member is paid out of the block they mined,
+    //    or not at all. The empty map is what the shared weight builder
+    //    expects when a mode makes no promises across blocks.
+    let balances: HashMap<AddressId, Sats> = HashMap::new();
 
     // Defensive sanitize (same as the PPLNS path): drop any address
     // that isn't a parseable Bitcoin address before it reaches the
-    // coinbase builder. One unparseable round/ledger row would
-    // otherwise abort the whole group coinbase build in `bp-mining-job`.
+    // coinbase builder. One unparseable round row would otherwise abort
+    // the whole group coinbase build in `bp-mining-job`.
     let shares_before = address_shares.len();
-    let balances_before = balances.len();
     address_shares.retain(|a, _| is_valid_payout_address(a.as_str()));
-    balances.retain(|a, _| is_valid_payout_address(a.as_str()));
-    let dropped = (shares_before - address_shares.len()) + (balances_before - balances.len());
+    let dropped = shares_before - address_shares.len();
     if dropped > 0 {
         warn!(
             %group_id,
             dropped,
-            shares_dropped = shares_before - address_shares.len(),
-            balances_dropped = balances_before - balances.len(),
             "group-solo distribution: dropped unparseable payout addresses before coinbase build"
         );
     }
@@ -369,14 +368,6 @@ async fn write_weight_snapshot_for_with_retry(
     }
 }
 
-fn balance_rows_to_balance_map(rows: &[PplnsGroupBalanceRow]) -> HashMap<AddressId, Sats> {
-    let mut out = HashMap::with_capacity(rows.len());
-    for row in rows {
-        out.insert(row.address.clone(), row.pending_sats);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,20 +389,6 @@ mod tests {
         assert!((dist_cfg.fee_percent - 1.5).abs() < 1e-9);
         assert_eq!(dist_cfg.coinbase_weight_budget, 60_000);
         assert_eq!(dist_cfg.snapshot_ttl_secs, 1800);
-    }
-
-    #[test]
-    fn balance_rows_to_map_preserves_pending_sats() {
-        let rows = vec![PplnsGroupBalanceRow {
-            address: AddressId::new("bc1qpending").unwrap(),
-            group_id: Uuid::new_v4(),
-            pending_sats: Sats(5_000),
-            total_paid_sats: Sats(0),
-            updated_at: 0,
-            last_accepted_share_at: None,
-        }];
-        let map = balance_rows_to_balance_map(&rows);
-        assert_eq!(map[&AddressId::new("bc1qpending").unwrap()].0, 5_000);
     }
 
     #[test]

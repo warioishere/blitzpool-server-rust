@@ -90,7 +90,6 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Ha
     // disable dust_sweep to avoid interference; per-group reset
     // crons load none (no preset on seeded group).
     let config = GroupSoloEngineConfig {
-        dust_sweep_enabled: false,
         fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
         ..GroupSoloEngineConfig::default()
     };
@@ -299,7 +298,7 @@ async fn on_block_found_applies_distribution_and_resets_round() {
     let actual = actual_paying_exactly(&result, 312_500_000);
     let outcome = h
         .engine
-        .on_block_found_scaled(
+        .on_block_found(
             h.group_id,
             block_height,
             &actual,
@@ -373,7 +372,7 @@ async fn a_richer_block_leaves_nobody_owing() {
     assert_finder_score_fraction(&result.distribution, &finder, 0.58);
 
     h.engine
-        .on_block_found_scaled(
+        .on_block_found(
             h.group_id,
             9_995_401,
             &actual_paying_exactly(&result, T_ACTUAL),
@@ -384,258 +383,61 @@ async fn a_richer_block_leaves_nobody_owing() {
         .await
         .expect("apply");
 
-    // Both members settle flat. Under the fixed-sats bonus the finder
-    // was left owing ~5M here and the other member holding the mirror
-    // credit.
-    //
-    // `fetch_one`, not `fetch_optional(...).unwrap_or(0)`: settlement
-    // writes a balance row for every entry it pays, so a missing row means
-    // settlement skipped the member entirely — and defaulting that to 0
-    // would report the very flat ledger this test exists to prove.
+    // Both members are paid their exact §4 share of the RICHER block.
+    // Under the fixed-sats bonus the finder was overpaid ~5M here and
+    // the other member underpaid the mirror amount, and only a ledger
+    // could have put that right afterwards.
+    let paid = actual_paying_exactly(&result, T_ACTUAL);
+    let history = read_block_history(&h.pool, h.group_id, 9_995_401).await;
     for who in [&finder, &other] {
-        let pending: i64 = sqlx::query_scalar(
-            r#"SELECT "pendingSats" FROM pplns_group_balance
-               WHERE "groupId" = $1 AND address = $2"#,
-        )
-        .bind(h.group_id)
-        .bind(who.as_str())
-        .fetch_one(&h.pool)
-        .await
-        .expect("settlement must have written a balance row for every paid member");
-        assert!(
-            pending.abs() <= 2,
-            "{} moved by {pending} on a 20 %-richer block — the bonus must not drift",
+        let on_chain = paid
+            .paid_by_address
+            .get(who.as_str())
+            .copied()
+            .expect("member must be paid on a 20 %-richer block") as i64;
+        assert_eq!(
+            history.get(who.as_str()).copied(),
+            Some(on_chain),
+            "{} history row must transcribe the coinbase exactly",
             who.as_str()
         );
     }
+    // And nothing was owed afterwards, because nothing can be.
+    assert_eq!(count_group_balance_rows(&h.pool, h.group_id).await, 0);
 
     drop_harness(h).await;
 }
 
-// ── A debt must survive the trip to the next distribution ──────────
-//
-// The finder bonus no longer drifts — but a HELD LEDGER BALANCE still
-// does, and it is the last satoshi-denominated promise a Group-Solo
-// distribution carries. `x_i` is projected into a weight against the
-// reference revenue, and §4 scales that weight with the block's actual
-// revenue, so a coinbase computed against a richer template than the
-// distribution was projected for pays the promise out inflated. The
-// difference is booked as a debt.
-//
-// That debt is only recoverable if the NEXT build reads it back:
-// `find_pplns_group_balances_for_group` selects `pendingSats <> 0`, so
-// a regression that filtered negative rows out would forgive every
-// debt in the pool — silently, and with every other test still green.
-// The previous version of this test proved the round trip via the
-// bonus overshoot; the bonus cannot overshoot any more, so the promise
-// has to come from the ledger instead.
-#[tokio::test]
-async fn a_debt_reaches_the_next_distribution() {
-    let h = match spawn_or_skip(12, None).await {
-        Some(h) => h,
-        None => return,
-    };
-    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
-    const T_REF: u64 = 312_500_000;
-    // The JD-client's own template: 20 % richer than the projection.
-    const T_ACTUAL: u64 = 375_000_000;
-
-    // An open credit — the pool owes the finder. This is the fixed-sats
-    // promise that a richer block overpays.
-    sqlx::query(
-        r#"INSERT INTO pplns_group_balance
-             (address, "groupId", "pendingSats", "totalPaidSats", "updatedAt")
-           VALUES ($1, $2, $3, 0, 0)"#,
-    )
-    .bind(finder.as_str())
-    .bind(h.group_id)
-    .bind(12_000_000i64)
-    .execute(&h.pool)
-    .await
-    .expect("seed credit");
-
-    for (address, at) in [(&finder, 1_700_000_000_001), (&other, 1_700_000_000_002)] {
-        h.engine
-            .record_share(None, h.group_id, address.as_str(), 100.0, at)
-            .await
-            .unwrap();
-    }
-    let result = h
-        .engine
-        .build_distribution(h.group_id, T_REF, &finder)
-        .await
-        .expect("build");
-    h.engine
-        .on_block_found_scaled(
-            h.group_id,
-            9_995_601,
-            &actual_paying_exactly(&result, T_ACTUAL),
-            &finder,
-            None,
-            Some(result.payouts_fingerprint()),
-        )
-        .await
-        .expect("apply");
-
-    let pending: i64 = sqlx::query_scalar(
-        r#"SELECT "pendingSats" FROM pplns_group_balance
-           WHERE "groupId" = $1 AND address = $2"#,
-    )
-    .bind(h.group_id)
-    .bind(finder.as_str())
-    .fetch_one(&h.pool)
-    .await
-    .expect("balance row");
-    assert!(
-        pending < 0,
-        "a credit paid out against a 20 %-richer block leaves the holder \
-         owing the difference; got pendingSats = {pending}"
-    );
-
-    // THE POINT: the builder has to see that debt on the next round.
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1_700_000_060_001)
-        .await
-        .unwrap();
-    let next = h
-        .engine
-        .build_distribution(h.group_id, T_REF, &finder)
-        .await
-        .expect("build 2");
-    let carried = next
-        .distribution
-        .entries
-        .iter()
-        .find(|e| e.address.as_str() == finder.as_str())
-        .map(|e| e.balance_sats)
-        .expect("finder is in the next distribution");
-    assert_eq!(
-        carried, pending,
-        "the debt must be carried into the next distribution or it is forgiven"
-    );
-
-    drop_harness(h).await;
-}
-
-// ── The books have to close ────────────────────────────────────────
-//
-// Settlement's whole job is to record the gap between what a block
-// earned a member and what its coinbase actually handed them. So across
-// every row it touches, the ledger may move by exactly
-// `Σ claims − Σ paid` and not one satoshi more — no clamp, no rounding
-// slack, no address quietly skipped. A single write that drops a
-// negative on the floor is real money gifted away, and it shows up
-// here and nowhere else.
-
-#[tokio::test]
-async fn ledger_movement_equals_claims_minus_payments() {
-    // 16 % finder bonus — what the old 50M-sat carve-out came to.
-    let h = match spawn_or_skip(12, Some(160_000)).await {
-        Some(h) => h,
-        None => return,
-    };
-    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
-    const T_REF: u64 = 312_500_000;
-    // A block 20 % richer than the projection, so claims and payments
-    // genuinely disagree and there is something to conserve.
-    const T_ACTUAL: u64 = 375_000_000;
-
-    // Both directions of open position, so the run covers a credit
-    // being repaid and a debt being collected in the same block.
-    for (address, pending) in [(&finder, 12_000_000i64), (&other, -3_000_000i64)] {
-        sqlx::query(
-            r#"INSERT INTO pplns_group_balance
-                 (address, "groupId", "pendingSats", "totalPaidSats", "updatedAt")
-               VALUES ($1, $2, $3, 0, 0)"#,
-        )
-        .bind(address.as_str())
-        .bind(h.group_id)
-        .bind(pending)
-        .execute(&h.pool)
-        .await
-        .expect("seed balance");
-    }
-    for (address, at) in [(&finder, 1_700_000_000_001), (&other, 1_700_000_000_002)] {
-        h.engine
-            .record_share(None, h.group_id, address.as_str(), 100.0, at)
-            .await
-            .unwrap();
-    }
-
-    let result = h
-        .engine
-        .build_distribution(h.group_id, T_REF, &finder)
-        .await
-        .expect("build");
-    let snapshot = StoredWeightSnapshot::from_distribution(&result.distribution);
-    let before = read_group_balances(&h.pool, h.group_id).await;
-
-    let actual = actual_paying_exactly(&result, T_ACTUAL);
-    h.engine
-        .on_block_found_scaled(
-            h.group_id,
-            9_995_501,
-            &actual,
-            &finder,
-            None,
-            Some(result.payouts_fingerprint()),
-        )
-        .await
-        .expect("apply");
-    let after = read_group_balances(&h.pool, h.group_id).await;
-
-    // What the block earned every member, from the stored settlement
-    // inputs — the same `X` the coinbase weights were projected with.
-    let extras_total = snapshot.extras_total();
-    let claims: i64 = snapshot
-        .entries
-        .iter()
-        .filter(|e| e.address != snapshot.fee_address)
-        .map(|e| {
-            bp_share::claim_sats(
-                e.score_weight,
-                snapshot.score_total,
-                snapshot.fee_ppm,
-                T_ACTUAL,
-                extras_total,
-            )
-        })
-        .sum();
-    let paid: i64 = actual
-        .paid_by_address
-        .iter()
-        .filter(|(a, _)| **a != snapshot.fee_address)
-        .map(|(_, sats)| *sats as i64)
-        .sum();
-
-    let movement: i64 = after
-        .iter()
-        .map(|(address, sats)| sats - before.get(address).copied().unwrap_or(0))
-        .sum();
-    assert_eq!(
-        movement,
-        claims - paid,
-        "ledger moved by {movement} on claims {claims} vs payments {paid}"
-    );
-
-    drop_harness(h).await;
-}
-
-async fn read_group_balances(
+/// `address → paidSats` from the payout history of one block. This is
+/// the whole record Group-Solo keeps of a found block: there is no
+/// balance table behind it.
+async fn read_block_history(
     pool: &PgPool,
     group_id: Uuid,
+    block_height: i32,
 ) -> std::collections::HashMap<String, i64> {
     sqlx::query_as::<_, (String, i64)>(
-        r#"SELECT address, "pendingSats" FROM pplns_group_balance WHERE "groupId" = $1"#,
+        r#"SELECT address, "paidSats" FROM pplns_group_block_history
+           WHERE "groupId" = $1 AND "blockHeight" = $2"#,
     )
     .bind(group_id)
+    .bind(block_height)
     .fetch_all(pool)
     .await
-    .expect("read balances")
+    .expect("read history")
     .into_iter()
     .collect()
+}
+
+/// How many `pplns_group_balance` rows this group has. Group-Solo writes
+/// none — asserting zero is the sharpest statement of "no ledger", and
+/// it fails loudly if a balance write ever creeps back in.
+async fn count_group_balance_rows(pool: &PgPool, group_id: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
+        .bind(group_id)
+        .fetch_one(pool)
+        .await
+        .expect("count balances")
 }
 
 // ── Test 3b — snapshot-carried apply survives a Redis snapshot overwrite ──
@@ -697,7 +499,7 @@ async fn snapshot_carried_apply_survives_redis_overwrite() {
     let actual = actual_paying_exactly(&job, reward);
     let outcome = h
         .engine
-        .on_block_found_scaled(
+        .on_block_found(
             h.group_id,
             block_height,
             &actual,
@@ -840,99 +642,6 @@ async fn an_unknown_payout_list_resolves_to_nothing() {
     drop_harness(h).await;
 }
 
-// ── Test 3b3 — a ledger change between job and apply survives ────────
-//
-// The snapshot is now built when the job is issued and applied when a block is
-// found on it — under the confirmation gate that is hours later. Writing its
-// `balance_after` as an absolute would roll back whatever moved `pendingSats`
-// in between (a kick redistribution, a dust sweep, another block). The snapshot
-// records the state it was computed against, so the apply writes the DELTA.
-//
-// Shares Redis db 11; the suite runs serially (`--test-threads=1`).
-#[tokio::test]
-async fn apply_preserves_a_ledger_change_made_after_the_job_was_built() {
-    let h = match spawn_or_skip(11, None).await {
-        Some(h) => h,
-        None => return,
-    };
-    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
-    let reward = 312_500_000;
-
-    // A member with a pending balance that this block will not pay out (no
-    // shares this round → no coinbase output, carried forward instead).
-    sqlx::query(
-        r#"INSERT INTO pplns_group_balance
-             ("groupId", address, "pendingSats", "totalPaidSats", "updatedAt")
-           VALUES ($1, $2, 4_000, 0, 0)"#,
-    )
-    .bind(h.group_id)
-    .bind(other.as_str())
-    .execute(&h.pool)
-    .await
-    .expect("seed pending balance");
-
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
-        .await
-        .unwrap();
-    let job = h
-        .engine
-        .build_distribution(h.group_id, reward, &finder)
-        .await
-        .expect("job-time build ok");
-    let snap = h
-        .engine
-        .weight_snapshot_for_block_found(h.group_id, &finder, &job.payouts_fingerprint())
-        .await
-        .expect("lookup ok");
-
-    // Between job issue and apply, something else moves the ledger — a kick
-    // redistribution, a sweep, an admin adjustment. Here: +1_000 sats.
-    sqlx::query(
-        r#"UPDATE pplns_group_balance SET "pendingSats" = "pendingSats" + 1_000
-           WHERE "groupId" = $1 AND address = $2"#,
-    )
-    .bind(h.group_id)
-    .bind(other.as_str())
-    .execute(&h.pool)
-    .await
-    .expect("move the ledger");
-
-    h.engine
-        .on_block_found_scaled(
-            h.group_id,
-            9_995_020,
-            &actual_paying_exactly(&job, reward),
-            &finder,
-            Some(snap),
-            Some(job.payouts_fingerprint()),
-        )
-        .await
-        .expect("apply ok");
-
-    // Strict: `other` earned nothing this round and its sub-min-payout
-    // credit got no coinbase output, so the weight settlement (a
-    // per-address `claim − paid` delta) leaves the row exactly as it
-    // stands — moved balance included. A stored absolute would have
-    // restored 4_000.
-    let after = h
-        .engine
-        .reader()
-        .balance(h.group_id, other.as_str())
-        .await
-        .expect("ok")
-        .expect("row")
-        .pending_sats;
-    assert_eq!(
-        after, 5_000,
-        "the +1_000 made after the job was built must survive the apply \
-         (absolute write would have restored 4_000)"
-    );
-
-    drop_harness(h).await;
-}
-
 // ── Test 3b4 — the apply consumes only its own payout-list snapshot ──
 //
 // Every member of a group mines a different job, and each job's distribution
@@ -985,7 +694,7 @@ async fn apply_deletes_only_the_payout_list_it_booked() {
     );
 
     h.engine
-        .on_block_found_scaled(
+        .on_block_found(
             h.group_id,
             9_995_021,
             &actual_paying_exactly(&booked, reward),
@@ -1041,7 +750,7 @@ async fn on_block_found_keeps_round_when_reset_flag_false() {
         .await
         .expect("ok");
     h.engine
-        .on_block_found_scaled(
+        .on_block_found(
             h.group_id,
             9_997_001,
             &actual_paying_exactly(&dist, 312_500_000),
@@ -1081,7 +790,7 @@ async fn on_block_found_keeps_round_when_reset_flag_false() {
 // history dedupes via its UNIQUE; the balance apply is gated on a non-zero
 // history insert so the second apply is a no-op on the balance.
 #[tokio::test]
-async fn duplicate_block_found_does_not_double_balance() {
+async fn duplicate_block_found_does_not_double_the_history() {
     let h = match spawn_or_skip(15, None).await {
         Some(h) => h,
         None => return,
@@ -1108,7 +817,7 @@ async fn duplicate_block_found_does_not_double_balance() {
 
     // First apply.
     h.engine
-        .on_block_found_scaled(
+        .on_block_found(
             h.group_id,
             height,
             &actual,
@@ -1118,19 +827,13 @@ async fn duplicate_block_found_does_not_double_balance() {
         )
         .await
         .expect("apply 1");
-    let after_first = h
-        .engine
-        .reader()
-        .balance(h.group_id, finder.as_str())
-        .await
-        .expect("ok")
-        .expect("row")
-        .total_paid_sats;
-    assert!(after_first > 0);
+    let after_first = read_block_history(&h.pool, h.group_id, height).await;
+    assert_eq!(after_first.len(), 1, "one member, one history row");
+    assert!(after_first[finder.as_str()] > 0);
 
     // Replay the SAME block-found (duplicate event).
     h.engine
-        .on_block_found_scaled(
+        .on_block_found(
             h.group_id,
             height,
             &actual,
@@ -1140,18 +843,12 @@ async fn duplicate_block_found_does_not_double_balance() {
         )
         .await
         .expect("apply 2 (replay) must not error");
-    let after_replay = h
-        .engine
-        .reader()
-        .balance(h.group_id, finder.as_str())
-        .await
-        .expect("ok")
-        .expect("row")
-        .total_paid_sats;
+    let after_replay = read_block_history(&h.pool, h.group_id, height).await;
 
     assert_eq!(
         after_first, after_replay,
-        "replayed block-found must not double-count totalPaidSats"
+        "a replayed block-found must leave the payout history exactly as the first \
+         delivery wrote it"
     );
 
     // Exactly one history row for the (group, height) survived.
@@ -1200,12 +897,12 @@ async fn on_block_found_re_entrancy_guard_per_group() {
     let actual2 = actual;
     let task1 = tokio::spawn(async move {
         engine1
-            .on_block_found_scaled(gid, 9_995_002, &actual1, &finder1, None, Some(fp))
+            .on_block_found(gid, 9_995_002, &actual1, &finder1, None, Some(fp))
             .await
     });
     let task2 = tokio::spawn(async move {
         engine2
-            .on_block_found_scaled(gid, 9_995_002, &actual2, &finder2, None, Some(fp))
+            .on_block_found(gid, 9_995_002, &actual2, &finder2, None, Some(fp))
             .await
     });
 
@@ -1233,145 +930,6 @@ async fn on_block_found_re_entrancy_guard_per_group() {
     drop_harness(h).await;
 }
 
-// ── Test 5 — reader.balance reads PG row ───────────────────────────
-
-#[tokio::test]
-async fn reader_balance_returns_row_after_block_found() {
-    let h = match spawn_or_skip(4, None).await {
-        Some(h) => h,
-        None => return,
-    };
-    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
-        .await
-        .unwrap();
-    let dist = h
-        .engine
-        .build_distribution(h.group_id, 312_500_000, &finder)
-        .await
-        .expect("ok");
-    h.engine
-        .on_block_found_scaled(
-            h.group_id,
-            9_995_003,
-            &actual_paying_exactly(&dist, 312_500_000),
-            &finder,
-            None,
-            Some(dist.payouts_fingerprint()),
-        )
-        .await
-        .expect("ok");
-
-    let bal = h
-        .engine
-        .reader()
-        .balance(h.group_id, finder.as_str())
-        .await
-        .expect("ok")
-        .expect("balance row exists");
-    assert!(bal.total_paid_sats > 0, "finder received coinbase output");
-
-    drop_harness(h).await;
-}
-
-// ── Test 5b — totalPaidSats accumulates across blocks ──────────────
-//
-// A member fully paid on-chain has `pendingSats = 0`. The block-found apply
-// must still see their prior `totalPaidSats` to accumulate it — earlier it
-// read balances filtered on `pendingSats > 0`, so a paid member was invisible
-// and their lifetime total got overwritten with the latest block instead of
-// summed. Two finder-only blocks must leave `totalPaidSats == 2x` one block.
-#[tokio::test]
-async fn total_paid_sats_accumulates_across_blocks() {
-    let h = match spawn_or_skip(13, None).await {
-        Some(h) => h,
-        None => return,
-    };
-    let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-    let reward = 312_500_000;
-
-    // Block 1.
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 1)
-        .await
-        .unwrap();
-    let d1 = h
-        .engine
-        .build_distribution(h.group_id, reward, &finder)
-        .await
-        .expect("ok");
-    h.engine
-        .on_block_found_scaled(
-            h.group_id,
-            9_996_001,
-            &actual_paying_exactly(&d1, reward),
-            &finder,
-            None,
-            Some(d1.payouts_fingerprint()),
-        )
-        .await
-        .expect("block 1 ok");
-    let after_one = h
-        .engine
-        .reader()
-        .balance(h.group_id, finder.as_str())
-        .await
-        .expect("ok")
-        .expect("balance row")
-        .total_paid_sats;
-    assert!(after_one > 0, "finder paid on block 1");
-
-    // Block 2 — round was reset by block 1, so re-seed a share. The finder's
-    // pending is now ~0, so the pending-filtered read would have hidden them.
-    h.engine
-        .record_share(None, h.group_id, finder.as_str(), 100.0, 2)
-        .await
-        .unwrap();
-    let d2 = h
-        .engine
-        .build_distribution(h.group_id, reward, &finder)
-        .await
-        .expect("ok");
-    h.engine
-        .on_block_found_scaled(
-            h.group_id,
-            9_996_002,
-            &actual_paying_exactly(&d2, reward),
-            &finder,
-            None,
-            Some(d2.payouts_fingerprint()),
-        )
-        .await
-        .expect("block 2 ok");
-    let after_two = h
-        .engine
-        .reader()
-        .balance(h.group_id, finder.as_str())
-        .await
-        .expect("ok")
-        .expect("balance row")
-        .total_paid_sats;
-
-    // Accumulation direction stays strict; the 2× equality gets the
-    // few-sat tolerance of the weight model (block 2 folds block 1's
-    // residual pending into the finder's weight, so the two on-chain
-    // amounts can differ by integer rounding between the claim formula
-    // and the §4 payout path). An overwrite would leave ≈ 1× — far
-    // outside the tolerance.
-    assert!(
-        after_two > after_one,
-        "totalPaidSats must grow with block 2"
-    );
-    assert!(
-        (after_two - after_one * 2).abs() <= 3,
-        "totalPaidSats must accumulate (block1 + block2), not overwrite with \
-         the latest block (after_one={after_one}, after_two={after_two})"
-    );
-
-    drop_harness(h).await;
-}
-
 // ── Test 6 — manual_reset triggers full wipe ───────────────────────
 
 #[tokio::test]
@@ -1380,17 +938,6 @@ async fn manual_reset_wipes_group_state() {
         Some(h) => h,
         None => return,
     };
-    // Seed via PG so the balance row outlives the round (Variant-B
-    // semantics: scheduled reset wipes balance rows too).
-    sqlx::query(
-        r#"INSERT INTO pplns_group_balance
-             (address, "groupId", "pendingSats", "totalPaidSats", "updatedAt")
-           VALUES ('test_eng_reset_a', $1, 5_000, 0, 0)"#,
-    )
-    .bind(h.group_id)
-    .execute(&h.pool)
-    .await
-    .unwrap();
     h.engine
         .record_share(None, h.group_id, "test_eng_reset_a", 50.0, 1)
         .await
@@ -1399,17 +946,9 @@ async fn manual_reset_wipes_group_state() {
     let fired = h.engine.manual_reset(h.group_id).await.expect("ok");
     assert!(fired);
 
-    // Round + balance both wiped.
+    // The round is what a reset wipes — there is nothing else to wipe.
     let stats = h.engine.reader().round_stats(h.group_id).await.expect("ok");
     assert_eq!(stats.total_shares, 0.0);
-
-    let bal_count: (i64,) =
-        sqlx::query_as(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
-            .bind(h.group_id)
-            .fetch_one(&h.pool)
-            .await
-            .unwrap();
-    assert_eq!(bal_count.0, 0);
 
     drop_harness(h).await;
 }
@@ -1523,7 +1062,7 @@ async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
     let block_height = 9_995_008;
     let outcome = h
         .engine
-        .on_block_found_scaled(
+        .on_block_found(
             h.group_id,
             block_height,
             &actual_paying_exactly(&result, reward),
@@ -1532,21 +1071,15 @@ async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
             Some(result.payouts_fingerprint()),
         )
         .await
-        .expect("on_block_found_scaled ok");
+        .expect("on_block_found ok");
     assert!(outcome.history_inserted >= 1);
 
-    // Exactly one balance row for the finder, carrying the single
-    // bonus-inclusive output's sats.
-    let bal = h
-        .engine
-        .reader()
-        .balance(h.group_id, finder.as_str())
-        .await
-        .expect("ok")
-        .expect("finder balance row exists");
+    // The history records that single bonus-inclusive output verbatim.
+    let history = read_block_history(&h.pool, h.group_id, block_height).await;
     assert_eq!(
-        bal.total_paid_sats, expected_finder_sats,
-        "finder totalPaidSats must equal the single bonus-inclusive output"
+        history.get(finder.as_str()).copied(),
+        Some(expected_finder_sats),
+        "the finder's history row must be the single bonus-inclusive output"
     );
 
     // Exactly one history coinbase row for the finder for this block.
@@ -1731,7 +1264,6 @@ async fn spawn_core_skips_startup_reset_crons() {
     seed_group_with_daily_reset(&pool, group_id).await;
 
     let config = || GroupSoloEngineConfig {
-        dust_sweep_enabled: false,
         // §4: the weight model requires the pool-output recipient.
         fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
         ..GroupSoloEngineConfig::default()
@@ -2026,7 +1558,7 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
     // THE REGRESSION: this returned `SnapshotRewardMismatch` and booked
     // nothing at all.
     h.engine
-        .on_block_found_scaled(
+        .on_block_found(
             h.group_id,
             height,
             &actual_paying_exactly(&result, T_ACTUAL),
@@ -2037,34 +1569,26 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
         .await
         .expect("a block off the reference revenue must still book");
 
-    // Both members settle flat even 1.6× off the reference. The bonus
-    // is a proportion, and no satoshi-denominated promise is left in a
-    // Group-Solo distribution — so `claim == paid` at any revenue.
-    let pending_of = |addr: String| {
-        let pool = h.pool.clone();
-        let gid = h.group_id;
-        async move {
-            // fetch_one: a missing row means settlement never reached this
-            // member, which unwrap_or(0) would render as a flat ledger.
-            sqlx::query_scalar::<_, i64>(
-                r#"SELECT "pendingSats" FROM pplns_group_balance
-                   WHERE "groupId" = $1 AND address = $2"#,
-            )
-            .bind(gid)
-            .bind(addr)
-            .fetch_one(&pool)
-            .await
-            .expect("settlement must have written a balance row for every paid member")
-        }
-    };
+    // Both members are paid their exact share even 1.6× off the
+    // reference. Every weight is a proportion, so there is no
+    // satoshi-denominated promise left to project wrong — and nothing
+    // is owed afterwards at any revenue.
+    let paid = actual_paying_exactly(&result, T_ACTUAL);
+    let history = read_block_history(&h.pool, h.group_id, height).await;
     for who in [&finder, &other] {
-        let pending = pending_of(who.as_str().to_string()).await;
-        assert!(
-            pending.abs() <= 2,
-            "{} moved by {pending} at 1.6× the reference — nothing may drift",
+        let on_chain = paid
+            .paid_by_address
+            .get(who.as_str())
+            .copied()
+            .expect("member must be paid") as i64;
+        assert_eq!(
+            history.get(who.as_str()).copied(),
+            Some(on_chain),
+            "{} history row must transcribe the coinbase at 1.6× the reference",
             who.as_str()
         );
     }
+    assert_eq!(count_group_balance_rows(&h.pool, h.group_id).await, 0);
 
     drop_harness(h).await;
 }
@@ -2096,7 +1620,7 @@ async fn a_group_coinbase_below_the_block_subsidy_is_refused() {
 
     let err = h
         .engine
-        .on_block_found_scaled(
+        .on_block_found(
             h.group_id,
             height,
             &actual_paying_exactly(&result, subsidy - 1),

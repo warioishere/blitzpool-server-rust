@@ -11,10 +11,9 @@
 //!
 //! On fire, the runner wipes the full round state (shares zset,
 //! counter, total, by-address, rejected-shares, best-share,
-//! last-accepted-share-at, and all per-finder snapshots), deletes
-//! every balance row for the group, and stamps `lastRoundResetAt`
-//! to now. A 60-second guard on `lastRoundResetAt` prevents
-//! scheduled-vs-scheduled double-fire.
+//! last-accepted-share-at, and all per-finder snapshots) and stamps
+//! `lastRoundResetAt` to now. A 60-second guard on `lastRoundResetAt`
+//! prevents scheduled-vs-scheduled double-fire.
 //!
 //! `chrono-tz` ships the IANA TZ database compiled into the binary,
 //! so the calendar-boundary math is OS-independent. DST handling for
@@ -25,9 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bp_cron_utils::Clock;
-use bp_db::{
-    delete_pplns_group_balances_for_group, find_group, update_pplns_group_last_reset_at, DbError,
-};
+use bp_db::{find_group, update_pplns_group_last_reset_at, DbError};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 use sqlx::PgPool;
@@ -300,10 +297,7 @@ impl<C: Clock> GroupResetRunner<C> {
         // 2. Redis: drop every per-finder snapshot for this group.
         let mut conn = self.round.connection_for_snapshot();
         delete_all_for_group(&mut conn, &group_key).await?;
-        // 3. PG: delete all balance rows for the group (Variant-B
-        //    "only active miners in this period get paid" semantics).
-        delete_pplns_group_balances_for_group(&self.pool, group_id).await?;
-        // 4. PG: stamp lastRoundResetAt so the 60s debounce on the
+        // 3. PG: stamp lastRoundResetAt so the 60s debounce on the
         //    next cron tick reads the fresh value.
         update_pplns_group_last_reset_at(&self.pool, group_id, now_ms).await?;
 

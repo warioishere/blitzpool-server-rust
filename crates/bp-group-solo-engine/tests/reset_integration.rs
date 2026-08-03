@@ -115,19 +115,6 @@ async fn seed_group_custom(
     .expect("seed group");
 }
 
-async fn seed_balance(pool: &PgPool, group_id: Uuid, address: &str, pending: i64) {
-    sqlx::query(
-        r#"INSERT INTO pplns_group_balance (address, "groupId", "pendingSats", "totalPaidSats", "updatedAt")
-           VALUES ($1, $2, $3, 0, 0)"#,
-    )
-    .bind(address)
-    .bind(group_id)
-    .bind(pending)
-    .execute(pool)
-    .await
-    .expect("seed balance");
-}
-
 async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
     let _ = sqlx::query(r#"DELETE FROM pplns_group_block_history WHERE "groupId" = $1"#)
         .bind(group_id)
@@ -164,7 +151,6 @@ async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
     };
     let group_id = Uuid::new_v4();
     seed_group(&pool, group_id, None).await;
-    seed_balance(&pool, group_id, "test_reset_a", 5_000).await;
 
     let round = GroupRoundStore::new(conn);
     let group_key = group_id.to_string();
@@ -204,15 +190,6 @@ async fn reset_scheduled_wipes_redis_pg_state_and_stamps() {
             .unwrap()
             .is_none()
     );
-
-    // PG balance wiped.
-    let bal_count: (i64,) =
-        sqlx::query_as(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
-            .bind(group_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(bal_count.0, 0);
 
     // lastRoundResetAt stamped to clock's now_ms.
     let last: (Option<i64>,) =
@@ -358,8 +335,6 @@ async fn reset_one_group_does_not_affect_another() {
     let group_b = Uuid::new_v4();
     seed_group(&pool, group_a, None).await;
     seed_group(&pool, group_b, None).await;
-    seed_balance(&pool, group_a, "test_iso_a", 1_000).await;
-    seed_balance(&pool, group_b, "test_iso_b", 2_000).await;
 
     let round = GroupRoundStore::new(conn);
     round
@@ -381,14 +356,6 @@ async fn reset_one_group_does_not_affect_another() {
         .await
         .unwrap()
         .is_empty());
-    let bal_a: (i64,) =
-        sqlx::query_as(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
-            .bind(group_a)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(bal_a.0, 0);
-
     // Group B: untouched.
     assert_eq!(
         round
@@ -398,14 +365,6 @@ async fn reset_one_group_does_not_affect_another() {
             .len(),
         1
     );
-    let bal_b: (i64,) =
-        sqlx::query_as(r#"SELECT count(*) FROM pplns_group_balance WHERE "groupId" = $1"#)
-            .bind(group_b)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(bal_b.0, 1);
-
     cleanup_group(&pool, group_a).await;
     cleanup_group(&pool, group_b).await;
 }

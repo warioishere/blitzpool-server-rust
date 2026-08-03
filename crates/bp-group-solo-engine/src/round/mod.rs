@@ -28,9 +28,7 @@
 //! clock survives across blocks).
 //!
 //! `reset_full` wipes everything including `last-accepted-share-at`.
-//! Used by the scheduled (calendar-aligned) cron reset path. The
-//! cron also DELETEs all `pplns_group_balance` rows for the group —
-//! that's the engine-layer's job, not the round-store's.
+//! Used by the scheduled (calendar-aligned) cron reset path.
 
 pub mod snapshot;
 

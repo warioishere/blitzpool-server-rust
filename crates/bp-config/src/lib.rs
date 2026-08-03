@@ -845,15 +845,6 @@ pub struct GroupFeesConfig {
     /// 0 sats), not validity — raise it before onboarding larger groups.
     #[serde(default = "default_group_solo_coinbase_weight_budget")]
     pub coinbase_weight_budget: u32,
-    /// Enable the daily 03:00 UTC Group-Solo dust-sweep cron (deletes dormant
-    /// `pplns_group_balance` rows below `min_payout_sats`). Manual sweeps via
-    /// admin trigger still work when false.
-    #[serde(default = "default_true")]
-    pub dust_sweep_enabled: bool,
-    /// Inactivity cutoff (days) at which a `pplns_group_balance` row becomes
-    /// eligible for the dormant-row sweep.
-    #[serde(default = "default_dormant_days")]
-    pub dormant_balance_days: u32,
 }
 
 impl Default for GroupFeesConfig {
@@ -862,8 +853,6 @@ impl Default for GroupFeesConfig {
             address: None,
             percent: None,
             coinbase_weight_budget: default_group_solo_coinbase_weight_budget(),
-            dust_sweep_enabled: true,
-            dormant_balance_days: default_dormant_days(),
         }
     }
 }
@@ -1114,9 +1103,6 @@ fn default_confirmation_depth() -> u32 {
 }
 fn default_bucket_shares() -> u64 {
     10_000
-}
-fn default_dormant_days() -> u32 {
-    30
 }
 fn default_capacity_threshold() -> f64 {
     0.8
@@ -1389,13 +1375,14 @@ mod tests {
         assert_eq!(c.abandoned_balance_days, 45);
     }
 
+    /// Group-Solo has no ledger and therefore no dust sweep. `[group_fees]`
+    /// is `deny_unknown_fields`, so a config still carrying the retired keys
+    /// fails the boot instead of quietly ignoring them — same rule as the
+    /// `[solo]` keys above.
     #[test]
-    fn group_fees_sweep_overrides_propagate_from_toml() {
-        let c: GroupFeesConfig =
-            toml::from_str("dust_sweep_enabled = false\ndormant_balance_days = 14")
-                .expect("parses");
-        assert!(!c.dust_sweep_enabled);
-        assert_eq!(c.dormant_balance_days, 14);
+    fn group_fees_rejects_the_retired_sweep_keys() {
+        assert!(toml::from_str::<GroupFeesConfig>("dust_sweep_enabled = false").is_err());
+        assert!(toml::from_str::<GroupFeesConfig>("dormant_balance_days = 14").is_err());
     }
 
     #[test]
@@ -1551,9 +1538,6 @@ mod tests {
         assert!(cfg.notifications.fcm.is_none());
         assert!(cfg.smtp.is_none());
         assert_eq!(cfg.solo.coinbase_weight_budget, 4_000);
-        // Group-Solo sweep config lives on [group_fees] now.
-        assert!(cfg.group_fees.dust_sweep_enabled);
-        assert_eq!(cfg.group_fees.dormant_balance_days, 30);
         assert_eq!(cfg.aggregation.pool_stats_interval_ms, 600_000);
         // [tdp] staleness threshold defaults to 120s when unset.
         assert_eq!(cfg.tdp.staleness_threshold_secs, 120);

@@ -52,7 +52,6 @@ fn share_seq(group_id: Uuid) -> Vec<SharedAcceptedShareOwned> {
 
 async fn spawn_engine(conn: ConnectionManager, pool: PgPool) -> GroupSoloEngine {
     let config = GroupSoloEngineConfig {
-        dust_sweep_enabled: false,
         ..GroupSoloEngineConfig::default()
     };
     GroupSoloEngine::spawn(config, conn, pool)

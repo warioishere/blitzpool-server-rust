@@ -143,7 +143,6 @@ mod tests {
             mode: MiningMode::Solo,
             group_id: None,
             height: 101,
-            groupsolo_snapshot: None,
         }
     }
 

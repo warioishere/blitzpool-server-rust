@@ -316,13 +316,11 @@ async fn spawn_group_solo(
     let engine_cfg = to_group_solo_engine_config(cfg)?;
     info!(
         fee_percent = engine_cfg.fee_percent,
-        dust_sweep_enabled = engine_cfg.dust_sweep_enabled,
-        core,
-        "group-solo: spawning engine"
+        core, "group-solo: spawning engine"
     );
     let redis = handles.redis.clone();
     let pool = handles.db.pool().clone();
-    // Core runs read-only (no dust-sweep / per-group round-reset crons).
+    // Core runs read-only (no per-group round-reset cron).
     let engine = if core {
         GroupSoloEngine::spawn_core(engine_cfg, redis, pool).await?
     } else {
@@ -347,8 +345,6 @@ fn to_group_solo_engine_config(cfg: &AppConfig) -> Result<GroupSoloEngineConfig,
         // larger than bitcoin-core reserved and rejects the block. Mirrors the
         // PPLNS engine↔default-stream coupling.
         coinbase_weight_budget: cfg.group_fees.coinbase_weight_budget,
-        dust_sweep_enabled: cfg.group_fees.dust_sweep_enabled,
-        dormant_balance_days: cfg.group_fees.dormant_balance_days,
         subsidy_halving_interval: subsidy_halving_interval(cfg.network),
         // The `min_payout_sats` floor is shared between PPLNS + Group-
         // Solo: both engines read the same value. When `[pplns]` is

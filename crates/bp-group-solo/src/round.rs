@@ -110,7 +110,7 @@ impl GroupRoundState {
     /// state. By default keeps `last_accepted_at` across rounds (the
     /// admin-kick clock isn't tied to block-find cadence); pass
     /// `clear_last_accepted = true` to reset it too (used by the
-    /// dust-sweep + group-dissolve paths).
+    /// scheduled-reset + group-dissolve paths).
     pub fn reset_round(&mut self, clear_last_accepted: bool) {
         self.address_shares.clear();
         self.rejected_shares.clear();

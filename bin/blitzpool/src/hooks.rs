@@ -43,11 +43,7 @@ use bp_api::push_hooks::{FcmRegisterContext, PushHooks, UnifiedPushRegisterConte
 use bp_common::AddressId;
 use bp_config::AppConfig;
 use bp_db::Db;
-use bp_db::{
-    add_pplns_group_balance_pending, delete_pplns_group_balance,
-    delete_pplns_group_balances_for_group, delete_pplns_group_block_history_for_group,
-    find_address_email, find_group_balance, PplnsGroupRow,
-};
+use bp_db::{delete_pplns_group_block_history_for_group, find_address_email, PplnsGroupRow};
 use bp_group_mgmt_engine::{
     EmailHooks, GroupServiceHooks, InvitationEmailContext, JoinDecisionEmailContext,
     JoinDecisionOutcome,
@@ -393,9 +389,16 @@ pub(crate) struct ProductionGroupServiceHooks {
 #[async_trait]
 impl GroupServiceHooks for ProductionGroupServiceHooks {
     async fn last_active_for_member(&self, group_id: Uuid, address: &AddressId) -> Option<i64> {
-        // Redis has the per-share timestamp; PG is only updated on block-found.
-        // Try Redis first so active miners who haven't found a block yet don't
-        // appear inactive.
+        // Redis holds the per-share timestamp, stamped on every accepted
+        // share. It is the only source: the PG fallback that used to sit
+        // behind this read the Group-Solo balance row, and there are no
+        // balance rows any more.
+        //
+        // `None` makes the caller fall back to `joined_at`, so a Redis
+        // loss without a restore makes a long-standing member look
+        // freshly joined and therefore kickable. The restore path exists
+        // (`--restore-redis-state`); the alternative was keeping a whole
+        // ledger table alive to carry one timestamp.
         let group_key = group_id.to_string();
         match self
             .group_solo
@@ -403,26 +406,14 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
             .read_last_accepted_share_at(&group_key, address.as_str())
             .await
         {
-            Ok(Some(ts)) => return Some(ts),
-            Ok(None) => {}
-            Err(err) => {
-                warn!(
-                    %err,
-                    %group_id,
-                    "group-hooks: last_active_for_member redis failed, falling back to db"
-                );
-            }
-        }
-        // PG fallback: persists across Redis resets, accurate after block-found.
-        match find_group_balance(self.db.pool(), address, group_id).await {
-            Ok(Some(row)) => row.last_accepted_share_at,
-            Ok(None) => None,
+            Ok(ts) => ts,
             Err(err) => {
                 warn!(
                     %err,
                     %group_id,
                     address = %address.as_str(),
-                    "group-hooks: last_active_for_member db query failed"
+                    "group-hooks: last_active_for_member redis read failed — reporting \
+                     'never mined', which lets the kick-inactivity guard fall back to joinedAt"
                 );
                 None
             }
@@ -433,7 +424,7 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
         &self,
         group_id: Uuid,
         kicked_address: &AddressId,
-        remaining_addresses: &[AddressId],
+        _remaining_addresses: &[AddressId],
     ) {
         let group_id_str = group_id.to_string();
 
@@ -479,72 +470,11 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
             );
         }
 
-        // PG: read pending balance before deleting so we can redistribute it.
-        let pending_sats = match find_group_balance(self.db.pool(), kicked_address, group_id).await
-        {
-            Ok(Some(row)) => row.pending_sats.0,
-            Ok(None) => 0,
-            Err(err) => {
-                warn!(
-                    %err,
-                    %group_id,
-                    address = %kicked_address.as_str(),
-                    "group-hooks: find_group_balance failed, redistribution skipped"
-                );
-                0
-            }
-        };
-
-        // PG: delete the kicked member's balance row AND redistribute its
-        // pending sats to the remaining members — atomically. Without the
-        // TX a mid-loop failure would delete the kicked balance but only
-        // partially credit the remaining members, silently destroying the
-        // uncredited sats (non-custodial: nobody holds them) and drifting
-        // the ledger. The TX makes it all-or-nothing: on any error the
-        // kicked balance row survives for a retry / dust-sweep, no sats lost.
-        let per_member = if pending_sats > 0 && !remaining_addresses.is_empty() {
-            pending_sats / remaining_addresses.len() as i64
-        } else {
-            0
-        };
-        let now = Utc::now().timestamp_millis();
-        let redistribute = async {
-            let mut tx = self.db.pool().begin().await?;
-            delete_pplns_group_balance(&mut *tx, kicked_address, group_id).await?;
-            if per_member > 0 {
-                for recipient in remaining_addresses {
-                    add_pplns_group_balance_pending(&mut *tx, recipient, group_id, per_member, now)
-                        .await?;
-                }
-            }
-            tx.commit().await?;
-            Ok::<(), bp_db::DbError>(())
-        }
-        .await;
-        match redistribute {
-            Ok(()) => {
-                if per_member > 0 {
-                    info!(
-                        %group_id,
-                        address = %kicked_address.as_str(),
-                        pending_sats,
-                        per_member,
-                        recipients = remaining_addresses.len(),
-                        "group-hooks: redistributed kicked member pending balance"
-                    );
-                }
-            }
-            Err(err) => {
-                warn!(
-                    %err,
-                    %group_id,
-                    address = %kicked_address.as_str(),
-                    pending_sats,
-                    "group-hooks: balance delete+redistribute TX failed; kicked balance \
-                     preserved for retry/dust-sweep (no sats lost)"
-                );
-            }
-        }
+        // Nothing to settle in Postgres. A kicked member's fair share is
+        // the round state that just left with them: `forget_member`
+        // removed their shares from the round, so the next distribution
+        // splits proportionally between whoever is left. That IS the
+        // redistribution — it needs no balance row, and there is none.
     }
 
     async fn on_group_dissolved(&self, group_id: Uuid) {
@@ -579,18 +509,6 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
                 %group_id,
                 "group-hooks: on_group_dissolved delete_all_snapshots failed (best-effort)"
             );
-        }
-
-        // PG: delete all balance rows for this group.
-        match delete_pplns_group_balances_for_group(self.db.pool(), group_id).await {
-            Ok(n) => {
-                info!(%group_id, rows = n, "group-hooks: on_group_dissolved balance rows deleted")
-            }
-            Err(err) => warn!(
-                %err,
-                %group_id,
-                "group-hooks: on_group_dissolved delete balances failed (best-effort)"
-            ),
         }
 
         // PG: delete all block history rows for this group.

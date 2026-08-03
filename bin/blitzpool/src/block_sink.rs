@@ -43,7 +43,6 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bp_bitcoin::BitcoinRpc;
-use bp_coinbase_snapshot::snapshot::StoredSnapshot;
 use bp_coinbase_snapshot::ActualCoinbase;
 use bp_common::{AddressId, MiningMode, StreamKind};
 use bp_group_solo_engine::engine::GroupSoloEngine;
@@ -97,18 +96,12 @@ pub(crate) struct BlockFoundEvent {
     /// Carried in the event so the apply side never re-derives it: the chain
     /// may have advanced by the time a Satellite consumes the event.
     pub height: i32,
-    /// Group-Solo distribution snapshot, frozen by the Core at the block-found
-    /// instant (exact reward, freshest round). `Some` only for `GroupSolo`
-    /// blocks; carried so the apply side applies the exact distribution the
-    /// coinbase paid instead of reading the raceable per-(group, finder) Redis
-    /// snapshot (which template rebuilds overwrite before the async apply runs).
-    /// `None` on a build failure → the apply falls back to the Redis read.
-    #[serde(default)]
-    pub groupsolo_snapshot: Option<StoredSnapshot>,
-    /// Weight-model (schema-2) variant of `groupsolo_snapshot`: the
-    /// settlement INPUTS of the distribution the winning job's coinbase
-    /// was built from. New events carry this; `groupsolo_snapshot`
-    /// stays for events produced before the weight model.
+    /// The settlement INPUTS of the distribution the winning job's
+    /// coinbase was built from, frozen by the Core at the block-found
+    /// instant. `Some` only for `GroupSolo` blocks; carried so the apply
+    /// side never re-reads the raceable per-(group, finder) Redis
+    /// snapshot (which template rebuilds overwrite before the async apply
+    /// runs). `None` on a build failure → the block is not booked.
     #[serde(default)]
     pub groupsolo_weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
     /// Identity of the payout list this block's coinbase pays, taken off the
@@ -519,7 +512,6 @@ impl TdpBlockSubmissionSink {
             mode: resolved.mode,
             group_id: resolved.group_id,
             height,
-            groupsolo_snapshot: None,
             groupsolo_weight_snapshot,
             actual_coinbase,
         };
@@ -849,7 +841,6 @@ impl BlockFoundApplier {
         height: i32,
         reward: u64,
         block_hash_hex: Option<&str>,
-        snapshot: Option<StoredSnapshot>,
         weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
         actual: Option<&bp_coinbase_snapshot::ActualCoinbase>,
         payouts_fingerprint: Option<[u8; 32]>,
@@ -863,7 +854,6 @@ impl BlockFoundApplier {
                     finder: address.as_str().to_string(),
                     block_height: height,
                     block_reward_sats: reward,
-                    snapshot: snapshot.clone(),
                     weight_snapshot: weight_snapshot.clone(),
                     actual_coinbase: actual.cloned(),
                     payouts_fingerprint,
@@ -879,7 +869,6 @@ impl BlockFoundApplier {
                         address,
                         height,
                         reward,
-                        snapshot,
                         weight_snapshot,
                         actual,
                         payouts_fingerprint,
@@ -908,7 +897,6 @@ impl BlockFoundApplier {
                     address,
                     height,
                     reward,
-                    snapshot,
                     weight_snapshot,
                     actual,
                     payouts_fingerprint,
@@ -918,10 +906,13 @@ impl BlockFoundApplier {
         }
     }
 
-    /// Immediate (non-gated) Group-Solo apply of the distribution the block's
-    /// coinbase pays. Weight-model settlement (claim − paid from the real
-    /// coinbase) when the event carries the weight snapshot + actuals; the
-    /// legacy exact-match apply only remains for events produced before.
+    /// Immediate (non-gated) Group-Solo apply: write the block's payout
+    /// history from its own coinbase.
+    ///
+    /// Both the weight snapshot AND the parsed coinbase are required. The
+    /// snapshot alone says what the pool intended; only the coinbase says
+    /// what it paid, and the history records the latter. Without both,
+    /// nothing is written and the block is an operator reprocess.
     #[allow(clippy::too_many_arguments)]
     async fn apply_group_solo_now(
         &self,
@@ -931,48 +922,29 @@ impl BlockFoundApplier {
         address: &AddressId,
         height: i32,
         reward: u64,
-        snapshot: Option<StoredSnapshot>,
         weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
         actual: Option<&bp_coinbase_snapshot::ActualCoinbase>,
         payouts_fingerprint: Option<[u8; 32]>,
     ) {
-        let applied = match (weight_snapshot, actual) {
-            (Some(ws), Some(actual)) => {
-                engine
-                    .on_block_found_scaled(
-                        group_uuid,
-                        height,
-                        actual,
-                        address,
-                        Some(ws),
-                        payouts_fingerprint,
-                    )
-                    .await
-            }
-            _ => match snapshot {
-                Some(snapshot) => {
-                    engine
-                        .on_block_found_with_snapshot(
-                            group_uuid,
-                            height,
-                            reward,
-                            address,
-                            snapshot.into(),
-                        )
-                        .await
-                }
-                None => {
-                    warn!(
-                        group_id = group_id_str,
-                        height,
-                        "block-found: Group-Solo event carries neither a weight snapshot (+ \
-                         actuals) nor a legacy snapshot — NOT booked, reprocess from the \
-                         block's own coinbase"
-                    );
-                    return;
-                }
-            },
+        let (Some(ws), Some(actual)) = (weight_snapshot, actual) else {
+            warn!(
+                group_id = group_id_str,
+                height,
+                "block-found: Group-Solo event carries no weight snapshot + parsed coinbase \
+                 — NOT booked, reprocess from the block's own coinbase"
+            );
+            return;
         };
+        let applied = engine
+            .on_block_found(
+                group_uuid,
+                height,
+                actual,
+                address,
+                Some(ws),
+                payouts_fingerprint,
+            )
+            .await;
         match applied {
             Ok(outcome) => {
                 self.settle_distributions();
@@ -981,8 +953,7 @@ impl BlockFoundApplier {
                     height,
                     reward_sats = reward,
                     history_inserted = outcome.history_inserted,
-                    balances_affected = outcome.balances_affected,
-                    "block-found: Group-Solo ledger applied"
+                    "block-found: Group-Solo payout history written"
                 )
             }
             Err(err) => warn!(%err, group_id = group_id_str, height,
@@ -1185,8 +1156,7 @@ impl BlockFoundApplier {
                         // PPLNS arm so an orphan / non-chain-extending
                         // candidate never books a phantom into the group
                         // ledger.
-                        let has_weight = event.groupsolo_weight_snapshot.is_some();
-                        if has_weight || event.groupsolo_snapshot.is_some() {
+                        if event.groupsolo_weight_snapshot.is_some() {
                             self.gate_or_apply_group_solo(
                                 engine,
                                 group_uuid,
@@ -1195,7 +1165,6 @@ impl BlockFoundApplier {
                                 height,
                                 reward,
                                 block_hash_hex.as_deref(),
-                                event.groupsolo_snapshot.clone(),
                                 event.groupsolo_weight_snapshot.clone(),
                                 event.actual_coinbase.as_ref(),
                                 event.pplns_payouts_fingerprint,
@@ -1616,9 +1585,24 @@ mod tests {
     /// and `height` so the apply side needs no gate / RPC.
     #[test]
     fn block_found_event_json_round_trips_with_stamped_fields() {
+        let weight_snapshot = bp_coinbase_snapshot::StoredWeightSnapshot {
+            entries: vec![bp_coinbase_snapshot::WeightSnapshotEntry {
+                address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                score_weight: 1_000_000_000_000,
+                balance_sats: 0,
+                wire_weight: 1_000_000_000_000,
+                dust_limit: 546,
+            }],
+            score_total: 1_000_000_000_000,
+            fee_ppm: 15_000,
+            fee_address: "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+                .to_string(),
+            reference_revenue_sats: 312_500_000,
+            weight_p: 15_228_426_395,
+        };
         let event = BlockFoundEvent {
             actual_coinbase: None,
-            groupsolo_weight_snapshot: None,
+            groupsolo_weight_snapshot: Some(weight_snapshot.clone()),
             pplns_payouts_fingerprint: None,
             address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
             worker: "rig1".to_string(),
@@ -1629,20 +1613,6 @@ mod tests {
             mode: MiningMode::GroupSolo,
             group_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
             height: 870_123,
-            groupsolo_snapshot: Some(StoredSnapshot {
-                balance_before: Vec::new(),
-                distribution: vec![bp_pplns::CoinbaseDistributionEntry {
-                    address: AddressId::new(
-                        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-                    )
-                    .unwrap(),
-                    percent: 100.0,
-                    sats: bp_common::Sats(312_500_000),
-                }],
-                block_reward_sats: 312_500_000,
-                considered_addresses: vec!["bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string()],
-                balance_after: vec![("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(), 0)],
-            }),
         };
         let json = serde_json::to_string(&event).expect("serialize");
         let back: BlockFoundEvent = serde_json::from_str(&json).expect("deserialize");
@@ -1657,6 +1627,6 @@ mod tests {
         assert_eq!(back.block_data, event.block_data);
         // The Group-Solo snapshot rides the wire intact — the apply side
         // depends on the exact frozen distribution, not a Redis re-read.
-        assert_eq!(back.groupsolo_snapshot, event.groupsolo_snapshot);
+        assert_eq!(back.groupsolo_weight_snapshot, Some(weight_snapshot));
     }
 }

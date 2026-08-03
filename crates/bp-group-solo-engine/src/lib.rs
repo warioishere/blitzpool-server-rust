@@ -15,12 +15,23 @@
 //!
 //! # Differences vs `bp-pplns-engine`
 //!
-//! - **Unsigned ledger**: `pendingSats` is always `≥ 0`. No matching
-//!   debits, no pair-cancel sweep. Sub-dust accumulates as positive
-//!   pending; dust-sweep deletes single-sided when dormant.
+//! - **No ledger.** PPLNS remembers what it owes a miner it could not
+//!   pay this block and settles it out of a later one, which is what
+//!   `pplns_balance` is for. Group-Solo makes the opposite trade: a
+//!   member the coinbase cannot pay forfeits the block and their share
+//!   falls to the pool output ([`bp_pplns::WithheldValue::ToPool`]).
+//!   Nobody is over- or underpaid, so there is no difference to carry —
+//!   no balances, no dust sweep, no settlement at block-found. What the
+//!   coinbase paid IS the record, and the audit log is written straight
+//!   from it.
+//!
+//!   That only holds while every member fits in the coinbase, so the
+//!   member cap is not a preference: `GroupService` refuses a join past
+//!   what `bp_pplns::max_coinbase_outputs` says the Group-Solo weight
+//!   budget can pay.
 //! - **Round-based, not windowed**: the share zset wipes on every
-//!   block-found. The optional cron-driven scheduled reset wipes
-//!   balances on top.
+//!   block-found. A cron-driven scheduled reset wipes it on a calendar
+//!   tick instead.
 //! - **Per-group config**: `finderBonusPpm`, `roundResetPreset`,
 //!   `roundResetTimezone`, `roundResetIntervalDays` live in the DB
 //!   row keyed by `groupId`, NOT in `GroupSoloEngineConfig`.
@@ -52,9 +63,8 @@ pub mod config;
 pub mod distribution;
 pub mod engine;
 pub mod error;
+pub mod history;
 pub mod hooks;
-pub mod ledger;
 pub mod reader;
 pub mod reset;
 pub mod round;
-pub mod sweep;

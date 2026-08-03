@@ -14,7 +14,6 @@
 //! Same Redis HASH layout as PPLNS via [`crate::pending_store`] — different key
 //! + payload, no duplicated put/remove/load logic.
 
-use bp_coinbase_snapshot::snapshot::StoredSnapshot;
 use redis::{aio::ConnectionManager, RedisError};
 
 use crate::pending_store::{put_pending, remove_pending, PendingBlockRef};
@@ -43,14 +42,9 @@ pub(crate) struct PendingGroupSoloBlock {
     pub block_height: i32,
     /// Block-reward portion this coinbase claims.
     pub block_reward_sats: u64,
-    /// Legacy (schema-1) exact-match snapshot. `Some` only on blobs frozen
-    /// before the weight model; new blobs carry `weight_snapshot` instead.
-    /// `serde(default)` keeps old blobs readable in both directions.
-    #[serde(default)]
-    pub snapshot: Option<StoredSnapshot>,
-    /// Weight-model settlement inputs (schema 2), applied via
-    /// `GroupSoloEngine::on_block_found_scaled` together with
-    /// `actual_coinbase` once the block confirms.
+    /// The distribution's settlement inputs, carried alongside
+    /// `actual_coinbase` so `GroupSoloEngine::on_block_found` can write
+    /// the payout history once the block confirms.
     #[serde(default)]
     pub weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
     /// What the block's coinbase actually paid — the weight-model
@@ -95,8 +89,6 @@ pub(crate) async fn remove_pending_group_solo_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bp_common::Sats;
-    use bp_pplns::CoinbaseDistributionEntry;
 
     /// The stored blob must round-trip exactly — it's replayed into the ledger
     /// once the block confirms.
@@ -112,17 +104,6 @@ mod tests {
             finder: "bcrt1qfinder".to_string(),
             block_height: 840_000,
             block_reward_sats: 312_500_000,
-            snapshot: Some(StoredSnapshot {
-                balance_before: Vec::new(),
-                distribution: vec![CoinbaseDistributionEntry {
-                    address: bp_common::AddressId::new("bcrt1qfinder".to_string()).unwrap(),
-                    percent: 100.0,
-                    sats: Sats(312_500_000),
-                }],
-                block_reward_sats: 312_500_000,
-                considered_addresses: vec!["bcrt1qfinder".to_string()],
-                balance_after: vec![("bcrt1qfinder".to_string(), 0)],
-            }),
         };
         let json = serde_json::to_string(&pb).unwrap();
         let back: PendingGroupSoloBlock = serde_json::from_str(&json).unwrap();
@@ -131,7 +112,6 @@ mod tests {
         assert_eq!(back.finder, pb.finder);
         assert_eq!(back.block_height, 840_000);
         assert_eq!(back.block_reward_sats, 312_500_000);
-        assert_eq!(back.snapshot, pb.snapshot);
         assert_eq!(back.block_hash(), "00000000deadbeef");
         assert_eq!(back.block_height(), 840_000);
     }

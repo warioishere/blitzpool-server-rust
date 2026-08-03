@@ -3,15 +3,12 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Integration tests for member-kick DB helpers:
-//! - `add_pplns_group_balance_pending` (redistribute pending on kick)
-//! - `delete_pplns_group_block_history_for_group` (dissolve cleanup)
+//! Integration tests for `delete_pplns_group_block_history_for_group`
+//! — the dissolve-cleanup helper.
 
-use bp_common::AddressId;
 use bp_db::{
-    add_pplns_group_balance_pending, bulk_insert_pplns_group_block_history,
-    bulk_upsert_pplns_group_balances, delete_pplns_group_block_history_for_group,
-    find_group_balance, GroupBalanceUpsert, GroupPayoutHistoryInsert,
+    bulk_insert_pplns_group_block_history, delete_pplns_group_block_history_for_group,
+    GroupPayoutHistoryInsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
@@ -57,79 +54,6 @@ async fn seed_group_in_tx(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, group_
     .execute(&mut **tx)
     .await
     .expect("seed group");
-}
-
-// ── add_pplns_group_balance_pending ────────────────────────────────
-
-#[tokio::test]
-async fn add_pending_creates_row_when_none_exists() {
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    let group_id = Uuid::new_v4();
-    seed_group_in_tx(&mut tx, group_id).await;
-
-    let addr = AddressId::new(ADDR_A.to_string()).unwrap();
-    add_pplns_group_balance_pending(&mut *tx, &addr, group_id, 5000, 1_700_000_000_000)
-        .await
-        .expect("add_pending ok");
-
-    let row = sqlx::query_as::<_, (i64,)>(
-        r#"SELECT "pendingSats" FROM pplns_group_balance WHERE address = $1 AND "groupId" = $2"#,
-    )
-    .bind(ADDR_A)
-    .bind(group_id)
-    .fetch_one(&mut *tx)
-    .await
-    .expect("fetch ok");
-    assert_eq!(row.0, 5000);
-
-    tx.rollback().await.expect("rollback ok");
-}
-
-#[tokio::test]
-async fn add_pending_increments_existing_row() {
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let mut tx = pool.begin().await.expect("begin tx");
-    let group_id = Uuid::new_v4();
-    seed_group_in_tx(&mut tx, group_id).await;
-
-    // Seed initial balance of 10_000
-    bulk_upsert_pplns_group_balances(
-        &mut *tx,
-        &[GroupBalanceUpsert {
-            address: ADDR_B.to_string(),
-            group_id,
-            pending_sats: 10_000,
-            total_paid_sats: 50_000,
-            updated_at_ms: 1_700_000_000_000,
-            last_accepted_share_at_ms: Some(1_700_000_000_000),
-        }],
-    )
-    .await
-    .expect("seed ok");
-
-    let addr = AddressId::new(ADDR_B.to_string()).unwrap();
-    add_pplns_group_balance_pending(&mut *tx, &addr, group_id, 3_000, 1_700_000_001_000)
-        .await
-        .expect("add_pending ok");
-
-    let row = sqlx::query_as::<_, (i64, i64)>(
-        r#"SELECT "pendingSats", "totalPaidSats" FROM pplns_group_balance
-           WHERE address = $1 AND "groupId" = $2"#,
-    )
-    .bind(ADDR_B)
-    .bind(group_id)
-    .fetch_one(&mut *tx)
-    .await
-    .expect("fetch ok");
-    assert_eq!(row.0, 13_000, "10_000 + 3_000 expected");
-    assert_eq!(row.1, 50_000, "totalPaidSats unchanged");
-
-    tx.rollback().await.expect("rollback ok");
 }
 
 // ── delete_pplns_group_block_history_for_group ────────────────────
@@ -247,10 +171,4 @@ async fn delete_history_for_group_is_isolated_to_group() {
     assert_eq!(count.0, 1, "group_b row should still exist");
 
     tx.rollback().await.expect("rollback ok");
-}
-
-// silence unused import warning if find_group_balance isn't used by all test paths
-#[allow(dead_code)]
-fn _ensure_imports_resolve(_: Option<bp_db::PplnsGroupBalanceRow>) {
-    let _ = find_group_balance;
 }

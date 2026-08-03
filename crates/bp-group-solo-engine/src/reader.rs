@@ -7,15 +7,12 @@
 //!   [`ReaderView::round_stats`]
 //! - `/api/pplns/groups/:groupId/best-difficulty` ⇒
 //!   [`ReaderView::best_difficulty`]
-//! - `/api/pplns/groups/:groupId/balance/:address` ⇒
-//!   [`ReaderView::balance`]
 //!
 //! `/api/pplns/groups/:groupId/blocks` (block-history list) is
 //! deferred to a consumer-driven bp-db read query; the underlying
 //! `PplnsGroupBlockHistoryRow` row-struct already exists in bp-db.
 
-use bp_common::AddressId;
-use bp_db::{find_group, find_group_balance};
+use bp_db::find_group;
 use bp_group_mgmt::group::PayoutMode;
 use uuid::Uuid;
 
@@ -30,15 +27,6 @@ impl GroupSoloEngine {
 
 pub struct ReaderView<'a> {
     engine: &'a GroupSoloEngine,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct GroupBalanceView {
-    pub address: String,
-    pub group_id: Uuid,
-    pub pending_sats: i64,
-    pub total_paid_sats: i64,
-    pub last_accepted_share_at_ms: Option<i64>,
 }
 
 /// Per-time-bucket sliding-window contribution for the timeline chart.
@@ -77,27 +65,6 @@ impl ReaderView<'_> {
             .read_best_share(&group_id.to_string())
             .await?;
         Ok(best)
-    }
-
-    /// One miner's balance + last-share state for a specific group.
-    /// `Ok(None)` if the address isn't a member with an open
-    /// pending balance.
-    pub async fn balance(
-        &self,
-        group_id: Uuid,
-        address: &str,
-    ) -> Result<Option<GroupBalanceView>, EngineError> {
-        let Ok(addr_id) = AddressId::new(address.to_string()) else {
-            return Ok(None);
-        };
-        let row = find_group_balance(self.engine.pool(), &addr_id, group_id).await?;
-        Ok(row.map(|r| GroupBalanceView {
-            address: r.address.as_str().to_string(),
-            group_id: r.group_id,
-            pending_sats: r.pending_sats.0,
-            total_paid_sats: r.total_paid_sats.0,
-            last_accepted_share_at_ms: r.last_accepted_share_at,
-        }))
     }
 
     /// Per-bucket sliding-window timeline for a `Window`-mode group (drives the

@@ -48,14 +48,6 @@ pub struct GroupSoloEngineConfig {
     /// Per-(group, finder) snapshot TTL in seconds. Defaults to 1h.
     pub snapshot_ttl_secs: u32,
 
-    /// Whether the daily 03:00 UTC group-dust-sweep runs.
-    pub dust_sweep_enabled: bool,
-
-    /// Group-Solo legacy dust-sweep dormancy threshold (days).
-    /// Defaults to 30. Shorter than PPLNS's 90d because group balances
-    /// are all-positive and have no counterparty to wait for.
-    pub dormant_balance_days: u32,
-
     /// Blocks between subsidy halvings on the network this pool runs
     /// on — the input to the settlement gate's floor
     /// (`bp_share::block_subsidy_sats`). NOT an operator knob: it is
@@ -74,8 +66,6 @@ impl Default for GroupSoloEngineConfig {
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
             coinbase_weight_budget: DEFAULT_COINBASE_WEIGHT_BUDGET,
             snapshot_ttl_secs: 3_600,
-            dust_sweep_enabled: true,
-            dormant_balance_days: 30,
             subsidy_halving_interval: bp_share::SUBSIDY_HALVING_INTERVAL,
         }
     }
@@ -97,11 +87,6 @@ impl GroupSoloEngineConfig {
         if self.snapshot_ttl_secs == 0 {
             return Err(ConfigError::ZeroUnsignedField {
                 field: "snapshot_ttl_secs",
-            });
-        }
-        if self.dormant_balance_days == 0 {
-            return Err(ConfigError::ZeroUnsignedField {
-                field: "dormant_balance_days",
             });
         }
         Ok(self)
@@ -239,20 +224,6 @@ mod tests {
     }
 
     #[test]
-    fn zero_dormant_balance_days_rejects() {
-        let cfg = GroupSoloEngineConfig {
-            dormant_balance_days: 0,
-            ..GroupSoloEngineConfig::default()
-        };
-        assert!(matches!(
-            cfg.try_new().unwrap_err(),
-            ConfigError::ZeroUnsignedField {
-                field: "dormant_balance_days",
-            }
-        ));
-    }
-
-    #[test]
     fn fee_suppressed_when_no_address() {
         let cfg = GroupSoloEngineConfig::default();
         assert!(cfg.fee_suppressed());
@@ -277,12 +248,5 @@ mod tests {
         };
         assert!(!cfg.fee_suppressed());
         cfg.try_new().expect("active fee config validates");
-    }
-
-    #[test]
-    fn group_solo_default_dormant_days_is_30() {
-        // Confirms the divergence from PPLNS's 90d default — group
-        // balances have no counterparty to wait for.
-        assert_eq!(GroupSoloEngineConfig::default().dormant_balance_days, 30);
     }
 }

@@ -301,7 +301,7 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
         bp_coinbase_snapshot::ActualCoinbase::from_coinbase(&coinbase_tx, Network::Regtest);
     assert_eq!(actual.total_value_sats, reward_sats);
     let outcome = engine
-        .on_block_found_scaled(
+        .on_block_found(
             group_id,
             after as i32,
             &actual,
@@ -399,7 +399,6 @@ async fn cleanup_member_rows(pool: &PgPool, addrs: &[&str]) {
 
 fn test_engine_config(fee_addr: &str) -> GroupSoloEngineConfig {
     GroupSoloEngineConfig {
-        dust_sweep_enabled: false,
         // Match production: real Group-Solo deployments always run with
         // a fee address and a non-zero fee percent. With `None`/`0`,
         // the rounding residuum in `suppress_matching_debits` mode
