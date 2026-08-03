@@ -168,9 +168,10 @@ pub use pplns::{
     bulk_update_pplns_last_accepted_share_at, bulk_upsert_pplns_balances,
     delete_pplns_balance_if_unchanged, find_pplns_balance, find_pplns_balances_abandoned,
     find_pplns_balances_for_addresses, find_pplns_balances_for_addresses_locked,
-    find_pplns_balances_with_open_balance, find_pplns_payout_history, pplns_block_already_booked,
-    update_pplns_balance_sats_if_unchanged, BalanceUpsert, PayoutHistoryInsert,
-    PplnsBalanceAggregate, PplnsBalanceRow, PplnsPayoutHistoryRow, TouchUpdate,
+    find_pplns_balances_with_open_balance, find_pplns_payout_history,
+    pplns_booked_value_rows_at_height, update_pplns_balance_sats_if_unchanged, BalanceUpsert,
+    PayoutHistoryInsert, PplnsBalanceAggregate, PplnsBalanceRow, PplnsPayoutHistoryRow,
+    TouchUpdate,
 };
 pub use stats_writes::{
     bulk_upsert_address_settings, bulk_upsert_client_rejected_statistics_entity,

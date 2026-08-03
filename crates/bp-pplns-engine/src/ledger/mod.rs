@@ -129,10 +129,41 @@ pub async fn apply_distribution(
     balances: &[BalanceWrite],
     now_ms: i64,
 ) -> Result<ApplyDistributionResult, LedgerError> {
-    if bp_db::pplns_block_already_booked(&mut *tx, block_height).await? {
-        return Ok(ApplyDistributionResult {
-            history_inserted: 0,
-            balances_affected: 0,
+    // Height is the only identity a booked block has here — the table has no
+    // `blockHash` column and is UNIQUE on `(blockHeight, address)`. So "this
+    // height has history" answers two different questions at once: a harmless
+    // redelivery of the SAME block, and a second, DIFFERENT block at the same
+    // height (a reorg replaced the one already booked). The first must pass
+    // silently; the second is a block whose miners were paid on-chain and
+    // whose settlement is about to be skipped.
+    //
+    // They are told apart by what the booking WOULD be rather than by which
+    // block it is, which is the question that actually matters: if the rows
+    // already recorded match the value-bearing rows this apply would write,
+    // replaying moves nothing either way — even for a genuinely different
+    // block, because two blocks that pay the same coinbase settle the same
+    // deltas and booking them twice would double-apply them.
+    let booked = bp_db::pplns_booked_value_rows_at_height(&mut *tx, block_height).await?;
+    if !booked.is_empty() {
+        let mut want: Vec<(String, i64)> = rows
+            .iter()
+            .filter(|r| r.paid_sats.0 != 0)
+            .map(|r| (r.address.as_str().to_string(), r.paid_sats.0))
+            .collect();
+        want.sort();
+        if booked == want {
+            // The ordinary replay: the confirmation watcher's post-apply
+            // `remove_pending_block` failed, or the process died in that
+            // window. Nothing to do.
+            return Ok(ApplyDistributionResult {
+                history_inserted: 0,
+                balances_affected: 0,
+            });
+        }
+        return Err(LedgerError::HeightBookedByAnotherBlock {
+            block_height,
+            booked_rows: booked.len(),
+            incoming_rows: want.len(),
         });
     }
 

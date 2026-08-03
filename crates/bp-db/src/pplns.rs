@@ -427,35 +427,41 @@ where
     Ok(result.rows_affected())
 }
 
-/// Has any payout-history row already been written for this block?
+/// The VALUE-BEARING payout rows already recorded at `block_height`, as
+/// `(address, paidSats)` sorted for comparison.
 ///
-/// The idempotency question, asked directly. `bulk_insert_pplns_payout_history`
-/// reports how many rows it inserted, and that number is NOT an answer to
-/// it: the caller's row set includes one row per address live in the PPLNS
-/// window at apply time, so a replay of an already-booked block can still
-/// report progress and let an absolute balance write run a second time.
-/// Ask the block, not the row count.
+/// This is what tells a harmless replay apart from a second, DIFFERENT
+/// block at the same height. `pplns_payout_history` has no `blockHash`
+/// column and is UNIQUE on `(blockHeight, address)`, so height is the only
+/// identity a booked block has, so a plain `EXISTS` on the height cannot
+/// say WHICH block it saw. That is what this replaces.
 ///
-/// `blockHeight` identifies the block here, exactly as the
-/// `("blockHeight", address)` UNIQUE already assumes. The dust sweep's
-/// synthetic heights are strictly negative and cannot collide.
-pub async fn pplns_block_already_booked<'e, E>(
+/// Rows with `paidSats = 0` are excluded on purpose: those are the
+/// "late arriver" rows the apply writes for addresses live in the window
+/// but absent from the distribution, and the window moves between attempts.
+/// Including them would make every legitimate replay look like a different
+/// block. What remains is block-determined — the coinbase payments and the
+/// non-zero settlement deltas both follow from the found block's own
+/// coinbase and its frozen snapshot — so it is identical on a replay of the
+/// same block and differs for another one.
+pub async fn pplns_booked_value_rows_at_height<'e, E>(
     executor: E,
     block_height: i32,
-) -> Result<bool, DbError>
+) -> Result<Vec<(String, i64)>, DbError>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let row = sqlx::query!(
-        r#"SELECT EXISTS(
-             SELECT 1 FROM pplns_payout_history WHERE "blockHeight" = $1
-           ) AS "booked!""#,
+    let rows = sqlx::query!(
+        r#"SELECT address, "paidSats" AS paid_sats
+             FROM pplns_payout_history
+            WHERE "blockHeight" = $1 AND "paidSats" <> 0
+            ORDER BY address"#,
         block_height,
     )
-    .fetch_one(executor)
+    .fetch_all(executor)
     .await
     .map_err(DbError::from)?;
-    Ok(row.booked)
+    Ok(rows.into_iter().map(|r| (r.address, r.paid_sats)).collect())
 }
 
 /// Bulk-insert payout-history rows for one block. `ON CONFLICT

@@ -563,6 +563,109 @@ async fn a_second_apply_of_the_same_block_moves_no_money() {
     drop_harness(h).await;
 }
 
+// ── A reorg replacement at the same height must not vanish ──────────
+//
+// MONEY. `pplns_payout_history` has no `blockHash` column and is UNIQUE on
+// `(blockHeight, address)`, so the ledger identifies a booked block by its
+// HEIGHT alone. When a reorg replaces a booked block with another one at the
+// same height, the guard used to answer "this height has history" and return
+// `Ok` with zero counts — which the confirmation watcher reads as success: it
+// fires the settlement, logs "payout history applied" and drops the parked
+// block. A block whose coinbase paid miners on-chain disappeared, and the
+// log line was indistinguishable from a harmless redelivery.
+//
+// It is now a terminal error, so the watcher parks it in the unbookable
+// store where the frozen distribution survives for a reprocess — and
+// `pool_blocks_unbookable` makes it a number rather than a lost line.
+//
+// The false-alarm half is guarded by `a_second_apply_of_the_same_block_moves_
+// no_money`, which grows the row set between two applies and demands a no-op.
+
+#[tokio::test]
+async fn a_different_block_at_the_same_height_is_refused_not_swallowed() {
+    let _serial = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(20, "test_heightconflict_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const BIG: &str = "bc1qc7slrfxkknqcq2jevvvkdgvrt8080852dfjewde450xdlk4ugp7szw5tk9";
+    const TINY: &str = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
+    const REWARD: u64 = 3_000_000_000;
+    let height: i32 = 9_997_301;
+    for addr in [BIG, TINY] {
+        cleanup_addr(&h.pool, addr, &[height]).await;
+    }
+
+    // TINY is withheld and settles as a CREDIT — a non-zero delta, so a
+    // second apply would visibly double it.
+    h.engine
+        .record_share(None, BIG, 1_000_000.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, TINY, 1.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+
+    let result = h.engine.build_distribution(REWARD).await.expect("built");
+    let fp = result.payouts_fingerprint();
+
+    // Block A confirms and books.
+    let coinbase_a = actual_paying_exactly(&result, REWARD);
+    let first = h
+        .engine
+        .on_block_found(height, &coinbase_a, None, Some(fp))
+        .await
+        .expect("first apply books");
+    assert!(first.history_inserted >= 1);
+    let credit_after_first = credit_of(&h.pool, TINY).await;
+    assert!(
+        credit_after_first > 0,
+        "precondition: the withheld miner carries a credit a double-apply would move"
+    );
+
+    // A reorg replaces it with block B at the SAME height, paying a
+    // different revenue — so a different coinbase and different deltas.
+    let coinbase_b = actual_paying_exactly(&result, REWARD + 250_000_000);
+    assert_ne!(
+        coinbase_a.paid_by_address, coinbase_b.paid_by_address,
+        "precondition: the two blocks must actually pay differently, or there \
+         is nothing for the guard to tell apart"
+    );
+
+    let err = h
+        .engine
+        .on_block_found(height, &coinbase_b, None, Some(fp))
+        .await
+        .expect_err("a different block at a booked height must not report success");
+    assert!(
+        err.is_terminal(),
+        "the recorded rows will not change on a retry, so retrying forever \
+         hides the block behind a repeating warning: {err}"
+    );
+    assert!(
+        matches!(
+            err,
+            bp_pplns_engine::engine::EngineError::Ledger(
+                bp_coinbase_snapshot::LedgerError::HeightBookedByAnotherBlock { .. }
+            )
+        ),
+        "expected the height-conflict verdict, got {err}"
+    );
+
+    // And nothing moved: the refusal rolls the whole transaction back.
+    assert_eq!(
+        credit_of(&h.pool, TINY).await,
+        credit_after_first,
+        "the refused apply must not have touched the ledger"
+    );
+
+    for addr in [BIG, TINY] {
+        cleanup_addr(&h.pool, addr, &[height]).await;
+    }
+    drop_harness(h).await;
+}
+
 /// The signed ledger balance of one address, `0` when it has no row.
 async fn credit_of(pool: &PgPool, address: &str) -> i64 {
     sqlx::query_as::<_, (i64,)>(r#"SELECT "balanceSats" FROM pplns_balance WHERE address = $1"#)

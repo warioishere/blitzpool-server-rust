@@ -128,12 +128,17 @@ impl EngineError {
             | EngineError::NoPayoutFingerprint { .. }
             | EngineError::RevenueBelowSubsidy { .. }
             | EngineError::Address(_) => true,
+            // A ledger error is usually infrastructure, but one of them is a
+            // verdict: a height that already carries a different block's
+            // payout rows will still carry them next tick. `LedgerError`
+            // owns that distinction so this engine and Group-Solo cannot
+            // disagree about it.
+            EngineError::Ledger(e) => e.is_terminal(),
             // Infrastructure, and the in-flight guard — all of these
             // clear on their own.
             EngineError::Redis(_)
             | EngineError::Window(_)
             | EngineError::Db(_)
-            | EngineError::Ledger(_)
             | EngineError::Sweep(_)
             | EngineError::Distribution(_)
             | EngineError::BlockFoundInProgress => false,
