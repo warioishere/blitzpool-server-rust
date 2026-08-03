@@ -31,7 +31,8 @@ pub use budget::{read_coinbase_budget, write_coinbase_budget};
 pub use build::{build_and_snapshot, BuildRequest, BuiltDistribution};
 pub use ledger::{ApplyDistributionResult, LedgerError, PayoutRowType};
 pub use snapshot::{
-    delete_snapshot, read_weight_snapshot, write_weight_snapshot, StoredWeightSnapshot,
+    delete_snapshot, read_weight_snapshot, read_weight_snapshot_with_retry,
+    resolve_snapshot_for_block_found, write_weight_snapshot, StoredWeightSnapshot,
     WeightSnapshotEntry,
 };
 

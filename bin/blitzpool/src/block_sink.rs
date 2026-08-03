@@ -94,20 +94,32 @@ pub(crate) struct BlockFoundEvent {
     /// may have advanced by the time a Satellite consumes the event.
     pub height: i32,
     /// The settlement INPUTS of the distribution the winning job's
-    /// coinbase was built from, frozen by the Core at the block-found
-    /// instant. `Some` only for `GroupSolo` blocks; carried so the apply
-    /// side never re-reads the raceable per-(group, finder) Redis
-    /// snapshot (which template rebuilds overwrite before the async apply
-    /// runs). `None` on a build failure → the block is not booked.
-    #[serde(default)]
-    pub groupsolo_weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
+    /// coinbase was built from, resolved by the Core at the block-found
+    /// instant — for EVERY snapshot-backed mode (PPLNS and Group-Solo
+    /// alike; see `TdpBlockSubmissionSink::resolve_weight_snapshot`).
+    ///
+    /// Carried so the apply side never re-reads a Redis key that has
+    /// moved on or expired: Group-Solo's per-(group, finder) key is
+    /// overwritten by continuous template rebuilds, and PPLNS's per-job
+    /// key TTLs out inside the confirmation window. `None` → the apply
+    /// side has to fall back to a late read under the fingerprint, which
+    /// usually finds nothing.
+    ///
+    /// The wire name stays `groupsolo_weight_snapshot`: this rides a
+    /// Redis stream that other processes replay, and a rolling deploy has
+    /// both spellings in flight at once. The Rust name is generic because
+    /// the field never was Group-Solo-specific — treating it as such is
+    /// exactly what left PPLNS without one.
+    #[serde(default, rename = "groupsolo_weight_snapshot")]
+    pub weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
     /// Identity of the payout list this block's coinbase pays, taken off the
-    /// job the winning share was built on. Both group-ledger paths look the
-    /// distribution up under it, so what gets booked is what the coinbase
-    /// actually paid instead of whatever a shared snapshot key holds by then —
-    /// PPLNS on the apply side, Group-Solo when the Core stamps
-    /// `groupsolo_snapshot`. `None`/zero when the pool did not build the
-    /// coinbase (`SetCustomMiningJob`) or the job path carries no fingerprint.
+    /// job the winning share was built on. It is what the Core resolves
+    /// [`Self::weight_snapshot`] under, so what gets booked is what the
+    /// coinbase actually paid instead of whatever a shared snapshot key holds
+    /// by then. It rides along afterwards as the apply side's fallback key
+    /// (and Group-Solo's post-apply cleanup target). `None`/zero when the
+    /// pool did not build the coinbase (`SetCustomMiningJob`) or the job path
+    /// carries no fingerprint.
     ///
     /// Named for PPLNS because that is where it started; the name is on the
     /// wire format of a stream other processes replay, so it stays.
@@ -470,29 +482,21 @@ impl TdpBlockSubmissionSink {
             }
         }
 
-        // Group-Solo: stamp the distribution the winning job's coinbase pays
-        // into the event, looked up by that job's payout-list fingerprint, so
-        // the apply side (an async Satellite under the split) books exactly
-        // that. Neither of the two things it replaces is safe: the
-        // per-(group, finder) Redis key is overwritten by continuous template
-        // rebuilds before the apply runs, and rebuilding the distribution here
-        // runs against a round that any share since job-issue has moved.
-        // `None` here means the block is NOT booked automatically.
-        // A zeroed fingerprint means the pool did not build this coinbase
-        // (`SetCustomMiningJob`) — there is no distribution of ours to find.
+        // Stamp the distribution the winning job's coinbase pays into the
+        // event, looked up by that job's payout-list fingerprint, so the apply
+        // side books exactly that. A zeroed fingerprint means the pool did not
+        // build this coinbase (`SetCustomMiningJob`) — there is no
+        // distribution of ours to find.
         let job_payouts_fingerprint = pplns_payouts_fingerprint.filter(|fp| fp != &[0u8; 32]);
-        let groupsolo_weight_snapshot = if resolved.mode == MiningMode::GroupSolo {
-            self.resolve_group_solo_distribution(
+        let weight_snapshot = self
+            .resolve_weight_snapshot(
+                resolved.mode,
                 &address,
                 resolved.group_id.as_deref(),
-                reward_sats,
                 job_payouts_fingerprint,
                 height,
             )
-            .await
-        } else {
-            None
-        };
+            .await;
 
         let event = BlockFoundEvent {
             address,
@@ -505,7 +509,7 @@ impl TdpBlockSubmissionSink {
             mode: resolved.mode,
             group_id: resolved.group_id,
             height,
-            groupsolo_weight_snapshot,
+            weight_snapshot,
             actual_coinbase,
         };
 
@@ -536,86 +540,140 @@ impl TdpBlockSubmissionSink {
         true
     }
 
-    /// Resolve the distribution a Group-Solo block's coinbase pays, for the
-    /// event the apply side consumes.
+    /// Resolve the settlement inputs a found block's coinbase was built
+    /// from, for the event the apply side consumes.
     ///
-    /// `None` means the block will not be booked, so every way of getting there
-    /// says which one it was — the operator's next step differs sharply between
-    /// them. A JD-client coinbase (zero fingerprint) must NOT be reprocessed at
-    /// all: the pool did not build it. A Redis miss must be reprocessed from the
-    /// block's own coinbase. A config or parse fault is a pool bug.
-    async fn resolve_group_solo_distribution(
+    /// **Every mode is decided here, by an exhaustive `match`.** It used to
+    /// be `if mode == GroupSolo`, and PPLNS fell out of it silently: its
+    /// blob went to the apply side empty and the apply re-read the
+    /// fingerprint key `confirmation_depth` blocks later, by which time the
+    /// key had usually expired and the settlement inputs were gone for good.
+    /// An `if` cannot be exhaustive; a `match` can, so the next mode cannot
+    /// be forgotten the same way.
+    ///
+    /// Resolving HERE — at the block-found instant, on the process that
+    /// holds the engines — is the point. The key is certainly alive now and
+    /// usually is not later, and it is the only store that ever holds these
+    /// inputs (the Redis→Postgres backup skips per-job snapshot keys).
+    ///
+    /// `None` means the apply side has no distribution in hand. What that
+    /// costs differs per mode and is decided by the caller, not here:
+    /// Group-Solo refuses to book (its only substitute would be a rebuild
+    /// against a round that has moved), PPLNS parks anyway and retries the
+    /// read at apply time. Every way of reaching `None` says which one it
+    /// was, because the operator's next step differs sharply: a JD-client
+    /// coinbase (zero fingerprint) must NOT be reprocessed at all — the pool
+    /// did not build it — while a Redis miss must be reprocessed from the
+    /// block's own coinbase, and a parse fault is a pool bug.
+    async fn resolve_weight_snapshot(
         &self,
+        mode: MiningMode,
         address: &str,
         group_id: Option<&str>,
-        reward_sats: Option<u64>,
         payouts_fingerprint: Option<[u8; 32]>,
         height: i32,
     ) -> Option<bp_coinbase_snapshot::StoredWeightSnapshot> {
-        let Some(engine) = self.applier.group_solo.as_ref() else {
-            warn!(
-                address,
-                height, "block-found: Group-Solo mode but the engine is not configured"
-            );
-            return None;
-        };
-        let Some(reward) = reward_sats else {
-            warn!(
-                address,
-                height, "block-found: Group-Solo block carries no reward — cannot resolve"
-            );
-            return None;
-        };
-        let Some(group_id_str) = group_id else {
-            warn!(
-                address,
-                height, "block-found: Group-Solo mode but the mode-gate returned no group_id"
-            );
-            return None;
-        };
-        let Some(fingerprint) = payouts_fingerprint else {
-            warn!(
-                address,
-                group_id = group_id_str,
-                height,
-                "block-found: Group-Solo job carries no payout fingerprint — the pool did not \
-                 build this coinbase (JD-client custom job), so there is no pool-side \
-                 distribution to book. Do NOT reprocess."
-            );
-            return None;
-        };
-        let (Ok(finder), Ok(group_uuid)) = (
-            AddressId::new(address.to_string()),
-            uuid::Uuid::parse_str(group_id_str),
-        ) else {
-            warn!(
-                address,
-                group_id = group_id_str,
-                height,
-                "block-found: Group-Solo finder address or group_id failed to parse"
-            );
-            return None;
-        };
-        // Reward-band plausibility is checked at apply time, where the
-        // actual coinbase is at hand; `reward` names the job's pinned
-        // value for the log lines only.
-        let _ = reward;
-        match engine
-            .weight_snapshot_for_block_found(group_uuid, &finder, &fingerprint)
-            .await
-        {
-            Ok(snap) => Some(snap),
-            Err(err) => {
-                error!(
-                    %err,
+        // Both snapshot-backed modes need the winning job's payout list.
+        // Checked once, before the per-mode arms, because the answer — and
+        // the operator's instruction — is the same for both.
+        let fingerprint = || match payouts_fingerprint {
+            Some(fp) => Some(fp),
+            None => {
+                warn!(
                     address,
-                    group_id = group_id_str,
                     height,
-                    fingerprint = %hex::encode(fingerprint),
-                    "block-found: Group-Solo distribution lookup failed — the block is NOT booked \
-                     and must be reprocessed from its own coinbase"
+                    ?mode,
+                    "block-found: job carries no payout fingerprint — the pool did not build \
+                     this coinbase (JD-client custom job), so there is no pool-side \
+                     distribution to book. Do NOT reprocess."
                 );
                 None
+            }
+        };
+        match mode {
+            // Solo pays a single output and writes no engine ledger row;
+            // Blockparty recomputes its fixed per-member percentages from
+            // the DB and books idempotently on the block hash. Neither
+            // resolves a snapshot, so neither has one to carry. Kept as
+            // explicit arms so a mode that DOES need one cannot be added
+            // without deciding this.
+            MiningMode::Solo | MiningMode::Blockparty => None,
+            MiningMode::Pplns => {
+                let engine = self.applier.pplns.as_ref().or_else(|| {
+                    warn!(
+                        address,
+                        height, "block-found: PPLNS mode but the engine is not configured"
+                    );
+                    None
+                })?;
+                let fingerprint = fingerprint()?;
+                match engine.weight_snapshot_for_block_found(&fingerprint).await {
+                    Ok(snap) => Some(snap),
+                    Err(err) => {
+                        // NOT fatal for PPLNS: the apply side reads the
+                        // fingerprint again. That read usually loses the
+                        // race with the TTL, so this is worth an error,
+                        // but the block still gets its second chance.
+                        error!(
+                            %err,
+                            address,
+                            height,
+                            fingerprint = %hex::encode(fingerprint),
+                            "block-found: PPLNS distribution lookup failed — parking the block \
+                             without its settlement inputs; the apply will re-read the \
+                             fingerprint, which usually loses to the snapshot TTL"
+                        );
+                        None
+                    }
+                }
+            }
+            MiningMode::GroupSolo => {
+                let engine = self.applier.group_solo.as_ref().or_else(|| {
+                    warn!(
+                        address,
+                        height, "block-found: Group-Solo mode but the engine is not configured"
+                    );
+                    None
+                })?;
+                let Some(group_id_str) = group_id else {
+                    warn!(
+                        address,
+                        height,
+                        "block-found: Group-Solo mode but the mode-gate returned no group_id"
+                    );
+                    return None;
+                };
+                let fingerprint = fingerprint()?;
+                let (Ok(finder), Ok(group_uuid)) = (
+                    AddressId::new(address.to_string()),
+                    uuid::Uuid::parse_str(group_id_str),
+                ) else {
+                    warn!(
+                        address,
+                        group_id = group_id_str,
+                        height,
+                        "block-found: Group-Solo finder address or group_id failed to parse"
+                    );
+                    return None;
+                };
+                match engine
+                    .weight_snapshot_for_block_found(group_uuid, &finder, &fingerprint)
+                    .await
+                {
+                    Ok(snap) => Some(snap),
+                    Err(err) => {
+                        error!(
+                            %err,
+                            address,
+                            group_id = group_id_str,
+                            height,
+                            fingerprint = %hex::encode(fingerprint),
+                            "block-found: Group-Solo distribution lookup failed — the block is \
+                             NOT booked and must be reprocessed from its own coinbase"
+                        );
+                        None
+                    }
+                }
             }
         }
     }
@@ -877,7 +935,7 @@ impl BlockFoundApplier {
                         height,
                         reward,
                         block_hash_hex.as_deref(),
-                        event.groupsolo_weight_snapshot.clone(),
+                        event.weight_snapshot.clone(),
                         event.actual_coinbase.as_ref(),
                         event.pplns_payouts_fingerprint,
                         None, // pool-wide accounting: no group context
@@ -1019,13 +1077,13 @@ impl BlockFoundApplier {
                         // PPLNS arm so an orphan / non-chain-extending
                         // candidate never books a phantom into the group
                         // ledger.
-                        if event.groupsolo_weight_snapshot.is_some() {
+                        if event.weight_snapshot.is_some() {
                             self.gate_or_apply(
                                 address_str,
                                 height,
                                 reward,
                                 block_hash_hex.as_deref(),
-                                event.groupsolo_weight_snapshot.clone(),
+                                event.weight_snapshot.clone(),
                                 event.actual_coinbase.as_ref(),
                                 event.pplns_payouts_fingerprint,
                                 Some(PendingGroup {
@@ -1558,7 +1616,7 @@ mod tests {
         };
         let event = BlockFoundEvent {
             actual_coinbase: None,
-            groupsolo_weight_snapshot: Some(weight_snapshot.clone()),
+            weight_snapshot: Some(weight_snapshot.clone()),
             pplns_payouts_fingerprint: None,
             address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
             worker: "rig1".to_string(),
@@ -1583,6 +1641,6 @@ mod tests {
         assert_eq!(back.block_data, event.block_data);
         // The Group-Solo snapshot rides the wire intact — the apply side
         // depends on the exact frozen distribution, not a Redis re-read.
-        assert_eq!(back.groupsolo_weight_snapshot, Some(weight_snapshot));
+        assert_eq!(back.weight_snapshot, Some(weight_snapshot));
     }
 }

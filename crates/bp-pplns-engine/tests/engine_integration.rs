@@ -296,6 +296,129 @@ async fn on_block_found_applies_distribution_from_snapshot() {
     drop_harness(h).await;
 }
 
+// ── The settlement inputs must outlive the snapshot TTL ────────────
+//
+// A confirmation-gated block applies `confirmation_depth` blocks after it
+// was found — about 20 minutes at the default depth of 3, against a
+// `snapshot_ttl_secs` of 1200 whose clock started when the WINNING JOB was
+// built. Reading the key only at apply time loses that race roughly half
+// the time, and losing it is not a delay: per-job snapshot keys are
+// excluded from the Redis→Postgres backup, so the inputs are then gone
+// from every store. The block's own coinbase still says who WAS paid — it
+// cannot say what the miners it did NOT pay were owed.
+//
+// So the Core resolves them at the block-found instant and the parked blob
+// carries them. This test deletes the key outright, which is the strongest
+// form of "the TTL expired", and pins both directions.
+
+#[tokio::test]
+async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
+    use redis::AsyncCommands as _;
+
+    let _serial = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(12, "test_ttlgone_").await {
+        Some(h) => h,
+        None => return,
+    };
+    // Addresses unique to this test — real ones, because the builder drops
+    // anything `bitcoin::Address` cannot parse and a prefix string would
+    // leave the distribution empty.
+    const BIG: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+    const TINY: &str = "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297";
+    const REWARD: u64 = 3_000_000_000;
+    let h_without: i32 = 9_997_101;
+    let h_with: i32 = 9_997_102;
+    cleanup_addr(&h.pool, BIG, &[h_without, h_with]).await;
+    cleanup_addr(&h.pool, TINY, &[h_without, h_with]).await;
+
+    // TINY's 1-in-1_000_001 share of 30 BTC ≈ 2_999 sat, under the
+    // 5_000-sat `min_payout`, so it is WITHHELD from the coinbase and
+    // settles as credit instead. That credit is precisely the money a lost
+    // snapshot destroys, so it is what the assertions key on.
+    h.engine
+        .record_share(None, BIG, 1_000_000.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, TINY, 1.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+
+    let result = h.engine.build_distribution(REWARD).await.expect("built");
+    let fp = result.payouts_fingerprint();
+    assert!(
+        result.snapshot_written,
+        "precondition: the build persisted its snapshot"
+    );
+    let actual = actual_paying_exactly(&result, REWARD);
+    assert!(
+        !actual.paid_by_address.contains_key(TINY),
+        "precondition: the sub-min_payout miner gets no coinbase output, so \
+         its claim exists only in the snapshot"
+    );
+
+    // What the Core stamps into the block-found event, resolved while the
+    // key is still alive — through the same seam the build wrote it under.
+    let blob = h
+        .engine
+        .weight_snapshot_for_block_found(&fp)
+        .await
+        .expect("the Core resolves the winning job's inputs at found-time");
+
+    // The TTL expires during the confirmation window.
+    let mut conn = h.engine.window().connection_for_snapshot();
+    let key = bp_pplns_engine::window::snapshot_key_for(&fp);
+    let _: () = conn.del(&key).await.expect("drop the snapshot key");
+
+    // Negative control FIRST, so the positive case below cannot pass on a
+    // key that was never actually gone. Without the blob there is nothing
+    // left to settle from — this is the failure the fix exists to remove,
+    // and it must still be reachable.
+    let without_blob = h
+        .engine
+        .on_block_found(h_without, &actual, None, Some(fp))
+        .await;
+    assert!(
+        matches!(
+            without_blob,
+            Err(bp_pplns_engine::engine::EngineError::SnapshotMissing { .. })
+        ),
+        "with the key gone and no blob, the block cannot be booked at all \
+         (got {without_blob:?})"
+    );
+
+    // With the blob, the same block settles normally.
+    let outcome = h
+        .engine
+        .on_block_found(h_with, &actual, Some(blob), Some(fp))
+        .await
+        .expect("the parked blob is enough to settle from");
+    assert!(outcome.history_inserted >= 1, "settlement wrote its rows");
+
+    let credit = credit_of(&h.pool, TINY).await;
+    assert!(
+        credit > 0,
+        "the withheld miner must be CREDITED what the coinbase did not pay \
+         it (got {credit} sats) — that credit is exactly what an expired \
+         snapshot destroys"
+    );
+
+    cleanup_addr(&h.pool, BIG, &[h_without, h_with]).await;
+    cleanup_addr(&h.pool, TINY, &[h_without, h_with]).await;
+    drop_harness(h).await;
+}
+
+/// The signed ledger balance of one address, `0` when it has no row.
+async fn credit_of(pool: &PgPool, address: &str) -> i64 {
+    sqlx::query_as::<_, (i64,)>(r#"SELECT "balanceSats" FROM pplns_balance WHERE address = $1"#)
+        .bind(address)
+        .fetch_optional(pool)
+        .await
+        .expect("balance read")
+        .map(|r| r.0)
+        .unwrap_or(0)
+}
+
 // ── A later build must not cost the found block its distribution ───
 //
 // The bug this guards: the pool builds the job a block is later mined on,

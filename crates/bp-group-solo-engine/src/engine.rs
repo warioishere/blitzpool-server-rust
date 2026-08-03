@@ -182,14 +182,6 @@ struct CachedGroupMode {
 /// hot share path almost always hits the cache.
 const MODE_CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// How often the block-found snapshot read is retried before the block is given
-/// up on. That read is the only thing standing between a found block and its
-/// booking, and the caller does not retry — a connection reset mid-reconnect
-/// would otherwise cost the block.
-const SNAPSHOT_READ_RETRIES: u32 = 3;
-/// Backoff between those attempts, multiplied by the attempt number.
-const SNAPSHOT_READ_BACKOFF: Duration = Duration::from_millis(80);
-
 /// Decide whether a windowed share in `bucket_id` should trigger a trim, given
 /// the highest bucket already trimmed (`watermark`, `None` if never). Trim on
 /// the first share of a group (cold start catches up any aging) and whenever a
@@ -599,38 +591,17 @@ impl GroupSoloEngine {
     ) -> Result<bp_coinbase_snapshot::StoredWeightSnapshot, EngineError> {
         let mut conn = self.inner.round.connection_for_snapshot();
         let group_key = group_id.to_string();
-        // Retry a transient Redis failure rather than discarding the
-        // block; the caller has no retry of its own. A genuinely missing
-        // snapshot (`Ok(None)`) is NOT retried — it will not appear.
-        let mut attempt = 0;
-        loop {
-            match crate::round::snapshot::read_weight_snapshot_for(
-                &mut conn,
-                &group_key,
-                weights_fingerprint,
-            )
-            .await
-            {
-                Ok(Some(s)) => return Ok(s),
-                Ok(None) => {
-                    return Err(EngineError::SnapshotMissingForPayouts {
-                        group_id,
-                        finder_address: finder_address.as_str().to_string(),
-                    })
-                }
-                Err(e) if attempt < SNAPSHOT_READ_RETRIES => {
-                    warn!(
-                        error = %e,
-                        %group_id,
-                        attempt,
-                        "group-solo weight-snapshot read failed — retrying before giving up"
-                    );
-                    attempt += 1;
-                    tokio::time::sleep(SNAPSHOT_READ_BACKOFF * attempt).await;
-                }
-                Err(e) => return Err(EngineError::Redis(e)),
-            }
-        }
+        bp_coinbase_snapshot::resolve_snapshot_for_block_found(
+            &mut conn,
+            |fp| crate::round::snapshot::key_for_fingerprint(&group_key, fp),
+            weights_fingerprint,
+            "group-solo",
+        )
+        .await?
+        .ok_or_else(|| EngineError::SnapshotMissingForPayouts {
+            group_id,
+            finder_address: finder_address.as_str().to_string(),
+        })
     }
 
     /// Apply a Group-Solo found block: write its payout history from the
@@ -699,8 +670,13 @@ impl GroupSoloEngine {
                 let mut conn = self.inner.round.connection_for_snapshot();
                 let read = match weights_fingerprint.filter(|fp| fp != &[0u8; 32]) {
                     Some(fp) => {
-                        crate::round::snapshot::read_weight_snapshot_for(&mut conn, &group_key, &fp)
-                            .await?
+                        bp_coinbase_snapshot::resolve_snapshot_for_block_found(
+                            &mut conn,
+                            |fp| crate::round::snapshot::key_for_fingerprint(&group_key, fp),
+                            &fp,
+                            "group-solo",
+                        )
+                        .await?
                     }
                     None => {
                         crate::round::snapshot::read_weight_snapshot(

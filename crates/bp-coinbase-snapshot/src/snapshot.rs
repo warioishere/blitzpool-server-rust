@@ -17,6 +17,7 @@
 //! Group-Solo builds `groupsolo:{groupId}:snapshot:{finderAddress}`.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use redis::{aio::ConnectionManager, AsyncCommands, RedisError};
 use tracing::warn;
@@ -221,6 +222,78 @@ pub async fn read_weight_snapshot(
                 "weight snapshot: failed to parse fields, treating as missing"
             );
             Ok(None)
+        }
+    }
+}
+
+/// How often a transient Redis failure on a block-found snapshot read is
+/// retried before the caller gives up.
+///
+/// That read stands between a found block and its booking, and no caller
+/// has a retry of its own. A connection reset mid-reconnect would
+/// otherwise cost the block. A genuinely missing snapshot (`Ok(None)`)
+/// is NOT retried — it will not appear.
+const READ_RETRIES: u32 = 3;
+/// Backoff between those attempts, multiplied by the attempt number.
+const READ_BACKOFF: Duration = Duration::from_millis(80);
+
+/// Resolve the settlement inputs a found block's coinbase was built
+/// from — the READ twin of [`crate::build::build_and_snapshot`], and
+/// the one implementation of it.
+///
+/// It takes the same `snapshot_key` seam the write side takes, for the
+/// same reason: the two engines disagree only on the key scheme
+/// (`pplns:snapshot:…` vs `groupsolo:{groupId}:jobsnapshot:…`), and a
+/// resolution that does not go through the writer's own seam is a
+/// resolution that can drift away from what was written.
+///
+/// **Call this at the block-found instant, never at apply time.** The
+/// key carries a TTL sized for a live job, and both modes' applies can
+/// run far past it — the confirmation-gated ones by design. Resolving
+/// late loses the inputs outright: per-job snapshot keys are excluded
+/// from the Redis→Postgres backup (see `redis_backup::is_per_job_snapshot`),
+/// so nothing else holds them, and the block's own coinbase can only
+/// say who WAS paid, never what the unpaid were owed.
+///
+/// `Ok(None)` is a verdict, not a failure: the key is gone or holds a
+/// schema this build cannot settle from. The caller maps it to its own
+/// terminal error.
+pub async fn resolve_snapshot_for_block_found(
+    conn: &mut ConnectionManager,
+    snapshot_key: impl FnOnce(&[u8; 32]) -> String,
+    weights_fingerprint: &[u8; 32],
+    scope: &str,
+) -> Result<Option<StoredWeightSnapshot>, RedisError> {
+    let key = snapshot_key(weights_fingerprint);
+    read_weight_snapshot_with_retry(conn, &key, scope).await
+}
+
+/// [`read_weight_snapshot`] with the block-found retry policy.
+///
+/// The twin of `build::write_with_retry`. Prefer
+/// [`resolve_snapshot_for_block_found`], which pairs the retry with the
+/// key seam; this is exposed for the paths that already hold a key.
+pub async fn read_weight_snapshot_with_retry(
+    conn: &mut ConnectionManager,
+    key: &str,
+    scope: &str,
+) -> Result<Option<StoredWeightSnapshot>, RedisError> {
+    let mut attempt = 0;
+    loop {
+        match read_weight_snapshot(conn, key).await {
+            Ok(found) => return Ok(found),
+            Err(err) if attempt < READ_RETRIES => {
+                warn!(
+                    %err,
+                    scope,
+                    key,
+                    attempt,
+                    "weight-snapshot read failed — retrying before giving up on the block"
+                );
+                attempt += 1;
+                tokio::time::sleep(READ_BACKOFF * attempt).await;
+            }
+            Err(err) => return Err(err),
         }
     }
 }

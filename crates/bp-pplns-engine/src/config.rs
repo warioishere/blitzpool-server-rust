@@ -56,8 +56,10 @@ pub struct PplnsEngineConfig {
     /// Snapshots are keyed by the payout list they distribute, so one is
     /// written per distinct distribution — roughly (connections × template
     /// rate) — and only the applied block's own key is deleted. The TTL is
-    /// therefore what bounds the keyspace, and it is also what the 10-minute
-    /// `pplns:*` Redis→Postgres backup has to carry.
+    /// therefore what bounds the keyspace. Nothing else does: the 10-minute
+    /// `pplns:*` Redis→Postgres backup deliberately SKIPS per-job snapshot
+    /// keys (`redis_backup::is_per_job_snapshot`), so once one expires its
+    /// settlement inputs are gone from every store.
     ///
     /// A snapshot is only useful while a job built from it can still be
     /// mined, and a job is GC-eligible once `bp_jobs_lifecycle`'s
@@ -66,6 +68,15 @@ pub struct PplnsEngineConfig {
     /// hoarding an hour's worth of dead distributions the way the previous
     /// 3600 did. That value made sense when a single shared key was
     /// overwritten in place; per-job keys it merely multiplies.
+    ///
+    /// This is deliberately NOT sized against the confirmation window, and
+    /// a found block must not depend on it being: at depth 3 the gated
+    /// apply lands ~20 min after the block, against a TTL whose clock
+    /// started when the winning job was built. That race is lost about half
+    /// the time. The Core therefore resolves a found block's snapshot at
+    /// the block-found instant and carries it in the parked blob — see
+    /// `PplnsEngine::weight_snapshot_for_block_found`. Raising this value
+    /// would only make the old race less visible, not correct.
     pub snapshot_ttl_secs: u32,
 
     /// Trim batch size — legacy per-share trim tunable. No longer used by the

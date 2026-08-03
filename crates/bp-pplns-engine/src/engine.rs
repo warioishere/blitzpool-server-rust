@@ -59,14 +59,6 @@ use crate::window::{snapshot::StoredWeightSnapshot, NetworkDifficulty, WindowErr
 use bp_coinbase_snapshot::ActualCoinbase;
 use bp_share::{block_subsidy_sats, claim_sats, reward_within_band};
 
-/// How often a transient Redis failure on the block-found snapshot read is
-/// retried before the block is given up on. That read is the only thing
-/// standing between a found block and its payout, and the caller does not
-/// retry — a connection reset mid-reconnect would otherwise cost the block.
-const SNAPSHOT_READ_RETRIES: u32 = 3;
-/// Backoff between those attempts, multiplied by the attempt number.
-const SNAPSHOT_READ_BACKOFF: std::time::Duration = std::time::Duration::from_millis(80);
-
 /// Errors surfaced across the engine boundary.
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -86,6 +78,11 @@ pub enum EngineError {
     Distribution(Arc<DistributionError>),
     #[error("snapshot missing for block {block_height} — pool restart or expired TTL?")]
     SnapshotMissing { block_height: i32 },
+    #[error(
+        "no snapshot under the winning job's payout list — the block needs an \
+         operator reprocess from its own coinbase"
+    )]
+    SnapshotMissingForPayouts,
     #[error(
         "block {block_height} carried no payout fingerprint — the pool did not \
          build this coinbase (JD-client custom job), so there is no pool-side \
@@ -127,6 +124,7 @@ impl EngineError {
         match self {
             EngineError::Config(_)
             | EngineError::SnapshotMissing { .. }
+            | EngineError::SnapshotMissingForPayouts
             | EngineError::NoPayoutFingerprint { .. }
             | EngineError::RevenueBelowSubsidy { .. }
             | EngineError::Address(_) => true,
@@ -324,13 +322,51 @@ impl PplnsEngine {
             .map_err(EngineError::Distribution)
     }
 
+    /// Look up the settlement inputs the found block's coinbase was built
+    /// from, so the Core can stamp them into the block-found event.
+    ///
+    /// This exists for the same reason as Group-Solo's namesake, and it is
+    /// resolved at the same moment: at the block-found instant, where the
+    /// snapshot key is certainly still alive. The confirmation-gated apply
+    /// runs `confirmation_depth` blocks later — about 20 minutes at depth 3,
+    /// against a 20-minute [`crate::config::PplnsEngineConfig::snapshot_ttl_secs`]
+    /// whose clock started when the winning JOB was built. Reading it only
+    /// then loses the race about half the time, and losing it is not a
+    /// delay: the inputs are gone from every store (the Redis→Postgres
+    /// backup skips per-job snapshot keys on purpose), so what the
+    /// withheld miners were owed can no longer be computed from anything.
+    /// The block's own coinbase says who WAS paid, never what the unpaid
+    /// were entitled to.
+    ///
+    /// `weights_fingerprint` is the identity of the winning job's payout
+    /// list, carried on the job the share was built on. The build that
+    /// produced that list stored its snapshot under it, and nothing else
+    /// writes that key.
+    pub async fn weight_snapshot_for_block_found(
+        &self,
+        weights_fingerprint: &[u8; 32],
+    ) -> Result<StoredWeightSnapshot, EngineError> {
+        let mut conn = self.inner.window.connection_for_snapshot();
+        bp_coinbase_snapshot::resolve_snapshot_for_block_found(
+            &mut conn,
+            crate::window::snapshot_key_for,
+            weights_fingerprint,
+            "pplns",
+        )
+        .await?
+        .ok_or(EngineError::SnapshotMissingForPayouts)
+    }
+
     /// Apply a found block: settle `claim(T_actual) − paid` per address
     /// against the block's OWN coinbase, then write the payout history.
     ///
-    /// `snapshot` is the distribution's settlement inputs. The
-    /// confirmation-gated path carries it in the parked blob (the Redis
-    /// key can TTL out before a block confirms); the immediate path
-    /// passes `None` and it is read back under the fingerprint.
+    /// `snapshot` is the distribution's settlement inputs. The Core
+    /// resolves them at found-time and both paths carry them in — the
+    /// confirmation-gated one in the parked blob, the immediate one
+    /// straight through. `None` is the fallback for the case where that
+    /// resolution failed (a Redis blip at the worst moment): the
+    /// fingerprint is then read back here, which is a second chance, not
+    /// the design.
     ///
     /// Idempotent on redelivery without a guard of its own:
     /// `pplns_payout_history` is UNIQUE on `(blockHeight, address)` and
@@ -367,39 +403,28 @@ impl PplnsEngine {
         snapshot: Option<StoredWeightSnapshot>,
         payouts_fingerprint: Option<[u8; 32]>,
     ) -> Result<ApplyDistributionResult, EngineError> {
-        // 1. Snapshot source: the parked blob, else the fingerprint key.
+        // 1. Snapshot source: the blob the Core resolved at found-time,
+        //    else a late read under the fingerprint. The late read is the
+        //    fallback for a Redis blip at the found instant, not the
+        //    design — by now the key has usually TTL'd out (see
+        //    `weight_snapshot_for_block_found`).
         let snapshot = match snapshot {
             Some(s) => s,
             None => {
                 let fingerprint = payouts_fingerprint
                     .filter(|fp| fp != &[0u8; 32])
                     .ok_or(EngineError::NoPayoutFingerprint { block_height })?;
-                // Retry a transient Redis failure rather than discarding
-                // the block; the caller has no retry of its own. A
-                // genuinely missing snapshot is NOT retried.
-                let mut attempt = 0;
-                loop {
-                    match self
-                        .inner
-                        .window
-                        .read_weight_snapshot_for(&fingerprint)
-                        .await
-                    {
-                        Ok(Some(s)) => break s,
-                        Ok(None) => return Err(EngineError::SnapshotMissing { block_height }),
-                        Err(e) if attempt < SNAPSHOT_READ_RETRIES => {
-                            warn!(
-                                error = %e,
-                                block_height,
-                                attempt,
-                                "PPLNS weight-snapshot read failed — retrying before giving up"
-                            );
-                            attempt += 1;
-                            tokio::time::sleep(SNAPSHOT_READ_BACKOFF * attempt).await;
+                self.weight_snapshot_for_block_found(&fingerprint)
+                    .await
+                    .map_err(|e| match e {
+                        // At apply time the missing key means the TTL won:
+                        // report it as the block-scoped failure the
+                        // operator reprocess keys off.
+                        EngineError::SnapshotMissingForPayouts => {
+                            EngineError::SnapshotMissing { block_height }
                         }
-                        Err(e) => return Err(EngineError::Redis(e)),
-                    }
-                }
+                        other => other,
+                    })?
             }
         };
 

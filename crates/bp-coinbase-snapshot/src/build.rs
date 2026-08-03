@@ -88,6 +88,11 @@ pub struct BuiltDistribution {
 /// exists once the distribution is built, and the two engines use
 /// different key schemes (`pplns:snapshot:fp:…` vs
 /// `groupsolo:{groupId}:snapshot:fp:…`).
+///
+/// Whatever this writes is read back by
+/// [`crate::snapshot::resolve_snapshot_for_block_found`], through the
+/// same seam. Change the key scheme here and it changes there; there is
+/// no second place to forget.
 pub async fn build_and_snapshot(
     mut req: BuildRequest<'_>,
     conn: &mut ConnectionManager,
