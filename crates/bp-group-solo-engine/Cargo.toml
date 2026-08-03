@@ -14,7 +14,6 @@ workspace = true
 # Internal — pure math + domain types + shared utilities
 bp-common = { workspace = true }
 bp-pplns = { workspace = true }
-bp-group-solo = { workspace = true }
 # Pure domain enums/validators — PayoutMode + window-length reinterpretation.
 bp-group-mgmt = { workspace = true }
 bp-db = { workspace = true }
@@ -61,7 +60,6 @@ redis = { workspace = true }
 sqlx = { workspace = true }
 bp-common = { workspace = true }
 bp-pplns = { workspace = true }
-bp-group-solo = { workspace = true }
 bp-group-mgmt = { workspace = true }
 bp-db = { workspace = true }
 uuid = { workspace = true }

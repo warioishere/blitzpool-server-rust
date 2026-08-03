@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `DistributionBuilder` — production-side wrapper around
-//! `bp_group_solo::build_group_solo_distribution`.
+//! `DistributionBuilder` — the Group-Solo side of the shared
+//! build-and-snapshot path.
 //!
 //! Reads the group's round state from Redis (`by-address` hash) and
 //! the group's per-group config row (`finder_bonus_ppm`) from the

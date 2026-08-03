@@ -54,7 +54,7 @@ use crate::ledger::{
     apply_distribution, pending_row, ApplyDistributionResult, AuditRow, BalanceWrite, LedgerError,
     PayoutRowType,
 };
-use crate::sweep::{spawn_daily_task, DustSweepRunner, SweepError, SweepStats, SystemClock};
+use crate::sweep::{spawn_daily_task, DustSweepRunner, SweepError, SystemClock};
 use crate::window::{snapshot::StoredWeightSnapshot, NetworkDifficulty, WindowError, WindowStore};
 use bp_coinbase_snapshot::ActualCoinbase;
 use bp_share::{block_subsidy_sats, claim_sats, reward_within_band};
@@ -93,16 +93,6 @@ pub enum EngineError {
     )]
     NoPayoutFingerprint { block_height: i32 },
     #[error(
-        "snapshot reward mismatch for block {block_height}: \
-         snapshot={snapshot_reward} sats, block={actual_reward} sats — \
-         stale snapshot deleted; operator must trigger reprocessing"
-    )]
-    SnapshotRewardMismatch {
-        block_height: i32,
-        snapshot_reward: u64,
-        actual_reward: u64,
-    },
-    #[error(
         "block {block_height} coinbase pays {actual_reward} sats, less than the \
          {subsidy} sat subsidy the block was entitled to — it forfeited money, so \
          nothing about it is trustworthy enough to book unattended"
@@ -112,17 +102,10 @@ pub enum EngineError {
         actual_reward: u64,
         subsidy: u64,
     },
-    #[error(
-        "block {block_height} already has payout-history rows — a redelivered \
-         block-found must fail closed, not re-credit the ledger"
-    )]
-    AlreadyBooked { block_height: i32 },
     #[error("on_block_found already in flight — concurrent block-find for same engine")]
     BlockFoundInProgress,
     #[error("invalid address in snapshot: {0}")]
     Address(#[from] InvalidAddressError),
-    #[error("prepared block-found decode: {0}")]
-    PreparedDecode(String),
 }
 
 impl EngineError {
@@ -145,11 +128,8 @@ impl EngineError {
             EngineError::Config(_)
             | EngineError::SnapshotMissing { .. }
             | EngineError::NoPayoutFingerprint { .. }
-            | EngineError::SnapshotRewardMismatch { .. }
             | EngineError::RevenueBelowSubsidy { .. }
-            | EngineError::AlreadyBooked { .. }
-            | EngineError::Address(_)
-            | EngineError::PreparedDecode(_) => true,
+            | EngineError::Address(_) => true,
             // Infrastructure, and the in-flight guard — all of these
             // clear on their own.
             EngineError::Redis(_)
@@ -175,7 +155,6 @@ struct Inner {
     window: WindowStore,
     distribution_builder: DistributionBuilder,
     touch_buffer: Arc<TouchBuffer>,
-    sweep_runner: DustSweepRunner<SystemClock>,
     config: PplnsEngineConfig,
     cancel_tx: watch::Sender<bool>,
     block_found_in_progress: AtomicBool,
@@ -275,7 +254,6 @@ impl PplnsEngine {
                 window,
                 distribution_builder,
                 touch_buffer,
-                sweep_runner,
                 config,
                 cancel_tx,
                 block_found_in_progress: AtomicBool::new(false),
@@ -663,17 +641,6 @@ impl PplnsEngine {
         Ok((audit_rows, balance_writes))
     }
 
-    /// Run one manual dust-sweep tick. Exposes the sweep runner for
-    /// admin endpoints / tests; the background cron triggers a sweep
-    /// automatically at 03:00 UTC.
-    pub async fn manual_sweep(&self) -> Result<SweepStats, EngineError> {
-        self.inner
-            .sweep_runner
-            .sweep()
-            .await
-            .map_err(EngineError::from)
-    }
-
     /// Drop one cached distribution entry. Called by the engine itself
     /// on share-record; exposed so manual admin tooling can force a
     /// recompute too.
@@ -746,18 +713,5 @@ mod tests {
         let e = EngineError::SnapshotMissing { block_height: 9001 };
         let s = format!("{e}");
         assert!(s.contains("9001"), "got: {s}");
-    }
-
-    #[test]
-    fn snapshot_reward_mismatch_error_carries_all_fields() {
-        let e = EngineError::SnapshotRewardMismatch {
-            block_height: 850_000,
-            snapshot_reward: 312_500_000,
-            actual_reward: 312_499_100,
-        };
-        let s = format!("{e}");
-        assert!(s.contains("850000"), "got: {s}");
-        assert!(s.contains("312500000"), "got: {s}");
-        assert!(s.contains("312499100"), "got: {s}");
     }
 }

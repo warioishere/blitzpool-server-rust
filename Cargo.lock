@@ -736,14 +736,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bp-group-solo"
-version = "2.2.5"
-dependencies = [
- "bp-common",
- "bp-pplns",
-]
-
-[[package]]
 name = "bp-group-solo-engine"
 version = "2.2.5"
 dependencies = [
@@ -754,7 +746,6 @@ dependencies = [
  "bp-cron-utils",
  "bp-db",
  "bp-group-mgmt",
- "bp-group-solo",
  "bp-inflight-cache",
  "bp-mining-job",
  "bp-pplns",
@@ -1052,7 +1043,6 @@ dependencies = [
  "async-trait",
  "bitcoin",
  "bp-common",
- "bp-group-solo",
  "bp-job-declaration",
  "bp-jobs-lifecycle",
  "bp-metrics",

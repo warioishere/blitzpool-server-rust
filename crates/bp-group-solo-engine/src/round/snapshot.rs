@@ -72,23 +72,6 @@ pub async fn write_weight_snapshot(
     .await
 }
 
-/// Persist a schema-2 WEIGHT snapshot under its weights fingerprint.
-pub async fn write_weight_snapshot_for(
-    conn: &mut ConnectionManager,
-    group_id: &str,
-    weights_fingerprint: &[u8; 32],
-    snapshot: &bp_coinbase_snapshot::StoredWeightSnapshot,
-    ttl_seconds: u32,
-) -> Result<(), RedisError> {
-    bp_coinbase_snapshot::snapshot::write_weight_snapshot(
-        conn,
-        &key_for_fingerprint(group_id, weights_fingerprint),
-        snapshot,
-        ttl_seconds,
-    )
-    .await
-}
-
 /// Load the schema-2 WEIGHT snapshot for one weights fingerprint.
 pub async fn read_weight_snapshot_for(
     conn: &mut ConnectionManager,

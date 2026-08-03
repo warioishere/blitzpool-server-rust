@@ -16,7 +16,6 @@ members = [
     "crates/bp-coinbase-snapshot",
     "crates/bp-pplns",
     "crates/bp-pplns-engine",
-    "crates/bp-group-solo",
     "crates/bp-group-solo-engine",
     "crates/bp-group-mgmt",
     "crates/bp-group-mgmt-engine",
@@ -236,7 +235,6 @@ bp-cron-utils = { path = "crates/bp-cron-utils" }
 bp-coinbase-snapshot = { path = "crates/bp-coinbase-snapshot" }
 bp-pplns = { path = "crates/bp-pplns" }
 bp-pplns-engine = { path = "crates/bp-pplns-engine" }
-bp-group-solo = { path = "crates/bp-group-solo" }
 bp-group-solo-engine = { path = "crates/bp-group-solo-engine" }
 bp-group-mgmt = { path = "crates/bp-group-mgmt" }
 bp-group-mgmt-engine = { path = "crates/bp-group-mgmt-engine" }

@@ -81,14 +81,6 @@ pub enum EngineError {
         finder_address: String,
     },
     #[error(
-        "snapshot reward mismatch for group {group_id}: snapshot={snapshot_reward} block={actual_reward}"
-    )]
-    SnapshotRewardMismatch {
-        group_id: Uuid,
-        snapshot_reward: u64,
-        actual_reward: u64,
-    },
-    #[error(
         "group {group_id} block {block_height} coinbase pays {actual_reward} sats, less than \
          the {subsidy} sat subsidy the block was entitled to — it forfeited money, so nothing \
          about it is trustworthy enough to book unattended"
@@ -125,7 +117,6 @@ impl EngineError {
             EngineError::Config(_)
             | EngineError::SnapshotMissing { .. }
             | EngineError::SnapshotMissingForPayouts { .. }
-            | EngineError::SnapshotRewardMismatch { .. }
             | EngineError::RevenueBelowSubsidy { .. }
             | EngineError::Address(_) => true,
             // Infrastructure, and the per-group in-flight guard — all
@@ -1097,19 +1088,5 @@ mod tests {
         let s = format!("{e}");
         assert!(s.contains("bc1qfinder"));
         assert!(s.contains("9999"));
-    }
-
-    #[test]
-    fn snapshot_reward_mismatch_carries_both_rewards() {
-        let g = Uuid::new_v4();
-        let e = EngineError::SnapshotRewardMismatch {
-            group_id: g,
-            snapshot_reward: 312_500_000,
-            actual_reward: 300_000_000,
-        };
-        let s = format!("{e}");
-        assert!(s.contains("312500000"), "snapshot reward in message");
-        assert!(s.contains("300000000"), "actual reward in message");
-        assert!(s.contains(&g.to_string()), "group id in message");
     }
 }
