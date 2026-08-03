@@ -371,6 +371,37 @@ where
     Ok(result.rows_affected())
 }
 
+/// Has any payout-history row already been written for this block?
+///
+/// The idempotency question, asked directly. `bulk_insert_pplns_payout_history`
+/// reports how many rows it inserted, and that number is NOT an answer to
+/// it: the caller's row set includes one row per address live in the PPLNS
+/// window at apply time, so a replay of an already-booked block can still
+/// report progress and let an absolute balance write run a second time.
+/// Ask the block, not the row count.
+///
+/// `blockHeight` identifies the block here, exactly as the
+/// `("blockHeight", address)` UNIQUE already assumes. The dust sweep's
+/// synthetic heights are strictly negative and cannot collide.
+pub async fn pplns_block_already_booked<'e, E>(
+    executor: E,
+    block_height: i32,
+) -> Result<bool, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row = sqlx::query!(
+        r#"SELECT EXISTS(
+             SELECT 1 FROM pplns_payout_history WHERE "blockHeight" = $1
+           ) AS "booked!""#,
+        block_height,
+    )
+    .fetch_one(executor)
+    .await
+    .map_err(DbError::from)?;
+    Ok(row.booked)
+}
+
 /// Bulk-insert payout-history rows for one block. `ON CONFLICT
 /// ("blockHeight", address) DO NOTHING` guards against double-write on
 /// replay — a partial-success / restart-mid-processing scenario won't

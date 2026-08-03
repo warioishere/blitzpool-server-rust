@@ -74,15 +74,36 @@ pub fn pending_row(address: AddressId, delta_sats: Sats) -> AuditRow {
 // ── apply_distribution — the block-found TX ─────────────────────────
 
 /// Atomically:
-/// 1. Insert audit rows into `pplns_payout_history` (idempotent via
-///    `(blockHeight, address)` UNIQUE).
-/// 2. Upsert absolute new `balanceSats` + `totalPaidSats` + `updatedAt`
+/// 1. Refuse outright if this block already has payout history — see
+///    below.
+/// 2. Insert audit rows into `pplns_payout_history`.
+/// 3. Upsert absolute new `balanceSats` + `totalPaidSats` + `updatedAt`
 ///    into `pplns_balance`.
 ///
-/// On any error the transaction rolls back — neither write lands. On
-/// replay (same `block_height`), the history insert silently dedupes
-/// via the UNIQUE constraint and the balance upsert converges to the
-/// same absolute state.
+/// On any error the transaction rolls back — neither write lands.
+///
+/// **Why step 1 asks the block rather than counting inserted rows.**
+/// This used to run the balance upsert whenever the history insert had
+/// reported rows inserted, reasoning that the `(blockHeight, address)`
+/// UNIQUE swallows a replay. That is only true while the row set is the
+/// same on both attempts, and it is not: the caller appends one row per
+/// "late arriver" — an address live in the PPLNS window at APPLY time,
+/// absent from the snapshot. The window moves between attempts, so a
+/// single new miner makes the insert report progress on an
+/// already-booked block, and the balance write is ABSOLUTE
+/// (`current + delta`) against a `current` re-read after the first
+/// commit. Measured on a replay: a withheld miner's credit went
+/// 2 999 → 5 998 sat, and a credit paid out twice is satoshis the other
+/// miners fund.
+///
+/// Concurrent duplicate applies were never the danger — both derive
+/// their absolute write from the same `current`, so they converge. The
+/// danger is SEQUENTIAL replay, which is what the confirmation watcher
+/// produces when its post-apply `remove_pending_block` fails (its error
+/// is deliberately ignored) or the process dies in that window. A
+/// concurrent apply that read `current` late enough to see the first
+/// one's effect necessarily sees its history rows here too, because the
+/// balance read happens before this check.
 ///
 /// Caller (typically [`crate::hooks::PplnsBlockSubmissionSink`]) is
 /// responsible for:
@@ -97,6 +118,13 @@ pub async fn apply_distribution(
     now_ms: i64,
 ) -> Result<ApplyDistributionResult, LedgerError> {
     let mut tx = pool.begin().await?;
+
+    if bp_db::pplns_block_already_booked(&mut *tx, block_height).await? {
+        return Ok(ApplyDistributionResult {
+            history_inserted: 0,
+            balances_affected: 0,
+        });
+    }
 
     let history_rows: Vec<PayoutHistoryInsert> = rows
         .iter()
@@ -120,18 +148,11 @@ pub async fn apply_distribution(
         })
         .collect();
 
+    // Past the gate above this block has no history, so both writes are
+    // this apply's first and only ones. The `ON CONFLICT DO NOTHING` on
+    // the insert stays as the constraint-level backstop it always was.
     let history_inserted = bulk_insert_pplns_payout_history(&mut *tx, &history_rows).await?;
-    // Idempotency gate. The history table dedupes a replayed / duplicate
-    // block-found via its UNIQUE (blockHeight, address). The balance upsert
-    // accumulates `totalPaidSats`, so only run it when the history rows were
-    // actually inserted — a 0-insert means this block already booked (stream
-    // redelivery, or a duplicate block-found re-frozen at the same height) and
-    // re-applying would double-count the balance.
-    let balances_affected = if history_inserted > 0 {
-        bulk_upsert_pplns_balances(&mut *tx, &balance_rows).await?
-    } else {
-        0
-    };
+    let balances_affected = bulk_upsert_pplns_balances(&mut *tx, &balance_rows).await?;
 
     tx.commit().await?;
     Ok(ApplyDistributionResult {

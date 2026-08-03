@@ -408,6 +408,114 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
     drop_harness(h).await;
 }
 
+// ── A booked block stays booked, whatever the row set does ─────────
+//
+// `apply_distribution` used to infer "already booked" from a side effect:
+// it ran the balance upsert only when the history insert had reported rows
+// inserted, on the reasoning that the `(blockHeight, address)` UNIQUE
+// swallows a replay. That holds only if the row set is the SAME on both
+// attempts, and it is not — the audit rows include one per "late arriver",
+// an address live in the PPLNS window at APPLY time but absent from the
+// snapshot. The window moves between attempts, so one new miner is enough
+// to make the insert report progress on a block that is already booked,
+// and the balance write is ABSOLUTE (`current + delta`) against a `current`
+// re-read after the first commit — i.e. `current + 2·delta`.
+//
+// Reaching a second attempt takes an interrupted first one: the
+// confirmation watcher removes the parked entry only after the apply
+// commits, and ignores the removal's own error (`let _ =`), so a Redis blip
+// or a process kill in that window replays the block.
+
+#[tokio::test]
+async fn a_second_apply_of_the_same_block_moves_no_money() {
+    let _serial = balance_table_lock().lock().await;
+    let h = match spawn_or_skip(13, "test_reapply_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const BIG: &str = "bc1qc7slrfxkknqcq2jevvvkdgvrt8080852dfjewde450xdlk4ugp7szw5tk9";
+    const TINY: &str = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0";
+    const LATECOMER: &str = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
+    const REWARD: u64 = 3_000_000_000;
+    let height: i32 = 9_997_201;
+    for addr in [BIG, TINY, LATECOMER] {
+        cleanup_addr(&h.pool, addr, &[height]).await;
+    }
+
+    // TINY is withheld (sub-`min_payout`) and therefore settles as a
+    // CREDIT — a non-zero delta, which is what a double-apply doubles. A
+    // fully-paid miner books ~0 and would hide the bug.
+    h.engine
+        .record_share(None, BIG, 1_000_000.0, 1_700_000_000_001)
+        .await
+        .unwrap();
+    h.engine
+        .record_share(None, TINY, 1.0, 1_700_000_000_002)
+        .await
+        .unwrap();
+
+    let result = h.engine.build_distribution(REWARD).await.expect("built");
+    let fp = result.payouts_fingerprint();
+    let actual = actual_paying_exactly(&result, REWARD);
+
+    let first = h
+        .engine
+        .on_block_found(height, &actual, None, Some(fp))
+        .await
+        .expect("first apply books");
+    assert!(
+        first.history_inserted >= 1,
+        "the first apply wrote its rows"
+    );
+    let credit_after_first = credit_of(&h.pool, TINY).await;
+    assert!(
+        credit_after_first > 0,
+        "precondition: the withheld miner carries a credit to double"
+    );
+
+    // The trigger: a miner absent from the snapshot starts mining before
+    // the replay runs, so the apply's row set GROWS by one late-arriver row.
+    h.engine
+        .record_share(None, LATECOMER, 50.0, 1_700_000_000_003)
+        .await
+        .unwrap();
+    let window = h
+        .engine
+        .window()
+        .read_window_by_address()
+        .await
+        .expect("window read");
+    assert!(
+        window.contains_key(LATECOMER),
+        "precondition: the latecomer must be in the window the apply reads, \
+         or the row set does not grow and this test proves nothing"
+    );
+
+    let second = h
+        .engine
+        .on_block_found(height, &actual, None, Some(fp))
+        .await
+        .expect("a replayed block-found is a no-op, not an error");
+
+    let credit_after_second = credit_of(&h.pool, TINY).await;
+    assert_eq!(
+        credit_after_second, credit_after_first,
+        "a replayed block must move NO money — the withheld miner's credit \
+         went {credit_after_first} → {credit_after_second}, and a credit paid \
+         out twice is satoshis the other miners fund"
+    );
+    assert_eq!(
+        (second.history_inserted, second.balances_affected),
+        (0, 0),
+        "a replayed block must write nothing at all (got {second:?})"
+    );
+
+    for addr in [BIG, TINY, LATECOMER] {
+        cleanup_addr(&h.pool, addr, &[height]).await;
+    }
+    drop_harness(h).await;
+}
+
 /// The signed ledger balance of one address, `0` when it has no row.
 async fn credit_of(pool: &PgPool, address: &str) -> i64 {
     sqlx::query_as::<_, (i64,)>(r#"SELECT "balanceSats" FROM pplns_balance WHERE address = $1"#)
