@@ -114,6 +114,9 @@ clap = { workspace = true, features = ["env"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# Shared test helpers — notably the per-binary Redis DB ranges that keep
+# concurrent tests from FLUSHDB-ing each other.
+bp-test-support = { workspace = true }
 # Real bitcoin-node for the chain-reconciliation regtest: the RPC shapes it
 # decodes (`getblock`, `getrawtransaction`) can only be verified against Core.
 bp-regtest-harness = { workspace = true }

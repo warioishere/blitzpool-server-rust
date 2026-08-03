@@ -76,6 +76,12 @@ locally** — a green CI does not mean they passed.
    ```bash
    docker start bp-test-pg bp-test-redis   # 15433 / 16379
    ```
+   The Redis container must have **512 logical databases** — tests are
+   isolated by a per-binary DB range (`bp_test_support::redis_db`), and a
+   stock 16-DB server folds them back on top of each other. Recreate it as
+   `docker run -d --name bp-test-redis -p 16379:6379 valkey/valkey:8-alpine
+   valkey-server --databases 512`. Adding a test means picking a number no
+   sibling **in the same binary** uses; the base is the binary's.
    New migrations (`crates/bp-db/migrations/`) are NOT applied to those
    containers automatically. A stale schema surfaces first as a
    `cargo sqlx prepare` failure on the missing column — compile-time is

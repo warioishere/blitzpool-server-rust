@@ -35,6 +35,11 @@ struct Harness {
 async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
+    // Fold this binary's local number into its own DB range — see
+    // `bp_test_support::redis_db`.
+    let redis_db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, redis_db)
+            .await;
     let redis_url = format!("{redis_base}/{redis_db}");
 
     let pool = match tokio::time::timeout(
@@ -505,6 +510,8 @@ async fn build_window(h: &Harness) -> WindowStore {
     // ConnectionManager is multiplexed.
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
     let db = redis_db_for_prefix(&h.address_prefix);
+    let db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, db).await;
     let url = format!("{redis_base}/{db}");
     let client = Client::open(url).expect("client");
     let conn = ConnectionManager::new(client).await.expect("conn");
@@ -575,7 +582,14 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
 
     const ACL_USER: &str = "bp_test_readonly_snapshot";
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    let client = Client::open(format!("{redis_base}/6")).expect("client");
+    // The SAME logical DB the harness seeded into. Hardcoding the local
+    // number here worked only while local numbers WERE the raw index; the
+    // per-binary ranges made that silently point at an empty database and
+    // the distribution came back empty.
+    let db = redis_db_for_prefix(&h.address_prefix);
+    let db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, db).await;
+    let client = Client::open(format!("{redis_base}/{db}")).expect("client");
     let mut admin = ConnectionManager::new(client).await.expect("admin conn");
 
     // Everything except writes. `-@write` covers DEL/HSET/EXPIRE, so the
@@ -599,7 +613,7 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
     }
 
     let ro_url = redis_base.replacen("redis://", &format!("redis://{ACL_USER}:readonlypw@"), 1);
-    let ro_client = Client::open(format!("{ro_url}/6")).expect("read-only client");
+    let ro_client = Client::open(format!("{ro_url}/{db}")).expect("read-only client");
     let ro_conn = ConnectionManager::new(ro_client)
         .await
         .expect("read-only conn");
@@ -834,6 +848,8 @@ async fn an_unreadable_window_fails_the_build_instead_of_degrading() {
 async fn raw_conn(h: &Harness) -> ConnectionManager {
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
     let db = redis_db_for_prefix(&h.address_prefix);
+    let db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, db).await;
     let client = Client::open(format!("{redis_base}/{db}")).expect("client");
     ConnectionManager::new(client).await.expect("conn")
 }

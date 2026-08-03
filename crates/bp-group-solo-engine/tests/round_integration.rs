@@ -22,6 +22,11 @@ const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
 
 async fn connect_or_skip(test_db: u8) -> Option<ConnectionManager> {
     let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+    // Fold this binary's local number into its own DB range — see
+    // `bp_test_support::redis_db`. Without it every binary's 0..15
+    // land on the same 16 databases and FLUSHDB each other mid-run.
+    let test_db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_ROUND, test_db).await;
     let url = format!("{base}/{test_db}");
     let client = match Client::open(url.clone()) {
         Ok(c) => c,

@@ -504,6 +504,7 @@ dependencies = [
  "bp-stratum-v1",
  "bp-stratum-v2",
  "bp-template-distribution",
+ "bp-test-support",
  "bs58 0.5.1",
  "chrono",
  "clap",
@@ -975,6 +976,7 @@ version = "2.2.5"
 dependencies = [
  "async-trait",
  "bp-share-hook",
+ "bp-test-support",
  "metrics",
  "redis",
  "serde",

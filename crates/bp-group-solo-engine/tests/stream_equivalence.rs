@@ -20,7 +20,7 @@ use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_group_solo_engine::hooks::GroupSoloAcceptedShareSink;
 use bp_share_hook::{MiningMode, SharedAcceptedShareOwned, SharedAcceptedShareSink};
 use bp_share_stream::{AcceptedShareConsumer, AcceptedShareProducer};
-use bp_test_support::{connect_pg_or_skip, connect_redis_or_skip};
+use bp_test_support::{connect_pg_or_skip, connect_redis_in_range_or_skip};
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -145,10 +145,11 @@ async fn in_process_and_stream_paths_leave_identical_group_solo_round() {
     let Some(pool) = connect_pg_or_skip().await else {
         return;
     };
-    // DBs 0–15 only (valkey default); 12/13 here, 14/15 in the dup test.
+    // Local numbers inside this binary's own DB range — see
+    // `bp_test_support::redis_db`; 12/13 here, 14/15 in the dup test.
     let (Some(conn_a), Some(conn_b)) = (
-        connect_redis_or_skip(12).await,
-        connect_redis_or_skip(13).await,
+        connect_redis_in_range_or_skip(bp_test_support::redis_db::GS_STREAM_EQUIV, 12).await,
+        connect_redis_in_range_or_skip(bp_test_support::redis_db::GS_STREAM_EQUIV, 13).await,
     ) else {
         return;
     };
@@ -181,8 +182,8 @@ async fn duplicate_entries_in_the_stream_do_not_break_group_solo_equivalence() {
         return;
     };
     let (Some(conn_a), Some(conn_b)) = (
-        connect_redis_or_skip(14).await,
-        connect_redis_or_skip(15).await,
+        connect_redis_in_range_or_skip(bp_test_support::redis_db::GS_STREAM_EQUIV, 14).await,
+        connect_redis_in_range_or_skip(bp_test_support::redis_db::GS_STREAM_EQUIV, 15).await,
     ) else {
         return;
     };

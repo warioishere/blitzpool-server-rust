@@ -40,6 +40,12 @@ struct Harness {
 async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Harness> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
+    // Fold this binary's local number into its own DB range — see
+    // `bp_test_support::redis_db`. Without it every binary's 0..15
+    // land on the same 16 databases and FLUSHDB each other mid-run.
+    let redis_db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_DISTRIBUTION, redis_db)
+            .await;
     let redis_url = format!("{redis_base}/{redis_db}");
 
     let pool = match tokio::time::timeout(

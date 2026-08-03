@@ -438,6 +438,11 @@ mod tests {
     /// anything but its own devices — flushing would buy no isolation
     /// there and would wipe whatever a sibling is mid-way through.
     async fn connect_redis_or_skip_shared(db: u8) -> Option<ConnectionManager> {
+        // Fold this binary's local number into its own DB range —
+        // see `bp_test_support::redis_db`. Two binaries both using
+        // 0..15 flush each other mid-run.
+        let db =
+            bp_test_support::redis_db_in_range(bp_test_support::redis_db::BLITZPOOL_BIN, db).await;
         let client = redis::Client::open(format!("{REDIS_URL}/{db}")).ok()?;
         tokio::time::timeout(StdDuration::from_secs(2), ConnectionManager::new(client))
             .await

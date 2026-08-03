@@ -32,6 +32,10 @@ struct Harness {
 async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Harness> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
+    // Fold this binary's local number into its own DB range — see
+    // `bp_test_support::redis_db`.
+    let redis_db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_ENGINE, redis_db).await;
     let redis_url = format!("{redis_base}/{redis_db}");
 
     let pool = match tokio::time::timeout(
@@ -543,7 +547,7 @@ async fn snapshot_carried_apply_survives_redis_overwrite() {
 // (`--test-threads=1`), which the shared PG/Redis already requires.
 #[tokio::test]
 async fn block_found_resolves_the_job_time_distribution_not_a_rebuild() {
-    let h = match spawn_or_skip(11, None).await {
+    let h = match spawn_or_skip(13, None).await {
         Some(h) => h,
         None => return,
     };
@@ -612,7 +616,7 @@ async fn block_found_resolves_the_job_time_distribution_not_a_rebuild() {
 // Shares Redis db 11; the suite runs serially (`--test-threads=1`).
 #[tokio::test]
 async fn an_unknown_payout_list_resolves_to_nothing() {
-    let h = match spawn_or_skip(11, None).await {
+    let h = match spawn_or_skip(16, None).await {
         Some(h) => h,
         None => return,
     };
@@ -652,7 +656,7 @@ async fn an_unknown_payout_list_resolves_to_nothing() {
 // Shares Redis db 11; the suite runs serially (`--test-threads=1`).
 #[tokio::test]
 async fn apply_deletes_only_the_payout_list_it_booked() {
-    let h = match spawn_or_skip(11, None).await {
+    let h = match spawn_or_skip(17, None).await {
         Some(h) => h,
         None => return,
     };
@@ -1332,6 +1336,8 @@ async fn connect_pg_or_skip() -> Option<PgPool> {
 /// Connect a flushed Redis logical DB, or `None` to skip.
 async fn connect_redis_or_skip(redis_db: u8) -> Option<ConnectionManager> {
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
+    let redis_db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_ENGINE, redis_db).await;
     let client = Client::open(format!("{redis_base}/{redis_db}")).ok()?;
     let mut conn = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -1383,7 +1389,7 @@ async fn seed_group_with_daily_reset(pool: &PgPool, group_id: Uuid) {
 // now-relative timestamps so the record-path and read-path trims agree.
 #[tokio::test]
 async fn window_mode_record_path_trims_aged_buckets() {
-    let h = match spawn_or_skip(12, None).await {
+    let h = match spawn_or_skip(18, None).await {
         Some(h) => h,
         None => return,
     };
@@ -1523,7 +1529,7 @@ async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
 /// inside the band — the arithmetic does not change at the boundary.
 #[tokio::test]
 async fn a_group_block_far_off_the_reference_is_still_booked() {
-    let h = match spawn_or_skip(3, Some(160_000)).await {
+    let h = match spawn_or_skip(19, Some(160_000)).await {
         Some(h) => h,
         None => return,
     };

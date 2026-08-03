@@ -47,6 +47,11 @@ struct EngineHarness {
 async fn connect_or_skip(redis_db: u8, prefix: &str) -> Option<(ConnectionManager, PgPool)> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
+    // Fold this binary's local number into its own DB range — see
+    // `bp_test_support::redis_db`. Without it every binary's 0..15
+    // land on the same 16 databases and FLUSHDB each other mid-run.
+    let redis_db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_ENGINE, redis_db).await;
     let redis_url = format!("{redis_base}/{redis_db}");
 
     let pool = match tokio::time::timeout(
@@ -428,6 +433,11 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
 
 #[tokio::test]
 async fn a_second_apply_of_the_same_block_moves_no_money() {
+    // This test is one of the few that DEPENDS on Redis state surviving
+    // between two steps (the latecomer below must still be in the window),
+    // so it needs a logical DB no sibling flushes — see
+    // `bp_test_support::redis_db`. The precondition assert stays as the
+    // backstop if that ever stops holding.
     let _serial = balance_table_lock().lock().await;
     let h = match spawn_or_skip(13, "test_reapply_").await {
         Some(h) => h,
@@ -1122,7 +1132,7 @@ fn _force_use(_: AddressId) {}
 #[tokio::test]
 async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
     let _guard = balance_table_lock().lock().await;
-    let h = match spawn_or_skip(3, "test_engine_unk_").await {
+    let h = match spawn_or_skip(16, "test_engine_unk_").await {
         Some(h) => h,
         None => return,
     };
@@ -1168,7 +1178,7 @@ async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
 #[tokio::test]
 async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() {
     let _guard = balance_table_lock().lock().await;
-    let h = match spawn_or_skip(4, "test_engine_consume_").await {
+    let h = match spawn_or_skip(17, "test_engine_consume_").await {
         Some(h) => h,
         None => return,
     };
@@ -1246,7 +1256,7 @@ async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() 
 #[tokio::test]
 async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
     let _guard = balance_table_lock().lock().await;
-    let h = match spawn_or_skip(5, "test_engine_stale_").await {
+    let h = match spawn_or_skip(18, "test_engine_stale_").await {
         Some(h) => h,
         None => return,
     };
@@ -1540,7 +1550,7 @@ async fn a_coinbase_below_the_block_subsidy_is_refused() {
 #[tokio::test]
 async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
     let _serial = balance_table_lock().lock().await;
-    let h = match spawn_or_skip(13, "test_rebase_").await {
+    let h = match spawn_or_skip(19, "test_rebase_").await {
         Some(h) => h,
         None => return,
     };

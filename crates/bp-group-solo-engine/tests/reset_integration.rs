@@ -22,6 +22,11 @@ const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 async fn connect_or_skip(redis_db: u8) -> Option<(PgPool, ConnectionManager)> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
+    // Fold this binary's local number into its own DB range — see
+    // `bp_test_support::redis_db`. Without it every binary's 0..15
+    // land on the same 16 databases and FLUSHDB each other mid-run.
+    let redis_db =
+        bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_RESET, redis_db).await;
     let redis_url = format!("{redis_base}/{redis_db}");
 
     let pool = match tokio::time::timeout(

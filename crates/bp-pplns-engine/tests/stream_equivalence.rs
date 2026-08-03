@@ -27,7 +27,7 @@ use bp_pplns_engine::hooks::PplnsAcceptedShareSink;
 use bp_pplns_engine::window::NetworkDifficulty;
 use bp_share_hook::{MiningMode, SharedAcceptedShareOwned, SharedAcceptedShareSink};
 use bp_share_stream::{AcceptedShareConsumer, AcceptedShareProducer};
-use bp_test_support::{connect_pg_or_skip, connect_redis_or_skip};
+use bp_test_support::{connect_pg_or_skip, connect_redis_in_range_or_skip};
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 
@@ -159,8 +159,8 @@ async fn in_process_and_stream_paths_leave_identical_pplns_window() {
         return;
     };
     let (Some(conn_a), Some(conn_b)) = (
-        connect_redis_or_skip(11).await,
-        connect_redis_or_skip(12).await,
+        connect_redis_in_range_or_skip(bp_test_support::redis_db::PPLNS_STREAM_EQUIV, 11).await,
+        connect_redis_in_range_or_skip(bp_test_support::redis_db::PPLNS_STREAM_EQUIV, 12).await,
     ) else {
         return;
     };
@@ -197,8 +197,8 @@ async fn duplicate_entries_in_the_stream_do_not_break_equivalence() {
         return;
     };
     let (Some(conn_a), Some(conn_b)) = (
-        connect_redis_or_skip(13).await,
-        connect_redis_or_skip(14).await,
+        connect_redis_in_range_or_skip(bp_test_support::redis_db::PPLNS_STREAM_EQUIV, 13).await,
+        connect_redis_in_range_or_skip(bp_test_support::redis_db::PPLNS_STREAM_EQUIV, 14).await,
     ) else {
         return;
     };
@@ -261,7 +261,9 @@ async fn mixed_epoch_share_ids_apply_once_without_seq_collision() {
     let Some(pool) = connect_pg_or_skip().await else {
         return;
     };
-    let Some(conn) = connect_redis_or_skip(5).await else {
+    let Some(conn) =
+        connect_redis_in_range_or_skip(bp_test_support::redis_db::PPLNS_STREAM_EQUIV, 5).await
+    else {
         return;
     };
 
@@ -301,7 +303,9 @@ async fn only_pplns_mode_shares_land_in_the_pplns_window() {
     let Some(pool) = connect_pg_or_skip().await else {
         return;
     };
-    let Some(conn) = connect_redis_or_skip(6).await else {
+    let Some(conn) =
+        connect_redis_in_range_or_skip(bp_test_support::redis_db::PPLNS_STREAM_EQUIV, 6).await
+    else {
         return;
     };
 
@@ -340,7 +344,9 @@ async fn pplns_touch_uses_share_time_not_consume_time() {
     let Some(pool) = connect_pg_or_skip().await else {
         return;
     };
-    let Some(conn) = connect_redis_or_skip(7).await else {
+    let Some(conn) =
+        connect_redis_in_range_or_skip(bp_test_support::redis_db::PPLNS_STREAM_EQUIV, 7).await
+    else {
         return;
     };
 
