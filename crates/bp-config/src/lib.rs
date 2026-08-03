@@ -538,16 +538,24 @@ pub struct Sv2Config {
     pub jdp_enabled: bool,
     #[serde(default)]
     pub jdp_port: Option<u16>,
-    /// JDP block-found orphan-protection redundancy switch.
-    /// `false` (default): on `PushSolution` the pool **logs only** —
-    /// JDC is responsible for propagating the block via its own
-    /// `TdpHandle::submit_solution` path. SRI's reference pool does
-    /// the same.
-    /// `true`: pool additionally reconstructs the block + submits via
-    /// `bitcoind submitblock` RPC — anti-orphan redundancy for
-    /// production pools that serve
-    /// commercial JDCs. Off by default because most deployments
-    /// don't run JDC traffic — flip on when JDPs are in active use.
+    /// Pool-side block resubmit over JSON-RPC — the ONLY way the pool can
+    /// meet §6.4.9 ("When receiving `PushSolution`, JDS MUST attempt to
+    /// reconstruct and propagate the block") on Bitcoin Core v31.
+    ///
+    /// Routing it through Core's job-declaration IPC instead would be the
+    /// natural home for it — that interface already holds the declaration it
+    /// validated. It cannot be done yet: v31's JDP interface has no
+    /// `submitSolution`, and its `handle_push_solution` is an explicit stub
+    /// ("Not yet implemented — deliberately left as a stub for future work").
+    /// Verified against bitcoin_core_sv2 v0.5.0 (sv2-apps v0.7.0) on
+    /// 2026-08-03. It arrives with Core v32 via sv2-apps#593; do not wire it
+    /// before then, the call would silently do nothing.
+    ///
+    /// `false` (default): on `PushSolution` the pool logs only — the JDC
+    /// propagates through its own node, which the spec guarantees happens
+    /// regardless. The pool then contributes nothing to shrinking the orphan
+    /// window, so a deployment that actually serves JDCs wants this on.
+    /// `true`: reconstruct the block and submit it via `bitcoind submitblock`.
     #[serde(default)]
     pub jdp_orphan_submitblock: bool,
     /// Bitcoin-core data directory for the JDP validation IPC (SV2 §6.1).

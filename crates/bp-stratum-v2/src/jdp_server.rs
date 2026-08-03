@@ -255,40 +255,13 @@ fn ordered_raw_txs(by_position: &std::collections::HashMap<u32, Vec<u8>>) -> Vec
 /// different fee revenue, or invalid transactions — "in many ways identical to
 /// block withholding").
 ///
-/// §6.1 gives the JDS two duties that only a Bitcoin node can discharge:
-/// "Maintaining an internal mempool" and "Publishing valid block submissions
-/// received from JDC". This trait is that node.
-///
-/// `None` in [`JdpServerHooks::node_backend`] keeps the pool's previous
-/// behaviour: declarations are accepted on the JDC's word, and propagation —
-/// if it happens at all — goes through whatever the block sink was given.
+/// This is the seam where a declared job is handed to a Bitcoin node for a real
+/// verdict. `None` in [`JdpServerHooks::job_validator`] keeps the pool's
+/// template-only behaviour: every declaration is accepted on the JDC's word.
 #[async_trait]
-pub trait JdpNodeBackend: Send + Sync {
+pub trait DeclaredJobValidator: Send + Sync {
     /// Ask the node whether this declared job is valid.
     async fn validate_declaration(&self, job: DeclaredJobToValidate<'_>) -> JobVerdict;
-
-    /// §6.4.9: "When receiving `PushSolution`, JDS MUST attempt to reconstruct
-    /// and propagate the block using the template data associated with its most
-    /// recently sent `DeclareMiningJob.Success`."
-    ///
-    /// The node does the reconstructing: it already holds the declaration it
-    /// validated, which is exactly the template data the spec points at. The
-    /// JDC submits through its own node regardless — propagating on both sides
-    /// is the point, it shrinks the orphan window.
-    async fn propagate_solution(&self, solution: SolutionToPropagate<'_>);
-}
-
-/// One `PushSolution`, in the shape a node-side backend needs.
-pub struct SolutionToPropagate<'a> {
-    /// The JDP session it arrived on — the node keys its declaration state by
-    /// downstream, so a solution must not be attributed to another connection.
-    pub session_id: u32,
-    pub extranonce: &'a [u8],
-    pub prev_hash: [u8; 32],
-    pub ntime: u32,
-    pub nonce: u32,
-    pub n_bits: u32,
-    pub version: u32,
 }
 
 /// One declared job, in the shape a node-side validator needs.
@@ -332,7 +305,7 @@ pub struct JdpServerHooks {
     /// Node-side validation of declared jobs (§6.1). `None` → the pool
     /// accepts every declaration on the JDC's word, which is what it did
     /// before this hook existed.
-    pub node_backend: Option<Arc<dyn JdpNodeBackend>>,
+    pub job_validator: Option<Arc<dyn DeclaredJobValidator>>,
 }
 
 impl JdpServerHooks {
@@ -344,7 +317,7 @@ impl JdpServerHooks {
             prev_hash_provider: n.clone(),
             block_submission_sink: n.clone(),
             distribution_source: n,
-            node_backend: None,
+            job_validator: None,
         }
     }
 }
@@ -1044,7 +1017,7 @@ async fn dispatch_jdp_inbound(
             // so the node only reports what it is genuinely missing. Rejection
             // short-circuits: nothing is registered, so there is no state to
             // roll back.
-            if let Some(validator) = hooks.node_backend.as_ref() {
+            if let Some(validator) = hooks.job_validator.as_ref() {
                 let partition = partition_against_template(&input.wtxid_list, &template_txs);
                 let known = ordered_raw_txs(&partition.known_raw_txs);
                 if let JobVerdict::Rejected(error_code) = validator
@@ -1089,7 +1062,7 @@ async fn dispatch_jdp_inbound(
             // see the whole transaction set. Asking again is the point — a
             // JDC could otherwise hide an invalid transaction by declaring it
             // as one we were missing.
-            if let Some(validator) = hooks.node_backend.as_ref() {
+            if let Some(validator) = hooks.job_validator.as_ref() {
                 if let Some(pending) = state.pending_declaration.as_ref() {
                     let merged = merge_provided_with_known(
                         pending.pending.clone(),
@@ -1170,23 +1143,6 @@ async fn dispatch_jdp_inbound(
                         AddressId::new("u".to_string()).expect("'u' is a valid AddressId")
                     })
                 });
-            // §6.4.9 MUST: hand it to the node so it reconstructs and
-            // propagates from the declaration it already validated. The
-            // block sink keeps doing its own thing (booking, and the
-            // optional RPC resubmit) — this is the propagation half.
-            if let Some(backend) = hooks.node_backend.as_ref() {
-                backend
-                    .propagate_solution(SolutionToPropagate {
-                        session_id,
-                        extranonce: &input.extranonce,
-                        prev_hash: input.prev_hash,
-                        ntime: input.ntime,
-                        nonce: input.nonce,
-                        n_bits: input.n_bits,
-                        version: input.version,
-                    })
-                    .await;
-            }
             handle_push_solution(state, &input, miner_address)
         }
     }
@@ -1648,7 +1604,6 @@ mod tests {
     struct StubValidator {
         verdict: std::sync::Mutex<Option<JobVerdict>>,
         calls: std::sync::atomic::AtomicUsize,
-        propagated: std::sync::atomic::AtomicUsize,
     }
 
     impl StubValidator {
@@ -1656,19 +1611,15 @@ mod tests {
             Arc::new(Self {
                 verdict: std::sync::Mutex::new(Some(verdict)),
                 calls: std::sync::atomic::AtomicUsize::new(0),
-                propagated: std::sync::atomic::AtomicUsize::new(0),
             })
         }
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::Relaxed)
         }
-        fn propagated(&self) -> usize {
-            self.propagated.load(std::sync::atomic::Ordering::Relaxed)
-        }
     }
 
     #[async_trait]
-    impl JdpNodeBackend for StubValidator {
+    impl DeclaredJobValidator for StubValidator {
         async fn validate_declaration(&self, _job: DeclaredJobToValidate<'_>) -> JobVerdict {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1677,11 +1628,6 @@ mod tests {
                 Some(JobVerdict::NeedsTransactions) => JobVerdict::NeedsTransactions,
                 _ => JobVerdict::Accepted,
             }
-        }
-
-        async fn propagate_solution(&self, _solution: SolutionToPropagate<'_>) {
-            self.propagated
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1707,7 +1653,7 @@ mod tests {
         state.full_template_mode = true;
         let validator = StubValidator::new(JobVerdict::Rejected("invalid-coinbase-tx".to_string()));
         let mut hooks = JdpServerHooks::no_op();
-        hooks.node_backend = Some(validator.clone() as Arc<dyn JdpNodeBackend>);
+        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
         let bridge = fresh_bridge();
 
         let outcome = dispatch_jdp_inbound(
@@ -1739,43 +1685,6 @@ mod tests {
         );
     }
 
-    /// §6.4.9 is a MUST: a solution has to reach the node so it can relay the
-    /// block. The JDC submits through its own node too — propagating on both
-    /// sides is what shrinks the orphan window.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_pushed_solution_reaches_the_node() {
-        let mut state = fresh_session();
-        let _ = handle_setup_connection(&mut state, &jdp_setup());
-        let backend = StubValidator::new(JobVerdict::Accepted);
-        let mut hooks = JdpServerHooks::no_op();
-        hooks.node_backend = Some(backend.clone() as Arc<dyn JdpNodeBackend>);
-        let bridge = fresh_bridge();
-
-        let _ = dispatch_jdp_inbound(
-            &mut state,
-            InboundJdpFrame::PushSolution(crate::jdp::client::PushSolutionInput {
-                extranonce: vec![0xEE; 8],
-                prev_hash: [0xAB; 32],
-                ntime: 0x6500_0001,
-                nonce: 0xdead_beef,
-                n_bits: 0x1d00_ffff,
-                version: 0x2000_0000,
-            }),
-            &hooks,
-            &bridge,
-            1,
-            "1.2.3.4:5555",
-            1_000,
-        )
-        .await;
-
-        assert_eq!(
-            backend.propagated(),
-            1,
-            "the solution must be handed to the node — §6.4.9 MUST"
-        );
-    }
-
     /// Without a validator wired the pool keeps its previous behaviour —
     /// declarations are taken on the JDC's word. Guards against the gate
     /// silently becoming mandatory.
@@ -1785,7 +1694,7 @@ mod tests {
         let _ = handle_setup_connection(&mut state, &jdp_setup());
         state.full_template_mode = true;
         let hooks = JdpServerHooks::no_op();
-        assert!(hooks.node_backend.is_none());
+        assert!(hooks.job_validator.is_none());
         let bridge = fresh_bridge();
 
         let outcome = dispatch_jdp_inbound(
@@ -1815,7 +1724,7 @@ mod tests {
         state.full_template_mode = true;
         let validator = StubValidator::new(JobVerdict::NeedsTransactions);
         let mut hooks = JdpServerHooks::no_op();
-        hooks.node_backend = Some(validator.clone() as Arc<dyn JdpNodeBackend>);
+        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
         let bridge = fresh_bridge();
 
         let outcome = dispatch_jdp_inbound(

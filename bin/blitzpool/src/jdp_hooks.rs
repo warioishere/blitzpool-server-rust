@@ -48,8 +48,9 @@
 //!    both things that want it. First the **orphan-protection
 //!    redundancy** resubmit via [`BitcoinRpc::submit_block`]: the JDC
 //!    also submits via its own TDP connection, so the pool-side submit
-//!    is a hot-path Anti-Orphan measure consistent with the SV2 spec
-//!    §6.4.9 "JDS SHOULD propagate". Then the payout ledger, which
+//!    is the pool's half of the redundancy §6.4.9 asks for ("JDS MUST
+//!    attempt to reconstruct and propagate the block" — a MUST, not a
+//!    SHOULD). Then the payout ledger, which
 //!    books the block only once its header proves work against the
 //!    pool's OWN target and tip. Either half can be switched off
 //!    (`[sv2].jdp_orphan_submitblock`, no ledger fan-out wired) without
@@ -103,7 +104,7 @@ pub(crate) fn build_jdp_hooks(
     ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
     distribution_source: Arc<dyn PayoutDistributionSource>,
     settle: Arc<OnceLock<DistributionInvalidationHandle>>,
-    node_backend: Option<Arc<dyn JdpNodeBackend>>,
+    job_validator: Option<Arc<dyn DeclaredJobValidator>>,
 ) -> JdpServerHooks {
     let propagator: Option<Arc<dyn BlockPropagator>> = if orphan_submitblock_enabled {
         info!(
@@ -144,7 +145,7 @@ pub(crate) fn build_jdp_hooks(
         prev_hash_provider: Arc::new(TdpCurrentPrevHashProvider { tdp }),
         block_submission_sink: block_sink,
         distribution_source,
-        node_backend,
+        job_validator,
     }
 }
 
@@ -834,9 +835,7 @@ fn log_booking_status(miner_address: &AddressId, booking: Option<PayoutBooking>)
 // same `node.sock`. Nothing here replaces that path.
 
 use bitcoin_core_sv2::runtime_api::BitcoinCoreVersion;
-use bp_stratum_v2::jdp_server::{
-    DeclaredJobToValidate, JdpNodeBackend, JobVerdict, SolutionToPropagate,
-};
+use bp_stratum_v2::jdp_server::{DeclaredJobToValidate, DeclaredJobValidator, JobVerdict};
 use jd_server_sv2::job_declarator::job_validation::{
     bitcoin_core_ipc::BitcoinCoreIPCEngine, DeclareMiningJobResult, JobValidationEngine,
 };
@@ -844,7 +843,6 @@ use stratum_apps::tp_type::BitcoinNetwork as SriBitcoinNetwork;
 use stratum_core::job_declaration_sv2::{
     DeclareMiningJob as Sv2DeclareMiningJob,
     ProvideMissingTransactionsSuccess as Sv2ProvideMissingTransactionsSuccess,
-    PushSolution as Sv2PushSolution,
 };
 
 pub(crate) struct ProductionJobValidator {
@@ -863,7 +861,7 @@ impl ProductionJobValidator {
         data_dir: std::path::PathBuf,
         network: bp_config::Network,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Option<Arc<dyn JdpNodeBackend>> {
+    ) -> Option<Arc<dyn DeclaredJobValidator>> {
         let sri_network = match network {
             bp_config::Network::Mainnet => SriBitcoinNetwork::Mainnet,
             bp_config::Network::Testnet4 => SriBitcoinNetwork::Testnet4,
@@ -892,7 +890,7 @@ impl ProductionJobValidator {
                 );
                 Some(Arc::new(Self {
                     engine: Arc::new(engine),
-                }) as Arc<dyn JdpNodeBackend>)
+                }) as Arc<dyn DeclaredJobValidator>)
             }
             Err(err) => {
                 warn!(
@@ -908,7 +906,7 @@ impl ProductionJobValidator {
 }
 
 #[async_trait]
-impl JdpNodeBackend for ProductionJobValidator {
+impl DeclaredJobValidator for ProductionJobValidator {
     async fn validate_declaration(&self, job: DeclaredJobToValidate<'_>) -> JobVerdict {
         // Rebuild the SV2 message the engine expects. Every field comes
         // straight from the frame the JDC sent; `mining_job_token` and
@@ -970,28 +968,6 @@ impl JdpNodeBackend for ProductionJobValidator {
             // from the JDC; the second leg asks again with the full set.
             DeclareMiningJobResult::MissingTransactions(_) => JobVerdict::NeedsTransactions,
         }
-    }
-
-    async fn propagate_solution(&self, solution: SolutionToPropagate<'_>) {
-        let Ok(extranonce) = solution.extranonce.to_vec().try_into() else {
-            warn!("jdp: solution extranonce does not fit the SV2 wire shape — not propagated");
-            return;
-        };
-        let push = Sv2PushSolution {
-            extranonce,
-            prev_hash: solution.prev_hash.into(),
-            ntime: solution.ntime,
-            nonce: solution.nonce,
-            nbits: solution.n_bits,
-            version: solution.version,
-        };
-        // Fire-and-forget, like SRI's JDS: the node reconstructs the block from
-        // the declaration it validated and relays it. The JDC submits through
-        // its own node in parallel — that redundancy IS the orphan protection
-        // §6.4.9 asks for.
-        self.engine
-            .handle_push_solution(solution.session_id as usize, push)
-            .await;
     }
 }
 
