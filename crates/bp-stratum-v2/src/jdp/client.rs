@@ -353,6 +353,12 @@ pub struct JdpHandlerOutcome {
 }
 
 impl JdpHandlerOutcome {
+    /// One outbound frame, no events. Public twin of [`Self::with_frame`] for
+    /// the IO layer, which rejects a declaration before the pure handler runs.
+    pub fn with_frame_pub(frame: JdpOutboundFrame) -> Self {
+        Self::with_frame(frame)
+    }
+
     fn with_frame(frame: JdpOutboundFrame) -> Self {
         Self {
             outbound: vec![frame],

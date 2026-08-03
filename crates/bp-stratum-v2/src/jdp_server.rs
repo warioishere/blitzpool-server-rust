@@ -71,6 +71,7 @@ use crate::jdp::client::{
 };
 use crate::jdp::dynamic_outputs::PayoutBooking;
 use crate::jdp::payout_distribution::WeightedOutput;
+use crate::jdp::tx_validation::{merge_provided_with_known, partition_against_template};
 use crate::jdp_server_codec::{
     decode_jdp_inbound, encode_jdp_outbound, encode_jdp_outbound_ext_0x0003, InboundJdpFrame,
 };
@@ -236,6 +237,61 @@ pub trait JdpBlockSubmissionSink: Send + Sync {
     );
 }
 
+/// `position → raw_tx` in declaration order. The node-side validator wants a
+/// plain list; the position map is how the pool tracks the round-trip.
+fn ordered_raw_txs(by_position: &std::collections::HashMap<u32, Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut positions: Vec<&u32> = by_position.keys().collect();
+    positions.sort_unstable();
+    positions
+        .into_iter()
+        .filter_map(|p| by_position.get(p).cloned())
+        .collect()
+}
+
+/// SV2 §6.1 lists "Maintaining an internal mempool (via RPCs (or similar) to a
+/// Bitcoin Node)" among the JDS's responsibilities, and Full-Template mode
+/// exists precisely so the pool can check what Coinbase-only mode has to take
+/// on trust (§6.3.1: a miner declaring a coinbase whose template has a
+/// different fee revenue, or invalid transactions — "in many ways identical to
+/// block withholding").
+///
+/// This is the seam where a declared job is handed to a Bitcoin node for a real
+/// verdict. `None` in [`JdpServerHooks::job_validator`] keeps the pool's
+/// template-only behaviour: every declaration is accepted on the JDC's word.
+#[async_trait]
+pub trait DeclaredJobValidator: Send + Sync {
+    /// Ask the node whether this declared job is valid.
+    async fn validate_declaration(&self, job: DeclaredJobToValidate<'_>) -> JobVerdict;
+}
+
+/// One declared job, in the shape a node-side validator needs.
+pub struct DeclaredJobToValidate<'a> {
+    /// The JDP session the declaration came in on. A node-side validator keeps
+    /// per-downstream state, so declarations must not be attributed to the
+    /// wrong connection.
+    pub session_id: u32,
+    pub version: u32,
+    pub coinbase_tx_prefix: &'a [u8],
+    pub coinbase_tx_suffix: &'a [u8],
+    /// Declared wtxids in declaration order (wire byte order).
+    pub wtxid_list: &'a [[u8; 32]],
+    /// Raw transactions the pool can already supply. The node reports back
+    /// whatever it still misses rather than guessing.
+    pub known_raw_txs: &'a [Vec<u8>],
+}
+
+/// What the node said about a declared job.
+pub enum JobVerdict {
+    /// Validated — the node accepts the job.
+    Accepted,
+    /// Rejected. Carries the SV2 error code for `DeclareMiningJob.Error`.
+    Rejected(String),
+    /// The node is missing transactions the pool did not supply. NOT a
+    /// rejection: the pool's own `ProvideMissingTransactions` round-trip
+    /// fetches them from the JDC and the second leg asks again.
+    NeedsTransactions,
+}
+
 #[derive(Clone)]
 pub struct JdpServerHooks {
     pub allocate_resolver: Arc<dyn JdpAllocateResolver>,
@@ -246,6 +302,10 @@ pub struct JdpServerHooks {
     /// production by `bin/blitzpool::jdp_hooks`; the [`NoOpJdpHooks`]
     /// returns `None` everywhere (extension not offered).
     pub distribution_source: Arc<dyn PayoutDistributionSource>,
+    /// Node-side validation of declared jobs (§6.1). `None` → the pool
+    /// accepts every declaration on the JDC's word, which is what it did
+    /// before this hook existed.
+    pub job_validator: Option<Arc<dyn DeclaredJobValidator>>,
 }
 
 impl JdpServerHooks {
@@ -257,6 +317,7 @@ impl JdpServerHooks {
             prev_hash_provider: n.clone(),
             block_submission_sink: n.clone(),
             distribution_source: n,
+            job_validator: None,
         }
     }
 }
@@ -951,6 +1012,39 @@ async fn dispatch_jdp_inbound(
         }
         InboundJdpFrame::DeclareMiningJob(input) => {
             let template_txs = hooks.template_tx_provider.snapshot().await;
+            // §6.1: hand the declaration to a Bitcoin node before committing
+            // to it. Whatever the local template already covers is supplied,
+            // so the node only reports what it is genuinely missing. Rejection
+            // short-circuits: nothing is registered, so there is no state to
+            // roll back.
+            if let Some(validator) = hooks.job_validator.as_ref() {
+                let partition = partition_against_template(&input.wtxid_list, &template_txs);
+                let known = ordered_raw_txs(&partition.known_raw_txs);
+                if let JobVerdict::Rejected(error_code) = validator
+                    .validate_declaration(DeclaredJobToValidate {
+                        session_id,
+                        version: input.version,
+                        coinbase_tx_prefix: &input.coinbase_tx_prefix,
+                        coinbase_tx_suffix: &input.coinbase_tx_suffix,
+                        wtxid_list: &input.wtxid_list,
+                        known_raw_txs: &known,
+                    })
+                    .await
+                {
+                    warn!(
+                        session_id,
+                        error_code, "jdp: node rejected the declared job — not accepting it"
+                    );
+                    return JdpHandlerOutcome::with_frame_pub(
+                        JdpOutboundFrame::DeclareMiningJobError {
+                            request_id: input.request_id,
+                            error_code,
+                            error_details: b"declared job rejected by the pool's bitcoin node"
+                                .to_vec(),
+                        },
+                    );
+                }
+            }
             let current_prev_hash = hooks.prev_hash_provider.current_prev_hash().await;
             let distribution =
                 resolve_distribution_acceptance(bridge, session_id, input.distribution_id);
@@ -964,6 +1058,51 @@ async fn dispatch_jdp_inbound(
             )
         }
         InboundJdpFrame::ProvideMissingTransactionsSuccess(input) => {
+            // Second leg: the JDC just filled the gaps, so the node can now
+            // see the whole transaction set. Asking again is the point — a
+            // JDC could otherwise hide an invalid transaction by declaring it
+            // as one we were missing.
+            if let Some(validator) = hooks.job_validator.as_ref() {
+                if let Some(pending) = state.pending_declaration.as_ref() {
+                    let merged = merge_provided_with_known(
+                        pending.pending.clone(),
+                        input.transaction_list.clone(),
+                    )
+                    .ok();
+                    if let Some(merged) = merged {
+                        let known = ordered_raw_txs(&merged);
+                        let declared = pending.input.clone();
+                        if let JobVerdict::Rejected(error_code) = validator
+                            .validate_declaration(DeclaredJobToValidate {
+                                session_id,
+                                version: declared.version,
+                                coinbase_tx_prefix: &declared.coinbase_tx_prefix,
+                                coinbase_tx_suffix: &declared.coinbase_tx_suffix,
+                                wtxid_list: &declared.wtxid_list,
+                                known_raw_txs: &known,
+                            })
+                            .await
+                        {
+                            warn!(
+                                session_id,
+                                error_code,
+                                "jdp: node rejected the completed declaration — not accepting it"
+                            );
+                            // Drop the pending declaration with it, otherwise
+                            // the session keeps a half-finished round-trip.
+                            state.pending_declaration = None;
+                            return JdpHandlerOutcome::with_frame_pub(
+                                JdpOutboundFrame::DeclareMiningJobError {
+                                    request_id: declared.request_id,
+                                    error_code,
+                                    error_details:
+                                        b"declared job rejected by the pool's bitcoin node".to_vec(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
             let current_prev_hash = hooks.prev_hash_provider.current_prev_hash().await;
             // §7.2/§10 are judged when the declaration is ACCEPTED —
             // re-resolve against the pending declare's referenced id,
@@ -1441,6 +1580,170 @@ mod tests {
             }
             _ => panic!("expected AllocateMiningJobTokenSuccess"),
         }
+    }
+
+    // ── §6.1 node-side validation of declared jobs ──────────────────
+
+    /// The marker the §6.1 gate stamps on its own rejections. Lets a test tell
+    /// "the node refused this" apart from the ordinary handler errors (an
+    /// unallocated token, say) that have nothing to do with the gate.
+    const NODE_REFUSAL: &[u8] = b"declared job rejected by the pool's bitcoin node";
+
+    fn refused_by_node(outcome: &JdpHandlerOutcome) -> bool {
+        outcome.outbound.iter().any(|f| {
+            matches!(
+                f,
+                JdpOutboundFrame::DeclareMiningJobError { error_details, .. }
+                    if error_details.as_slice() == NODE_REFUSAL
+            )
+        })
+    }
+
+    /// Stands in for bitcoin-core: answers with whatever verdict the test
+    /// wants and records that it was actually consulted.
+    struct StubValidator {
+        verdict: std::sync::Mutex<Option<JobVerdict>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StubValidator {
+        fn new(verdict: JobVerdict) -> Arc<Self> {
+            Arc::new(Self {
+                verdict: std::sync::Mutex::new(Some(verdict)),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl DeclaredJobValidator for StubValidator {
+        async fn validate_declaration(&self, _job: DeclaredJobToValidate<'_>) -> JobVerdict {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match self.verdict.lock().expect("verdict lock").take() {
+                Some(JobVerdict::Rejected(code)) => JobVerdict::Rejected(code),
+                Some(JobVerdict::NeedsTransactions) => JobVerdict::NeedsTransactions,
+                _ => JobVerdict::Accepted,
+            }
+        }
+    }
+
+    fn declare_input() -> crate::jdp::client::DeclareMiningJobInput {
+        crate::jdp::client::DeclareMiningJobInput {
+            request_id: 11,
+            mining_job_token: Token([0xAA; 16]),
+            version: 0x2000_0000,
+            coinbase_tx_prefix: vec![0xBB; 8],
+            coinbase_tx_suffix: vec![0xCC; 8],
+            wtxid_list: vec![[0x11; 32]],
+            distribution_id: None,
+        }
+    }
+
+    /// A node rejection must stop the declaration dead: the JDC gets a
+    /// `DeclareMiningJob.Error` and nothing is registered. Accepting it would
+    /// mean paying shares for a job the pool's own node says is invalid.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_rejected_declaration_is_refused() {
+        let mut state = fresh_session();
+        let _ = handle_setup_connection(&mut state, &jdp_setup());
+        state.full_template_mode = true;
+        let validator = StubValidator::new(JobVerdict::Rejected("invalid-coinbase-tx".to_string()));
+        let mut hooks = JdpServerHooks::no_op();
+        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+        let bridge = fresh_bridge();
+
+        let outcome = dispatch_jdp_inbound(
+            &mut state,
+            InboundJdpFrame::DeclareMiningJob(declare_input()),
+            &hooks,
+            &bridge,
+            1,
+            "1.2.3.4:5555",
+            1_000,
+        )
+        .await;
+
+        assert_eq!(validator.calls(), 1, "the node must actually be consulted");
+        match &outcome.outbound[0] {
+            JdpOutboundFrame::DeclareMiningJobError {
+                request_id,
+                error_code,
+                ..
+            } => {
+                assert_eq!(*request_id, 11);
+                assert_eq!(error_code, "invalid-coinbase-tx");
+            }
+            other => panic!("expected DeclareMiningJobError, got {other:?}"),
+        }
+        assert!(
+            state.pending_declaration.is_none(),
+            "a refused declaration must leave no half-finished round-trip behind"
+        );
+    }
+
+    /// Without a validator wired the pool keeps its previous behaviour —
+    /// declarations are taken on the JDC's word. Guards against the gate
+    /// silently becoming mandatory.
+    #[tokio::test(flavor = "current_thread")]
+    async fn without_a_validator_the_declaration_is_not_refused() {
+        let mut state = fresh_session();
+        let _ = handle_setup_connection(&mut state, &jdp_setup());
+        state.full_template_mode = true;
+        let hooks = JdpServerHooks::no_op();
+        assert!(hooks.job_validator.is_none());
+        let bridge = fresh_bridge();
+
+        let outcome = dispatch_jdp_inbound(
+            &mut state,
+            InboundJdpFrame::DeclareMiningJob(declare_input()),
+            &hooks,
+            &bridge,
+            1,
+            "1.2.3.4:5555",
+            1_000,
+        )
+        .await;
+
+        assert!(
+            !refused_by_node(&outcome),
+            "no validator must mean no node-driven rejection: {:?}",
+            outcome.outbound
+        );
+    }
+
+    /// `NeedsTransactions` is not a rejection: the node simply cannot judge
+    /// yet. The pool's own ProvideMissingTransactions round-trip has to run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn needs_transactions_is_not_a_rejection() {
+        let mut state = fresh_session();
+        let _ = handle_setup_connection(&mut state, &jdp_setup());
+        state.full_template_mode = true;
+        let validator = StubValidator::new(JobVerdict::NeedsTransactions);
+        let mut hooks = JdpServerHooks::no_op();
+        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+        let bridge = fresh_bridge();
+
+        let outcome = dispatch_jdp_inbound(
+            &mut state,
+            InboundJdpFrame::DeclareMiningJob(declare_input()),
+            &hooks,
+            &bridge,
+            1,
+            "1.2.3.4:5555",
+            1_000,
+        )
+        .await;
+
+        assert_eq!(validator.calls(), 1);
+        assert!(
+            !refused_by_node(&outcome),
+            "a node that lacks transactions must not fail the declaration: {:?}",
+            outcome.outbound
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

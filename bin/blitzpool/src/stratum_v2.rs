@@ -443,6 +443,7 @@ mod tests {
                 vardiff_silence_easing_enabled: false,
             },
             sv2: Sv2Config {
+                jdp_validation_data_dir: None,
                 authority_privkey_hex: privkey,
                 ed25519_authority_seed_hex: None,
                 cert_signed_part: None,

@@ -60,6 +60,8 @@ chrono = { workspace = true }
 bp-stratum-v1 = { workspace = true }
 bp-stratum-v2 = { workspace = true }
 jd_server_sv2 = { workspace = true }
+stratum-core = { workspace = true }
+bitcoin_core_sv2 = { workspace = true }
 bp-share = { workspace = true }
 bp-protocol-detect = { workspace = true }
 bp-mining-job = { workspace = true }

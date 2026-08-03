@@ -155,6 +155,26 @@ pub(crate) async fn spawn(
         fee_address,
     });
 
+    // SV2 §6.1: hand declared jobs to bitcoin-core for a real verdict when the
+    // operator points us at the node's data directory. Off → trusted, as before.
+    let job_validator = match cfg.sv2.jdp_validation_data_dir.clone() {
+        Some(data_dir) => {
+            crate::jdp_hooks::ProductionJobValidator::connect(
+                data_dir,
+                cfg.network,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+        }
+        None => {
+            info!(
+                "jdp: declared jobs are NOT validated against bitcoin-core \
+                 (set `[sv2].jdp_validation_data_dir` to enable, SV2 §6.1)"
+            );
+            None
+        }
+    };
+
     let hooks = build_jdp_hooks(
         tdp,
         bitcoin_rpc,
@@ -165,6 +185,7 @@ pub(crate) async fn spawn(
         ledger_booker,
         distribution_source,
         settle_slot.clone(),
+        job_validator,
     );
 
     let distribution_interval = Duration::from_secs(

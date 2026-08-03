@@ -550,6 +550,17 @@ pub struct Sv2Config {
     /// don't run JDC traffic — flip on when JDPs are in active use.
     #[serde(default)]
     pub jdp_orphan_submitblock: bool,
+    /// Bitcoin-core data directory for the JDP validation IPC (SV2 §6.1).
+    /// When set, every declared Custom Job is handed to bitcoin-core's
+    /// `job_declaration_protocol` interface for a real `checkBlock` verdict
+    /// instead of being accepted on the JDC's word. The socket is derived the
+    /// way bitcoin-core lays it out: `<data_dir>/<network>/node.sock` (no
+    /// subdirectory on mainnet) — the same node the pool already draws
+    /// templates from, just a second interface on it.
+    ///
+    /// Unset (default) keeps the previous behaviour: declarations are trusted.
+    #[serde(default)]
+    pub jdp_validation_data_dir: Option<PathBuf>,
     /// Republish cadence (seconds) for the ext 0x0003 payout
     /// distribution push (`SetPayoutDistribution`). The publisher also
     /// fires immediately on settlement invalidation; the timer only

@@ -103,6 +103,7 @@ pub(crate) fn build_jdp_hooks(
     ledger_booker: Option<Arc<crate::block_sink::TdpBlockSubmissionSink>>,
     distribution_source: Arc<dyn PayoutDistributionSource>,
     settle: Arc<OnceLock<DistributionInvalidationHandle>>,
+    job_validator: Option<Arc<dyn DeclaredJobValidator>>,
 ) -> JdpServerHooks {
     let propagator: Option<Arc<dyn BlockPropagator>> = if orphan_submitblock_enabled {
         info!(
@@ -143,6 +144,7 @@ pub(crate) fn build_jdp_hooks(
         prev_hash_provider: Arc::new(TdpCurrentPrevHashProvider { tdp }),
         block_submission_sink: block_sink,
         distribution_source,
+        job_validator,
     }
 }
 
@@ -816,6 +818,155 @@ fn log_booking_status(miner_address: &AddressId, booking: Option<PayoutBooking>)
             "JDP block-found: no proof this coinbase pays a pool distribution \
              (base-protocol declaration, or validation failed) — NOT bookable"
         ),
+    }
+}
+
+// ─── 6. ProductionJobValidator (SV2 §6.1, node-side validation) ───────
+//
+// SRI's own JDS library owns the hard part: a dedicated thread running the
+// !Send Cap'n-Proto client against bitcoin-core's `job_declaration_protocol`
+// IPC interface, where `checkBlock` gives a real consensus verdict on a
+// declared job. We hold it and translate between its SV2 wire types and the
+// pool's own decoded shapes.
+//
+// Note this is a DIFFERENT core interface than the one the pool already uses:
+// templates and block submission ride `template_distribution_protocol` on the
+// same `node.sock`. Nothing here replaces that path.
+
+use bitcoin_core_sv2::runtime_api::BitcoinCoreVersion;
+use bp_stratum_v2::jdp_server::{DeclaredJobToValidate, DeclaredJobValidator, JobVerdict};
+use jd_server_sv2::job_declarator::job_validation::{
+    bitcoin_core_ipc::BitcoinCoreIPCEngine, DeclareMiningJobResult, JobValidationEngine,
+};
+use stratum_apps::tp_type::BitcoinNetwork as SriBitcoinNetwork;
+use stratum_core::job_declaration_sv2::{
+    DeclareMiningJob as Sv2DeclareMiningJob,
+    ProvideMissingTransactionsSuccess as Sv2ProvideMissingTransactionsSuccess,
+};
+
+pub(crate) struct ProductionJobValidator {
+    engine: Arc<BitcoinCoreIPCEngine>,
+}
+
+impl ProductionJobValidator {
+    /// Connect to bitcoin-core's JDP IPC interface. `data_dir` is the node's
+    /// data directory — the socket is `<data_dir>/<network>/node.sock`, the
+    /// same node the pool already takes templates from.
+    ///
+    /// `None` when the network has no mapping in the upstream enum (Testnet3),
+    /// or when the socket cannot be reached: validation then stays off rather
+    /// than silently rejecting every declaration.
+    pub(crate) async fn connect(
+        data_dir: std::path::PathBuf,
+        network: bp_config::Network,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Option<Arc<dyn DeclaredJobValidator>> {
+        let sri_network = match network {
+            bp_config::Network::Mainnet => SriBitcoinNetwork::Mainnet,
+            bp_config::Network::Testnet4 => SriBitcoinNetwork::Testnet4,
+            bp_config::Network::Regtest => SriBitcoinNetwork::Regtest,
+            bp_config::Network::Testnet => {
+                warn!(
+                    "jdp: declared-job validation not available on testnet3 \
+                     (upstream has no socket layout for it) — declarations stay trusted"
+                );
+                return None;
+            }
+        };
+        // Core v31 is what the pool's TDP path already speaks.
+        match BitcoinCoreIPCEngine::new(
+            BitcoinCoreVersion::V31X,
+            sri_network,
+            Some(data_dir.clone()),
+            cancel,
+        )
+        .await
+        {
+            Ok(engine) => {
+                info!(
+                    data_dir = %data_dir.display(),
+                    "jdp: declared jobs are validated against bitcoin-core (SV2 §6.1)"
+                );
+                Some(Arc::new(Self {
+                    engine: Arc::new(engine),
+                }) as Arc<dyn DeclaredJobValidator>)
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    data_dir = %data_dir.display(),
+                    "jdp: could not reach bitcoin-core's job-declaration IPC — \
+                     declarations stay trusted"
+                );
+                None
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl DeclaredJobValidator for ProductionJobValidator {
+    async fn validate_declaration(&self, job: DeclaredJobToValidate<'_>) -> JobVerdict {
+        // Rebuild the SV2 message the engine expects. Every field comes
+        // straight from the frame the JDC sent; `mining_job_token` and
+        // `excess_data` are not part of the consensus question, so a
+        // placeholder token and empty excess keep the shape valid without
+        // pretending to carry meaning.
+        let wtxids: Vec<stratum_core::binary_sv2::U256<'static>> = job
+            .wtxid_list
+            .iter()
+            .map(|w| stratum_core::binary_sv2::U256::from(*w))
+            .collect();
+        let Ok(wtxid_list) = stratum_core::binary_sv2::Seq064K::new(wtxids) else {
+            warn!("jdp: wtxid list too long to validate — rejecting");
+            return JobVerdict::Rejected("invalid-job-declaration".to_string());
+        };
+        let (Ok(mining_job_token), Ok(prefix), Ok(suffix), Ok(excess_data)) = (
+            vec![0u8; 8].try_into(),
+            job.coinbase_tx_prefix.to_vec().try_into(),
+            job.coinbase_tx_suffix.to_vec().try_into(),
+            Vec::new().try_into(),
+        ) else {
+            warn!("jdp: declared coinbase does not fit the SV2 wire shape — rejecting");
+            return JobVerdict::Rejected("invalid-coinbase-tx".to_string());
+        };
+        let declare = Sv2DeclareMiningJob {
+            request_id: 0,
+            mining_job_token,
+            version: job.version,
+            coinbase_tx_prefix: prefix,
+            coinbase_tx_suffix: suffix,
+            wtxid_list,
+            excess_data,
+        };
+
+        // Hand over every raw transaction we already hold, so the node only
+        // reports what is genuinely missing rather than everything.
+        let provided: Vec<stratum_core::binary_sv2::B016M<'static>> = job
+            .known_raw_txs
+            .iter()
+            .filter_map(|tx| tx.clone().try_into().ok())
+            .collect();
+        let provide =
+            stratum_core::binary_sv2::Seq064K::new(provided)
+                .ok()
+                .map(|transaction_list| Sv2ProvideMissingTransactionsSuccess {
+                    request_id: 0,
+                    transaction_list,
+                });
+
+        match self
+            .engine
+            .handle_declare_mining_job(job.session_id as usize, declare, provide)
+            .await
+        {
+            DeclareMiningJobResult::Success => JobVerdict::Accepted,
+            DeclareMiningJobResult::Error(code) => JobVerdict::Rejected(code.to_string()),
+            // The node still lacks transactions we could not supply. The
+            // pool's own ProvideMissingTransactions round-trip fetches them
+            // from the JDC; the second leg asks again with the full set.
+            DeclareMiningJobResult::MissingTransactions(_) => JobVerdict::NeedsTransactions,
+        }
     }
 }
 
