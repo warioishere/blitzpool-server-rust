@@ -971,6 +971,61 @@ impl DeclaredJobValidator for ProductionJobValidator {
 }
 
 #[cfg(test)]
+mod jdp_validation_regtest {
+    use super::*;
+
+    /// The §6.1 validator must reach a REAL bitcoin-core over its
+    /// job-declaration IPC. Everything this asserts is a deployment fact that
+    /// unit tests cannot see: that the socket really is
+    /// `<data_dir>/regtest/node.sock` (upstream derives it, we only hand over
+    /// the data dir), that `BitcoinCoreVersion::V31X` matches the node we run,
+    /// and that our network mapping lands on the right subdirectory.
+    ///
+    /// Skipped with a warning when `bitcoin-node` is absent — same policy as
+    /// every other regtest here.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::print_stderr)]
+    async fn validator_connects_to_a_real_node_over_the_jdp_ipc() {
+        let cfg = bp_regtest_harness::RegtestConfig::default();
+        if !cfg.is_available() {
+            eprintln!(
+                "skipping JDP-validation regtest — bitcoin-node not found at {} \
+                 (set BITCOIN_NODE_PATH to override)",
+                cfg.bitcoin_node_path.display()
+            );
+            return;
+        }
+        let node = bp_regtest_harness::RegtestNode::start_with(cfg)
+            .await
+            .expect("regtest start");
+        // Core v31 blocks IPC work while IBD is active; a short chain of
+        // recent blocks exits it.
+        node.generate_to_self(101)
+            .await
+            .expect("mine 101 blocks for IBD-exit");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let validator = ProductionJobValidator::connect(
+            node.datadir_path().to_path_buf(),
+            bp_config::Network::Regtest,
+            cancel.clone(),
+        )
+        .await;
+
+        assert!(
+            validator.is_some(),
+            "the validator must reach the node's job-declaration IPC at {}/regtest/node.sock — \
+             if this fails the socket layout or the Core version mapping is wrong, and \
+             production would silently fall back to trusting the JDC",
+            node.datadir_path().display()
+        );
+
+        cancel.cancel();
+        node.shutdown().await.expect("regtest shutdown");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
