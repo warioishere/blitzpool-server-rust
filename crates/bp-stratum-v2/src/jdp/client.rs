@@ -59,7 +59,7 @@ use crate::tokens::{Token, TokenAllocError, TokenStore};
 use crate::bridge::DistributionAcceptance;
 
 use super::declarations::{DeclaredJob, DeclaredJobStore};
-use super::dynamic_outputs::{parse_coinbase_suffix_outputs, PayoutBooking};
+use super::dynamic_outputs::{declared_coinbase_outputs, PayoutBooking};
 use super::payout_distribution::validate_coinbase_outputs_against_distribution;
 use super::tx_validation::{
     merge_provided_with_known, partition_against_template, PendingDeclaration,
@@ -895,7 +895,8 @@ fn accept_declaration(
                 });
             }
         };
-        let Some(declared_outputs) = parse_coinbase_suffix_outputs(&input.coinbase_tx_suffix)
+        let Some(declared_outputs) =
+            declared_coinbase_outputs(&input.coinbase_tx_prefix, &input.coinbase_tx_suffix)
         else {
             tracing::warn!(
                 request_id = input.request_id,
@@ -1143,16 +1144,37 @@ mod tests {
             request_id: req_id,
             mining_job_token: token,
             version: 0x2000_0000,
-            coinbase_tx_prefix: vec![0xAA; 8],
+            coinbase_tx_prefix: coinbase_prefix(),
             coinbase_tx_suffix: vec![0xBB; 8],
             wtxid_list: wtxids,
             distribution_id: None,
         }
     }
 
+    /// A realistic declared `coinbase_tx_prefix`: coinbase header, a BIP-34
+    /// height push, and a 12-byte extranonce slot the prefix stops at. The
+    /// declare-time validation rebuilds the transaction from this plus the
+    /// suffix, so a placeholder blob no longer works — it used to, because the
+    /// old parser only ever looked at the suffix.
+    const EXTRANONCE_SLOT: usize = 12;
+    fn coinbase_prefix() -> Vec<u8> {
+        use bitcoin::consensus::Encodable;
+        let script_sig_head: [u8; 3] = [0x03, 0xC8, 0x00];
+        let mut p = Vec::new();
+        p.extend_from_slice(&2u32.to_le_bytes()); // version
+        p.push(0x01); // input count
+        p.extend_from_slice(&[0u8; 32]); // prevout txid
+        p.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // prevout index
+        bitcoin::VarInt((script_sig_head.len() + EXTRANONCE_SLOT) as u64)
+            .consensus_encode(&mut p)
+            .unwrap();
+        p.extend_from_slice(&script_sig_head);
+        p
+    }
+
     /// Wrap a consensus `Vec<TxOut>` blob as a realistic coinbase suffix
     /// (`nSequence(4) + outputs + nLockTime(4)`) — what the declare-time
-    /// payout-output validation parses.
+    /// payout-output validation parses, paired with [`coinbase_prefix`].
     fn coinbase_suffix(outputs_consensus: &[u8]) -> Vec<u8> {
         let mut s = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
         s.extend_from_slice(outputs_consensus);
@@ -2125,9 +2147,15 @@ mod tests {
                 ntime,
                 ..
             } => {
-                // prefix(8) + extranonce(8) + suffix(8) = 24
-                assert_eq!(coinbase_raw.len(), 24);
-                assert_eq!(&coinbase_raw[8..16], &extranonce[..]);
+                // The candidate is the declared prefix + the miner's extranonce
+                // + the declared suffix, spliced in that order.
+                let plen = coinbase_prefix().len();
+                assert_eq!(coinbase_raw.len(), plen + extranonce.len() + 8);
+                assert_eq!(&coinbase_raw[..plen], &coinbase_prefix()[..]);
+                assert_eq!(
+                    &coinbase_raw[plen..plen + extranonce.len()],
+                    &extranonce[..]
+                );
                 assert_eq!(transactions.len(), 1, "1 non-coinbase tx");
                 assert_eq!(transactions[0], vec![0xCA; 8]);
                 assert_eq!(*prev_hash, [0xAB; 32]);

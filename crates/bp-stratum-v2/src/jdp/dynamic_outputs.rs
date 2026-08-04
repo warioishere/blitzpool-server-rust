@@ -11,8 +11,8 @@
 //! - [`encode_coinbase_outputs`] — `(address, sats)` list → consensus
 //!   `Vec<TxOut>` bytes (`AllocateMiningJobToken.Success.coinbase_tx_outputs`
 //!   on the non-negotiated base path).
-//! - [`parse_coinbase_suffix_outputs`] — the declared coinbase suffix →
-//!   its output vector, fail-closed.
+//! - [`declared_coinbase_outputs`] — the declared prefix/suffix pair →
+//!   the rebuilt transaction's output vector, fail-closed.
 //! - [`PayoutBooking`] — the accounting identity a proven declaration
 //!   carries to the block-found path.
 
@@ -77,24 +77,79 @@ pub fn encode_coinbase_outputs(
     Ok(buf)
 }
 
-/// Parse the coinbase output vector out of a SV2 `coinbase_tx_suffix`.
+/// Rebuild the declared coinbase transaction from the SV2 prefix/suffix pair
+/// and hand back its outputs.
 ///
-/// The suffix is the coinbase bytes AFTER the extranonce slot:
-/// `[nSequence: 4][output_count: CompactSize][TxOuts][nLockTime: 4]`. The
-/// output vector is parsed as a consensus `Vec<TxOut>` that MUST consume the
-/// region between nSequence and nLockTime exactly. Returns `None` if the
-/// suffix is shorter than the 8 framing bytes or doesn't match this layout —
-/// callers treat that as a validation failure (fail-closed: never accept an
-/// output set we cannot actually verify).
-pub fn parse_coinbase_suffix_outputs(coinbase_tx_suffix: &[u8]) -> Option<Vec<TxOut>> {
-    if coinbase_tx_suffix.len() < 8 {
-        return None;
+/// A JDC declares its coinbase split around the extranonce slot it does not
+/// control: `coinbase_tx_prefix` ends where the slot begins,
+/// `coinbase_tx_suffix` resumes after it. To read the outputs we reassemble
+/// the whole transaction with the slot zero-filled and let
+/// `Transaction::consensus_decode` do the parsing — **the transaction's own
+/// framing tells us where the outputs are**, so nothing here assumes a byte
+/// layout for the suffix.
+///
+/// The slot width comes from the prefix itself: it carries the scriptSig
+/// length as a CompactSize, and it stops at the slot, so
+/// `slot = declared_script_sig_len − script_sig_bytes_already_in_prefix`.
+/// This is the same derivation SRI's `jd-server` uses
+/// (`job_validation/bitcoin_core_ipc.rs::get_coinbase_tx`) — except they
+/// hardcode the header at 43 bytes, which assumes a segwit-serialised coinbase
+/// (marker+flag). Ours are serialised without it (41), so the header is parsed
+/// rather than assumed.
+///
+/// **Fail-closed**, and it stays that way for the case this cannot express: a
+/// JDC that puts its own scriptSig bytes AFTER the extranonce (T>0 — see
+/// `deferred-jds-coinbase-suffix-parse`). The derivation above yields `N + T`,
+/// so the rebuilt scriptSig comes out T bytes long and the decode fails. That
+/// is a rejection, never a wrong ACCEPT; SRI has the identical limitation.
+pub fn declared_coinbase_outputs(
+    coinbase_tx_prefix: &[u8],
+    coinbase_tx_suffix: &[u8],
+) -> Option<Vec<TxOut>> {
+    let slot = extranonce_slot_width(coinbase_tx_prefix)?;
+
+    let mut raw = Vec::with_capacity(coinbase_tx_prefix.len() + slot + coinbase_tx_suffix.len());
+    raw.extend_from_slice(coinbase_tx_prefix);
+    raw.resize(raw.len() + slot, 0);
+    raw.extend_from_slice(coinbase_tx_suffix);
+
+    // `deserialize` (not `deserialize_partial`) rejects trailing bytes, so a
+    // coinbase whose real shape disagrees with the declared scriptSig length
+    // cannot squeeze through.
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw).ok()?;
+    Some(tx.output)
+}
+
+/// How many bytes of scriptSig the prefix leaves for the extranonce slot.
+///
+/// Walks the coinbase header instead of assuming its size: version (4), the
+/// optional segwit marker+flag (`00 01`), input count (CompactSize, must be 1),
+/// the 36-byte outpoint, then the scriptSig length. Whatever that length
+/// exceeds the scriptSig bytes already present in the prefix is the slot.
+fn extranonce_slot_width(coinbase_tx_prefix: &[u8]) -> Option<usize> {
+    use bitcoin::consensus::Decodable;
+
+    let mut cursor = coinbase_tx_prefix;
+    let read = |cursor: &mut &[u8], n: usize| -> Option<()> {
+        if cursor.len() < n {
+            return None;
+        }
+        *cursor = &cursor[n..];
+        Some(())
+    };
+
+    read(&mut cursor, 4)?; // version
+    if cursor.starts_with(&[0x00, 0x01]) {
+        read(&mut cursor, 2)?; // segwit marker + flag
     }
-    // Strip the leading nSequence (4) and trailing nLockTime (4); the middle
-    // MUST be exactly a consensus Vec<TxOut> (`deserialize` rejects trailing
-    // bytes, so a non-standard scriptSig tail fails closed).
-    let body = &coinbase_tx_suffix[4..coinbase_tx_suffix.len() - 4];
-    bitcoin::consensus::deserialize::<Vec<TxOut>>(body).ok()
+    if bitcoin::VarInt::consensus_decode(&mut cursor).ok()?.0 != 1 {
+        return None; // a coinbase has exactly one input
+    }
+    read(&mut cursor, 36)?; // outpoint: 32-byte txid + 4-byte index
+    let script_sig_len = bitcoin::VarInt::consensus_decode(&mut cursor).ok()?.0 as usize;
+
+    // `cursor` now points at the scriptSig bytes the prefix carries.
+    script_sig_len.checked_sub(cursor.len())
 }
 
 // ── PayoutBooking ───────────────────────────────────────────────────
@@ -176,31 +231,133 @@ mod tests {
         suffix
     }
 
+    /// A declared `coinbase_tx_prefix`: header, then `script_sig_head` bytes of
+    /// scriptSig, with `slot` further bytes reserved for the extranonce. The
+    /// declared scriptSig length therefore covers `script_sig_head + slot + tail`,
+    /// where `tail` is the T>0 case (bytes the JDC keeps AFTER the extranonce).
+    fn prefix_with(script_sig_head: &[u8], slot: usize, tail: usize) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&2u32.to_le_bytes()); // version
+        p.push(0x01); // input count
+        p.extend_from_slice(&[0u8; 32]); // prevout txid
+        p.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // prevout index
+        bitcoin::VarInt((script_sig_head.len() + slot + tail) as u64)
+            .consensus_encode(&mut p)
+            .unwrap();
+        p.extend_from_slice(script_sig_head);
+        p
+    }
+
+    fn one_output_bytes(sats: i64) -> Vec<u8> {
+        encode_coinbase_outputs(
+            Network::Regtest,
+            &[DynamicOutput {
+                address: AddressId::new(ADDR).unwrap(),
+                sats: Sats(sats),
+            }],
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn suffix_parse_roundtrips() {
-        let outputs = vec![DynamicOutput {
-            address: AddressId::new(ADDR).unwrap(),
-            sats: Sats(42),
-        }];
-        let bytes = encode_coinbase_outputs(Network::Regtest, &outputs).unwrap();
-        let parsed = parse_coinbase_suffix_outputs(&suffix_with(&bytes)).unwrap();
+    fn declared_outputs_roundtrip_through_a_rebuilt_transaction() {
+        let parsed = declared_coinbase_outputs(
+            &prefix_with(&[0x03, 0xC8, 0x00], /*slot=*/ 12, /*tail=*/ 0),
+            &suffix_with(&one_output_bytes(42)),
+        )
+        .unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].value.to_sat(), 42);
     }
 
+    // The whole point of rebuilding the transaction: the slot width is derived
+    // from the prefix, so it does not have to be a fixed size.
     #[test]
-    fn suffix_parse_fails_closed_on_trailing_garbage() {
-        let outputs = vec![DynamicOutput {
-            address: AddressId::new(ADDR).unwrap(),
-            sats: Sats(42),
-        }];
-        let mut bytes = encode_coinbase_outputs(Network::Regtest, &outputs).unwrap();
-        bytes.push(0xAA); // trailing byte between outputs and nLockTime
-        assert!(parse_coinbase_suffix_outputs(&suffix_with(&bytes)).is_none());
+    fn the_slot_width_is_read_from_the_prefix_not_assumed() {
+        for slot in [1usize, 8, 12, 32, 255] {
+            let parsed = declared_coinbase_outputs(
+                &prefix_with(&[0x03, 0xC8, 0x00], slot, 0),
+                &suffix_with(&one_output_bytes(7)),
+            );
+            assert!(parsed.is_some(), "slot width {slot} should parse");
+        }
+    }
+
+    // The header is WALKED, not assumed at a fixed offset. SRI hardcodes 43,
+    // which only holds for a segwit-serialised coinbase; ours are serialised
+    // without marker+flag (41). Both must yield the same slot width — asserted
+    // on the derivation itself, because the surrounding `deserialize` would
+    // fail for either reason and could not tell the two apart.
+    #[test]
+    fn the_header_length_is_parsed_for_both_serialisations() {
+        let plain = prefix_with(&[0x03, 0xC8, 0x00], /*slot=*/ 12, /*tail=*/ 0);
+        assert_eq!(extranonce_slot_width(&plain), Some(12));
+
+        let mut segwit = Vec::new();
+        segwit.extend_from_slice(&2u32.to_le_bytes());
+        segwit.extend_from_slice(&[0x00, 0x01]); // marker + flag
+        segwit.push(0x01);
+        segwit.extend_from_slice(&[0u8; 32]);
+        segwit.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        bitcoin::VarInt(15).consensus_encode(&mut segwit).unwrap(); // 3 head + 12 slot
+        segwit.extend_from_slice(&[0x03, 0xC8, 0x00]);
+        assert_eq!(
+            extranonce_slot_width(&segwit),
+            Some(12),
+            "skipping marker+flag must land on the same scriptSig length"
+        );
     }
 
     #[test]
-    fn suffix_parse_rejects_short_buffers() {
-        assert!(parse_coinbase_suffix_outputs(&[0u8; 7]).is_none());
+    fn trailing_garbage_in_the_output_region_fails_closed() {
+        let mut bytes = one_output_bytes(42);
+        bytes.push(0xAA);
+        assert!(declared_coinbase_outputs(
+            &prefix_with(&[0x03, 0xC8, 0x00], 12, 0),
+            &suffix_with(&bytes)
+        )
+        .is_none());
+    }
+
+    // The known interop limit, pinned so it is a decision and not a surprise:
+    // scriptSig bytes AFTER the extranonce make the derived width N+T, the
+    // rebuilt scriptSig runs long, and the decode fails. Rejection, never a
+    // wrong accept. SRI's jd-server behaves identically.
+    #[test]
+    fn a_declaration_with_scriptsig_bytes_after_the_extranonce_is_refused() {
+        let mut suffix = vec![0xAB, 0xCD]; // T = 2 scriptSig bytes
+        suffix.extend_from_slice(&suffix_with(&one_output_bytes(42)));
+        assert!(
+            declared_coinbase_outputs(
+                &prefix_with(&[0x03, 0xC8, 0x00], /*slot=*/ 12, /*tail=*/ 2),
+                &suffix
+            )
+            .is_none(),
+            "T>0 is not supported and must fail closed"
+        );
+    }
+
+    #[test]
+    fn a_prefix_that_is_not_a_coinbase_header_is_refused() {
+        assert!(declared_coinbase_outputs(&[0u8; 7], &suffix_with(&one_output_bytes(1))).is_none());
+        // input count != 1 is not a coinbase.
+        let mut two_inputs = prefix_with(&[0x03, 0xC8, 0x00], 12, 0);
+        two_inputs[4] = 0x02;
+        assert!(
+            declared_coinbase_outputs(&two_inputs, &suffix_with(&one_output_bytes(1))).is_none()
+        );
+    }
+
+    #[test]
+    fn a_prefix_claiming_less_scriptsig_than_it_carries_is_refused() {
+        // declared scriptSig length 1, but 3 head bytes present → underflow.
+        let mut p = Vec::new();
+        p.extend_from_slice(&2u32.to_le_bytes());
+        p.push(0x01);
+        p.extend_from_slice(&[0u8; 32]);
+        p.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        bitcoin::VarInt(1).consensus_encode(&mut p).unwrap();
+        p.extend_from_slice(&[0x03, 0xC8, 0x00]);
+        assert!(declared_coinbase_outputs(&p, &suffix_with(&one_output_bytes(1))).is_none());
     }
 }

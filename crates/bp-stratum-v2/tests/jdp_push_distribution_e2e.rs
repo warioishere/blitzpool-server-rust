@@ -382,15 +382,10 @@ async fn jdp_push_distribution_end_to_end() {
         );
         // coinbase = prefix + extranonce + suffix, assembled server-side.
         let raw = &c.coinbase_raw;
-        assert_eq!(&raw[..COINBASE_PREFIX.len()], COINBASE_PREFIX);
-        assert_eq!(
-            &raw[COINBASE_PREFIX.len()..COINBASE_PREFIX.len() + extranonce.len()],
-            &extranonce[..]
-        );
-        assert_eq!(
-            &raw[COINBASE_PREFIX.len() + extranonce.len()..],
-            &suffix[..]
-        );
+        let plen = coinbase_prefix().len();
+        assert_eq!(&raw[..plen], &coinbase_prefix()[..]);
+        assert_eq!(&raw[plen..plen + extranonce.len()], &extranonce[..]);
+        assert_eq!(&raw[plen + extranonce.len()..], &suffix[..]);
     }
 
     // ── §7.2 grace window: slide the pool-wide distribution twice ─────
@@ -457,7 +452,31 @@ async fn jdp_push_distribution_end_to_end() {
 
 // ── JDC-side fixtures ───────────────────────────────────────────────
 
-const COINBASE_PREFIX: &[u8] = b"cb-prefix";
+/// Bytes of extranonce the declared prefix reserves — must match the
+/// extranonce this JDC fixture actually submits.
+const EXTRANONCE_LEN: usize = 8;
+
+/// A declared `coinbase_tx_prefix` that is a real coinbase header: version,
+/// one input, the null outpoint, the scriptSig length, then a BIP-34 height
+/// push. It stops where the extranonce slot begins.
+///
+/// This used to be `b"cb-prefix"`. The declare-time validation now rebuilds the
+/// whole transaction from prefix + zeroed slot + suffix (the slot width comes
+/// out of the prefix's scriptSig length), so a placeholder no longer parses.
+fn coinbase_prefix() -> Vec<u8> {
+    use bitcoin::consensus::Encodable;
+    let script_sig_head: [u8; 3] = [0x03, 0xC8, 0x00];
+    let mut p = Vec::new();
+    p.extend_from_slice(&2u32.to_le_bytes());
+    p.push(0x01);
+    p.extend_from_slice(&[0u8; 32]);
+    p.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    bitcoin::VarInt((script_sig_head.len() + EXTRANONCE_LEN) as u64)
+        .consensus_encode(&mut p)
+        .unwrap();
+    p.extend_from_slice(&script_sig_head);
+    p
+}
 
 fn setup_connection(port: u16) -> AnyMessage<'static> {
     AnyMessage::Common(CommonMessages::SetupConnection(
@@ -576,7 +595,7 @@ async fn write_declare(
             request_id,
             mining_job_token: token.to_vec().try_into().unwrap(),
             version: 0x2000_0000,
-            coinbase_tx_prefix: COINBASE_PREFIX.to_vec().try_into().unwrap(),
+            coinbase_tx_prefix: coinbase_prefix().try_into().unwrap(),
             coinbase_tx_suffix: suffix.to_vec().try_into().unwrap(),
             wtxid_list: Vec::new().try_into().unwrap(),
             excess_data: Vec::new().try_into().unwrap(),
