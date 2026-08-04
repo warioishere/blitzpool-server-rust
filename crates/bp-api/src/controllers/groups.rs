@@ -433,8 +433,14 @@ struct GroupCoinbaseCapacity {
 /// fixed group-solo coinbase weight budget. Global (the budget is engine-wide,
 /// not per group), so the UI subtracts a group's own member count to show the
 /// remaining headroom. Uses the shared, fee-output-correct
-/// [`max_coinbase_outputs`](bp_pplns_engine::max_coinbase_outputs) so this
-/// matches the operator capacity-alert ceiling exactly.
+/// [`max_coinbase_outputs`](bp_pplns_engine::max_coinbase_outputs), the same
+/// ceiling `GroupService` refuses a join against.
+///
+/// This is the ceiling an external capacity monitor divides into: fill level =
+/// `members.length` from `GET /api/pplns/groups/:id`. For PPLNS the pair is
+/// `GET /api/pplns/distribution` (length) over `maxMinerOutputsAdaptive` from
+/// `GET /api/pplns/fees` — note the PPLNS budget autoscales and is NOT this
+/// one.
 async fn coinbase_capacity<H, M>(
     State(state): State<SharedState<H, M>>,
 ) -> Result<Json<GroupCoinbaseCapacity>, ApiError>

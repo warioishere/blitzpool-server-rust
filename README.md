@@ -74,7 +74,9 @@ Effect: as the PPLNS window grows, the reservation grows ahead of it; when the w
 
 The distribution builder reserves the structural coinbase overhead, then greedily keeps the largest payouts that fit the stream's budget and **trims the smallest payouts to pending** (carry-forward). Because the assembled coinbase can therefore *never* exceed the reservation core was told about, **a found block is always valid** — the pool can never build a coinbase that overflows its template and gets rejected by core.
 
-Trimmed sats are **never lost**: in PPLNS they become a signed pending credit; in Group-Solo they stay as positive `pendingSats` and clear in a future block. Under-sizing a budget costs *fairness* (a small miner waits a block or two for their payout), never *validity*. A capacity-alert cron emails the operator before anyone is actually trimmed, and a `GET /api/pplns/groups/coinbase-capacity` endpoint surfaces the live member ceiling.
+Where a trimmed payout goes differs by mode, deliberately. **PPLNS**: the value stays inside the miners' cut as a signed pending credit and is repaid from a later block (`WithheldValue::ToOtherMiners`). **Group-Solo**: it falls into the §4 residual and is paid to the pool (`WithheldValue::ToPool`) — there is no group ledger and no carry-forward, which is why membership is hard-capped at what the coinbase can actually pay. Under-sizing a PPLNS budget therefore costs *fairness* (a small miner waits a block or two), never *validity*.
+
+Capacity is monitored externally rather than by the pool: `GET /api/pplns/groups/coinbase-capacity` reports the member ceiling and `GET /api/pplns/fees` the PPLNS `maxMinerOutputsAdaptive`, each divided into the current fill (`members.length` from the group detail, or the length of `GET /api/pplns/distribution`).
 
 ### 4. Core/Satellite split (horizontal scale)
 
@@ -124,7 +126,6 @@ Configuration is **TOML-first** (parsed by `bp-config`), grouped into sections �
 | `[group_fees].coinbase_weight_budget` | Group-Solo + Blockparty fixed budget (default 10 000 WU ≈ 50 members) |
 | `[group_fees].address` / `.percent` | Shared Group-Solo/Blockparty fee lane (falls back to `[pplns]` fee) |
 | `[solo].coinbase_weight_budget` / `[blockparty].coinbase_weight_budget` | Per-mode fixed alt-stream reservations |
-| `[capacity_alert]` | Operator capacity-alert email thresholds |
 | `--roles` / `BLITZPOOL_ROLES` | Deployment topology override (front/api/payout/stats/notify) |
 
 Schema is applied via **sqlx migrations run at boot** (advisory-locked + idempotent, so every process in a split can run them safely). Postgres + Redis are required — there is no SQLite path. Upstream SV2-stack dependency pins and bump strategy live in [`UPSTREAM_DEPS.md`](UPSTREAM_DEPS.md).

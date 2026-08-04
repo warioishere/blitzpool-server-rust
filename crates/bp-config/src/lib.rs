@@ -46,10 +46,6 @@ pub struct AppConfig {
     /// Required when SMTP + email features are enabled.
     #[serde(default)]
     pub pool_base_url: Option<String>,
-    /// Mailbox the capacity-alert / fail-safe ops mails go to.
-    /// Without this the alert pipeline silently disables itself.
-    #[serde(default)]
-    pub pool_admin_email: Option<String>,
     /// `true` ⇒ the `/api` HTTP server expects to be fronted by a
     /// TLS-terminating proxy and emits `Strict-Transport-Security`
     /// + secure-cookie hints. `false` ⇒ plain HTTP.
@@ -92,8 +88,6 @@ pub struct AppConfig {
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub smtp: Option<SmtpConfig>,
-    #[serde(default)]
-    pub capacity_alert: CapacityAlertConfig,
     #[serde(default)]
     pub aggregation: AggregationConfig,
     #[serde(default)]
@@ -1044,30 +1038,6 @@ pub struct SmtpConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CapacityAlertConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Hashrate / capacity ratio above which a warning email is sent
-    /// to `pool_admin_email`.
-    #[serde(default = "default_capacity_threshold")]
-    pub threshold: f64,
-    /// Ratio above which the alert is escalated to "urgent".
-    #[serde(default = "default_capacity_urgent")]
-    pub urgent_threshold: f64,
-}
-
-impl Default for CapacityAlertConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            threshold: default_capacity_threshold(),
-            urgent_threshold: default_capacity_urgent(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AggregationConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -1149,12 +1119,6 @@ fn default_confirmation_depth() -> u32 {
 }
 fn default_bucket_shares() -> u64 {
     10_000
-}
-fn default_capacity_threshold() -> f64 {
-    0.8
-}
-fn default_capacity_urgent() -> f64 {
-    0.95
 }
 fn default_pool_stats_interval_ms() -> u64 {
     600_000

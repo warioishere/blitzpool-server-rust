@@ -98,10 +98,6 @@ pub(crate) struct ProductionHooks {
     /// re-parsing the VAPID config. `None` when `[notifications.web_push]`
     /// isn't configured.
     pub(crate) web_push: Option<Arc<WebPushAdapter>>,
-    /// SMTP adapter, exposed so the capacity-monitor cron can send
-    /// operator alert emails without re-building the transport.
-    /// `None` when `[smtp]` is not configured.
-    pub(crate) smtp: Option<Arc<SmtpAdapter>>,
 }
 
 #[derive(Debug, Error)]
@@ -160,7 +156,6 @@ pub(crate) async fn spawn(
         group_service,
         fcm,
         web_push,
-        smtp,
     })
 }
 

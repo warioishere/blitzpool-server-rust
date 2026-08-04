@@ -78,7 +78,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bp_config::{AppConfig, ConfigError, Role};
-use bp_pplns::DEFAULT_COINBASE_WEIGHT_BUDGET;
 use clap::Parser;
 
 use crate::api_server::{ApiServerError, ApiServerHandle};
@@ -601,29 +600,18 @@ async fn main() -> ExitCode {
     }
 
     // Background crons split by role: maintenance (kill-dead, cleanups,
-    // invitation/join expiry, capacity alert) on the accounting role; the
+    // invitation/join expiry) on the accounting role; the
     // notification crons (network-difficulty, best-difficulty, hourly stats) on
     // the notify role. The best_difficulty + hourly crons additionally need
     // their fan-out (`dispatcher` / listeners) wired, and seed from
     // address_settings to avoid cold-start notification spam. A process running
     // both roles spawns both groups.
     let crons = if is_accounting || is_notify {
-        let cap_params = crons::CapacityMonitorParams {
-            pplns_window: engines.pplns.as_ref().map(|e| e.window().clone()),
-            coinbase_budget: engines
-                .pplns
-                .as_ref()
-                .map(|e| e.coinbase_budget().get())
-                .unwrap_or(DEFAULT_COINBASE_WEIGHT_BUDGET),
-        };
         let crons = crons::spawn(
             &handles,
             &production_hooks,
             &listeners,
             dispatcher.clone(),
-            cap_params,
-            &cfg.capacity_alert,
-            cfg.pool_admin_email.as_deref(),
             is_accounting,
             is_notify,
         )

@@ -18,10 +18,6 @@ pool_identifier = "blitzpool"
 # assemble invitation + email-verification links). No trailing slash.
 # pool_base_url = "https://blitzpool.example.com"
 
-# Operator mailbox for capacity-alert + fail-safe ops mails. Without
-# this the alert pipeline disables itself.
-# pool_admin_email = "admin@example.com"
-
 # `true` when the `/api` HTTP server is fronted by a TLS-terminating
 # proxy. Toggles HSTS + secure-cookie hints in responses.
 api_secure = false
@@ -405,13 +401,8 @@ submit_latency = false
 # from = "Blitz Pool <noreply@example.com>"
 
 # ───────────────────────────────────────────────────────────────
-# Capacity alert + background aggregation
+# Background aggregation
 # ───────────────────────────────────────────────────────────────
-
-[capacity_alert]
-enabled = true
-threshold = 0.8
-urgent_threshold = 0.95
 
 [aggregation]
 enabled = true

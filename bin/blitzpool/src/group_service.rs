@@ -48,9 +48,9 @@ pub(crate) struct SharedGroupService {
 /// fatal — Stratum + API both depend on a hot cache at first share.
 ///
 /// The member ceiling comes from the Group-Solo engine's coinbase weight
-/// budget, computed with the same [`max_coinbase_outputs`] the operator
-/// capacity alert and `GET /api/pplns/groups/coinbase-capacity` use, so
-/// what the UI shows and what a join is refused against are one number.
+/// budget, computed with the same [`max_coinbase_outputs`] that
+/// `GET /api/pplns/groups/coinbase-capacity` reports, so what the UI shows and
+/// what a join is refused against are one number.
 pub(crate) async fn spawn(
     foundation: &FoundationHandles,
     production_hooks: &ProductionHooks,

@@ -34,15 +34,15 @@ pub struct GroupSoloEngineConfig {
     /// Group-Solo block correctly and will not boot.
     pub fee_address: Option<AddressId>,
 
-    /// Pool fee % as f64 (`[0.0, 100.0]`). Reuses `PPLNS_FEE_PERCENT`
-    /// at the env layer.
+    /// Pool fee % as f64 (`[0.0, 100.0]`).
     pub fee_percent: f64,
 
-    /// Operational minimum on-chain payout. Outputs below this stay
-    /// as positive `pendingSats` in the group ledger until they
-    /// either clear in a future block or get swept after dormancy.
-    /// Clamped upward to `DUST_LIMIT_SATS` (546). Reuses
-    /// `PPLNS_MIN_PAYOUT_SATS`.
+    /// Operational minimum on-chain payout. A member below this gets NO
+    /// output, and their share falls into the §4 residual — i.e. to the pool
+    /// (`WithheldValue::ToPool`). There is no group ledger and no
+    /// carry-forward: Group-Solo remembers nothing between blocks, which is
+    /// what `GroupService`'s coinbase-capacity cap on membership buys.
+    /// Clamped upward to `DUST_LIMIT_SATS` (546).
     pub min_payout_sats: Sats,
 
     /// Coinbase weight budget (WU). Handed straight to bitcoin-core

@@ -52,11 +52,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bp_config::CapacityAlertConfig;
 use bp_cron_utils::SystemClock;
-use bp_db::{count_pplns_group_members_for_group, list_active_pplns_groups};
 use bp_group_mgmt_engine::cron::{spawn_invitation_expiry_cron, spawn_join_request_expiry_cron};
-use bp_notifications::adapter::{NtfyAdapter, SmtpAdapter, TelegramAdapter};
+use bp_notifications::adapter::{NtfyAdapter, TelegramAdapter};
 use bp_notifications::cron::best_difficulty::{
     spawn_best_difficulty_cron, BestDifficultyCronConfig,
 };
@@ -65,9 +63,6 @@ use bp_notifications::cron::network_difficulty::{
     spawn_network_difficulty_cron, NetworkDifficultyCronConfig,
 };
 use bp_notifications::dispatcher::NotificationDispatcher;
-use bp_notifications::template::{render_capacity_alert, CapacityAlertContext, CapacityAlertLevel};
-use bp_pplns::max_coinbase_outputs;
-use bp_pplns_engine::window::WindowStore;
 use chrono::Utc;
 use sqlx::PgPool;
 use tokio::sync::watch;
@@ -103,82 +98,6 @@ pub(crate) mod offsets {
     pub(crate) const INVITATION_EXPIRY: Duration = Duration::from_secs(11);
     pub(crate) const JOIN_REQUEST_EXPIRY: Duration = Duration::from_secs(19);
     pub(crate) const STALE_PUSH_CLEANUP: Duration = Duration::from_secs(41);
-    pub(crate) const CAPACITY_MONITOR: Duration = Duration::from_secs(53);
-}
-
-/// Engine-side inputs for the capacity-monitor cron. Extracted from
-/// the PPLNS engine by the caller (main.rs) so crons.rs doesn't
-/// need to import the full engine type.
-pub(crate) struct CapacityMonitorParams {
-    /// Cloned window store from the PPLNS engine, `None` when PPLNS
-    /// is disabled and only group-solo capacity needs monitoring.
-    pub pplns_window: Option<WindowStore>,
-    /// The configured coinbase weight budget — used to derive
-    /// `max_coinbase_outputs`.
-    pub coinbase_budget: u32,
-}
-
-// ─── Capacity monitor helpers ────────────────────────────────────
-
-const CAPACITY_DAILY_REMINDER_MS: i64 = 24 * 60 * 60 * 1_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CapLevel {
-    Below,
-    Warning,
-    Urgent,
-}
-
-struct CapState {
-    level: CapLevel,
-    last_sent_ms: i64,
-}
-
-impl Default for CapState {
-    fn default() -> Self {
-        Self {
-            level: CapLevel::Below,
-            last_sent_ms: 0,
-        }
-    }
-}
-
-fn cap_level_for(percent: f64, warning: f64, urgent: f64) -> CapLevel {
-    if percent >= urgent {
-        CapLevel::Urgent
-    } else if percent >= warning {
-        CapLevel::Warning
-    } else {
-        CapLevel::Below
-    }
-}
-
-/// State machine that decides whether to send a capacity alert.
-fn cap_decide(prev: &CapState, new: CapLevel, now_ms: i64) -> Option<CapacityAlertLevel> {
-    if prev.level == new {
-        if new == CapLevel::Below {
-            return None;
-        }
-        if now_ms - prev.last_sent_ms >= CAPACITY_DAILY_REMINDER_MS {
-            return Some(match new {
-                CapLevel::Warning => CapacityAlertLevel::Warning,
-                CapLevel::Urgent => CapacityAlertLevel::Urgent,
-                CapLevel::Below => unreachable!(),
-            });
-        }
-        return None;
-    }
-    if new == CapLevel::Below {
-        return Some(CapacityAlertLevel::Recovery);
-    }
-    if new == CapLevel::Urgent {
-        return Some(CapacityAlertLevel::Urgent);
-    }
-    // new == Warning
-    if prev.level == CapLevel::Urgent {
-        return None; // stepping down — wait for full recovery
-    }
-    Some(CapacityAlertLevel::Warning)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -206,7 +125,7 @@ pub(crate) struct CronHandles {
 
 struct Inner {
     // ── Maintenance crons — the `payout`/accounting role. DB upkeep + group
-    //    lifecycle + the operator capacity alert; no notification dispatcher.
+    //    lifecycle crons; no notification dispatcher.
     //    `None` when this process doesn't run maintenance (e.g. a `notify`-only
     //    process). ──
     /// Cancellation handle for the locally-spawned kill_dead_clients
@@ -250,11 +169,6 @@ struct Inner {
     /// when this process doesn't run maintenance.
     stale_push_cancel: Option<CancellationToken>,
     stale_push_join: Option<JoinHandle<()>>,
-    /// Hourly coinbase-capacity operator alert. `None` when not running
-    /// maintenance, or smtp is not configured / `capacity_alert.enabled =
-    /// false`.
-    capacity_monitor_cancel: Option<CancellationToken>,
-    capacity_monitor_join: Option<JoinHandle<()>>,
     /// Which cron groups this process actually spawned — for the summary line.
     ran_maintenance: bool,
     ran_notifications: bool,
@@ -274,7 +188,6 @@ impl CronHandles {
                 invitation_expiry = inner.invitation_expiry_shutdown.is_some(),
                 join_request_expiry = inner.join_request_expiry_shutdown.is_some(),
                 stale_push_cleanup = inner.stale_push_cancel.is_some(),
-                capacity_monitor = inner.capacity_monitor_cancel.is_some(),
                 notifications = inner.ran_notifications,
                 network_difficulty = inner.network_difficulty_shutdown.is_some(),
                 network_difficulty_push = inner.network_difficulty_has_push,
@@ -307,9 +220,6 @@ impl CronHandles {
         if let Some(c) = inner.stale_push_cancel {
             c.cancel();
         }
-        if let Some(c) = inner.capacity_monitor_cancel {
-            c.cancel();
-        }
         if let Some(tx) = inner.invitation_expiry_shutdown {
             let _ = tx.send(true);
         }
@@ -326,7 +236,7 @@ impl CronHandles {
         if let Some(tx) = inner.best_difficulty_shutdown {
             let _ = tx.send(true);
         }
-        // Only the locally-owned tasks (kill_dead + the cleanups + capacity)
+        // Only the locally-owned tasks (kill_dead + the cleanups)
         // are joinable here; the other crons are detached `tokio::spawn`s
         // inside their helpers, so sending `true` on their shutdown channel
         // ends their loop on the next select iteration (sub-millisecond).
@@ -350,11 +260,6 @@ impl CronHandles {
                 warn!(%err, "crons: stale_push_cleanup join failed");
             }
         }
-        if let Some(join) = inner.capacity_monitor_join {
-            if let Err(err) = join.await {
-                warn!(%err, "crons: capacity_monitor join failed");
-            }
-        }
     }
 }
 
@@ -365,7 +270,7 @@ impl CronHandles {
 /// `bp-config` later.
 ///
 /// `run_maintenance` (the `payout`/accounting role) gates the DB-upkeep + group
-/// lifecycle + capacity-alert crons; `run_notifications` (the `notify` role)
+/// lifecycle crons; `run_notifications` (the `notify` role)
 /// gates the push/digest crons. A process running both (e.g. the default
 /// satellite back) spawns everything; a split process spawns only its group.
 #[allow(clippy::too_many_arguments)]
@@ -374,9 +279,6 @@ pub(crate) async fn spawn(
     hooks: &ProductionHooks,
     listeners: &ListenerHandles,
     dispatcher: Option<Arc<NotificationDispatcher>>,
-    cap_params: CapacityMonitorParams,
-    cap_cfg: &CapacityAlertConfig,
-    admin_email: Option<&str>,
     run_maintenance: bool,
     run_notifications: bool,
 ) -> CronHandles {
@@ -417,37 +319,6 @@ pub(crate) async fn spawn(
     let join_request_expiry_shutdown = run_maintenance.then(|| {
         spawn_join_request_expiry_cron(pool.clone(), SystemClock, offsets::JOIN_REQUEST_EXPIRY)
     });
-    let (capacity_monitor_cancel, capacity_monitor_join) = 'cap: {
-        if !run_maintenance {
-            break 'cap (None, None);
-        }
-        let (Some(smtp), Some(email), true) = (hooks.smtp.clone(), admin_email, cap_cfg.enabled)
-        else {
-            info!(
-                enabled = cap_cfg.enabled,
-                smtp_ready = hooks.smtp.is_some(),
-                admin_email_set = admin_email.is_some(),
-                "crons.capacity_monitor: SKIPPED"
-            );
-            break 'cap (None, None);
-        };
-        if email.trim().is_empty() {
-            info!("crons.capacity_monitor: SKIPPED (POOL_ADMIN_EMAIL is empty)");
-            break 'cap (None, None);
-        }
-        let cancel = CancellationToken::new();
-        let join = spawn_capacity_monitor(
-            cap_params,
-            pool.clone(),
-            smtp,
-            email.to_string(),
-            cap_cfg.threshold,
-            cap_cfg.urgent_threshold,
-            cancel.clone(),
-        );
-        (Some(cancel), Some(join))
-    };
-
     // ── Notification group (notify role) ──
     let network_difficulty_has_push = hooks.fcm.is_some() || hooks.web_push.is_some();
     let network_difficulty_shutdown = if run_notifications {
@@ -530,8 +401,6 @@ pub(crate) async fn spawn(
             network_difficulty_has_push,
             hourly_stats_telegram,
             hourly_stats_ntfy,
-            capacity_monitor_cancel,
-            capacity_monitor_join,
             ran_maintenance: run_maintenance,
             ran_notifications: run_notifications,
         }),
@@ -685,144 +554,6 @@ pub(crate) fn spawn_old_blocks_cleanup(pool: PgPool, cancel: CancellationToken) 
         }
         info!("crons.old_blocks_cleanup: loop stopped");
     })
-}
-
-/// Hourly cron: email operator when PPLNS window or group-solo member
-/// count approaches the coinbase output capacity ceiling.
-///
-/// Uses in-memory state for dedup (no Redis required); state resets on
-/// restart which may cause one extra alert per restart — acceptable.
-fn spawn_capacity_monitor(
-    params: CapacityMonitorParams,
-    pool: PgPool,
-    smtp: Arc<SmtpAdapter>,
-    admin_email: String,
-    warning_threshold: f64,
-    urgent_threshold: f64,
-    cancel: CancellationToken,
-) -> JoinHandle<()> {
-    use std::collections::HashMap;
-    tokio::spawn(async move {
-        let max = max_coinbase_outputs(params.coinbase_budget);
-        let checker = CapacityChecker {
-            coinbase_budget: params.coinbase_budget,
-            env_var: "PPLNS_COINBASE_WEIGHT_BUDGET".to_string(),
-            warning_threshold,
-            urgent_threshold,
-            smtp,
-            admin_email,
-        };
-        let mut states: HashMap<String, CapState> = HashMap::new();
-        let mut ticker = staggered_interval(HOURLY_TICK, offsets::CAPACITY_MONITOR);
-        info!(
-            max,
-            budget = params.coinbase_budget,
-            "crons.capacity_monitor: loop started"
-        );
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    info!("crons.capacity_monitor: cancelled");
-                    break;
-                }
-                _ = ticker.tick() => {
-                    let now_ms = Utc::now().timestamp_millis();
-
-                    // PPLNS window check
-                    if let Some(ref window) = params.pplns_window {
-                        match window.read_window_by_address().await {
-                            Ok(map) => {
-                                checker
-                                    .check("pplns", "PPLNS main pool", map.len() as u64, max, now_ms, &mut states)
-                                    .await;
-                            }
-                            Err(err) => warn!(%err, "crons.capacity_monitor: read_window_by_address"),
-                        }
-                    }
-
-                    // Group-solo member count check
-                    match list_active_pplns_groups(&pool).await {
-                        Ok(groups) => {
-                            for group in groups.into_iter().filter(|g| g.active) {
-                                match count_pplns_group_members_for_group(&pool, group.id).await {
-                                    Ok(n) => {
-                                        let key = format!("group:{}", group.id);
-                                        let scope = format!(r#"Group "{}""#, group.name);
-                                        checker.check(&key, &scope, n as u64, max, now_ms, &mut states).await;
-                                    }
-                                    Err(err) => warn!(%err, group_id = %group.id, "crons.capacity_monitor: count members"),
-                                }
-                            }
-                        }
-                        Err(err) => warn!(%err, "crons.capacity_monitor: list_active_pplns_groups"),
-                    }
-                }
-            }
-        }
-        info!("crons.capacity_monitor: loop stopped");
-    })
-}
-
-struct CapacityChecker {
-    coinbase_budget: u32,
-    env_var: String,
-    warning_threshold: f64,
-    urgent_threshold: f64,
-    smtp: Arc<SmtpAdapter>,
-    admin_email: String,
-}
-
-impl CapacityChecker {
-    async fn check(
-        &self,
-        state_key: &str,
-        scope: &str,
-        current: u64,
-        max: u64,
-        now_ms: i64,
-        states: &mut std::collections::HashMap<String, CapState>,
-    ) {
-        let percent = if max > 0 {
-            current as f64 / max as f64
-        } else {
-            1.0
-        };
-        let new_level = cap_level_for(percent, self.warning_threshold, self.urgent_threshold);
-        let prev = states.entry(state_key.to_string()).or_default();
-        let Some(alert_level) = cap_decide(prev, new_level, now_ms) else {
-            return;
-        };
-        let threshold = match new_level {
-            CapLevel::Urgent => self.urgent_threshold,
-            _ => self.warning_threshold,
-        };
-        let ctx = CapacityAlertContext {
-            level: alert_level,
-            scope: scope.to_string(),
-            current,
-            max,
-            percent,
-            threshold,
-            coinbase_weight_budget: self.coinbase_budget as u64,
-            env_var_name: self.env_var.clone(),
-        };
-        let content = render_capacity_alert(&ctx);
-        match self.smtp.send_email(&self.admin_email, &content).await {
-            Ok(()) => {
-                info!(
-                    scope,
-                    %percent,
-                    current,
-                    max,
-                    level = ?alert_level,
-                    "crons.capacity_monitor: alert sent"
-                );
-                prev.level = new_level;
-                prev.last_sent_ms = now_ms;
-            }
-            Err(err) => warn!(%err, scope, "crons.capacity_monitor: send_email failed"),
-        }
-    }
 }
 
 /// Weekly cron: hard-DELETE push subscriptions that have had no activity

@@ -9,7 +9,6 @@
 //! - [`render_invitation`] — payout-group invitation
 //! - [`render_join_decision`] — public join-request approval / rejection
 //! - [`render_binding_change`] — K1-lock attempted-takeover notice
-//! - [`render_capacity_alert`] — coinbase-output capacity operator alert
 //!
 //! The render functions are pure: same context → same bytes. Recipient
 //! email is **not** part of the context structs (the adapter layer
@@ -18,7 +17,6 @@
 //! stays small and uniform.
 
 mod binding_change;
-mod capacity_alert;
 mod content;
 mod helpers;
 mod invitation;
@@ -26,7 +24,6 @@ mod join_decision;
 mod verification;
 
 pub use binding_change::{render_binding_change, BindingChangeContext};
-pub use capacity_alert::{render_capacity_alert, CapacityAlertContext, CapacityAlertLevel};
 pub use content::EmailContent;
 pub use invitation::{render_invitation, InvitationContext};
 pub use join_decision::{render_join_decision, JoinDecision, JoinDecisionContext};

@@ -386,7 +386,6 @@ mod tests {
             network: Network::Regtest,
             pool_identifier: "Blitzpool-Test".into(),
             pool_base_url: None,
-            pool_admin_email: None,
             api_secure: false,
             roles: Vec::new(),
             bitcoin_rpc: BitcoinRpcConfig {
@@ -473,7 +472,6 @@ mod tests {
             blockparty: None,
             notifications: Default::default(),
             smtp: None,
-            capacity_alert: Default::default(),
             aggregation: Default::default(),
             metrics: Default::default(),
         }
