@@ -82,7 +82,7 @@ bp-mining-job = { workspace = true }
 bitcoin = { workspace = true, features = ["secp-recovery", "base64"] }
 # BIP-322 generic message-signature verification (covers taproot p2tr + segwit),
 # the modern format alongside the legacy recoverable-signature path above.
-bip322 = "0.0.10"
+bip322 = "0.0.11"
 # Chart-visibility cutoff helper shared with the writer-side
 # accumulator — keeps `/api/info/chart/mode/:mode` consistent with the
 # slot bookkeeping that drives the writes.

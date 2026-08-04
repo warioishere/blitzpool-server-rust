@@ -389,6 +389,116 @@ mod tests {
         (sk, PublicKey::new(inner), CompressedPublicKey(inner))
     }
 
+    /// A BIP-322 "simple" signature over `message`, produced by the same crate
+    /// that verifies it.
+    fn sign_bip322(sk: &SecretKey, address: &str, message: &str) -> String {
+        let wif = bitcoin::PrivateKey::new(*sk, Network::Bitcoin).to_wif();
+        bip322::sign_simple_encoded(address, message, &[wif], None).expect("bip322 signing")
+    }
+
+    // Covers the FIRST branch of `verify_message_signature`. Every other test
+    // here drives a recoverable signature, where the BIP-322 attempt fails and
+    // falls through to the legacy path — so without this one the `bip322` call
+    // was only ever exercised on its error return, and a `bip322` crate bump
+    // could change what the pool accepts as proof of address ownership without
+    // a single test noticing.
+    //
+    // Taproot is the case that matters most: `MessageSignature::from_base64`
+    // cannot represent a taproot signature, so for `bc1p…` addresses BIP-322 is
+    // the ONLY route. If it breaks, those miners cannot prove ownership at all.
+    #[test]
+    fn bip322_signature_verifies_for_segwit_and_taproot() {
+        let (sk, _pk, cpk) = test_key();
+        let msg = "Blitzpool address-ownership verification\nNonce: xyz";
+
+        let p2wpkh = Address::p2wpkh(&cpk, Network::Bitcoin).to_string();
+        assert_eq!(
+            verify_message_signature(
+                &p2wpkh,
+                msg,
+                &sign_bip322(&sk, &p2wpkh, msg),
+                Network::Bitcoin
+            ),
+            Some(("bip322".to_string(), "p2wpkh".to_string()))
+        );
+
+        let secp = Secp256k1::new();
+        let (xonly, _parity) = sk.public_key(&secp).x_only_public_key();
+        let p2tr = Address::p2tr(&secp, xonly, None, Network::Bitcoin).to_string();
+        assert_eq!(
+            verify_message_signature(&p2tr, msg, &sign_bip322(&sk, &p2tr, msg), Network::Bitcoin),
+            Some(("bip322".to_string(), "p2tr".to_string()))
+        );
+    }
+
+    // REGRESSION GUARD for a remotely reachable panic that `bip322` 0.0.10 had
+    // and 0.0.11 fixed — its changelog does not mention it.
+    //
+    // `verify_simple_encoded` decodes the caller's base64 straight into a
+    // `Witness`, so the witness is attacker-controlled. For a P2SH address
+    // 0.0.10 took `witness[1]` as the public key and then computed
+    // `pub_key.wpubkey_hash().unwrap()` — and `wpubkey_hash()` returns `Err`
+    // for an UNCOMPRESSED key, which `PublicKey::from_slice` happily accepts.
+    // So a 65-byte key at witness[1] panicked the handler. `POST
+    // /api/address/ownership/verify` is unauthenticated (5/min per IP) and the
+    // router installs no `CatchPanicLayer`.
+    //
+    // 0.0.11 turned that `unwrap()` into a typed error. This test asserts the
+    // input is REJECTED rather than fatal; pin `bip322` back to 0.0.10 and it
+    // panics instead of returning `None`.
+    #[test]
+    fn a_crafted_witness_with_an_uncompressed_key_is_rejected_not_fatal() {
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::Witness;
+
+        let (sk, _pk, cpk) = test_key();
+        // P2SH-P2WPKH — the address family that reached the unwrap.
+        let addr = Address::p2shwpkh(&cpk, Network::Bitcoin).to_string();
+
+        let uncompressed = bitcoin::PublicKey {
+            compressed: false,
+            inner: sk.public_key(&Secp256k1::new()),
+        };
+        assert_eq!(uncompressed.to_bytes().len(), 65, "must be uncompressed");
+
+        // Two items so 0.0.10's `witness.len() > 1` guard is satisfied; item 1
+        // is the key it would have hashed.
+        let mut witness = Witness::new();
+        witness.push([0x30u8; 72]); // shape-only stand-in for a signature
+        witness.push(uncompressed.to_bytes());
+
+        let signature = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serialize(&witness),
+        );
+
+        assert_eq!(
+            verify_message_signature(&addr, "any challenge", &signature, Network::Bitcoin),
+            None,
+            "a crafted witness must fail verification, not panic"
+        );
+    }
+
+    #[test]
+    fn bip322_signature_does_not_prove_a_different_message_or_address() {
+        let (sk, _pk, cpk) = test_key();
+        let addr = Address::p2wpkh(&cpk, Network::Bitcoin).to_string();
+        let sig = sign_bip322(&sk, &addr, "the real challenge");
+
+        assert_eq!(
+            verify_message_signature(&addr, "a different challenge", &sig, Network::Bitcoin),
+            None
+        );
+
+        let other = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let other_cpk = CompressedPublicKey(other.public_key(&Secp256k1::new()));
+        let other_addr = Address::p2wpkh(&other_cpk, Network::Bitcoin).to_string();
+        assert_eq!(
+            verify_message_signature(&other_addr, "the real challenge", &sig, Network::Bitcoin),
+            None
+        );
+    }
+
     #[test]
     fn recoverable_signature_verifies_across_p2pkh_p2wpkh_p2sh() {
         let (sk, pk, cpk) = test_key();
