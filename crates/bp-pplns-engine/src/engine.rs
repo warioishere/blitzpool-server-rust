@@ -9,13 +9,18 @@
 //!
 //! Construction:
 //!
-//! ```ignore
-//! let engine = PplnsEngine::spawn(
-//!     config,
-//!     redis_connection_manager,
-//!     pg_pool,
-//!     network_difficulty_handle,
-//! ).await?;
+//! ```no_run
+//! # use bp_pplns_engine::{config::PplnsEngineConfig, engine::PplnsEngine};
+//! # use bp_pplns_engine::window::NetworkDifficulty;
+//! # async fn wire(
+//! #     config: PplnsEngineConfig,
+//! #     redis: redis::aio::ConnectionManager,
+//! #     pg: sqlx::PgPool,
+//! #     net_diff: NetworkDifficulty,
+//! # ) -> Result<(), Box<dyn std::error::Error>> {
+//! let engine = PplnsEngine::spawn(config, redis, pg, net_diff).await?;
+//! # let _ = engine;
+//! # Ok(()) }
 //! ```
 //!
 //! Public API:

@@ -14,6 +14,10 @@ workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 sqlx = { workspace = true, optional = true }
+# Needed by the exported `warn_throttled!` macro: it expands to a
+# `$crate::tracing::warn!`, so the macro works in any crate WITHOUT that crate
+# having to depend on tracing itself.
+tracing = { workspace = true }
 
 [features]
 # Enables `sqlx::Type/Decode/Encode` impls for Postgres on the newtypes.

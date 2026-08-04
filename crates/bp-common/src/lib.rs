@@ -391,17 +391,32 @@ impl LogThrottle {
 /// log" idiom: pass the throttle, the timestamp, then the usual `warn!`
 /// fields + message. Expands to a no-op when the window hasn't elapsed.
 ///
-/// ```ignore
-/// warn_throttled!(self.warn_throttle, ts_ms, error = %e, address, "record_share failed");
+/// ```
+/// use bp_common::{warn_throttled, LogThrottle};
+///
+/// let throttle = LogThrottle::new(60_000); // at most one line per minute
+/// let now_ms = 1_700_000_000_000i64;
+/// let address = "bc1qexample";
+/// let err = "connection reset by peer";
+/// warn_throttled!(throttle, now_ms, error = %err, address, "record_share failed");
 /// ```
 #[macro_export]
 macro_rules! warn_throttled {
     ($throttle:expr, $now_ms:expr, $($fields:tt)+) => {
         if let Some(suppressed) = $throttle.allow($now_ms) {
-            ::tracing::warn!(suppressed, $($fields)+);
+            // `$crate::tracing`, not `::tracing`: the macro is exported, and
+            // routing through our own re-export means a caller does not need
+            // `tracing` as a direct dependency to use it. The doctest above is
+            // what proves that — it is compiled as its own crate.
+            $crate::tracing::warn!(suppressed, $($fields)+);
         }
     };
 }
+
+/// Re-export for [`warn_throttled!`] to expand against. Not part of the
+/// public API.
+#[doc(hidden)]
+pub use tracing;
 
 // ---------------------------------------------------------------------------
 // Tests

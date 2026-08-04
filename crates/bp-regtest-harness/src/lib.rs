@@ -20,7 +20,7 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```no_run
 //! use bp_regtest_harness::{RegtestConfig, RegtestNode};
 //! use std::time::Duration;
 //!
