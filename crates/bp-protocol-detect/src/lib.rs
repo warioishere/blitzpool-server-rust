@@ -22,8 +22,8 @@
 //! - Fail-ban state (per-IP failure counter + ban TTL in Redis with
 //!   in-memory fallback) — I/O, lives next to the Redis adapter.
 //! - HTTP-to-API proxy fallback — composition with `bp-api`.
-//! - Per-connection debug logging / `STRATUM_PROTOCOL_DEBUG` env gate —
-//!   wiring concern.
+//! - Per-connection debug logging (`[debug] stratum_wire_logs`) — wiring
+//!   concern.
 
 /// Outcome of looking at the first byte of an incoming connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

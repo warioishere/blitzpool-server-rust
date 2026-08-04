@@ -39,7 +39,7 @@ email_header!(ListUnsubscribePost, "List-Unsubscribe-Post");
 email_header!(AutoSubmitted, "Auto-Submitted");
 email_header!(Precedence, "Precedence");
 
-/// Configuration parsed from `SMTP_*` env vars at startup. `host` /
+/// Configuration from the `[smtp]` TOML section. `host` /
 /// `user` / `pass` / `from` are required to enable sending; `reply_to`
 /// and `unsubscribe_mailto` default to `from` when unset.
 #[derive(Debug, Clone)]

@@ -20,8 +20,8 @@ bp-stats = { workspace = true }
 bp-mining-mode = { workspace = true }
 # Job-lifecycle math (retire-not-clear, classify, age_entries) is shared
 # with bp-stratum-v1 — extracted as a pure-math leaf 2026-05-16. See
-# `bp_jobs_lifecycle::LifecycleConfig` for the constants the SV2 path
-# would otherwise hardcode as `SV2_STALE_GRACE_MS` etc.
+# `bp_jobs_lifecycle::LifecycleConfig` for the grace/retention constants the
+# SV2 path would otherwise duplicate.
 bp-jobs-lifecycle = { workspace = true }
 # Classic vardiff (sliding-window shares-per-minute) is shared with
 # bp-stratum-v1 — extracted as a pure-math leaf 2026-05-16. Every SV2

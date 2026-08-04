@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use crate::error::MetricsError;
 
 /// Default listen address — `0.0.0.0:9000`. Production wiring picks
-/// this up from the `BP_PROMETHEUS_PORT` env var.
+/// this up from `[metrics] bind` in the TOML.
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:9000";
 
 #[derive(Clone, Debug)]

@@ -15,11 +15,11 @@
 //! [`bp-vardiff`] was extracted) so both protocols keep their lifecycle
 //! constants in lock-step. The default values are:
 //!
-//! | Field | Env var | Default | Reason |
+//! | Field | Set by | Default | Reason |
 //! |---|---|---|---|
-//! | `grace_ms` | `STALE_GRACE_MS` / `SV2_STALE_GRACE_MS` | `5000` | Network-jitter absorption — shares against jobs retired ≤ 5 s ago are still credited |
-//! | `retention_ms` | `JOB_RETENTION_MS` / `SV2_EXTENDED_JOB_RETENTION_MS` | `600000` | Retired entries past 10 min are GC-eligible |
-//! | `min_retained` | `MIN_RETAINED` | `3` | Floor to protect the newest 3 entries from aging — guards startup-window where everything is fresh |
+//! | `grace_ms` | not configurable | `5000` | Network-jitter absorption — shares against jobs retired ≤ 5 s ago are still credited |
+//! | `retention_ms` | `[stratum] job_retention_ms` | `600000` | Retired entries past 10 min are GC-eligible |
+//! | `min_retained` | not configurable | `3` | Floor to protect the newest 3 entries from aging — guards startup-window where everything is fresh |
 //!
 //! Why retire-not-clear at all: previously the jobs map was wiped
 //! synchronously on block change BEFORE broadcasting the new

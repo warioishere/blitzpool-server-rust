@@ -37,7 +37,7 @@ struct ReplyMarkup<'a> {
 
 #[derive(Debug, Clone)]
 pub struct TelegramConfig {
-    /// Bot token from `@BotFather` — `TELEGRAM_BOT_TOKEN` env var.
+    /// Bot token from `@BotFather` — `[notifications.telegram] bot_token`.
     pub bot_token: String,
 }
 
@@ -50,7 +50,7 @@ impl TelegramAdapter {
     pub fn new(config: TelegramConfig) -> AdapterResult<Self> {
         if config.bot_token.trim().is_empty() {
             return Err(AdapterError::Config(
-                "TELEGRAM_BOT_TOKEN is empty".to_string(),
+                "[notifications.telegram] bot_token is empty".to_string(),
             ));
         }
         let client = Client::builder()

@@ -6,7 +6,10 @@
 //! No I/O. Window aggregation, Redis snapshots, DB writes, and dust-sweep
 //! cron belong to a higher-level service crate that consumes this one.
 //!
-//! Sat-drift tolerance is recorded in `feedback-sat-parity-relaxed`.
+//! **Sat tolerance:** a payout is `floor(weight · T / W)`, so an entry is at
+//! most one satoshi under its exact share, and the pool output takes the §4
+//! residual `pay_P = T − Σpay` — the outputs sum to `T` exactly. There is no
+//! drift allowance beyond that flooring.
 
 mod distribution;
 mod weight;

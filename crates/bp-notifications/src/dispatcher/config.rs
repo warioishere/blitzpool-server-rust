@@ -11,7 +11,7 @@ pub struct DispatcherConfig {
     /// `Europe/Zurich` — falls back to `UTC` on parse failure.
     pub timezone: Tz,
     /// If `false`, `notify_best_diff` is a no-op. Controlled by
-    /// the `NTFY_DIFF_NOTIFICATIONS` env var (which disables ntfy
+    /// `[notifications.ntfy] diff_notifications` (which disables ntfy
     /// best-diff spam). We extend the toggle to the whole dispatcher
     /// because the engine never knows in advance which adapters would
     /// handle a given event.

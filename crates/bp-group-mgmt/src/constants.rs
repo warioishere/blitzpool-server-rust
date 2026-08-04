@@ -10,9 +10,10 @@
 /// proportional share + the fee output (+ finder bonus when configured).
 pub const MIN_MEMBERS_ACTIVE: u32 = 1;
 
-/// Default kick-inactivity window. An admin can only remove a member
-/// who hasn't submitted a share in this many days. Overridable per
-/// pool via `GROUP_INACTIVITY_KICK_DAYS`.
+/// Kick-inactivity window: an admin can only remove a member who hasn't
+/// submitted a share in this many days. NOT configurable — `blitzpool`
+/// hardcodes it as `group_service::KICK_INACTIVITY_DAYS`, which must stay in
+/// step with this constant.
 pub const DEFAULT_KICK_INACTIVITY_DAYS: u32 = 14;
 
 /// Hard upper bound on the round-reset custom interval, in days.

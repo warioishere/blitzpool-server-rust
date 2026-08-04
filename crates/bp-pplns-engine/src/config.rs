@@ -2,7 +2,7 @@
 
 //! `PplnsEngineConfig` — typed knobs for the PPLNS service-engine.
 //!
-//! Mirrors the `PPLNS_*` / `DUST_SWEEP_*` env-var groups in
+//! Mirrors the `[pplns]` TOML section in
 //! `blitzpool.env`, plus a few engine-internal tunables (trim batch size,
 //! snapshot TTL). Construction is fallible via [`PplnsEngineConfig::try_new`]
 //! so the caller sees field-level errors before the engine spins up.
@@ -41,20 +41,20 @@ pub struct PplnsEngineConfig {
     pub fee_address: Option<AddressId>,
 
     /// Pool fee % as f64 (e.g. `1.5` for 1.5%). Must be `[0.0, 100.0]`.
-    /// Read from `PPLNS_FEE_PERCENT` env var as a float.
+    /// `[pplns] fee_percent` in the TOML.
     pub fee_percent: f64,
 
     /// Pool operational minimum payout. Outputs below this stay as
     /// pending credit in the signed ledger. Always clamped upward to
     /// `DUST_LIMIT_SATS` (546) — values below violate Bitcoin Core relay
-    /// policy. Env var: `PPLNS_MIN_PAYOUT_SATS` (default 5000).
+    /// policy. `[pplns] min_payout_sats` (default 5000).
     pub min_payout_sats: Sats,
 
     /// Coinbase weight budget (WU). Handed straight to bitcoin-core
     /// over the TDP IPC stream (`tdp_constraint_for_budget`) — there is
     /// no `bitcoin.conf` knob to keep in sync. Default 50_000 (≈400
     /// P2WPKH outputs); floored at `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`.
-    /// Env var: `PPLNS_COINBASE_WEIGHT_BUDGET`.
+    /// `[pplns] coinbase_weight_budget`.
     pub coinbase_weight_budget: u32,
 
     /// Sliding-window size factor: `window_size = factor *
@@ -106,13 +106,13 @@ pub struct PplnsEngineConfig {
     /// spikes coalesce.
     pub touch_flush_interval_secs: u32,
 
-    /// Whether the daily 03:00 UTC dust-sweep cron runs. Env var:
-    /// `DUST_SWEEP_ENABLED`. Manual sweeps via admin trigger remain
+    /// Whether the daily 03:00 UTC dust-sweep cron runs.
+    /// `[pplns] dust_sweep_enabled`. Manual sweeps via admin trigger remain
     /// available independent of this flag.
     pub dust_sweep_enabled: bool,
 
     /// A balance row is sweep-eligible once `lastAcceptedShareAt` is
-    /// older than this many days. Env var: `ABANDONED_BALANCE_DAYS`
+    /// older than this many days. `[pplns] abandoned_balance_days`
     /// (default 90).
     pub abandoned_balance_days: u32,
 

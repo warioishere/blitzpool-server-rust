@@ -38,7 +38,7 @@ use crate::util::{normalize_address, now_ms};
 
 /// Construction-time config knobs. The pool fee address + percent are
 /// resolved from environment in the bin/blitzpool boot layer (env keys
-/// `GROUP_FEE_ADDRESS`/`GROUP_FEE_PERCENT` with `PPLNS_FEE_*` fallback)
+/// `[group_fees].address`/`.percent`, address falling back to `[pplns].fee_address`)
 /// and handed in here as values.
 #[derive(Clone, Debug)]
 pub struct BlockpartyServiceConfig {

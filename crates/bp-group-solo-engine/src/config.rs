@@ -8,11 +8,13 @@
 //! on demand at `get_payout_distribution` / round-reset time. Only
 //! knobs that apply across *all* groups live here.
 //!
-//! Several fee/min-payout/weight-budget knobs are intentionally
-//! duplicated with `bp_pplns_engine::config::PplnsEngineConfig` — both
-//! engines read from the same `PPLNS_*` env vars independently. Each
-//! engine owns its own typed config, and the bin/blitzpool wiring
-//! populates both from one env source.
+//! Several fee/min-payout/weight-budget knobs are intentionally duplicated
+//! with `bp_pplns_engine::config::PplnsEngineConfig`: each engine owns its own
+//! typed config and `bin/blitzpool` populates both from the TOML. They are NOT
+//! one source — `[group_fees]` carries this engine's fee address, percent and
+//! weight budget, `[pplns]` the other's, and they routinely differ (a pool can
+//! run 1 % PPLNS and 1.5 % on the group lane). Only the fee **address** falls
+//! back from `[group_fees].address` to `[pplns].fee_address`.
 
 use bp_common::{AddressId, Sats};
 use bp_pplns::{
@@ -47,7 +49,7 @@ pub struct GroupSoloEngineConfig {
 
     /// Coinbase weight budget (WU). Handed straight to bitcoin-core
     /// over the Group-Solo TDP IPC stream — there is no `bitcoin.conf`
-    /// knob to keep in sync. Reuses `PPLNS_COINBASE_WEIGHT_BUDGET`;
+    /// knob to keep in sync. `[group_fees] coinbase_weight_budget`;
     /// floored at `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`.
     pub coinbase_weight_budget: u32,
 

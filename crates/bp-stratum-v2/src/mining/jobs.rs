@@ -36,8 +36,8 @@
 //!
 //! [`bp_jobs_lifecycle::LifecycleConfig::DEFAULT`] holds the standard
 //! defaults (5 s grace, 10 min retention, 3-entry floor). Production
-//! wiring reads `SV2_STALE_GRACE_MS` and
-//! `SV2_EXTENDED_JOB_RETENTION_MS` env-vars and overrides; both helpers
+//! wiring passes `[stratum] job_retention_ms` as the retention override
+//! (the grace window is not configurable); both helpers
 //! below pin against `LifecycleConfig::DEFAULT`.
 
 use std::collections::HashMap;

@@ -226,7 +226,7 @@ pub async fn find_ntfy_subscriptions_with_hourly_enabled(
 }
 
 /// Per-address ntfy subscription (topic is derived from address +
-/// the deployment-wide `NTFY_TOPIC_PREFIX`, so a single row per
+/// the deployment-wide `[notifications.ntfy] topic_prefix`, so a single row per
 /// address — `address` carries a `UNIQUE` constraint upstream).
 pub async fn find_ntfy_subscription_by_address(
     pool: &PgPool,

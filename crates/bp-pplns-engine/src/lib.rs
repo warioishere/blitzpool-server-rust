@@ -7,9 +7,14 @@
 //! `bp-stratum-v1` and `bp-stratum-v2` via the hook traits they define,
 //! and into `bp-db` (PostgreSQL) + Redis for state persistence.
 //!
-//! Output tolerance follows the project-wide [`feedback-sat-parity-relaxed`]
-//! memory: a few thousand sats of drift is acceptable during the migration;
-//! solvency, ledger symmetry, and idempotency are not negotiable.
+//! **Output tolerance is one satoshi per entry, and nothing is destroyed.**
+//! Under the weight model a payout is `floor(weight · T / W)`, so each miner
+//! entry lands at most one satoshi below its exact share, and the pool output
+//! is the §4 residual `pay_P = T − Σpay` — it absorbs every remainder, so the
+//! outputs sum to `T` exactly. There is no drift budget to spend: solvency,
+//! ledger symmetry and idempotency are not negotiable, and neither is the sum.
+//! (This used to claim "a few thousand sats of drift is acceptable during the
+//! migration". The migration is over and the weight model removed the slack.)
 //!
 //! # Module layout
 //!
