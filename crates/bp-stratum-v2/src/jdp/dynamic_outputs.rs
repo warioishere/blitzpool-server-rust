@@ -283,11 +283,79 @@ mod tests {
         }
     }
 
-    // The header is WALKED, not assumed at a fixed offset. SRI hardcodes 43,
-    // which only holds for a segwit-serialised coinbase; ours are serialised
-    // without marker+flag (41). Both must yield the same slot width — asserted
-    // on the derivation itself, because the surrounding `deserialize` would
-    // fail for either reason and could not tell the two apart.
+    // ── the shape a real JDC actually sends ──────────────────────────
+    //
+    // `channels-sv2`'s `JobFactory` (which every SRI jd-client builds its
+    // declaration with) slices a **segwit-serialised** coinbase:
+    //
+    //   index  = 4 version + 2 segwit + 1 inputs + 32 outpoint + 4 index
+    //          + 1 scriptSig len + script_sig_head
+    //   prefix = serialize(coinbase)[..index]
+    //   suffix = serialize(coinbase)[index + full_extranonce_size..]
+    //
+    // so the prefix carries marker+flag (SRI's hardcoded 43) and the suffix
+    // carries the **witness** as well as nSequence/outputs/nLockTime. Rebuilding
+    // prefix + zeroed slot + suffix therefore reproduces the serialised
+    // transaction byte for byte. This is the realistic path; the fixtures above
+    // use the witness-less form our own coinbase builder emits.
+    #[test]
+    fn a_declaration_shaped_like_channels_sv2_sends_it_roundtrips() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, Witness};
+
+        const SLOT: usize = 12;
+        let script_sig_head: [u8; 3] = [0x03, 0xC8, 0x00]; // BIP-34 height push
+
+        let mut script_sig = script_sig_head.to_vec();
+        script_sig.extend_from_slice(&[0u8; SLOT]); // the extranonce slot
+
+        let mut witness = Witness::new();
+        witness.push([0u8; 32]); // witness reserved value — makes it segwit-serialised
+
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(script_sig),
+                sequence: Sequence(0xFFFF_FFFF),
+                witness,
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(312_400_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x14, 0xAA]),
+                },
+            ],
+        };
+
+        let raw = bitcoin::consensus::serialize(&tx);
+        let index = 4 + 2 + 1 + 32 + 4 + 1 + script_sig_head.len();
+        let prefix = &raw[..index];
+        let suffix = &raw[index + SLOT..];
+
+        assert_eq!(
+            extranonce_slot_width(prefix),
+            Some(SLOT),
+            "the slot width must come out of a segwit-serialised prefix too"
+        );
+        assert_eq!(
+            declared_coinbase_outputs(prefix, suffix).as_deref(),
+            Some(tx.output.as_slice()),
+            "a declaration in the shape channels-sv2 emits must round-trip"
+        );
+    }
+
+    // The header is WALKED, not assumed at a fixed offset — SRI hardcodes 43,
+    // which holds for the segwit-serialised coinbase a JDC declares but not for
+    // the witness-less one our own builder emits (41). Both must yield the same
+    // slot width, asserted on the derivation itself because the surrounding
+    // `deserialize` would fail for either reason and could not tell them apart.
     #[test]
     fn the_header_length_is_parsed_for_both_serialisations() {
         let plain = prefix_with(&[0x03, 0xC8, 0x00], /*slot=*/ 12, /*tail=*/ 0);
