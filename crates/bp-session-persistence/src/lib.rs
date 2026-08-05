@@ -23,6 +23,7 @@
 
 pub mod client_row;
 pub mod config;
+mod diff_stat_buffer;
 pub mod engine;
 pub mod error;
 mod hashrate_sampler;

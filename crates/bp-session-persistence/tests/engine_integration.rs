@@ -11,9 +11,7 @@
 use std::time::Duration;
 
 use bp_db::upsert_client;
-use bp_session_persistence::{
-    ClientDifficultyStatisticsSink, SessionPersistenceConfig, SessionPersistenceEngine,
-};
+use bp_session_persistence::{SessionPersistenceConfig, SessionPersistenceEngine};
 use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink, SharedSessionPersistence};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tokio::sync::Mutex;
@@ -189,6 +187,12 @@ async fn _exhibit_upsert_client_path(pool: &PgPool) {
 /// `ClientDifficultyStatisticsSink` records the per-(address, worker,
 /// hour-slot) MAX submission difficulty; a lower follow-up share leaves
 /// the stored max untouched, and a higher one raises it.
+///
+/// Goes through the ENGINE since the sink was batched (2026-08-05): the sink
+/// only merges into the buffer, and the row appears when the flush loop — or
+/// the shutdown drain — writes it. So this now covers the whole chain
+/// (record → coalesce → bulk upsert → row), including that `shutdown()`
+/// does not discard the current window.
 #[tokio::test]
 async fn diff_stats_sink_keeps_per_slot_maximum() {
     let _guard = ENGINE_LOCK.lock().await;
@@ -205,7 +209,19 @@ async fn diff_stats_sink_keeps_per_slot_maximum() {
     };
     del(pool.clone()).await;
 
-    let sink = ClientDifficultyStatisticsSink::new(pool.clone());
+    // A long interval on purpose: the assertion must be satisfied by the
+    // SHUTDOWN drain, not by a tick that happened to fire in between. A test
+    // that passes only because a timer raced it would not pin the drain.
+    let handle = SessionPersistenceEngine::spawn(
+        SessionPersistenceConfig {
+            diff_stat_flush_interval: Duration::from_secs(3_600),
+            ..Default::default()
+        },
+        pool.clone(),
+    )
+    .await
+    .expect("spawn engine");
+    let sink = handle.client_difficulty_statistics_sink();
     let share = |submission_difficulty: f64| SharedAcceptedShare {
         address,
         worker: "rig1",
@@ -225,6 +241,22 @@ async fn diff_stats_sink_keeps_per_slot_maximum() {
     sink.record_accepted(share(1_000.0)).await; // first → max 1000
     sink.record_accepted(share(50_000.0)).await; // new max
     sink.record_accepted(share(2_000.0)).await; // below max → no change
+
+    // Nothing may be in the DB yet — the whole point of batching is that the
+    // share path does not write. If this fires, the sink went inline again.
+    let pending: i64 = sqlx::query_scalar(
+        r#"SELECT count(*) FROM client_difficulty_statistics_entity WHERE address = $1"#,
+    )
+    .bind(address)
+    .fetch_one(&pool)
+    .await
+    .expect("count before flush");
+    assert_eq!(
+        pending, 0,
+        "the share path must not write; the flush loop does"
+    );
+
+    handle.shutdown().await;
 
     let row = sqlx::query(
         r#"SELECT MAX("maxDifficulty")::float8 AS m

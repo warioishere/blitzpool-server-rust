@@ -9,7 +9,8 @@
 
 use bp_common::AddressId;
 use bp_db::{
-    bulk_set_client_hashrate, bulk_touch_clients_for_share, delete_client_for_session,
+    bulk_set_client_hashrate, bulk_touch_clients_for_share,
+    bulk_upsert_client_difficulty_statistics, delete_client_for_session,
     find_addresses_for_ntfy_listener, kill_dead_clients, reset_all_client_hashrate,
     touch_client_for_share, update_sv2_user_agent_by_address, upsert_client,
     upsert_ntfy_subscription, ClientUpsert,
@@ -984,4 +985,87 @@ async fn both_bulk_writers_wait_on_the_shared_advisory_lock() {
         .bind(SID)
         .execute(&pool)
         .await;
+}
+
+// ── bulk_upsert_client_difficulty_statistics ──────────────────────
+
+/// The batched form must keep the per-slot MAX, not last-write-wins: the
+/// flush window is drained in `HashMap` order, so if the upsert overwrote
+/// instead of taking `GREATEST`, whichever row happened to be iterated last
+/// would decide the stored value — and a miner's best share of the hour would
+/// silently disappear whenever a lower one followed it into the same batch.
+#[tokio::test]
+async fn bulk_diff_stats_keep_the_running_max_per_slot() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    const ADDR: &str = "test_bulk_diff_addr";
+    const SLOT: i64 = 1_700_000_000_000;
+    let del = || {
+        sqlx::query(r#"DELETE FROM client_difficulty_statistics_entity WHERE address = $1"#)
+            .bind(ADDR)
+            .execute(&pool)
+    };
+    let _ = del().await;
+
+    let addrs = vec![ADDR.to_string(), ADDR.to_string()];
+    let workers = vec!["rigA".to_string(), "rigB".to_string()];
+    let slots = vec![SLOT, SLOT];
+
+    // Two workers, one statement.
+    let rows = bulk_upsert_client_difficulty_statistics(
+        &pool,
+        &addrs,
+        &workers,
+        &slots,
+        &[1_000.0f32, 4_000.0f32],
+        &[10i64, 10i64],
+    )
+    .await
+    .expect("first upsert");
+    assert_eq!(rows, 2);
+
+    // rigA gets a HIGHER max, rigB a LOWER one — in the same batch.
+    bulk_upsert_client_difficulty_statistics(
+        &pool,
+        &addrs,
+        &workers,
+        &slots,
+        &[9_000.0f32, 5.0f32],
+        &[20i64, 20i64],
+    )
+    .await
+    .expect("second upsert");
+
+    let read = |worker: &'static str| {
+        sqlx::query(
+            r#"SELECT "maxDifficulty"::float8 AS m, "createdAt" AS c, "updatedAt" AS u
+                   FROM client_difficulty_statistics_entity
+                   WHERE address = $1 AND "clientName" = $2 AND "slotTime" = $3"#,
+        )
+        .bind(ADDR)
+        .bind(worker)
+        .bind(SLOT)
+        .fetch_one(&pool)
+    };
+
+    let a = read("rigA").await.expect("rigA row");
+    let m: f64 = a.get("m");
+    assert_eq!(m, 9_000.0, "a higher share must raise the slot max");
+
+    let b = read("rigB").await.expect("rigB row");
+    let m: f64 = b.get("m");
+    assert_eq!(m, 4_000.0, "a LOWER share must not lower the slot max");
+    let created: i64 = b.get("c");
+    let updated: i64 = b.get("u");
+    assert_eq!(
+        created, 10,
+        "createdAt belongs to the insert and must not move"
+    );
+    assert_eq!(
+        updated, 20,
+        "updatedAt tracks the latest write even when the max held"
+    );
+
+    let _ = del().await;
 }

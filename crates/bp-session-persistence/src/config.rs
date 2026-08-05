@@ -18,6 +18,10 @@ pub struct SessionPersistenceConfig {
     /// that vardiff's ~10–15 shares/min keep a window well-populated (30 s
     /// is too few shares → noisy), short enough to stay "live".
     pub hashrate_sample_interval: Duration,
+    /// Flush interval for the buffered per-slot max-difficulty upserts.
+    /// Matches `touch_flush_interval`: both drain the same share window, and
+    /// a per-slot max is not more urgent than a session touch.
+    pub diff_stat_flush_interval: Duration,
     /// Whether this process zeroes stale `hashRate` at startup. Only the
     /// hashRate-writing role (Front) should set this — the sampler map is
     /// empty on boot, so leftover hashRate from the previous process would
@@ -32,6 +36,7 @@ impl Default for SessionPersistenceConfig {
         Self {
             touch_flush_interval: Duration::from_secs(30),
             hashrate_sample_interval: Duration::from_secs(60),
+            diff_stat_flush_interval: Duration::from_secs(30),
             reconcile_hashrate_on_boot: false,
         }
     }
@@ -47,6 +52,13 @@ impl SessionPersistenceConfig {
         if self.hashrate_sample_interval.is_zero() {
             return Err(SessionPersistenceError::Config(
                 "hashrate_sample_interval must be > 0".to_string(),
+            ));
+        }
+        // A zero interval is not "flush eagerly" — `tokio::time::interval`
+        // panics on it, and it would take the whole engine down at spawn.
+        if self.diff_stat_flush_interval.is_zero() {
+            return Err(SessionPersistenceError::Config(
+                "diff_stat_flush_interval must be > 0".to_string(),
             ));
         }
         Ok(())

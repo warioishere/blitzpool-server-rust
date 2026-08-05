@@ -15,18 +15,15 @@
 //! every session gets a `client_entity` row, stamped with the miner's
 //! `user_agent` from the register call.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
-type DiffSlotCache = Arc<Mutex<HashMap<(String, String), (i64, f64)>>>;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use bp_db::upsert_client_difficulty_statistic;
 use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink, SharedSessionPersistence};
 use sqlx::PgPool;
 use tracing::warn;
 
 use crate::client_row::{deregister_client, register_client};
+use crate::diff_stat_buffer::{DiffStatBuffer, DiffStatKeyRef};
 use crate::hashrate_sampler::HashrateSampler;
 use crate::touch_buffer::{TouchBuffer, TouchKeyRef};
 
@@ -161,25 +158,23 @@ const DIFF_STAT_SLOT_MS: i64 = 60 * 60 * 1000;
 /// hour-slot)` maximum share difficulty into
 /// `client_difficulty_statistics_entity` (feeds `/api/client/:address/diff-scores`).
 ///
-/// Coalesces in memory: the per-slot max is monotonic, so a PG upsert
-/// fires only when a share sets a NEW max for its current hour-slot —
-/// rare after a slot's first minutes, so the share hot-path stays cheap.
-/// The cache holds one entry per `(address, worker)`; the entry is
-/// overwritten when the hour rolls over, so it stays bounded by the
-/// active-miner count.
+/// Coalesces in memory and writes in BATCHES: the share hot path merges the
+/// per-slot max into [`DiffStatBuffer`], and one flush loop upserts the whole
+/// window in a single statement.
+///
+/// It used to upsert inline on every new max, which is cheap mid-slot and a
+/// burst at the edges — after a restart and at every hour rollover, every
+/// miner's first share is a new max and the next ones keep raising it. Measured
+/// on prod 2026-08-05: 4.88 s for one of those single-row upserts, 2.5 minutes
+/// after a payout restart.
 #[derive(Clone)]
 pub struct ClientDifficultyStatisticsSink {
-    pool: PgPool,
-    // (address, worker) -> (slot_time_ms, max_difficulty_seen_in_slot)
-    seen: DiffSlotCache,
+    buffer: Arc<DiffStatBuffer>,
 }
 
 impl ClientDifficultyStatisticsSink {
-    pub fn new(pool: PgPool) -> Self {
-        Self {
-            pool,
-            seen: Arc::new(Mutex::new(HashMap::new())),
-        }
+    pub(crate) fn new(buffer: Arc<DiffStatBuffer>) -> Self {
+        Self { buffer }
     }
 }
 
@@ -202,51 +197,17 @@ impl SharedAcceptedShareSink for ClientDifficultyStatisticsSink {
         } else {
             share.worker
         };
-        let key = (share.address.to_string(), worker.to_string());
-
-        // Decide under the lock whether this share sets a new per-slot max;
-        // update the cache and capture the value to persist. No await while
-        // the lock is held.
-        let new_max = {
-            let mut seen = self.seen.lock().expect("diff-stat seen mutex poisoned");
-            match seen.get(&key).copied() {
-                Some((s, m)) if s == slot => {
-                    if candidate > m {
-                        seen.insert(key.clone(), (slot, candidate));
-                        Some(candidate)
-                    } else {
-                        None
-                    }
-                }
-                // New miner, or the hour-slot rolled over → first share of
-                // the slot is its max so far.
-                _ => {
-                    seen.insert(key.clone(), (slot, candidate));
-                    Some(candidate)
-                }
-            }
-        };
-        let Some(max_difficulty) = new_max else {
-            return;
-        };
-
-        if let Err(e) = upsert_client_difficulty_statistic(
-            &self.pool,
-            share.address,
-            worker,
-            slot,
-            max_difficulty as f32,
-            now_ms,
-        )
-        .await
-        {
-            warn!(
-                error = %e,
-                address = share.address,
+        // Borrowed key: no allocation unless this is the slot's first share.
+        // The buffer keeps the running max itself, so there is no second cache
+        // to consult and nothing to await on the hot path.
+        self.buffer.record(
+            DiffStatKeyRef {
+                address: share.address,
                 worker,
-                slot,
-                "ClientDifficultyStatisticsSink: upsert failed"
-            );
-        }
+                slot_ms: slot,
+            },
+            candidate as f32,
+            now_ms,
+        );
     }
 }

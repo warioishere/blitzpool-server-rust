@@ -438,41 +438,62 @@ pub async fn find_client_difficulty_statistics(
     .map_err(DbError::from)
 }
 
-/// Upsert the per-`(address, clientName, slotTime)` maximum share
-/// difficulty into `client_difficulty_statistics_entity` (keeps the
-/// GREATEST). Feeds the `/api/client/:address/diff-scores` chart. The
-/// unique index
-/// `IDX_client_difficulty_statistics_unique (address, clientName, slotTime)`
-/// backs the `ON CONFLICT`; `id` is sequence-generated. `max_difficulty`
-/// is stored in the `real` column, so it's bound as `f32`.
-pub async fn upsert_client_difficulty_statistic(
+/// N per-slot maxima in one `INSERT … SELECT unnest(...) … ON CONFLICT DO
+/// UPDATE`. Sole writer of the table's upsert path — the per-row variant it
+/// replaced went with the inline sink.
+///
+/// `maxDifficulty` takes `GREATEST` against what is already stored (a lower
+/// share in the same batch must not lower the slot's max), `updatedAt`
+/// overwrites, and `createdAt` is only set on the insert so an existing row
+/// keeps its original.
+///
+/// ⚠️ **The caller MUST collapse duplicates per `(address, clientName,
+/// slotTime)`.** Postgres rejects a multi-row `ON CONFLICT DO UPDATE` that
+/// would touch the same row twice with "cannot affect row a second time" —
+/// which is a hard error, not a merge. The buffer that feeds this is keyed by
+/// exactly that triple, so duplicates are impossible by construction; anything
+/// else calling it has to guarantee the same.
+///
+/// No advisory lock here, unlike the `client_entity` pair: that one exists
+/// because TWO loops write the same rows concurrently, a deadlock that was
+/// actually measured. Here a single flush loop is the only writer, so there is
+/// nothing to serialise against. ⚠️ Splitting `payout` and `stats` into two
+/// processes would create a second writer — then this needs its own lock, on
+/// its own key.
+pub async fn bulk_upsert_client_difficulty_statistics(
     pool: &PgPool,
-    address: &str,
-    client_name: &str,
-    slot_time: i64,
-    max_difficulty: f32,
-    now_ms: i64,
-) -> Result<(), DbError> {
-    sqlx::query!(
+    addresses: &[String],
+    client_names: &[String],
+    slot_times: &[i64],
+    max_difficulties: &[f32],
+    updated_ats: &[i64],
+) -> Result<u64, DbError> {
+    let result = sqlx::query!(
         r#"INSERT INTO client_difficulty_statistics_entity
                (address, "clientName", "slotTime", "maxDifficulty", "createdAt", "updatedAt")
-           VALUES ($1, $2, $3, $4, $5, $5)
+           SELECT
+               unnest($1::text[]),
+               unnest($2::text[]),
+               unnest($3::bigint[]),
+               unnest($4::real[]),
+               unnest($5::bigint[]),
+               unnest($5::bigint[])
            ON CONFLICT (address, "clientName", "slotTime") DO UPDATE SET
                "maxDifficulty" = GREATEST(
                    EXCLUDED."maxDifficulty",
                    client_difficulty_statistics_entity."maxDifficulty"
                ),
                "updatedAt" = EXCLUDED."updatedAt""#,
-        address,
-        client_name,
-        slot_time,
-        max_difficulty,
-        now_ms,
+        addresses,
+        client_names,
+        slot_times,
+        max_difficulties,
+        updated_ats,
     )
     .execute(pool)
     .await
-    .map(|_| ())
-    .map_err(DbError::from)
+    .map_err(DbError::from)?;
+    Ok(result.rows_affected())
 }
 
 #[derive(Clone, Debug, FromRow)]
