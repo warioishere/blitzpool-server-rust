@@ -924,7 +924,7 @@ async fn both_bulk_writers_wait_on_the_shared_advisory_lock() {
     // 1. The hashrate sampler's write must not get through.
     let blocked = tokio::time::timeout(
         std::time::Duration::from_millis(1_500),
-        bulk_set_client_hashrate(&pool, &addresses, &names, &sessions, &vec![1.0e12]),
+        bulk_set_client_hashrate(&pool, &addresses, &names, &sessions, &[1.0e12]),
     )
     .await;
     assert!(
@@ -941,10 +941,10 @@ async fn both_bulk_writers_wait_on_the_shared_advisory_lock() {
             &addresses,
             &names,
             &sessions,
-            &vec![1.0f32],
-            &vec![None],
-            &vec![1i32],
-            &vec![42i64],
+            &[1.0f32],
+            &[None],
+            &[1i32],
+            &[42i64],
         ),
     )
     .await;
@@ -965,7 +965,7 @@ async fn both_bulk_writers_wait_on_the_shared_advisory_lock() {
 
     let rows = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        bulk_set_client_hashrate(&pool, &addresses, &names, &sessions, &vec![1.0e12]),
+        bulk_set_client_hashrate(&pool, &addresses, &names, &sessions, &[1.0e12]),
     )
     .await
     .expect("must not block once the lock is free")
