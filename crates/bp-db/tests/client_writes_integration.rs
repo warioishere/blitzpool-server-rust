@@ -854,3 +854,134 @@ async fn reset_all_client_hashrate_zeroes_active_only() {
             .expect("cleanup");
     }
 }
+
+// ── the advisory lock that serialises the two bulk writers ─────────
+
+/// MONEY-adjacent, but really an availability test: the 30 s touch flush and
+/// the 60 s hashrate sampler both drive `UPDATE … FROM unnest(...)` over the
+/// SAME `client_entity` rows, each in its own `HashMap` order. Postgres locks
+/// rows in processing order, so before `CLIENT_ENTITY_BULK_WRITE_LOCK` the two
+/// deadlocked in production — 46 times in ~90 minutes.
+///
+/// Deterministic on purpose. A "run both concurrently and hope they collide"
+/// stress test would be green on a fast machine and prove nothing; this holds
+/// the advisory lock from an outside session and asserts each writer BLOCKS.
+/// Without the fix both return immediately, so it fails in both directions.
+///
+/// The lock key is duplicated here deliberately — it is a wire contract with
+/// Postgres, and a test that imported the constant could not catch the
+/// constant itself changing.
+const BULK_WRITE_LOCK_KEY: i64 = 0x636c_6e74_6277;
+
+async fn seed_lock_probe_row(pool: &PgPool, session: &str) {
+    let _ = sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
+        .bind(session)
+        .execute(pool)
+        .await;
+    upsert_client(
+        pool,
+        &ClientUpsert {
+            address: "test_lock_addr".to_string(),
+            client_name: "wkr".to_string(),
+            session_id: session.to_string(),
+            user_agent: None,
+            start_time_ms: 1,
+            current_difficulty: None,
+        },
+    )
+    .await
+    .expect("seed client");
+}
+
+#[tokio::test]
+async fn both_bulk_writers_wait_on_the_shared_advisory_lock() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let _guard = HASHRATE_DB_LOCK.lock().await;
+
+    const SID: &str = "tLckPrb";
+    seed_lock_probe_row(&pool, SID).await;
+
+    // A dedicated connection holds the lock SESSION-scoped, so it outlives
+    // the statements under test. Own pool: the shared one has 2 connections
+    // and both writers need one while we hold this.
+    let holder_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string()))
+        .await
+        .expect("holder pool");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(BULK_WRITE_LOCK_KEY)
+        .execute(&holder_pool)
+        .await
+        .expect("take lock");
+
+    let addresses = vec!["test_lock_addr".to_string()];
+    let names = vec!["wkr".to_string()];
+    let sessions = vec![SID.to_string()];
+
+    // 1. The hashrate sampler's write must not get through.
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(1_500),
+        bulk_set_client_hashrate(&pool, &addresses, &names, &sessions, &vec![1.0e12]),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "bulk_set_client_hashrate returned while the bulk-write lock was held — \
+         it is not taking the lock, so it can still deadlock against the toucher"
+    );
+
+    // 2. Same for the touch flush.
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(1_500),
+        bulk_touch_clients_for_share(
+            &pool,
+            &addresses,
+            &names,
+            &sessions,
+            &vec![1.0f32],
+            &vec![None],
+            &vec![1i32],
+            &vec![42i64],
+        ),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "bulk_touch_clients_for_share returned while the bulk-write lock was held — \
+         it is not taking the lock"
+    );
+
+    // Negative control: with the lock released, the very same call succeeds —
+    // so the timeouts above were the lock, not a broken statement or a dead DB.
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(BULK_WRITE_LOCK_KEY)
+        .execute(&holder_pool)
+        .await
+        .expect("release lock");
+    holder_pool.close().await;
+
+    let rows = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        bulk_set_client_hashrate(&pool, &addresses, &names, &sessions, &vec![1.0e12]),
+    )
+    .await
+    .expect("must not block once the lock is free")
+    .expect("write ok");
+    assert_eq!(rows, 1, "the probe row must actually be updated");
+
+    let stored: f64 = sqlx::query(r#"SELECT "hashRate" FROM client_entity WHERE "sessionId" = $1"#)
+        .bind(SID)
+        .fetch_one(&pool)
+        .await
+        .expect("read back")
+        .get(0);
+    assert_eq!(stored, 1.0e12);
+
+    let _ = sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
+        .bind(SID)
+        .execute(&pool)
+        .await;
+}

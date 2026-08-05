@@ -910,6 +910,53 @@ pub async fn device_watch_seed(
         .collect())
 }
 
+/// Advisory-lock key serialising the bulk writers of `client_entity`.
+///
+/// Both bulk updates below drive `UPDATE … FROM unnest(...)` over the SAME
+/// rows, and both build their arrays by iterating a `HashMap` — so the two
+/// row orders are arbitrary and mutually different. Postgres takes row locks
+/// in processing order, so two of them running concurrently deadlock. That is
+/// measured, not theoretical: 46 times in ~90 minutes on the prod accounting
+/// process (2026-08-05), where the 30 s touch flush and the 60 s hashrate
+/// sampler collide on every sampler tick. `deadlock_timeout` is 1 s, which is
+/// why both statements ALSO trip the 1 s slow-statement warning first — that
+/// warning is a symptom, not a second problem.
+///
+/// Sorting the input arrays would NOT fix it: the planner may reorder the
+/// join, so input order does not guarantee lock order. Serialising the
+/// writers does.
+///
+/// A process-local mutex would not be enough either. `payout` and `stats` are
+/// separate roles and `consumes_streams = (payout || stats) && !front`, so an
+/// operator may split them into two processes — both of which run the stream
+/// consumer, hence both bulk writers. An advisory lock holds across
+/// processes; a mutex would silently stop working the day someone splits the
+/// roles.
+///
+/// ⚠️ Any future bulk writer of `client_entity` MUST take this lock too.
+const CLIENT_ENTITY_BULK_WRITE_LOCK: i64 = 0x636c_6e74_6277; // "clntbw"
+
+/// Take [`CLIENT_ENTITY_BULK_WRITE_LOCK`] for the rest of `tx`.
+///
+/// The `_xact_` variant releases on commit OR rollback, so an error path
+/// cannot leak the lock and wedge the other writer — which a session-scoped
+/// `pg_advisory_lock` could. Blocking (not `try_`) is deliberate: skipping
+/// would leave the hashrate sampler's values stale for a whole window, and
+/// the wait is bounded by the other statement, which is milliseconds in
+/// normal operation.
+async fn take_client_entity_bulk_write_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), DbError> {
+    sqlx::query!(
+        "SELECT pg_advisory_xact_lock($1)",
+        CLIENT_ENTITY_BULK_WRITE_LOCK
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(DbError::from)?;
+    Ok(())
+}
+
 /// Bulk variant of [`touch_client_for_share`] — collapses N per-session
 /// updates into a single `UPDATE … FROM unnest(...)`. Same column
 /// semantics as the per-row form: `bestDifficulty` takes `GREATEST`,
@@ -919,6 +966,10 @@ pub async fn device_watch_seed(
 /// hashrate sampler ([`bulk_set_client_hashrate`]). Caller is responsible
 /// for collapsing duplicates per `(address, clientName, sessionId)` key
 /// (a buffered flusher keeps only the latest sample per key).
+///
+/// Serialised against the other bulk writer via
+/// [`CLIENT_ENTITY_BULK_WRITE_LOCK`] — disjoint COLUMNS do not prevent a
+/// deadlock, because row locks are per row.
 #[allow(clippy::too_many_arguments)]
 pub async fn bulk_touch_clients_for_share(
     pool: &PgPool,
@@ -930,6 +981,8 @@ pub async fn bulk_touch_clients_for_share(
     channel_counts: &[i32],
     updated_ats: &[i64],
 ) -> Result<u64, DbError> {
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    take_client_entity_bulk_write_lock(&mut tx).await?;
     let result = sqlx::query!(
         r#"UPDATE client_entity AS t
            SET "bestDifficulty"    = GREATEST(t."bestDifficulty", u.share_diff),
@@ -959,9 +1012,10 @@ pub async fn bulk_touch_clients_for_share(
         channel_counts,
         updated_ats,
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok(result.rows_affected())
 }
 
@@ -974,6 +1028,9 @@ pub async fn bulk_touch_clients_for_share(
 /// staleness stays owned by the share-touch path + `kill_dead_clients`.
 /// Already-soft-deleted rows are skipped. Caller collapses duplicates
 /// per `(address, clientName, sessionId)`.
+///
+/// Serialised against [`bulk_touch_clients_for_share`] via
+/// [`CLIENT_ENTITY_BULK_WRITE_LOCK`].
 pub async fn bulk_set_client_hashrate(
     pool: &PgPool,
     addresses: &[String],
@@ -981,6 +1038,8 @@ pub async fn bulk_set_client_hashrate(
     session_ids: &[String],
     hash_rates: &[f64],
 ) -> Result<u64, DbError> {
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    take_client_entity_bulk_write_lock(&mut tx).await?;
     let result = sqlx::query!(
         r#"UPDATE client_entity AS t
            SET "hashRate" = u.hash_rate
@@ -1000,9 +1059,10 @@ pub async fn bulk_set_client_hashrate(
         session_ids,
         hash_rates,
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok(result.rows_affected())
 }
 
