@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO client_entity\n               (address, \"clientName\", \"sessionId\", \"startTime\", \"firstSeen\",\n                \"bestDifficulty\", \"currentDifficulty\", \"channelCount\", \"updatedAt\")\n           SELECT u.address, u.\"clientName\", u.\"sessionId\", u.updated_at, u.updated_at,\n                  u.share_diff, u.current_diff, u.channel_count, u.updated_at\n             FROM (\n               SELECT\n                   unnest($1::text[])     AS address,\n                   unnest($2::text[])     AS \"clientName\",\n                   unnest($3::text[])     AS \"sessionId\",\n                   unnest($4::real[])     AS share_diff,\n                   unnest($5::real[])     AS current_diff,\n                   unnest($6::int[])      AS channel_count,\n                   unnest($7::bigint[])   AS updated_at\n             ) AS u\n           ON CONFLICT (address, \"clientName\", \"sessionId\") DO UPDATE\n           SET \"bestDifficulty\"    = GREATEST(client_entity.\"bestDifficulty\",\n                                              EXCLUDED.\"bestDifficulty\"),\n               \"currentDifficulty\" = COALESCE(EXCLUDED.\"currentDifficulty\",\n                                              client_entity.\"currentDifficulty\"),\n               \"firstSeen\"         = COALESCE(client_entity.\"firstSeen\",\n                                              EXCLUDED.\"firstSeen\"),\n               \"channelCount\"      = EXCLUDED.\"channelCount\",\n               \"updatedAt\"         = EXCLUDED.\"updatedAt\",\n               \"deletedAt\"         = NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Float4Array",
+        "Float4Array",
+        "Int4Array",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4226aa96d55b6e0bf18578a276d296c846ecba36b1ee50a4c2295d7b787aa483"
+}

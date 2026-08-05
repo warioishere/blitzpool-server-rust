@@ -984,9 +984,30 @@ async fn take_client_entity_bulk_write_lock(
 /// `currentDifficulty` `COALESCE`s (NULL preserves existing), `firstSeen`
 /// only fills when NULL, `updatedAt` overwrites, `deletedAt` clears.
 /// `hashRate` is deliberately not touched — it's owned by the live
-/// hashrate sampler ([`bulk_set_client_hashrate`]). Caller is responsible
-/// for collapsing duplicates per `(address, clientName, sessionId)` key
-/// (a buffered flusher keeps only the latest sample per key).
+/// hashrate sampler ([`bulk_set_client_hashrate`]).
+///
+/// ⚠️ **The caller MUST collapse duplicates per `(address, clientName,
+/// sessionId)`.** That is the conflict target, and Postgres rejects a
+/// multi-row `ON CONFLICT DO UPDATE` that would touch the same row twice with
+/// "cannot affect row a second time" — a hard error, not a merge. The touch
+/// buffer is keyed by exactly that triple, so duplicates are impossible by
+/// construction.
+///
+/// **Upsert, not a bare UPDATE (changed 2026-08-05).** It used to be
+/// `UPDATE … FROM unnest(...)`, which silently affected 0 rows whenever the
+/// session row did not exist yet — and then EVERY subsequent touch for that
+/// session was a no-op too, so the session never appeared at all. That was
+/// reachable already: `register_client` only warns on failure, and nothing
+/// retried it. Inserting on conflict-miss removes the ordering requirement
+/// between the register write (front role) and the touch flush (accounting
+/// role) entirely: whoever gets there first creates the row.
+///
+/// On the INSERT branch, `startTime` is the share's own timestamp — the
+/// session started no later than the first share we saw. A later
+/// `upsert_client` overwrites it with the miner-reported value
+/// (`SET "startTime" = EXCLUDED."startTime"`), so the two are order-independent.
+/// `userAgent` stays NULL until the register fills it, and `hashRate` keeps its
+/// column default so the sampler still owns it.
 ///
 /// Serialised against the other bulk writer via
 /// [`CLIENT_ENTITY_BULK_WRITE_LOCK`] — disjoint COLUMNS do not prevent a
@@ -1005,14 +1026,12 @@ pub async fn bulk_touch_clients_for_share(
     let mut tx = pool.begin().await.map_err(DbError::from)?;
     take_client_entity_bulk_write_lock(&mut tx).await?;
     let result = sqlx::query!(
-        r#"UPDATE client_entity AS t
-           SET "bestDifficulty"    = GREATEST(t."bestDifficulty", u.share_diff),
-               "currentDifficulty" = COALESCE(u.current_diff, t."currentDifficulty"),
-               "firstSeen"         = COALESCE(t."firstSeen", u.updated_at),
-               "channelCount"      = u.channel_count,
-               "updatedAt"         = u.updated_at,
-               "deletedAt"         = NULL
-           FROM (
+        r#"INSERT INTO client_entity
+               (address, "clientName", "sessionId", "startTime", "firstSeen",
+                "bestDifficulty", "currentDifficulty", "channelCount", "updatedAt")
+           SELECT u.address, u."clientName", u."sessionId", u.updated_at, u.updated_at,
+                  u.share_diff, u.current_diff, u.channel_count, u.updated_at
+             FROM (
                SELECT
                    unnest($1::text[])     AS address,
                    unnest($2::text[])     AS "clientName",
@@ -1021,10 +1040,17 @@ pub async fn bulk_touch_clients_for_share(
                    unnest($5::real[])     AS current_diff,
                    unnest($6::int[])      AS channel_count,
                    unnest($7::bigint[])   AS updated_at
-           ) AS u
-           WHERE t.address      = u.address
-             AND t."clientName" = u."clientName"
-             AND t."sessionId"  = u."sessionId""#,
+             ) AS u
+           ON CONFLICT (address, "clientName", "sessionId") DO UPDATE
+           SET "bestDifficulty"    = GREATEST(client_entity."bestDifficulty",
+                                              EXCLUDED."bestDifficulty"),
+               "currentDifficulty" = COALESCE(EXCLUDED."currentDifficulty",
+                                              client_entity."currentDifficulty"),
+               "firstSeen"         = COALESCE(client_entity."firstSeen",
+                                              EXCLUDED."firstSeen"),
+               "channelCount"      = EXCLUDED."channelCount",
+               "updatedAt"         = EXCLUDED."updatedAt",
+               "deletedAt"         = NULL"#,
         addresses,
         client_names,
         session_ids,

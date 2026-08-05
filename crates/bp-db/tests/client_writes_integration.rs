@@ -1069,3 +1069,96 @@ async fn bulk_diff_stats_keep_the_running_max_per_slot() {
 
     let _ = del().await;
 }
+
+/// The touch path is an UPSERT, not a bare UPDATE: it must create the session
+/// row when it does not exist yet.
+///
+/// Why that matters beyond tidiness — as a plain `UPDATE … FROM unnest(...)`
+/// this silently affected 0 rows on a conflict-miss, and since nothing ever
+/// retried, EVERY later touch for that session was a no-op too: the session
+/// never appeared at all. Reachable today, because `register_client` only warns
+/// on failure. It also decouples the register write (front role) from the touch
+/// flush (accounting role) — two different processes, so their order is not
+/// something either side can guarantee.
+#[tokio::test]
+async fn bulk_touch_creates_the_row_when_the_session_was_never_registered() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    const ADDR: &str = "test_touch_insert_addr";
+    const SID: &str = "tTchIns";
+    let del = || {
+        sqlx::query(r#"DELETE FROM client_entity WHERE address = $1"#)
+            .bind(ADDR)
+            .execute(&pool)
+    };
+    let _ = del().await;
+
+    // Precondition — the row genuinely does not exist. Without this the test
+    // could pass on a leftover row and prove nothing about the INSERT branch.
+    let pre: i64 = sqlx::query_scalar(r#"SELECT count(*) FROM client_entity WHERE address = $1"#)
+        .bind(ADDR)
+        .fetch_one(&pool)
+        .await
+        .expect("count before");
+    assert_eq!(pre, 0, "no row may exist before the touch");
+
+    let affected = bulk_touch_clients_for_share(
+        &pool,
+        &[ADDR.to_string()],
+        &["wkr".to_string()],
+        &[SID.to_string()],
+        &[4_096.0f32],
+        &[Some(1_024.0f32)],
+        &[3i32],
+        &[1_700_000_000_000i64],
+    )
+    .await
+    .expect("touch");
+    assert_eq!(affected, 1, "the touch must have created exactly one row");
+
+    let row = sqlx::query(
+        r#"SELECT "bestDifficulty"::float8 AS bd, "currentDifficulty"::float8 AS cd,
+                  "channelCount" AS cc, "updatedAt" AS ua, "startTime" AS st,
+                  "firstSeen" AS fs, "hashRate" AS hr, "deletedAt" AS da,
+                  "userAgent" AS agent
+             FROM client_entity WHERE address = $1 AND "sessionId" = $2"#,
+    )
+    .bind(ADDR)
+    .bind(SID)
+    .fetch_one(&pool)
+    .await
+    .expect("the row must exist now");
+
+    let bd: f64 = row.get("bd");
+    assert_eq!(bd, 4_096.0);
+    let cd: f64 = row.get("cd");
+    assert_eq!(cd, 1_024.0);
+    let cc: i32 = row.get("cc");
+    assert_eq!(cc, 3);
+    let ua: i64 = row.get("ua");
+    assert_eq!(ua, 1_700_000_000_000);
+    // startTime is NOT NULL with no default, so the INSERT branch has to supply
+    // it; the share's own timestamp is the honest answer until the register
+    // overwrites it with the miner-reported value.
+    let st: i64 = row.get("st");
+    assert_eq!(st, 1_700_000_000_000);
+    let fs: i64 = row.get("fs");
+    assert_eq!(fs, 1_700_000_000_000);
+    // hashRate stays with its column default — the sampler owns that column and
+    // the touch must not write it, or the two writers would fight over it.
+    let hr: f64 = row.get("hr");
+    assert_eq!(hr, 0.0);
+    let da: Option<i64> = row.get("da");
+    assert!(
+        da.is_none(),
+        "a freshly touched session is not soft-deleted"
+    );
+    let agent: Option<String> = row.get("agent");
+    assert!(
+        agent.is_none(),
+        "userAgent stays NULL until the register fills it"
+    );
+
+    let _ = del().await;
+}
