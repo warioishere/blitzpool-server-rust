@@ -28,9 +28,11 @@ pub mod engine;
 pub mod error;
 mod hashrate_sampler;
 pub mod hooks;
+pub mod session_rows;
 mod touch_buffer;
 
 pub use config::SessionPersistenceConfig;
 pub use engine::{SessionPersistenceEngine, SessionPersistenceEngineHandle};
 pub use error::SessionPersistenceError;
 pub use hooks::{ClientDifficultyStatisticsSink, SessionPersistenceHook};
+pub use session_rows::ClientRowSessionSink;

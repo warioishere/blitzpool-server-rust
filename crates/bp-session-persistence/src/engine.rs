@@ -29,6 +29,7 @@ use crate::diff_stat_buffer::{run_flush_loop as run_diff_stat_flush_loop, DiffSt
 use crate::error::SessionPersistenceError;
 use crate::hashrate_sampler::{run_sample_loop, HashrateSampler};
 use crate::hooks::{ClientDifficultyStatisticsSink, ClientRowTouchSink, SessionPersistenceHook};
+use crate::session_rows::{ClientRowSessionSink, PersistedSessions};
 use crate::touch_buffer::{run_flush_loop, TouchBuffer};
 
 pub struct SessionPersistenceEngine {
@@ -37,6 +38,7 @@ pub struct SessionPersistenceEngine {
     touch_buffer: Arc<TouchBuffer>,
     hashrate_sampler: Arc<HashrateSampler>,
     diff_stat_buffer: Arc<DiffStatBuffer>,
+    persisted_sessions: Arc<PersistedSessions>,
 }
 
 impl SessionPersistenceEngine {
@@ -54,6 +56,7 @@ impl SessionPersistenceEngine {
             touch_buffer: Arc::new(TouchBuffer::default()),
             hashrate_sampler: Arc::new(HashrateSampler::default()),
             diff_stat_buffer: Arc::new(DiffStatBuffer::default()),
+            persisted_sessions: Arc::new(PersistedSessions::default()),
         })
     }
 
@@ -75,6 +78,7 @@ impl SessionPersistenceEngine {
             touch_buffer: self.touch_buffer,
             hashrate_sampler: self.hashrate_sampler,
             diff_stat_buffer: self.diff_stat_buffer,
+            persisted_sessions: self.persisted_sessions,
             shutdown: Arc::new(std::sync::Mutex::new(ShutdownState::default())),
         }
     }
@@ -113,6 +117,7 @@ impl SessionPersistenceEngine {
             touch_buffer: self.touch_buffer,
             hashrate_sampler: self.hashrate_sampler,
             diff_stat_buffer: self.diff_stat_buffer,
+            persisted_sessions: self.persisted_sessions,
             shutdown: Arc::new(std::sync::Mutex::new(ShutdownState {
                 txs: vec![touch_tx, sampler_tx, diff_tx],
                 joins: vec![touch_join, sampler_join, diff_join],
@@ -141,6 +146,7 @@ pub struct SessionPersistenceEngineHandle {
     touch_buffer: Arc<TouchBuffer>,
     hashrate_sampler: Arc<HashrateSampler>,
     diff_stat_buffer: Arc<DiffStatBuffer>,
+    persisted_sessions: Arc<PersistedSessions>,
     shutdown: Arc<std::sync::Mutex<ShutdownState>>,
 }
 
@@ -148,7 +154,19 @@ impl SessionPersistenceEngineHandle {
     /// Hook impl for `bp_stratum_v1::SessionPersistence`. Wire into
     /// `ServerHooks::session_persistence`.
     pub fn session_persistence_hook(&self) -> SessionPersistenceHook {
-        SessionPersistenceHook::new(self.pool.clone())
+        SessionPersistenceHook::new(self.pool.clone(), self.persisted_sessions.clone())
+    }
+
+    /// Front-side sink that CREATES the `client_entity` row on a session's
+    /// first accepted share. Shares the claimed-session set with
+    /// [`Self::session_persistence_hook`], which is what lets the teardown
+    /// path tell a session that mined from one that never did.
+    ///
+    /// Wire this ONLY into the front's producing fan-out. The accounting role
+    /// must not run it: it would write rows for shares it merely replays off
+    /// the stream, and it has no teardown signal to retire them with.
+    pub fn client_row_session_sink(&self) -> ClientRowSessionSink {
+        ClientRowSessionSink::new(self.pool.clone(), self.persisted_sessions.clone())
     }
 
     /// Hook impl that touches the per-session `client_entity` row on

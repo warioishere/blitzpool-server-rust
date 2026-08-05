@@ -22,48 +22,71 @@ use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink, SharedSessionP
 use sqlx::PgPool;
 use tracing::warn;
 
-use crate::client_row::{deregister_client, register_client};
+use crate::client_row::deregister_client;
 use crate::diff_stat_buffer::{DiffStatBuffer, DiffStatKeyRef};
 use crate::hashrate_sampler::HashrateSampler;
+use crate::session_rows::PersistedSessions;
 use crate::touch_buffer::{TouchBuffer, TouchKeyRef};
 
-/// `SharedSessionPersistence` impl that persists the `client_entity`
-/// row on register + soft-deletes it on deregister. Cheap to clone
-/// (single `Arc<PgPool>`).
+/// `SharedSessionPersistence` impl that RETIRES the `client_entity` row when a
+/// session ends — and only if that session ever had one.
+///
+/// The creating half moved to [`crate::session_rows::ClientRowSessionSink`]:
+/// a session earns its row by mining, not by connecting. See that module for
+/// the measurement behind it (6 129 sessions/hour from 57 addresses, median
+/// lifetime 0.1 s). `register_session` therefore has nothing left to do here,
+/// while the two OUTER links of the persistence chain — the mode-gate publish
+/// and the Redis live-session publish — are untouched and still fire on every
+/// authorize.
+///
+/// Cheap to clone (an `Arc<PgPool>` and an `Arc` to the shared set).
 #[derive(Clone)]
 pub struct SessionPersistenceHook {
     pool: PgPool,
+    persisted: Arc<PersistedSessions>,
 }
 
 impl SessionPersistenceHook {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub(crate) fn new(pool: PgPool, persisted: Arc<PersistedSessions>) -> Self {
+        Self { pool, persisted }
     }
 }
 
 #[async_trait]
 impl SharedSessionPersistence for SessionPersistenceHook {
+    /// Deliberately empty. The row is created by the first accepted share
+    /// ([`crate::session_rows::ClientRowSessionSink`]), because a connection
+    /// that hangs up after the handshake has nothing to record and used to
+    /// cost an INSERT plus a soft-delete anyway.
+    ///
+    /// Nothing is lost by not writing here: the retired call passed `None` for
+    /// both `start_time_ms` and `current_difficulty`, so the row carried no
+    /// authorize-only data — `userAgent` rides on the share.
+    ///
+    /// This impl is still the chain's innermost link because the RETIREMENT
+    /// half below is real; the outer links (mode gate, Redis live sessions)
+    /// keep doing their work on register.
     async fn register_session(
         &self,
-        session_id: &str,
-        address: &str,
-        worker: &str,
-        user_agent: Option<&str>,
+        _session_id: &str,
+        _address: &str,
+        _worker: &str,
+        _user_agent: Option<&str>,
     ) {
-        if let Err(e) = register_client(
-            &self.pool, address, worker, session_id, user_agent, None, None,
-        )
-        .await
-        {
-            warn!(
-                error = %e,
-                session_id, address, worker,
-                "SessionPersistenceHook: register_client failed"
-            );
-        }
     }
 
+    /// Soft-delete the row — but only for a session that actually had one.
+    /// A session that never mined was never claimed, so this returns without
+    /// touching the database. That is the other half of the saving: a
+    /// throwaway connection costs neither the INSERT nor this UPDATE.
+    ///
+    /// `kill_dead_clients` (every 60 s, 5-minute staleness) remains the
+    /// backstop for anything this path misses, exactly as it already is for a
+    /// network drop with no clean FIN.
     async fn deregister_session(&self, session_id: &str) {
+        if !self.persisted.release(session_id) {
+            return;
+        }
         if let Err(e) = deregister_client(&self.pool, session_id).await {
             warn!(
                 error = %e,

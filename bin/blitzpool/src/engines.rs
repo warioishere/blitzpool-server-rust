@@ -178,8 +178,12 @@ pub(crate) async fn spawn(
     // instead, so it skips them (and the `core:epoch` INCR).
     let (accepted_sink, rejected_sink) = if cfg.has_role(Role::Front) {
         let core_epoch = fetch_core_epoch(&handles.redis).await?;
-        let accepted =
-            build_producing_composite(mode_gate.clone(), handles.redis.clone(), core_epoch);
+        let accepted = build_producing_composite(
+            mode_gate.clone(),
+            handles.redis.clone(),
+            core_epoch,
+            Arc::new(session_persistence.client_row_session_sink()),
+        );
         // Stamp the group_id (gate) then publish to the rejected stream; the
         // back runs the reject counters off it.
         let rejected = build_producing_rejected_composite(mode_gate.clone(), handles.redis.clone());
@@ -621,7 +625,9 @@ impl SharedAcceptedShareSink for CompositeAcceptedShareSink {
             // diag: per-sink timing — one of these inline accepted-share
             // sinks occasionally blocks the connection loop for ~1s. Index
             // order = build_accepted_sinks (money: [pplns?], group-solo;
-            // aux: stats, best-difficulty, touch, diff-stats, live-marker).
+            // aux: stats, best-difficulty, touch, diff-stats, live-marker) —
+            // or, in the front, build_producing_composite (session-row,
+            // producing).
             let t0 = std::time::Instant::now();
             sink.record_accepted(share).await;
             let us = t0.elapsed().as_micros();
@@ -716,12 +722,17 @@ fn build_producing_composite(
     gate: Arc<BlitzpoolModeGate>,
     redis: redis::aio::ConnectionManager,
     core_epoch: u64,
+    session_row: Arc<dyn SharedAcceptedShareSink>,
 ) -> Arc<CompositeAcceptedShareSink> {
     let producing: Arc<dyn SharedAcceptedShareSink> = Arc::new(ProducingSink::new(
         AcceptedShareProducer::new(redis, ACCEPTED_STREAM_KEY),
     ));
     Arc::new(CompositeAcceptedShareSink {
-        sinks: ArcSwap::new(Arc::new(vec![producing])),
+        // `session_row` FIRST, and the fan-out below awaits in index order, so
+        // the `client_entity` row exists before the share is published — the
+        // accounting role can never see a share whose session row is missing.
+        // Belt and braces rather than load-bearing: the touch is an upsert.
+        sinks: ArcSwap::new(Arc::new(vec![session_row, producing])),
         sequencer: ShareSequencer::new(core_epoch),
         gate,
     })
@@ -1050,7 +1061,17 @@ mod tests {
         let addr = "bc1qproducingsink";
         gate.set_mode(addr, MiningModeResult::pplns());
 
-        let composite = build_producing_composite(gate, conn.clone(), 7);
+        // The front's fan-out is [session-row, producing] — the session-row
+        // sink has to be in it, or a mining session would never get a
+        // `client_entity` row now that authorize no longer writes one. A
+        // counting stand-in proves the wiring without needing Postgres.
+        let session_rows = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let composite = build_producing_composite(
+            gate,
+            conn.clone(),
+            7,
+            Arc::new(CountingSink(session_rows.clone())),
+        );
 
         // Adapter-shaped input: share_id blank + mode Solo — the composite
         // overwrites both from the gate before publishing.
@@ -1083,6 +1104,12 @@ mod tests {
         assert_eq!(owned.mode, MiningMode::Pplns, "mode stamped from gate");
         assert_eq!(owned.group_id, None);
         assert_eq!(owned.share_id, "7:0", "share_id stamped from sequencer");
+        assert_eq!(
+            session_rows.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the session-row sink must be in the front's fan-out — without it a \
+             mining session never gets a client_entity row"
+        );
         assert!((owned.effective_difficulty - 1024.0).abs() < 1e-9);
     }
 

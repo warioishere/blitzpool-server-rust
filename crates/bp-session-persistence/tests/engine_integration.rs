@@ -20,6 +20,31 @@ const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/public_p
 
 static ENGINE_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// One accepted share for a session, with the fields the row-creating sink
+/// reads. `effective_difficulty` is the vardiff target (what lands in
+/// `currentDifficulty`), `submission_difficulty` the share's own value.
+fn share_for<'a>(
+    address: &'a str,
+    worker: &'a str,
+    session_id: &'a str,
+) -> SharedAcceptedShare<'a> {
+    SharedAcceptedShare {
+        address,
+        worker,
+        session_id,
+        effective_difficulty: 1_024.0,
+        submission_difficulty: 2_048.0,
+        user_agent: Some("bitaxe/test"),
+        is_block_candidate: false,
+        hash_rate: 0.0,
+        channel_count: 1,
+        ts_ms: 0,
+        share_id: "",
+        mode: bp_share_hook::MiningMode::Solo,
+        group_id: None,
+    }
+}
+
 async fn connect_or_skip() -> Option<PgPool> {
     let url = std::env::var("BP_PG_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
     match tokio::time::timeout(
@@ -55,8 +80,15 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
     }
 }
 
+/// The row's lifecycle, end to end, after it moved off the authorize path:
+/// register writes NOTHING, the first accepted share creates the row, and the
+/// teardown retires it.
+///
+/// The middle assertion is the one that matters — a connection that completes
+/// the handshake and hangs up (measured on prod: 6 129 sessions/hour from 57
+/// addresses, median lifetime 0.1 s) must not cost a single statement.
 #[tokio::test]
-async fn engine_session_persistence_hook_writes_then_soft_deletes() {
+async fn a_session_row_is_created_by_the_first_share_not_by_authorize() {
     let _guard = ENGINE_LOCK.lock().await;
     let Some(pool) = connect_or_skip().await else {
         return;
@@ -68,12 +100,40 @@ async fn engine_session_persistence_hook_writes_then_soft_deletes() {
         .await
         .expect("spawn engine");
     let hook = handle.session_persistence_hook();
+    let sink = handle.client_row_session_sink();
     let address = format!("{prefix}alice");
 
     hook.register_session("sessZ001", &address, "worker1", None)
         .await;
 
-    let row = sqlx::query(
+    let after_register: i64 =
+        sqlx::query_scalar(r#"SELECT count(*) FROM client_entity WHERE "sessionId" = $1"#)
+            .bind("sessZ001")
+            .fetch_one(&pool)
+            .await
+            .expect("count after register");
+    assert_eq!(
+        after_register, 0,
+        "authorize must not write a row — that is the whole saving"
+    );
+
+    // A throwaway connection ends here, and must have cost nothing at all.
+    hook.deregister_session("sessZ001").await;
+    let after_probe: i64 =
+        sqlx::query_scalar(r#"SELECT count(*) FROM client_entity WHERE "sessionId" = $1"#)
+            .bind("sessZ001")
+            .fetch_one(&pool)
+            .await
+            .expect("count after probe teardown");
+    assert_eq!(after_probe, 0, "a session that never mined leaves no row");
+
+    // Now the same session mines.
+    hook.register_session("sessZ001", &address, "worker1", None)
+        .await;
+    sink.record_accepted(share_for(&address, "worker1", "sessZ001"))
+        .await;
+
+    let del: Option<i64> = sqlx::query_scalar(
         r#"SELECT "deletedAt" FROM client_entity
            WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3"#,
     )
@@ -82,25 +142,29 @@ async fn engine_session_persistence_hook_writes_then_soft_deletes() {
     .bind("sessZ001")
     .fetch_one(&pool)
     .await
-    .expect("read after register");
-    let del: Option<i64> = row.get("deletedAt");
-    assert!(del.is_none(), "fresh row must not be soft-deleted");
+    .expect("the first share must have created the row");
+    assert!(del.is_none(), "a freshly mined session is not soft-deleted");
 
     hook.deregister_session("sessZ001").await;
-
     let del2: Option<i64> =
         sqlx::query_scalar(r#"SELECT "deletedAt" FROM client_entity WHERE "sessionId" = $1"#)
             .bind("sessZ001")
             .fetch_one(&pool)
             .await
             .expect("read after deregister");
-    assert!(del2.is_some(), "deletedAt must be stamped post-deregister");
+    assert!(
+        del2.is_some(),
+        "a session that DID mine must be retired on teardown"
+    );
 
     cleanup(&pool, prefix).await;
 }
 
+/// Reconnect under the same composite PK still clears the soft-delete — the
+/// behaviour is unchanged, only its trigger moved from the register to the
+/// first share (`register_client`'s `ON CONFLICT … SET "deletedAt" = NULL`).
 #[tokio::test]
-async fn engine_re_register_under_same_session_id_clears_soft_delete() {
+async fn a_share_after_a_reconnect_clears_the_soft_delete() {
     let _guard = ENGINE_LOCK.lock().await;
     let Some(pool) = connect_or_skip().await else {
         return;
@@ -112,13 +176,26 @@ async fn engine_re_register_under_same_session_id_clears_soft_delete() {
         .await
         .expect("spawn engine");
     let hook = handle.session_persistence_hook();
+    let sink = handle.client_row_session_sink();
     let address = format!("{prefix}bob");
 
     hook.register_session("sessY002", &address, "wkr", None)
         .await;
+    sink.record_accepted(share_for(&address, "wkr", "sessY002"))
+        .await;
     hook.deregister_session("sessY002").await;
-    // Same composite PK re-register: ON CONFLICT path clears deletedAt.
+
+    let del_mid: Option<i64> =
+        sqlx::query_scalar(r#"SELECT "deletedAt" FROM client_entity WHERE "sessionId" = $1"#)
+            .bind("sessY002")
+            .fetch_one(&pool)
+            .await
+            .expect("read after teardown");
+    assert!(del_mid.is_some(), "precondition: the row is soft-deleted");
+
     hook.register_session("sessY002", &address, "wkr", None)
+        .await;
+    sink.record_accepted(share_for(&address, "wkr", "sessY002"))
         .await;
 
     let del: Option<i64> = sqlx::query_scalar(
@@ -131,7 +208,10 @@ async fn engine_re_register_under_same_session_id_clears_soft_delete() {
     .fetch_one(&pool)
     .await
     .expect("read");
-    assert!(del.is_none(), "re-register must clear soft-delete");
+    assert!(
+        del.is_none(),
+        "a share after the reconnect must clear the soft-delete"
+    );
 
     cleanup(&pool, prefix).await;
 }
