@@ -840,16 +840,6 @@ fn accept_declaration(
     distribution: Option<DistributionAcceptance>,
     now_ms: u64,
 ) -> JdpHandlerOutcome {
-    // Reject genuinely-empty coinbases up front (spec §6.4.3 — the coinbase
-    // MUST carry the pool's committed payout outputs).
-    if input.coinbase_tx_prefix.is_empty() && input.coinbase_tx_suffix.is_empty() {
-        return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-            request_id: input.request_id,
-            error_code: ERR_INVALID_JOB_PARAM_COINBASE.to_string(),
-            error_details: b"Empty coinbase transaction".to_vec(),
-        });
-    }
-
     // The coinbase must rebuild, on EVERY connection — not just the 0x0003
     // ones whose payout check happens to need it.
     //
@@ -1958,6 +1948,68 @@ mod tests {
             "the reference must survive a non-bookable distribution — it is \
              what a Full-Template SetCustomMiningJob inherits"
         );
+    }
+
+    /// A coinbase that is not a coinbase is refused, and the refusal does
+    /// not depend on WHICH shape it is missing.
+    ///
+    /// There used to be a separate up-front test for `prefix.is_empty() &&
+    /// suffix.is_empty()`, which only ever caught the narrowest of these:
+    /// the rebuild refuses an empty prefix whatever the suffix says, so the
+    /// early check answered nothing the reconstruction did not. What has to
+    /// hold either way is that nothing empty or malformed is ever declared,
+    /// so that is what this pins — plus a positive control, or "everything
+    /// is refused" would read the same as "these are refused".
+    #[test]
+    fn a_coinbase_that_will_not_rebuild_is_refused() {
+        for (label, prefix, suffix) in [
+            ("both empty", vec![], vec![]),
+            ("empty prefix", vec![], coinbase_suffix(&one_output_blob())),
+            ("empty suffix", coinbase_prefix(), vec![]),
+            (
+                "garbage prefix",
+                vec![0xAA; 8],
+                coinbase_suffix(&one_output_blob()),
+            ),
+        ] {
+            let mut s = fresh();
+            let token = complete_setup_and_allocate(&mut s);
+            let mut input = declare(4, token, vec![]);
+            input.coinbase_tx_prefix = prefix;
+            input.coinbase_tx_suffix = suffix;
+            let out = handle_declare_mining_job(
+                &mut s,
+                &input,
+                &HashMap::new(),
+                Some([0xAB; 32]),
+                None,
+                3_000,
+            );
+            match &out.outbound[0] {
+                JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
+                    assert_eq!(error_code, ERR_INVALID_JOB_PARAM_COINBASE, "{label}");
+                }
+                other => panic!("{label} must be refused, got {other:?}"),
+            }
+            assert_eq!(s.declared_jobs.len(), 0, "{label} must not be stored");
+        }
+
+        // Positive control: the honest coinbase from the same fixtures is
+        // accepted, so the refusals above are about the coinbase.
+        let mut s = fresh();
+        let token = complete_setup_and_allocate(&mut s);
+        let out = handle_declare_mining_job(
+            &mut s,
+            &declare(5, token, vec![]),
+            &HashMap::new(),
+            Some([0xAB; 32]),
+            None,
+            3_000,
+        );
+        assert!(matches!(
+            out.outbound[0],
+            JdpOutboundFrame::DeclareMiningJobSuccess { .. }
+        ));
     }
 
     #[test]

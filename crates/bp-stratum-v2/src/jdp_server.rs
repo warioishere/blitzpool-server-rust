@@ -1337,15 +1337,6 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-// ── Public re-export for the IO-layer wire-up ───────────────────────
-
-/// Drain timeout placeholder — re-exported to match
-/// `ServerConfig::shutdown_drain_timeout` semantics. Not yet wired:
-/// `StratumV2JdpServer::shutdown` is fire-and-forget for now (the
-/// cancel-token causes all per-connection tasks to exit on their
-/// next select tick).
-pub const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
 #[cfg(test)]
 mod tests {
     use super::*;
