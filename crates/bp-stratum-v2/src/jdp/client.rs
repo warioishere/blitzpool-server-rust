@@ -729,6 +729,20 @@ pub fn handle_declare_mining_job(
         request_id: input.request_id,
         unknown_tx_position_list: partition.missing_positions.clone(),
     });
+    // Only one round-trip is tracked per connection, so a JDC that sends a
+    // second `DeclareMiningJob` before answering the first
+    // `ProvideMissingTransactions` loses the first one. Its `request_id` is
+    // then never answered — neither Success nor Error — and that JDC waits
+    // for a frame that will not come. Say so: the alternative is a
+    // declaration disappearing without a trace.
+    if let Some(abandoned) = state.pending_declaration.as_ref() {
+        tracing::warn!(
+            abandoned_request_id = abandoned.pending.request_id,
+            request_id = input.request_id,
+            "jdp: a second DeclareMiningJob arrived while one was in flight — the \
+             first is abandoned and its request_id will never be answered"
+        );
+    }
     state.pending_declaration = Some(PendingState {
         input: input.clone(),
         pending: PendingDeclaration {
@@ -1968,6 +1982,68 @@ mod tests {
         }
         assert!(s.pending_declaration.is_some());
         assert_eq!(s.declared_jobs.len(), 0, "not accepted yet");
+    }
+
+    /// A JDC that pipelines a second `DeclareMiningJob` before answering
+    /// the first `ProvideMissingTransactions` loses the first: one
+    /// round-trip is tracked per connection. Pinned in both directions —
+    /// the second declaration becomes the pending one, AND the first is
+    /// gone for good, so its `Success` is dropped rather than accepted
+    /// against the wrong declaration.
+    #[test]
+    fn a_second_declare_abandons_the_in_flight_one() {
+        let mut s = fresh();
+        let token = complete_setup_and_allocate(&mut s);
+        let known = [0x01; 32];
+        let missing = [0x02; 32];
+        let mut tpl = HashMap::new();
+        tpl.insert(known, vec![0xCA; 16]);
+
+        handle_declare_mining_job(
+            &mut s,
+            &declare(4, token, vec![known, missing]),
+            &tpl,
+            Some([0xAB; 32]),
+            None,
+            3_000,
+        );
+        assert_eq!(
+            s.pending_declaration.as_ref().unwrap().pending.request_id,
+            4
+        );
+
+        handle_declare_mining_job(
+            &mut s,
+            &declare(5, token, vec![known, missing]),
+            &tpl,
+            Some([0xAB; 32]),
+            None,
+            3_100,
+        );
+        assert_eq!(
+            s.pending_declaration.as_ref().unwrap().pending.request_id,
+            5,
+            "the second declaration takes the slot"
+        );
+
+        // The abandoned round-trip cannot be completed any more: its
+        // Success is silently dropped and nothing is declared.
+        let out = handle_provide_missing_transactions_success(
+            &mut s,
+            &ProvideMissingTransactionsSuccessInput {
+                request_id: 4,
+                transaction_list: vec![vec![0xBB; 16]],
+            },
+            Some([0xAB; 32]),
+            None,
+            3_200,
+        );
+        assert!(out.outbound.is_empty(), "no frame for an abandoned request");
+        assert_eq!(s.declared_jobs.len(), 0, "nothing was declared");
+        assert!(
+            s.pending_declaration.is_some(),
+            "the live round-trip #5 is untouched"
+        );
     }
 
     // ── ProvideMissingTransactions.Success ────────────────────────
