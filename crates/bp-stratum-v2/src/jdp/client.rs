@@ -295,14 +295,11 @@ pub enum JdpSessionEvent {
     /// mining-protocol bridge to build a `SetCustomMiningJob` for
     /// the matching JDC miner.
     ///
-    /// Carries only what the bridge registration keys on. Everything
-    /// else about the job — the declared tip included — is read off the
-    /// stored [`DeclaredJob`] under `new_token`, so nothing here may
-    /// disagree with it.
-    JobDeclared {
-        new_token: Token,
-        miner_address: AddressId,
-    },
+    /// Carries only the key. Everything else about the job — the miner
+    /// and the declared tip included — is read off the stored
+    /// [`DeclaredJob`] under `new_token`, so nothing here can disagree
+    /// with it.
+    JobDeclared { new_token: Token },
     /// A `PushSolution` has been resolved against a declared job —
     /// the IO layer assembles the final block (merkle root + 80-byte
     /// header) from these components and hands it to
@@ -1003,6 +1000,7 @@ fn accept_declaration(
 
     state.declared_jobs.insert(DeclaredJob {
         new_token,
+        miner_address: miner_address.clone(),
         version: input.version,
         coinbase_tx_prefix: input.coinbase_tx_prefix.clone(),
         coinbase_tx_suffix: input.coinbase_tx_suffix.clone(),
@@ -1019,10 +1017,7 @@ fn accept_declaration(
             request_id: input.request_id,
             new_mining_job_token: new_token,
         }],
-        events: vec![JdpSessionEvent::JobDeclared {
-            new_token,
-            miner_address,
-        }],
+        events: vec![JdpSessionEvent::JobDeclared { new_token }],
     }
 }
 
@@ -1038,13 +1033,16 @@ fn accept_declaration(
 /// [`JdpSessionEvent::BlockSubmissionCandidate`] for the IO layer to
 /// hand to bitcoin-core's `submitblock` RPC.
 ///
+/// The block is booked against the matched declaration's own
+/// [`DeclaredJob::miner_address`] — not against a separately resolved
+/// one, which could name a different miner than the job it belongs to.
+///
 /// - Not in full-template mode → silently dropped.
 /// - No matching declared job → silently dropped.
 /// - Missing raw-tx data for any wtxid position → silently dropped.
 pub fn handle_push_solution(
     state: &mut JdpSessionState,
     input: &PushSolutionInput,
-    miner_address: AddressId,
 ) -> JdpHandlerOutcome {
     // The drops below are WARN-logged: a PushSolution is a found BLOCK, and
     // discarding one silently would make a lost pool-side block booking
@@ -1074,6 +1072,7 @@ pub fn handle_push_solution(
     // copy out the bytes we need so the borrow can drop before
     // building the outcome.
     let new_token = job.new_token;
+    let miner_address = job.miner_address.clone();
     let booking = job.booking;
     // A block that WAS validated against a published distribution but carries
     // no booking. The only way to be in that state is `bookable == false` —
@@ -2286,7 +2285,7 @@ mod tests {
             n_bits: 0,
             version: 0,
         };
-        let out = handle_push_solution(&mut s, &solution, addr());
+        let out = handle_push_solution(&mut s, &solution);
         assert!(out.outbound.is_empty());
         assert!(out.events.is_empty());
     }
@@ -2303,8 +2302,65 @@ mod tests {
             n_bits: 0,
             version: 0,
         };
-        let out = handle_push_solution(&mut s, &solution, addr());
+        let out = handle_push_solution(&mut s, &solution);
         assert!(out.events.is_empty());
+    }
+
+    /// The block is booked against the DECLARATION's miner, and the
+    /// declaration alone decides who that is.
+    ///
+    /// The address used to be resolved a second time, out of the
+    /// connection's `TokenStore`, and a miss there fabricated `"unknown"`
+    /// — which the mode gate answers with Solo, so the block got a
+    /// `blocks_entity` row and no settlement while its coinbase had
+    /// already paid a real distribution on chain. Both directions are
+    /// asserted: the candidate names the declaring miner, and it does so
+    /// even with the token store emptied underneath it, which is exactly
+    /// the state that produced the fabricated name.
+    #[test]
+    fn a_pushed_solution_is_booked_against_its_declarations_miner() {
+        let mut s = fresh();
+        let token = complete_setup_and_allocate(&mut s);
+        let wtxid_a = [0x01; 32];
+        let mut tpl = HashMap::new();
+        tpl.insert(wtxid_a, vec![0xCA; 8]);
+        let _ = handle_declare_mining_job(
+            &mut s,
+            &declare(7, token, vec![wtxid_a]),
+            &tpl,
+            Some([0xAB; 32]),
+            None,
+            3_000,
+        );
+
+        // Drop every token the session holds — the declaration must still
+        // know whose it is.
+        s.tokens = TokenStore::new();
+
+        let solution = PushSolutionInput {
+            extranonce: vec![0xEE; 8],
+            prev_hash: [0xAB; 32],
+            ntime: 0x6500_0001,
+            nonce: 0x1234_5678,
+            n_bits: 0x1d00_ffff,
+            version: 0x2000_0000,
+        };
+        let out = handle_push_solution(&mut s, &solution);
+        match &out.events[0] {
+            JdpSessionEvent::BlockSubmissionCandidate { miner_address, .. } => {
+                assert_eq!(
+                    miner_address,
+                    &addr(),
+                    "the candidate must name the declaring miner, never a stand-in"
+                );
+                assert_ne!(
+                    miner_address.as_str(),
+                    "unknown",
+                    "a fabricated address resolves to Solo and books nothing"
+                );
+            }
+            other => panic!("expected BlockSubmissionCandidate, got {other:?}"),
+        }
     }
 
     /// Happy-path: declare a job → push solution that matches its
@@ -2328,7 +2384,7 @@ mod tests {
             n_bits: 0x1d00_ffff,
             version: 0x2000_0000,
         };
-        let out = handle_push_solution(&mut s, &solution, addr());
+        let out = handle_push_solution(&mut s, &solution);
         assert!(out.outbound.is_empty());
         match &out.events[0] {
             JdpSessionEvent::BlockSubmissionCandidate {
@@ -2381,7 +2437,7 @@ mod tests {
             n_bits: 0,
             version: 0,
         };
-        let out = handle_push_solution(&mut s, &solution, addr());
+        let out = handle_push_solution(&mut s, &solution);
         assert!(out.events.is_empty());
     }
 }

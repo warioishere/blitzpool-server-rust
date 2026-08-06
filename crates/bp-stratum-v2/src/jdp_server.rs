@@ -1117,29 +1117,10 @@ async fn dispatch_jdp_inbound(
                 now_ms,
             )
         }
-        InboundJdpFrame::PushSolution(input) => {
-            // The miner_address is bound to the declared job's
-            // RegisteredDeclaredJob in the bridge; but the
-            // push-solution handler accepts it as an argument
-            // because the JDP-session itself doesn't carry the
-            // address (multi-token-per-connection means different
-            // pushes might map to different addresses, but in
-            // practice one connection = one miner). Lookup via the
-            // declared_jobs store (already has prev_hash matching).
-            let miner_address = state
-                .declared_jobs
-                .match_for_solution(&input.prev_hash)
-                .map(|j| j.new_token)
-                .and_then(|token| state.tokens.lookup(&token).map(|a| a.miner_address.clone()))
-                .unwrap_or_else(|| {
-                    AddressId::new("unknown".to_string()).unwrap_or_else(|_| {
-                        // AddressId::new requires non-empty + valid
-                        // chars; "unknown" passes. Defensive fallback.
-                        AddressId::new("u".to_string()).expect("'u' is a valid AddressId")
-                    })
-                });
-            handle_push_solution(state, &input, miner_address)
-        }
+        // The handler matches the solution to a declaration and reads the
+        // miner off that same declaration, so there is nothing to resolve
+        // here.
+        InboundJdpFrame::PushSolution(input) => handle_push_solution(state, &input),
     }
 }
 
@@ -1335,17 +1316,12 @@ pub(crate) fn register_declared_jobs_in_bridge(
 ) {
     let mut reg = bridge.write().expect("bridge RwLock poisoned");
     for event in events {
-        if let JdpSessionEvent::JobDeclared {
-            new_token,
-            miner_address,
-        } = event
-        {
+        if let JdpSessionEvent::JobDeclared { new_token } = event {
             if let Some(declared_job) = state.declared_jobs.get(new_token) {
                 reg.register(
                     *new_token,
                     RegisteredDeclaredJob {
                         declared_job: declared_job.clone(),
-                        miner_address: miner_address.clone(),
                         jdp_session_id,
                     },
                 );
@@ -1817,6 +1793,7 @@ mod tests {
         let token = Token([0xAA; 16]);
         let job = DeclaredJob {
             new_token: token,
+            miner_address: AddressId::new(ADDR.to_string()).unwrap(),
             version: 0,
             coinbase_tx_prefix: vec![],
             coinbase_tx_suffix: vec![],
@@ -1829,10 +1806,7 @@ mod tests {
         };
         state.declared_jobs.insert(job);
         let bridge = fresh_bridge();
-        let events = vec![JdpSessionEvent::JobDeclared {
-            new_token: token,
-            miner_address: AddressId::new(ADDR.to_string()).unwrap(),
-        }];
+        let events = vec![JdpSessionEvent::JobDeclared { new_token: token }];
         register_declared_jobs_in_bridge(&state, &bridge, 42, &events);
         let r = bridge.read().unwrap();
         let entry = r.job_ref(&token).expect("must be registered");

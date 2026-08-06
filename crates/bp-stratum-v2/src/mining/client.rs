@@ -5924,6 +5924,7 @@ mod tests {
         RegisteredDeclaredJob {
             declared_job: JdpDeclaredJob {
                 new_token: token,
+                miner_address: AddressId::new(address.to_string()).unwrap(),
                 version: 0x2000_0000,
                 coinbase_tx_prefix,
                 coinbase_tx_suffix,
@@ -5934,7 +5935,6 @@ mod tests {
                 booking: None,
                 distribution_id: None,
             },
-            miner_address: AddressId::new(address.to_string()).unwrap(),
             jdp_session_id: session_id,
         }
     }
@@ -7148,6 +7148,7 @@ mod tests {
         let entry = RegisteredDeclaredJob {
             declared_job: JdpDeclaredJob {
                 new_token: token,
+                miner_address: AddressId::new(REGTEST_ADDR).unwrap(),
                 version: 0x2000_0000,
                 coinbase_tx_prefix: raw[..index].to_vec(),
                 coinbase_tx_suffix: raw[index + FIXTURE_DECLARED_SLOT..].to_vec(),
@@ -7158,7 +7159,6 @@ mod tests {
                 booking: None,
                 distribution_id: None,
             },
-            miner_address: AddressId::new(REGTEST_ADDR.to_string()).unwrap(),
             jdp_session_id: 42,
         };
 

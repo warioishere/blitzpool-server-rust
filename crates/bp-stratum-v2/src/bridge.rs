@@ -43,9 +43,12 @@
 //!   [`JdpDeclaredJobRegistry::evict_for_jdp_session`] on connection
 //!   close — keeps the registry bounded as JDC connections come and
 //!   go).
-//! - The miner address (cross-checked against the mining-connection's
-//!   locked address when the mining-handler resolves the token, so
-//!   one miner can't steal another's declared job).
+//!
+//! The miner address is NOT a field of its own: it lives on the declared
+//! job, and [`JdpDeclaredJobRegistry::job_ref`] projects it from there for
+//! the mining-side cross-check (so one miner can't claim another's
+//! declared job). A second copy could name a different miner than the job
+//! it belongs to, and the block-found path books against that name.
 //!
 //! There is no age-based sweep, and none is owed: every exit path of
 //! the per-connection task — cancel, read error, write error — falls
@@ -95,9 +98,6 @@ pub struct RegisteredDeclaredJob {
     /// merkle context + raw tx data. Mining-handler reads this to
     /// build the ExtendedJob.
     pub declared_job: DeclaredJob,
-    /// Miner address bound to this token. Cross-checked at lookup
-    /// time against the mining-connection's locked address.
-    pub miner_address: AddressId,
     /// JDP session id that registered the entry. Used by
     /// [`JdpDeclaredJobRegistry::evict_for_jdp_session`] when the
     /// JDP connection closes — which every exit path of the
@@ -420,7 +420,9 @@ impl JdpDeclaredJobRegistry {
     /// absent payout set).
     pub fn job_ref(&self, token: &Token) -> Option<BridgeJobRef> {
         self.entries.get(token).map(|s| BridgeJobRef {
-            miner_address: s.entry.miner_address.clone(),
+            // Off the declaration itself — the entry keeps no second copy,
+            // so this cannot name a different miner than the job does.
+            miner_address: s.entry.declared_job.miner_address.clone(),
             declared_prev_hash: s.entry.declared_job.prev_hash,
             binding: s.binding.clone(),
             // Proven at declare time: set only by the ext-0x0003 check that
@@ -676,6 +678,7 @@ mod tests {
 
         DeclaredJob {
             new_token: token,
+            miner_address: addr(),
             version: 0x2000_0000,
             coinbase_tx_prefix: prefix,
             coinbase_tx_suffix: suffix,
@@ -691,7 +694,6 @@ mod tests {
     fn registration(token: Token, session_id: u32) -> RegisteredDeclaredJob {
         RegisteredDeclaredJob {
             declared_job: declared(token),
-            miner_address: addr(),
             jdp_session_id: session_id,
         }
     }

@@ -2561,6 +2561,7 @@ mod tests {
         let token = Token([7u8; 16]);
         let declared_job = crate::jdp::declarations::DeclaredJob {
             new_token: token,
+            miner_address: AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap(),
             version: 0x2000_0000,
             coinbase_tx_prefix,
             coinbase_tx_suffix,
@@ -2585,7 +2586,6 @@ mod tests {
                 token,
                 crate::bridge::RegisteredDeclaredJob {
                     declared_job,
-                    miner_address: owner.clone(),
                     jdp_session_id: OLD_SESSION,
                 },
             );
