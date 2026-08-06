@@ -1064,6 +1064,35 @@ pub fn handle_push_solution(
     // building the outcome.
     let new_token = job.new_token;
     let booking = job.booking;
+    // A block that WAS validated against a published distribution but carries
+    // no booking. The only way to be in that state is `bookable == false` —
+    // the distribution's settlement snapshot never landed (the Redis write
+    // failed past its retries), so §4 was proven at declare time but the
+    // inputs needed to settle it were not preserved.
+    //
+    // The coinbase pays the published split on-chain either way. What is lost
+    // is this block's ledger reconciliation, and it is lost for good: nothing
+    // parks it. Parking would mean re-creating the settlement inputs here,
+    // i.e. re-doing the very write that just failed, into a second store —
+    // a second implementation of snapshot-freezing on the money path for an
+    // event that needs a Redis outage AND a block find in the same
+    // distribution interval. Deliberately not built (decision 2026-08-06);
+    // this line is the whole mitigation, so it must be loud enough to act on.
+    //
+    // Distinguished from the ordinary `booking: None` — a base-protocol
+    // declaration, where there is simply nothing to book and a WARN is right.
+    // Telling the two apart is only possible since `DeclaredJob` carries its
+    // own `distribution_id` (#17); do not collapse the two fields.
+    if booking.is_none() && job.distribution_id.is_some() {
+        tracing::error!(
+            prev_hash = %hash_hex(&input.prev_hash),
+            distribution_id = job.distribution_id,
+            "jdp: BLOCK FOUND on a validated distribution that was never bookable — \
+             its coinbase pays miners on-chain but this block gets NO ledger entry, \
+             and nothing preserves the inputs to add one later. Settlement snapshot \
+             write must have failed when the distribution was published."
+        );
+    }
     let coinbase_prefix = job.coinbase_tx_prefix.clone();
     let coinbase_suffix = job.coinbase_tx_suffix.clone();
     let wtxid_count = job.wtxid_list.len();
