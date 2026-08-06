@@ -5870,7 +5870,6 @@ mod tests {
             },
             miner_address: AddressId::new(address.to_string()).unwrap(),
             jdp_session_id: session_id,
-            registered_at_ms: 1_000,
         }
     }
 
@@ -7095,7 +7094,6 @@ mod tests {
             },
             miner_address: AddressId::new(REGTEST_ADDR.to_string()).unwrap(),
             jdp_session_id: 42,
-            registered_at_ms: 1_000,
         };
 
         let mut s = solo_session_with_extended_channel();

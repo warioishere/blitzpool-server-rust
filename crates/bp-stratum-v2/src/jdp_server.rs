@@ -888,13 +888,7 @@ async fn run_jdp_connection(
                 //
                 // Second, unchanged: the bridge must be populated by the time
                 // the JobDeclared event is visible to other hooks.
-                register_declared_jobs_in_bridge(
-                    &state,
-                    &bridge,
-                    session_id,
-                    now_ms(),
-                    &outcome.events,
-                );
+                register_declared_jobs_in_bridge(&state, &bridge, session_id, &outcome.events);
                 if let Err(err) = write_jdp_outbound_frames(&mut writer, outcome.outbound).await {
                     warn!("jdp {session_id_hex} write: {err:?}");
                     break;
@@ -1327,7 +1321,6 @@ pub(crate) fn register_declared_jobs_in_bridge(
     state: &JdpSessionState,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
     jdp_session_id: u32,
-    now_ms: u64,
     events: &[JdpSessionEvent],
 ) {
     let mut reg = bridge.write().expect("bridge RwLock poisoned");
@@ -1335,7 +1328,6 @@ pub(crate) fn register_declared_jobs_in_bridge(
         if let JdpSessionEvent::JobDeclared {
             new_token,
             miner_address,
-            ..
         } = event
         {
             if let Some(declared_job) = state.declared_jobs.get(new_token) {
@@ -1345,7 +1337,6 @@ pub(crate) fn register_declared_jobs_in_bridge(
                         declared_job: declared_job.clone(),
                         miner_address: miner_address.clone(),
                         jdp_session_id,
-                        registered_at_ms: now_ms,
                     },
                 );
             }
@@ -1832,11 +1823,11 @@ mod tests {
             new_token: token,
             miner_address: AddressId::new(ADDR.to_string()).unwrap(),
         }];
-        register_declared_jobs_in_bridge(&state, &bridge, 42, 1_000, &events);
+        register_declared_jobs_in_bridge(&state, &bridge, 42, &events);
         let r = bridge.read().unwrap();
-        let entry = r.lookup(&token).expect("must be registered");
+        let entry = r.job_ref(&token).expect("must be registered");
         assert_eq!(entry.jdp_session_id, 42);
         assert_eq!(entry.miner_address.as_str(), ADDR);
-        assert_eq!(entry.declared_job.prev_hash, Some([0xCC; 32]));
+        assert_eq!(entry.declared_prev_hash, Some([0xCC; 32]));
     }
 }

@@ -2572,7 +2572,6 @@ mod tests {
                     declared_job,
                     miner_address: owner.clone(),
                     jdp_session_id: OLD_SESSION,
-                    registered_at_ms: 1_000,
                 },
             );
         }
