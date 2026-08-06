@@ -456,8 +456,16 @@ const STALE_PUSH_SUBSCRIPTION_TTL: Duration = Duration::from_secs(90 * 24 * 60 *
 /// 14-day cutoff for the per-(address, worker, session, slot) detail
 /// tables — UI charts only render 1d/3d/7d windows.
 const STATS_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
-/// 1-day cutoff for soft-deleted clients before hard-delete.
-const CLIENT_HARD_DELETE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+/// 2-hour cutoff for soft-deleted clients before hard-delete.
+///
+/// Was 24 h. Nothing needs the corpses that long: the device-status
+/// gate's restart seed looks back `SEED_LOOKBACK` = 1 h, and the
+/// "known device" decision is carried by the reported state in Redis
+/// (7-day TTL), not by these rows. What the long window did do is bloat
+/// the table — measured 2026-08-06 on prod: ~71k retained rows against
+/// ~740 live ones, scattering the live rows over ~250 heap pages that
+/// every bulk writer then re-logs as full-page writes.
+const CLIENT_HARD_DELETE_RETENTION: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Hourly cron: purge 14-day-old stats from the four per-session
 /// tables + hard-delete soft-deleted clients older than 1 day.

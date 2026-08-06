@@ -939,6 +939,13 @@ pub struct DeviceStatusConfig {
     /// How long a device must look present before "back online" is sent.
     /// Keeps a device that flaps on a slow cycle from producing a
     /// message every time it briefly reappears.
+    ///
+    /// Keep this comfortably above ~20 s: a session's `client_entity`
+    /// row is born by the session-persistence debounce (15 s + one 5 s
+    /// flush tick), and the gate counts a device without a row as
+    /// absent. Below that margin nothing breaks — a first resolve that
+    /// misses the row re-arms and the notice arrives one grace later —
+    /// but the online message for a brand-new worker is delayed.
     #[serde(default = "default_online_dwell_secs")]
     pub online_dwell_secs: u64,
     /// Hard floor on the spacing between two device messages for one

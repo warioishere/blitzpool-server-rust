@@ -11,33 +11,39 @@
 //! ## [`SessionPersistenceHook`]
 //!
 //! `bp_share_hook::SharedSessionPersistence` impl. Fires on every
-//! authorize (register) and disconnect (deregister). Mode-blind —
-//! every session gets a `client_entity` row, stamped with the miner's
-//! `user_agent` from the register call.
+//! authorize (register) and disconnect (deregister). Mode-blind. A
+//! register writes NO statement — it only pends the session in the
+//! [`RowDebounce`]; the row is born by the engine's birth flush once the
+//! session has survived the debounce window, so probe connections that
+//! authorize and hang up never reach Postgres at all. Deregister
+//! soft-deletes only sessions that were actually born.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareSink, SharedSessionPersistence};
 use sqlx::PgPool;
+use tokio::time::Instant;
 use tracing::warn;
 
-use crate::client_row::{deregister_client, register_client};
 use crate::diff_stat_buffer::{DiffStatBuffer, DiffStatKeyRef};
 use crate::hashrate_sampler::HashrateSampler;
+use crate::row_debounce::RowDebounce;
 use crate::touch_buffer::{TouchBuffer, TouchKeyRef};
 
-/// `SharedSessionPersistence` impl that persists the `client_entity`
-/// row on register + soft-deletes it on deregister. Cheap to clone
-/// (single `Arc<PgPool>`).
+/// `SharedSessionPersistence` impl: pends the session for the debounced
+/// row birth on register, soft-deletes born sessions on deregister.
+/// Cheap to clone (two `Arc`s under the hood).
 #[derive(Clone)]
 pub struct SessionPersistenceHook {
     pool: PgPool,
+    debounce: Arc<RowDebounce>,
 }
 
 impl SessionPersistenceHook {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub(crate) fn new(pool: PgPool, debounce: Arc<RowDebounce>) -> Self {
+        Self { pool, debounce }
     }
 }
 
@@ -50,25 +56,30 @@ impl SharedSessionPersistence for SessionPersistenceHook {
         worker: &str,
         user_agent: Option<&str>,
     ) {
-        if let Err(e) = register_client(
-            &self.pool, address, worker, session_id, user_agent, None, None,
-        )
-        .await
-        {
-            warn!(
-                error = %e,
-                session_id, address, worker,
-                "SessionPersistenceHook: register_client failed"
-            );
-        }
+        // The authorize timestamp becomes the row's startTime/firstSeen
+        // when (and if) the row is born — same value the synchronous
+        // upsert used to stamp.
+        self.debounce.register(
+            address,
+            worker,
+            session_id,
+            user_agent,
+            now_ms(),
+            Instant::now(),
+        );
     }
 
     async fn deregister_session(&self, session_id: &str) {
-        if let Err(e) = deregister_client(&self.pool, session_id).await {
+        // Only a born session owes the table a soft-delete; a probe's
+        // teardown is a pure map removal and costs no statement.
+        if !self.debounce.deregister(session_id) {
+            return;
+        }
+        if let Err(e) = bp_db::delete_client_for_session(&self.pool, session_id).await {
             warn!(
                 error = %e,
                 session_id,
-                "SessionPersistenceHook: deregister_client failed"
+                "SessionPersistenceHook: soft-delete on deregister failed"
             );
         }
     }
@@ -108,11 +119,7 @@ impl ClientRowTouchSink {
 #[async_trait]
 impl SharedAcceptedShareSink for ClientRowTouchSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let now_ms = now_ms();
         // Worker can be empty in some SV2 paths (no `.<name>` suffix in
         // user_identity). The session row was registered with the
         // matching default ("default" in SV2, "" in SV1), so use the
@@ -185,10 +192,7 @@ impl SharedAcceptedShareSink for ClientDifficultyStatisticsSink {
         if !candidate.is_finite() || candidate <= 0.0 {
             return;
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let now_ms = now_ms();
         let slot = (now_ms / DIFF_STAT_SLOT_MS) * DIFF_STAT_SLOT_MS;
         // Empty worker → "default", matching the PK convention the
         // client-row touch sink uses for the session row.
@@ -210,4 +214,14 @@ impl SharedAcceptedShareSink for ClientDifficultyStatisticsSink {
             now_ms,
         );
     }
+}
+
+/// Wall-clock milliseconds since the Unix epoch — the stamp for
+/// `startTime`/`updatedAt`-family columns. `0` on a pre-1970 clock,
+/// matching what the synchronous register path always did.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

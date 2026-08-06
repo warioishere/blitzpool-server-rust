@@ -570,10 +570,16 @@ pub async fn find_worker_shares(
 
 // ── Session-persistence writes (consumer: bp-session-persistence) ───
 
-/// One client-row to insert / upsert — register the session on
-/// authorize. `firstSeen` is set to `start_time_ms` on INSERT (the
-/// authorize timestamp) and left unchanged on re-register conflicts.
-/// `bestDifficulty` stays NULL until the first accepted share.
+/// One client-row to insert / upsert. Production rows are written by the
+/// row-birth debounce in `bp-session-persistence`: a session earns its
+/// row by surviving the debounce window, so a probe that authorizes and
+/// hangs up right away never reaches this type. `firstSeen` is set to
+/// `start_time_ms` (the authorize timestamp) on INSERT and left
+/// unchanged on re-register conflicts. `bestDifficulty` starts at its
+/// column default `0` (`NOT NULL`) until the first touch raises it.
+///
+/// `current_difficulty` is `None` on the production path — vardiff
+/// freshness is owned by the share-touch flush; test seeds may set it.
 #[derive(Clone, Debug)]
 pub struct ClientUpsert {
     pub address: String,
@@ -584,40 +590,94 @@ pub struct ClientUpsert {
     pub current_difficulty: Option<f32>,
 }
 
-/// INSERT or UPDATE a `client_entity` row keyed on the composite PK
-/// `(address, clientName, sessionId)`. ON CONFLICT path covers
-/// defensive re-register with the same sessionId — refreshes
-/// `userAgent`, `startTime`, `currentDifficulty`, and clears
-/// `deletedAt` so a previously soft-deleted session can be reactivated
-/// without leaking the soft-delete flag.
-pub async fn upsert_client<'e, E>(executor: E, row: &ClientUpsert) -> Result<u64, DbError>
+/// The one INSERT … ON CONFLICT statement behind [`upsert_client`] and
+/// [`bulk_upsert_clients`] — keyed on the composite PK
+/// `(address, clientName, sessionId)`. The conflict arm covers a
+/// re-register with the same sessionId: refreshes `userAgent`,
+/// `startTime`, `currentDifficulty`, and clears `deletedAt` so a
+/// previously soft-deleted session is reactivated without leaking the
+/// soft-delete flag.
+///
+/// `rows` must be unique per `(address, clientName, sessionId)` —
+/// `ON CONFLICT DO UPDATE` rejects a statement that hits the same row
+/// twice. Both callers hold that by construction (a map keyed on the
+/// triple / a single row).
+async fn upsert_clients_stmt<'e, E>(executor: E, rows: &[ClientUpsert]) -> Result<u64, DbError>
 where
     E: sqlx::PgExecutor<'e>,
 {
+    let mut addresses = Vec::with_capacity(rows.len());
+    let mut client_names = Vec::with_capacity(rows.len());
+    let mut session_ids = Vec::with_capacity(rows.len());
+    let mut user_agents: Vec<Option<String>> = Vec::with_capacity(rows.len());
+    let mut start_times = Vec::with_capacity(rows.len());
+    let mut current_difficulties: Vec<Option<f32>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        addresses.push(row.address.clone());
+        client_names.push(row.client_name.clone());
+        session_ids.push(row.session_id.clone());
+        user_agents.push(row.user_agent.clone());
+        start_times.push(row.start_time_ms);
+        current_difficulties.push(row.current_difficulty);
+    }
     let result = sqlx::query!(
         r#"INSERT INTO client_entity
              (address, "clientName", "sessionId", "userAgent", "startTime", "firstSeen",
               "currentDifficulty", "createdAt", "updatedAt")
-           VALUES ($1, $2, $3, $4, $5, $5, $6,
-                   (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
-                   (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint)
+           SELECT u.address, u.client_name, u.session_id, u.user_agent,
+                  u.start_time, u.start_time, u.current_difficulty,
+                  (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
+                  (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
+           FROM (
+               SELECT
+                   unnest($1::text[])   AS address,
+                   unnest($2::text[])   AS client_name,
+                   unnest($3::text[])   AS session_id,
+                   unnest($4::text[])   AS user_agent,
+                   unnest($5::bigint[]) AS start_time,
+                   unnest($6::real[])   AS current_difficulty
+           ) AS u
            ON CONFLICT (address, "clientName", "sessionId") DO UPDATE
            SET "userAgent"         = EXCLUDED."userAgent",
                "startTime"         = EXCLUDED."startTime",
                "currentDifficulty" = EXCLUDED."currentDifficulty",
                "updatedAt"         = EXCLUDED."updatedAt",
                "deletedAt"         = NULL"#,
-        &row.address,
-        &row.client_name,
-        &row.session_id,
-        row.user_agent.as_deref(),
-        row.start_time_ms,
-        row.current_difficulty,
+        &addresses,
+        &client_names,
+        &session_ids,
+        &user_agents as &[Option<String>],
+        &start_times,
+        &current_difficulties as &[Option<f32>],
     )
     .execute(executor)
     .await
     .map_err(DbError::from)?;
     Ok(result.rows_affected())
+}
+
+/// Single-row convenience over [`upsert_clients_stmt`]. Executor-generic
+/// so a test can run it inside its rollback transaction; production
+/// writes go through [`bulk_upsert_clients`], which takes the bulk-write
+/// lock.
+pub async fn upsert_client<'e, E>(executor: E, row: &ClientUpsert) -> Result<u64, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    upsert_clients_stmt(executor, std::slice::from_ref(row)).await
+}
+
+/// Insert / upsert N client rows in one statement — the row-birth flush
+/// of the session-persistence debounce. Runs in its own transaction and
+/// takes [`CLIENT_ENTITY_BULK_WRITE_LOCK`] first: the INSERT takes
+/// unique-index locks on the same PK space the other bulk writers
+/// UPDATE over, and disjoint columns do not prevent a deadlock.
+pub async fn bulk_upsert_clients(pool: &PgPool, rows: &[ClientUpsert]) -> Result<u64, DbError> {
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    take_client_entity_bulk_write_lock(&mut tx).await?;
+    let n = upsert_clients_stmt(&mut *tx, rows).await?;
+    tx.commit().await.map_err(DbError::from)?;
+    Ok(n)
 }
 
 /// Soft-delete every `client_entity` row matching `sessionId`. Sets
@@ -931,10 +991,11 @@ pub async fn device_watch_seed(
         .collect())
 }
 
-/// Advisory-lock key serialising the bulk writers of `client_entity`.
+/// Advisory-lock key serialising the bulk writers of `client_entity`
+/// (the two bulk UPDATEs below plus [`bulk_upsert_clients`]).
 ///
-/// Both bulk updates below drive `UPDATE … FROM unnest(...)` over the SAME
-/// rows, and both build their arrays by iterating a `HashMap` — so the two
+/// The bulk updates drive `UPDATE … FROM unnest(...)` over the SAME
+/// rows, and each builds its arrays by iterating a `HashMap` — so the
 /// row orders are arbitrary and mutually different. Postgres takes row locks
 /// in processing order, so two of them running concurrently deadlock. That is
 /// measured, not theoretical: 46 times in ~90 minutes on the prod accounting

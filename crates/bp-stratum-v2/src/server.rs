@@ -1377,13 +1377,15 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                 // typically send no vendor → fall back to
                 // `jd-client/sv2` so the downstream-report POST can
                 // later refine it to the actual primary vendor.
-                // `register_session` (mode-gate publish + client_entity
-                // write) already ran in the connection loop's channel-open
-                // block, BEFORE stream routing — doing it here would resolve
-                // the stream too late and double the gate refcount. We only
-                // emit the device-online event here. The register call lifted
-                // the vendor-derived UA into client_entity.userAgent for the
-                // /api/info histogram (`bitaxe/sv2`, etc.).
+                // `register_session` (mode-gate publish + the debounced
+                // client_entity row birth) already ran in the connection
+                // loop's channel-open block, BEFORE stream routing — doing it
+                // here would resolve the stream too late and double the gate
+                // refcount. We only emit the device-online event here. The
+                // register call carried the vendor-derived UA into the
+                // pending row for the /api/info histogram (`bitaxe/sv2`,
+                // etc.); it reaches client_entity.userAgent when the row is
+                // born.
                 let user_agent_owned = if state.vendor.is_empty() {
                     "jd-client/sv2".to_string()
                 } else {

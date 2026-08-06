@@ -71,8 +71,10 @@ const DISPATCH_CONCURRENCY: usize = 8;
 const REPORTED_PREFIX: &str = "device:status:reported:";
 
 /// How long a persisted reported state survives without being rewritten.
-/// Comfortably longer than the 24 h `client_entity` hard-delete, after
-/// which a returning device is a new device anyway.
+/// Comfortably longer than the 2 h `client_entity` hard-delete: this
+/// state — not the table's `firstSeen`, which never outlives the
+/// retention window — is what actually carries "the subscriber already
+/// knows this device" across restarts.
 const REPORTED_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// The concrete gate the binary uses.
