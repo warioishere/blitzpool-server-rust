@@ -1145,8 +1145,11 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
             let (bridge_job, distribution) = {
                 let guard = bridge.read().expect("bridge RwLock poisoned");
                 (
-                    // Slim projection (address + declared tip) — the handler
-                    // doesn't need the (potentially large) declared-job payload.
+                    // Projection: address, declared tip, and the declaration
+                    // binding — precomputed at register time, so this stays a
+                    // map lookup and a clone rather than re-deriving the
+                    // declaration's shape while the lock is held. The raw
+                    // transactions themselves the handler never needs.
                     guard.job_ref(&input.mining_job_token),
                     // §7.2 acceptance for the referenced distribution.
                     // Mining connections carry no JDP session id, so

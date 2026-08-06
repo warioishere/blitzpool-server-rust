@@ -59,7 +59,7 @@ use crate::tokens::{Token, TokenAllocError, TokenStore};
 use crate::bridge::DistributionAcceptance;
 
 use super::declarations::{DeclaredJob, DeclaredJobStore};
-use super::dynamic_outputs::{declared_coinbase_outputs, PayoutBooking};
+use super::dynamic_outputs::{declared_coinbase_tx, PayoutBooking};
 use super::payout_distribution::validate_coinbase_outputs_against_distribution;
 use super::tx_validation::{
     merge_provided_with_known, partition_against_template, PendingDeclaration,
@@ -838,6 +838,33 @@ fn accept_declaration(
         });
     }
 
+    // The coinbase must rebuild, on EVERY connection — not just the 0x0003
+    // ones whose payout check happens to need it.
+    //
+    // The mining-side declaration binding
+    // ([`crate::jdp::custom_job_binding`]) projects from exactly this
+    // reconstruction. Accepting a declaration we cannot express there would
+    // answer `DeclareMiningJobSuccess` once and then reject every
+    // `SetCustomMiningJob` the JDC builds on it, with no way out — a JDC
+    // whose coinbase carries its own scriptSig bytes AFTER the extranonce
+    // slot (see [`declared_coinbase_tx`]) is exactly that shape, and it is a
+    // limitation of our reconstruction, not a malformed job. Refusing it here
+    // tells the JDC at the point it can still change something.
+    let Some(declared_coinbase) =
+        declared_coinbase_tx(&input.coinbase_tx_prefix, &input.coinbase_tx_suffix)
+    else {
+        tracing::warn!(
+            request_id = input.request_id,
+            "jdp: declared coinbase cannot be reconstructed — rejecting the declaration"
+        );
+        return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
+            request_id: input.request_id,
+            error_code: ERR_INVALID_JOB_PARAM_COINBASE.to_string(),
+            error_details: b"declared coinbase does not rebuild from prefix + slot + suffix"
+                .to_vec(),
+        });
+    };
+
     // Ext 0x0003 §7 validation (push model). When the JDC negotiated
     // 0x0003, every declared job MUST reference a published distribution
     // via the §6 `distribution_id` TLV, and the declared coinbase MUST
@@ -895,22 +922,8 @@ fn accept_declaration(
                 });
             }
         };
-        let Some(declared_outputs) =
-            declared_coinbase_outputs(&input.coinbase_tx_prefix, &input.coinbase_tx_suffix)
-        else {
-            tracing::warn!(
-                request_id = input.request_id,
-                "jdp: declared coinbase suffix failed to parse — rejecting declaration"
-            );
-            return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-                request_id: input.request_id,
-                error_code: ERR_INVALID_JOB_PARAM_COINBASE.to_string(),
-                error_details: b"declared coinbase suffix is not a parseable output vector"
-                    .to_vec(),
-            });
-        };
         match validate_coinbase_outputs_against_distribution(
-            &declared_outputs,
+            &declared_coinbase.tx.output,
             &entry.pool_payout,
             &entry.payouts,
             &entry.dust_limits,
@@ -1145,7 +1158,10 @@ mod tests {
             mining_job_token: token,
             version: 0x2000_0000,
             coinbase_tx_prefix: coinbase_prefix(),
-            coinbase_tx_suffix: vec![0xBB; 8],
+            // A real suffix, not a placeholder: EVERY declaration now has to
+            // rebuild, so a blob that is not an output vector is refused on
+            // the base path too — which is the point.
+            coinbase_tx_suffix: coinbase_suffix(&one_output_blob()),
             wtxid_list: wtxids,
             distribution_id: None,
         }
@@ -1175,6 +1191,15 @@ mod tests {
     /// Wrap a consensus `Vec<TxOut>` blob as a realistic coinbase suffix
     /// (`nSequence(4) + outputs + nLockTime(4)`) — what the declare-time
     /// payout-output validation parses, paired with [`coinbase_prefix`].
+    /// One consensus-serialised output, enough to make a rebuildable coinbase.
+    fn one_output_blob() -> Vec<u8> {
+        let mut b = vec![0x01]; // output count
+        b.extend_from_slice(&312_500_000u64.to_le_bytes());
+        b.push(0x01); // script length
+        b.push(0x51); // OP_TRUE
+        b
+    }
+
     fn coinbase_suffix(outputs_consensus: &[u8]) -> Vec<u8> {
         let mut s = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
         s.extend_from_slice(outputs_consensus);
@@ -1753,29 +1778,66 @@ mod tests {
     /// vector fails closed (never accept an output set we cannot
     /// verify).
     #[test]
-    fn declare_unparseable_suffix_rejected_when_negotiated() {
+    fn declare_unrebuildable_coinbase_rejected_on_either_connection() {
+        // Both connection kinds, because the base one is the case that
+        // matters: it used to store such a declaration and answer Success,
+        // leaving the mining-side binding to reject every job built on it
+        // — permanently, and with an error an SRI jd-client treats as fatal.
+        for negotiated in [false, true] {
+            let mut s = fresh();
+            let token = complete_setup_and_allocate(&mut s);
+            let mut input = declare(3, token, vec![]);
+            // 8 opaque bytes: strips to an empty body, not a TxOut vector.
+            input.coinbase_tx_suffix = vec![0xBB; 8];
+            let distribution = if negotiated {
+                negotiate_0x0003(&mut s);
+                input.distribution_id = Some(7);
+                accepted(distribution_entry(7))
+            } else {
+                None
+            };
+            let out = handle_declare_mining_job(
+                &mut s,
+                &input,
+                &HashMap::new(),
+                Some([0xAB; 32]),
+                distribution,
+                3_000,
+            );
+            match &out.outbound[0] {
+                JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
+                    assert_eq!(error_code, ERR_INVALID_JOB_PARAM_COINBASE);
+                }
+                f => panic!("expected DeclareMiningJobError (negotiated={negotiated}), got {f:?}"),
+            }
+            assert_eq!(s.declared_jobs.len(), 0);
+        }
+    }
+
+    /// The mirror, and the reason the rejection above is safe: a coinbase
+    /// that DOES rebuild is still accepted on a plain base-protocol
+    /// connection, with no distribution in sight.
+    #[test]
+    fn declare_rebuildable_coinbase_accepted_on_a_base_connection() {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
-        negotiate_0x0003(&mut s);
-        // `declare()`'s default suffix is 8 opaque bytes — strips to an
-        // empty body, which is not a consensus TxOut vector.
-        let mut input = declare(3, token, vec![]);
-        input.distribution_id = Some(7);
         let out = handle_declare_mining_job(
             &mut s,
-            &input,
+            &declare(3, token, vec![]),
             &HashMap::new(),
             Some([0xAB; 32]),
-            accepted(distribution_entry(7)),
+            None,
             3_000,
         );
-        match &out.outbound[0] {
-            JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
-                assert_eq!(error_code, ERR_INVALID_JOB_PARAM_COINBASE);
-            }
-            f => panic!("expected DeclareMiningJobError, got {f:?}"),
-        }
-        assert_eq!(s.declared_jobs.len(), 0);
+        assert!(
+            matches!(
+                out.outbound[0],
+                JdpOutboundFrame::DeclareMiningJobSuccess { .. }
+            ),
+            "got {:?}",
+            out.outbound[0]
+        );
+        assert_eq!(s.declared_jobs.len(), 1);
     }
 
     /// §2: a distribution reference from a client that never negotiated
@@ -2150,7 +2212,8 @@ mod tests {
                 // The candidate is the declared prefix + the miner's extranonce
                 // + the declared suffix, spliced in that order.
                 let plen = coinbase_prefix().len();
-                assert_eq!(coinbase_raw.len(), plen + extranonce.len() + 8);
+                let slen = coinbase_suffix(&one_output_blob()).len();
+                assert_eq!(coinbase_raw.len(), plen + extranonce.len() + slen);
                 assert_eq!(&coinbase_raw[..plen], &coinbase_prefix()[..]);
                 assert_eq!(
                     &coinbase_raw[plen..plen + extranonce.len()],

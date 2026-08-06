@@ -74,6 +74,7 @@ use std::sync::Arc;
 
 use bp_common::AddressId;
 
+use crate::jdp::custom_job_binding::{binding_from_declared_job, DeclaredJobBinding};
 use crate::jdp::declarations::DeclaredJob;
 use crate::jdp::payout_distribution::WeightedOutput;
 use crate::tokens::Token;
@@ -103,10 +104,10 @@ pub struct RegisteredDeclaredJob {
     pub registered_at_ms: u64,
 }
 
-/// Slim projection of a bridge entry for the mining-side
-/// `SetCustomMiningJob` cross-checks: the miner identity plus the tip the
-/// declaration was accepted under — not the (potentially large)
-/// declared-job payload the handler doesn't need.
+/// Projection of a bridge entry for the mining-side `SetCustomMiningJob`
+/// cross-checks: the miner identity, the tip the declaration was accepted
+/// under, and the declared job's own fields — not the (potentially large)
+/// declared-job payload, whose raw transactions the handler never reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BridgeJobRef {
     /// Miner address bound to the token (cross-checked against the mining
@@ -116,6 +117,30 @@ pub struct BridgeJobRef {
     /// pool had no tip at accept time (cold start) — then the mining-side
     /// tip binding is not checkable.
     pub declared_prev_hash: Option<[u8; 32]>,
+    /// The declared job's coinbase and transaction set, projected down to
+    /// what `SetCustomMiningJob` repeats
+    /// ([`crate::jdp::custom_job_binding`]). `None` when the stored
+    /// declaration cannot be projected — a coinbase that will not rebuild,
+    /// or a transaction that will not decode. The handler REJECTS on `None`;
+    /// it is the one state where a declaration exists but nothing about the
+    /// job it authorises can be established.
+    pub binding: Option<DeclaredJobBinding>,
+}
+
+/// A registered entry plus the projection the mining side compares against.
+///
+/// The projection is built ONCE, here, and never again: a
+/// [`RegisteredDeclaredJob`] is immutable from the moment it lands, so
+/// rebuilding it per `SetCustomMiningJob` would deserialise every declared
+/// transaction and rebuild the whole merkle tree to arrive at the same bytes
+/// — for a mainnet-sized declaration, thousands of transactions over a
+/// megabyte or two, on a per-message path, while the registry's lock is held
+/// and the JDP side waits behind it to register declarations and publish
+/// distributions.
+#[derive(Debug)]
+struct StoredJob {
+    entry: RegisteredDeclaredJob,
+    binding: Option<DeclaredJobBinding>,
 }
 
 // ── Payout distributions (ext 0x0003 push model) ─────────────────────
@@ -230,7 +255,7 @@ impl DistributionSlot {
 /// locking — the outer lock wrapper sequences cross-task access.
 #[derive(Debug, Default)]
 pub struct JdpDeclaredJobRegistry {
-    entries: HashMap<Token, RegisteredDeclaredJob>,
+    entries: HashMap<Token, StoredJob>,
     /// Pool-wide distribution (PPLNS) — what every connection gets
     /// pushed on open and on the publisher's timer.
     pool_wide_distribution: DistributionSlot,
@@ -268,23 +293,29 @@ impl JdpDeclaredJobRegistry {
         token: Token,
         entry: RegisteredDeclaredJob,
     ) -> Option<RegisteredDeclaredJob> {
-        self.entries.insert(token, entry)
+        // The one place the projection is built. Doing it here rather than
+        // per lookup keeps the message path O(1) — see [`StoredJob`].
+        let binding = binding_from_declared_job(&entry.declared_job);
+        self.entries
+            .insert(token, StoredJob { entry, binding })
+            .map(|s| s.entry)
     }
 
     /// Look up a token. Returns `None` for unknown / evicted tokens
     /// (mining-handler emits `invalid-job-id`-equivalent).
     pub fn lookup(&self, token: &Token) -> Option<&RegisteredDeclaredJob> {
-        self.entries.get(token)
+        self.entries.get(token).map(|s| &s.entry)
     }
 
-    /// Slim projection of a token's bridge entry for the mining-side
+    /// Projection of a token's bridge entry for the mining-side
     /// `SetCustomMiningJob` cross-checks. `None` for unknown / evicted
     /// tokens (the mining-handler fails closed on that, together with an
     /// absent payout set).
     pub fn job_ref(&self, token: &Token) -> Option<BridgeJobRef> {
-        self.entries.get(token).map(|e| BridgeJobRef {
-            miner_address: e.miner_address.clone(),
-            declared_prev_hash: e.declared_job.prev_hash,
+        self.entries.get(token).map(|s| BridgeJobRef {
+            miner_address: s.entry.miner_address.clone(),
+            declared_prev_hash: s.entry.declared_job.prev_hash,
+            binding: s.binding.clone(),
         })
     }
 
@@ -477,7 +508,7 @@ impl JdpDeclaredJobRegistry {
 
     /// Drop one specific token. Idempotent.
     pub fn remove(&mut self, token: &Token) -> Option<RegisteredDeclaredJob> {
-        self.entries.remove(token)
+        self.entries.remove(token).map(|s| s.entry)
     }
 
     /// Drop every entry owned by a closing JDP session. Returns the
@@ -486,7 +517,7 @@ impl JdpDeclaredJobRegistry {
     pub fn evict_for_jdp_session(&mut self, jdp_session_id: u32) -> usize {
         let before = self.entries.len();
         self.entries
-            .retain(|_, e| e.jdp_session_id != jdp_session_id);
+            .retain(|_, s| s.entry.jdp_session_id != jdp_session_id);
         // A tailored distribution dies with the session it was
         // published to.
         self.tailored_distributions.remove(&jdp_session_id);
@@ -504,7 +535,7 @@ impl JdpDeclaredJobRegistry {
     pub fn cleanup_expired(&mut self, now_ms: u64, max_age_ms: u64) -> usize {
         let before = self.entries.len();
         self.entries
-            .retain(|_, e| now_ms.saturating_sub(e.registered_at_ms) <= max_age_ms);
+            .retain(|_, s| now_ms.saturating_sub(s.entry.registered_at_ms) <= max_age_ms);
         // Tailored distribution slots are NOT aged out here. They die
         // with their session (`evict_for_jdp_session`, which the IO
         // layer calls whenever a JDP connection task ends, clean or
@@ -520,7 +551,7 @@ impl JdpDeclaredJobRegistry {
     /// Iterate all registered tokens. Order is unspecified (HashMap
     /// iteration). Used by diagnostics / tests.
     pub fn iter(&self) -> impl Iterator<Item = (&Token, &RegisteredDeclaredJob)> {
-        self.entries.iter()
+        self.entries.iter().map(|(t, s)| (t, &s.entry))
     }
 }
 
@@ -539,14 +570,42 @@ mod tests {
         Token([byte; 16])
     }
 
+    /// Scripts the fixture declaration commits to.
+    const SCRIPT_SIG_PREFIX: [u8; 3] = [0x03, 0xC8, 0x00]; // BIP-34 height push
+    const SLOT: usize = 12;
+
+    /// A coinbase that actually rebuilds. It used to be opaque filler
+    /// (`vec![0xAA; 8]`), whose fifth byte reads as an input count of 170 —
+    /// so anything projected from it came out `None`, and a test of the
+    /// projection would have been testing the nothing-to-see case.
     fn declared(token: Token) -> DeclaredJob {
+        use bitcoin::consensus::Encodable;
+
+        let script_sig_len = SCRIPT_SIG_PREFIX.len() + SLOT;
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&2u32.to_le_bytes()); // coinbase_tx_version
+        prefix.push(0x01); // input count
+        prefix.extend_from_slice(&[0u8; 32]); // null outpoint hash
+        prefix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // outpoint index
+                                                                 // Library encoder rather than a truncating cast — see the note in
+                                                                 // `custom_job_binding::tests::coinbase_parts`.
+        bitcoin::VarInt(script_sig_len as u64)
+            .consensus_encode(&mut prefix)
+            .expect("Vec<u8> writer cannot fail");
+        prefix.extend_from_slice(&SCRIPT_SIG_PREFIX);
+
+        let mut suffix = Vec::new();
+        suffix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // nSequence
+        suffix.push(0x00); // empty output vector
+        suffix.extend_from_slice(&0u32.to_le_bytes()); // locktime
+
         DeclaredJob {
             new_token: token,
             original_token: Token([0u8; 16]),
             request_id: 1,
             version: 0x2000_0000,
-            coinbase_tx_prefix: vec![0xAA; 8],
-            coinbase_tx_suffix: vec![0xBB; 8],
+            coinbase_tx_prefix: prefix,
+            coinbase_tx_suffix: suffix,
             wtxid_list: vec![],
             raw_transactions: Map::new(),
             prev_hash: Some([0xAB; 32]),
@@ -562,6 +621,57 @@ mod tests {
             jdp_session_id: session_id,
             registered_at_ms: now_ms,
         }
+    }
+
+    // ── the projection the mining side actually consumes ───────────
+
+    /// `job_ref()` is the ONLY production site that builds
+    /// `BridgeJobRef.binding` — `server.rs` calls it, nothing else. The
+    /// mining-handler tests build the field through their own copy of this
+    /// projection, so without this test the registry could stop projecting
+    /// entirely and the whole suite would stay green while every real
+    /// Full-Template `SetCustomMiningJob` was hard-rejected. The binding
+    /// fails closed, so such a defect is indistinguishable from a correct
+    /// refusal from the outside.
+    #[test]
+    fn job_ref_carries_the_declaration_projected() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        let t = token(1);
+        reg.register(t, registration(t, 7, 1_000));
+
+        let job_ref = reg.job_ref(&t).expect("registered token must resolve");
+        assert_eq!(job_ref.miner_address, addr());
+        assert_eq!(job_ref.declared_prev_hash, Some([0xAB; 32]));
+
+        let binding = job_ref
+            .binding
+            .expect("a rebuildable declaration must project");
+        // Read back off the declared bytes, not off a second copy of the
+        // projection — these are what the mining side compares against.
+        assert_eq!(binding.version, 0x2000_0000);
+        assert_eq!(binding.coinbase_tx_version, 2);
+        assert_eq!(binding.coinbase_script_sig_prefix, SCRIPT_SIG_PREFIX);
+        assert_eq!(binding.coinbase_tx_input_n_sequence, 0xFFFF_FFFF);
+        assert_eq!(binding.coinbase_tx_outputs, vec![0x00]);
+        assert_eq!(binding.coinbase_tx_locktime, 0);
+        assert_eq!(binding.extranonce_slot, SLOT);
+        // No declared transactions, so the coinbase is the only leaf.
+        assert!(binding.merkle_path.is_empty());
+    }
+
+    /// The negative half: a declaration that cannot be rebuilt still
+    /// registers and still resolves, but projects to nothing — which is what
+    /// the mining handler turns into a refusal.
+    #[test]
+    fn job_ref_projects_none_for_an_unrebuildable_declaration() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        let t = token(2);
+        let mut entry = registration(t, 7, 1_000);
+        entry.declared_job.coinbase_tx_prefix = vec![0xAA; 8];
+        reg.register(t, entry);
+
+        let job_ref = reg.job_ref(&t).expect("registered token must resolve");
+        assert!(job_ref.binding.is_none());
     }
 
     // ── basic CRUD ─────────────────────────────────────────────────

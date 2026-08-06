@@ -21,6 +21,40 @@ pub fn merkle_root_from_coinbase(coinbase_hash: &[u8; 32], merkle_branch: &[[u8;
     current
 }
 
+/// The inverse: build the branch [`merkle_root_from_coinbase`] folds.
+///
+/// `leaves` is the block's txid list in block order, coinbase first, each in
+/// internal byte order. Returns the sibling hashes from the coinbase leaf up
+/// to the root — what an SV1 `mining.notify` merkle branch and an SV2
+/// `merkle_path` carry. Odd levels duplicate their last entry, as consensus
+/// does.
+///
+/// It lives HERE, beside the fold, deliberately: the two have to agree on the
+/// duplicate-last rule, and the cross-check in this module's tests is what
+/// establishes that they do. A second copy elsewhere would be free to drift
+/// from this one with nothing failing.
+pub fn coinbase_merkle_branch(leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let mut level = leaves.to_vec();
+    let mut branch = Vec::new();
+    let mut buf = [0u8; 64];
+    while level.len() > 1 {
+        // The coinbase is the left child at every level, so its sibling is
+        // always the node at index 1.
+        branch.push(level[1]);
+        let half = level.len().div_ceil(2);
+        let mut next = Vec::with_capacity(half);
+        for idx in 0..half {
+            let left = level[2 * idx];
+            let right = level[std::cmp::min(2 * idx + 1, level.len() - 1)];
+            buf[..32].copy_from_slice(&left);
+            buf[32..].copy_from_slice(&right);
+            next.push(sha256d(&buf));
+        }
+        level = next;
+    }
+    branch
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,46 +132,30 @@ mod tests {
         level[0]
     }
 
-    /// The branch of sibling hashes for leaf 0 (the coinbase) — exactly what
-    /// the pool forwards as the SV1 `mining.notify` merkle branch / SV2
-    /// `merkle_path`.
-    fn coinbase_branch(leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
-        let mut branch = Vec::new();
-        let mut level = leaves.to_vec();
-        let mut idx = 0usize;
-        while level.len() > 1 {
-            if level.len() % 2 == 1 {
-                level.push(*level.last().unwrap());
-            }
-            // Coinbase is always the left child at every level (idx stays even),
-            // so its sibling is the node to its right.
-            branch.push(level[idx + 1]);
-            let mut next = Vec::with_capacity(level.len() / 2);
-            let mut buf = [0u8; 64];
-            for pair in level.chunks(2) {
-                buf[..32].copy_from_slice(&pair[0]);
-                buf[32..].copy_from_slice(&pair[1]);
-                next.push(sha256d(&buf));
-            }
-            level = next;
-            idx /= 2;
-        }
-        branch
-    }
-
+    /// The cross-check runs against the PRODUCTION branch builder, not a
+    /// test-local copy of it. `reference_root` stays hand-rolled on purpose —
+    /// it is the independent second opinion the builder is measured against,
+    /// and it reaches the root by a different route (pair the whole level,
+    /// repeat) than the branch does (siblings on the way up).
     #[test]
     fn fold_matches_full_tree_root_for_various_tx_counts() {
-        // 1 (coinbase-only), 2, 3, 4, 5, 7 transactions. Odd counts force
+        // 1 (coinbase-only), 2, 3, 4, 5, 7, 9 transactions. Odd counts force
         // the duplicate-last rule at one or more levels.
-        for n in [1usize, 2, 3, 4, 5, 7] {
+        for n in [1usize, 2, 3, 4, 5, 7, 9] {
             let leaves: Vec<[u8; 32]> = (0..n as u8).map(leaf).collect();
             let expected = reference_root(&leaves);
-            let branch = coinbase_branch(&leaves);
+            let branch = coinbase_merkle_branch(&leaves);
             let got = merkle_root_from_coinbase(&leaves[0], &branch);
             assert_eq!(
                 got, expected,
                 "fold must reconstruct the full-tree root for {n} transactions"
             );
         }
+    }
+
+    /// A block with only the coinbase has no siblings to fold.
+    #[test]
+    fn a_lone_coinbase_has_an_empty_branch() {
+        assert!(coinbase_merkle_branch(&[leaf(1)]).is_empty());
     }
 }

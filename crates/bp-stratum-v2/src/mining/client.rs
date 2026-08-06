@@ -197,6 +197,17 @@ pub const ERR_CUSTOM_JOB_REQUIRES_SOLO: &str = "custom-jobs-require-solo";
 pub const ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS: &str =
     "invalid-job-param-value-coinbase_tx_outputs";
 
+/// `invalid-job-param-value-declaration-mismatch` — the job this
+/// `SetCustomMiningJob` asks to mine is not the job the token was declared
+/// for: a different coinbase, or a different transaction set (merkle path).
+///
+/// One code for every field, deliberately. The JDC's remedy is identical in
+/// each case — declare and submit the same job — so a per-field code would
+/// buy it nothing; which field disagreed is WARN-logged for the operator.
+/// The check itself lives in [`crate::jdp::custom_job_binding`].
+pub const ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH: &str =
+    "invalid-job-param-value-declaration-mismatch";
+
 /// `stale-payout-distribution` — the `distribution_id` referenced by this
 /// `SetCustomMiningJob` is outside the acceptance window (ext 0x0003
 /// §7.2/§10). The JDC re-declares against the latest distribution.
@@ -2469,13 +2480,14 @@ pub struct SetCustomMiningJobInput {
 ///
 /// **Caller-resolved context**: the IO layer looks up the declared-job
 /// entry for `mining_job_token` in [`crate::bridge::JdpDeclaredJobRegistry`]
-/// and passes its slim projection as `bridge_job`
-/// ([`crate::bridge::BridgeJobRef`] — address + declared tip, not the job
-/// payload). If `Some`, the handler cross-checks the channel's locked miner
-/// address (mismatch → `invalid-job-param-value-token-mismatch`) and the
-/// tip binding: the custom job MUST build on the tip its declaration was
-/// accepted under (drift → `stale-chain-tip`, the retryable stale-race
-/// classification).
+/// and passes its projection as `bridge_job`
+/// ([`crate::bridge::BridgeJobRef`] — address, declared tip, and the
+/// declaration's own fields, but not its raw transactions). If `Some`, the
+/// handler cross-checks the channel's locked miner address (mismatch →
+/// `invalid-job-param-value-token-mismatch`), the tip binding — the custom
+/// job MUST build on the tip its declaration was accepted under (drift →
+/// `stale-chain-tip`, the retryable stale-race classification) — and the
+/// declaration binding of [`crate::jdp::custom_job_binding`].
 ///
 /// **Fail-closed token check**: a token that resolves to neither a bridge
 /// entry nor a payout distribution is unknown (never declared here, expired,
@@ -2535,6 +2547,9 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     if channel.kind != ChannelKind::Extended {
         return reject(ERR_INVALID_JOB_ID);
     }
+    // Read before the borrow ends — the declaration binding below needs it,
+    // and the assembly further down uses the same number.
+    let full_extranonce_size = channel.full_extranonce_size();
 
     // Fail-closed token check: the token must resolve to SOMETHING we can
     // validate against — a declared job (Full-Template) or a referenced
@@ -2566,6 +2581,51 @@ pub fn handle_set_custom_mining_job<C: Clock>(
                 return reject(ERR_STALE_CHAIN_TIP);
             }
         }
+
+        // Declaration binding: the job asked for here MUST be the job the
+        // token was declared for. NOT a revenue check — how much a JDC's
+        // template is worth is its own call. What it carries over is the
+        // §6.1 node validation: `jdp_server` had bitcoin-core check the
+        // DECLARED job, and nothing on this side re-examines the tx set the
+        // `merkle_path` commits to. Without the comparison, "the node
+        // approved the declaration" and "this coinbase pays the published
+        // distribution" describe two jobs that need not be the same one.
+        let Some(binding) = job.binding.as_ref() else {
+            // A declaration that will not project. The coinbase half of that
+            // is now caught where it belongs — `accept_declaration` refuses a
+            // coinbase it cannot rebuild, on every connection, so the JDC
+            // learns at declare time instead of being told Success and then
+            // rejected on every job forever. What can still land here is the
+            // transaction half: a declared raw tx that went missing or will
+            // not decode between registration and this lookup. That is an
+            // internal inconsistency, not a client error, and it leaves
+            // nothing to establish about the job the token authorises.
+            tracing::warn!(
+                channel_id = input.channel_id,
+                "sv2: declared job cannot be projected for binding — rejecting custom job"
+            );
+            return reject(ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
+        };
+        if let Err(violation) = crate::jdp::custom_job_binding::check_custom_job(
+            binding,
+            crate::jdp::custom_job_binding::MinedJobFields {
+                version: input.version,
+                coinbase_tx_version: input.coinbase_tx_version,
+                coinbase_prefix: &input.coinbase_prefix,
+                coinbase_tx_input_n_sequence: input.coinbase_tx_input_n_sequence,
+                coinbase_tx_outputs: &input.coinbase_tx_outputs,
+                coinbase_tx_locktime: input.coinbase_tx_locktime,
+                merkle_path: &input.merkle_path,
+                full_extranonce_size,
+            },
+        ) {
+            tracing::warn!(
+                channel_id = input.channel_id,
+                ?violation,
+                "sv2: custom job does not match its declaration — rejecting"
+            );
+            return reject(ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
+        }
     }
 
     // Solo gate for base-protocol custom jobs: without an ext-0x0003
@@ -2585,14 +2645,22 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // the submitted outputs must match the §4 recompute POSITIONALLY
     // (§7.1).
     //
-    // It runs for Full-Template jobs too, and must. The declare-time
-    // §7.1 check covers the coinbase that was DECLARED; `BridgeJobRef`
-    // carries only the miner address and the declared tip, so nothing
-    // ties `input.coinbase_tx_outputs` to what was declared — and it is
-    // these outputs the `ExtendedJob` below is assembled from. Gating
-    // the block on `bridge_job.is_none()` let a JDC declare a conforming
-    // coinbase, then mine a different one paying itself, while its
-    // shares kept earning in the shared window.
+    // It runs for Full-Template jobs too, and must — for a reason the
+    // declaration binding above does NOT cover, so do not delete it on the
+    // strength of that binding.
+    //
+    // The binding answers "is this the job that was declared?". It says
+    // nothing about whether the distribution that job referenced is still
+    // live. A declaration accepted under distribution k can arrive here
+    // after k was superseded or settlement-invalidated (§7.2/§10) — same
+    // job, same bytes, binding satisfied, and a coinbase paying a
+    // withdrawn split. Only the block below resolves the reference against
+    // the acceptance window and re-checks the §4 recompute, and it is
+    // `input.coinbase_tx_outputs` the `ExtendedJob` is assembled from.
+    //
+    // (Before the binding existed this block also carried the weight of
+    // "nothing ties the mined coinbase to the declared one". That half has
+    // moved; this half has not.)
     //
     // Distributions are multi-use by design: many jobs of one tip
     // legitimately reference one distribution, and double-paying two
@@ -5611,38 +5679,148 @@ mod tests {
     use crate::tokens::Token;
     use std::collections::HashMap as Map;
 
-    /// Standard SetCustomMiningJob input with one minimal scriptSig
-    /// prefix byte + a 1-byte output blob. Per-test override-able.
-    fn custom_job_input(channel_id: u32, token: Token) -> SetCustomMiningJobInput {
+    /// The scriptSig prefix every fixture below declares and mines: a
+    /// BIP-34 height push.
+    const FIXTURE_SCRIPT_SIG_PREFIX: [u8; 3] = [0x03, 0xC8, 0x00];
+    /// Extranonce slot the DECLARATION reserves. MUST equal the test
+    /// channel's `full_extranonce_size()` — the binding compares the two,
+    /// because `handle_push_solution` splices the channel's extranonce into
+    /// the declared gap. `the_fixture_slot_matches_the_test_channel` pins it,
+    /// so a change to the channel fixture cannot drift away from this
+    /// silently.
+    const FIXTURE_DECLARED_SLOT: usize = 12;
+
+    /// Two consensus-decodable transactions standing in for a declared set,
+    /// returned as `(wtxid_list, raw_transactions)`.
+    ///
+    /// The wtxids are opaque tags — only the LIST LENGTH and the raw bytes
+    /// feed the merkle branch, and the branch is built from the txids the
+    /// raw bytes hash to.
+    fn fixture_declared_txs() -> (Vec<[u8; 32]>, Map<u32, Vec<u8>>) {
+        let mut raw = Map::new();
+        let mut wtxids = Vec::new();
+        for (position, tag) in [0xA1u8, 0xB2].into_iter().enumerate() {
+            let tx = bitcoin::Transaction {
+                version: bitcoin::transaction::Version(2),
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![bitcoin::TxIn {
+                    previous_output: bitcoin::OutPoint {
+                        txid: {
+                            use bitcoin::hashes::Hash as _;
+                            bitcoin::Txid::from_byte_array([tag; 32])
+                        },
+                        vout: 0,
+                    },
+                    script_sig: bitcoin::ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::new(),
+                }],
+                output: vec![bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(1_000),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                }],
+            };
+            raw.insert(position as u32, bitcoin::consensus::serialize(&tx));
+            wtxids.push([tag; 32]);
+        }
+        (wtxids, raw)
+    }
+
+    /// The declared coinbase as SV2 splits it: everything before the
+    /// extranonce slot, and everything after. Same assembly the handler
+    /// performs on the mining side, so the two describe one transaction.
+    fn fixture_declared_coinbase_parts(
+        script_sig_prefix: &[u8],
+        outputs_blob: &[u8],
+    ) -> (Vec<u8>, Vec<u8>) {
+        let script_sig_len = script_sig_prefix.len() + FIXTURE_DECLARED_SLOT;
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&2u32.to_le_bytes()); // coinbase_tx_version
+        prefix.push(0x01); // input count
+        prefix.extend_from_slice(&[0u8; 32]); // null outpoint hash
+        prefix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // outpoint index
+        prefix.extend_from_slice(&encode_varint(script_sig_len as u64));
+        prefix.extend_from_slice(script_sig_prefix);
+
+        let mut suffix = Vec::new();
+        suffix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // nSequence
+        suffix.extend_from_slice(outputs_blob);
+        suffix.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        (prefix, suffix)
+    }
+
+    /// The `SetCustomMiningJob` an HONEST JDC mining `entry` would send:
+    /// every bound field taken from the declaration itself.
+    ///
+    /// Tests that want a binding violation start here and change exactly one
+    /// field, so what they prove is that field and not fixture drift. The
+    /// projection is shared with production deliberately; what pins the
+    /// projection ITSELF is
+    /// `custom_job_binding::tests::branch_folds_back_to_the_full_tree_root`,
+    /// which recomputes the root by a different algorithm.
+    fn custom_job_matching(
+        channel_id: u32,
+        entry: &RegisteredDeclaredJob,
+    ) -> SetCustomMiningJobInput {
+        let b = crate::jdp::custom_job_binding::binding_from_declared_job(&entry.declared_job)
+            .expect("fixture declaration must project");
         SetCustomMiningJobInput {
             channel_id,
             request_id: 1,
-            mining_job_token: token,
-            version: 0x2000_0000,
-            prev_hash: [0xAB; 32],
+            mining_job_token: entry.declared_job.new_token,
+            version: b.version,
+            prev_hash: entry.declared_job.prev_hash.unwrap_or([0xAB; 32]),
             min_ntime: 0x6500_0001,
             n_bits: 0x1d00_ffff,
-            coinbase_tx_version: 2,
-            coinbase_prefix: vec![0x03, 0xC8, 0x00], // BIP-34 height push
-            coinbase_tx_input_n_sequence: 0xFFFF_FFFF,
-            coinbase_tx_outputs: vec![0x00], // empty output count varint
-            coinbase_tx_locktime: 0,
-            merkle_path: vec![[0x11; 32], [0x22; 32]],
+            coinbase_tx_version: b.coinbase_tx_version,
+            coinbase_prefix: b.coinbase_script_sig_prefix,
+            coinbase_tx_input_n_sequence: b.coinbase_tx_input_n_sequence,
+            coinbase_tx_outputs: b.coinbase_tx_outputs,
+            coinbase_tx_locktime: b.coinbase_tx_locktime,
+            merkle_path: b.merkle_path,
             distribution_id: None,
         }
     }
 
+    /// Standard SetCustomMiningJob input, describing exactly the job
+    /// [`bridge_entry_for`] declares.
+    fn custom_job_input(channel_id: u32, token: Token) -> SetCustomMiningJobInput {
+        custom_job_matching(channel_id, &bridge_entry_for(token, REGTEST_ADDR, 1))
+    }
+
     fn bridge_entry_for(token: Token, address: &str, session_id: u32) -> RegisteredDeclaredJob {
+        bridge_entry_declaring(
+            token,
+            address,
+            session_id,
+            &FIXTURE_SCRIPT_SIG_PREFIX,
+            &[0x00], // empty output vector
+        )
+    }
+
+    /// A bridge entry declaring a specific coinbase — for tests whose subject
+    /// is the mined coinbase, which must be DECLARED that way too or the
+    /// binding check fires before they reach what they mean to test.
+    fn bridge_entry_declaring(
+        token: Token,
+        address: &str,
+        session_id: u32,
+        script_sig_prefix: &[u8],
+        outputs_blob: &[u8],
+    ) -> RegisteredDeclaredJob {
+        let (coinbase_tx_prefix, coinbase_tx_suffix) =
+            fixture_declared_coinbase_parts(script_sig_prefix, outputs_blob);
+        let (wtxid_list, raw_transactions) = fixture_declared_txs();
         RegisteredDeclaredJob {
             declared_job: JdpDeclaredJob {
                 new_token: token,
                 original_token: Token([0u8; 16]),
                 request_id: 1,
                 version: 0x2000_0000,
-                coinbase_tx_prefix: vec![],
-                coinbase_tx_suffix: vec![],
-                wtxid_list: vec![],
-                raw_transactions: Map::new(),
+                coinbase_tx_prefix,
+                coinbase_tx_suffix,
+                wtxid_list,
+                raw_transactions,
                 prev_hash: Some([0xAB; 32]),
                 declared_at_ms: 1_000,
                 booking: None,
@@ -5734,13 +5912,16 @@ mod tests {
         assert_eq!(ext.created_at, 1_000);
     }
 
-    /// Slim handler-side projection of a bridge entry (what the IO layer's
-    /// `job_ref()` produces).
+    /// What the IO layer hands the handler — produced by REGISTERING the
+    /// entry and asking the real registry, not by rebuilding the projection
+    /// here. A hand-rolled copy would be a second implementation of the one
+    /// thing these tests exist to exercise, free to drift from the registry
+    /// while every assertion below stayed green.
     fn job_ref_for(entry: &RegisteredDeclaredJob) -> crate::bridge::BridgeJobRef {
-        crate::bridge::BridgeJobRef {
-            miner_address: entry.miner_address.clone(),
-            declared_prev_hash: entry.declared_job.prev_hash,
-        }
+        let mut registry = crate::bridge::JdpDeclaredJobRegistry::new();
+        let token = entry.declared_job.new_token;
+        registry.register(token, entry.clone());
+        registry.job_ref(&token).expect("just registered")
     }
 
     /// Extended-channel session on the SOLO stream — the only stream where a
@@ -6117,32 +6298,41 @@ mod tests {
         ));
     }
 
-    /// A Full-Template job (bridge entry present) must be §7.1-validated
-    /// on the outputs it SUBMITS, not trusted because a declare-time
-    /// check once passed on outputs nothing here can see.
+    /// A Full-Template job (bridge entry present) must be §7.1-validated on
+    /// the outputs it SUBMITS, not waved through because it matches its
+    /// declaration.
     ///
-    /// The attack this closes: declare a conforming coinbase to get a
-    /// token, then send `SetCustomMiningJob` with that token and a
-    /// coinbase paying yourself. `BridgeJobRef` carries only the address
-    /// and the declared tip, and the `ExtendedJob` is assembled from the
-    /// SUBMITTED outputs — so skipping the check let the miner mine a
-    /// self-paying coinbase while its shares earned in the shared window.
+    /// The declaration binding cannot stand in for this. It proves the job
+    /// is the one that was declared — and a JDC whose own template pays
+    /// itself declares and mines exactly that, consistently. What §7.1 adds
+    /// is the question the binding never asks: does this coinbase pay the
+    /// distribution the pool published? The `ExtendedJob` is assembled from
+    /// the SUBMITTED outputs, so without the check those are whatever the
+    /// JDC chose, while its shares earn in the shared window.
     #[test]
     fn set_custom_mining_job_full_template_nonconformant_coinbase_rejects() {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
-        let bridge = bridge_entry_for(token, REGTEST_ADDR, 42);
-        let entry = distribution_entry(None);
-        let acc = accepted(entry);
-        let mut input = custom_job_input(cid, token);
-        input.distribution_id = Some(9);
         // Pays a single output to the miner instead of the published
-        // weights — what a declare-then-swap would put on the wire.
-        input.coinbase_tx_outputs = bitcoin::consensus::serialize(&vec![bitcoin::TxOut {
+        // weights. DECLARED that way too, so the declaration binding passes
+        // and §7.1 is what has to catch it — a JDC whose own template pays
+        // itself, rather than one that swapped after declaring.
+        let self_paying = bitcoin::consensus::serialize(&vec![bitcoin::TxOut {
             value: bitcoin::Amount::from_sat(312_500_000),
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x00, 0x14, 0xBB]),
         }]);
+        let bridge = bridge_entry_declaring(
+            token,
+            REGTEST_ADDR,
+            42,
+            &FIXTURE_SCRIPT_SIG_PREFIX,
+            &self_paying,
+        );
+        let entry = distribution_entry(None);
+        let acc = accepted(entry);
+        let mut input = custom_job_matching(cid, &bridge);
+        input.distribution_id = Some(9);
         let out = handle_set_custom_mining_job(
             &mut s,
             &input,
@@ -6166,13 +6356,13 @@ mod tests {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
-        let bridge = bridge_entry_for(token, REGTEST_ADDR, 42);
         let entry = distribution_entry(None);
         let blob = conformant_outputs(&entry, 312_500_000);
+        let bridge =
+            bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob);
         let acc = accepted(entry);
-        let mut input = custom_job_input(cid, token);
+        let mut input = custom_job_matching(cid, &bridge);
         input.distribution_id = Some(9);
-        input.coinbase_tx_outputs = blob;
         let out = handle_set_custom_mining_job(
             &mut s,
             &input,
@@ -6276,14 +6466,30 @@ mod tests {
     /// varint (0xFD + u16-LE).
     #[test]
     fn set_custom_mining_job_emits_3byte_varint_for_large_scriptsig() {
-        let mut s = solo_session_with_extended_channel();
+        // Driven through the Coinbase-only path (a referenced distribution, no
+        // declaration). A DECLARED job cannot reach this length any more: the
+        // reconstruction refuses a scriptSig past the consensus 100-byte
+        // maximum, so a bound job's prefix stops well short of a 3-byte
+        // CompactSize. The assembly itself still has to encode one correctly.
+        let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
-        let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
+        let entry = distribution_entry(None);
+        let blob = conformant_outputs(&entry, 312_500_000);
+        let acc = accepted(entry);
         let mut input = custom_job_input(cid, token);
+        input.distribution_id = Some(9);
+        input.coinbase_tx_outputs = blob;
         input.coinbase_prefix = vec![0xAA; 253];
-        let _ =
-            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&acc), 1_000);
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "coinbase-only job must be accepted, got {:?}",
+            out.outbound[0]
+        );
         let ch = s.channels.get(&cid).unwrap();
         let ext = ch.extended_jobs.get(&1).expect("must be stored");
         // After 4(version) + 1(input_count) + 36(null_outpoint) = 41
@@ -6293,5 +6499,318 @@ mod tests {
         assert_eq!(&ext.coinbase_prefix[42..44], &[0x09, 0x01]);
         // Then the 253 JDC-prefix bytes.
         assert_eq!(ext.coinbase_prefix.len(), 41 + 3 + 253);
+    }
+
+    // ── Declaration binding ────────────────────────────────────────────
+
+    /// Both coinbases are §7.1-conformant against the same distribution —
+    /// they differ only in the `T` they divide, so the payout check passes
+    /// either way and cannot tell a declared job from a substituted one.
+    /// That is what makes this the case worth pinning: the binding is the
+    /// only thing that notices the substitution.
+    ///
+    /// Note what is NOT asserted here. Mining for a lower `T` is not itself
+    /// an offence — a JDC picks its own template, and settlement books from
+    /// whatever the coinbase actually paid. What must not happen is a job
+    /// arriving on the mining connection that is not the one the node
+    /// validated at declare time.
+    ///
+    /// Both directions in one test, so it cannot pass on a precondition
+    /// that silently did not hold: the declared coinbase is accepted, the
+    /// substituted one is rejected.
+    #[test]
+    fn a_swapped_coinbase_paying_the_same_distribution_is_still_rejected() {
+        let token = Token([1u8; 16]);
+        let entry = distribution_entry(None);
+        let declared_blob = conformant_outputs(&entry, 312_500_000);
+        let halved_blob = conformant_outputs(&entry, 156_250_000);
+        assert_ne!(declared_blob, halved_blob, "the two revenues must differ");
+
+        // Pin the premise the whole test rests on: BOTH blobs satisfy §7.1
+        // against this distribution, so the payout check cannot tell them
+        // apart and only the binding can. Left implicit, a later change to
+        // dust pruning or rounding could make the halved vector
+        // non-conformant — §7.1 would then be the thing rejecting it, except
+        // it never gets the chance, because the binding runs first. The test
+        // would stay green and stop demonstrating anything.
+        for (label, blob) in [("declared", &declared_blob), ("halved", &halved_blob)] {
+            let outputs: Vec<bitcoin::TxOut> =
+                bitcoin::consensus::deserialize(blob).expect("conformant blob must decode");
+            assert!(
+                crate::jdp::payout_distribution::validate_coinbase_outputs_against_distribution(
+                    &outputs,
+                    &entry.pool_payout,
+                    &entry.payouts,
+                    &entry.dust_limits,
+                    &entry.additional_outputs,
+                )
+                .is_ok(),
+                "the {label} coinbase must be §7.1-conformant, or this test \
+                 proves nothing about the binding"
+            );
+        }
+        let bridge = bridge_entry_declaring(
+            token,
+            REGTEST_ADDR,
+            42,
+            &FIXTURE_SCRIPT_SIG_PREFIX,
+            &declared_blob,
+        );
+
+        // Positive control: mining what was declared is accepted.
+        let mut s = negotiated_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let mut honest = custom_job_matching(cid, &bridge);
+        honest.distribution_id = Some(9);
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &honest,
+            Some(&job_ref_for(&bridge)),
+            Some(&accepted(entry.clone())),
+            1_000,
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "the declared coinbase must still be accepted, got {:?}",
+            out.outbound[0]
+        );
+
+        // The swap: same distribution, half the revenue.
+        let mut s = negotiated_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let mut swapped = custom_job_matching(cid, &bridge);
+        swapped.distribution_id = Some(9);
+        swapped.coinbase_tx_outputs = halved_blob;
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &swapped,
+            Some(&job_ref_for(&bridge)),
+            Some(&accepted(entry)),
+            1_000,
+        );
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
+            }
+            other => panic!("a swapped coinbase must not be minable, got {other:?}"),
+        }
+    }
+
+    /// The case this module exists for: leave the coinbase alone and change
+    /// the transaction set. §7.1 sees an untouched coinbase and passes, and
+    /// nothing else on the mining side looks at the `merkle_path` — so the
+    /// node validation `jdp_server` ran over the DECLARED set would carry
+    /// over to a set no one checked.
+    #[test]
+    fn a_swapped_merkle_path_is_rejected() {
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let token = Token([1u8; 16]);
+        let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
+
+        let honest = custom_job_matching(cid, &entry);
+        assert!(!honest.merkle_path.is_empty(), "fixture must commit to txs");
+        let out =
+            handle_set_custom_mining_job(&mut s, &honest, Some(&job_ref_for(&entry)), None, 1_000);
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "the declared transaction set must still be accepted"
+        );
+
+        let mut swapped = custom_job_matching(cid, &entry);
+        swapped.merkle_path[0] = [0xEE; 32];
+        let out =
+            handle_set_custom_mining_job(&mut s, &swapped, Some(&job_ref_for(&entry)), None, 1_000);
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
+            }
+            other => panic!("a swapped transaction set must not be minable, got {other:?}"),
+        }
+    }
+
+    /// The fixture declaration and the fixture channel must reserve the same
+    /// extranonce width, or every binding test below would be exercising a
+    /// rejection instead of the case it means to test. Pinned rather than
+    /// assumed: the channel's width comes from `session_with_extended_channel`
+    /// and could be changed there without anyone noticing here.
+    #[test]
+    fn the_fixture_slot_matches_the_test_channel() {
+        let s = session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        assert_eq!(
+            s.channels.get(&cid).unwrap().full_extranonce_size(),
+            FIXTURE_DECLARED_SLOT
+        );
+    }
+
+    /// The declaration reserves a gap for the extranonce; the mining channel
+    /// sizes its own. Nothing else in the binding compares the two — the
+    /// committed scriptSig prefix stops exactly where the gap begins. But a
+    /// found block is reassembled as declared_prefix || channel extranonce ||
+    /// declared_suffix, and the declared prefix's scriptSig length covers the
+    /// DECLARED gap, so a different width yields a coinbase that contradicts
+    /// its own length field and a block lost at submit.
+    ///
+    /// Both directions: the matching width is accepted, a job whose channel
+    /// disagrees with the declaration is refused at accept time.
+    #[test]
+    fn a_channel_extranonce_wider_than_the_declared_slot_is_rejected() {
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let token = Token([1u8; 16]);
+        let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
+        let input = custom_job_matching(cid, &entry);
+
+        let out =
+            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "matching widths must be accepted"
+        );
+
+        // Widen the channel's extranonce past the gap the declaration left.
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        s.channels.get_mut(&cid).unwrap().extranonce_size += 1;
+        let out =
+            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
+            }
+            other => panic!("a mismatched extranonce width must be refused, got {other:?}"),
+        }
+    }
+
+    /// The shape a REAL JDC declares in, accepted end to end.
+    ///
+    /// Every other binding fixture builds the witness-less coinbase our own
+    /// builder emits. `channels_sv2::JobFactory` — what an SRI jd-client
+    /// declares with — slices a SEGWIT-serialised one: marker+flag inside
+    /// `coinbase_tx_prefix`, the witness inside `coinbase_tx_suffix`. Only
+    /// the OUTPUTS were pinned for that shape (in `dynamic_outputs`);
+    /// nothing pinned the scriptSig prefix, nSequence, locktime, the
+    /// re-serialised output blob or the slot width.
+    ///
+    /// That gap was the dangerous kind: the binding fails closed, so a
+    /// projection that read any of those differently would reject every real
+    /// JDC's first job — dropping it into the fatal solo fallback — while the
+    /// whole suite stayed green.
+    ///
+    /// The mined side here is built from the ORIGINAL transaction, not from
+    /// the projection, so the two sides reach their bytes independently and
+    /// the test can actually disagree.
+    #[test]
+    fn a_segwit_shaped_declaration_accepts_the_job_a_real_jdc_would_mine() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        let script_sig_head = FIXTURE_SCRIPT_SIG_PREFIX;
+        let mut script_sig = script_sig_head.to_vec();
+        script_sig.extend_from_slice(&[0u8; FIXTURE_DECLARED_SLOT]);
+
+        let mut witness = Witness::new();
+        witness.push([0u8; 32]); // witness reserved value ⇒ segwit serialisation
+
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(script_sig),
+                sequence: Sequence(0xFFFF_FFFF),
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(312_500_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+
+        // Sliced exactly as JobFactory does: 4 version + 2 marker/flag
+        // + 1 input count + 32 outpoint hash + 4 index + 1 scriptSig len.
+        let raw = bitcoin::consensus::serialize(&tx);
+        let index = 4 + 2 + 1 + 32 + 4 + 1 + script_sig_head.len();
+        let (wtxid_list, raw_transactions) = fixture_declared_txs();
+        let token = Token([1u8; 16]);
+        let entry = RegisteredDeclaredJob {
+            declared_job: JdpDeclaredJob {
+                new_token: token,
+                original_token: Token([0u8; 16]),
+                request_id: 1,
+                version: 0x2000_0000,
+                coinbase_tx_prefix: raw[..index].to_vec(),
+                coinbase_tx_suffix: raw[index + FIXTURE_DECLARED_SLOT..].to_vec(),
+                wtxid_list,
+                raw_transactions,
+                prev_hash: Some([0xAB; 32]),
+                declared_at_ms: 1_000,
+                booking: None,
+            },
+            miner_address: AddressId::new(REGTEST_ADDR.to_string()).unwrap(),
+            jdp_session_id: 42,
+            registered_at_ms: 1_000,
+        };
+
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        // Built from `tx`, independently of the projection under test. The
+        // merkle_path carried over from `custom_job_input` is right for this
+        // declaration too: the branch is the SIBLINGS of leaf 0, so it turns
+        // on the transaction set (same `fixture_declared_txs`) and never on
+        // the coinbase itself.
+        let mut input = custom_job_input(cid, token);
+        input.version = 0x2000_0000;
+        input.coinbase_tx_version = tx.version.0 as u32;
+        input.coinbase_prefix = script_sig_head.to_vec();
+        input.coinbase_tx_input_n_sequence = tx.input[0].sequence.0;
+        input.coinbase_tx_outputs = bitcoin::consensus::serialize(&tx.output);
+        input.coinbase_tx_locktime = tx.lock_time.to_consensus_u32();
+
+        let out =
+            handle_set_custom_mining_job(&mut s, &input, Some(&job_ref_for(&entry)), None, 1_000);
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "a segwit-shaped declaration must accept the job it declared, got {:?}",
+            out.outbound[0]
+        );
+    }
+
+    /// A declaration the projection cannot express authorises nothing.
+    /// Reachable because a base-protocol declaration is stored without its
+    /// coinbase ever being parsed — only the ext-0x0003 path does that at
+    /// declare time.
+    #[test]
+    fn a_declaration_that_cannot_be_projected_is_rejected() {
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let token = Token([1u8; 16]);
+        let mut entry = bridge_entry_for(token, REGTEST_ADDR, 42);
+        let input = custom_job_input(cid, token);
+        // Truncate the declared coinbase past repair.
+        entry.declared_job.coinbase_tx_prefix = vec![0x02, 0x00];
+        let job_ref = job_ref_for(&entry);
+        assert!(job_ref.binding.is_none(), "fixture must fail to project");
+        let out = handle_set_custom_mining_job(&mut s, &input, Some(&job_ref), None, 1_000);
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
+            }
+            other => panic!("an unprojectable declaration must not authorise, got {other:?}"),
+        }
     }
 }

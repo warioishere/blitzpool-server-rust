@@ -24,4 +24,4 @@ pub use coinbase::{
     EXTRANONCE_SLOT_LEN,
 };
 pub use header::build_block_header;
-pub use merkle::merkle_root_from_coinbase;
+pub use merkle::{coinbase_merkle_branch, merkle_root_from_coinbase};
