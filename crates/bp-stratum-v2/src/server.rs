@@ -1144,24 +1144,42 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
         InboundMiningFrame::SetCustomMiningJob(input) => {
             let (bridge_job, distribution) = {
                 let guard = bridge.read().expect("bridge RwLock poisoned");
-                (
-                    // Projection: address, declared tip, and the declaration
-                    // binding — precomputed at register time, so this stays a
-                    // map lookup and a clone rather than re-deriving the
-                    // declaration's shape while the lock is held. The raw
-                    // transactions themselves the handler never needs.
-                    guard.job_ref(&input.mining_job_token),
-                    // §7.2 acceptance for the referenced distribution.
-                    // Mining connections carry no JDP session id, so
-                    // tailored entries resolve by the channel's address.
-                    input.distribution_id.map(|id| {
-                        let scope = match state.address.as_ref() {
-                            Some(addr) => crate::bridge::DistributionScope::MinerAddress(addr),
-                            None => crate::bridge::DistributionScope::JdpSession(0),
-                        };
-                        guard.distribution_acceptance(id, scope)
-                    }),
+                // Projection: address, declared tip, the declaration binding
+                // and the declaration's own distribution reference — all
+                // precomputed at register time, so this stays a map lookup and
+                // a clone rather than re-deriving the declaration's shape while
+                // the lock is held. The raw transactions the handler never
+                // needs.
+                let bridge_job = guard.job_ref(&input.mining_job_token);
+                // §7.2/§10 acceptance for the referenced distribution. The
+                // reference decides its own scope: a frame TLV (Coinbase-only)
+                // has no declaration behind it and resolves by owner address,
+                // while an inherited one (Full-Template) must resolve under the
+                // JDP session that accepted it — see `DistributionReference`.
+                let distribution = crate::bridge::resolve_distribution_reference(
+                    input.distribution_id,
+                    bridge_job.as_ref(),
+                    state.stream,
+                    state
+                        .negotiated_extensions
+                        .contains(&crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS),
                 )
+                .map(|reference| {
+                    let scope = match reference {
+                        crate::bridge::DistributionReference::FromFrame { .. } => {
+                            match state.address.as_ref() {
+                                Some(addr) => crate::bridge::DistributionScope::MinerAddress(addr),
+                                None => crate::bridge::DistributionScope::JdpSession(0),
+                            }
+                        }
+                        crate::bridge::DistributionReference::FromDeclaration {
+                            jdp_session_id,
+                            ..
+                        } => crate::bridge::DistributionScope::JdpSession(jdp_session_id),
+                    };
+                    guard.distribution_acceptance(reference.distribution_id(), scope)
+                });
+                (bridge_job, distribution)
             };
             // Distributions are multi-use (ext 0x0003 push model) —
             // nothing to consume on acceptance.
@@ -2393,6 +2411,229 @@ mod tests {
                 );
             }
             other => panic!("expected stale error, got {other:?}"),
+        }
+    }
+
+    /// The IO-layer half of the ext-0x0003 twin, which nothing else covers:
+    /// a Full-Template `SetCustomMiningJob` carries no §6 TLV, so the
+    /// acceptance has to be resolved from the reference its DECLARATION was
+    /// accepted under — and under the scope it was accepted in.
+    ///
+    /// The trap this pins: one payout address is one account, so it can own
+    /// several tailored slots (two jd-clients, or a ghost left by an
+    /// ungraceful drop). `DistributionScope::MinerAddress` answers with the
+    /// NEWEST slot for that address. Resolving the older session's declaration
+    /// through it finds a slot that never held its id → `Stale` → an SRI
+    /// jd-client takes the fatal solo fallback, forever, while the other
+    /// client on the same address mines normally.
+    ///
+    /// Both directions: the older session's job must be ACCEPTED, and a
+    /// genuinely withdrawn distribution must still be refused — otherwise
+    /// "resolves under the right scope" would read the same as "resolves
+    /// against anything".
+    #[test]
+    fn dispatch_resolves_an_inherited_distribution_in_its_declaring_session() {
+        use crate::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
+        use crate::mining::client::SetCustomMiningJobInput;
+        use crate::tokens::Token;
+
+        const OLD_SESSION: u32 = 11;
+        const NEW_SESSION: u32 = 22;
+
+        let mut s = fresh_test_session();
+        let alloc = Mutex::new(ExtranonceAllocator::new_default());
+        let bridge = fresh_bridge();
+        let _ = dispatch_inbound_frame(
+            &mut s,
+            InboundMiningFrame::SetupConnection(SetupConnectionInput {
+                protocol: PROTOCOL_MINING,
+                min_version: 2,
+                max_version: 2,
+                flags: FLAG_REQUIRES_VERSION_ROLLING,
+                vendor: "t".to_string(),
+                firmware: "0.1".to_string(),
+                hardware_version: "r".to_string(),
+                device_id: "d".to_string(),
+            }),
+            &alloc,
+            &bridge,
+            0,
+        );
+        let _ = dispatch_inbound_frame(
+            &mut s,
+            InboundMiningFrame::RequestExtensions(crate::extensions::RequestExtensions {
+                request_id: 1,
+                requested_extensions: vec![
+                    crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
+                ],
+            }),
+            &alloc,
+            &bridge,
+            0,
+        );
+        let _ = dispatch_inbound_frame(
+            &mut s,
+            InboundMiningFrame::OpenExtendedMiningChannel(
+                crate::mining::client::OpenExtendedMiningChannelInput {
+                    request_id: 2,
+                    user_identity: format!("{ADDR}.w"),
+                    nominal_hash_rate: 1_000_000.0,
+                    max_target: [0xFF; 32],
+                    min_extranonce_size: 8,
+                },
+                Vec::new(),
+            ),
+            &alloc,
+            &bridge,
+            0,
+        );
+        let cid = s.primary_channel.expect("extended channel opened");
+        let owner = bp_common::AddressId::new(ADDR.to_string()).unwrap();
+
+        let tailored = |id: u64, published_at_ms: u64| crate::bridge::PayoutDistributionEntry {
+            distribution_id: id,
+            pool_payout: WeightedOutput {
+                script_pubkey: vec![0x51],
+                weight: 1,
+            },
+            payouts: vec![WeightedOutput {
+                script_pubkey: vec![0x00, 0x14, 0xAA],
+                weight: 9,
+            }],
+            dust_limits: vec![1],
+            additional_outputs: vec![],
+            reference_reward_sats: 312_500_000,
+            payouts_fingerprint: Some([0x5A; 32]),
+            bookable: true,
+            owner: Some(owner.clone()),
+            jdp_session_id: Some(OLD_SESSION),
+            published_at_ms,
+        };
+        let declared_against = tailored(5, 1_000);
+        let conformant = bitcoin::consensus::serialize(
+            &compute_payout_vector(
+                &declared_against.pool_payout,
+                &declared_against.payouts,
+                &declared_against.dust_limits,
+                &declared_against.additional_outputs,
+                312_500_000,
+            )
+            .unwrap(),
+        );
+
+        // The declared coinbase has to rebuild around the channel's OWN
+        // extranonce slot, or the declaration binding refuses the job before
+        // the distribution is ever consulted and this test would pass on the
+        // wrong rejection.
+        let slot = s
+            .channels
+            .get(&cid)
+            .expect("channel opened")
+            .full_extranonce_size();
+        let script_sig_prefix = vec![0x03, 0xC8, 0x00];
+        let mut coinbase_tx_prefix = Vec::new();
+        coinbase_tx_prefix.extend_from_slice(&2u32.to_le_bytes());
+        coinbase_tx_prefix.push(0x01);
+        coinbase_tx_prefix.extend_from_slice(&[0u8; 32]);
+        coinbase_tx_prefix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        coinbase_tx_prefix.push((script_sig_prefix.len() + slot) as u8);
+        coinbase_tx_prefix.extend_from_slice(&script_sig_prefix);
+        let mut coinbase_tx_suffix = Vec::new();
+        coinbase_tx_suffix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        coinbase_tx_suffix.extend_from_slice(&conformant);
+        coinbase_tx_suffix.extend_from_slice(&0u32.to_le_bytes());
+
+        let token = Token([7u8; 16]);
+        let declared_job = crate::jdp::declarations::DeclaredJob {
+            new_token: token,
+            original_token: Token([0u8; 16]),
+            request_id: 1,
+            version: 0x2000_0000,
+            coinbase_tx_prefix,
+            coinbase_tx_suffix,
+            wtxid_list: vec![],
+            raw_transactions: Default::default(),
+            prev_hash: Some([0xAB; 32]),
+            declared_at_ms: 1_000,
+            booking: None,
+            distribution_id: Some(5),
+        };
+        let binding = crate::jdp::custom_job_binding::binding_from_declared_job(&declared_job)
+            .expect("fixture declaration must project");
+        {
+            let mut guard = bridge.write().unwrap();
+            guard.publish_tailored(OLD_SESSION, declared_against);
+            // A second, NEWER slot for the SAME address — the ghost/second
+            // client. `MinerAddress` scope would answer from this one.
+            let mut newer = tailored(6, 9_000);
+            newer.jdp_session_id = Some(NEW_SESSION);
+            guard.publish_tailored(NEW_SESSION, newer);
+            guard.register(
+                token,
+                crate::bridge::RegisteredDeclaredJob {
+                    declared_job,
+                    miner_address: owner.clone(),
+                    jdp_session_id: OLD_SESSION,
+                    registered_at_ms: 1_000,
+                },
+            );
+        }
+
+        // No TLV — the shape a conformant Full-Template JDC sends. Every bound
+        // field comes from the declaration, so nothing but the distribution
+        // scope can decide the outcome.
+        let make_input = |req: u32| SetCustomMiningJobInput {
+            channel_id: cid,
+            request_id: req,
+            mining_job_token: token,
+            version: binding.version,
+            prev_hash: [0xAB; 32],
+            min_ntime: 0x6500_0001,
+            n_bits: 0x1d00_ffff,
+            coinbase_tx_version: binding.coinbase_tx_version,
+            coinbase_prefix: binding.coinbase_script_sig_prefix.clone(),
+            coinbase_tx_input_n_sequence: binding.coinbase_tx_input_n_sequence,
+            coinbase_tx_outputs: binding.coinbase_tx_outputs.clone(),
+            coinbase_tx_locktime: binding.coinbase_tx_locktime,
+            merkle_path: binding.merkle_path.clone(),
+            distribution_id: None,
+        };
+
+        let out = dispatch_inbound_frame(
+            &mut s,
+            InboundMiningFrame::SetCustomMiningJob(make_input(1)),
+            &alloc,
+            &bridge,
+            0,
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                crate::mining::client::OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "the declaring session's distribution must resolve, got {:?}",
+            out.outbound[0]
+        );
+
+        // §10 settlement: now it genuinely is withdrawn and must be refused.
+        bridge.write().unwrap().invalidate_all_distributions();
+        let out = dispatch_inbound_frame(
+            &mut s,
+            InboundMiningFrame::SetCustomMiningJob(make_input(2)),
+            &alloc,
+            &bridge,
+            0,
+        );
+        match &out.outbound[0] {
+            crate::mining::client::OutboundFrame::SetCustomMiningJobError {
+                error_code, ..
+            } => {
+                assert_eq!(
+                    error_code,
+                    crate::mining::client::ERR_STALE_PAYOUT_DISTRIBUTION
+                );
+            }
+            other => panic!("a settled distribution must not stay mineable, got {other:?}"),
         }
     }
 

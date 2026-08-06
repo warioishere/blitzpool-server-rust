@@ -125,6 +125,126 @@ pub struct BridgeJobRef {
     /// it is the one state where a declaration exists but nothing about the
     /// job it authorises can be established.
     pub binding: Option<DeclaredJobBinding>,
+    /// ext 0x0003 §6: the `distribution_id` this job's DECLARATION referenced,
+    /// carried over from the JDP connection.
+    ///
+    /// It exists because §6 places the TLV per mode, and only one of the two
+    /// placements is on the mining connection:
+    ///
+    /// | Mode          | TLV rides on         |
+    /// |---------------|----------------------|
+    /// | Coinbase-only | `SetCustomMiningJob` |
+    /// | Full-Template | `DeclareMiningJob`   |
+    ///
+    /// So a conformant Full-Template JDC sends NO TLV here, and reading the
+    /// reference off the mining frame alone would leave the job looking like
+    /// an unbacked self-built one. `None` for a base-protocol declaration
+    /// (nothing referenced), which is a different thing from "referenced but
+    /// no longer acceptable" — that stays [`DistributionAcceptance`]'s answer.
+    pub distribution_id: Option<u64>,
+    /// JDP session that accepted the declaration. Carried so an inherited
+    /// reference can be resolved under the scope it was accepted in — see
+    /// [`DistributionReference::FromDeclaration`].
+    pub jdp_session_id: u32,
+}
+
+/// Where the distribution reference for a `SetCustomMiningJob` came from.
+///
+/// The two arms are NOT interchangeable. They were accepted under different
+/// [`DistributionScope`]s, so they have to be resolved under different ones —
+/// which is why this is an enum and not a bare `Option<u64>`. Returning only
+/// the id would leave the scope to be re-derived at the call site, and a
+/// scope that disagrees with the acceptance answers for a distribution the
+/// declaration was never judged against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DistributionReference {
+    /// Coinbase-only: the JDC put the §6 TLV on this frame. No declaration
+    /// stands behind it, so tailored slots resolve by owner address.
+    FromFrame { distribution_id: u64 },
+    /// Full-Template: §6 puts the TLV on `DeclareMiningJob`, so the reference
+    /// comes across with the declaration.
+    ///
+    /// It MUST resolve under the declaring JDP session, not by owner address.
+    /// One payout address can own several tailored slots — a JDC that dropped
+    /// ungracefully leaves a ghost behind until the cleanup sweep, and a
+    /// second client on the same address is entirely normal since the address
+    /// is the account. `DistributionScope::MinerAddress` answers with the
+    /// NEWEST slot for that address, which for an older session's declaration
+    /// is a slot that never held its id — permanent
+    /// `stale-payout-distribution`, and fatal for an SRI jd-client.
+    FromDeclaration {
+        distribution_id: u64,
+        jdp_session_id: u32,
+    },
+}
+
+impl DistributionReference {
+    pub fn distribution_id(&self) -> u64 {
+        match self {
+            Self::FromFrame { distribution_id }
+            | Self::FromDeclaration {
+                distribution_id, ..
+            } => *distribution_id,
+        }
+    }
+}
+
+/// Which distribution a `SetCustomMiningJob` is judged against, decided ONCE
+/// for both the IO layer (which resolves §7.2/§10 acceptance from it) and
+/// [`crate::mining::client::handle_set_custom_mining_job`] (which runs the
+/// gates on it). Split in two they would drift into resolving one
+/// distribution and validating against another.
+///
+/// A reference is inherited from the declaration only where that is both
+/// permitted and load-bearing — see the two guards below. Everywhere else the
+/// job is judged exactly as it was before this path existed.
+pub fn resolve_distribution_reference(
+    frame_tlv: Option<u64>,
+    bridge_job: Option<&BridgeJobRef>,
+    stream: bp_common::StreamKind,
+    negotiated_on_this_connection: bool,
+) -> Option<DistributionReference> {
+    // What the JDC actually sent wins, on every stream. The §2 negotiation
+    // gate judges it in the handler, as it did before this path existed.
+    if let Some(distribution_id) = frame_tlv {
+        return Some(DistributionReference::FromFrame { distribution_id });
+    }
+
+    // §2: a JDC that negotiated the extension on only one connection MUST NOT
+    // use it. Synthesising a reference for such a client would be using it on
+    // its behalf, so there is nothing to inherit — the job falls back to the
+    // base-protocol custom-job path and its Solo gate, which is where it
+    // landed before too.
+    if !negotiated_on_this_connection {
+        return None;
+    }
+
+    // The reference is only load-bearing where the Solo gate would otherwise
+    // refuse, i.e. on a stream whose shares enter shared accounting. A Solo
+    // stream pays its own finder, has no shared window to freeload on, and
+    // has always been served without any distribution reference. Inheriting
+    // one there would subject it — for the first time — to the §7.2/§10
+    // acceptance window and the owner/stream checks, every one of them a new
+    // way to refuse a job that used to be served. A refusal here is fatal for
+    // an SRI jd-client, so this stays a `match`: a stream kind added later
+    // must be classified deliberately rather than default into inheriting.
+    let feeds_shared_accounting = match stream {
+        bp_common::StreamKind::Solo => false,
+        bp_common::StreamKind::Pplns
+        | bp_common::StreamKind::GroupSolo
+        | bp_common::StreamKind::Blockparty => true,
+    };
+    if !feeds_shared_accounting {
+        return None;
+    }
+
+    bridge_job.and_then(|j| {
+        j.distribution_id
+            .map(|distribution_id| DistributionReference::FromDeclaration {
+                distribution_id,
+                jdp_session_id: j.jdp_session_id,
+            })
+    })
 }
 
 /// A registered entry plus the projection the mining side compares against.
@@ -316,6 +436,12 @@ impl JdpDeclaredJobRegistry {
             miner_address: s.entry.miner_address.clone(),
             declared_prev_hash: s.entry.declared_job.prev_hash,
             binding: s.binding.clone(),
+            // Proven at declare time: set only by the ext-0x0003 check that
+            // recomputed §4 against this coinbase. NOT taken from `booking`,
+            // which additionally requires the settlement snapshot to have
+            // landed — see `DeclaredJob::distribution_id`.
+            distribution_id: s.entry.declared_job.distribution_id,
+            jdp_session_id: s.entry.jdp_session_id,
         })
     }
 
@@ -558,6 +684,7 @@ impl JdpDeclaredJobRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bp_common::StreamKind;
     use std::collections::HashMap as Map;
 
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
@@ -611,6 +738,7 @@ mod tests {
             prev_hash: Some([0xAB; 32]),
             declared_at_ms: 1_000,
             booking: None,
+            distribution_id: None,
         }
     }
 
@@ -657,6 +785,151 @@ mod tests {
         assert_eq!(binding.extranonce_slot, SLOT);
         // No declared transactions, so the coinbase is the only leaf.
         assert!(binding.merkle_path.is_empty());
+    }
+
+    /// ext 0x0003 §6 puts the `distribution_id` TLV on `DeclareMiningJob` in
+    /// Full-Template mode, so the mining side never sees it on the wire and
+    /// has to read it off the projection. Both directions: a declaration that
+    /// referenced one projects it, a base-protocol declaration projects
+    /// `None` — otherwise "everything inherits" would read the same as
+    /// "inheritance works".
+    #[test]
+    fn job_ref_carries_the_declarations_distribution_reference() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+
+        let declared_under_0x0003 = token(1);
+        let mut entry = registration(declared_under_0x0003, 7, 1_000);
+        entry.declared_job.distribution_id = Some(9);
+        reg.register(declared_under_0x0003, entry);
+
+        let base_protocol = token(2);
+        reg.register(base_protocol, registration(base_protocol, 7, 1_000));
+
+        assert_eq!(
+            reg.job_ref(&declared_under_0x0003)
+                .expect("registered")
+                .distribution_id,
+            Some(9)
+        );
+        assert_eq!(
+            reg.job_ref(&base_protocol)
+                .expect("registered")
+                .distribution_id,
+            None
+        );
+        // Without this the inherited reference resolves under the wrong
+        // scope — see `DistributionReference::FromDeclaration`.
+        assert_eq!(
+            reg.job_ref(&declared_under_0x0003)
+                .expect("registered")
+                .jdp_session_id,
+            7
+        );
+    }
+
+    /// A job_ref for a declaration accepted under `distribution_id` on JDP
+    /// session `session`.
+    fn declared_ref(distribution_id: Option<u64>, session: u32) -> BridgeJobRef {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        let t = token(1);
+        let mut entry = registration(t, session, 1_000);
+        entry.declared_job.distribution_id = distribution_id;
+        reg.register(t, entry);
+        reg.job_ref(&t).expect("registered")
+    }
+
+    /// The frame's own TLV wins where there is one (Coinbase-only); the
+    /// declaration's fills in where there is not (Full-Template), and it
+    /// carries the session so the acceptance is resolved in the scope the
+    /// declaration was accepted under.
+    #[test]
+    fn a_frames_own_tlv_outranks_the_declarations_reference() {
+        let job_ref = declared_ref(Some(9), 7);
+
+        assert_eq!(
+            resolve_distribution_reference(Some(11), Some(&job_ref), StreamKind::Pplns, true),
+            Some(DistributionReference::FromFrame {
+                distribution_id: 11
+            }),
+            "a TLV on the frame is the JDC's own statement about THIS job"
+        );
+        assert_eq!(
+            resolve_distribution_reference(None, Some(&job_ref), StreamKind::Pplns, true),
+            Some(DistributionReference::FromDeclaration {
+                distribution_id: 9,
+                jdp_session_id: 7,
+            })
+        );
+        assert_eq!(
+            resolve_distribution_reference(None, None, StreamKind::Pplns, true),
+            None
+        );
+        assert_eq!(
+            resolve_distribution_reference(
+                None,
+                Some(&declared_ref(None, 7)),
+                StreamKind::Pplns,
+                true
+            ),
+            None,
+            "a base-protocol declaration references nothing to inherit"
+        );
+    }
+
+    /// A Solo stream pays its own finder and has always been served without
+    /// any distribution reference. Inheriting one would drag it into the §2
+    /// gate, the §7.2/§10 window and the owner checks for the first time —
+    /// each a new way to refuse a job that used to be served, and fatal for
+    /// an SRI jd-client. Its own TLV still counts, exactly as before.
+    #[test]
+    fn a_solo_stream_inherits_nothing_but_still_honours_its_own_tlv() {
+        let job_ref = declared_ref(Some(9), 7);
+
+        assert_eq!(
+            resolve_distribution_reference(None, Some(&job_ref), StreamKind::Solo, true),
+            None
+        );
+        assert_eq!(
+            resolve_distribution_reference(Some(11), Some(&job_ref), StreamKind::Solo, true),
+            Some(DistributionReference::FromFrame {
+                distribution_id: 11
+            })
+        );
+        // Every stream whose shares DO enter shared accounting inherits, so
+        // the carve-out above is about Solo and not about "non-PPLNS".
+        for stream in [
+            StreamKind::Pplns,
+            StreamKind::GroupSolo,
+            StreamKind::Blockparty,
+        ] {
+            assert!(
+                resolve_distribution_reference(None, Some(&job_ref), stream, true).is_some(),
+                "{stream:?} feeds shared accounting and must inherit"
+            );
+        }
+    }
+
+    /// §2: a JDC that negotiated the extension on only one connection MUST NOT
+    /// use it. Synthesising a reference for such a client would be using it on
+    /// its behalf, so there is nothing to inherit and the job falls back to
+    /// the base-protocol custom-job path — where it landed before this path
+    /// existed. Its own TLV is still seen, so the handler's §2 gate keeps a
+    /// TLV-carrying non-negotiated client to reject.
+    #[test]
+    fn a_connection_that_never_negotiated_inherits_nothing() {
+        let job_ref = declared_ref(Some(9), 7);
+
+        assert_eq!(
+            resolve_distribution_reference(None, Some(&job_ref), StreamKind::Pplns, false),
+            None
+        );
+        assert_eq!(
+            resolve_distribution_reference(Some(11), Some(&job_ref), StreamKind::Pplns, false),
+            Some(DistributionReference::FromFrame {
+                distribution_id: 11
+            }),
+            "the handler's §2 gate needs to see the TLV in order to reject it"
+        );
     }
 
     /// The negative half: a declaration that cannot be rebuilt still
