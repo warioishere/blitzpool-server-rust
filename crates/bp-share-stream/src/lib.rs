@@ -88,7 +88,7 @@ pub const CACHE_INVALIDATION_STREAM_KEY: &str = "cache:invalidate";
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CacheInvalidation {
     /// `"group"` (Group-Solo address cache) or `"blockparty"` (party routing
-    /// cache). See [`CacheKind`] for the canonical values.
+    /// cache). See [`cache_kind`] for the canonical values.
     pub kind: String,
 }
 

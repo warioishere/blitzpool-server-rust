@@ -115,7 +115,7 @@ pub fn pending_row(address: AddressId, delta_sats: Sats) -> AuditRow {
 /// rows — so the `SELECT` sees them. A plain read-committed `SELECT`
 /// alone would not.
 ///
-/// Caller (typically [`crate::hooks::PplnsBlockSubmissionSink`]) is
+/// Caller (typically [`crate::engine::PplnsEngine::on_block_found`]) is
 /// responsible for:
 /// - reading the snapshot persisted at template-build time
 /// - opening the transaction, locking the balance rows, and mapping the

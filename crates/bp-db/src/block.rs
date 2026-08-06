@@ -100,7 +100,7 @@ pub async fn found_block_miner_at_height(
 
 /// `true` when some payout ledger recorded a distribution for `height`.
 ///
-/// Distinct from [`block_recorded_at_height`], and the distinction is the
+/// Distinct from [`found_block_miner_at_height`], and the distinction is the
 /// point: `blocks_entity` is written by the front the moment a block is
 /// found, *before* any ledger applies. A block whose distribution then fails
 /// to book has the `blocks_entity` row and no payout rows — the exact shape of

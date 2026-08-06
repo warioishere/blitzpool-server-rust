@@ -53,7 +53,7 @@ pub struct WeightSnapshotEntry {
 
 /// Persistent form of a weight distribution (schema 3).
 ///
-/// Where the schema-1 [`StoredSnapshot`] freezes the OUTCOME (exact
+/// Where the schema-1 `StoredSnapshot` froze the OUTCOME (exact
 /// sats per output, valid for exactly one reward), this freezes the
 /// INPUTS: settlement recomputes each address's claim from
 /// `bp_share::claim_sats(score_weight, score_total, fee_ppm, T_actual)`
@@ -147,7 +147,7 @@ impl StoredWeightSnapshot {
 }
 
 /// Persist a weight snapshot under `key` with `ttl_seconds`. Same
-/// DEL + HSET + EXPIRE shape (and rationale) as [`write_snapshot`];
+/// DEL + HSET + EXPIRE shape (and rationale) as [`write_weight_snapshot`];
 /// the `schema` field is what keeps the formats from ever hydrating
 /// through the wrong parser.
 ///
@@ -231,7 +231,7 @@ return 1
 
 /// Load a weight snapshot, or `Ok(None)` when the key is missing, has
 /// a different schema (including every schema-1 snapshot), or fails to
-/// parse. Same warn-not-crash policy as [`read_snapshot`].
+/// parse. Same warn-not-crash policy as [`read_weight_snapshot`].
 pub async fn read_weight_snapshot(
     conn: &mut ConnectionManager,
     key: &str,
