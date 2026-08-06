@@ -89,7 +89,7 @@ pub use blockparty::{
 };
 pub use client::{
     bulk_set_client_hashrate, bulk_touch_clients_for_share,
-    bulk_upsert_client_difficulty_statistics, delete_client_for_session,
+    bulk_upsert_client_difficulty_statistics, bulk_upsert_clients, delete_client_for_session,
     delete_old_client_difficulty_statistics, delete_old_client_rejected_statistics,
     delete_old_client_statistics, delete_old_clients, delete_old_pool_mode_hashrate,
     device_first_seen, device_watch_seed, find_client, find_client_difficulty_statistics,

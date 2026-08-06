@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO client_entity\n             (address, \"clientName\", \"sessionId\", \"userAgent\", \"startTime\", \"firstSeen\",\n              \"currentDifficulty\", \"createdAt\", \"updatedAt\")\n           SELECT u.address, u.client_name, u.session_id, u.user_agent,\n                  u.start_time, u.start_time, u.current_difficulty,\n                  (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,\n                  (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint\n           FROM (\n               SELECT\n                   unnest($1::text[])   AS address,\n                   unnest($2::text[])   AS client_name,\n                   unnest($3::text[])   AS session_id,\n                   unnest($4::text[])   AS user_agent,\n                   unnest($5::bigint[]) AS start_time,\n                   unnest($6::real[])   AS current_difficulty\n           ) AS u\n           ON CONFLICT (address, \"clientName\", \"sessionId\") DO UPDATE\n           SET \"userAgent\"         = EXCLUDED.\"userAgent\",\n               \"startTime\"         = EXCLUDED.\"startTime\",\n               \"currentDifficulty\" = EXCLUDED.\"currentDifficulty\",\n               \"updatedAt\"         = EXCLUDED.\"updatedAt\",\n               \"deletedAt\"         = NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Int8Array",
+        "Float4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9c40d82d31922b7046cce199b5e87f547804f17da1070683639eea3caef9fb7c"
+}

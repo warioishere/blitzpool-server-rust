@@ -3,11 +3,15 @@
 //! Composite handle exposing the hook impls + the buffered share-touch
 //! flusher.
 //!
-//! `SessionPersistenceHook` (authorize/disconnect) writes through
-//! synchronously — one statement per connection event, nothing to batch.
-//! Everything on the SHARE path is buffered, because at ~250 shares/s a
-//! statement per share dominates the DB write budget:
+//! Nothing here writes a statement per event any more. The connection
+//! path (authorize/disconnect) is debounced — see [`RowDebounce`]: a
+//! session's row is born only once it has survived `row_debounce`, so
+//! probe connections never reach Postgres. Everything on the SHARE path
+//! is buffered, because at ~250 shares/s a statement per share dominates
+//! the DB write budget:
 //!
+//! - [`RowDebounce`] → one bulk `INSERT … ON CONFLICT` for the due row
+//!   births every `row_flush_interval` (default 5 s).
 //! - [`TouchBuffer`] → one bulk `UPDATE client_entity … FROM unnest(...)`
 //!   every `touch_flush_interval` (default 30 s).
 //! - [`HashrateSampler`] → one bulk `UPDATE client_entity` per
@@ -22,6 +26,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio::time::Duration;
 use tracing::warn;
 
 use crate::config::SessionPersistenceConfig;
@@ -29,6 +34,7 @@ use crate::diff_stat_buffer::{run_flush_loop as run_diff_stat_flush_loop, DiffSt
 use crate::error::SessionPersistenceError;
 use crate::hashrate_sampler::{run_sample_loop, HashrateSampler};
 use crate::hooks::{ClientDifficultyStatisticsSink, ClientRowTouchSink, SessionPersistenceHook};
+use crate::row_debounce::{run_birth_loop, RowDebounce};
 use crate::touch_buffer::{run_flush_loop, TouchBuffer};
 
 pub struct SessionPersistenceEngine {
@@ -37,6 +43,7 @@ pub struct SessionPersistenceEngine {
     touch_buffer: Arc<TouchBuffer>,
     hashrate_sampler: Arc<HashrateSampler>,
     diff_stat_buffer: Arc<DiffStatBuffer>,
+    row_debounce: Arc<RowDebounce>,
 }
 
 impl SessionPersistenceEngine {
@@ -54,6 +61,7 @@ impl SessionPersistenceEngine {
             touch_buffer: Arc::new(TouchBuffer::default()),
             hashrate_sampler: Arc::new(HashrateSampler::default()),
             diff_stat_buffer: Arc::new(DiffStatBuffer::default()),
+            row_debounce: Arc::new(RowDebounce::default()),
         })
     }
 
@@ -75,14 +83,26 @@ impl SessionPersistenceEngine {
             touch_buffer: self.touch_buffer,
             hashrate_sampler: self.hashrate_sampler,
             diff_stat_buffer: self.diff_stat_buffer,
+            row_debounce: self.row_debounce,
+            row_debounce_age: self.config.row_debounce,
             shutdown: Arc::new(std::sync::Mutex::new(ShutdownState::default())),
         }
     }
 
     fn spawn_internal(self) -> SessionPersistenceEngineHandle {
-        // Three background loops: the 30s touch-buffer flush, the 60s
-        // live-hashrate sampler, and the 30s diff-stat flush. Each gets its
-        // own shutdown channel; the handle joins all of them on `shutdown()`.
+        // Four background loops: the 5s row-birth flush, the 30s
+        // touch-buffer flush, the 60s live-hashrate sampler, and the 30s
+        // diff-stat flush. Each gets its own shutdown channel; the handle
+        // joins all of them on `shutdown()`.
+        let (birth_tx, birth_rx) = oneshot::channel();
+        let birth_join = tokio::spawn(run_birth_loop(
+            self.row_debounce.clone(),
+            self.pool.clone(),
+            self.config.row_debounce,
+            self.config.row_flush_interval,
+            birth_rx,
+        ));
+
         let (touch_tx, touch_rx) = oneshot::channel();
         let touch_join = tokio::spawn(run_flush_loop(
             self.touch_buffer.clone(),
@@ -113,9 +133,11 @@ impl SessionPersistenceEngine {
             touch_buffer: self.touch_buffer,
             hashrate_sampler: self.hashrate_sampler,
             diff_stat_buffer: self.diff_stat_buffer,
+            row_debounce: self.row_debounce,
+            row_debounce_age: self.config.row_debounce,
             shutdown: Arc::new(std::sync::Mutex::new(ShutdownState {
-                txs: vec![touch_tx, sampler_tx, diff_tx],
-                joins: vec![touch_join, sampler_join, diff_join],
+                txs: vec![birth_tx, touch_tx, sampler_tx, diff_tx],
+                joins: vec![birth_join, touch_join, sampler_join, diff_join],
             })),
         }
     }
@@ -125,7 +147,8 @@ impl SessionPersistenceEngine {
 /// `Clone` (the SV1 and SV2 servers each clone the handle into their
 /// hook wiring at startup). Only the first `shutdown()` actually
 /// signals + joins; subsequent calls are no-ops. Holds one entry per
-/// background loop (touch flush + hashrate sampler + diff-stat flush).
+/// background loop (row birth + touch flush + hashrate sampler +
+/// diff-stat flush).
 #[derive(Default)]
 struct ShutdownState {
     txs: Vec<oneshot::Sender<()>>,
@@ -134,21 +157,47 @@ struct ShutdownState {
 
 /// Shared handle. `bin/blitzpool` clones it into the SV1 / SV2 server
 /// hooks at startup. Implements `shutdown()` — calling it on any clone
-/// drains the touch buffer once and joins the flush task.
+/// drains the touch buffer once and joins the flush tasks. (The row
+/// debounce is deliberately NOT drained on shutdown — its pending
+/// sessions are about to die with the process's sockets.)
 #[derive(Clone)]
 pub struct SessionPersistenceEngineHandle {
     pool: PgPool,
     touch_buffer: Arc<TouchBuffer>,
     hashrate_sampler: Arc<HashrateSampler>,
     diff_stat_buffer: Arc<DiffStatBuffer>,
+    row_debounce: Arc<RowDebounce>,
+    row_debounce_age: Duration,
     shutdown: Arc<std::sync::Mutex<ShutdownState>>,
 }
 
 impl SessionPersistenceEngineHandle {
     /// Hook impl for `bp_stratum_v1::SessionPersistence`. Wire into
-    /// `ServerHooks::session_persistence`.
+    /// `ServerHooks::session_persistence`. All clones share the one
+    /// debounce, so SV1 and SV2 sessions pend into the same map.
     pub fn session_persistence_hook(&self) -> SessionPersistenceHook {
-        SessionPersistenceHook::new(self.pool.clone())
+        SessionPersistenceHook::new(self.pool.clone(), self.row_debounce.clone())
+    }
+
+    /// Run one birth pass over EVERY pending session, debounce age
+    /// ignored. The deterministic drain the integration tests use (the
+    /// birth loop has no shutdown drain to lean on); harmless in
+    /// production — it writes the same rows a tick would, just earlier.
+    pub async fn flush_births_now(&self) -> u64 {
+        crate::row_debounce::flush_once(&self.row_debounce, &self.pool, Duration::ZERO).await
+    }
+
+    /// Number of sessions currently pending birth. Diagnostic; the
+    /// integration tests pin the retry/drop budget through it.
+    pub fn pending_births(&self) -> usize {
+        self.row_debounce.pending_len()
+    }
+
+    /// Run one birth pass honouring the configured debounce age —
+    /// exactly what a timer tick does. Tests use this to show that a
+    /// session younger than the debounce is NOT written.
+    pub async fn flush_due_births(&self) -> u64 {
+        crate::row_debounce::flush_once(&self.row_debounce, &self.pool, self.row_debounce_age).await
     }
 
     /// Hook impl that touches the per-session `client_entity` row on

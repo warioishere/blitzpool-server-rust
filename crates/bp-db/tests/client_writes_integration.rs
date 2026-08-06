@@ -4,8 +4,9 @@
 #![allow(clippy::needless_return)]
 
 //! Integration tests for the session-persistence write-primitives
-//! (`upsert_client`, `delete_client_for_session`, …). Each test wraps
-//! writes in TX-rollback for isolation.
+//! (`upsert_client`, `delete_client_for_session`, …). Single-row tests
+//! wrap writes in TX-rollback for isolation; the bulk writers own their
+//! transaction (bulk-write lock), so their tests clean up by sessionId.
 
 use bp_common::AddressId;
 use bp_db::{
@@ -202,6 +203,170 @@ async fn upsert_client_on_conflict_resurrects_soft_deleted_row() {
     assert!(del.is_none(), "deletedAt must clear on re-register");
 
     tx.rollback().await.expect("rollback");
+}
+
+// ── bulk_upsert_clients ─────────────────────────────────────────────
+
+/// The birth flush's bulk form: N rows, mixed insert + conflict, mixed
+/// Some/None `userAgent`, in one statement. Same statement as
+/// `upsert_client`, so the column semantics above carry over; what this
+/// pins is the array plumbing. Pool-level (the fn owns its transaction
+/// for the bulk-write lock), so cleanup by sessionId instead of
+/// TX-rollback.
+#[tokio::test]
+async fn bulk_upsert_clients_inserts_and_updates_in_one_statement() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    const SESSIONS: &[&str] = &["tBUs1", "tBUs2"];
+    for sid in SESSIONS {
+        let _ = sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
+            .bind(sid)
+            .execute(&pool)
+            .await;
+    }
+
+    // Seed the first session, then soft-delete it — its bulk entry runs
+    // the conflict arm; the second session's entry is a fresh insert.
+    bp_db::bulk_upsert_clients(
+        &pool,
+        &[ClientUpsert {
+            address: "test_bulkups_addr".to_string(),
+            client_name: "wkr".to_string(),
+            session_id: "tBUs1".to_string(),
+            user_agent: Some("bitaxe/2.7".to_string()),
+            start_time_ms: 1_700_000_000_000,
+            current_difficulty: None,
+        }],
+    )
+    .await
+    .expect("seed");
+    delete_client_for_session(&pool, "tBUs1")
+        .await
+        .expect("soft-delete seed");
+
+    let rows = [
+        ClientUpsert {
+            address: "test_bulkups_addr".to_string(),
+            client_name: "wkr".to_string(),
+            session_id: "tBUs1".to_string(),
+            user_agent: Some("bitaxe/3.0".to_string()),
+            start_time_ms: 1_700_000_099_000,
+            current_difficulty: None,
+        },
+        ClientUpsert {
+            address: "test_bulkups_addr".to_string(),
+            client_name: "wkr2".to_string(),
+            session_id: "tBUs2".to_string(),
+            user_agent: None,
+            start_time_ms: 1_700_000_050_000,
+            current_difficulty: None,
+        },
+    ];
+    let n = bp_db::bulk_upsert_clients(&pool, &rows)
+        .await
+        .expect("bulk upsert");
+    assert_eq!(n, 2, "one conflict-update + one insert");
+
+    let row1 = sqlx::query(
+        r#"SELECT "userAgent", "deletedAt", "firstSeen" FROM client_entity
+           WHERE "sessionId" = $1"#,
+    )
+    .bind("tBUs1")
+    .fetch_one(&pool)
+    .await
+    .expect("read conflict row");
+    let ua1: Option<String> = row1.get("userAgent");
+    let del1: Option<i64> = row1.get("deletedAt");
+    let fs1: Option<i64> = row1.get("firstSeen");
+    assert_eq!(
+        ua1.as_deref(),
+        Some("bitaxe/3.0"),
+        "conflict arm refreshes userAgent"
+    );
+    assert!(del1.is_none(), "conflict arm clears the soft-delete");
+    assert_eq!(
+        fs1,
+        Some(1_700_000_000_000),
+        "firstSeen survives the re-register"
+    );
+
+    let row2 =
+        sqlx::query(r#"SELECT "userAgent", "firstSeen" FROM client_entity WHERE "sessionId" = $1"#)
+            .bind("tBUs2")
+            .fetch_one(&pool)
+            .await
+            .expect("read insert row");
+    let ua2: Option<String> = row2.get("userAgent");
+    let fs2: Option<i64> = row2.get("firstSeen");
+    assert_eq!(ua2, None, "a NULL userAgent element must stay NULL");
+    assert_eq!(
+        fs2,
+        Some(1_700_000_050_000),
+        "firstSeen = startTime on insert"
+    );
+
+    for sid in SESSIONS {
+        sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
+            .bind(sid)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+}
+
+/// An over-long `clientName` (varchar(64)) fails the WHOLE bulk
+/// statement — and it surfaces as `DbError::Sqlx(sqlx::Error::Database)`.
+/// The row-birth debounce keys its retry-or-drop decision on exactly
+/// that variant, so this pins the classification against sqlx.
+#[tokio::test]
+async fn bulk_upsert_clients_oversized_name_fails_whole_batch_as_database_error() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    const HEALTHY: &str = "tBUpsn";
+    let _ = sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
+        .bind(HEALTHY)
+        .execute(&pool)
+        .await;
+
+    let rows = [
+        ClientUpsert {
+            address: "test_bulkups_addr".to_string(),
+            client_name: "w".repeat(65),
+            session_id: "tBUpsX".to_string(),
+            user_agent: None,
+            start_time_ms: 1,
+            current_difficulty: None,
+        },
+        ClientUpsert {
+            address: "test_bulkups_addr".to_string(),
+            client_name: "wkr".to_string(),
+            session_id: HEALTHY.to_string(),
+            user_agent: None,
+            start_time_ms: 1,
+            current_difficulty: None,
+        },
+    ];
+    let err = bp_db::bulk_upsert_clients(&pool, &rows)
+        .await
+        .expect_err("varchar(64) overflow must fail the statement");
+    assert!(
+        matches!(&err, bp_db::DbError::Sqlx(sqlx::Error::Database(_))),
+        "a 22001 must classify as a database (row-specific) error, got: {err:?}"
+    );
+
+    let healthy_rows: i64 =
+        sqlx::query_scalar(r#"SELECT count(*) FROM client_entity WHERE "sessionId" = $1"#)
+            .bind(HEALTHY)
+            .fetch_one(&pool)
+            .await
+            .expect("count healthy");
+    assert_eq!(
+        healthy_rows, 0,
+        "the statement is all-or-nothing — the healthy row rolls back with it; \
+         per-row isolation is the caller's job (see bp-session-persistence)"
+    );
 }
 
 #[tokio::test]

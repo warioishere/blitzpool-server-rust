@@ -10,24 +10,25 @@
 //! into:
 //!
 //! - **[`hooks::SessionPersistenceHook`]** — `bp_stratum_v1::SessionPersistence`
-//!   trait impl. On `register_session` (miner authorize), upserts a row
-//!   into `client_entity`. On `deregister_session` (disconnect),
-//!   soft-deletes by `sessionId`. Mode-blind: every authorize lands here.
+//!   trait impl. On `register_session` (miner authorize), pends the
+//!   session in the row-birth debounce — no statement; the row is born
+//!   by the engine's flush once the session survives the debounce
+//!   window. On `deregister_session` (disconnect), soft-deletes by
+//!   `sessionId` — only if a row was born. Mode-blind: every authorize
+//!   lands here.
 //! - **[`hooks::ClientDifficultyStatisticsSink`]** — `bp-share-hook`
 //!   accepted-share sink recording the per-(address, worker, hour-slot)
 //!   MAX submission difficulty into `client_difficulty_statistics_entity`.
-//! - **[`client_row`]** — thin wrappers around the two `bp-db`
-//!   primitives (`upsert_client`, `delete_client_for_session`).
 //! - **[`engine::SessionPersistenceEngine`]** — `spawn(config, pool)` →
 //!   handle exposing the hooks-ready references.
 
-pub mod client_row;
 pub mod config;
 mod diff_stat_buffer;
 pub mod engine;
 pub mod error;
 mod hashrate_sampler;
 pub mod hooks;
+mod row_debounce;
 mod touch_buffer;
 
 pub use config::SessionPersistenceConfig;
