@@ -15,7 +15,7 @@
 //!    roll their portion of the extranonce locally without a pool
 //!    round-trip).
 //! 3. **Shares** can be rolled by the miner — but block-acceptance is
-//!    transitive via `bp-mining-job/tests/regtest_e2e.rs` (DEFERRED.md
+//!    transitive via `bp-mining-job/tests/regtest_e2e.rs` (the same
 //!    transitivity argument), so we don't drive a SubmitSharesExtended
 //!    here.
 //!

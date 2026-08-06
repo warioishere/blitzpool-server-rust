@@ -2507,7 +2507,7 @@ pub struct SetCustomMiningJobInput {
 /// distribution reference — the §6 TLV on this frame (Coinbase-only) or the
 /// one the declaration carried (Full-Template, where §6 puts the TLV on
 /// `DeclareMiningJob` instead), via
-/// [`crate::bridge::effective_distribution_id`] — against the bridge registry
+/// [`crate::bridge::resolve_distribution_reference`] — against the bridge registry
 /// and passes the [`DistributionAcceptance`]. The submitted
 /// `coinbase_tx_outputs` MUST
 /// match the §4 recompute positionally (§7.1), and for a tailored

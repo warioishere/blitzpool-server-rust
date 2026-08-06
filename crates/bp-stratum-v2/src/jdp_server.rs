@@ -138,7 +138,7 @@ pub struct BuiltPayoutDistribution {
     /// Revenue the weight boosts were projected against.
     pub reference_reward_sats: u64,
     /// Settlement-snapshot identity. `None` = the owning mode books
-    /// without a snapshot (Solo / Blockparty).
+    /// without a snapshot (Solo).
     pub payouts_fingerprint: Option<[u8; 32]>,
     /// Whether a found block on this distribution may be booked
     /// (`false` when the snapshot write failed).
@@ -674,8 +674,8 @@ async fn run_jdp_connection(
     let (mut reader, mut writer) = noise.into_split();
 
     let mut state = JdpSessionState::new(session_id);
-    // Whether this session got a tailored distribution (Solo /
-    // Group-Solo / Blockparty); the pool-wide push then stops for it —
+    // Whether this session got a tailored distribution (Solo or
+    // Group-Solo); the pool-wide push then stops for it —
     // §4 "latest MUST be used" makes the tailored stream authoritative.
     let mut tailored_active = false;
     // The miner a tailored distribution was built for. Kept so a §10
@@ -895,9 +895,9 @@ async fn run_jdp_connection(
                 }
                 outcome.outbound = Vec::new();
                 // Identity became known (allocate) on a negotiated
-                // session → check for a tailored distribution (Solo /
-                // Group-Solo / Blockparty). PPLNS miners get `None`
-                // and keep riding the pool-wide push.
+                // session → check for a tailored distribution (Solo or
+                // Group-Solo). PPLNS miners ride the pool-wide push;
+                // Blockparty is refused a distribution altogether.
                 if state
                     .negotiated_extensions
                     .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)

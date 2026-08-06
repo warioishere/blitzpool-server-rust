@@ -24,7 +24,7 @@
 //! multiple plausible signatures whose right shape only becomes clear at
 //! the consumer site. Those are added 2-at-a-time as call sites
 //! emerge (Design-Prinzip 9: extract abstractions on demand, never
-//! speculatively). See `DEFERRED.md` for the running list.
+//! speculatively).
 //!
 //! # SQL verification status
 //!

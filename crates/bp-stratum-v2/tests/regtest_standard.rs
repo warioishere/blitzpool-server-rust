@@ -18,8 +18,8 @@
 //!
 //! Block-acceptance (TDP `submit_solution` for a winning share) is
 //! deferred to the SV2-extended e2e test + the existing
-//! `bp-mining-job/tests/regtest_e2e.rs` (transitivity argument from
-//! `DEFERRED.md`: that test proves "ANY valid MiningJob bytes →
+//! `bp-mining-job/tests/regtest_e2e.rs` (transitivity argument:
+//! that test proves "ANY valid MiningJob bytes →
 //! bitcoin-core accepts", and this test proves "SV2 wire roundtrip
 //! produces the same MiningJob bytes the mining-job crate's helpers
 //! emit").

@@ -22,15 +22,11 @@
 //!    lookup, kick / dissolve cleanup against `GroupRoundStore`'s
 //!    Redis keys, min-payout floor lookup.
 //!
-//! **BlockSubmissionSink** is deliberately out of scope for 7.3 —
-//! it requires a small `bp-stratum-v1::ShareAccept` extension
-//! (`enonce1: [u8; 4]` + `extranonce2: [u8; 8]` fields) so the
-//! adapter can rebuild the witness coinbase for
-//! `TdpHandle::submit_solution`. Since the block-submit path doesn't
-//! fire until Phase 7.4 binds the Stratum TCP listeners, the
-//! ShareAccept extension + the per-SV1/SV2 sink impls naturally
-//! co-locate with the Stratum wiring. Tracked in DEFERRED.md under
-//! the Phase 7 block.
+//! **BlockSubmissionSink** is not here: it needs the `ShareAccept`
+//! extranonce fields to rebuild the witness coinbase for
+//! `TdpHandle::submit_solution`, so it co-locates with the Stratum
+//! wiring instead — [`crate::block_sink::TdpBlockSubmissionSink`],
+//! which implements both the SV1 and the SV2 sink trait.
 
 use std::sync::Arc;
 

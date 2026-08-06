@@ -539,9 +539,10 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
 
 /// Production [`bp_stratum_v2::jdp_server::PayoutDistributionSource`]:
 /// builds the pool-wide PPLNS distribution for the publisher and
-/// tailored distributions (Solo / Group-Solo / Blockparty) once an
-/// allocate reveals a session's identity, and allocates the §3.1
-/// strictly-increasing `distribution_id` via Redis.
+/// tailored distributions (Solo or Group-Solo — see
+/// [`jdp_serves_a_distribution`]) once an allocate reveals a session's
+/// identity, and allocates the §3.1 strictly-increasing
+/// `distribution_id` via Redis.
 pub(crate) struct ProductionDistributionSource {
     pub(crate) resolver: Arc<ProductionPayoutResolver>,
     pub(crate) tdp: bp_template_distribution::TdpHandle,
@@ -600,10 +601,10 @@ impl ProductionDistributionSource {
         })
     }
 
-    /// Sats-at-reference as weights, for the modes with their own exact
-    /// allocators (Solo / Blockparty — they settle by recompute, no
-    /// snapshot). `entries` in §4 order WITHOUT a pool output; the pool
-    /// output script comes from `pool_script_addr`.
+    /// Sats-at-reference as weights, for Solo — the one mode JDP serves
+    /// that has its own exact allocator and settles by recompute rather
+    /// than from a snapshot. `entries` in §4 order WITHOUT a pool output;
+    /// the pool output script comes from `pool_addr`.
     fn lower_exact_entries(
         &self,
         pool_addr: &str,
@@ -638,8 +639,7 @@ impl ProductionDistributionSource {
             dust_limits,
             additional_outputs: Vec::new(),
             reference_reward_sats,
-            // Solo books nothing; Blockparty settles by its own
-            // recompute + history row — both without a snapshot.
+            // Solo books nothing, so there is no snapshot to name.
             payouts_fingerprint: None,
             bookable: true,
         })

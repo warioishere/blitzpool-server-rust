@@ -22,7 +22,7 @@
 //! - [`join_request`] — join-request [`join_request::JoinRequestStatus`]
 //!   enum, message validator, and staleness check.
 //!
-//! ## What's deferred (see `DEFERRED.md`)
+//! ## What's deferred
 //!
 //! - DB-coupled service operations (`createGroup` / `addMember` /
 //!   `removeMember` / `transferCreator` / `dissolveGroup` / etc.) →

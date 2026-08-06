@@ -89,9 +89,9 @@ pub fn partition_against_template(
 /// In-flight declaration state. Stored on the JDP-session between
 /// emitting `ProvideMissingTransactions` and receiving
 /// `ProvideMissingTransactions.Success`. The handler-layer holds at
-/// most one of these per connection — a second `DeclareMiningJob`
-/// arriving while a pending one is in-flight is a JDC bug we'd want
-/// to log and drop (deferred to `jdp::client`).
+/// most one of these per connection: a second `DeclareMiningJob`
+/// arriving while one is in flight REPLACES it, so the first
+/// declaration is abandoned and its `request_id` never answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingDeclaration {
     /// `DeclareMiningJob.request_id` — echoed on the Success frame.

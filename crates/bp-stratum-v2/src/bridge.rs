@@ -286,14 +286,14 @@ pub struct PayoutDistributionEntry {
     /// — the booking band is checked against this.
     pub reference_reward_sats: u64,
     /// Settlement-snapshot identity (weights fingerprint). `None` when
-    /// the owning mode books without a snapshot (Solo / Blockparty).
+    /// the owning mode books without a snapshot (Solo).
     pub payouts_fingerprint: Option<[u8; 32]>,
     /// Whether a booking may be stamped on jobs built from this
     /// distribution (`false` e.g. when the snapshot write failed — the
     /// job is still served, but a found block is reported-not-booked).
     pub bookable: bool,
     /// `None` = pool-wide (every connection may reference it);
-    /// `Some` = tailored to one miner (Solo / Group-Solo / Blockparty).
+    /// `Some` = tailored to one miner (Solo or Group-Solo).
     pub owner: Option<AddressId>,
     /// JDP session a tailored entry was published to (evicted with it).
     pub jdp_session_id: Option<u32>,
@@ -380,8 +380,8 @@ pub struct JdpDeclaredJobRegistry {
     /// Pool-wide distribution (PPLNS) — what every connection gets
     /// pushed on open and on the publisher's timer.
     pool_wide_distribution: DistributionSlot,
-    /// Tailored per-JDP-session distributions (Solo / Group-Solo /
-    /// Blockparty, published after the session's identity is known).
+    /// Tailored per-JDP-session distributions (Solo or Group-Solo,
+    /// published after the session's identity is known).
     tailored_distributions: HashMap<u32, DistributionSlot>,
     /// JDP sessions whose miner NEEDS a tailored distribution but whose
     /// build failed. Without this they would silently resolve against
@@ -595,9 +595,9 @@ impl JdpDeclaredJobRegistry {
     }
 
     /// Mark a JDP session as requiring a tailored distribution it does
-    /// not have — its miner is Solo / Group-Solo / Blockparty and the
+    /// not have — either its miner is Solo or Group-Solo and the
     /// tailored build failed (no fee address, engine error, no
-    /// template).
+    /// template), or it is Blockparty, which JDP refuses to serve.
     ///
     /// Without this the session falls through to the pool-wide slot and
     /// declares against the PPLNS weights, so a group's block pays the

@@ -15,7 +15,7 @@
 //! - Decoupled from any I/O — unit tests pin every boundary byte from
 //!   the protocol spec without spawning a TCP listener.
 //!
-//! # What's NOT here (see `DEFERRED.md` for tracker rows)
+//! # What's NOT here
 //!
 //! - TCP server / accept loop / per-port config — composition concern,
 //!   lives in `bin/blitzpool`.
