@@ -701,13 +701,16 @@ mod tests {
     // ── the projection the mining side actually consumes ───────────
 
     /// `job_ref()` is the ONLY production site that builds
-    /// `BridgeJobRef.binding` — `server.rs` calls it, nothing else. The
-    /// mining-handler tests build the field through their own copy of this
-    /// projection, so without this test the registry could stop projecting
-    /// entirely and the whole suite would stay green while every real
-    /// Full-Template `SetCustomMiningJob` was hard-rejected. The binding
-    /// fails closed, so such a defect is indistinguishable from a correct
-    /// refusal from the outside.
+    /// `BridgeJobRef.binding` — `server.rs` calls it, nothing else.
+    ///
+    /// It reads the projection back off the declared bytes rather than
+    /// through a second copy of the projection, which is what makes it
+    /// worth having next to the mining-handler tests: those drive the real
+    /// registry too (`job_ref_for` registers and calls `job_ref`), so a
+    /// registry that stopped projecting takes 20 tests down with it —
+    /// measured. What this one adds is WHICH bytes came through, on a
+    /// binding that fails closed and is therefore indistinguishable from a
+    /// correct refusal when only the verdict is checked.
     #[test]
     fn job_ref_carries_the_declaration_projected() {
         let mut reg = JdpDeclaredJobRegistry::new();
