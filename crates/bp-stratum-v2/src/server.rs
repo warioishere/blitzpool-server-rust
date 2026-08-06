@@ -740,6 +740,14 @@ async fn run_mining_connection(
                     &bridge,
                     now_ms(),
                 );
+                // SV2 §3.6.3: `SetupConnection.Error` is sent "prior to
+                // closing the connection". Read the request BEFORE the write
+                // consumes the outbound batch; act on it AFTER, so the client
+                // still receives the frame telling it why.
+                let disconnect = outcome.events.iter().find_map(|e| match e {
+                    SessionEvent::Disconnect { reason } => Some(reason.clone()),
+                    _ => None,
+                });
                 let write_start = std::time::Instant::now();
                 if let Err(err) = write_outbound_frames(
                     &mut writer,
@@ -750,6 +758,10 @@ async fn run_mining_connection(
                 .await
                 {
                     warn!("sv2 connection {session_id_hex} write: {err:?}");
+                    break;
+                }
+                if let Some(reason) = disconnect {
+                    debug!("sv2 connection {session_id_hex} closing after setup rejection: {reason}");
                     break;
                 }
                 let write_us = write_start.elapsed().as_micros();
@@ -1359,6 +1371,9 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
     for event in events {
         match event {
             SessionEvent::SetupComplete => {}
+            // Acted on in the connection loop, which owns the socket —
+            // it breaks once the rejection frame is written.
+            SessionEvent::Disconnect { .. } => {}
             SessionEvent::ChannelOpened {
                 channel_id,
                 address,

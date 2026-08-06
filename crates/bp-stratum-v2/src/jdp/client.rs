@@ -38,8 +38,9 @@
 //!   and lets the same handler-layer drive both production wiring +
 //!   regtest.
 //! - **No socket destruction inside the handler**. We emit
-//!   [`JdpSessionEvent::Disconnect`] on protocol mismatch and let the
-//!   IO layer handle the close.
+//!   [`JdpSessionEvent::Disconnect`] on protocol / version mismatch;
+//!   the IO layer writes the pending `SetupConnection.Error` first and
+//!   closes after it, per SV2 §3.6.3.
 //!
 //! ## Implementation strategy
 //!

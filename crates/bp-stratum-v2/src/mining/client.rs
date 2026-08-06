@@ -465,6 +465,10 @@ pub enum SessionEvent {
     /// connection level (we accepted its protocol version + vendor).
     /// Caller can register the connection in the live-clients registry.
     SetupComplete,
+    /// The connection must be closed once the pending outbound frames
+    /// are on the wire. Emitted with `SetupConnection.Error`, which SV2
+    /// §3.6.3 defines as being sent "prior to closing the connection".
+    Disconnect { reason: String },
     /// A new mining channel opened. Caller can record per-channel
     /// metadata (DB, registry).
     ChannelOpened {
@@ -732,16 +736,33 @@ impl<C: Clock + Clone> MiningSessionState<C> {
 /// SV2 spec returns `SetupConnectionError.flags` as the bitset of
 /// flags we DON'T accept — for `protocol-version-mismatch` it's 0;
 /// for unsupported flags it's the offending bits.
+/// `SetupConnection.Error` plus the request to close.
+///
+/// SV2 §3.6.3: the server sends this message "prior to closing the
+/// connection". The frame goes out first — the IO layer breaks only after
+/// the write — or the client never learns why it was refused.
+fn setup_rejected(error_code: &str, reason: String) -> HandlerOutcome {
+    let mut outcome = HandlerOutcome::with_frame(OutboundFrame::SetupConnectionError {
+        flags: 0,
+        error_code: error_code.to_string(),
+    });
+    outcome.events.push(SessionEvent::Disconnect { reason });
+    outcome
+}
+
 pub fn handle_setup_connection<C: Clock>(
     state: &mut MiningSessionState<C>,
     input: &SetupConnectionInput,
 ) -> HandlerOutcome {
     // Version range intersection check.
     if input.min_version > MAX_PROTOCOL_VERSION || input.max_version < MIN_PROTOCOL_VERSION {
-        return HandlerOutcome::with_frame(OutboundFrame::SetupConnectionError {
-            flags: 0,
-            error_code: ERR_PROTOCOL_VERSION_MISMATCH.to_string(),
-        });
+        return setup_rejected(
+            ERR_PROTOCOL_VERSION_MISMATCH,
+            format!(
+                "version range {}–{} does not include {MIN_PROTOCOL_VERSION}",
+                input.min_version, input.max_version
+            ),
+        );
     }
 
     // Sub-protocol gate. We accept Mining (0) and TDP-only (2). TDP
@@ -755,11 +776,11 @@ pub fn handle_setup_connection<C: Clock>(
         PROTOCOL_TEMPLATE_DISTRIBUTION => {
             state.is_tdp_client = true;
         }
-        _ => {
-            return HandlerOutcome::with_frame(OutboundFrame::SetupConnectionError {
-                flags: 0,
-                error_code: ERR_UNSUPPORTED_PROTOCOL.to_string(),
-            });
+        other => {
+            return setup_rejected(
+                ERR_UNSUPPORTED_PROTOCOL,
+                format!("protocol {other} is not served on this port"),
+            );
         }
     }
 
@@ -3037,6 +3058,13 @@ mod tests {
             }
             _ => panic!("expected error"),
         }
+        // SV2 §3.6.3: the error is sent prior to closing the connection.
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Disconnect { .. })),
+            "a rejected setup must ask the IO layer to close"
+        );
         assert!(!s.setup_complete);
     }
 
@@ -3074,6 +3102,44 @@ mod tests {
         }
         assert!(!s.is_tdp_client);
         assert!(!s.setup_complete);
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Disconnect { .. })),
+            "a rejected setup must ask the IO layer to close"
+        );
+    }
+
+    /// The negative half: an ACCEPTED setup must not ask for a close.
+    /// Without this, "everything disconnects" would read the same as
+    /// "rejections disconnect" — including the TDP-only path, which
+    /// shares this handler and must stay open.
+    #[test]
+    fn an_accepted_setup_does_not_ask_for_a_close() {
+        for (label, input) in [
+            ("mining", good_setup()),
+            ("tdp-only", {
+                let mut i = good_setup();
+                i.protocol = PROTOCOL_TEMPLATE_DISTRIBUTION;
+                i
+            }),
+        ] {
+            let mut s = fresh_session();
+            let out = handle_setup_connection(&mut s, &input);
+            assert!(
+                matches!(
+                    out.outbound[0],
+                    OutboundFrame::SetupConnectionSuccess { .. }
+                ),
+                "{label} must be accepted"
+            );
+            assert!(
+                !out.events
+                    .iter()
+                    .any(|e| matches!(e, SessionEvent::Disconnect { .. })),
+                "{label} must NOT be disconnected"
+            );
+        }
     }
 
     // ── OpenStandardMiningChannel ──────────────────────────────────

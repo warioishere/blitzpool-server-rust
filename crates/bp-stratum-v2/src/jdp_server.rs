@@ -870,6 +870,14 @@ async fn run_jdp_connection(
                         ),
                     }
                 }
+                // SV2 §3.6.3: `SetupConnection.Error` is sent "prior to
+                // closing the connection". Read the request BEFORE the write
+                // consumes the outbound batch; act on it AFTER, so the client
+                // still receives the frame telling it why.
+                let disconnect = outcome.events.iter().find_map(|e| match e {
+                    JdpSessionEvent::Disconnect { reason } => Some(reason.clone()),
+                    _ => None,
+                });
                 // Register declared jobs in the bridge BEFORE the frames go
                 // out, and therefore before `fan_out_events`.
                 //
@@ -894,6 +902,10 @@ async fn run_jdp_connection(
                     break;
                 }
                 outcome.outbound = Vec::new();
+                if let Some(reason) = disconnect {
+                    debug!("jdp {session_id_hex} closing after setup rejection: {reason}");
+                    break;
+                }
                 // Identity became known (allocate) on a negotiated
                 // session → check for a tailored distribution (Solo or
                 // Group-Solo). PPLNS miners ride the pool-wide push;
@@ -1185,8 +1197,8 @@ fn wire_from_entry(entry: &PayoutDistributionEntry) -> SetPayoutDistribution {
 /// Fan out [`JdpSessionEvent`]s: SetupComplete and TokenAllocated are
 /// informational, JobDeclared was registered in the bridge before the
 /// outbound write, BlockSubmissionCandidate goes to the
-/// block-submission sink, Disconnect closes the connection (caller
-/// handles via the cancel-token path).
+/// block-submission sink. Disconnect is not handled here — the
+/// connection loop reads it off the outcome and breaks after the write.
 async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
     for event in events {
         match event {
@@ -1225,11 +1237,9 @@ async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
                     )
                     .await;
             }
-            JdpSessionEvent::Disconnect { .. } => {
-                // Disconnect signal — connection-task break-condition.
-                // The select-loop already broke once we hit this; no
-                // additional action.
-            }
+            // Acted on in the connection loop, which owns the socket —
+            // it breaks once the rejection frame is written.
+            JdpSessionEvent::Disconnect { .. } => {}
         }
     }
 }

@@ -502,11 +502,42 @@ async fn jdp_push_distribution_end_to_end() {
         ERR_INVALID_PAYOUT_DISTRIBUTION,
     );
 
+    // ── Connection 3: a refused setup is answered, then closed ────────
+    //
+    // SV2 §3.6.3: `SetupConnection.Error` is sent "prior to closing the
+    // connection". Both halves matter and are asserted here: the client
+    // must LEARN why (the error frame arrives), and the socket must then
+    // go (the next read ends). Without the close the pool holds an FD for
+    // a session that can do nothing — there is no idle timeout on this
+    // path.
+    let (mut reader3, mut writer3) = connect_jdc(addr).await;
+    write_msg(&mut writer3, setup_connection_wrong_protocol(addr.port())).await;
+    match read_jdc(&mut reader3).await {
+        JdcInbound::Message(AnyMessage::Common(CommonMessages::SetupConnectionError(e))) => {
+            assert_eq!(
+                std::str::from_utf8(e.error_code.as_ref()).unwrap(),
+                "unsupported-protocol"
+            );
+        }
+        other => panic!("expected SetupConnectionError, got {other:?}"),
+    }
+    // The server closes: reading again ends rather than hanging. A
+    // timeout here means the connection stayed open — the bug this
+    // asserts against.
+    let after = tokio::time::timeout(Duration::from_secs(5), reader3.read_frame()).await;
+    match after {
+        Ok(Err(_)) => {}
+        Ok(Ok(f)) => panic!("expected the server to close, got another frame: {f:?}"),
+        Err(_) => panic!("the server left a refused connection open"),
+    }
+
     // ── Teardown ──────────────────────────────────────────────────────
     drop(writer);
     drop(reader);
     drop(writer2);
     drop(reader2);
+    drop(writer3);
+    drop(reader3);
     server.shutdown().await;
     accept_handle.abort();
 }
@@ -598,6 +629,26 @@ fn entry_with_id(id: u64) -> PayoutDistributionEntry {
 
 type Reader = NoiseTcpReadHalf<AnyMessage<'static>>;
 type Writer = NoiseTcpWriteHalf<AnyMessage<'static>>;
+
+/// A `SetupConnection` the JDP server must refuse: the Mining
+/// sub-protocol on the job-declaration port.
+fn setup_connection_wrong_protocol(port: u16) -> AnyMessage<'static> {
+    AnyMessage::Common(CommonMessages::SetupConnection(
+        SetupConnection {
+            protocol: Protocol::MiningProtocol,
+            min_version: 2,
+            max_version: 2,
+            flags: FLAG_DECLARE_TX_DATA,
+            endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
+            endpoint_port: port,
+            vendor: "test-jdc".to_string().try_into().unwrap(),
+            hardware_version: "rev1".to_string().try_into().unwrap(),
+            firmware: "0.1".to_string().try_into().unwrap(),
+            device_id: "jdc-wrong-protocol".to_string().try_into().unwrap(),
+        }
+        .into_static(),
+    ))
+}
 
 async fn connect_jdc(addr: std::net::SocketAddr) -> (Reader, Writer) {
     let socket = TcpStream::connect(addr).await.expect("connect");
