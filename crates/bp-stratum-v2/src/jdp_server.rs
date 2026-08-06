@@ -940,7 +940,7 @@ async fn run_jdp_connection(
                         }
                     }
                 }
-                fan_out_events(outcome.events, &session_id, &bridge, &hooks, now_ms()).await;
+                fan_out_events(outcome.events, &hooks).await;
             }
         }
     }
@@ -1188,54 +1188,21 @@ fn wire_from_entry(entry: &PayoutDistributionEntry) -> SetPayoutDistribution {
     }
 }
 
-/// Fan out [`JdpSessionEvent`]s: TokenAllocated is informational,
-/// JobDeclared registers in the bridge for the mining server's
-/// SetCustomMiningJob lookup, BlockSubmissionCandidate goes to the
+/// Fan out [`JdpSessionEvent`]s: SetupComplete and TokenAllocated are
+/// informational, JobDeclared was registered in the bridge before the
+/// outbound write, BlockSubmissionCandidate goes to the
 /// block-submission sink, Disconnect closes the connection (caller
 /// handles via the cancel-token path).
-async fn fan_out_events(
-    events: Vec<JdpSessionEvent>,
-    jdp_session_id: &u32,
-    bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
-    hooks: &JdpServerHooks,
-    now_ms: u64,
-) {
+async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
     for event in events {
         match event {
             JdpSessionEvent::SetupComplete { .. } => {}
             JdpSessionEvent::TokenAllocated { .. } => {}
-            JdpSessionEvent::JobDeclared {
-                new_token,
-                original_token,
-                miner_address,
-                prev_hash,
-            } => {
-                // Pull the full DeclaredJob out of the session store
-                // so the bridge entry carries the complete payload
-                // for the mining-side SetCustomMiningJob handler.
-                // We can't read the session here (we don't have it),
-                // so we register a stub and rely on the mining-handler
-                // to consult the bridge for cross-check only. For
-                // full data, the IO-layer needs to thread the
-                // session-state reference through; deferred.
-                let _ = (
-                    new_token,
-                    original_token,
-                    miner_address,
-                    prev_hash,
-                    bridge,
-                    jdp_session_id,
-                    now_ms,
-                );
-                // Note: full bridge.register requires the DeclaredJob
-                // payload from `state.declared_jobs[new_token]`. This
-                // is doable but requires either an `Arc<Mutex>` on
-                // the session state or threading the registration
-                // back into `run_jdp_connection`'s scope. For now:
-                // bridge registration happens inline in
-                // `run_jdp_connection` via `register_declared_job`
-                // (see below) — events fan-out only logs.
-            }
+            // Already registered, before the outbound write — see the
+            // `register_declared_jobs_in_bridge` call in
+            // `run_jdp_connection`, which has the session state this
+            // fan-out does not carry. Do not register here as well.
+            JdpSessionEvent::JobDeclared { .. } => {}
             JdpSessionEvent::BlockSubmissionCandidate {
                 miner_address,
                 new_token,
