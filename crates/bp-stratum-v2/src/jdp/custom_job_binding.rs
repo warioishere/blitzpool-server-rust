@@ -302,8 +302,6 @@ mod tests {
         }
         DeclaredJob {
             new_token: Token([1u8; 16]),
-            original_token: Token([0u8; 16]),
-            request_id: 1,
             version: 0x2000_0000,
             coinbase_tx_prefix,
             coinbase_tx_suffix,

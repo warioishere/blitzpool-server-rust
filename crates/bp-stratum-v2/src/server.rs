@@ -2546,8 +2546,6 @@ mod tests {
         let token = Token([7u8; 16]);
         let declared_job = crate::jdp::declarations::DeclaredJob {
             new_token: token,
-            original_token: Token([0u8; 16]),
-            request_id: 1,
             version: 0x2000_0000,
             coinbase_tx_prefix,
             coinbase_tx_suffix,

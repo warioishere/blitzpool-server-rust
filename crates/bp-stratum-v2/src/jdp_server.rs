@@ -1196,7 +1196,7 @@ fn wire_from_entry(entry: &PayoutDistributionEntry) -> SetPayoutDistribution {
 async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
     for event in events {
         match event {
-            JdpSessionEvent::SetupComplete { .. } => {}
+            JdpSessionEvent::SetupComplete => {}
             JdpSessionEvent::TokenAllocated { .. } => {}
             // Already registered, before the outbound write — see the
             // `register_declared_jobs_in_bridge` call in
@@ -1816,8 +1816,6 @@ mod tests {
         let token = Token([0xAA; 16]);
         let job = DeclaredJob {
             new_token: token,
-            original_token: Token([0xBB; 16]),
-            request_id: 1,
             version: 0,
             coinbase_tx_prefix: vec![],
             coinbase_tx_suffix: vec![],
@@ -1832,9 +1830,7 @@ mod tests {
         let bridge = fresh_bridge();
         let events = vec![JdpSessionEvent::JobDeclared {
             new_token: token,
-            original_token: Token([0xBB; 16]),
             miner_address: AddressId::new(ADDR.to_string()).unwrap(),
-            prev_hash: Some([0xCC; 32]),
         }];
         register_declared_jobs_in_bridge(&state, &bridge, 42, 1_000, &events);
         let r = bridge.read().unwrap();

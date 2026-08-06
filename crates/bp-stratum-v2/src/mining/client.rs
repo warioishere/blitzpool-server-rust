@@ -5858,8 +5858,6 @@ mod tests {
         RegisteredDeclaredJob {
             declared_job: JdpDeclaredJob {
                 new_token: token,
-                original_token: Token([0u8; 16]),
-                request_id: 1,
                 version: 0x2000_0000,
                 coinbase_tx_prefix,
                 coinbase_tx_suffix,
@@ -7085,8 +7083,6 @@ mod tests {
         let entry = RegisteredDeclaredJob {
             declared_job: JdpDeclaredJob {
                 new_token: token,
-                original_token: Token([0u8; 16]),
-                request_id: 1,
                 version: 0x2000_0000,
                 coinbase_tx_prefix: raw[..index].to_vec(),
                 coinbase_tx_suffix: raw[index + FIXTURE_DECLARED_SLOT..].to_vec(),

@@ -278,8 +278,11 @@ pub enum JdpOutboundFrame {
 #[derive(Clone, Debug)]
 pub enum JdpSessionEvent {
     /// `SetupConnection` completed. Caller can register the JDP
-    /// connection in the live-connection registry.
-    SetupComplete { full_template_mode: bool },
+    /// connection in the live-connection registry. The negotiated
+    /// Full-Template flag is not carried: it lives on
+    /// [`JdpSessionState::full_template_mode`], which is what every
+    /// gate reads.
+    SetupComplete,
     /// A token was allocated. Caller can persist (e.g. for cross-
     /// connection coinbase-outputs lookups via the
     /// `findEmittedOutputsForJob`-equivalent).
@@ -290,11 +293,14 @@ pub enum JdpSessionEvent {
     /// A `DeclareMiningJob` was accepted. Caller fans out to the
     /// mining-protocol bridge to build a `SetCustomMiningJob` for
     /// the matching JDC miner.
+    ///
+    /// Carries only what the bridge registration keys on. Everything
+    /// else about the job — the declared tip included — is read off the
+    /// stored [`DeclaredJob`] under `new_token`, so nothing here may
+    /// disagree with it.
     JobDeclared {
         new_token: Token,
-        original_token: Token,
         miner_address: AddressId,
-        prev_hash: Option<[u8; 32]>,
     },
     /// A `PushSolution` has been resolved against a declared job —
     /// the IO layer assembles the final block (merkle root + 80-byte
@@ -416,7 +422,6 @@ pub struct JdpSessionState {
 pub struct PendingState {
     pub input: DeclareMiningJobInput,
     pub pending: PendingDeclaration,
-    pub original_token: Token,
     pub miner_address: AddressId,
     /// Pool chain-tip when the `DeclareMiningJob` arrived. Compared against
     /// the tip when `ProvideMissingTransactions.Success` completes the
@@ -499,7 +504,7 @@ pub fn handle_setup_connection(
             used_version: state.used_version,
             flags: negotiated_flags,
         }],
-        events: vec![JdpSessionEvent::SetupComplete { full_template_mode }],
+        events: vec![JdpSessionEvent::SetupComplete],
     }
 }
 
@@ -704,7 +709,6 @@ pub fn handle_declare_mining_job(
         }
     };
 
-    let original_token = allocated.token;
     let miner_address = allocated.miner_address.clone();
 
     let partition = partition_against_template(&input.wtxid_list, template_txs);
@@ -714,7 +718,6 @@ pub fn handle_declare_mining_job(
             state,
             input,
             partition.known_raw_txs,
-            original_token,
             miner_address,
             current_prev_hash,
             distribution,
@@ -733,7 +736,6 @@ pub fn handle_declare_mining_job(
             missing_positions: partition.missing_positions,
             known_raw_txs: partition.known_raw_txs,
         },
-        original_token,
         miner_address,
         prev_hash_at_declare: current_prev_hash,
     });
@@ -796,7 +798,6 @@ pub fn handle_provide_missing_transactions_success(
         state,
         &pending.input,
         merged,
-        pending.original_token,
         pending.miner_address,
         current_prev_hash,
         distribution,
@@ -822,7 +823,6 @@ fn accept_declaration(
     state: &mut JdpSessionState,
     input: &DeclareMiningJobInput,
     raw_transactions: HashMap<u32, Vec<u8>>,
-    original_token: Token,
     miner_address: AddressId,
     current_prev_hash: Option<[u8; 32]>,
     distribution: Option<DistributionAcceptance>,
@@ -988,8 +988,6 @@ fn accept_declaration(
 
     state.declared_jobs.insert(DeclaredJob {
         new_token,
-        original_token,
-        request_id: input.request_id,
         version: input.version,
         coinbase_tx_prefix: input.coinbase_tx_prefix.clone(),
         coinbase_tx_suffix: input.coinbase_tx_suffix.clone(),
@@ -1008,9 +1006,7 @@ fn accept_declaration(
         }],
         events: vec![JdpSessionEvent::JobDeclared {
             new_token,
-            original_token,
             miner_address,
-            prev_hash: current_prev_hash,
         }],
     }
 }
@@ -1368,13 +1364,10 @@ mod tests {
             }
         ));
         assert!(s.setup_complete);
+        // The negotiated mode lives on the session state — that is what
+        // the Declare and PushSolution gates read.
         assert!(s.full_template_mode);
-        assert!(matches!(
-            out.events[0],
-            JdpSessionEvent::SetupComplete {
-                full_template_mode: true
-            }
-        ));
+        assert!(matches!(out.events[0], JdpSessionEvent::SetupComplete));
     }
 
     #[test]

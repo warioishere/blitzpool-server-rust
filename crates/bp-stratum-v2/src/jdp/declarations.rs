@@ -47,12 +47,6 @@ pub struct DeclaredJob {
     /// the JDC's reference for `PushSolution` and (via the SV2
     /// mining-protocol bridge) `SetCustomMiningJob`.
     pub new_token: Token,
-    /// Token the JDC presented in `DeclareMiningJob` (an earlier
-    /// `AllocateMiningJobToken` token). Kept for audit / debug.
-    pub original_token: Token,
-    /// The JDC's `DeclareMiningJob.request_id` — echoed in the
-    /// `Success` frame.
-    pub request_id: u32,
     /// Block-header `version` field the JDC declared.
     pub version: u32,
     /// Coinbase prefix as the JDC declared it (everything before the
@@ -238,8 +232,6 @@ mod tests {
     fn job(token_seed: u8, declared_at: u64, prev_hash: Option<[u8; 32]>) -> DeclaredJob {
         DeclaredJob {
             new_token: tok(token_seed),
-            original_token: tok(token_seed.wrapping_add(0x80)),
-            request_id: token_seed as u32,
             version: 0x2000_0000,
             coinbase_tx_prefix: vec![0xAA; 8],
             coinbase_tx_suffix: vec![0xBB; 8],
