@@ -2471,8 +2471,14 @@ pub struct SetCustomMiningJobInput {
     pub coinbase_tx_outputs: Vec<u8>,
     pub coinbase_tx_locktime: u32,
     pub merkle_path: Vec<[u8; 32]>,
-    /// The ext 0x0003 §6 `distribution_id` TLV, when present and the
-    /// extension is negotiated on this connection (IO-layer-extracted).
+    /// The ext 0x0003 §6 `distribution_id` TLV, exactly as it arrived on this
+    /// frame — extracted by the IO layer UNCONDITIONALLY, *not* filtered by
+    /// the negotiated set.
+    ///
+    /// That is deliberate and load-bearing: §2 requires a TLV from a
+    /// non-negotiated client to be rejected, and a field that were pre-filtered
+    /// to `None` would make that gate unreachable and invite its deletion. The
+    /// handler owns the check.
     pub distribution_id: Option<u64>,
 }
 
@@ -2498,8 +2504,12 @@ pub struct SetCustomMiningJobInput {
 /// arbitrary self-built jobs feed the share pipeline.
 ///
 /// **ext 0x0003 payout validation**: the IO layer resolves the job's
-/// `distribution_id` TLV against the bridge registry and passes the
-/// [`DistributionAcceptance`]. The submitted `coinbase_tx_outputs` MUST
+/// distribution reference — the §6 TLV on this frame (Coinbase-only) or the
+/// one the declaration carried (Full-Template, where §6 puts the TLV on
+/// `DeclareMiningJob` instead), via
+/// [`crate::bridge::effective_distribution_id`] — against the bridge registry
+/// and passes the [`DistributionAcceptance`]. The submitted
+/// `coinbase_tx_outputs` MUST
 /// match the §4 recompute positionally (§7.1), and for a tailored
 /// distribution the channel address MUST match its owner (the sole
 /// cross-account guard in Coinbase-only mode, where there is no
@@ -2517,9 +2527,9 @@ pub struct SetCustomMiningJobInput {
 /// - Bridge miner-address mismatch →
 ///   `invalid-job-param-value-token-mismatch`.
 /// - Bridge declared-tip mismatch → `stale-chain-tip`.
-/// - No distribution reference + non-Solo stream →
-///   `custom-jobs-require-solo` (base custom jobs must not feed shared
-///   accounting).
+/// - No distribution reference on the frame AND none on the declaration +
+///   non-Solo stream → `custom-jobs-require-solo` (base custom jobs must not
+///   feed shared accounting).
 /// - Else: rebuild `coinbase_tx_prefix` + `coinbase_tx_suffix` from
 ///   the JDC's scriptSig fragments, allocate
 ///   `channel.next_job_id`, insert [`ExtendedJob`] (with
@@ -2559,6 +2569,32 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     if bridge_job.is_none() && input.distribution_id.is_none() {
         return reject(ERR_INVALID_MINING_JOB_TOKEN);
     }
+
+    // ext 0x0003 §6 places the `distribution_id` TLV per Job Declaration mode,
+    // and only Coinbase-only puts it on THIS message — a conformant
+    // Full-Template JDC put it on `DeclareMiningJob`, where the JDP side
+    // validated the declared coinbase against it and stored it with the
+    // declaration. Reading the frame alone would see `None` for that JDC and
+    // classify a fully-backed job as an unbacked self-built one.
+    //
+    // Inheriting the reference does NOT inherit its acceptance: the resolution
+    // still runs against the §7.2/§10 window, so a declaration accepted under
+    // a since-superseded or settlement-invalidated distribution is rejected
+    // here exactly as a stale TLV would be.
+    //
+    // Inheritance is deliberately narrow — off Solo, and only where §2 lets
+    // this connection use the extension at all. `resolve_distribution_reference`
+    // owns both guards, and the IO layer resolved the acceptance above through
+    // the same call, so the id validated here is the id that was resolved.
+    let distribution_ref = crate::bridge::resolve_distribution_reference(
+        input.distribution_id,
+        bridge_job,
+        state.stream,
+        state
+            .negotiated_extensions
+            .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS),
+    )
+    .map(|reference| reference.distribution_id());
 
     // Channel-locked miner address — cross-checked below against the bridge
     // entry and/or the referenced distribution's owner.
@@ -2634,7 +2670,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // Solo that's freeloading on the PPLNS window / group. With a
     // distribution reference (validated below) the coinbase is bound to
     // the published weights, so non-Solo is legitimate.
-    if input.distribution_id.is_none() && state.stream != StreamKind::Solo {
+    if distribution_ref.is_none() && state.stream != StreamKind::Solo {
         return reject(ERR_CUSTOM_JOB_REQUIRES_SOLO);
     }
 
@@ -2666,13 +2702,21 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // legitimately reference one distribution, and double-paying two
     // distributions at once is structurally impossible under positional
     // equality — so nothing here is consumed.
-    if input.distribution_id.is_some() {
-        if !state
-            .negotiated_extensions
-            .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
+    if distribution_ref.is_some() {
+        if input.distribution_id.is_some()
+            && !state
+                .negotiated_extensions
+                .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
         {
             // §2: TLV fields from a non-negotiated extension are a
             // protocol violation, not something to silently honour.
+            //
+            // Keyed on the FRAME's TLV, because that is what §2 speaks about
+            // — "any job declaration carrying this extension's TLV fields".
+            // An inherited reference is the pool's own inference and can only
+            // exist when this connection negotiated
+            // (`resolve_distribution_reference` refuses to synthesise one
+            // otherwise), so judging it here would be judging ourselves.
             return reject(ERR_INVALID_PAYOUT_DISTRIBUTION);
         }
         let entry = match distribution {
@@ -5824,11 +5868,41 @@ mod tests {
                 prev_hash: Some([0xAB; 32]),
                 declared_at_ms: 1_000,
                 booking: None,
+                distribution_id: None,
             },
             miner_address: AddressId::new(address.to_string()).unwrap(),
             jdp_session_id: session_id,
             registered_at_ms: 1_000,
         }
+    }
+
+    /// A Full-Template declaration accepted against `distribution_id` — what
+    /// the JDP side writes when the §6 TLV rode on `DeclareMiningJob` and the
+    /// coinbase recomputed against that distribution.
+    fn declared_under_distribution(
+        mut entry: RegisteredDeclaredJob,
+        distribution_id: u64,
+    ) -> RegisteredDeclaredJob {
+        entry.declared_job.distribution_id = Some(distribution_id);
+        entry.declared_job.booking = Some(crate::jdp::dynamic_outputs::PayoutBooking {
+            distribution_id,
+            payouts_fingerprint: [0u8; 32],
+            reference_reward_sats: 312_500_000,
+        });
+        entry
+    }
+
+    /// The same declaration against a distribution whose settlement snapshot
+    /// never landed (`bookable: false`): fully validated and served, but a
+    /// found block is reported instead of booked, so the JDP side leaves
+    /// `booking` empty while still recording what was referenced.
+    fn declared_under_unbookable_distribution(
+        mut entry: RegisteredDeclaredJob,
+        distribution_id: u64,
+    ) -> RegisteredDeclaredJob {
+        entry.declared_job.distribution_id = Some(distribution_id);
+        entry.declared_job.booking = None;
+        entry
     }
 
     #[test]
@@ -6403,6 +6477,270 @@ mod tests {
         }
     }
 
+    /// ext 0x0003 §6 places the `distribution_id` TLV per Job Declaration
+    /// mode, and Full-Template puts it on `DeclareMiningJob` — NOT on
+    /// `SetCustomMiningJob`. So a conformant Full-Template JDC arrives here
+    /// with no TLV at all, and the reference has to come from its
+    /// declaration.
+    ///
+    /// Both directions in one test on purpose: the accept alone would also
+    /// pass if the Solo gate had simply stopped gating, and the reject alone
+    /// would pass on a fixture that never referenced anything. Together they
+    /// pin it to the inheritance.
+    #[test]
+    fn full_template_custom_job_inherits_its_declarations_distribution() {
+        let entry = distribution_entry(None);
+        let blob = conformant_outputs(&entry, 312_500_000);
+        let token = Token([1u8; 16]);
+        let declared =
+            bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob);
+
+        // Declared under distribution 9, no TLV on the mining frame — the
+        // shape a spec-conformant Full-Template JDC actually sends.
+        let mut s = negotiated_session_with_extended_channel();
+        assert_ne!(
+            s.stream,
+            StreamKind::Solo,
+            "the Solo gate must be live, or this proves nothing"
+        );
+        let cid = s.primary_channel.unwrap();
+        let with_booking = declared_under_distribution(declared.clone(), 9);
+        let mut input = custom_job_matching(cid, &with_booking);
+        input.distribution_id = None;
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&with_booking)),
+            Some(&accepted(entry.clone())),
+            1_000,
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "a Full-Template job must be judged by the distribution its \
+             declaration referenced, got {:?}",
+            out.outbound[0]
+        );
+
+        // Negative control: same job, same absent TLV, but the declaration
+        // referenced nothing (base-protocol JDP). Then there is genuinely
+        // nothing backing the coinbase and the Solo gate must still bite.
+        let mut s = negotiated_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let mut input = custom_job_matching(cid, &declared);
+        input.distribution_id = None;
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&declared)),
+            Some(&accepted(entry)),
+            1_000,
+        );
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_CUSTOM_JOB_REQUIRES_SOLO);
+            }
+            other => panic!("a declaration referencing nothing must not inherit, got {other:?}"),
+        }
+    }
+
+    /// Inheriting the reference must not inherit a pass. The §7.1 recompute
+    /// runs on the SUBMITTED outputs either way — otherwise Full-Template
+    /// would be the one mode where dropping the TLV skips the check.
+    #[test]
+    fn inherited_distribution_still_validates_the_submitted_coinbase() {
+        let mut s = negotiated_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let token = Token([1u8; 16]);
+        // Declared (and mined) paying itself instead of the published weights.
+        let self_paying = bitcoin::consensus::serialize(&vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(312_500_000),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x00, 0x14, 0xBB]),
+        }]);
+        let declared = declared_under_distribution(
+            bridge_entry_declaring(
+                token,
+                REGTEST_ADDR,
+                42,
+                &FIXTURE_SCRIPT_SIG_PREFIX,
+                &self_paying,
+            ),
+            9,
+        );
+        let mut input = custom_job_matching(cid, &declared);
+        input.distribution_id = None;
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&declared)),
+            Some(&accepted(distribution_entry(None))),
+            1_000,
+        );
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_INVALID_PAYOUT_DISTRIBUTION);
+            }
+            other => panic!("an inherited reference must still be §7.1-checked, got {other:?}"),
+        }
+    }
+
+    /// A distribution whose settlement snapshot never landed is still served:
+    /// the declaration is validated, accepted, and mineable — only a found
+    /// block is reported instead of booked.
+    ///
+    /// Reading the reference off `booking` would silently turn that into a
+    /// hard refusal, i.e. a snapshot-write failure would stop the JDC from
+    /// mining at all instead of costing one booking. For an SRI JDC a refusal
+    /// here is fatal (solo fallback), so the degradation must stay a
+    /// degradation.
+    #[test]
+    fn an_unbookable_distribution_still_yields_a_mineable_job() {
+        let mut s = negotiated_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let token = Token([1u8; 16]);
+        let entry = distribution_entry(None);
+        let blob = conformant_outputs(&entry, 312_500_000);
+        let declared = declared_under_unbookable_distribution(
+            bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob),
+            9,
+        );
+        assert!(
+            declared.declared_job.booking.is_none(),
+            "the whole point is that this one carries no booking"
+        );
+        let mut input = custom_job_matching(cid, &declared);
+        input.distribution_id = None;
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&declared)),
+            Some(&accepted(entry)),
+            1_000,
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "a non-bookable distribution must cost a booking, not the job, got {:?}",
+            out.outbound[0]
+        );
+    }
+
+    /// §2: the extension must be negotiated on BOTH connections, and a client
+    /// that negotiated on only one MUST NOT use it. A declaration that
+    /// negotiated 0x0003 on its JDP connection therefore does not license a
+    /// mining connection that never did.
+    ///
+    /// The refusal is the base-protocol one — `custom-jobs-require-solo`,
+    /// exactly what this connection got before the inheritance path existed.
+    /// NOT `invalid-payout-distribution`: that code says "your TLV is a
+    /// protocol violation", and this client sent no TLV. Answering it here
+    /// would be blaming the JDC for a reference the pool inferred.
+    #[test]
+    fn inherited_distribution_needs_the_extension_on_the_mining_connection() {
+        let mut s = session_with_extended_channel(); // 0x0003 NOT negotiated here
+        let cid = s.primary_channel.unwrap();
+        let token = Token([1u8; 16]);
+        let entry = distribution_entry(None);
+        let blob = conformant_outputs(&entry, 312_500_000);
+        let declared = declared_under_distribution(
+            bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob),
+            9,
+        );
+        let mut input = custom_job_matching(cid, &declared);
+        input.distribution_id = None;
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&declared)),
+            Some(&accepted(entry)),
+            1_000,
+        );
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_CUSTOM_JOB_REQUIRES_SOLO);
+            }
+            other => panic!("§2 requires negotiation on this connection too, got {other:?}"),
+        }
+    }
+
+    /// A Solo stream has always been served a reference-less custom job, and
+    /// this commit must not change that. The inherited reference would drag it
+    /// into the §7.2/§10 acceptance window for the first time — so a pool
+    /// block settling between `DeclareMiningJobSuccess` and this frame, or any
+    /// supersession, would answer `stale-payout-distribution` where the job
+    /// used to be served. Fatal for an SRI jd-client.
+    ///
+    /// The unresolvable acceptance is the point: it is what a settled or
+    /// superseded distribution looks like here.
+    #[test]
+    fn a_solo_stream_is_untouched_by_its_declarations_distribution() {
+        let mut s = solo_session_with_extended_channel();
+        s.negotiated_extensions
+            .push(SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
+        let cid = s.primary_channel.unwrap();
+        let token = Token([1u8; 16]);
+        let entry = distribution_entry(None);
+        let blob = conformant_outputs(&entry, 312_500_000);
+        let declared = declared_under_distribution(
+            bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob),
+            9,
+        );
+        let mut input = custom_job_matching(cid, &declared);
+        input.distribution_id = None;
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&declared)),
+            None, // settled / superseded — nothing resolves
+            1_000,
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "a Solo job must not start failing on a window it never consulted, got {:?}",
+            out.outbound[0]
+        );
+    }
+
+    /// The mirror of the Solo carve-out: a stream whose shares DO enter shared
+    /// accounting must still be refused when its inherited reference no longer
+    /// resolves. Without this the carve-out could widen into "inherited
+    /// references skip the window", which is the freeloading direction.
+    #[test]
+    fn a_shared_accounting_stream_still_fails_on_an_unresolvable_inherited_id() {
+        let mut s = negotiated_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let token = Token([1u8; 16]);
+        let entry = distribution_entry(None);
+        let blob = conformant_outputs(&entry, 312_500_000);
+        let declared = declared_under_distribution(
+            bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob),
+            9,
+        );
+        assert_ne!(s.stream, StreamKind::Solo);
+        let mut input = custom_job_matching(cid, &declared);
+        input.distribution_id = None;
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&declared)),
+            None, // settled / superseded
+            1_000,
+        );
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_STALE_PAYOUT_DISTRIBUTION);
+            }
+            other => panic!("a withdrawn distribution must not be mineable, got {other:?}"),
+        }
+    }
+
     /// A pool-wide distribution (`owner: None`) is the PPLNS window's.
     /// A Group-Solo connection referencing it would mine blocks paying
     /// PPLNS while its shares earned a cut of the group's round.
@@ -6757,6 +7095,7 @@ mod tests {
                 prev_hash: Some([0xAB; 32]),
                 declared_at_ms: 1_000,
                 booking: None,
+                distribution_id: None,
             },
             miner_address: AddressId::new(REGTEST_ADDR.to_string()).unwrap(),
             jdp_session_id: 42,

@@ -83,6 +83,20 @@ pub struct DeclaredJob {
     /// declaration, or a connection that never negotiated 0x0003 — and then
     /// a found block is reported but not booked.
     pub booking: Option<PayoutBooking>,
+    /// ext 0x0003 §6: the `distribution_id` this declaration was accepted
+    /// against, whether or not a block found on it can be booked.
+    ///
+    /// Deliberately NOT read off [`Self::booking`], which is the narrower
+    /// claim: `booking` additionally requires the distribution's settlement
+    /// snapshot to have landed (`bookable`). A declaration against a
+    /// non-bookable distribution is still fully validated and still served —
+    /// only a found block is reported instead of booked. Deriving the
+    /// reference from `booking` would turn that degraded-but-working state
+    /// into a hard `custom-jobs-require-solo` refusal on the mining side.
+    ///
+    /// `None` for a base-protocol declaration, which is what the mining-side
+    /// Solo gate is meant to catch.
+    pub distribution_id: Option<u64>,
 }
 
 // ── DeclaredJobStore ─────────────────────────────────────────────────
@@ -234,6 +248,7 @@ mod tests {
             prev_hash,
             declared_at_ms: declared_at,
             booking: None,
+            distribution_id: None,
         }
     }
 

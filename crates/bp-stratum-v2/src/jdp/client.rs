@@ -873,6 +873,10 @@ fn accept_declaration(
     // When 0x0003 wasn't negotiated, this is a plain base-protocol
     // declaration and the block below is skipped.
     let mut declared_booking: Option<PayoutBooking> = None;
+    // Which distribution this declaration was accepted against. Set on every
+    // accepted 0x0003 declaration, including the non-bookable ones — see
+    // `DeclaredJob::distribution_id` for why the two must not be conflated.
+    let mut declared_distribution_id: Option<u64> = None;
     if state
         .negotiated_extensions
         .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
@@ -930,6 +934,10 @@ fn accept_declaration(
             &entry.additional_outputs,
         ) {
             Ok(_declared_revenue) => {
+                // The coinbase pays this distribution — record it as the
+                // declaration's reference regardless of bookability, so the
+                // mining side can judge the custom job against it.
+                declared_distribution_id = Some(entry.distribution_id);
                 // Vouch for booking only when the distribution's
                 // settlement snapshot actually landed.
                 if entry.bookable {
@@ -990,6 +998,7 @@ fn accept_declaration(
         prev_hash: current_prev_hash,
         declared_at_ms: now_ms,
         booking: declared_booking,
+        distribution_id: declared_distribution_id,
     });
 
     JdpHandlerOutcome {
@@ -1869,6 +1878,16 @@ mod tests {
     /// `bookable = false` (settlement snapshot missing): the
     /// declaration is still accepted, but no booking is stamped — a
     /// found block is reported, not booked.
+    ///
+    /// It MUST still record which distribution it was accepted against. That
+    /// reference is what the mining side inherits for a Full-Template job
+    /// (ext 0x0003 §6 puts the TLV on this message, not on
+    /// `SetCustomMiningJob`), and deriving it from `booking` instead would
+    /// turn a failed snapshot write — one lost booking — into
+    /// `custom-jobs-require-solo` on every subsequent job, which is fatal for
+    /// an SRI jd-client. This is the only test that runs the real writer
+    /// through `handle_declare_mining_job`; every other one hand-stamps the
+    /// field onto a fixture.
     #[test]
     fn declare_unbookable_distribution_accepted_without_booking() {
         let mut s = fresh();
@@ -1895,7 +1914,14 @@ mod tests {
             "unbookable distribution still serves the job, got {:?}",
             out.outbound[0]
         );
-        assert_eq!(s.declared_jobs.iter().next().unwrap().booking, None);
+        let declared = s.declared_jobs.iter().next().unwrap();
+        assert_eq!(declared.booking, None);
+        assert_eq!(
+            declared.distribution_id,
+            Some(7),
+            "the reference must survive a non-bookable distribution — it is \
+             what a Full-Template SetCustomMiningJob inherits"
+        );
     }
 
     #[test]
@@ -2089,14 +2115,18 @@ mod tests {
             f => panic!("expected DeclareMiningJobSuccess, got {f:?}"),
         }
         assert_eq!(s.declared_jobs.len(), 1);
+        let declared = s.declared_jobs.iter().next().unwrap();
         assert_eq!(
-            s.declared_jobs.iter().next().unwrap().booking,
+            declared.booking,
             Some(PayoutBooking {
                 distribution_id: 7,
                 payouts_fingerprint: [7u8; 32],
                 reference_reward_sats: 312_500_000,
             })
         );
+        // The mining side inherits this, not `booking` — the two are separate
+        // claims and only this one survives a non-bookable distribution.
+        assert_eq!(declared.distribution_id, Some(7));
     }
 
     #[test]

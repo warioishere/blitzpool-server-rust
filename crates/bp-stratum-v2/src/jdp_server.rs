@@ -870,16 +870,24 @@ async fn run_jdp_connection(
                         ),
                     }
                 }
-                if let Err(err) = write_jdp_outbound_frames(&mut writer, outcome.outbound).await {
-                    warn!("jdp {session_id_hex} write: {err:?}");
-                    break;
-                }
-                outcome.outbound = Vec::new();
-                // Register declared jobs in the bridge BEFORE
-                // fan_out_events: the bridge gives the mining-server
-                // its SetCustomMiningJob lookup, so it must be
-                // populated by the time the JobDeclared event is
-                // visible to other hooks.
+                // Register declared jobs in the bridge BEFORE the frames go
+                // out, and therefore before `fan_out_events`.
+                //
+                // Two reasons, and the first one is a race: the outbound batch
+                // contains `DeclareMiningJobSuccess{new_mining_job_token}`, and
+                // the JDC's MINING connection is a separate socket served by an
+                // independent task. The moment that token is on the wire the
+                // JDC may send `SetCustomMiningJob` for it. Per ext 0x0003 §6 a
+                // Full-Template frame carries no `distribution_id` TLV, so
+                // everything backing that job — the declaration binding AND its
+                // distribution reference — lives in the bridge entry alone; a
+                // lookup that misses answers `invalid-mining-job-token`, which
+                // an SRI jd-client treats as fatal. Publishing first closes the
+                // window at no cost: an entry for a token whose Success frame
+                // then fails to send simply expires unused.
+                //
+                // Second, unchanged: the bridge must be populated by the time
+                // the JobDeclared event is visible to other hooks.
                 register_declared_jobs_in_bridge(
                     &state,
                     &bridge,
@@ -887,6 +895,11 @@ async fn run_jdp_connection(
                     now_ms(),
                     &outcome.events,
                 );
+                if let Err(err) = write_jdp_outbound_frames(&mut writer, outcome.outbound).await {
+                    warn!("jdp {session_id_hex} write: {err:?}");
+                    break;
+                }
+                outcome.outbound = Vec::new();
                 // Identity became known (allocate) on a negotiated
                 // session → check for a tailored distribution (Solo /
                 // Group-Solo / Blockparty). PPLNS miners get `None`
@@ -1846,6 +1859,7 @@ mod tests {
             prev_hash: Some([0xCC; 32]),
             declared_at_ms: 500,
             booking: None,
+            distribution_id: None,
         };
         state.declared_jobs.insert(job);
         let bridge = fresh_bridge();
