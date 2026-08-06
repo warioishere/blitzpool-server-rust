@@ -24,7 +24,7 @@
 //!   per flusher and surfaces a one-shot threshold-crossing signal.
 //!
 //! The bulk-flush queries (PG `unnest(...)` upserts) and the cron schedule
-//! are deferred to the service-wiring layer — see `DEFERRED.md`.
+//! are deferred to the service-wiring layer.
 
 pub mod accumulator;
 pub mod buffer;

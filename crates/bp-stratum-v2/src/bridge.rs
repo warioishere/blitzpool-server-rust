@@ -43,11 +43,17 @@
 //!   [`JdpDeclaredJobRegistry::evict_for_jdp_session`] on connection
 //!   close — keeps the registry bounded as JDC connections come and
 //!   go).
-//! - The miner address (cross-checked against the mining-connection's
-//!   locked address when the mining-handler resolves the token, so
-//!   one miner can't steal another's declared job).
-//! - The wall-clock ms when the entry was registered (drives the
-//!   periodic-cleanup tick).
+//!
+//! The miner address is NOT a field of its own: it lives on the declared
+//! job, and [`JdpDeclaredJobRegistry::job_ref`] projects it from there for
+//! the mining-side cross-check (so one miner can't claim another's
+//! declared job). A second copy could name a different miner than the job
+//! it belongs to, and the block-found path books against that name.
+//!
+//! There is no age-based sweep, and none is owed: every exit path of
+//! the per-connection task — cancel, read error, write error — falls
+//! through to `evict_for_jdp_session`, so an entry cannot outlive its
+//! session.
 //!
 //! ## Lifecycle
 //!
@@ -60,7 +66,7 @@
 //!     ↓
 //! JDC opens mining connection, sends SetCustomMiningJob
 //!     ↓
-//! Mining-handler calls registry.lookup(&token)        (read)
+//! Mining-handler calls registry.job_ref(&token)       (read)
 //!     ↓ Some(...)
 //! Mining-handler builds ExtendedJob, emits Success
 //!     ↓
@@ -92,16 +98,11 @@ pub struct RegisteredDeclaredJob {
     /// merkle context + raw tx data. Mining-handler reads this to
     /// build the ExtendedJob.
     pub declared_job: DeclaredJob,
-    /// Miner address bound to this token. Cross-checked at lookup
-    /// time against the mining-connection's locked address.
-    pub miner_address: AddressId,
     /// JDP session id that registered the entry. Used by
     /// [`JdpDeclaredJobRegistry::evict_for_jdp_session`] when the
-    /// JDP connection closes.
+    /// JDP connection closes — which every exit path of the
+    /// per-connection task runs, so there is no age-based sweep.
     pub jdp_session_id: u32,
-    /// Wall-clock ms when the entry was registered. Drives
-    /// [`JdpDeclaredJobRegistry::cleanup_expired`].
-    pub registered_at_ms: u64,
 }
 
 /// Projection of a bridge entry for the mining-side `SetCustomMiningJob`
@@ -285,14 +286,14 @@ pub struct PayoutDistributionEntry {
     /// — the booking band is checked against this.
     pub reference_reward_sats: u64,
     /// Settlement-snapshot identity (weights fingerprint). `None` when
-    /// the owning mode books without a snapshot (Solo / Blockparty).
+    /// the owning mode books without a snapshot (Solo).
     pub payouts_fingerprint: Option<[u8; 32]>,
     /// Whether a booking may be stamped on jobs built from this
     /// distribution (`false` e.g. when the snapshot write failed — the
     /// job is still served, but a found block is reported-not-booked).
     pub bookable: bool,
     /// `None` = pool-wide (every connection may reference it);
-    /// `Some` = tailored to one miner (Solo / Group-Solo / Blockparty).
+    /// `Some` = tailored to one miner (Solo or Group-Solo).
     pub owner: Option<AddressId>,
     /// JDP session a tailored entry was published to (evicted with it).
     pub jdp_session_id: Option<u32>,
@@ -379,8 +380,8 @@ pub struct JdpDeclaredJobRegistry {
     /// Pool-wide distribution (PPLNS) — what every connection gets
     /// pushed on open and on the publisher's timer.
     pool_wide_distribution: DistributionSlot,
-    /// Tailored per-JDP-session distributions (Solo / Group-Solo /
-    /// Blockparty, published after the session's identity is known).
+    /// Tailored per-JDP-session distributions (Solo or Group-Solo,
+    /// published after the session's identity is known).
     tailored_distributions: HashMap<u32, DistributionSlot>,
     /// JDP sessions whose miner NEEDS a tailored distribution but whose
     /// build failed. Without this they would silently resolve against
@@ -394,14 +395,6 @@ pub struct JdpDeclaredJobRegistry {
 impl JdpDeclaredJobRegistry {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     /// Register a declared job. Returns the previously-registered
@@ -421,19 +414,15 @@ impl JdpDeclaredJobRegistry {
             .map(|s| s.entry)
     }
 
-    /// Look up a token. Returns `None` for unknown / evicted tokens
-    /// (mining-handler emits `invalid-job-id`-equivalent).
-    pub fn lookup(&self, token: &Token) -> Option<&RegisteredDeclaredJob> {
-        self.entries.get(token).map(|s| &s.entry)
-    }
-
     /// Projection of a token's bridge entry for the mining-side
     /// `SetCustomMiningJob` cross-checks. `None` for unknown / evicted
     /// tokens (the mining-handler fails closed on that, together with an
     /// absent payout set).
     pub fn job_ref(&self, token: &Token) -> Option<BridgeJobRef> {
         self.entries.get(token).map(|s| BridgeJobRef {
-            miner_address: s.entry.miner_address.clone(),
+            // Off the declaration itself — the entry keeps no second copy,
+            // so this cannot name a different miner than the job does.
+            miner_address: s.entry.declared_job.miner_address.clone(),
             declared_prev_hash: s.entry.declared_job.prev_hash,
             binding: s.binding.clone(),
             // Proven at declare time: set only by the ext-0x0003 check that
@@ -607,15 +596,10 @@ impl JdpDeclaredJobRegistry {
         }
     }
 
-    /// Number of live tailored slots. Diagnostics / tests.
-    pub fn tailored_distribution_count(&self) -> usize {
-        self.tailored_distributions.len()
-    }
-
     /// Mark a JDP session as requiring a tailored distribution it does
-    /// not have — its miner is Solo / Group-Solo / Blockparty and the
+    /// not have — either its miner is Solo or Group-Solo and the
     /// tailored build failed (no fee address, engine error, no
-    /// template).
+    /// template), or it is Blockparty, which JDP refuses to serve.
     ///
     /// Without this the session falls through to the pool-wide slot and
     /// declares against the PPLNS weights, so a group's block pays the
@@ -632,11 +616,6 @@ impl JdpDeclaredJobRegistry {
         self.pool_wide_denied.remove(&jdp_session_id);
     }
 
-    /// Drop one specific token. Idempotent.
-    pub fn remove(&mut self, token: &Token) -> Option<RegisteredDeclaredJob> {
-        self.entries.remove(token).map(|s| s.entry)
-    }
-
     /// Drop every entry owned by a closing JDP session. Returns the
     /// count removed — useful for diagnostics + the IO layer's
     /// connection-close log.
@@ -649,35 +628,6 @@ impl JdpDeclaredJobRegistry {
         self.tailored_distributions.remove(&jdp_session_id);
         self.pool_wide_denied.remove(&jdp_session_id);
         before - self.entries.len()
-    }
-
-    /// Sweep entries older than `max_age_ms`. Returns the count
-    /// removed. Run on a slow timer (e.g. once per minute) — most
-    /// entries are evicted by [`Self::evict_for_jdp_session`] on
-    /// connection close, this is just a backstop for tokens that
-    /// outlive their JDP session's clean teardown (forced
-    /// disconnect, OS-level reset). Boundary inclusive: an entry
-    /// whose age **equals** `max_age_ms` is kept.
-    pub fn cleanup_expired(&mut self, now_ms: u64, max_age_ms: u64) -> usize {
-        let before = self.entries.len();
-        self.entries
-            .retain(|_, s| now_ms.saturating_sub(s.entry.registered_at_ms) <= max_age_ms);
-        // Tailored distribution slots are NOT aged out here. They die
-        // with their session (`evict_for_jdp_session`, which the IO
-        // layer calls whenever a JDP connection task ends, clean or
-        // not), and a live session can hold one for days without ever
-        // republishing — a Solo distribution has a single payout entry
-        // and simply does not change. Ageing them on publish time would
-        // drop the slot underneath a connected miner, whose every later
-        // declaration then resolves against the pool-wide slot that
-        // never held its id and is answered `stale-payout-distribution`.
-        before - self.entries.len()
-    }
-
-    /// Iterate all registered tokens. Order is unspecified (HashMap
-    /// iteration). Used by diagnostics / tests.
-    pub fn iter(&self) -> impl Iterator<Item = (&Token, &RegisteredDeclaredJob)> {
-        self.entries.iter().map(|(t, s)| (t, &s.entry))
     }
 }
 
@@ -728,8 +678,7 @@ mod tests {
 
         DeclaredJob {
             new_token: token,
-            original_token: Token([0u8; 16]),
-            request_id: 1,
+            miner_address: addr(),
             version: 0x2000_0000,
             coinbase_tx_prefix: prefix,
             coinbase_tx_suffix: suffix,
@@ -742,30 +691,31 @@ mod tests {
         }
     }
 
-    fn registration(token: Token, session_id: u32, now_ms: u64) -> RegisteredDeclaredJob {
+    fn registration(token: Token, session_id: u32) -> RegisteredDeclaredJob {
         RegisteredDeclaredJob {
             declared_job: declared(token),
-            miner_address: addr(),
             jdp_session_id: session_id,
-            registered_at_ms: now_ms,
         }
     }
 
     // ── the projection the mining side actually consumes ───────────
 
     /// `job_ref()` is the ONLY production site that builds
-    /// `BridgeJobRef.binding` — `server.rs` calls it, nothing else. The
-    /// mining-handler tests build the field through their own copy of this
-    /// projection, so without this test the registry could stop projecting
-    /// entirely and the whole suite would stay green while every real
-    /// Full-Template `SetCustomMiningJob` was hard-rejected. The binding
-    /// fails closed, so such a defect is indistinguishable from a correct
-    /// refusal from the outside.
+    /// `BridgeJobRef.binding` — `server.rs` calls it, nothing else.
+    ///
+    /// It reads the projection back off the declared bytes rather than
+    /// through a second copy of the projection, which is what makes it
+    /// worth having next to the mining-handler tests: those drive the real
+    /// registry too (`job_ref_for` registers and calls `job_ref`), so a
+    /// registry that stopped projecting takes 20 tests down with it —
+    /// measured. What this one adds is WHICH bytes came through, on a
+    /// binding that fails closed and is therefore indistinguishable from a
+    /// correct refusal when only the verdict is checked.
     #[test]
     fn job_ref_carries_the_declaration_projected() {
         let mut reg = JdpDeclaredJobRegistry::new();
         let t = token(1);
-        reg.register(t, registration(t, 7, 1_000));
+        reg.register(t, registration(t, 7));
 
         let job_ref = reg.job_ref(&t).expect("registered token must resolve");
         assert_eq!(job_ref.miner_address, addr());
@@ -798,12 +748,12 @@ mod tests {
         let mut reg = JdpDeclaredJobRegistry::new();
 
         let declared_under_0x0003 = token(1);
-        let mut entry = registration(declared_under_0x0003, 7, 1_000);
+        let mut entry = registration(declared_under_0x0003, 7);
         entry.declared_job.distribution_id = Some(9);
         reg.register(declared_under_0x0003, entry);
 
         let base_protocol = token(2);
-        reg.register(base_protocol, registration(base_protocol, 7, 1_000));
+        reg.register(base_protocol, registration(base_protocol, 7));
 
         assert_eq!(
             reg.job_ref(&declared_under_0x0003)
@@ -832,7 +782,7 @@ mod tests {
     fn declared_ref(distribution_id: Option<u64>, session: u32) -> BridgeJobRef {
         let mut reg = JdpDeclaredJobRegistry::new();
         let t = token(1);
-        let mut entry = registration(t, session, 1_000);
+        let mut entry = registration(t, session);
         entry.declared_job.distribution_id = distribution_id;
         reg.register(t, entry);
         reg.job_ref(&t).expect("registered")
@@ -939,7 +889,7 @@ mod tests {
     fn job_ref_projects_none_for_an_unrebuildable_declaration() {
         let mut reg = JdpDeclaredJobRegistry::new();
         let t = token(2);
-        let mut entry = registration(t, 7, 1_000);
+        let mut entry = registration(t, 7);
         entry.declared_job.coinbase_tx_prefix = vec![0xAA; 8];
         reg.register(t, entry);
 
@@ -948,51 +898,40 @@ mod tests {
     }
 
     // ── basic CRUD ─────────────────────────────────────────────────
+    //
+    // Asserted through `job_ref` — the same call the mining server
+    // makes. A test-only accessor would prove less: it is not the
+    // surface that can break in production.
 
     #[test]
-    fn register_and_lookup_roundtrips() {
+    fn register_and_resolve_roundtrips() {
         let mut reg = JdpDeclaredJobRegistry::new();
         let t = token(1);
-        reg.register(t, registration(t, 42, 1_000));
-        let got = reg.lookup(&t).expect("must find");
+        reg.register(t, registration(t, 42));
+        let got = reg.job_ref(&t).expect("must resolve");
         assert_eq!(got.jdp_session_id, 42);
-        assert_eq!(got.declared_job.new_token, t);
         assert_eq!(got.miner_address.as_str(), ADDR);
     }
 
     #[test]
-    fn lookup_unknown_returns_none() {
+    fn unknown_token_does_not_resolve() {
         let reg = JdpDeclaredJobRegistry::new();
-        assert!(reg.lookup(&token(0xFF)).is_none());
+        assert!(reg.job_ref(&token(0xFF)).is_none());
     }
 
     #[test]
     fn register_overwrites_existing_token() {
         let mut reg = JdpDeclaredJobRegistry::new();
         let t = token(1);
-        reg.register(t, registration(t, 42, 1_000));
+        reg.register(t, registration(t, 42));
         let prev = reg
-            .register(t, registration(t, 99, 2_000))
+            .register(t, registration(t, 99))
             .expect("must return previous");
         assert_eq!(prev.jdp_session_id, 42);
-        assert_eq!(reg.lookup(&t).unwrap().jdp_session_id, 99);
-        assert_eq!(reg.len(), 1, "no duplicate stored");
-    }
-
-    #[test]
-    fn remove_drops_entry() {
-        let mut reg = JdpDeclaredJobRegistry::new();
-        let t = token(1);
-        reg.register(t, registration(t, 1, 1_000));
-        let removed = reg.remove(&t).expect("must remove");
-        assert_eq!(removed.jdp_session_id, 1);
-        assert!(reg.is_empty());
-    }
-
-    #[test]
-    fn remove_unknown_is_idempotent_noop() {
-        let mut reg = JdpDeclaredJobRegistry::new();
-        assert!(reg.remove(&token(0xFF)).is_none());
+        assert_eq!(reg.job_ref(&t).unwrap().jdp_session_id, 99);
+        // No duplicate stored: evicting the surviving session takes the
+        // single entry with it, so the count is the assertion.
+        assert_eq!(reg.evict_for_jdp_session(99), 1, "exactly one entry held");
     }
 
     // ── evict_for_jdp_session ──────────────────────────────────────
@@ -1000,67 +939,22 @@ mod tests {
     #[test]
     fn evict_for_jdp_session_removes_only_matching_session() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.register(token(1), registration(token(1), 42, 1_000));
-        reg.register(token(2), registration(token(2), 42, 1_100));
-        reg.register(token(3), registration(token(3), 99, 1_200));
+        reg.register(token(1), registration(token(1), 42));
+        reg.register(token(2), registration(token(2), 42));
+        reg.register(token(3), registration(token(3), 99));
         let evicted = reg.evict_for_jdp_session(42);
         assert_eq!(evicted, 2);
-        assert_eq!(reg.len(), 1);
-        assert!(reg.lookup(&token(3)).is_some());
-        assert!(reg.lookup(&token(1)).is_none());
+        assert!(reg.job_ref(&token(3)).is_some());
+        assert!(reg.job_ref(&token(1)).is_none());
+        assert!(reg.job_ref(&token(2)).is_none());
     }
 
     #[test]
     fn evict_for_unknown_session_returns_zero() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.register(token(1), registration(token(1), 42, 1_000));
+        reg.register(token(1), registration(token(1), 42));
         assert_eq!(reg.evict_for_jdp_session(999), 0);
-        assert_eq!(reg.len(), 1);
-    }
-
-    // ── cleanup_expired ────────────────────────────────────────────
-
-    #[test]
-    fn cleanup_expired_removes_only_aged_entries() {
-        let mut reg = JdpDeclaredJobRegistry::new();
-        reg.register(token(1), registration(token(1), 1, 1_000));
-        reg.register(token(2), registration(token(2), 1, 5_000));
-        // max_age = 1500 ms, now = 4_000:
-        //   entry 1: age 3_000 > 1_500 → evict
-        //   entry 2: now < registered_at → saturating_sub → 0 ≤ 1_500 → keep
-        let evicted = reg.cleanup_expired(4_000, 1_500);
-        assert_eq!(evicted, 1);
-        assert!(reg.lookup(&token(1)).is_none());
-        assert!(reg.lookup(&token(2)).is_some());
-    }
-
-    #[test]
-    fn cleanup_expired_boundary_is_inclusive() {
-        let mut reg = JdpDeclaredJobRegistry::new();
-        reg.register(token(1), registration(token(1), 1, 1_000));
-        let evicted = reg.cleanup_expired(1_000 + 1_500, 1_500);
-        assert_eq!(evicted, 0, "boundary age == max_age must keep");
-        assert!(reg.lookup(&token(1)).is_some());
-    }
-
-    #[test]
-    fn cleanup_expired_zero_age_returns_zero() {
-        let mut reg = JdpDeclaredJobRegistry::new();
-        reg.register(token(1), registration(token(1), 1, 1_000));
-        // now < registered_at: saturating_sub → 0, always ≤ max_age.
-        assert_eq!(reg.cleanup_expired(500, 100), 0);
-        assert!(reg.lookup(&token(1)).is_some());
-    }
-
-    // ── iter ───────────────────────────────────────────────────────
-
-    #[test]
-    fn iter_yields_all_entries() {
-        let mut reg = JdpDeclaredJobRegistry::new();
-        reg.register(token(1), registration(token(1), 1, 1_000));
-        reg.register(token(2), registration(token(2), 2, 2_000));
-        let collected: Vec<u32> = reg.iter().map(|(_, e)| e.jdp_session_id).collect();
-        assert_eq!(collected.len(), 2);
+        assert!(reg.job_ref(&token(1)).is_some(), "untouched");
     }
 
     // ── Payout distributions (ext 0x0003 push model) ────────────────
@@ -1355,39 +1249,29 @@ mod tests {
         assert_eq!(accepted_id(&reg.distribution_acceptance(1, scope)), Some(1));
     }
 
-    /// `tailored slot dies with its JDP session`
+    /// `tailored slot dies with its JDP session — and only with it`
+    ///
+    /// Asserted through `current_tailored`, which is what the connection
+    /// task actually asks before deciding whether to republish. A slot
+    /// count would answer a weaker question.
     #[test]
     fn tailored_slot_evicted_with_session() {
         let mut reg = JdpDeclaredJobRegistry::new();
         reg.publish_pool_wide(distribution(1, None, None));
         reg.publish_tailored(7, distribution(2, Some(addr()), Some(7)));
-        assert_eq!(reg.tailored_distribution_count(), 1);
+        assert!(reg.current_tailored(7).is_some());
+        // A pool-wide republish must not disturb it: only the session's
+        // own eviction may take the slot away.
+        reg.publish_pool_wide(distribution(3, None, None));
+        assert!(
+            reg.current_tailored(7).is_some(),
+            "a connected miner keeps its tailored slot"
+        );
+
         reg.evict_for_jdp_session(7);
-        assert_eq!(reg.tailored_distribution_count(), 0);
+        assert!(reg.current_tailored(7).is_none());
         // The session id (were it reused) is back on pool-wide.
         let scope = DistributionScope::JdpSession(7);
-        assert_eq!(accepted_id(&reg.distribution_acceptance(1, scope)), Some(1));
-    }
-
-    /// A tailored slot must survive the age sweep: a Solo distribution
-    /// never changes, so its publish timestamp says nothing about
-    /// whether the session still exists. Only the session's own
-    /// eviction removes it.
-    #[test]
-    fn tailored_slot_outlives_the_age_sweep() {
-        let mut reg = JdpDeclaredJobRegistry::new();
-        reg.publish_pool_wide(distribution(1, None, None));
-        reg.publish_tailored(7, distribution(2, Some(addr()), Some(7))); // published_at 1_002
-                                                                         // Far beyond any job-token horizon.
-        reg.cleanup_expired(10_000_000, 1_500);
-        assert_eq!(reg.tailored_distribution_count(), 1);
-        let scope = DistributionScope::JdpSession(7);
-        assert_eq!(
-            accepted_id(&reg.distribution_acceptance(2, scope)),
-            Some(2),
-            "a connected miner's declarations must still resolve"
-        );
-        reg.evict_for_jdp_session(7);
-        assert_eq!(reg.tailored_distribution_count(), 0);
+        assert_eq!(accepted_id(&reg.distribution_acceptance(3, scope)), Some(3));
     }
 }

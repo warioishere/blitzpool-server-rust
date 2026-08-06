@@ -23,6 +23,12 @@
 //!    that never negotiated 0x0003 is rejected
 //!    `invalid-payout-distribution` (the IO layer must surface the TLV
 //!    despite the extension being un-negotiated).
+//! 7. **The JDP → Mining seam** — an accepted declaration is resolvable
+//!    in the bridge under its issued token, carrying the binding, the
+//!    declared tip and the §6 `distribution_id`. That is everything the
+//!    mining connection judges a Full-Template `SetCustomMiningJob`
+//!    against, and it was previously untested: removing the
+//!    registration call left the whole suite green.
 //!
 //! Needs no bitcoin-node / TDP / PG — declare-time validation runs
 //! entirely against the published distribution.
@@ -341,7 +347,62 @@ async fn jdp_push_distribution_end_to_end() {
 
     // Declare #10: conformant coinbase + TLV(FIRST_ID) → accepted.
     write_declare(&mut writer, 10, &token, &suffix, Some(FIRST_ID)).await;
-    expect_declare_success(read_jdc(&mut reader).await, 10);
+    let declared_token = expect_declare_success(read_jdc(&mut reader).await, 10);
+
+    // ── The JDP → Mining seam ─────────────────────────────────────────
+    //
+    // An accepted declaration has to become resolvable on the OTHER
+    // connection: the JDC opens a separate mining socket and presents
+    // this token in `SetCustomMiningJob`. Everything that job is judged
+    // against lives in the bridge entry — the declaration binding, the
+    // tip it was accepted under, and the §6 `distribution_id`, which in
+    // Full-Template mode rides on `DeclareMiningJob` and is therefore
+    // never seen on the mining wire at all.
+    //
+    // No race: the registration happens BEFORE the Success frame is
+    // written (see `run_jdp_connection`), so holding the frame means the
+    // entry is already there.
+    //
+    // This seam had no coverage. Disabling the registration call
+    // outright left all 447 unit tests and every integration test green,
+    // while every real Full-Template JDC would have been answered
+    // `invalid-mining-job-token` — fatal for an SRI jd-client.
+    let declared_token =
+        Token(<[u8; 16]>::try_from(declared_token.as_slice()).expect("16-byte job token"));
+    let job_ref = bridge
+        .read()
+        .unwrap()
+        .job_ref(&declared_token)
+        .expect("an accepted declaration MUST be resolvable by the mining side");
+    assert_eq!(job_ref.miner_address.as_str(), REGTEST_ADDR);
+    assert_eq!(
+        job_ref.declared_prev_hash,
+        Some(PREV_HASH),
+        "the mining side rejects a custom job that does not build on this tip"
+    );
+    assert_eq!(
+        job_ref.distribution_id,
+        Some(FIRST_ID),
+        "§6 puts the TLV on DeclareMiningJob in Full-Template mode — the mining \
+         side can only inherit the reference from here"
+    );
+    // Presence is not enough: a stub entry would satisfy the lookup and
+    // still fail every `SetCustomMiningJob`. Pin what the binding says.
+    let binding = job_ref
+        .binding
+        .expect("the declared coinbase must project, or the custom job is refused");
+    assert_eq!(binding.coinbase_script_sig_prefix, SCRIPT_SIG_HEAD);
+    assert_eq!(binding.extranonce_slot, EXTRANONCE_LEN);
+    assert_eq!(binding.version, 0x2000_0000);
+
+    // Negative control, in the same test so the block above cannot pass
+    // on a lookup that answers `Some` for anything: a token this JDC
+    // never declared resolves to nothing.
+    assert!(
+        bridge.read().unwrap().job_ref(&Token([0x77; 16])).is_none(),
+        "an undeclared token must not resolve — otherwise the assertions \
+         above prove nothing"
+    );
 
     // PushSolution on the declared tip → the sink receives the booking
     // of the validated distribution.
@@ -441,11 +502,42 @@ async fn jdp_push_distribution_end_to_end() {
         ERR_INVALID_PAYOUT_DISTRIBUTION,
     );
 
+    // ── Connection 3: a refused setup is answered, then closed ────────
+    //
+    // SV2 §3.6.3: `SetupConnection.Error` is sent "prior to closing the
+    // connection". Both halves matter and are asserted here: the client
+    // must LEARN why (the error frame arrives), and the socket must then
+    // go (the next read ends). Without the close the pool holds an FD for
+    // a session that can do nothing — there is no idle timeout on this
+    // path.
+    let (mut reader3, mut writer3) = connect_jdc(addr).await;
+    write_msg(&mut writer3, setup_connection_wrong_protocol(addr.port())).await;
+    match read_jdc(&mut reader3).await {
+        JdcInbound::Message(AnyMessage::Common(CommonMessages::SetupConnectionError(e))) => {
+            assert_eq!(
+                std::str::from_utf8(e.error_code.as_ref()).unwrap(),
+                "unsupported-protocol"
+            );
+        }
+        other => panic!("expected SetupConnectionError, got {other:?}"),
+    }
+    // The server closes: reading again ends rather than hanging. A
+    // timeout here means the connection stayed open — the bug this
+    // asserts against.
+    let after = tokio::time::timeout(Duration::from_secs(5), reader3.read_frame()).await;
+    match after {
+        Ok(Err(_)) => {}
+        Ok(Ok(f)) => panic!("expected the server to close, got another frame: {f:?}"),
+        Err(_) => panic!("the server left a refused connection open"),
+    }
+
     // ── Teardown ──────────────────────────────────────────────────────
     drop(writer);
     drop(reader);
     drop(writer2);
     drop(reader2);
+    drop(writer3);
+    drop(reader3);
     server.shutdown().await;
     accept_handle.abort();
 }
@@ -456,6 +548,11 @@ async fn jdp_push_distribution_end_to_end() {
 /// extranonce this JDC fixture actually submits.
 const EXTRANONCE_LEN: usize = 8;
 
+/// The scriptSig bytes the declared coinbase commits to before the
+/// extranonce slot (a BIP-34 height push). The mining side compares
+/// against exactly these via the bridge projection.
+const SCRIPT_SIG_HEAD: [u8; 3] = [0x03, 0xC8, 0x00];
+
 /// A declared `coinbase_tx_prefix` that is a real coinbase header: version,
 /// one input, the null outpoint, the scriptSig length, then a BIP-34 height
 /// push. It stops where the extranonce slot begins.
@@ -465,16 +562,15 @@ const EXTRANONCE_LEN: usize = 8;
 /// out of the prefix's scriptSig length), so a placeholder no longer parses.
 fn coinbase_prefix() -> Vec<u8> {
     use bitcoin::consensus::Encodable;
-    let script_sig_head: [u8; 3] = [0x03, 0xC8, 0x00];
     let mut p = Vec::new();
     p.extend_from_slice(&2u32.to_le_bytes());
     p.push(0x01);
     p.extend_from_slice(&[0u8; 32]);
     p.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-    bitcoin::VarInt((script_sig_head.len() + EXTRANONCE_LEN) as u64)
+    bitcoin::VarInt((SCRIPT_SIG_HEAD.len() + EXTRANONCE_LEN) as u64)
         .consensus_encode(&mut p)
         .unwrap();
-    p.extend_from_slice(&script_sig_head);
+    p.extend_from_slice(&SCRIPT_SIG_HEAD);
     p
 }
 
@@ -533,6 +629,26 @@ fn entry_with_id(id: u64) -> PayoutDistributionEntry {
 
 type Reader = NoiseTcpReadHalf<AnyMessage<'static>>;
 type Writer = NoiseTcpWriteHalf<AnyMessage<'static>>;
+
+/// A `SetupConnection` the JDP server must refuse: the Mining
+/// sub-protocol on the job-declaration port.
+fn setup_connection_wrong_protocol(port: u16) -> AnyMessage<'static> {
+    AnyMessage::Common(CommonMessages::SetupConnection(
+        SetupConnection {
+            protocol: Protocol::MiningProtocol,
+            min_version: 2,
+            max_version: 2,
+            flags: FLAG_DECLARE_TX_DATA,
+            endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
+            endpoint_port: port,
+            vendor: "test-jdc".to_string().try_into().unwrap(),
+            hardware_version: "rev1".to_string().try_into().unwrap(),
+            firmware: "0.1".to_string().try_into().unwrap(),
+            device_id: "jdc-wrong-protocol".to_string().try_into().unwrap(),
+        }
+        .into_static(),
+    ))
+}
 
 async fn connect_jdc(addr: std::net::SocketAddr) -> (Reader, Writer) {
     let socket = TcpStream::connect(addr).await.expect("connect");
@@ -628,12 +744,15 @@ fn expect_setup_success(inbound: JdcInbound) {
     }
 }
 
-fn expect_declare_success(inbound: JdcInbound, request_id: u32) {
+/// Returns the `new_mining_job_token` the JDS issued — the key the
+/// mining connection later presents in `SetCustomMiningJob`.
+fn expect_declare_success(inbound: JdcInbound, request_id: u32) -> Vec<u8> {
     match inbound {
         JdcInbound::Message(AnyMessage::JobDeclaration(
             JobDeclaration::DeclareMiningJobSuccess(s),
         )) => {
             assert_eq!(s.request_id, request_id);
+            s.new_mining_job_token.as_bytes().to_vec()
         }
         other => panic!("expected DeclareMiningJobSuccess #{request_id}, got {other:?}"),
     }

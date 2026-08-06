@@ -237,6 +237,7 @@ mod tests {
     use super::*;
     use crate::jdp::declarations::DeclaredJob;
     use crate::tokens::Token;
+    use bp_common::AddressId;
     use std::collections::HashMap;
 
     const SCRIPT_SIG_PREFIX: [u8; 3] = [0x03, 0xC8, 0x00];
@@ -302,8 +303,7 @@ mod tests {
         }
         DeclaredJob {
             new_token: Token([1u8; 16]),
-            original_token: Token([0u8; 16]),
-            request_id: 1,
+            miner_address: AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap(),
             version: 0x2000_0000,
             coinbase_tx_prefix,
             coinbase_tx_suffix,

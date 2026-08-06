@@ -7,18 +7,12 @@
 //!
 //! The JDC sends a wtxid list as part of `DeclareMiningJob`. The JDS
 //! needs raw transaction bytes for every wtxid so it can later
-//! reconstruct the block on `PushSolution` (spec §6.4.9). Two
-//! partitions drive the response:
-//!
-//! 1. **Mempool partition** (informational, for logging only): which
-//!    wtxids does bitcoin-core's mempool already know about? Computed
-//!    by [`partition_mempool_known`]. This is used for logging only;
-//!    it doesn't affect what we ask the JDC.
-//!
-//! 2. **Template partition** (actionable): which wtxids do we have
-//!    raw transaction bytes for in our current template? Computed by
-//!    [`partition_against_template`]. The missing positions are
-//!    requested from the JDC via `ProvideMissingTransactions`.
+//! reconstruct the block on `PushSolution` (spec §6.4.9). What drives
+//! the response is which of them the JDS already holds: the wtxids it
+//! has raw bytes for in its current template are covered, and the
+//! missing positions are requested from the JDC via
+//! `ProvideMissingTransactions`. Computed by
+//! [`partition_against_template`].
 //!
 //! ## Round-trip state
 //!
@@ -36,7 +30,7 @@
 //! output of SHA256d). Callers are responsible for keying their
 //! template-tx and mempool-wtxid maps in the same byte order.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 // ── PartitionResult ─────────────────────────────────────────────────
 
@@ -90,49 +84,14 @@ pub fn partition_against_template(
     }
 }
 
-// ── partition_mempool_known (informational) ─────────────────────────
-
-/// Outcome of [`partition_mempool_known`]. Both lists hold wtxid
-/// bytes (not positions) because this is used for logging
-/// only — it's not actionable.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MempoolPartition {
-    pub known: Vec<[u8; 32]>,
-    pub unknown: Vec<[u8; 32]>,
-}
-
-/// Partition `wtxid_list` against `mempool_wtxids` (what bitcoin-core
-/// currently has in its mempool). Used for logging only
-/// — doesn't affect what's requested via `ProvideMissingTransactions`.
-///
-/// **Graceful-degradation note**: On mempool-lookup failure, the
-/// caller may adopt a fallback that accepts all transactions (assumes
-/// everything is in mempool). This pure function just reports what the
-/// caller pre-computed; error handling is the caller's responsibility.
-pub fn partition_mempool_known(
-    wtxid_list: &[[u8; 32]],
-    mempool_wtxids: &HashSet<[u8; 32]>,
-) -> MempoolPartition {
-    let mut known = Vec::new();
-    let mut unknown = Vec::new();
-    for wtxid in wtxid_list {
-        if mempool_wtxids.contains(wtxid) {
-            known.push(*wtxid);
-        } else {
-            unknown.push(*wtxid);
-        }
-    }
-    MempoolPartition { known, unknown }
-}
-
 // ── PendingDeclaration ──────────────────────────────────────────────
 
 /// In-flight declaration state. Stored on the JDP-session between
 /// emitting `ProvideMissingTransactions` and receiving
 /// `ProvideMissingTransactions.Success`. The handler-layer holds at
-/// most one of these per connection — a second `DeclareMiningJob`
-/// arriving while a pending one is in-flight is a JDC bug we'd want
-/// to log and drop (deferred to `jdp::client`).
+/// most one of these per connection: a second `DeclareMiningJob`
+/// arriving while one is in flight REPLACES it, so the first
+/// declaration is abandoned and its `request_id` never answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingDeclaration {
     /// `DeclareMiningJob.request_id` — echoed on the Success frame.
@@ -252,26 +211,6 @@ mod tests {
         assert!(result.missing_positions.is_empty());
         assert_eq!(result.known_raw_txs.get(&0), Some(&vec![0xAA]));
         assert_eq!(result.known_raw_txs.get(&1), Some(&vec![0xAA]));
-    }
-
-    // ── partition_mempool_known ────────────────────────────────────
-
-    #[test]
-    fn partition_mempool_classifies_known_and_unknown() {
-        let mut mempool = HashSet::new();
-        mempool.insert(wtxid(0x01));
-        mempool.insert(wtxid(0x03));
-        let list = vec![wtxid(0x01), wtxid(0x02), wtxid(0x03)];
-        let result = partition_mempool_known(&list, &mempool);
-        assert_eq!(result.known, vec![wtxid(0x01), wtxid(0x03)]);
-        assert_eq!(result.unknown, vec![wtxid(0x02)]);
-    }
-
-    #[test]
-    fn partition_mempool_empty_list() {
-        let result = partition_mempool_known(&[], &HashSet::new());
-        assert!(result.known.is_empty());
-        assert!(result.unknown.is_empty());
     }
 
     // ── merge_provided_with_known ──────────────────────────────────

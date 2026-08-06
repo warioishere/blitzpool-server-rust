@@ -138,7 +138,7 @@ pub struct BuiltPayoutDistribution {
     /// Revenue the weight boosts were projected against.
     pub reference_reward_sats: u64,
     /// Settlement-snapshot identity. `None` = the owning mode books
-    /// without a snapshot (Solo / Blockparty).
+    /// without a snapshot (Solo).
     pub payouts_fingerprint: Option<[u8; 32]>,
     /// Whether a found block on this distribution may be booked
     /// (`false` when the snapshot write failed).
@@ -674,8 +674,8 @@ async fn run_jdp_connection(
     let (mut reader, mut writer) = noise.into_split();
 
     let mut state = JdpSessionState::new(session_id);
-    // Whether this session got a tailored distribution (Solo /
-    // Group-Solo / Blockparty); the pool-wide push then stops for it —
+    // Whether this session got a tailored distribution (Solo or
+    // Group-Solo); the pool-wide push then stops for it —
     // §4 "latest MUST be used" makes the tailored stream authoritative.
     let mut tailored_active = false;
     // The miner a tailored distribution was built for. Kept so a §10
@@ -870,6 +870,14 @@ async fn run_jdp_connection(
                         ),
                     }
                 }
+                // SV2 §3.6.3: `SetupConnection.Error` is sent "prior to
+                // closing the connection". Read the request BEFORE the write
+                // consumes the outbound batch; act on it AFTER, so the client
+                // still receives the frame telling it why.
+                let disconnect = outcome.events.iter().find_map(|e| match e {
+                    JdpSessionEvent::Disconnect { reason } => Some(reason.clone()),
+                    _ => None,
+                });
                 // Register declared jobs in the bridge BEFORE the frames go
                 // out, and therefore before `fan_out_events`.
                 //
@@ -888,22 +896,20 @@ async fn run_jdp_connection(
                 //
                 // Second, unchanged: the bridge must be populated by the time
                 // the JobDeclared event is visible to other hooks.
-                register_declared_jobs_in_bridge(
-                    &state,
-                    &bridge,
-                    session_id,
-                    now_ms(),
-                    &outcome.events,
-                );
+                register_declared_jobs_in_bridge(&state, &bridge, session_id, &outcome.events);
                 if let Err(err) = write_jdp_outbound_frames(&mut writer, outcome.outbound).await {
                     warn!("jdp {session_id_hex} write: {err:?}");
                     break;
                 }
                 outcome.outbound = Vec::new();
+                if let Some(reason) = disconnect {
+                    debug!("jdp {session_id_hex} closing after setup rejection: {reason}");
+                    break;
+                }
                 // Identity became known (allocate) on a negotiated
-                // session → check for a tailored distribution (Solo /
-                // Group-Solo / Blockparty). PPLNS miners get `None`
-                // and keep riding the pool-wide push.
+                // session → check for a tailored distribution (Solo or
+                // Group-Solo). PPLNS miners ride the pool-wide push;
+                // Blockparty is refused a distribution altogether.
                 if state
                     .negotiated_extensions
                     .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
@@ -940,7 +946,7 @@ async fn run_jdp_connection(
                         }
                     }
                 }
-                fan_out_events(outcome.events, &session_id, &bridge, &hooks, now_ms()).await;
+                fan_out_events(outcome.events, &hooks).await;
             }
         }
     }
@@ -1111,29 +1117,10 @@ async fn dispatch_jdp_inbound(
                 now_ms,
             )
         }
-        InboundJdpFrame::PushSolution(input) => {
-            // The miner_address is bound to the declared job's
-            // RegisteredDeclaredJob in the bridge; but the
-            // push-solution handler accepts it as an argument
-            // because the JDP-session itself doesn't carry the
-            // address (multi-token-per-connection means different
-            // pushes might map to different addresses, but in
-            // practice one connection = one miner). Lookup via the
-            // declared_jobs store (already has prev_hash matching).
-            let miner_address = state
-                .declared_jobs
-                .match_for_solution(&input.prev_hash)
-                .map(|j| j.new_token)
-                .and_then(|token| state.tokens.lookup(&token).map(|a| a.miner_address.clone()))
-                .unwrap_or_else(|| {
-                    AddressId::new("unknown".to_string()).unwrap_or_else(|_| {
-                        // AddressId::new requires non-empty + valid
-                        // chars; "unknown" passes. Defensive fallback.
-                        AddressId::new("u".to_string()).expect("'u' is a valid AddressId")
-                    })
-                });
-            handle_push_solution(state, &input, miner_address)
-        }
+        // The handler matches the solution to a declaration and reads the
+        // miner off that same declaration, so there is nothing to resolve
+        // here.
+        InboundJdpFrame::PushSolution(input) => handle_push_solution(state, &input),
     }
 }
 
@@ -1188,54 +1175,21 @@ fn wire_from_entry(entry: &PayoutDistributionEntry) -> SetPayoutDistribution {
     }
 }
 
-/// Fan out [`JdpSessionEvent`]s: TokenAllocated is informational,
-/// JobDeclared registers in the bridge for the mining server's
-/// SetCustomMiningJob lookup, BlockSubmissionCandidate goes to the
-/// block-submission sink, Disconnect closes the connection (caller
-/// handles via the cancel-token path).
-async fn fan_out_events(
-    events: Vec<JdpSessionEvent>,
-    jdp_session_id: &u32,
-    bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
-    hooks: &JdpServerHooks,
-    now_ms: u64,
-) {
+/// Fan out [`JdpSessionEvent`]s: SetupComplete and TokenAllocated are
+/// informational, JobDeclared was registered in the bridge before the
+/// outbound write, BlockSubmissionCandidate goes to the
+/// block-submission sink. Disconnect is not handled here — the
+/// connection loop reads it off the outcome and breaks after the write.
+async fn fan_out_events(events: Vec<JdpSessionEvent>, hooks: &JdpServerHooks) {
     for event in events {
         match event {
-            JdpSessionEvent::SetupComplete { .. } => {}
+            JdpSessionEvent::SetupComplete => {}
             JdpSessionEvent::TokenAllocated { .. } => {}
-            JdpSessionEvent::JobDeclared {
-                new_token,
-                original_token,
-                miner_address,
-                prev_hash,
-            } => {
-                // Pull the full DeclaredJob out of the session store
-                // so the bridge entry carries the complete payload
-                // for the mining-side SetCustomMiningJob handler.
-                // We can't read the session here (we don't have it),
-                // so we register a stub and rely on the mining-handler
-                // to consult the bridge for cross-check only. For
-                // full data, the IO-layer needs to thread the
-                // session-state reference through; deferred.
-                let _ = (
-                    new_token,
-                    original_token,
-                    miner_address,
-                    prev_hash,
-                    bridge,
-                    jdp_session_id,
-                    now_ms,
-                );
-                // Note: full bridge.register requires the DeclaredJob
-                // payload from `state.declared_jobs[new_token]`. This
-                // is doable but requires either an `Arc<Mutex>` on
-                // the session state or threading the registration
-                // back into `run_jdp_connection`'s scope. For now:
-                // bridge registration happens inline in
-                // `run_jdp_connection` via `register_declared_job`
-                // (see below) — events fan-out only logs.
-            }
+            // Already registered, before the outbound write — see the
+            // `register_declared_jobs_in_bridge` call in
+            // `run_jdp_connection`, which has the session state this
+            // fan-out does not carry. Do not register here as well.
+            JdpSessionEvent::JobDeclared { .. } => {}
             JdpSessionEvent::BlockSubmissionCandidate {
                 miner_address,
                 new_token,
@@ -1264,11 +1218,9 @@ async fn fan_out_events(
                     )
                     .await;
             }
-            JdpSessionEvent::Disconnect { .. } => {
-                // Disconnect signal — connection-task break-condition.
-                // The select-loop already broke once we hit this; no
-                // additional action.
-            }
+            // Acted on in the connection loop, which owns the socket —
+            // it breaks once the rejection frame is written.
+            JdpSessionEvent::Disconnect { .. } => {}
         }
     }
 }
@@ -1360,25 +1312,17 @@ pub(crate) fn register_declared_jobs_in_bridge(
     state: &JdpSessionState,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
     jdp_session_id: u32,
-    now_ms: u64,
     events: &[JdpSessionEvent],
 ) {
     let mut reg = bridge.write().expect("bridge RwLock poisoned");
     for event in events {
-        if let JdpSessionEvent::JobDeclared {
-            new_token,
-            miner_address,
-            ..
-        } = event
-        {
+        if let JdpSessionEvent::JobDeclared { new_token } = event {
             if let Some(declared_job) = state.declared_jobs.get(new_token) {
                 reg.register(
                     *new_token,
                     RegisteredDeclaredJob {
                         declared_job: declared_job.clone(),
-                        miner_address: miner_address.clone(),
                         jdp_session_id,
-                        registered_at_ms: now_ms,
                     },
                 );
             }
@@ -1392,15 +1336,6 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-
-// ── Public re-export for the IO-layer wire-up ───────────────────────
-
-/// Drain timeout placeholder — re-exported to match
-/// `ServerConfig::shutdown_drain_timeout` semantics. Not yet wired:
-/// `StratumV2JdpServer::shutdown` is fire-and-forget for now (the
-/// cancel-token causes all per-connection tasks to exit on their
-/// next select tick).
-pub const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {
@@ -1849,8 +1784,7 @@ mod tests {
         let token = Token([0xAA; 16]);
         let job = DeclaredJob {
             new_token: token,
-            original_token: Token([0xBB; 16]),
-            request_id: 1,
+            miner_address: AddressId::new(ADDR.to_string()).unwrap(),
             version: 0,
             coinbase_tx_prefix: vec![],
             coinbase_tx_suffix: vec![],
@@ -1863,17 +1797,12 @@ mod tests {
         };
         state.declared_jobs.insert(job);
         let bridge = fresh_bridge();
-        let events = vec![JdpSessionEvent::JobDeclared {
-            new_token: token,
-            original_token: Token([0xBB; 16]),
-            miner_address: AddressId::new(ADDR.to_string()).unwrap(),
-            prev_hash: Some([0xCC; 32]),
-        }];
-        register_declared_jobs_in_bridge(&state, &bridge, 42, 1_000, &events);
+        let events = vec![JdpSessionEvent::JobDeclared { new_token: token }];
+        register_declared_jobs_in_bridge(&state, &bridge, 42, &events);
         let r = bridge.read().unwrap();
-        let entry = r.lookup(&token).expect("must be registered");
+        let entry = r.job_ref(&token).expect("must be registered");
         assert_eq!(entry.jdp_session_id, 42);
         assert_eq!(entry.miner_address.as_str(), ADDR);
-        assert_eq!(entry.declared_job.prev_hash, Some([0xCC; 32]));
+        assert_eq!(entry.declared_prev_hash, Some([0xCC; 32]));
     }
 }

@@ -286,8 +286,7 @@ where
 // ─── /api/info/block-template ────────────────────────────────────
 //
 // Exposes TDP-snapshot fields the UI can use to render "current
-// template" without round-tripping bitcoin-core (see DEFERRED.md
-// block-template entry for shape divergence notes).
+// template" without round-tripping bitcoin-core.
 
 async fn block_template<H, M>(
     State(state): State<SharedState<H, M>>,

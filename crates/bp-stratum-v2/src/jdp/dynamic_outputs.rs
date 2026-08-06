@@ -39,10 +39,6 @@ pub enum EncodeError {
     /// (delegated to `bp_mining_job::address_to_script`).
     #[error("address-to-script failed: {0}")]
     InvalidAddress(String),
-    /// `bitcoin::consensus::encode` failure. Shouldn't fire in
-    /// practice (we write to a `Vec<u8>`) but kept total.
-    #[error("consensus encoding: {0}")]
-    Consensus(String),
 }
 
 /// Serialise `outputs` as a consensus-encoded `Vec<TxOut>`.
@@ -72,9 +68,13 @@ pub fn encode_coinbase_outputs(
         });
     }
     let mut buf = Vec::with_capacity(64 + outputs.len() * 40);
+    // Same answer as everywhere else in this crate that consensus-encodes
+    // into a `Vec<u8>` (`WeightedOutput::to_wire_txout`, the declared-job
+    // fixtures): the writer has no failure mode, so an error variant for it
+    // would be one the caller can never see.
     txouts
         .consensus_encode(&mut buf)
-        .map_err(|e| EncodeError::Consensus(format!("{e}")))?;
+        .expect("Vec<u8> writer cannot fail");
     Ok(buf)
 }
 

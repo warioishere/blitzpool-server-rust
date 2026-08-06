@@ -28,22 +28,21 @@
 //! The earlier skeleton listed 8 hooks (block submission, accepted /
 //! rejected sinks, session persistence, block-found notification,
 //! mempool validator, miner lookup, coinbase distributor). The 5
-//! above cover the **mining-server** per-connection task. The
-//! remaining 3 belong to a different surface:
+//! above cover the **mining-server** per-connection task. None of the
+//! other three is owed here:
 //!
 //! - `BlockFoundNotificationSink` lives in `bp_notifications`
 //!   (Telegram / ntfy / push). It's downstream of the share-accept
 //!   hook (the service layer composes both).
-//! - `MempoolValidator` belongs to the JDP-server hook surface
-//!   (`jdp_server.rs`) — it's only ever consulted on JDP frames,
-//!   never on mining frames.
 //! - `MinerLookup` is the bridge between JDP IP and mining
 //!   miner-address; that's caller-supplied state inside
 //!   `MiningServerContext`, not an async hook (it's a sync registry
 //!   lookup, see [`crate::bridge::JdpDeclaredJobRegistry`]).
-//!
-//! Tracking those 3 under the same module would be premature — we'll
-//! pull them in when their callers land.
+//! - `MempoolValidator` was never built, and nothing is waiting for
+//!   it: a declared job gets its node-side verdict from
+//!   [`crate::jdp_server::DeclaredJobValidator`] over bitcoin-core's
+//!   job-declaration IPC (SV2 §6.1) — a consensus answer, not a
+//!   mempool guess.
 
 use std::sync::Arc;
 

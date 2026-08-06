@@ -28,6 +28,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use bp_common::AddressId;
+
 use super::dynamic_outputs::PayoutBooking;
 use crate::tokens::Token;
 
@@ -47,12 +49,16 @@ pub struct DeclaredJob {
     /// the JDC's reference for `PushSolution` and (via the SV2
     /// mining-protocol bridge) `SetCustomMiningJob`.
     pub new_token: Token,
-    /// Token the JDC presented in `DeclareMiningJob` (an earlier
-    /// `AllocateMiningJobToken` token). Kept for audit / debug.
-    pub original_token: Token,
-    /// The JDC's `DeclareMiningJob.request_id` — echoed in the
-    /// `Success` frame.
-    pub request_id: u32,
+    /// Whose declaration this is, resolved when the token was allocated.
+    ///
+    /// Stamped here rather than looked up again at `PushSolution` time:
+    /// the block-found path books against this address, and a second
+    /// lookup can answer differently from the job it belongs to. It used
+    /// to read the connection's `TokenStore`, which drops a token the
+    /// moment an expired one is presented — a miss there fabricated the
+    /// address `"unknown"`, which the mode gate resolves to Solo, so the
+    /// block was recorded and never settled.
+    pub miner_address: AddressId,
     /// Block-header `version` field the JDC declared.
     pub version: u32,
     /// Coinbase prefix as the JDC declared it (everything before the
@@ -238,8 +244,7 @@ mod tests {
     fn job(token_seed: u8, declared_at: u64, prev_hash: Option<[u8; 32]>) -> DeclaredJob {
         DeclaredJob {
             new_token: tok(token_seed),
-            original_token: tok(token_seed.wrapping_add(0x80)),
-            request_id: token_seed as u32,
+            miner_address: AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap(),
             version: 0x2000_0000,
             coinbase_tx_prefix: vec![0xAA; 8],
             coinbase_tx_suffix: vec![0xBB; 8],

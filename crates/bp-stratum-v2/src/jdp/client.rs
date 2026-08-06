@@ -38,8 +38,9 @@
 //!   and lets the same handler-layer drive both production wiring +
 //!   regtest.
 //! - **No socket destruction inside the handler**. We emit
-//!   [`JdpSessionEvent::Disconnect`] on protocol mismatch and let the
-//!   IO layer handle the close.
+//!   [`JdpSessionEvent::Disconnect`] on protocol / version mismatch;
+//!   the IO layer writes the pending `SetupConnection.Error` first and
+//!   closes after it, per SV2 §3.6.3.
 //!
 //! ## Implementation strategy
 //!
@@ -278,8 +279,11 @@ pub enum JdpOutboundFrame {
 #[derive(Clone, Debug)]
 pub enum JdpSessionEvent {
     /// `SetupConnection` completed. Caller can register the JDP
-    /// connection in the live-connection registry.
-    SetupComplete { full_template_mode: bool },
+    /// connection in the live-connection registry. The negotiated
+    /// Full-Template flag is not carried: it lives on
+    /// [`JdpSessionState::full_template_mode`], which is what every
+    /// gate reads.
+    SetupComplete,
     /// A token was allocated. Caller can persist (e.g. for cross-
     /// connection coinbase-outputs lookups via the
     /// `findEmittedOutputsForJob`-equivalent).
@@ -290,12 +294,12 @@ pub enum JdpSessionEvent {
     /// A `DeclareMiningJob` was accepted. Caller fans out to the
     /// mining-protocol bridge to build a `SetCustomMiningJob` for
     /// the matching JDC miner.
-    JobDeclared {
-        new_token: Token,
-        original_token: Token,
-        miner_address: AddressId,
-        prev_hash: Option<[u8; 32]>,
-    },
+    ///
+    /// Carries only the key. Everything else about the job — the miner
+    /// and the declared tip included — is read off the stored
+    /// [`DeclaredJob`] under `new_token`, so nothing here can disagree
+    /// with it.
+    JobDeclared { new_token: Token },
     /// A `PushSolution` has been resolved against a declared job —
     /// the IO layer assembles the final block (merkle root + 80-byte
     /// header) from these components and hands it to
@@ -416,7 +420,6 @@ pub struct JdpSessionState {
 pub struct PendingState {
     pub input: DeclareMiningJobInput,
     pub pending: PendingDeclaration,
-    pub original_token: Token,
     pub miner_address: AddressId,
     /// Pool chain-tip when the `DeclareMiningJob` arrived. Compared against
     /// the tip when `ProvideMissingTransactions.Success` completes the
@@ -499,7 +502,7 @@ pub fn handle_setup_connection(
             used_version: state.used_version,
             flags: negotiated_flags,
         }],
-        events: vec![JdpSessionEvent::SetupComplete { full_template_mode }],
+        events: vec![JdpSessionEvent::SetupComplete],
     }
 }
 
@@ -704,7 +707,6 @@ pub fn handle_declare_mining_job(
         }
     };
 
-    let original_token = allocated.token;
     let miner_address = allocated.miner_address.clone();
 
     let partition = partition_against_template(&input.wtxid_list, template_txs);
@@ -714,7 +716,6 @@ pub fn handle_declare_mining_job(
             state,
             input,
             partition.known_raw_txs,
-            original_token,
             miner_address,
             current_prev_hash,
             distribution,
@@ -726,6 +727,20 @@ pub fn handle_declare_mining_job(
         request_id: input.request_id,
         unknown_tx_position_list: partition.missing_positions.clone(),
     });
+    // Only one round-trip is tracked per connection, so a JDC that sends a
+    // second `DeclareMiningJob` before answering the first
+    // `ProvideMissingTransactions` loses the first one. Its `request_id` is
+    // then never answered — neither Success nor Error — and that JDC waits
+    // for a frame that will not come. Say so: the alternative is a
+    // declaration disappearing without a trace.
+    if let Some(abandoned) = state.pending_declaration.as_ref() {
+        tracing::warn!(
+            abandoned_request_id = abandoned.pending.request_id,
+            request_id = input.request_id,
+            "jdp: a second DeclareMiningJob arrived while one was in flight — the \
+             first is abandoned and its request_id will never be answered"
+        );
+    }
     state.pending_declaration = Some(PendingState {
         input: input.clone(),
         pending: PendingDeclaration {
@@ -733,7 +748,6 @@ pub fn handle_declare_mining_job(
             missing_positions: partition.missing_positions,
             known_raw_txs: partition.known_raw_txs,
         },
-        original_token,
         miner_address,
         prev_hash_at_declare: current_prev_hash,
     });
@@ -796,7 +810,6 @@ pub fn handle_provide_missing_transactions_success(
         state,
         &pending.input,
         merged,
-        pending.original_token,
         pending.miner_address,
         current_prev_hash,
         distribution,
@@ -822,22 +835,11 @@ fn accept_declaration(
     state: &mut JdpSessionState,
     input: &DeclareMiningJobInput,
     raw_transactions: HashMap<u32, Vec<u8>>,
-    original_token: Token,
     miner_address: AddressId,
     current_prev_hash: Option<[u8; 32]>,
     distribution: Option<DistributionAcceptance>,
     now_ms: u64,
 ) -> JdpHandlerOutcome {
-    // Reject genuinely-empty coinbases up front (spec §6.4.3 — the coinbase
-    // MUST carry the pool's committed payout outputs).
-    if input.coinbase_tx_prefix.is_empty() && input.coinbase_tx_suffix.is_empty() {
-        return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
-            request_id: input.request_id,
-            error_code: ERR_INVALID_JOB_PARAM_COINBASE.to_string(),
-            error_details: b"Empty coinbase transaction".to_vec(),
-        });
-    }
-
     // The coinbase must rebuild, on EVERY connection — not just the 0x0003
     // ones whose payout check happens to need it.
     //
@@ -988,8 +990,7 @@ fn accept_declaration(
 
     state.declared_jobs.insert(DeclaredJob {
         new_token,
-        original_token,
-        request_id: input.request_id,
+        miner_address: miner_address.clone(),
         version: input.version,
         coinbase_tx_prefix: input.coinbase_tx_prefix.clone(),
         coinbase_tx_suffix: input.coinbase_tx_suffix.clone(),
@@ -1006,12 +1007,7 @@ fn accept_declaration(
             request_id: input.request_id,
             new_mining_job_token: new_token,
         }],
-        events: vec![JdpSessionEvent::JobDeclared {
-            new_token,
-            original_token,
-            miner_address,
-            prev_hash: current_prev_hash,
-        }],
+        events: vec![JdpSessionEvent::JobDeclared { new_token }],
     }
 }
 
@@ -1027,13 +1023,16 @@ fn accept_declaration(
 /// [`JdpSessionEvent::BlockSubmissionCandidate`] for the IO layer to
 /// hand to bitcoin-core's `submitblock` RPC.
 ///
+/// The block is booked against the matched declaration's own
+/// [`DeclaredJob::miner_address`] — not against a separately resolved
+/// one, which could name a different miner than the job it belongs to.
+///
 /// - Not in full-template mode → silently dropped.
 /// - No matching declared job → silently dropped.
 /// - Missing raw-tx data for any wtxid position → silently dropped.
 pub fn handle_push_solution(
     state: &mut JdpSessionState,
     input: &PushSolutionInput,
-    miner_address: AddressId,
 ) -> JdpHandlerOutcome {
     // The drops below are WARN-logged: a PushSolution is a found BLOCK, and
     // discarding one silently would make a lost pool-side block booking
@@ -1063,6 +1062,7 @@ pub fn handle_push_solution(
     // copy out the bytes we need so the borrow can drop before
     // building the outcome.
     let new_token = job.new_token;
+    let miner_address = job.miner_address.clone();
     let booking = job.booking;
     // A block that WAS validated against a published distribution but carries
     // no booking. The only way to be in that state is `bookable == false` —
@@ -1368,13 +1368,10 @@ mod tests {
             }
         ));
         assert!(s.setup_complete);
+        // The negotiated mode lives on the session state — that is what
+        // the Declare and PushSolution gates read.
         assert!(s.full_template_mode);
-        assert!(matches!(
-            out.events[0],
-            JdpSessionEvent::SetupComplete {
-                full_template_mode: true
-            }
-        ));
+        assert!(matches!(out.events[0], JdpSessionEvent::SetupComplete));
     }
 
     #[test]
@@ -1953,6 +1950,68 @@ mod tests {
         );
     }
 
+    /// A coinbase that is not a coinbase is refused, and the refusal does
+    /// not depend on WHICH shape it is missing.
+    ///
+    /// There used to be a separate up-front test for `prefix.is_empty() &&
+    /// suffix.is_empty()`, which only ever caught the narrowest of these:
+    /// the rebuild refuses an empty prefix whatever the suffix says, so the
+    /// early check answered nothing the reconstruction did not. What has to
+    /// hold either way is that nothing empty or malformed is ever declared,
+    /// so that is what this pins — plus a positive control, or "everything
+    /// is refused" would read the same as "these are refused".
+    #[test]
+    fn a_coinbase_that_will_not_rebuild_is_refused() {
+        for (label, prefix, suffix) in [
+            ("both empty", vec![], vec![]),
+            ("empty prefix", vec![], coinbase_suffix(&one_output_blob())),
+            ("empty suffix", coinbase_prefix(), vec![]),
+            (
+                "garbage prefix",
+                vec![0xAA; 8],
+                coinbase_suffix(&one_output_blob()),
+            ),
+        ] {
+            let mut s = fresh();
+            let token = complete_setup_and_allocate(&mut s);
+            let mut input = declare(4, token, vec![]);
+            input.coinbase_tx_prefix = prefix;
+            input.coinbase_tx_suffix = suffix;
+            let out = handle_declare_mining_job(
+                &mut s,
+                &input,
+                &HashMap::new(),
+                Some([0xAB; 32]),
+                None,
+                3_000,
+            );
+            match &out.outbound[0] {
+                JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
+                    assert_eq!(error_code, ERR_INVALID_JOB_PARAM_COINBASE, "{label}");
+                }
+                other => panic!("{label} must be refused, got {other:?}"),
+            }
+            assert_eq!(s.declared_jobs.len(), 0, "{label} must not be stored");
+        }
+
+        // Positive control: the honest coinbase from the same fixtures is
+        // accepted, so the refusals above are about the coinbase.
+        let mut s = fresh();
+        let token = complete_setup_and_allocate(&mut s);
+        let out = handle_declare_mining_job(
+            &mut s,
+            &declare(5, token, vec![]),
+            &HashMap::new(),
+            Some([0xAB; 32]),
+            None,
+            3_000,
+        );
+        assert!(matches!(
+            out.outbound[0],
+            JdpOutboundFrame::DeclareMiningJobSuccess { .. }
+        ));
+    }
+
     #[test]
     fn declare_partial_coverage_emits_provide_missing_and_stashes_pending() {
         let mut s = fresh();
@@ -1975,6 +2034,68 @@ mod tests {
         }
         assert!(s.pending_declaration.is_some());
         assert_eq!(s.declared_jobs.len(), 0, "not accepted yet");
+    }
+
+    /// A JDC that pipelines a second `DeclareMiningJob` before answering
+    /// the first `ProvideMissingTransactions` loses the first: one
+    /// round-trip is tracked per connection. Pinned in both directions —
+    /// the second declaration becomes the pending one, AND the first is
+    /// gone for good, so its `Success` is dropped rather than accepted
+    /// against the wrong declaration.
+    #[test]
+    fn a_second_declare_abandons_the_in_flight_one() {
+        let mut s = fresh();
+        let token = complete_setup_and_allocate(&mut s);
+        let known = [0x01; 32];
+        let missing = [0x02; 32];
+        let mut tpl = HashMap::new();
+        tpl.insert(known, vec![0xCA; 16]);
+
+        handle_declare_mining_job(
+            &mut s,
+            &declare(4, token, vec![known, missing]),
+            &tpl,
+            Some([0xAB; 32]),
+            None,
+            3_000,
+        );
+        assert_eq!(
+            s.pending_declaration.as_ref().unwrap().pending.request_id,
+            4
+        );
+
+        handle_declare_mining_job(
+            &mut s,
+            &declare(5, token, vec![known, missing]),
+            &tpl,
+            Some([0xAB; 32]),
+            None,
+            3_100,
+        );
+        assert_eq!(
+            s.pending_declaration.as_ref().unwrap().pending.request_id,
+            5,
+            "the second declaration takes the slot"
+        );
+
+        // The abandoned round-trip cannot be completed any more: its
+        // Success is silently dropped and nothing is declared.
+        let out = handle_provide_missing_transactions_success(
+            &mut s,
+            &ProvideMissingTransactionsSuccessInput {
+                request_id: 4,
+                transaction_list: vec![vec![0xBB; 16]],
+            },
+            Some([0xAB; 32]),
+            None,
+            3_200,
+        );
+        assert!(out.outbound.is_empty(), "no frame for an abandoned request");
+        assert_eq!(s.declared_jobs.len(), 0, "nothing was declared");
+        assert!(
+            s.pending_declaration.is_some(),
+            "the live round-trip #5 is untouched"
+        );
     }
 
     // ── ProvideMissingTransactions.Success ────────────────────────
@@ -2216,7 +2337,7 @@ mod tests {
             n_bits: 0,
             version: 0,
         };
-        let out = handle_push_solution(&mut s, &solution, addr());
+        let out = handle_push_solution(&mut s, &solution);
         assert!(out.outbound.is_empty());
         assert!(out.events.is_empty());
     }
@@ -2233,8 +2354,65 @@ mod tests {
             n_bits: 0,
             version: 0,
         };
-        let out = handle_push_solution(&mut s, &solution, addr());
+        let out = handle_push_solution(&mut s, &solution);
         assert!(out.events.is_empty());
+    }
+
+    /// The block is booked against the DECLARATION's miner, and the
+    /// declaration alone decides who that is.
+    ///
+    /// The address used to be resolved a second time, out of the
+    /// connection's `TokenStore`, and a miss there fabricated `"unknown"`
+    /// — which the mode gate answers with Solo, so the block got a
+    /// `blocks_entity` row and no settlement while its coinbase had
+    /// already paid a real distribution on chain. Both directions are
+    /// asserted: the candidate names the declaring miner, and it does so
+    /// even with the token store emptied underneath it, which is exactly
+    /// the state that produced the fabricated name.
+    #[test]
+    fn a_pushed_solution_is_booked_against_its_declarations_miner() {
+        let mut s = fresh();
+        let token = complete_setup_and_allocate(&mut s);
+        let wtxid_a = [0x01; 32];
+        let mut tpl = HashMap::new();
+        tpl.insert(wtxid_a, vec![0xCA; 8]);
+        let _ = handle_declare_mining_job(
+            &mut s,
+            &declare(7, token, vec![wtxid_a]),
+            &tpl,
+            Some([0xAB; 32]),
+            None,
+            3_000,
+        );
+
+        // Drop every token the session holds — the declaration must still
+        // know whose it is.
+        s.tokens = TokenStore::new();
+
+        let solution = PushSolutionInput {
+            extranonce: vec![0xEE; 8],
+            prev_hash: [0xAB; 32],
+            ntime: 0x6500_0001,
+            nonce: 0x1234_5678,
+            n_bits: 0x1d00_ffff,
+            version: 0x2000_0000,
+        };
+        let out = handle_push_solution(&mut s, &solution);
+        match &out.events[0] {
+            JdpSessionEvent::BlockSubmissionCandidate { miner_address, .. } => {
+                assert_eq!(
+                    miner_address,
+                    &addr(),
+                    "the candidate must name the declaring miner, never a stand-in"
+                );
+                assert_ne!(
+                    miner_address.as_str(),
+                    "unknown",
+                    "a fabricated address resolves to Solo and books nothing"
+                );
+            }
+            other => panic!("expected BlockSubmissionCandidate, got {other:?}"),
+        }
     }
 
     /// Happy-path: declare a job → push solution that matches its
@@ -2258,7 +2436,7 @@ mod tests {
             n_bits: 0x1d00_ffff,
             version: 0x2000_0000,
         };
-        let out = handle_push_solution(&mut s, &solution, addr());
+        let out = handle_push_solution(&mut s, &solution);
         assert!(out.outbound.is_empty());
         match &out.events[0] {
             JdpSessionEvent::BlockSubmissionCandidate {
@@ -2311,7 +2489,7 @@ mod tests {
             n_bits: 0,
             version: 0,
         };
-        let out = handle_push_solution(&mut s, &solution, addr());
+        let out = handle_push_solution(&mut s, &solution);
         assert!(out.events.is_empty());
     }
 }

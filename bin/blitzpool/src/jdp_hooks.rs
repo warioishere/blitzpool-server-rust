@@ -27,12 +27,12 @@
 //!    addresses anyway).
 //!
 //! 2. **[`TdpTemplateTxProvider`]** — returns the wtxid→tx_bytes map
-//!    for the **current** template. Phase 7.4d.4 ships this as an
-//!    empty map: the JDC will respond to `ProvideMissingTransactions`
-//!    with the full tx-set. That's bandwidth-suboptimal (1–2 MB per
-//!    declaration vs ~80 KB if pool knew most txs) but functionally
-//!    correct. A proper TDP tx-cache is deferred — see DEFERRED.md
-//!    "JDP tx-cache (bandwidth optimisation)".
+//!    for the **current** template, out of the long-lived
+//!    [`TemplateTxCache`]. The cache is gated on
+//!    `[sv2].jdp_orphan_submitblock`; without it the provider answers
+//!    with an empty map and the JDC fills in the whole transaction set
+//!    over `ProvideMissingTransactions` — correct either way, but 1–2 MB
+//!    per declaration instead of the handful of txs the pool is missing.
 //!
 //! 3. **[`TdpCurrentPrevHashProvider`]** — reads
 //!    `TdpHandle::current_snapshot().set_new_prev_hash.prev_hash`.
