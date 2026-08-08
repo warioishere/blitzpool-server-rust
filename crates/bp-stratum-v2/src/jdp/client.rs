@@ -60,7 +60,7 @@ use crate::tokens::{Token, TokenAllocError, TokenStore};
 use crate::bridge::DistributionAcceptance;
 
 use super::declarations::{DeclaredJob, DeclaredJobStore};
-use super::dynamic_outputs::{declared_coinbase_tx, PayoutBooking};
+use super::dynamic_outputs::{declared_coinbase_tx, CandidateBacking, PayoutBooking};
 use super::payout_distribution::validate_coinbase_outputs_against_distribution;
 use super::tx_validation::{
     merge_provided_with_known, partition_against_template, PendingDeclaration,
@@ -284,12 +284,27 @@ pub enum JdpSessionEvent {
     /// [`JdpSessionState::full_template_mode`], which is what every
     /// gate reads.
     SetupComplete,
-    /// A token was allocated. Caller can persist (e.g. for cross-
-    /// connection coinbase-outputs lookups via the
-    /// `findEmittedOutputsForJob`-equivalent).
+    /// A token was allocated. The IO layer registers it in the
+    /// cross-connection bridge so the mining side can resolve the token
+    /// when its `SetCustomMiningJob` arrives without a declaration
+    /// (base-protocol Coinbase-only mode).
     TokenAllocated {
         token: Token,
         miner_address: AddressId,
+        /// §6.4.3's designated pool payout output, read back off the blob
+        /// this allocate answered with
+        /// ([`crate::jdp::dynamic_outputs::designated_payout_script`]).
+        ///
+        /// `None` on an ext 0x0003 session, where §2 requires the outputs
+        /// to be empty and the published distribution replaces the base
+        /// convention entirely — a custom job is then judged by the §7.1
+        /// recompute, never by this script.
+        payout_script: Option<Vec<u8>>,
+        /// The token's own expiry, so the bridge entry cannot outlive the
+        /// token it mirrors. Carried on the event rather than looked up
+        /// later: the token store is the JDP session's, and a lookup that
+        /// missed would have to invent an expiry.
+        expires_at_ms: u64,
     },
     /// A `DeclareMiningJob` was accepted. Caller fans out to the
     /// mining-protocol bridge to build a `SetCustomMiningJob` for
@@ -335,10 +350,11 @@ pub enum JdpSessionEvent {
         nonce: u32,
         /// Block-header `n_bits` field.
         n_bits: u32,
-        /// How to book this block, carried from the declare-time proof that
-        /// the JDC's coinbase pays the pool's issued payout set. `None` →
-        /// report the block, book nothing.
-        booking: Option<PayoutBooking>,
+        /// What the declaration behind this solution was backed by, carried
+        /// from the declare-time §7.1 proof. Decides BOTH whether the block
+        /// is booked and whether the §10 settle fires — which are not the
+        /// same question, see [`CandidateBacking`].
+        backing: CandidateBacking,
     },
     /// The connection should be closed. Emitted on protocol /
     /// version mismatch in `SetupConnection`. IO layer closes the
@@ -604,6 +620,10 @@ pub fn handle_allocate_token(
     let token = alloc.token;
     let outputs = alloc.coinbase_outputs.clone();
     let miner_address = alloc.miner_address.clone();
+    let expires_at_ms = alloc.expires_at_ms;
+    // Derived from the very bytes this frame carries, so the script the
+    // mining side holds a custom job to is the script the JDC was sent.
+    let payout_script = super::dynamic_outputs::designated_payout_script(&outputs);
 
     JdpHandlerOutcome {
         outbound: vec![JdpOutboundFrame::AllocateMiningJobTokenSuccess {
@@ -614,6 +634,8 @@ pub fn handle_allocate_token(
         events: vec![JdpSessionEvent::TokenAllocated {
             token,
             miner_address,
+            payout_script,
+            expires_at_ms,
         }],
     }
 }
@@ -973,17 +995,48 @@ fn accept_declaration(
             }
         }
     }
+    // No base-protocol counterpart here, deliberately. §6.4.3 says a pool
+    // SHOULD reject a job that allocates nothing to its designated payout
+    // output, and the mining side does exactly that for Coinbase-only mode
+    // (`mining::client::handle_set_custom_mining_job`) — but a declaration
+    // is not the place for it here.
+    //
+    // A base-protocol custom job is Solo-only (the Solo gate on the mining
+    // side), and on Solo the designated output IS the declaring miner's own
+    // address. So the only thing this check could catch is a miner
+    // shortchanging itself, with no pool funds and no other miner's share
+    // involved. Adding it would mean a new rejection path, and a new way to
+    // refuse a declaration — fatal for an SRI jd-client, which treats every
+    // declare error except `stale-chain-tip` as terminal — in exchange for
+    // protecting nobody. If a base-protocol job is ever served off Solo,
+    // this is the first thing that has to change.
 
-    // Allocate a fresh token for the declared job via the shared
-    // TokenStore for consistency + rate-limit accounting.
+    // Mint the `new_mining_job_token` through the shared TokenStore, so a
+    // declared job's token has the same shape and TTL as an allocated one —
+    // but NOT through `allocate`, which enforces the §6.4.2 rate limit.
+    //
+    // That limit belongs to `AllocateMiningJobToken`, the message a CLIENT
+    // sends. Drawing the pool's own answer from the same budget meant a JDC
+    // that allocated and then declared inside one second had its declaration
+    // dropped with no frame at all — and the reference client refills its
+    // token queue fire-and-forget from four call sites, several of which fire
+    // on the same block change as a declare. The JDC then waits for a
+    // response that never comes, and §6.2 sends it to another pool.
     let new_token = match state
         .tokens
-        .allocate(now_ms, miner_address.clone(), Vec::new())
+        .mint_for_declaration(now_ms, miner_address.clone())
     {
         Ok(entry) => entry.token,
-        Err(_) => {
-            // Rate-limited / entropy failure — drop silently, the JDC
-            // will retry on the next declaration.
+        Err(err) => {
+            // Only entropy failure or a saturated counter can reach this now.
+            // Both are pool-side faults the JDC cannot act on and cannot see
+            // (SV2 has no error for it), so say so loudly here.
+            tracing::error!(
+                %err,
+                request_id = input.request_id,
+                "jdp: could not mint a declaration token — dropping DeclareMiningJob \
+                 with no response; the JDC will treat this as an unresponsive JDS"
+            );
             return JdpHandlerOutcome::default();
         }
     };
@@ -1027,9 +1080,9 @@ fn accept_declaration(
 /// [`DeclaredJob::miner_address`] — not against a separately resolved
 /// one, which could name a different miner than the job it belongs to.
 ///
-/// - Not in full-template mode → silently dropped.
-/// - No matching declared job → silently dropped.
-/// - Missing raw-tx data for any wtxid position → silently dropped.
+/// - Coinbase-only mode → dropped, and that is the NORMAL case, not a fault.
+/// - No matching declared job → dropped.
+/// - Missing raw-tx data for any wtxid position → dropped.
 pub fn handle_push_solution(
     state: &mut JdpSessionState,
     input: &PushSolutionInput,
@@ -1038,10 +1091,23 @@ pub fn handle_push_solution(
     // discarding one silently would make a lost pool-side block booking
     // undiagnosable. (The block itself is safe either way — the JDC submits
     // through its own node too.)
+    //
+    // Coinbase-only is the exception and logs at INFO, because it is not a
+    // fault and it is not rare. A Coinbase-only JDC DOES send `PushSolution`
+    // — verified against the reference client, which emits one on every
+    // BlockFound with no mode branch at all (sv2-apps v0.7.0,
+    // `jd-client/src/lib/utils.rs` and both sites in
+    // `channel_manager/downstream_message_handler.rs`). Do not "fix" this
+    // into acting on it: §6.3.1 means there is no declaration, so the pool
+    // holds no transaction list and CANNOT reassemble the block — a merkle
+    // path is not a tx set. Propagation is the JDC's own node's job here,
+    // and the pool records the block off the mining side instead
+    // (`ExtendedJob::jdp_claims_the_block`).
     if !state.full_template_mode {
-        tracing::warn!(
+        tracing::info!(
             prev_hash = %hash_hex(&input.prev_hash),
-            "jdp: PushSolution dropped — connection not in Full-Template mode"
+            "jdp: PushSolution from a Coinbase-only session — no declaration to reassemble the \
+             block from; the JDC propagates it and the mining side records it"
         );
         return JdpHandlerOutcome::default();
     }
@@ -1063,36 +1129,44 @@ pub fn handle_push_solution(
     // building the outcome.
     let new_token = job.new_token;
     let miner_address = job.miner_address.clone();
-    let booking = job.booking;
-    // A block that WAS validated against a published distribution but carries
-    // no booking. The only way to be in that state is `bookable == false` —
-    // the distribution's settlement snapshot never landed (the Redis write
-    // failed past its retries), so §4 was proven at declare time but the
-    // inputs needed to settle it were not preserved.
-    //
-    // The coinbase pays the published split on-chain either way. What is lost
-    // is this block's ledger reconciliation, and it is lost for good: nothing
-    // parks it. Parking would mean re-creating the settlement inputs here,
-    // i.e. re-doing the very write that just failed, into a second store —
-    // a second implementation of snapshot-freezing on the money path for an
-    // event that needs a Redis outage AND a block find in the same
-    // distribution interval. Deliberately not built (decision 2026-08-06);
-    // this line is the whole mitigation, so it must be loud enough to act on.
-    //
-    // Distinguished from the ordinary `booking: None` — a base-protocol
-    // declaration, where there is simply nothing to book and a WARN is right.
-    // Telling the two apart is only possible since `DeclaredJob` carries its
-    // own `distribution_id` (#17); do not collapse the two fields.
-    if booking.is_none() && job.distribution_id.is_some() {
-        tracing::error!(
-            prev_hash = %hash_hex(&input.prev_hash),
-            distribution_id = job.distribution_id,
-            "jdp: BLOCK FOUND on a validated distribution that was never bookable — \
-             its coinbase pays miners on-chain but this block gets NO ledger entry, \
-             and nothing preserves the inputs to add one later. Settlement snapshot \
-             write must have failed when the distribution was published."
-        );
-    }
+    // The three states, resolved once, by `match` over BOTH fields rather
+    // than by asking `booking.is_some()` — that question reads like "was a
+    // distribution involved?" and answers a different one. `DeclaredJob` has
+    // carried the two separately since #17 exactly so this match is possible.
+    let backing = match (job.booking, job.distribution_id) {
+        (Some(booking), _) => CandidateBacking::Bookable(booking),
+        // Validated against a published distribution, but `bookable == false`
+        // — its settlement snapshot never landed (the Redis write failed past
+        // its retries). §4 was proven at declare time; the inputs to settle it
+        // were not preserved.
+        //
+        // The coinbase pays the published split on-chain either way. What is
+        // lost is this block's LEDGER reconciliation, and it is lost for good:
+        // nothing parks it. Parking would mean re-creating the settlement
+        // inputs here, i.e. re-doing the very write that just failed, into a
+        // second store — a second implementation of snapshot-freezing on the
+        // money path for an event that needs a Redis outage AND a block find
+        // in the same distribution interval. Deliberately not built (decision
+        // 2026-08-06), so this line is the whole mitigation.
+        //
+        // What is NOT lost, and must not be: the §10 settle. See
+        // `CandidateBacking`.
+        (None, Some(distribution_id)) => {
+            tracing::error!(
+                prev_hash = %hash_hex(&input.prev_hash),
+                distribution_id,
+                "jdp: BLOCK FOUND on a validated distribution that was never bookable — \
+                 its coinbase pays miners on-chain but this block gets NO ledger entry, \
+                 and nothing preserves the inputs to add one later. Settlement snapshot \
+                 write must have failed when the distribution was published. The \
+                 distribution IS settled, so nothing is paid twice."
+            );
+            CandidateBacking::UnbookableDistribution { distribution_id }
+        }
+        // Base-protocol declaration: nothing published, nothing to book, and
+        // nothing to settle.
+        (None, None) => CandidateBacking::BaseProtocol,
+    };
     let coinbase_prefix = job.coinbase_tx_prefix.clone();
     let coinbase_suffix = job.coinbase_tx_suffix.clone();
     let wtxid_count = job.wtxid_list.len();
@@ -1123,7 +1197,7 @@ pub fn handle_push_solution(
         events: vec![JdpSessionEvent::BlockSubmissionCandidate {
             miner_address,
             new_token,
-            booking,
+            backing,
             coinbase_raw,
             transactions,
             prev_hash: input.prev_hash,
@@ -1637,6 +1711,102 @@ mod tests {
         assert!(matches!(out.events[0], JdpSessionEvent::JobDeclared { .. }));
         assert_eq!(s.declared_jobs.len(), 1);
         assert!(s.pending_declaration.is_none());
+    }
+
+    /// INTEROP: a declaration in the same second as an allocate must be
+    /// answered.
+    ///
+    /// §6.4.2's rate limit belongs to `AllocateMiningJobToken`, the message
+    /// the CLIENT sends. The pool's own `new_mining_job_token` used to be
+    /// minted through the same limited call, so the allocate consumed the
+    /// budget and the declare that followed it was dropped — no Success, no
+    /// Error, nothing on the wire. The JDC then waits for an answer that
+    /// never comes and §6.2 sends it to a different pool.
+    ///
+    /// This is not a synthetic timing: the reference jd-client refills its
+    /// token queue fire-and-forget from four call sites
+    /// (sv2-apps v0.7.0, `channel_manager/template_message_handler.rs`
+    /// lines 273/347/350/685), several of which fire on the same block
+    /// change that produces a declaration.
+    #[test]
+    fn a_declaration_in_the_same_second_as_an_allocate_is_still_answered() {
+        let mut s = fresh();
+        let _ = handle_setup_connection(&mut s, &good_setup());
+        // Allocate at t=1000 — this is what stamps the §6.4.2 budget.
+        let out = handle_allocate_token(&mut s, &good_alloc(1), alloc_ctx(), 1_000);
+        let token = match out.outbound[0] {
+            JdpOutboundFrame::AllocateMiningJobTokenSuccess {
+                mining_job_token, ..
+            } => mining_job_token,
+            _ => panic!("expected AllocateMiningJobTokenSuccess"),
+        };
+
+        // Declare 100 ms later — well inside the 1 s allocate limit.
+        let wtxid = [0x01; 32];
+        let mut tpl = HashMap::new();
+        tpl.insert(wtxid, vec![0xCA; 16]);
+        let input = declare(3, token, vec![wtxid]);
+        let out = handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, 1_100);
+
+        assert!(
+            !out.outbound.is_empty(),
+            "the declaration must be ANSWERED — dropping it leaves the JDC waiting on a \
+             frame that never arrives, which §6.2 turns into a pool switch"
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                JdpOutboundFrame::DeclareMiningJobSuccess { .. }
+            ),
+            "got {:?}",
+            out.outbound[0]
+        );
+        assert_eq!(s.declared_jobs.len(), 1);
+    }
+
+    /// The mirror, so the fix above did not simply delete the limit: the
+    /// CLIENT's allocate is still rate-limited, and minting a declaration
+    /// token in between must not extend that budget either — otherwise the
+    /// same bug reappears with the roles swapped.
+    #[test]
+    fn the_client_facing_allocate_limit_survives_a_declaration() {
+        let mut s = fresh();
+        let _ = handle_setup_connection(&mut s, &good_setup());
+        let out = handle_allocate_token(&mut s, &good_alloc(1), alloc_ctx(), 1_000);
+        let token = match out.outbound[0] {
+            JdpOutboundFrame::AllocateMiningJobTokenSuccess {
+                mining_job_token, ..
+            } => mining_job_token,
+            _ => panic!("expected AllocateMiningJobTokenSuccess"),
+        };
+        let wtxid = [0x01; 32];
+        let mut tpl = HashMap::new();
+        tpl.insert(wtxid, vec![0xCA; 16]);
+        let _ = handle_declare_mining_job(
+            &mut s,
+            &declare(3, token, vec![wtxid]),
+            &tpl,
+            Some([0xAB; 32]),
+            None,
+            1_100,
+        );
+
+        // A second allocate still inside the second: refused, as §6.4.2 asks.
+        let out = handle_allocate_token(&mut s, &good_alloc(2), alloc_ctx(), 1_500);
+        assert!(
+            out.outbound.is_empty(),
+            "a second allocate inside 1 s must still be rate-limited"
+        );
+        // And past the second it is served again — measured from the
+        // ALLOCATE at 1_000, not from the declaration at 1_100.
+        let out = handle_allocate_token(&mut s, &good_alloc(3), alloc_ctx(), 2_050);
+        assert!(
+            matches!(
+                out.outbound[0],
+                JdpOutboundFrame::AllocateMiningJobTokenSuccess { .. }
+            ),
+            "the declaration must not have pushed the allocate budget forward"
+        );
     }
 
     /// §6: on a 0x0003-negotiated connection every `DeclareMiningJob`

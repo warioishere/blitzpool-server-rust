@@ -170,6 +170,12 @@ pub struct ShareAccept {
     /// channels until [`StandardJobContext`] threads the template id
     /// through (Standard block-submit path).
     pub template_id: Option<u64>,
+    /// Copied off [`crate::mining::jobs::ExtendedJob::jdp_claims_the_block`]:
+    /// `true` when a block found on this job will be claimed by the JDP
+    /// `PushSolution` path. The block sink needs it to decide whether a
+    /// custom-job block is its own to record. Always `false` on the
+    /// Standard path, which has no custom jobs.
+    pub jdp_claims_the_block: bool,
     /// Identity of the payout list the job's coinbase pays. The block sink
     /// hands it to the PPLNS engine so the ledger books the distribution
     /// this block actually paid, not whatever the shared snapshot key holds
@@ -425,6 +431,7 @@ pub fn validate_submit_standard(
         hash: pow.submission_hash,
         is_block_candidate,
         template_id: job_ctx.template_id,
+        jdp_claims_the_block: false,
         payouts_fingerprint: job_ctx.payouts_fingerprint,
         witness_coinbase,
         // Standard-channel shares never carry a per-share Worker-ID
@@ -710,6 +717,7 @@ pub fn validate_submit_extended(
         hash: pow.submission_hash,
         is_block_candidate,
         template_id: ext_job.template_id,
+        jdp_claims_the_block: ext_job.jdp_claims_the_block,
         payouts_fingerprint: ext_job.payouts_fingerprint,
         witness_coinbase,
         effective_worker_name,
@@ -799,6 +807,7 @@ mod tests {
             network_difficulty: Difficulty(1e15),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,
+            jdp_claims_the_block: false,
             created_at: 0,
             retired_at: None,
         }

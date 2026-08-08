@@ -57,10 +57,9 @@ pub struct WeightSnapshotEntry {
 /// sats per output, valid for exactly one reward), this freezes the
 /// INPUTS: settlement recomputes each address's claim from
 /// `bp_share::claim_sats(score_weight, score_total, fee_ppm, T_actual)`
-/// and books `claim − actually_paid` against the balance — correct for
-/// ANY actual revenue inside the booking band, which is what makes one
-/// snapshot serve the pool's own templates and every JDC's
-/// independently-valued jobs alike.
+/// and books `claim − actually_paid` against the balance — correct at
+/// ANY actual revenue, which is what makes one snapshot serve the pool's
+/// own templates and every JDC's independently-valued jobs alike.
 ///
 /// Schema 3 dropped the `finder_bonus` field: the bonus is a proportion
 /// now, already inside `score_weight`.
@@ -86,8 +85,9 @@ pub struct StoredWeightSnapshot {
     pub fee_ppm: u32,
     /// Pool-output recipient.
     pub fee_address: String,
-    /// Revenue the wire-weight boosts were projected against; the
-    /// booking band is checked against this.
+    /// Revenue the wire-weight boosts were projected against — the base
+    /// [`StoredWeightSnapshot::extras_total`] re-projects satoshi promises
+    /// from at settlement time.
     pub reference_revenue_sats: u64,
     /// `Σ score_weight` — denominator of every claim.
     pub score_total: u64,

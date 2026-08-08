@@ -355,6 +355,39 @@ impl TdpBlockSubmissionSink {
         .await
     }
 
+    /// The same record WITHOUT the ledger: `blocks_entity` row plus the
+    /// notification, no engine write.
+    ///
+    /// For a block whose distribution was never bookable — its settlement
+    /// snapshot did not land, so nothing can compute `claim − paid`. The
+    /// block is still the pool's, and a block that exists in nobody's history
+    /// is a block the operator has to find in a log.
+    ///
+    /// `reward_sats: None` is what holds the ledger off, and it is the
+    /// existing, documented lever rather than a new branch: `apply_block_found`
+    /// skips the engine write for every non-Solo mode without a reward. The
+    /// fingerprint and the coinbase go as `None` for the same reason — there
+    /// is no distribution to resolve and nothing may be settled from a guess.
+    pub(crate) async fn record_declared_block_without_booking(
+        &self,
+        miner_address: String,
+        session_id: String,
+        block_hash: String,
+        block_data: String,
+    ) -> bool {
+        self.emit_block_found(
+            miner_address,
+            "jdp".to_string(),
+            session_id,
+            None,
+            Some(block_hash),
+            block_data,
+            None,
+            None,
+        )
+        .await
+    }
+
     /// Convenience: wrap in `Arc<dyn BlockSubmissionSink>` so the
     /// caller can drop it directly into `bp_stratum_v1::ServerHooks
     /// { block_sink, … }`.
@@ -914,17 +947,28 @@ impl BlockFoundApplier {
                 );
             }
             (_, None) => {
-                // Defensive only: both SV1 and SV2 now thread the per-job
-                // `coinbase_tx_value_remaining` into the ShareAccept, so a
-                // non-Solo block-found always carries `Some(reward)`. A `None`
-                // here would mean a caller regressed — skip the ledger-write
-                // (still dispatch below) and flag it loudly.
+                // Two callers reach this, and only one of them is a fault.
+                //
+                // Legitimate: `record_declared_block_without_booking` — a JDP
+                // block whose distribution was never bookable. It passes no
+                // reward precisely to keep the ledger out while still writing
+                // the row, so the block appears in the API instead of only in
+                // a log.
+                //
+                // A fault: anything else. Both SV1 and SV2 thread the per-job
+                // reward into the ShareAccept, so an ordinary non-Solo
+                // block-found always carries `Some(reward)`.
+                //
+                // The two are told apart by the log line that precedes this
+                // one, not here — this side has no way to know. Either way the
+                // ledger write is skipped and the dispatch below still runs.
                 warn!(
                     address = address_str,
                     height,
                     mode = ?event.mode,
-                    "block-found: non-Solo mode with no reward — engine ledger-write skipped \
-                     (unexpected: reward should always be present, possible caller regression)"
+                    "block-found: non-Solo mode with no reward — engine ledger-write skipped. \
+                     Expected for a JDP block recorded without a booking; a caller regression \
+                     otherwise."
                 );
             }
             (MiningMode::Pplns, Some(reward)) => match self.pplns.as_ref() {
@@ -1251,24 +1295,69 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
         session_id_hex: &str,
         stream: StreamKind,
     ) {
-        // Empty `witness_coinbase` / missing `template_id` happens
-        // when the job was declared via `SetCustomMiningJob` (the
-        // JDC built the template — pool has no template_id to call
-        // submit_solution with, and the coinbase bytes weren't
-        // pool-built). The JDC handles its own block-submit via the
-        // JDP `PushSolution` flow in that case; warn here for
-        // visibility but don't double-submit on the mining side.
+        // Empty `witness_coinbase` / missing `template_id` happens when the
+        // job was declared via `SetCustomMiningJob` (the JDC built the
+        // template — the pool has no template_id to call `submit_solution`
+        // with, and the coinbase bytes weren't pool-built). The JDC
+        // propagates its own block either way, so there is nothing to
+        // submit here. What still has to happen is the RECORD.
+        //
+        // Who records it is `ExtendedJob::jdp_claims_the_block`, and only
+        // that: the JDP `PushSolution` path matches a solution against a
+        // DECLARED job, so it never sees a Coinbase-only one (§6.3.1 — that
+        // mode never declares), whether or not a distribution backs it.
+        // Deciding on the distribution instead left every Coinbase-only
+        // 0x0003 block unrecorded AND unsettled.
+        //
+        // Recording a claimed block here too would write the
+        // `blocks_entity` row twice — the insert has no `ON CONFLICT` — and
+        // the first, unbooked row would then suppress the booked one.
         if accept.witness_coinbase.is_empty() || accept.template_id.is_none() {
+            if accept.jdp_claims_the_block {
+                info!(
+                    address,
+                    worker,
+                    session_id_hex,
+                    "sv2 block-found on a declared, distribution-backed custom job \
+                     — the JDP PushSolution path records and books it"
+                );
+                return;
+            }
+            // The pool reassembled this coinbase itself, out of the job it
+            // served and the miner's own extranonce (the same reconstruction
+            // SV1 does) — so it is not a guess, and it is the block's OWN
+            // coinbase, which is the only thing settlement may book from.
+            // The reward follows from it for the same reason: a reference
+            // figure would be the pool's intention, not what the block paid.
+            let actual = decode_actual_coinbase(&accept.witness_coinbase, self.network);
+            let reward_sats = actual.as_ref().map(|a| a.total_value_sats);
+            // Zeroed unless ext 0x0003 published a distribution this coinbase
+            // was proven to pay (`emit_block_found` filters the zero out).
+            // With it, a Coinbase-only 0x0003 block settles from its own
+            // coinbase exactly as a pool-built one does; without it there is
+            // nothing published to book against and the record stands alone.
+            let fingerprint = accept.payouts_fingerprint;
             warn!(
                 address,
                 worker,
                 session_id_hex,
-                effective_diff = accept.effective_difficulty.as_f64(),
                 submission_diff = accept.submission_difficulty.as_f64(),
-                "sv2 block-found on SetCustomMiningJob-declared job: pool has no template_id \
-                 to call submit_solution with. Share is credited; if the JDC is wired to a JDP \
-                 server (Phase 7.4d.4+), PushSolution will claim the block instead."
+                bookable = fingerprint != [0u8; 32],
+                "sv2 block-found on a custom job the JDP path will not claim: the JDC \
+                 propagates it through its own node, the pool records it here (no template_id \
+                 to submit with)"
             );
+            self.emit_block_found(
+                address.to_string(),
+                worker.to_string(),
+                session_id_hex.to_string(),
+                reward_sats,
+                Some(block_hash_display(&accept.header)),
+                hex::encode(accept.header),
+                Some(fingerprint),
+                actual,
+            )
+            .await;
             return;
         }
         let template_id = accept.template_id.expect("checked is_some above");

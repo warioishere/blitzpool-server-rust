@@ -193,6 +193,7 @@ mod tests {
             hash: [0u8; 32],
             is_block_candidate: candidate,
             template_id: None,
+            jdp_claims_the_block: false,
             witness_coinbase: Vec::new(),
             effective_worker_name: None,
             coinbase_tx_value_remaining: 5_000_000_000,

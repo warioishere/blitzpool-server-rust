@@ -105,6 +105,43 @@ pub struct RegisteredDeclaredJob {
     pub jdp_session_id: u32,
 }
 
+/// An allocated token the pool answered under the BASE protocol, i.e. with
+/// a §6.4.3 designated payout output rather than an ext 0x0003 distribution.
+///
+/// It exists because Coinbase-only mode has no `DeclareMiningJob` — the JDC
+/// takes the allocate token straight to `SetCustomMiningJob` on the mining
+/// connection (§6.3.1: "the `DeclareMiningJob` message is never used"). So
+/// the declared-job map cannot resolve that token, and without this one the
+/// mining side has nothing to judge the job by and refuses it.
+///
+/// Only base-protocol allocations land here. On an ext 0x0003 session §2
+/// requires empty `coinbase_tx_outputs`, so there is no designated script
+/// and nothing to register: such a job is judged by the §7.1 recompute
+/// against the published distribution, which is a different and stronger
+/// check. Keeping the map base-only means it can never be the thing that
+/// waves an extension job through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllocatedTokenRef {
+    /// Miner address the token was issued to (cross-checked against the
+    /// mining channel's locked address, exactly as for a declared job).
+    pub miner_address: AddressId,
+    /// The script §6.4.3 designated as the pool payout output for this
+    /// token. The custom job's coinbase must pay it — see
+    /// [`crate::jdp::dynamic_outputs::pays_designated_output`].
+    pub payout_script: Vec<u8>,
+    /// JDP session that issued it (evicted with the session).
+    pub jdp_session_id: u32,
+    /// The issuing token's own expiry, carried verbatim from
+    /// [`crate::tokens::AllocatedToken`].
+    ///
+    /// Without it this map has no bound at all: the token store rate-limits
+    /// to one allocation per second and expires each after an hour, but a
+    /// bridge entry used to live until its whole session ended — so one
+    /// connection held open for a day left ~86 400 entries behind, under the
+    /// same lock the mining hot path takes.
+    pub expires_at_ms: u64,
+}
+
 /// Projection of a bridge entry for the mining-side `SetCustomMiningJob`
 /// cross-checks: the miner identity, the tip the declaration was accepted
 /// under, and the declared job's own fields — not the (potentially large)
@@ -282,8 +319,9 @@ pub struct PayoutDistributionEntry {
     pub dust_limits: Vec<u32>,
     /// Consensus-serialized 0-value TxOuts the pool appends.
     pub additional_outputs: Vec<Vec<u8>>,
-    /// Revenue the distribution's weight boosts were projected against
-    /// — the booking band is checked against this.
+    /// Revenue the distribution's weight boosts were projected against —
+    /// carried to the block-found path, which uses it as the fallback
+    /// reward when the block's own coinbase value is unavailable.
     pub reference_reward_sats: u64,
     /// Settlement-snapshot identity (weights fingerprint). `None` when
     /// the owning mode books without a snapshot (Solo).
@@ -377,6 +415,9 @@ impl DistributionSlot {
 #[derive(Debug, Default)]
 pub struct JdpDeclaredJobRegistry {
     entries: HashMap<Token, StoredJob>,
+    /// Base-protocol allocate tokens (Coinbase-only mode has no
+    /// declaration to key on) — see [`AllocatedTokenRef`].
+    allocations: HashMap<Token, AllocatedTokenRef>,
     /// Pool-wide distribution (PPLNS) — what every connection gets
     /// pushed on open and on the publisher's timer.
     pool_wide_distribution: DistributionSlot,
@@ -432,6 +473,37 @@ impl JdpDeclaredJobRegistry {
             distribution_id: s.entry.declared_job.distribution_id,
             jdp_session_id: s.entry.jdp_session_id,
         })
+    }
+
+    // ── Base-protocol allocate tokens ───────────────────────────────
+
+    /// Register a base-protocol allocate token so the mining side can
+    /// resolve it when a Coinbase-only `SetCustomMiningJob` arrives.
+    ///
+    /// Called only with a designated payout script; an ext 0x0003 session
+    /// has none and registers nothing (see [`AllocatedTokenRef`]).
+    ///
+    /// Sweeps expired entries on the way in. That is the only bound this
+    /// map has, and one insert's worth of scanning is affordable precisely
+    /// because inserts are rate-limited to one per second per connection —
+    /// the same limit that would otherwise fill it.
+    pub fn register_allocation(&mut self, token: Token, entry: AllocatedTokenRef, now_ms: u64) {
+        self.allocations.retain(|_, a| a.expires_at_ms > now_ms);
+        self.allocations.insert(token, entry);
+    }
+
+    /// The base-protocol allocation behind a token, if any. `None` for an
+    /// unknown/evicted token, for an EXPIRED one, and for every ext 0x0003
+    /// allocation.
+    ///
+    /// Expiry is judged here as well as at insert time: a token that
+    /// outlived its hour must stop authorising jobs even if nothing has
+    /// been allocated since, and the JDP and mining connections do not
+    /// share a clock tick.
+    pub fn allocation_ref(&self, token: &Token, now_ms: u64) -> Option<&AllocatedTokenRef> {
+        self.allocations
+            .get(token)
+            .filter(|a| a.expires_at_ms > now_ms)
     }
 
     // ── Payout distributions (ext 0x0003 push model) ────────────────
@@ -619,15 +691,24 @@ impl JdpDeclaredJobRegistry {
     /// Drop every entry owned by a closing JDP session. Returns the
     /// count removed — useful for diagnostics + the IO layer's
     /// connection-close log.
+    ///
+    /// The count spans BOTH maps: it is a diagnostic for "how much did this
+    /// session hold", and a number that silently ignored one of the two
+    /// would understate exactly the map that can grow.
     pub fn evict_for_jdp_session(&mut self, jdp_session_id: u32) -> usize {
-        let before = self.entries.len();
+        let before = self.entries.len() + self.allocations.len();
         self.entries
             .retain(|_, s| s.entry.jdp_session_id != jdp_session_id);
+        // Allocate tokens die with their session for the same reason the
+        // declared jobs do: the token is only meaningful while the JDP
+        // connection that issued it is alive.
+        self.allocations
+            .retain(|_, a| a.jdp_session_id != jdp_session_id);
         // A tailored distribution dies with the session it was
         // published to.
         self.tailored_distributions.remove(&jdp_session_id);
         self.pool_wide_denied.remove(&jdp_session_id);
-        before - self.entries.len()
+        before - (self.entries.len() + self.allocations.len())
     }
 }
 

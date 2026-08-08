@@ -62,7 +62,7 @@ use crate::ledger::{
 use crate::sweep::{spawn_daily_task, DustSweepRunner, SweepError, SystemClock};
 use crate::window::{snapshot::StoredWeightSnapshot, NetworkDifficulty, WindowError, WindowStore};
 use bp_coinbase_snapshot::ActualCoinbase;
-use bp_share::{block_subsidy_sats, claim_sats, reward_within_band};
+use bp_share::{block_subsidy_sats, claim_sats};
 
 /// Errors surfaced across the engine boundary.
 #[derive(Debug, Error)]
@@ -478,19 +478,6 @@ impl PplnsEngine {
                 subsidy,
             });
         }
-        // Drift off the projection base is an ALARM, not a gate. The
-        // claims below come from the block's own coinbase, so they are
-        // right at any revenue.
-        if !reward_within_band(snapshot.reference_revenue_sats, actual.total_value_sats) {
-            warn!(
-                reference_reward = snapshot.reference_revenue_sats,
-                actual_reward = actual.total_value_sats,
-                block_height,
-                "PPLNS block revenue far off the distribution's reference — booking it from the \
-                 real coinbase, but the job source is worth a look"
-            );
-        }
-
         // 2. Settle. The balance write is absolute (`current + delta`), so
         //    `current` MUST be read under `FOR UPDATE` in the same
         //    transaction that writes it — otherwise the daily dust sweep,

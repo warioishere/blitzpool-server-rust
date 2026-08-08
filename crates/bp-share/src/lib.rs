@@ -284,28 +284,6 @@ pub fn compute_payout_amounts(
     })
 }
 
-/// Divergence band between a distribution's reference revenue and the
-/// revenue a block actually pays: `|T_actual − T_ref| ≤ T_ref /
-/// SETTLEMENT_BAND_DIVISOR` (±25 %). Mempool-fee drift between a
-/// distribution publish and a found block lives comfortably inside
-/// this.
-///
-/// This is an ALARM, not a booking gate. `T_ref` is only the base the
-/// wire weights were projected against; settlement books `claim −
-/// paid` from the block's own coinbase, and that identity holds at
-/// every `T` (`Σ deltas = 0` for any `T_actual/T_ref`). Refusing to
-/// book outside the band left the paid-out balances standing in the
-/// ledger, so the next block paid them a second time — the drift is
-/// worth an operator's attention, never a reason to lose the block.
-/// The hard gate is [`block_subsidy_sats`].
-pub const SETTLEMENT_BAND_DIVISOR: u64 = 4;
-
-/// Is `t_actual` within the settlement band around `t_ref`?
-pub fn reward_within_band(t_ref: u64, t_actual: u64) -> bool {
-    let tolerance = t_ref / SETTLEMENT_BAND_DIVISOR;
-    t_actual >= t_ref.saturating_sub(tolerance) && t_actual <= t_ref.saturating_add(tolerance)
-}
-
 /// The genesis block subsidy: 50 BTC.
 pub const INITIAL_BLOCK_SUBSIDY_SATS: u64 = 5_000_000_000;
 
@@ -1532,16 +1510,5 @@ mod tests {
         assert_eq!(block_subsidy_sats(-1, SUBSIDY_HALVING_INTERVAL), 0);
         assert_eq!(block_subsidy_sats(i32::MIN, SUBSIDY_HALVING_INTERVAL), 0);
         assert_eq!(block_subsidy_sats(800_000, 0), 0);
-    }
-
-    /// The band is an alarm, not a gate — but it still has to describe
-    /// the ±25 % it claims to.
-    #[test]
-    fn settlement_band_spans_a_quarter_either_way() {
-        const T: u64 = 400_000_000;
-        assert!(reward_within_band(T, 300_000_000));
-        assert!(reward_within_band(T, 500_000_000));
-        assert!(!reward_within_band(T, 299_999_999));
-        assert!(!reward_within_band(T, 500_000_001));
     }
 }

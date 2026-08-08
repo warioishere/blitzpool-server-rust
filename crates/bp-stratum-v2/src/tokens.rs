@@ -221,9 +221,36 @@ impl TokenStore {
         self.allocated.is_empty()
     }
 
+    /// Mint a token for a message the POOL originates — today only the
+    /// `new_mining_job_token` of a `DeclareMiningJobSuccess`.
+    ///
+    /// Deliberately not rate-limited, and that is the whole point of it
+    /// existing separately. §6.4.2 asks for the limit on
+    /// `AllocateMiningJobToken`, the message a client sends; minting through
+    /// [`Self::allocate`] made the pool's own answer draw from the client's
+    /// budget. A JDC that allocates and then declares inside the same second
+    /// — which the reference client does on every block change, since it
+    /// refills its token queue fire-and-forget from four call sites — had its
+    /// `DeclareMiningJob` silently dropped, no frame at all, and waited for
+    /// an answer that never came.
+    ///
+    /// Nothing was holding the limit up on this path: what a declaration can
+    /// accumulate is capped by
+    /// [`crate::jdp::declarations::MAX_DECLARED_JOBS`] (FIFO, 3), and each
+    /// declare is throttled by its own node validation on a connection that
+    /// processes frames sequentially.
+    pub fn mint_for_declaration(
+        &mut self,
+        now_ms: u64,
+        miner_address: AddressId,
+    ) -> Result<&AllocatedToken, TokenAllocError> {
+        self.mint(now_ms, miner_address, Vec::new())
+    }
+
     /// Allocate a new token + record it under `(miner_address,
-    /// coinbase_outputs)`. Enforces rate limit. Bumps the per-connection
-    /// counter (BE-encoded into the token prefix).
+    /// coinbase_outputs)`. Enforces the §6.4.2 rate limit — see
+    /// [`Self::mint_for_declaration`] for the path that must not. Bumps the
+    /// per-connection counter (BE-encoded into the token prefix).
     pub fn allocate(
         &mut self,
         now_ms: u64,
@@ -239,6 +266,21 @@ impl TokenStore {
                 });
             }
         }
+        self.last_alloc_ms = Some(now_ms);
+        self.mint(now_ms, miner_address, coinbase_outputs)
+    }
+
+    /// Mint and store a token. One implementation for both entry points, so
+    /// the token SHAPE (counter prefix + entropy suffix) and the TTL cannot
+    /// drift between the client-facing allocate and the pool's own minting.
+    /// The rate limit lives in the caller — it is the only thing that
+    /// legitimately differs.
+    fn mint(
+        &mut self,
+        now_ms: u64,
+        miner_address: AddressId,
+        coinbase_outputs: Vec<u8>,
+    ) -> Result<&AllocatedToken, TokenAllocError> {
         self.counter = self
             .counter
             .checked_add(1)
@@ -253,7 +295,10 @@ impl TokenStore {
                 .map_err(|e| TokenAllocError::EntropyFailed(e.to_string()))?;
         }
         let token = Token(bytes);
-        self.last_alloc_ms = Some(now_ms);
+        // NOT stamped here: `last_alloc_ms` is the §6.4.2 budget of the
+        // CLIENT's allocate message, and `allocate` stamps it before calling
+        // in. Stamping here would make a pool-minted declaration token block
+        // the miner's next allocate for a second — the same bug mirrored.
         let entry = AllocatedToken {
             token,
             miner_address,

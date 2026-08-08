@@ -11,6 +11,9 @@
 //! - [`encode_coinbase_outputs`] — `(address, sats)` list → consensus
 //!   `Vec<TxOut>` bytes (`AllocateMiningJobToken.Success.coinbase_tx_outputs`
 //!   on the non-negotiated base path).
+//! - [`designated_payout_script`] / [`pays_designated_output`] — the two
+//!   halves of the §6.4.3 base-protocol convention: which script the pool
+//!   designated, and whether a coinbase honours it.
 //! - [`declared_coinbase_tx`] — the declared prefix/suffix pair → the
 //!   rebuilt transaction, its extranonce slot width and its committed
 //!   scriptSig prefix, fail-closed.
@@ -76,6 +79,64 @@ pub fn encode_coinbase_outputs(
         .consensus_encode(&mut buf)
         .expect("Vec<u8> writer cannot fail");
     Ok(buf)
+}
+
+// ── §6.4.3 base-protocol payout output ───────────────────────────────
+
+/// The script the pool designated as its payout output, read back out of
+/// the blob it sent as `AllocateMiningJobToken.Success.coinbase_tx_outputs`.
+///
+/// §6.4.3 fixes the convention: "JDS MUST reserve the **first** output with
+/// a locking script where the pool payout will go. While this output is
+/// initially set with a 0 amount of sats, this convention designates this
+/// locking script as the **pool payout output**." The designation is
+/// positional in the ALLOCATE message *only* — see
+/// [`pays_designated_output`] for why the check side cannot index.
+///
+/// Reading it back rather than carrying the script alongside keeps one
+/// source of truth: a second copy could name a script the pool never sent.
+/// `None` when the blob does not decode or holds no output — the caller
+/// then has nothing to hold a custom job to and must refuse it.
+pub fn designated_payout_script(coinbase_outputs: &[u8]) -> Option<Vec<u8>> {
+    let outputs: Vec<TxOut> = bitcoin::consensus::deserialize(coinbase_outputs).ok()?;
+    outputs.first().map(|o| o.script_pubkey.as_bytes().to_vec())
+}
+
+/// Does this coinbase honour the pool's designated payout output (§6.4.3)?
+///
+/// The rule the spec states is narrow, and everything around it is
+/// explicitly free: "JDC MUST allocate sats into the pool payout output in
+/// order to qualify for pooled mining rewards. JDS and Pool SHOULD reject
+/// custom jobs that fail to do so." The JDC MAY add further 0-value AND
+/// non-0-value outputs, and MAY "arbitrarily reorder the outputs" — so this
+/// searches for the script and requires a non-zero amount. It is
+/// deliberately NOT a positional or byte-for-byte comparison against what
+/// the pool sent: that would reject every conformant client, because the
+/// pool must send the amount as 0 and the JD-client then rewrites it to the
+/// template's revenue.
+///
+/// How MUCH is not checked, and that is not a gap this function could
+/// close: §6.4.3 names no threshold and answers a shortfall economically
+/// ("Pool MAY pay proportionally smaller rewards"), so any number here
+/// would be invented and would reject conformant clients.
+///
+/// What makes "some sats reached the script" a sufficient test is enforced
+/// elsewhere, and has to be: the ALLOCATE only designates a script when it
+/// is the asking miner's own
+/// (`ProductionJdpAllocateResolver::resolve_allocate_context`), so a JDC
+/// shorting the designated output shorts itself and nobody else. A pool
+/// payout routed to a third party — a Blockparty admin's pending-party fee
+/// route is the live example — is refused a base-protocol token instead,
+/// precisely because this check cannot enforce it: the JDC would satisfy
+/// it with one satoshi and keep the block.
+///
+/// So do not relax that allocate rule on the strength of this function,
+/// and do not add a threshold here on the strength of that rule. They are
+/// two halves of one guarantee.
+pub fn pays_designated_output(outputs: &[TxOut], designated_script: &[u8]) -> bool {
+    outputs
+        .iter()
+        .any(|o| o.script_pubkey.as_bytes() == designated_script && o.value > Amount::ZERO)
 }
 
 /// The declared coinbase rebuilt as a whole transaction, plus the width of the
@@ -229,8 +290,56 @@ pub struct PayoutBooking {
     /// distribution. Zeroed = the owning mode books without a snapshot.
     pub payouts_fingerprint: [u8; 32],
     /// The revenue the distribution's boosts were projected against —
-    /// carried for the booking band + logs.
+    /// the block-found path's fallback reward when the block's own
+    /// coinbase value cannot be read, plus logs.
     pub reference_reward_sats: u64,
+}
+
+/// What a `PushSolution`'s declaration was backed by.
+///
+/// Three states, spelled out as one type because the block-found path has to
+/// answer two DIFFERENT questions about them and they do not have the same
+/// answer:
+///
+/// | backing | book it? | §10 settle? |
+/// |---|---|---|
+/// | [`Self::BaseProtocol`] | no — nothing published | **no** — nothing published to invalidate |
+/// | [`Self::UnbookableDistribution`] | no — its snapshot never landed | **YES** |
+/// | [`Self::Bookable`] | yes | **YES** |
+///
+/// The middle row is why this is a type and not an `Option<PayoutBooking>`.
+/// Deriving both answers from `booking.is_some()` collapsed it into the top
+/// row: a block whose coinbase paid a published distribution on-chain left
+/// that distribution standing, so the weights kept promising balances the
+/// block had already paid — a second payout. `DeclaredJob` has carried
+/// `booking` and `distribution_id` as separate fields since #17 precisely so
+/// the two can be told apart; this is that distinction given a name, at the
+/// place that acts on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateBacking {
+    /// Base-protocol declaration — no distribution was referenced.
+    BaseProtocol,
+    /// A published distribution was referenced and the declared coinbase was
+    /// proven to pay it (§7.1), but its settlement snapshot never landed, so
+    /// there are no inputs to book against. The coinbase still paid it.
+    UnbookableDistribution { distribution_id: u64 },
+    /// Referenced, proven, and its settlement inputs are on file.
+    Bookable(PayoutBooking),
+}
+
+impl CandidateBacking {
+    /// Did this block's coinbase pay a distribution the pool PUBLISHED?
+    ///
+    /// The §10 question, and deliberately not the same as "can it be
+    /// booked": settling means "these published weights are spent", which is
+    /// true the moment the block lands, whether or not the ledger write
+    /// succeeds or is even possible.
+    pub fn paid_a_published_distribution(&self) -> bool {
+        match self {
+            Self::BaseProtocol => false,
+            Self::UnbookableDistribution { .. } | Self::Bookable(_) => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +355,84 @@ mod tests {
             encode_coinbase_outputs(Network::Regtest, &[]).unwrap(),
             vec![0x00]
         );
+    }
+
+    // ── §6.4.3 designated payout output ────────────────────────────
+
+    fn txout(sats: u64, script: Vec<u8>) -> TxOut {
+        TxOut {
+            value: Amount::from_sat(sats),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(script),
+        }
+    }
+
+    /// The round trip the allocate path actually performs: encode one
+    /// 0-value output for the miner, then read its script back out. The
+    /// script is what the mining side holds a custom job to, so it has to
+    /// be the miner's, not merely non-empty.
+    #[test]
+    fn the_designated_script_round_trips_through_the_allocate_blob() {
+        let addr = AddressId::new(ADDR.to_string()).unwrap();
+        let blob = encode_coinbase_outputs(
+            Network::Regtest,
+            &[DynamicOutput {
+                address: addr.clone(),
+                sats: Sats(0),
+            }],
+        )
+        .unwrap();
+        let expected = bp_mining_job::address_to_script(Network::Regtest, ADDR).unwrap();
+        assert_eq!(
+            designated_payout_script(&blob).as_deref(),
+            Some(expected.as_bytes())
+        );
+    }
+
+    /// An ext 0x0003 allocate sends `[0x00]` (§2: outputs MUST be empty),
+    /// and a blob that does not decode is a bug. Both must answer `None`
+    /// so the caller refuses rather than holding a job to a script the
+    /// pool never designated.
+    #[test]
+    fn no_designated_script_without_outputs() {
+        assert_eq!(designated_payout_script(&[0x00]), None);
+        assert_eq!(designated_payout_script(&[]), None);
+        assert_eq!(designated_payout_script(&[0xFF, 0xFF]), None);
+    }
+
+    /// The freedoms §6.4.3 grants the JDC, each one a case a byte-for-byte
+    /// or positional check would have wrongly rejected: it rewrites the
+    /// amount (the pool must send 0), reorders, and appends outputs of its
+    /// own — including valued ones.
+    #[test]
+    fn a_reordered_coinbase_with_extra_outputs_still_pays_the_designated_output() {
+        let pool = vec![0x00, 0x14, 0xAA];
+        let jdc = vec![0x00, 0x14, 0xBB];
+        assert!(pays_designated_output(
+            &[
+                txout(0, vec![0x6A, 0x01, 0x42]), // JDC OP_RETURN, first
+                txout(1_000, jdc.clone()),        // JDC keeps some revenue
+                txout(311_499_000, pool.clone()), // designated, amount rewritten
+            ],
+            &pool
+        ));
+    }
+
+    /// The two ways to fail it: the script is absent, or it is present but
+    /// carries nothing — which is exactly the state the pool sent it in, so
+    /// "the JDC did not touch it" must not read as "paid".
+    #[test]
+    fn a_designated_output_that_is_missing_or_unfunded_does_not_pay() {
+        let pool = vec![0x00, 0x14, 0xAA];
+        let jdc = vec![0x00, 0x14, 0xBB];
+        assert!(
+            !pays_designated_output(&[txout(312_500_000, jdc.clone())], &pool),
+            "paying someone else is not paying the designated output"
+        );
+        assert!(
+            !pays_designated_output(&[txout(0, pool.clone()), txout(312_500_000, jdc)], &pool),
+            "a 0-value designated output is the untouched blob, not a payment"
+        );
+        assert!(!pays_designated_output(&[], &pool));
     }
 
     #[test]

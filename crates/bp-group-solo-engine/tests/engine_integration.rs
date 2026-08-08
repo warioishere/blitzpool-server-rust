@@ -1536,13 +1536,17 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
     let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
     let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
     const T_REF: u64 = 312_500_000;
-    // 1.6 × the projection base — far outside the ±25 % band, and well
-    // above the block subsidy, so only the alarm fires.
+    // 1.6 × the projection base, and well above the block subsidy, so the
+    // one hard gate stays out of the way and the booking itself is what is
+    // being measured.
     const T_ACTUAL: u64 = 500_000_000;
     let height: i32 = 840_801;
-    assert!(
-        !bp_share::reward_within_band(T_REF, T_ACTUAL),
-        "the fixture must actually sit outside the settlement band"
+    // The fixture's own statement, now that no production constant defines
+    // a band: T_ACTUAL must be FAR off the projection base, or the test
+    // would pass on a block that never exercised the drift.
+    const _: () = assert!(
+        T_ACTUAL > T_REF + T_REF / 4,
+        "the fixture must pay far off the revenue it was built against"
     );
 
     h.engine

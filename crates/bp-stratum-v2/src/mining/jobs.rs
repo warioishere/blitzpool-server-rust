@@ -99,6 +99,32 @@ pub struct ExtendedJob {
     /// jobs the caller stores the template id (or another opaque
     /// reference) so the block-found path can produce a `SubmitSolution`.
     pub template_id: Option<u64>,
+    /// `true` when a block found on this custom job will be recorded by the
+    /// JDP `PushSolution` path, so the mining side must NOT record it too
+    /// (the `blocks_entity` insert has no `ON CONFLICT`).
+    ///
+    /// This is deliberately not "is there a distribution?". `PushSolution`
+    /// claims a solution by matching it against a **declared job**, and it
+    /// drops anything arriving on a connection that is not in Full-Template
+    /// mode. So a distribution alone does not mean the JDP side will see the
+    /// block:
+    ///
+    /// | job came from | JDP claims it | who records |
+    /// |---|---|---|
+    /// | declared + ext 0x0003 | yes, books it against the distribution | JDP |
+    /// | declared, base protocol | no — nothing to book | mining side |
+    /// | Coinbase-only + ext 0x0003 | **no** — §6.3.1, that mode never declares | mining side |
+    /// | Coinbase-only, base protocol | no — never declares | mining side |
+    ///
+    /// Reading it as "distribution-backed" put row three on the JDP side,
+    /// which never hears about it: the block was credited as a share and
+    /// then recorded nowhere — no `blocks_entity` row, no notification, and
+    /// (worse) no §10 settle, so the published weights kept encoding
+    /// balances the block had already paid out.
+    ///
+    /// Always `false` for pool-built jobs, which carry a `template_id` and
+    /// take the ordinary submit path instead.
+    pub jdp_claims_the_block: bool,
     /// Wall-clock ms when stored.
     pub created_at: u64,
     /// Wall-clock ms when superseded by a newer block. `None` while
@@ -452,6 +478,7 @@ mod tests {
             network_difficulty: Difficulty(1.0),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: None,
+            jdp_claims_the_block: false,
             created_at: now_ms,
             retired_at: None,
         }

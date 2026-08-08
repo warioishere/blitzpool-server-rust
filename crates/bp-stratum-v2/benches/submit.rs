@@ -100,6 +100,7 @@ fn ext_job(merkle_depth: usize) -> ExtendedJob {
         network_difficulty: Difficulty(1e15),
         coinbase_tx_value_remaining: 5_000_000_000,
         template_id: Some(1),
+        jdp_claims_the_block: false,
         created_at: 0,
         retired_at: None,
     }

@@ -400,6 +400,7 @@ mod tests {
             network_difficulty: bp_share::Difficulty(1e9),
             coinbase_tx_value_remaining: 5_000_000_000,
             template_id: Some(1),
+            jdp_claims_the_block: false,
             created_at: 0,
             retired_at: None,
         }

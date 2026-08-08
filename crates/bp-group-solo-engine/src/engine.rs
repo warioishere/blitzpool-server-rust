@@ -716,21 +716,6 @@ impl GroupSoloEngine {
                 subsidy,
             });
         }
-        // Drift off the projection base is an ALARM, not a gate. The
-        // rows below are transcribed from the block's own coinbase, so
-        // they are right at any revenue — the reference is only what the
-        // distribution happened to be built against.
-        if !bp_share::reward_within_band(snapshot.reference_revenue_sats, actual.total_value_sats) {
-            warn!(
-                %group_id,
-                reference_reward = snapshot.reference_revenue_sats,
-                actual_reward = actual.total_value_sats,
-                block_height,
-                "group-solo block revenue far off the distribution's reference — booking it from \
-                 the real coinbase, but the job source is worth a look"
-            );
-        }
-
         // 2. Mode + reset gate (one row read), and the round state for
         //    the sharesInRound audit fields. Read BEFORE any reset wipes
         //    it; in Window mode this trims + reads the sliding window.

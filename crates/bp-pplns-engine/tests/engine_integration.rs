@@ -1562,9 +1562,12 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
         .await
         .unwrap();
     let d2 = h.engine.build_distribution(T_REF).await.expect("build 2");
-    assert!(
-        !bp_share::reward_within_band(T_REF, T_ACTUAL),
-        "the fixture must actually sit outside the settlement band"
+    // The fixture's own statement, now that no production constant defines
+    // a band: T_ACTUAL must be FAR off the projection base, or the test
+    // would pass on a block that never exercised the drift.
+    const _: () = assert!(
+        T_ACTUAL > T_REF + T_REF / 4,
+        "the fixture must pay far off the revenue it was built against"
     );
     let actual2 = actual_paying_exactly(&d2, T_ACTUAL);
     assert!(

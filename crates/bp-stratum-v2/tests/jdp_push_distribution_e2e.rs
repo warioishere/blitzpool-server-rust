@@ -29,6 +29,11 @@
 //!    mining connection judges a Full-Template `SetCustomMiningJob`
 //!    against, and it was previously untested: removing the
 //!    registration call left the whole suite green.
+//! 8. **§6.4.3 base protocol** — a connection that never negotiates
+//!    0x0003 is answered with exactly ONE designated payout output at 0
+//!    sats paying the miner itself, and that token reaches the bridge as
+//!    an allocation. Coinbase-only mode never declares (§6.3.1), so this
+//!    allocate is the only record the mining side will have of it.
 //!
 //! Needs no bitcoin-node / TDP / PG — declare-time validation runs
 //! entirely against the published distribution.
@@ -38,19 +43,23 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bp_common::AddressId;
+use bp_common::{AddressId, Sats};
 use bp_stratum_v2::bridge::{JdpDeclaredJobRegistry, PayoutDistributionEntry};
 use bp_stratum_v2::extensions::{
     encode_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
 };
 use bp_stratum_v2::jdp::client::{
-    ERR_INVALID_PAYOUT_DISTRIBUTION, ERR_STALE_PAYOUT_DISTRIBUTION, FLAG_DECLARE_TX_DATA,
+    parse_user_identifier_as_address, AllocateTokenContext, ERR_INVALID_PAYOUT_DISTRIBUTION,
+    ERR_STALE_PAYOUT_DISTRIBUTION, FLAG_DECLARE_TX_DATA,
 };
-use bp_stratum_v2::jdp::dynamic_outputs::PayoutBooking;
+use bp_stratum_v2::jdp::dynamic_outputs::{
+    encode_coinbase_outputs, CandidateBacking, DynamicOutput, PayoutBooking,
+};
 use bp_stratum_v2::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
 use bp_stratum_v2::jdp_server::{
-    BuiltPayoutDistribution, CurrentPrevHashProvider, JdpBlockSubmissionSink, JdpServerHooks,
-    PayoutDistributionSource, StratumV2JdpServer, TailoredDistribution,
+    AllocateOutcome, BuiltPayoutDistribution, CurrentPrevHashProvider, JdpAllocateResolver,
+    JdpBlockSubmissionSink, JdpServerHooks, PayoutDistributionSource, StratumV2JdpServer,
+    TailoredDistribution,
 };
 use bp_stratum_v2::jdp_server_codec::EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION;
 use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
@@ -149,10 +158,57 @@ impl CurrentPrevHashProvider for FixedPrevHash {
     }
 }
 
+/// Allocate resolver mirroring what production answers, on both paths:
+/// empty outputs once ext 0x0003 is negotiated (§2), and otherwise the one
+/// §6.4.3 designated payout output at 0 sats paying the miner itself.
+///
+/// It has to be spelled out here rather than borrowed from
+/// [`JdpServerHooks::no_op`], whose base-path answer is an EMPTY output
+/// vector. That designates nothing, so the base-protocol allocation would
+/// register nothing in the bridge and the assertions below would pass
+/// against a pool that serves no Coinbase-only JDC at all.
+struct BaseModeAllocateResolver;
+
+#[async_trait]
+impl JdpAllocateResolver for BaseModeAllocateResolver {
+    async fn resolve_allocate_context(
+        &self,
+        user_identifier: &str,
+        _remote_addr: &str,
+        payout_distribution_negotiated: bool,
+    ) -> AllocateOutcome {
+        let Some(miner_address) = parse_user_identifier_as_address(user_identifier) else {
+            return AllocateOutcome::Ignored;
+        };
+        let coinbase_outputs = if payout_distribution_negotiated {
+            Vec::new()
+        } else {
+            match encode_coinbase_outputs(
+                bitcoin::Network::Regtest,
+                &[DynamicOutput {
+                    address: miner_address.clone(),
+                    sats: Sats(0),
+                }],
+            ) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return AllocateOutcome::Refused {
+                        reason: "fixture address does not encode",
+                    }
+                }
+            }
+        };
+        AllocateOutcome::Granted(AllocateTokenContext {
+            miner_address,
+            coinbase_outputs,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct RecordedCandidate {
     miner_address: String,
-    booking: Option<PayoutBooking>,
+    backing: CandidateBacking,
     coinbase_raw: Vec<u8>,
     prev_hash: [u8; 32],
 }
@@ -169,7 +225,7 @@ impl JdpBlockSubmissionSink for RecordingSink {
         &self,
         miner_address: AddressId,
         _new_token: Token,
-        booking: Option<PayoutBooking>,
+        backing: CandidateBacking,
         coinbase_raw: Vec<u8>,
         _transactions: Vec<Vec<u8>>,
         prev_hash: [u8; 32],
@@ -180,7 +236,7 @@ impl JdpBlockSubmissionSink for RecordingSink {
     ) {
         self.candidates.lock().unwrap().push(RecordedCandidate {
             miner_address: miner_address.as_str().to_string(),
-            booking,
+            backing,
             coinbase_raw,
             prev_hash,
         });
@@ -202,6 +258,7 @@ async fn jdp_push_distribution_end_to_end() {
     });
     hooks.prev_hash_provider = Arc::new(FixedPrevHash);
     hooks.block_submission_sink = sink.clone();
+    hooks.allocate_resolver = Arc::new(BaseModeAllocateResolver);
 
     let server = StratumV2JdpServer::spawn(
         noise_config,
@@ -433,8 +490,8 @@ async fn jdp_push_distribution_end_to_end() {
         assert_eq!(c.miner_address, REGTEST_ADDR);
         assert_eq!(c.prev_hash, PREV_HASH);
         assert_eq!(
-            c.booking,
-            Some(PayoutBooking {
+            c.backing,
+            CandidateBacking::Bookable(PayoutBooking {
                 distribution_id: FIRST_ID,
                 payouts_fingerprint: FINGERPRINT,
                 reference_reward_sats: REFERENCE_REWARD,
@@ -487,14 +544,51 @@ async fn jdp_push_distribution_end_to_end() {
         JdcInbound::Message(AnyMessage::JobDeclaration(
             JobDeclaration::AllocateMiningJobTokenSuccess(s),
         )) => {
-            assert!(
-                !s.coinbase_outputs.as_bytes().is_empty(),
-                "base path keeps its allocate outputs"
+            // §6.4.3 on the wire: exactly one designated payout output,
+            // sent with a 0 amount, paying this miner. The 0 is what lets a
+            // conformant JD-client write its whole template revenue into
+            // it; a second valued output here would make its coinbase
+            // overspend the block.
+            let outputs: Vec<bitcoin::TxOut> =
+                bitcoin::consensus::deserialize(s.coinbase_outputs.as_bytes())
+                    .expect("allocate outputs must decode");
+            assert_eq!(outputs.len(), 1, "§6.4.3 designates ONE payout output");
+            assert_eq!(outputs[0].value, bitcoin::Amount::ZERO);
+            assert_eq!(
+                outputs[0].script_pubkey,
+                bp_mining_job::address_to_script(bitcoin::Network::Regtest, REGTEST_ADDR).unwrap(),
+                "the designated output must pay the miner itself"
             );
             s.mining_job_token.as_bytes().to_vec()
         }
         other => panic!("expected AllocateMiningJobTokenSuccess, got {other:?}"),
     };
+
+    // This connection is FULL-TEMPLATE (it set `DECLARE_TX_DATA`), so its
+    // allocate token must NOT be resolvable on its own: that mode owes a
+    // `DeclareMiningJob`, which is where bitcoin-core validates its
+    // transaction set (§6.1). Registering it would let the JDC skip the
+    // declaration and mine a job no node ever saw.
+    //
+    // Connection 1's token must not resolve either, for a different reason:
+    // it negotiated 0x0003, so §2 left it no designated output and its jobs
+    // are judged by the §7.1 recompute. Two ways to be absent, both checked
+    // — the positive case is connection 4 below.
+    {
+        let reg = bridge.read().unwrap();
+        let full_template_token =
+            Token(<[u8; 16]>::try_from(token2.as_slice()).expect("16-byte allocate token"));
+        assert!(
+            reg.allocation_ref(&full_template_token, 0).is_none(),
+            "a Full-Template allocate must not be usable without declaring"
+        );
+        let negotiated_token =
+            Token(<[u8; 16]>::try_from(token.as_slice()).expect("16-byte allocate token"));
+        assert!(
+            reg.allocation_ref(&negotiated_token, 0).is_none(),
+            "an ext 0x0003 allocate must register no base-protocol allocation"
+        );
+    }
     write_declare(&mut writer2, 20, &token2, &suffix, Some(FIRST_ID + 2)).await;
     expect_declare_error(
         read_jdc(&mut reader2).await,
@@ -531,6 +625,69 @@ async fn jdp_push_distribution_end_to_end() {
         Err(_) => panic!("the server left a refused connection open"),
     }
 
+    // ── Connection 4: a real Coinbase-only JDC (the base path) ────────
+    //
+    // No `DECLARE_TX_DATA`, no 0x0003. §6.3.1: "the `DeclareMiningJob`
+    // message is never used" in this mode, so the allocate is the pool's
+    // ONLY record of the token — the mining connection resolves it here and
+    // holds the custom job's coinbase to the script registered with it.
+    // Without the entry this JDC is answered `invalid-mining-job-token` on
+    // every job it ever builds, which an SRI jd-client treats as fatal.
+    let (mut reader4, mut writer4) = connect_jdc(addr).await;
+    write_msg(&mut writer4, setup_connection_coinbase_only(addr.port())).await;
+    expect_setup_success(read_jdc(&mut reader4).await);
+    write_msg(
+        &mut writer4,
+        AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobToken(
+            AllocateMiningJobToken {
+                request_id: 4,
+                user_identifier: REGTEST_ADDR.to_string().try_into().unwrap(),
+            }
+            .into_static(),
+        )),
+    )
+    .await;
+    let token4 = match read_jdc(&mut reader4).await {
+        JdcInbound::Message(AnyMessage::JobDeclaration(
+            JobDeclaration::AllocateMiningJobTokenSuccess(s),
+        )) => {
+            // §6.4.3 on the wire: exactly ONE designated payout output, sent
+            // with a 0 amount. The 0 is what lets a conformant JD-client
+            // write its whole template revenue into it; a second VALUED
+            // output would make its coinbase overspend the block.
+            let outputs: Vec<bitcoin::TxOut> =
+                bitcoin::consensus::deserialize(s.coinbase_outputs.as_bytes())
+                    .expect("allocate outputs must decode");
+            assert_eq!(outputs.len(), 1, "§6.4.3 designates ONE payout output");
+            assert_eq!(outputs[0].value, bitcoin::Amount::ZERO);
+            s.mining_job_token.as_bytes().to_vec()
+        }
+        other => panic!("expected AllocateMiningJobTokenSuccess, got {other:?}"),
+    };
+    {
+        let reg = bridge.read().unwrap();
+        let coinbase_only_token =
+            Token(<[u8; 16]>::try_from(token4.as_slice()).expect("16-byte allocate token"));
+        let allocation = reg
+            .allocation_ref(&coinbase_only_token, 0)
+            .expect("a Coinbase-only allocate must reach the mining side");
+        assert_eq!(allocation.miner_address.as_str(), REGTEST_ADDR);
+        assert!(
+            !allocation.payout_script.is_empty(),
+            "the registered script is what the custom job's coinbase is held to"
+        );
+        // The token's own hour-long TTL travels with it, so the map cannot
+        // grow for the life of a connection.
+        assert!(
+            allocation.expires_at_ms > 0,
+            "the allocation must carry its token's expiry"
+        );
+        assert!(
+            reg.allocation_ref(&coinbase_only_token, u64::MAX).is_none(),
+            "an expired allocation must stop authorising jobs"
+        );
+    }
+
     // ── Teardown ──────────────────────────────────────────────────────
     drop(writer);
     drop(reader);
@@ -538,6 +695,8 @@ async fn jdp_push_distribution_end_to_end() {
     drop(reader2);
     drop(writer3);
     drop(reader3);
+    drop(writer4);
+    drop(reader4);
     server.shutdown().await;
     accept_handle.abort();
 }
@@ -629,6 +788,27 @@ fn entry_with_id(id: u64) -> PayoutDistributionEntry {
 
 type Reader = NoiseTcpReadHalf<AnyMessage<'static>>;
 type Writer = NoiseTcpWriteHalf<AnyMessage<'static>>;
+
+/// A Coinbase-only `SetupConnection`: `DECLARE_TX_DATA` clear, so the JDC
+/// never declares and takes its allocate token straight to the mining
+/// connection (§6.3.1).
+fn setup_connection_coinbase_only(port: u16) -> AnyMessage<'static> {
+    AnyMessage::Common(CommonMessages::SetupConnection(
+        SetupConnection {
+            protocol: Protocol::JobDeclarationProtocol,
+            min_version: 2,
+            max_version: 2,
+            flags: 0,
+            endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
+            endpoint_port: port,
+            vendor: "test-jdc".to_string().try_into().unwrap(),
+            hardware_version: "rev1".to_string().try_into().unwrap(),
+            firmware: "0.1".to_string().try_into().unwrap(),
+            device_id: "jdc-coinbase-only".to_string().try_into().unwrap(),
+        }
+        .into_static(),
+    ))
+}
 
 /// A `SetupConnection` the JDP server must refuse: the Mining
 /// sub-protocol on the job-declaration port.

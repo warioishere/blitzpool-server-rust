@@ -1154,7 +1154,7 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
             handle_submit_shares_extended(state, &input, now_ms)
         }
         InboundMiningFrame::SetCustomMiningJob(input) => {
-            let (bridge_job, distribution) = {
+            let (bridge_job, allocation, distribution) = {
                 let guard = bridge.read().expect("bridge RwLock poisoned");
                 // Projection: address, declared tip, the declaration binding
                 // and the declaration's own distribution reference — all
@@ -1163,6 +1163,12 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
                 // the lock is held. The raw transactions the handler never
                 // needs.
                 let bridge_job = guard.job_ref(&input.mining_job_token);
+                // Coinbase-only mode never declares (§6.3.1), so the only
+                // record of its token is the allocate. Base-protocol
+                // allocations only — see `AllocatedTokenRef`.
+                let allocation = guard
+                    .allocation_ref(&input.mining_job_token, now_ms)
+                    .cloned();
                 // §7.2/§10 acceptance for the referenced distribution. The
                 // reference decides its own scope: a frame TLV (Coinbase-only)
                 // has no declaration behind it and resolves by owner address,
@@ -1191,7 +1197,7 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
                     };
                     guard.distribution_acceptance(reference.distribution_id(), scope)
                 });
-                (bridge_job, distribution)
+                (bridge_job, allocation, distribution)
             };
             // Distributions are multi-use (ext 0x0003 push model) —
             // nothing to consume on acceptance.
@@ -1199,6 +1205,7 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
                 state,
                 &input,
                 bridge_job.as_ref(),
+                allocation.as_ref(),
                 distribution.as_ref(),
                 now_ms,
             )
@@ -1817,6 +1824,7 @@ mod tests {
             hash: [0u8; 32],
             is_block_candidate: false,
             template_id: None,
+            jdp_claims_the_block: false,
             witness_coinbase: Vec::new(),
             effective_worker_name: None,
             coinbase_tx_value_remaining: 5_000_000_000,

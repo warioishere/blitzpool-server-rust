@@ -190,6 +190,7 @@ async fn run_block_submit_case(miner_extranonce_size: u8) {
         network_difficulty: Difficulty(1.0e-18),
         coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
         template_id: Some(template.template_id),
+        jdp_claims_the_block: false,
         created_at: 0,
         retired_at: None,
     };
