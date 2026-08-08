@@ -455,6 +455,18 @@ impl JdpDeclaredJobRegistry {
             .map(|s| s.entry)
     }
 
+    /// Drop a declared job's entry once its token has authorised a custom
+    /// job. One declaration authorises exactly one `SetCustomMiningJob`,
+    /// which is the rule the reference JDS enforces.
+    ///
+    /// This removes only the MINING side's record. The JDP session keeps its
+    /// own copy of the declaration — that is what a `PushSolution`
+    /// reassembles the found block from, and dropping it here would lose
+    /// every JDC-found block.
+    pub fn consume_declared_job(&mut self, token: &Token) -> bool {
+        self.entries.remove(token).is_some()
+    }
+
     /// Projection of a token's bridge entry for the mining-side
     /// `SetCustomMiningJob` cross-checks. `None` for unknown / evicted
     /// tokens (the mining-handler fails closed on that, together with an

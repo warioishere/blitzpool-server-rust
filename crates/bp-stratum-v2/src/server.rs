@@ -1201,14 +1201,43 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
             };
             // Distributions are multi-use (ext 0x0003 push model) —
             // nothing to consume on acceptance.
-            handle_set_custom_mining_job(
+            let outcome = handle_set_custom_mining_job(
                 state,
                 &input,
                 bridge_job.as_ref(),
                 allocation.as_ref(),
                 distribution.as_ref(),
                 now_ms,
-            )
+            );
+            // A declared job's token authorises exactly ONE custom job, the
+            // rule the reference JDS enforces (`token_manager.deactivate` plus
+            // `take_declared_custom_job` on every `SetCustomMiningJob`,
+            // sv2-apps v0.7.0). A conformant JDC never re-uses one: each send
+            // either pops a fresh allocate token or follows a fresh
+            // declaration.
+            //
+            // Consumed only on SUCCESS — a rejected job must leave the token
+            // usable, or a stale-chain-tip retry (which SRI's jd-client
+            // treats as non-fatal and expects to be able to repeat) would
+            // answer `invalid-mining-job-token` instead.
+            //
+            // Only the BRIDGE entry goes. The JDP session's own
+            // `declared_jobs` store keeps the declaration, because that is
+            // what `PushSolution` reassembles the found block from. SRI can
+            // drop both because it does nothing with a solution
+            // (`handle_push_solution` is a `// todo` stub); we cannot.
+            if bridge_job.is_some()
+                && matches!(
+                    outcome.outbound.first(),
+                    Some(OutboundFrame::SetCustomMiningJobSuccess { .. })
+                )
+            {
+                bridge
+                    .write()
+                    .expect("bridge RwLock poisoned")
+                    .consume_declared_job(&input.mining_job_token);
+            }
+            outcome
         }
     }
 }
@@ -2450,6 +2479,98 @@ mod tests {
     /// jd-client takes the fatal solo fallback, forever, while the other
     /// client on the same address mines normally.
     ///
+    /// A declared job's token authorises exactly ONE `SetCustomMiningJob`,
+    /// matching the reference JDS (`token_manager.deactivate` plus
+    /// `take_declared_custom_job` on every custom job, sv2-apps v0.7.0).
+    ///
+    /// Both directions, because each one alone would pass on the wrong code:
+    ///
+    /// - a SECOND job on an accepted token is `invalid-mining-job-token`;
+    /// - a REJECTED job leaves the token usable, so the retry that an SRI
+    ///   jd-client makes after the non-fatal `stale-chain-tip` still works.
+    ///   Consuming on rejection would turn a benign tip race into a dead
+    ///   token and send the client into its fatal fallback.
+    #[test]
+    fn a_declared_token_authorises_one_custom_job_and_survives_a_rejection() {
+        use crate::mining::client::tests::{
+            bridge_entry_for, custom_job_matching, solo_session_with_extended_channel,
+        };
+        use crate::tokens::Token;
+
+        // Solo: a declared job carries no distribution here, and the Solo gate
+        // is what lets such a job be served at all.
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let alloc = Mutex::new(ExtranonceAllocator::new_default());
+        let bridge = fresh_bridge();
+        let token = Token([0x5Au8; 16]);
+        let entry = bridge_entry_for(token, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 42);
+        bridge.write().unwrap().register(
+            token,
+            crate::bridge::RegisteredDeclaredJob {
+                declared_job: entry.declared_job.clone(),
+                jdp_session_id: 42,
+            },
+        );
+
+        // Rejected first: a tip the declaration was not accepted under.
+        let mut stale = custom_job_matching(cid, &entry);
+        stale.prev_hash = [0xCD; 32];
+        let out = dispatch_inbound_frame(
+            &mut s,
+            InboundMiningFrame::SetCustomMiningJob(stale),
+            &alloc,
+            &bridge,
+            0,
+        );
+        match &out.outbound[0] {
+            crate::mining::client::OutboundFrame::SetCustomMiningJobError {
+                error_code, ..
+            } => {
+                assert_eq!(error_code, crate::mining::client::ERR_STALE_CHAIN_TIP);
+            }
+            other => panic!("expected stale-chain-tip, got {other:?}"),
+        }
+
+        // The retry on the same token must still be served.
+        let good = custom_job_matching(cid, &entry);
+        let out = dispatch_inbound_frame(
+            &mut s,
+            InboundMiningFrame::SetCustomMiningJob(good.clone()),
+            &alloc,
+            &bridge,
+            0,
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                crate::mining::client::OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "a rejection must not burn the token, got {:?}",
+            out.outbound[0]
+        );
+
+        // And now it is spent.
+        let out = dispatch_inbound_frame(
+            &mut s,
+            InboundMiningFrame::SetCustomMiningJob(good),
+            &alloc,
+            &bridge,
+            0,
+        );
+        match &out.outbound[0] {
+            crate::mining::client::OutboundFrame::SetCustomMiningJobError {
+                error_code, ..
+            } => {
+                assert_eq!(
+                    error_code,
+                    crate::mining::client::ERR_INVALID_MINING_JOB_TOKEN
+                );
+            }
+            other => panic!("a token must authorise one custom job, got {other:?}"),
+        }
+    }
+
     /// Both directions: the older session's job must be ACCEPTED, and a
     /// genuinely withdrawn distribution must still be refused — otherwise
     /// "resolves under the right scope" would read the same as "resolves
@@ -2567,6 +2688,7 @@ mod tests {
         coinbase_tx_suffix.extend_from_slice(&0u32.to_le_bytes());
 
         let token = Token([7u8; 16]);
+        const SECOND_TOKEN: Token = Token([8u8; 16]);
         let declared_job = crate::jdp::declarations::DeclaredJob {
             new_token: token,
             miner_address: AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap(),
@@ -2593,7 +2715,22 @@ mod tests {
             guard.register(
                 token,
                 crate::bridge::RegisteredDeclaredJob {
-                    declared_job,
+                    declared_job: declared_job.clone(),
+                    jdp_session_id: OLD_SESSION,
+                },
+            );
+            // A SECOND declaration, byte-identical but under its own token.
+            // A token authorises exactly one custom job now, so the two
+            // dispatches below cannot share one — and they must not: reusing
+            // it would test the consume rule, not the §10 refusal this test
+            // is about.
+            guard.register(
+                SECOND_TOKEN,
+                crate::bridge::RegisteredDeclaredJob {
+                    declared_job: crate::jdp::declarations::DeclaredJob {
+                        new_token: SECOND_TOKEN,
+                        ..declared_job
+                    },
                     jdp_session_id: OLD_SESSION,
                 },
             );
@@ -2602,10 +2739,10 @@ mod tests {
         // No TLV — the shape a conformant Full-Template JDC sends. Every bound
         // field comes from the declaration, so nothing but the distribution
         // scope can decide the outcome.
-        let make_input = |req: u32| SetCustomMiningJobInput {
+        let make_input = |req: u32, tok: Token| SetCustomMiningJobInput {
             channel_id: cid,
             request_id: req,
-            mining_job_token: token,
+            mining_job_token: tok,
             version: binding.version,
             prev_hash: [0xAB; 32],
             min_ntime: 0x6500_0001,
@@ -2621,7 +2758,7 @@ mod tests {
 
         let out = dispatch_inbound_frame(
             &mut s,
-            InboundMiningFrame::SetCustomMiningJob(make_input(1)),
+            InboundMiningFrame::SetCustomMiningJob(make_input(1, token)),
             &alloc,
             &bridge,
             0,
@@ -2639,7 +2776,7 @@ mod tests {
         bridge.write().unwrap().invalidate_all_distributions();
         let out = dispatch_inbound_frame(
             &mut s,
-            InboundMiningFrame::SetCustomMiningJob(make_input(2)),
+            InboundMiningFrame::SetCustomMiningJob(make_input(2, SECOND_TOKEN)),
             &alloc,
             &bridge,
             0,

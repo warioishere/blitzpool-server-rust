@@ -3026,7 +3026,7 @@ fn encode_varint(n: u64) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::mining::jobs::ExtendedJob;
     use bp_vardiff::TestClock;
@@ -6019,7 +6019,7 @@ mod tests {
     /// projection ITSELF is
     /// `custom_job_binding::tests::branch_folds_back_to_the_full_tree_root`,
     /// which recomputes the root by a different algorithm.
-    fn custom_job_matching(
+    pub(crate) fn custom_job_matching(
         channel_id: u32,
         entry: &RegisteredDeclaredJob,
     ) -> SetCustomMiningJobInput {
@@ -6049,7 +6049,11 @@ mod tests {
         custom_job_matching(channel_id, &bridge_entry_for(token, REGTEST_ADDR, 1))
     }
 
-    fn bridge_entry_for(token: Token, address: &str, session_id: u32) -> RegisteredDeclaredJob {
+    pub(crate) fn bridge_entry_for(
+        token: Token,
+        address: &str,
+        session_id: u32,
+    ) -> RegisteredDeclaredJob {
         bridge_entry_declaring(
             token,
             address,
@@ -6223,7 +6227,7 @@ mod tests {
     /// accepted. The ext-0x0003 tests deliberately keep the default (PPLNS)
     /// stream, which doubles as proof that a distribution-referenced custom
     /// job passes off Solo.
-    fn solo_session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
+    pub(crate) fn solo_session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
         let mut s = session_with_extended_channel();
         s.stream = StreamKind::Solo;
         s
