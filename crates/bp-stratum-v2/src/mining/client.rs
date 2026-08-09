@@ -189,11 +189,12 @@ pub const ERR_STALE_CHAIN_TIP: &str = "stale-chain-tip";
 /// (the whole point of the extension).
 pub const ERR_CUSTOM_JOB_REQUIRES_SOLO: &str = "custom-jobs-require-solo";
 
-/// `invalid-nbits` — a custom job whose `n_bits` is not the difficulty the
-/// pool last served this channel.
+/// `invalid-nbits` — a custom job **on the pool's own tip** whose `n_bits` is
+/// not the difficulty the pool last served that channel.
 ///
 /// `n_bits` is consensus: every miner on a tip agrees on it, so a conformant
-/// JDC always matches. A job that does not cannot produce a valid block.
+/// JDC on our tip always matches. A job that does not cannot produce a valid
+/// block.
 ///
 /// It has to be REJECTED rather than merely served, because the pool derives
 /// the job's block-candidate threshold from it
@@ -202,8 +203,15 @@ pub const ERR_CUSTOM_JOB_REQUIRES_SOLO: &str = "custom-jobs-require-solo";
 /// since the mining side now records a block found on a custom job, that is a
 /// phantom `blocks_entity` row and a "block found" notification per share.
 ///
-/// The standard code from `mining_sv2`, and the same one the reference JDS
-/// answers an nbits mismatch with.
+/// **Only on our tip.** `n_bits` moves with the tip at a difficulty retarget,
+/// so a mismatch across a tip change is the ordinary stale race and gets
+/// [`ERR_STALE_CHAIN_TIP`] — the one verdict an SRI jd-client survives. See
+/// `handle_set_custom_mining_job`.
+///
+/// The standard code from `mining_sv2`. The reference JDS answers an nbits
+/// mismatch with it too, but against a different operand — the client's OWN
+/// `DeclareMiningJob`, checked after `prev_hash` — so it never has to make
+/// this distinction and is no guide to when the code applies here.
 pub const ERR_INVALID_NBITS: &str = "invalid-nbits";
 
 /// `invalid-job-param-value-coinbase_tx_outputs` — the mined coinbase does
@@ -2635,23 +2643,46 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // found" — a phantom `blocks_entity` row and a notification per share,
     // now that the mining side records blocks found on custom jobs.
     //
-    // No conformant client is caught by this: `n_bits` is consensus, so
-    // everyone mining a tip has the same one. A mismatch means the job is
-    // either dishonest or built before a retarget, and neither can produce a
-    // valid block for the tip we are on.
+    // `n_bits` is consensus, so on ONE tip every miner has the same one and a
+    // mismatch is the client's fault. Across two tips it is not: `n_bits`
+    // moves with the tip at a retarget, so a job built on a tip we have not
+    // reached yet — or one we have already left — disagrees for a reason that
+    // says nothing about the client. Which is why the tip decides the verdict
+    // and not just the number.
     //
-    // `None` before the pool has served this channel any extended job —
-    // treated exactly as the tip check treats a missing tip.
-    if let Some(expected) = channel_n_bits {
+    // `stale-chain-tip` is the retryable classification an SRI jd-client
+    // treats as benign; EVERY other `SetCustomMiningJobError` sends it into
+    // its fallback, off this pool and into solo mining
+    // (`channel_manager/upstream_message_handler.rs`, sv2-apps v0.7.0). The
+    // reference JDS never faces the question because it compares `n_bits`
+    // against the client's OWN declaration and checks `prev_hash` first; we
+    // compare against the pool's chain view, so the classification is ours to
+    // get right. Answering `invalid-nbits` here cost a conformant JDC its
+    // pool at every difficulty retarget its node saw before ours did.
+    //
+    // Rejecting either way is deliberate: a job we cannot pin a threshold to
+    // must not register. `latest_extended_n_bits` and
+    // `latest_extended_prev_hash` are written by the same `is_new_block`
+    // branch of `apply_template_broadcast`, so both are `None` together —
+    // before the pool has served this channel any extended job, and only
+    // then.
+    if let (Some(expected), Some(tip)) = (channel_n_bits, channel_prev_hash) {
         if input.n_bits != expected {
+            let on_our_tip = input.prev_hash == tip;
             tracing::warn!(
                 channel_id = input.channel_id,
                 job_n_bits = input.n_bits,
                 pool_n_bits = expected,
-                "sv2: custom job carries an n_bits the pool is not working on — rejecting \
-                 (its block-candidate threshold would come from the client)"
+                on_our_tip,
+                "sv2: custom job carries an n_bits the pool is not working on — rejecting (its \
+                 block-candidate threshold would come from the client). Off our tip this is the \
+                 ordinary retarget race, not a client fault."
             );
-            return reject(ERR_INVALID_NBITS);
+            return reject(if on_our_tip {
+                ERR_INVALID_NBITS
+            } else {
+                ERR_STALE_CHAIN_TIP
+            });
         }
     }
 
@@ -6527,6 +6558,70 @@ pub(crate) mod tests {
                 }
                 (other, want) => panic!("n_bits {job_n_bits:#x}: wanted {want:?}, got {other:?}"),
             }
+        }
+    }
+
+    /// INTEROP: the same mismatch, seen from the OTHER tip, is
+    /// `stale-chain-tip` and not `invalid-nbits`.
+    ///
+    /// `n_bits` is consensus on one tip, so a client that disagrees there is
+    /// wrong — that is the test above. Across two tips it is not: `n_bits`
+    /// moves WITH the tip at a difficulty retarget, so a JDC whose node saw
+    /// the retarget block before ours sends the new number against our old
+    /// one, having done nothing wrong. It is the ordinary tip race, the one
+    /// `stale-chain-tip` exists for.
+    ///
+    /// The classification is the whole finding: an SRI jd-client treats
+    /// `stale-chain-tip` as benign and every other `SetCustomMiningJobError`
+    /// as a reason to leave the pool for solo mining
+    /// (`channel_manager/upstream_message_handler.rs`, sv2-apps v0.7.0).
+    /// Answering `invalid-nbits` here cost a conformant JDC its pool at every
+    /// retarget its node reached first.
+    ///
+    /// Both directions of the race, and the job is refused in both — a
+    /// threshold we cannot pin must not register. What differs is only which
+    /// verdict the client is sent home with.
+    #[test]
+    fn an_n_bits_mismatch_across_a_tip_change_is_the_retryable_verdict() {
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let outputs = [txout(312_500_000, designated_script(REGTEST_ADDR))];
+        const POOL_TIP: [u8; 32] = [0xAB; 32];
+        const OTHER_TIP: [u8; 32] = [0xCD; 32];
+        // A retarget moves `n_bits`; these two stand in for either side of one.
+        const POOL_N_BITS: u32 = 0x1d00_ffff;
+        const RETARGETED: u32 = 0x1c00_ffff;
+
+        // (the tip the job builds on, the n_bits it carries, the verdict)
+        for (job_tip, job_n_bits, want) in [
+            // The JDC is ahead: its node retargeted first.
+            (OTHER_TIP, RETARGETED, ERR_STALE_CHAIN_TIP),
+            // The pool is ahead: an in-flight job for the tip we just left.
+            (OTHER_TIP, POOL_N_BITS, ERR_STALE_CHAIN_TIP),
+            // Our own tip — no race to excuse it.
+            (POOL_TIP, RETARGETED, ERR_INVALID_NBITS),
+        ] {
+            let mut s = solo_session_with_extended_channel();
+            let cid = s.primary_channel.unwrap();
+            {
+                let ch = s.channels.get_mut(&cid).unwrap();
+                ch.latest_extended_prev_hash = Some(POOL_TIP);
+                ch.latest_extended_n_bits = Some(POOL_N_BITS);
+            }
+            let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
+            input.prev_hash = job_tip;
+            input.n_bits = job_n_bits;
+
+            let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+            match &out.outbound[0] {
+                OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                    assert_eq!(error_code, want, "tip {job_tip:?} / n_bits {job_n_bits:#x}");
+                }
+                other => panic!("tip {job_tip:?}: expected {want}, got {other:?}"),
+            }
+            assert!(
+                s.channels.get(&cid).unwrap().extended_jobs.is_empty(),
+                "a job whose threshold the pool cannot pin must not register"
+            );
         }
     }
 
