@@ -672,6 +672,28 @@ impl DeclaredBlockBooker for crate::block_sink::TdpBlockSubmissionSink {
     }
 }
 
+/// Decode a transaction and require that it consumed EVERY byte.
+///
+/// `Transaction::consensus_decode` reads from a slice and stops when it has a
+/// complete transaction. On a malformed input that happens to start with a
+/// valid one it therefore SUCCEEDS, silently, on a prefix — which is how a
+/// double-wrapped coinbase turned into a 21-byte transaction with no inputs
+/// instead of an error. Anything reassembled into a block has to be the whole
+/// thing, so a remainder is a failure.
+fn decode_whole_tx(bytes: &[u8]) -> Option<Transaction> {
+    let mut cursor = bytes;
+    let tx = Transaction::consensus_decode(&mut cursor).ok()?;
+    if !cursor.is_empty() {
+        warn!(
+            total = bytes.len(),
+            consumed = bytes.len() - cursor.len(),
+            "JDP block: transaction decoded from a PREFIX only — treating as malformed"
+        );
+        return None;
+    }
+    Some(tx)
+}
+
 /// Reassemble the block a `PushSolution` describes: the JDC's coinbase plus
 /// the transactions it declared, with the merkle root computed over them.
 ///
@@ -701,24 +723,49 @@ fn assemble_declared_block(
         );
         return None;
     }
-    // Non-witness coinbase → witness form (BIP-141 marker + flag + reserved
-    // witness value). Required for bitcoin-core to accept a SegWit block.
-    let coinbase_witness_bytes = assemble_witness_coinbase(coinbase_raw);
-    let coinbase_tx: Transaction =
-        match Transaction::consensus_decode(&mut coinbase_witness_bytes.as_slice()) {
-            Ok(t) => t,
-            Err(err) => {
-                warn!(%err, "JDP block: coinbase tx parse failed");
+    // The JDC's declared coinbase may arrive in EITHER serialisation, and the
+    // difference is invisible without looking: the SV2 declaration carries a
+    // `coinbase_tx_prefix`/`suffix` pair split around the extranonce, and what
+    // sits in them is whatever the client put there. The reference jd-client
+    // (sv2-apps v0.7.0) declares the WITNESS form — BIP-141 marker + flag
+    // after the version and the 32-byte reserved witness item before the
+    // locktime, both already present.
+    //
+    // Wrapping that a second time does not fail loudly, which is what made
+    // this expensive: `02000000 |0001| 0001 01 …` re-reads the real marker as
+    // an input count of ZERO, so rust-bitcoin decodes a witness transaction
+    // with no inputs and one output, stops after 21 bytes, and leaves the
+    // other 213 on the floor. The assembled "block" went out at 102 bytes and
+    // bitcoin-core answered `Block decode failed` — measured against the
+    // reference client, 62 of 62 submits (2026-08-09).
+    //
+    // So: try the bytes as they are first, and only fall back to wrapping
+    // them. `decode_whole_tx` is what makes either branch trustworthy — a
+    // decode that leaves a remainder is a FAILURE here, not a success.
+    let coinbase_tx: Transaction = match decode_whole_tx(coinbase_raw) {
+        Some(tx) => tx,
+        None => match decode_whole_tx(&assemble_witness_coinbase(coinbase_raw)) {
+            Some(tx) => tx,
+            None => {
+                warn!(
+                    len = coinbase_raw.len(),
+                    "JDP block: declared coinbase parses in neither serialisation — not submitting"
+                );
                 return None;
             }
-        };
+        },
+    };
     let mut txdata: Vec<Transaction> = Vec::with_capacity(1 + transactions.len());
     txdata.push(coinbase_tx);
     for (i, raw) in transactions.iter().enumerate() {
-        match Transaction::consensus_decode(&mut raw.as_slice()) {
-            Ok(tx) => txdata.push(tx),
-            Err(err) => {
-                warn!(%err, idx = i, "JDP block: tx parse failed");
+        // Same rule as the coinbase, and for the same reason: a transaction
+        // that decodes from a PREFIX of these bytes is a different
+        // transaction, and it would go into the merkle root as if it were the
+        // declared one.
+        match decode_whole_tx(raw) {
+            Some(tx) => txdata.push(tx),
+            None => {
+                warn!(idx = i, "JDP block: declared tx parse failed");
                 return None;
             }
         }
@@ -1943,6 +1990,119 @@ mod tests {
             "an uncomputed merkle root would name the wrong block"
         );
         assert_eq!(block.txdata.len(), 1);
+    }
+
+    /// The bytes the REFERENCE client actually declares, captured off the wire
+    /// from sv2-apps v0.7.0 on regtest (2026-08-09).
+    ///
+    /// They are already WITNESS-serialised: `00 01` marker+flag after the
+    /// version, and the 32-byte reserved witness item before the locktime.
+    const JDC_DECLARED_COINBASE_WITNESS_FORM: &str = "\
+02000000000101000000000000000000000000000000000000000000000000000000000000\
+0000ffffffff2102b80b0e2f2f62702d6a64632d746573742f0e00000001000000000000000\
+00000feffffff0288250000000000001600149b19fbdf3afc1136b235f38967276ff2e16319\
+fa0000000000000000266a24aa21a9edbfb3fcf6fc1b9e46c9dc5e85fde2375dc46d51f45e6\
+be619409085a2ef15b0a8012000000000000000000000000000000000000000000000000000\
+00000000000000b70b0000";
+
+    /// MONEY-ADJACENT: a declared coinbase that is ALREADY in witness form
+    /// must reassemble as itself.
+    ///
+    /// It used to be wrapped a second time by `assemble_witness_coinbase`,
+    /// which does not fail loudly: the real marker is then read as an input
+    /// count of ZERO, rust-bitcoin decodes a 21-byte transaction with no
+    /// inputs and one output, and the other 213 bytes are dropped. The
+    /// assembled block went out at 102 bytes and bitcoin-core answered
+    /// `Block decode failed` — 62 of 62 submits against the reference client.
+    /// The pool's whole half of the §6.4.9 anti-orphan redundancy was dead.
+    ///
+    /// The assertions pin the transaction, not just "something parsed": one
+    /// input, two outputs, and a byte-identical round trip. A prefix-decode
+    /// satisfies none of them.
+    #[test]
+    fn a_witness_serialised_declared_coinbase_reassembles_verbatim() {
+        let raw = hex::decode(JDC_DECLARED_COINBASE_WITNESS_FORM).expect("fixture hex");
+        assert_eq!(raw.len(), 198, "fixture must be the captured bytes");
+
+        let block = assemble_declared_block(
+            &raw,
+            &[],
+            [0xABu8; 32],
+            0x2000_0000,
+            1_700_000_000,
+            42,
+            0x1d00_ffff,
+        )
+        .expect("the reference client's own coinbase must reassemble");
+
+        let cb = &block.txdata[0];
+        assert_eq!(cb.input.len(), 1, "the coinbase input was read as data");
+        assert_eq!(cb.output.len(), 2, "payout + witness commitment");
+        assert_eq!(
+            bitcoin::consensus::serialize(cb),
+            raw,
+            "the reassembled coinbase must be the declared bytes, unchanged"
+        );
+    }
+
+    /// The other serialisation still works — the fix must not trade one form
+    /// for the other. A coinbase with no witness encodes without marker/flag,
+    /// which is what an SV1-shaped declaration looks like, and that one DOES
+    /// need the wrapping.
+    #[test]
+    fn a_non_witness_declared_coinbase_still_reassembles() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+
+        let coinbase = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x51, 0x00, 0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let raw = bitcoin::consensus::serialize(&coinbase);
+        assert_ne!(raw[4], 0x00, "fixture must NOT be witness-serialised");
+
+        let block = assemble_declared_block(
+            &raw,
+            &[],
+            [0xABu8; 32],
+            0x2000_0000,
+            1_700_000_000,
+            42,
+            0x1d00_ffff,
+        )
+        .expect("a non-witness coinbase must still reassemble");
+        assert_eq!(block.txdata[0].input.len(), 1);
+        assert_eq!(block.txdata[0].output.len(), 1);
+    }
+
+    /// The rule underneath both: a transaction that decodes from a PREFIX is
+    /// not the declared transaction. `consensus_decode` reads from a slice and
+    /// stops when it has something complete, so it reports success on trailing
+    /// garbage — and that silence is what let a corrupt coinbase into a block
+    /// instead of failing the reassembly.
+    #[test]
+    fn a_transaction_that_decodes_from_a_prefix_only_is_rejected() {
+        let mut raw = hex::decode(JDC_DECLARED_COINBASE_WITNESS_FORM).expect("fixture hex");
+        assert!(
+            decode_whole_tx(&raw).is_some(),
+            "precondition: the clean bytes decode"
+        );
+        raw.extend_from_slice(&[0xAB; 8]);
+        assert!(
+            decode_whole_tx(&raw).is_none(),
+            "trailing bytes mean these are not the declared transaction"
+        );
     }
 
     /// A JD-client may re-send a solution (reconnect, an ack it never saw).
