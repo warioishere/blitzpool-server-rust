@@ -256,6 +256,17 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         //   the §6.4.2 rate limit cannot throttle it, because it lives in
         //   `TokenStore::allocate`, which such an allocate never reaches.
         //
+        // ⚠️ A FIRST line, and it cannot be more than that. The mode gate
+        // learns an address from the PORT a mining session opens on
+        // (`mode_from_port`) and answers Solo for one it has never seen; a JDP
+        // connection has no port to derive a mode from. So a JDC that reaches
+        // the allocate before any mining session exists for its address IS
+        // served — measured against the reference client (2026-08-09). What
+        // makes the outcome right in that window is the mining side's
+        // `custom-jobs-require-solo`; what this saves, in the ordinary case
+        // where the miner is already connected, is a token nobody can use and
+        // the `resolve_payouts` write below.
+        //
         // `match` and not `!= Solo`: a stream added later has to be
         // classified deliberately rather than default into being served.
         let servable = match bp_stratum_v2::hooks::PayoutResolver::resolve_stream(
