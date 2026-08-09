@@ -285,6 +285,93 @@ pub fn resolve_distribution_reference(
     })
 }
 
+/// What the pool has on file for a `SetCustomMiningJob`'s
+/// `mining_job_token` — the record its coinbase is judged against.
+///
+/// Three states, and they are the JOB DECLARATION modes of ext 0x0003 §6.3
+/// as the mining side sees them. Spelled out as one type because the handler
+/// asks several questions of them (whose address must match, which tip binds,
+/// what pins the coinbase, who records a found block) and the answers do not
+/// line up with any single `Option` on the inputs.
+///
+/// Derived before this type existed by asking `bridge_job.is_some()` /
+/// `allocation.is_some()` at four separate places, which is what SV2 §6.3
+/// modes look like when nothing names them: a fourth mode would have fallen
+/// through every one of those tests without the compiler saying a word. It
+/// is the same distinction [`crate::jdp::dynamic_outputs::CandidateBacking`]
+/// already draws on the JDP block-found path, at the other end of the same
+/// job.
+///
+/// **This is the token's authority, not its payout coverage.** Whether a
+/// published distribution pins the coinbase split is a SEPARATE question,
+/// answered by [`resolve_distribution_reference`], and the two are not
+/// derivable from each other: a Full-Template job may or may not carry a
+/// distribution reference, and so may a base-protocol allocation. Folding
+/// them into one enum would drop the §7.1 recompute for a declared job that
+/// references a distribution — which the handler runs today, and must.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenBacking<'a> {
+    /// Full-Template (§6.3.2): a `DeclareMiningJob` stands behind the token.
+    /// bitcoin-core validated the declared transaction set (§6.1), so the
+    /// custom job is held to the declaration — address, declared tip, and the
+    /// binding of [`crate::jdp::custom_job_binding`].
+    Declared(&'a BridgeJobRef),
+    /// Coinbase-only on the base protocol (§6.3.1: `DeclareMiningJob` "is
+    /// never used"): the allocate is the pool's only record, so the job is
+    /// held to what §6.4.3 gives — the coinbase pays the designated payout
+    /// output — and to the token's own miner address.
+    BaseAllocation(&'a AllocatedTokenRef),
+    /// Coinbase-only under ext 0x0003: §2 requires the allocate's outputs to
+    /// be empty, so nothing was registered ([`AllocatedTokenRef`]), and
+    /// §6.3.1 forbids declaring. The published distribution is the whole
+    /// record, and the §7.1 recompute is what judges the job — a stronger
+    /// check than either of the other two arms applies.
+    DistributionOnly,
+}
+
+/// Which of the three a token is — or `None`, meaning it resolves to nothing
+/// the coinbase can be judged against (unknown / expired / evicted with its
+/// JDP session). The handler fails closed on `None`: accepting would register
+/// an arbitrary self-built coinbase into the share pipeline.
+///
+/// Pure and total on purpose, the same way
+/// `crate::jdp_server::classify_allocation` is: it takes only the three
+/// inputs that decide it, so every combination can be asserted without a
+/// connection, and a mode added later has to be classified here rather than
+/// fall into an existing arm.
+///
+/// `Declared` wins over `BaseAllocation`, an order that decides nothing today
+/// but is stated rather than left to chance, because the argument for that
+/// lives in two other files and has two halves of different strength:
+///
+/// - Full-Template registers no allocation AT ALL
+///   (`AllocationDisposition::LeftToTheDeclaration`), precisely so an allocate
+///   token cannot authorise a job that skipped `DeclareMiningJob`. Structural,
+///   and the case that matters.
+/// - Outside that mode the two maps are keyed by different tokens — a
+///   declaration lands under the `new_mining_job_token` that
+///   `TokenStore::mint_for_declaration` freshly minted, never under the
+///   allocate token — but both draw from the same `next_token()`, so this half
+///   rests on 12 random bytes not colliding, not on the key spaces being
+///   disjoint.
+///
+/// Should it ever occur, the declaration is the record to hold the job to:
+/// bitcoin-core validated its transaction set (§6.1), which the §6.4.3
+/// single-output test does not approach. What pins the payout split is a
+/// separate question and is answered either way.
+pub fn classify_backing<'a>(
+    bridge_job: Option<&'a BridgeJobRef>,
+    allocation: Option<&'a AllocatedTokenRef>,
+    distribution_reference: Option<DistributionReference>,
+) -> Option<TokenBacking<'a>> {
+    match (bridge_job, allocation, distribution_reference) {
+        (Some(job), _, _) => Some(TokenBacking::Declared(job)),
+        (None, Some(allocation), _) => Some(TokenBacking::BaseAllocation(allocation)),
+        (None, None, Some(_)) => Some(TokenBacking::DistributionOnly),
+        (None, None, None) => None,
+    }
+}
+
 /// A registered entry plus the projection the mining side compares against.
 ///
 /// The projection is built ONCE, here, and never again: a
@@ -972,6 +1059,76 @@ mod tests {
                 distribution_id: 11
             }),
             "the handler's §2 gate needs to see the TLV in order to reject it"
+        );
+    }
+
+    fn allocated_ref() -> AllocatedTokenRef {
+        AllocatedTokenRef {
+            miner_address: addr(),
+            payout_script: vec![0x51],
+            jdp_session_id: 7,
+            expires_at_ms: u64::MAX,
+        }
+    }
+
+    /// Every combination of the three inputs, asserted as a value — the point
+    /// of the classifier being pure. Driving these through the mining handler
+    /// instead would only show the verdict, and two of the arms have the same
+    /// verdict for different reasons.
+    #[test]
+    fn a_token_is_classified_by_what_the_pool_has_on_file() {
+        let declared = declared_ref(Some(9), 7);
+        let allocated = allocated_ref();
+        let reference = Some(DistributionReference::FromFrame {
+            distribution_id: 11,
+        });
+
+        // A declaration is the record whether or not it references a
+        // distribution — the two axes are independent, so classification
+        // must not consult the reference here.
+        assert_eq!(
+            classify_backing(Some(&declared), None, None),
+            Some(TokenBacking::Declared(&declared))
+        );
+        assert_eq!(
+            classify_backing(Some(&declared), None, reference),
+            Some(TokenBacking::Declared(&declared))
+        );
+        // Base-protocol Coinbase-only, and the same job with a frame TLV a
+        // §2-violating JDC put there: still the allocation's record, and the
+        // §6.4.3 check still applies. Nothing waves it through.
+        assert_eq!(
+            classify_backing(None, Some(&allocated), None),
+            Some(TokenBacking::BaseAllocation(&allocated))
+        );
+        assert_eq!(
+            classify_backing(None, Some(&allocated), reference),
+            Some(TokenBacking::BaseAllocation(&allocated))
+        );
+        // Coinbase-only under ext 0x0003: §2 leaves the allocate empty, so
+        // there is nothing on file but the distribution.
+        assert_eq!(
+            classify_backing(None, None, reference),
+            Some(TokenBacking::DistributionOnly)
+        );
+        // Fail-closed: unknown / expired / evicted.
+        assert_eq!(classify_backing(None, None, None), None);
+    }
+
+    /// The order between the first two arms, stated as a test because the
+    /// argument for it lives in two other files: Full-Template registers no
+    /// allocation, and outside that mode the two tokens differ. Not a
+    /// reachable job — the assertion is about which record wins if that ever
+    /// stops holding.
+    #[test]
+    fn a_declaration_outranks_an_allocation() {
+        let declared = declared_ref(None, 7);
+        let allocated = allocated_ref();
+
+        assert_eq!(
+            classify_backing(Some(&declared), Some(&allocated), None),
+            Some(TokenBacking::Declared(&declared)),
+            "the declaration is the stronger record — bitcoin-core validated its tx set (§6.1)"
         );
     }
 

@@ -2548,14 +2548,19 @@ pub struct SetCustomMiningJobInput {
 /// `stale-chain-tip`, the retryable stale-race classification) — and the
 /// declaration binding of [`crate::jdp::custom_job_binding`].
 ///
-/// **Fail-closed token check**: the token must resolve to something the
-/// coinbase can be judged against — a declared job (Full-Template), a
-/// referenced distribution (ext 0x0003), or a base-protocol allocation
-/// carrying the §6.4.3 designated payout output (Coinbase-only, passed as
-/// `allocation`). None of the three → unknown / expired / evicted with its
-/// JDP session → `invalid-mining-job-token`. Accepting an unresolvable
-/// token would let an arbitrary self-built coinbase feed the share
-/// pipeline.
+/// **Two questions, two `match`es.** What AUTHORISES the token
+/// ([`crate::bridge::TokenBacking`] — a declared job, a base-protocol
+/// allocation, or a published distribution alone) and what PINS its payout
+/// split ([`crate::bridge::resolve_distribution_reference`] — a distribution
+/// reference, or nothing) are independent: a declared job may or may not
+/// reference a distribution, and so may an allocation. Both are answered
+/// exhaustively, so a §6.3 mode added later has to be classified rather than
+/// fall through every arm.
+///
+/// **Fail-closed token check**: the token must resolve to one of the three
+/// backings. None of them → unknown / expired / evicted with its JDP session
+/// → `invalid-mining-job-token`. Accepting an unresolvable token would let an
+/// arbitrary self-built coinbase feed the share pipeline.
 ///
 /// **Base-protocol Coinbase-only** (`allocation`, no declaration and no
 /// distribution): §6.3.1 says `DeclareMiningJob` is never used in that
@@ -2686,16 +2691,6 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         }
     }
 
-    // Fail-closed token check: the token must resolve to SOMETHING we can
-    // validate against — a declared job (Full-Template), a referenced
-    // distribution (ext 0x0003, either mode), or a base-protocol allocation
-    // (Coinbase-only, which never declares). None → unknown/expired/
-    // evicted token; accepting would register an arbitrary self-built
-    // job whose shares feed the pipeline with nothing backing the coinbase.
-    if bridge_job.is_none() && input.distribution_id.is_none() && allocation.is_none() {
-        return reject(ERR_INVALID_MINING_JOB_TOKEN);
-    }
-
     // ext 0x0003 §6 places the `distribution_id` TLV per Job Declaration mode,
     // and only Coinbase-only puts it on THIS message — a conformant
     // Full-Template JDC put it on `DeclareMiningJob`, where the JDP side
@@ -2719,230 +2714,262 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         state
             .negotiated_extensions
             .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS),
-    )
-    .map(|reference| reference.distribution_id());
+    );
+
+    // Fail-closed token check: the token must resolve to SOMETHING we can
+    // validate against. `None` → unknown / expired / evicted token;
+    // accepting would register an arbitrary self-built job whose shares feed
+    // the pipeline with nothing backing the coinbase.
+    let Some(backing) = crate::bridge::classify_backing(bridge_job, allocation, distribution_ref)
+    else {
+        return reject(ERR_INVALID_MINING_JOB_TOKEN);
+    };
 
     // Channel-locked miner address — cross-checked below against the bridge
     // entry and/or the referenced distribution's owner.
     let channel_addr = state.address.as_ref().map(|a| a.as_str()).unwrap_or("");
 
-    // Bridge cross-checks for a declared job.
-    if let Some(job) = bridge_job {
-        // The miner address MUST match the channel's locked address (stops
-        // one miner claiming another's declared job).
-        if channel_addr != job.miner_address.as_str() {
-            return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
-        }
-        // Tip binding: the custom job MUST build on the tip its declaration
-        // was accepted under. A mismatch is the stale-tip race (the chain
-        // advanced between declare and submit) — classified retryable via
-        // `stale-chain-tip`, never as a parameter violation. Unknowable
-        // (`None`) when the pool had no tip at accept time.
-        if let Some(declared) = job.declared_prev_hash {
-            if input.prev_hash != declared {
-                return reject(ERR_STALE_CHAIN_TIP);
-            }
-        }
-
-        // Declaration binding: the job asked for here MUST be the job the
-        // token was declared for. NOT a revenue check — how much a JDC's
-        // template is worth is its own call. What it carries over is the
-        // §6.1 node validation: `jdp_server` had bitcoin-core check the
-        // DECLARED job, and nothing on this side re-examines the tx set the
-        // `merkle_path` commits to. Without the comparison, "the node
-        // approved the declaration" and "this coinbase pays the published
-        // distribution" describe two jobs that need not be the same one.
-        let Some(binding) = job.binding.as_ref() else {
-            // A declaration that will not project. The coinbase half of that
-            // is now caught where it belongs — `accept_declaration` refuses a
-            // coinbase it cannot rebuild, on every connection, so the JDC
-            // learns at declare time instead of being told Success and then
-            // rejected on every job forever. What can still land here is the
-            // transaction half: a declared raw tx that went missing or will
-            // not decode between registration and this lookup. That is an
-            // internal inconsistency, not a client error, and it leaves
-            // nothing to establish about the job the token authorises.
-            tracing::warn!(
-                channel_id = input.channel_id,
-                "sv2: declared job cannot be projected for binding — rejecting custom job"
-            );
-            return reject(ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
-        };
-        if let Err(violation) = crate::jdp::custom_job_binding::check_custom_job(
-            binding,
-            crate::jdp::custom_job_binding::MinedJobFields {
-                version: input.version,
-                coinbase_tx_version: input.coinbase_tx_version,
-                coinbase_prefix: &input.coinbase_prefix,
-                coinbase_tx_input_n_sequence: input.coinbase_tx_input_n_sequence,
-                coinbase_tx_outputs: &input.coinbase_tx_outputs,
-                coinbase_tx_locktime: input.coinbase_tx_locktime,
-                merkle_path: &input.merkle_path,
-                full_extranonce_size,
-            },
-        ) {
-            tracing::warn!(
-                channel_id = input.channel_id,
-                ?violation,
-                "sv2: custom job does not match its declaration — rejecting"
-            );
-            return reject(ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
-        }
-    }
-
-    // Base-protocol Coinbase-only (§6.3.1: "the `DeclareMiningJob` message
-    // is never used"). With no declaration and no distribution reference,
-    // the allocate is the pool's only record of this token.
-    //
-    // Keyed on `allocation` rather than on the absence of the other two:
-    // the fail-closed check above already guarantees that a job with
-    // neither a declaration nor a distribution has one, so asking for it
-    // directly says the same thing without a second, unreachable rejection
-    // of the same input. Full-Template does NOT come through here — its
-    // token is never registered as an allocation, precisely so it cannot
-    // skip the declaration.
-    if let Some(allocation) = allocation {
-        // Same guard the declared path applies: one miner must not mine
-        // against another's token.
-        if channel_addr != allocation.miner_address.as_str() {
-            return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
-        }
-        // Tip binding, the counterpart to the declared path's: a job built
-        // on a tip the pool has already moved past cannot produce a block,
-        // and without this it would still register and earn its shares
-        // credited hashrate for work that cannot land. `stale-chain-tip` is
-        // the retryable classification — the JDC rebuilds and resubmits.
-        // Unknowable (`None`) before the pool has served this channel any
-        // extended job, exactly as the declared path treats a missing tip.
-        if let Some(tip) = channel_prev_hash {
-            if input.prev_hash != tip {
-                return reject(ERR_STALE_CHAIN_TIP);
-            }
-        }
-        let outputs: Vec<bitcoin::TxOut> =
-            match bitcoin::consensus::deserialize(&input.coinbase_tx_outputs) {
-                Ok(v) => v,
-                Err(_) => return reject(ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS),
-            };
-        if !crate::jdp::dynamic_outputs::pays_designated_output(&outputs, &allocation.payout_script)
-        {
-            tracing::warn!(
-                channel_id = input.channel_id,
-                "sv2: base-protocol custom job allocates nothing to the pool's designated \
-                 payout output (§6.4.3) — rejecting"
-            );
-            return reject(ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS);
-        }
-    }
-
-    // Solo gate for base-protocol custom jobs: the check above binds the
-    // coinbase to ONE designated output, which is all §6.4.3 gives a pool.
-    // That is enough for Solo, where the designated script is the miner's
-    // own address and a self-chosen split can only shortchange itself. It
-    // is not enough off Solo: a shared window needs every payout slot
-    // pinned, and the base protocol has no way to express more than the one
-    // output — so those shares would enter PPLNS/group accounting behind a
-    // coinbase nobody validated the split of. ext 0x0003 is what expresses
-    // it, and with a distribution reference (validated below) non-Solo is
-    // legitimate.
-    if distribution_ref.is_none() && state.stream != StreamKind::Solo {
-        return reject(ERR_CUSTOM_JOB_REQUIRES_SOLO);
-    }
-
-    // ext 0x0003 (push model). This is the Pool's sole validation point
-    // for the coinbase the miner will ACTUALLY mine: §2 requires the
-    // extension negotiated on THIS (mining) connection, the referenced
-    // distribution must sit in the acceptance window (§7.2/§10), and
-    // the submitted outputs must match the §4 recompute POSITIONALLY
-    // (§7.1).
-    //
-    // It runs for Full-Template jobs too, and must — for a reason the
-    // declaration binding above does NOT cover, so do not delete it on the
-    // strength of that binding.
-    //
-    // The binding answers "is this the job that was declared?". It says
-    // nothing about whether the distribution that job referenced is still
-    // live. A declaration accepted under distribution k can arrive here
-    // after k was superseded or settlement-invalidated (§7.2/§10) — same
-    // job, same bytes, binding satisfied, and a coinbase paying a
-    // withdrawn split. Only the block below resolves the reference against
-    // the acceptance window and re-checks the §4 recompute, and it is
-    // `input.coinbase_tx_outputs` the `ExtendedJob` is assembled from.
-    //
-    // (Before the binding existed this block also carried the weight of
-    // "nothing ties the mined coinbase to the declared one". That half has
-    // moved; this half has not.)
-    //
-    // Distributions are multi-use by design: many jobs of one tip
-    // legitimately reference one distribution, and double-paying two
-    // distributions at once is structurally impossible under positional
-    // equality — so nothing here is consumed.
-    // Settlement identity of the distribution this job's coinbase pays,
-    // filled in by the block below. It is what lets a block found on a
-    // Coinbase-only ext 0x0003 job be BOOKED and not merely recorded: that
-    // mode never declares, so no `PayoutBooking` is ever stamped on the JDP
-    // side and this is the only carrier the fingerprint has. `None` for a
-    // base-protocol job (nothing was published) and for a Solo distribution
-    // (books without a snapshot).
-    let mut settlement_fingerprint: Option<[u8; 32]> = None;
-    if distribution_ref.is_some() {
-        if input.distribution_id.is_some()
-            && !state
-                .negotiated_extensions
-                .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
-        {
-            // §2: TLV fields from a non-negotiated extension are a
-            // protocol violation, not something to silently honour.
-            //
-            // Keyed on the FRAME's TLV, because that is what §2 speaks about
-            // — "any job declaration carrying this extension's TLV fields".
-            // An inherited reference is the pool's own inference and can only
-            // exist when this connection negotiated
-            // (`resolve_distribution_reference` refuses to synthesise one
-            // otherwise), so judging it here would be judging ourselves.
-            return reject(ERR_INVALID_PAYOUT_DISTRIBUTION);
-        }
-        let entry = match distribution {
-            Some(crate::bridge::DistributionAcceptance::Accepted(entry)) => entry.clone(),
-            _ => return reject(ERR_STALE_PAYOUT_DISTRIBUTION),
-        };
-        // The distribution must match the accounting THIS connection's
-        // shares enter. A tailored entry names its miner. A pool-wide
-        // entry (`owner: None`) is the PPLNS window's, so only a PPLNS
-        // stream may reference it — "every connection may reference it"
-        // is true of the acceptance window, not of the accounting.
-        // Without the stream check a Group-Solo connection could point
-        // at the pool-wide distribution: its blocks would pay the PPLNS
-        // window while its shares kept earning a cut of the group's.
-        match &entry.owner {
-            Some(owner) if channel_addr != owner.as_str() => {
+    // What the token authorises, and therefore which record the job is held
+    // to. A `match` and not three `Option` tests: these are the §6.3 Job
+    // Declaration modes, and a mode added later must be answered here rather
+    // than slip through every arm — see [`crate::bridge::TokenBacking`].
+    match backing {
+        crate::bridge::TokenBacking::Declared(job) => {
+            // The miner address MUST match the channel's locked address (stops
+            // one miner claiming another's declared job).
+            if channel_addr != job.miner_address.as_str() {
                 return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
             }
-            None if state.stream != StreamKind::Pplns => {
+            // Tip binding: the custom job MUST build on the tip its declaration
+            // was accepted under. A mismatch is the stale-tip race (the chain
+            // advanced between declare and submit) — classified retryable via
+            // `stale-chain-tip`, never as a parameter violation. Unknowable
+            // (`None`) when the pool had no tip at accept time.
+            if let Some(declared) = job.declared_prev_hash {
+                if input.prev_hash != declared {
+                    return reject(ERR_STALE_CHAIN_TIP);
+                }
+            }
+
+            // Declaration binding: the job asked for here MUST be the job the
+            // token was declared for. NOT a revenue check — how much a JDC's
+            // template is worth is its own call. What it carries over is the
+            // §6.1 node validation: `jdp_server` had bitcoin-core check the
+            // DECLARED job, and nothing on this side re-examines the tx set the
+            // `merkle_path` commits to. Without the comparison, "the node
+            // approved the declaration" and "this coinbase pays the published
+            // distribution" describe two jobs that need not be the same one.
+            let Some(binding) = job.binding.as_ref() else {
+                // A declaration that will not project. The coinbase half of that
+                // is now caught where it belongs — `accept_declaration` refuses a
+                // coinbase it cannot rebuild, on every connection, so the JDC
+                // learns at declare time instead of being told Success and then
+                // rejected on every job forever. What can still land here is the
+                // transaction half: a declared raw tx that went missing or will
+                // not decode between registration and this lookup. That is an
+                // internal inconsistency, not a client error, and it leaves
+                // nothing to establish about the job the token authorises.
+                tracing::warn!(
+                    channel_id = input.channel_id,
+                    "sv2: declared job cannot be projected for binding — rejecting custom job"
+                );
+                return reject(ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
+            };
+            if let Err(violation) = crate::jdp::custom_job_binding::check_custom_job(
+                binding,
+                crate::jdp::custom_job_binding::MinedJobFields {
+                    version: input.version,
+                    coinbase_tx_version: input.coinbase_tx_version,
+                    coinbase_prefix: &input.coinbase_prefix,
+                    coinbase_tx_input_n_sequence: input.coinbase_tx_input_n_sequence,
+                    coinbase_tx_outputs: &input.coinbase_tx_outputs,
+                    coinbase_tx_locktime: input.coinbase_tx_locktime,
+                    merkle_path: &input.merkle_path,
+                    full_extranonce_size,
+                },
+            ) {
+                tracing::warn!(
+                    channel_id = input.channel_id,
+                    ?violation,
+                    "sv2: custom job does not match its declaration — rejecting"
+                );
+                return reject(ERR_INVALID_JOB_PARAM_DECLARATION_MISMATCH);
+            }
+        }
+        // Base-protocol Coinbase-only (§6.3.1: "the `DeclareMiningJob` message
+        // is never used"). The allocate is the pool's only record of this
+        // token, so the job is held to the §6.4.3 designated output.
+        crate::bridge::TokenBacking::BaseAllocation(allocation) => {
+            // Same guard the declared path applies: one miner must not mine
+            // against another's token.
+            if channel_addr != allocation.miner_address.as_str() {
                 return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
             }
-            _ => {}
+            // Tip binding, the counterpart to the declared path's: a job built
+            // on a tip the pool has already moved past cannot produce a block,
+            // and without this it would still register and earn its shares
+            // credited hashrate for work that cannot land. `stale-chain-tip` is
+            // the retryable classification — the JDC rebuilds and resubmits.
+            // Unknowable (`None`) before the pool has served this channel any
+            // extended job, exactly as the declared path treats a missing tip.
+            if let Some(tip) = channel_prev_hash {
+                if input.prev_hash != tip {
+                    return reject(ERR_STALE_CHAIN_TIP);
+                }
+            }
+            let outputs: Vec<bitcoin::TxOut> =
+                match bitcoin::consensus::deserialize(&input.coinbase_tx_outputs) {
+                    Ok(v) => v,
+                    Err(_) => return reject(ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS),
+                };
+            if !crate::jdp::dynamic_outputs::pays_designated_output(
+                &outputs,
+                &allocation.payout_script,
+            ) {
+                tracing::warn!(
+                    channel_id = input.channel_id,
+                    "sv2: base-protocol custom job allocates nothing to the pool's designated \
+                     payout output (§6.4.3) — rejecting"
+                );
+                return reject(ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS);
+            }
         }
-        let declared: Vec<bitcoin::TxOut> =
-            match bitcoin::consensus::deserialize(&input.coinbase_tx_outputs) {
-                Ok(v) => v,
-                Err(_) => return reject(ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS),
-            };
-        if crate::jdp::payout_distribution::validate_coinbase_outputs_against_distribution(
-            &declared,
-            &entry.pool_payout,
-            &entry.payouts,
-            &entry.dust_limits,
-            &entry.additional_outputs,
-        )
-        .is_err()
-        {
-            return reject(ERR_INVALID_PAYOUT_DISTRIBUTION);
-        }
-        // Only now, past §7.1 — a fingerprint stamped before the recompute
-        // would name a distribution this coinbase was never proven to pay.
-        settlement_fingerprint = entry.payouts_fingerprint;
+        // Coinbase-only under ext 0x0003. Nothing to check HERE, and that is
+        // not a gap: §2 leaves the allocate empty by design, so there is no
+        // designated output to compare and no declaration to bind to. The
+        // whole judgement is the §7.1 recompute below, which every other
+        // backing also passes through and which pins every payout slot rather
+        // than the single one §6.4.3 can express.
+        crate::bridge::TokenBacking::DistributionOnly => {}
     }
+
+    // What pins this coinbase's payout split — the second of the two
+    // questions a custom job answers, and independent of the backing above:
+    // a declared job may or may not reference a distribution, and so may a
+    // base-protocol allocation.
+    //
+    // The Solo gate and the §7.1 recompute are the two answers to ONE
+    // question — what pins this coinbase's payout split — so they are the
+    // arms of one `match` and not two `Option` tests forty lines apart. Read
+    // separately they drifted: `distribution_ref.is_none()` here and
+    // `distribution_ref.is_some()` there described the same job in opposite
+    // words, with nothing making them agree.
+    //
+    // Settlement identity of the distribution this job's coinbase pays. It is
+    // what lets a block found on a Coinbase-only ext 0x0003 job be BOOKED and
+    // not merely recorded: that mode never declares, so no `PayoutBooking` is
+    // ever stamped on the JDP side and this is the only carrier the
+    // fingerprint has. `None` for a base-protocol job (nothing was published)
+    // and for a Solo distribution (books without a snapshot).
+    let settlement_fingerprint: Option<[u8; 32]> = match distribution_ref {
+        // Base protocol — nothing published. The backing check above bound
+        // the coinbase to ONE designated output, which is all §6.4.3 gives a
+        // pool. That is enough for Solo, where the designated script is the
+        // miner's own address and a self-chosen split can only shortchange
+        // itself. It is not enough off Solo: a shared window needs every
+        // payout slot pinned, and the base protocol has no way to express
+        // more than the one output — so those shares would enter PPLNS/group
+        // accounting behind a coinbase nobody validated the split of. ext
+        // 0x0003 is what expresses it.
+        None => {
+            if state.stream != StreamKind::Solo {
+                return reject(ERR_CUSTOM_JOB_REQUIRES_SOLO);
+            }
+            None
+        }
+        // ext 0x0003 (push model). This is the Pool's sole validation point
+        // for the coinbase the miner will ACTUALLY mine: §2 requires the
+        // extension negotiated on THIS (mining) connection, the referenced
+        // distribution must sit in the acceptance window (§7.2/§10), and
+        // the submitted outputs must match the §4 recompute POSITIONALLY
+        // (§7.1).
+        //
+        // It runs for Full-Template jobs too, and must — for a reason the
+        // declaration binding above does NOT cover, so do not delete it on
+        // the strength of that binding.
+        //
+        // The binding answers "is this the job that was declared?". It says
+        // nothing about whether the distribution that job referenced is still
+        // live. A declaration accepted under distribution k can arrive here
+        // after k was superseded or settlement-invalidated (§7.2/§10) — same
+        // job, same bytes, binding satisfied, and a coinbase paying a
+        // withdrawn split. Only this arm resolves the reference against
+        // the acceptance window and re-checks the §4 recompute, and it is
+        // `input.coinbase_tx_outputs` the `ExtendedJob` is assembled from.
+        //
+        // (Before the binding existed this block also carried the weight of
+        // "nothing ties the mined coinbase to the declared one". That half has
+        // moved; this half has not.)
+        //
+        // Distributions are multi-use by design: many jobs of one tip
+        // legitimately reference one distribution, and double-paying two
+        // distributions at once is structurally impossible under positional
+        // equality — so nothing here is consumed.
+        Some(reference) => {
+            // §2: TLV fields from a non-negotiated extension are a protocol
+            // violation, not something to silently honour — and only ONE of
+            // the two reference origins is a TLV the client sent, which is
+            // why this asks the origin rather than re-reading
+            // `input.distribution_id` to infer it.
+            match reference {
+                crate::bridge::DistributionReference::FromFrame { .. } => {
+                    if !state
+                        .negotiated_extensions
+                        .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
+                    {
+                        return reject(ERR_INVALID_PAYOUT_DISTRIBUTION);
+                    }
+                }
+                // §2 speaks about "any job declaration carrying this
+                // extension's TLV fields". An inherited reference is the
+                // pool's own inference and can only exist when this
+                // connection negotiated (`resolve_distribution_reference`
+                // refuses to synthesise one otherwise), so judging it here
+                // would be judging ourselves.
+                crate::bridge::DistributionReference::FromDeclaration { .. } => {}
+            }
+            let entry = match distribution {
+                Some(crate::bridge::DistributionAcceptance::Accepted(entry)) => entry.clone(),
+                _ => return reject(ERR_STALE_PAYOUT_DISTRIBUTION),
+            };
+            // The distribution must match the accounting THIS connection's
+            // shares enter. A tailored entry names its miner. A pool-wide
+            // entry (`owner: None`) is the PPLNS window's, so only a PPLNS
+            // stream may reference it — "every connection may reference it"
+            // is true of the acceptance window, not of the accounting.
+            // Without the stream check a Group-Solo connection could point
+            // at the pool-wide distribution: its blocks would pay the PPLNS
+            // window while its shares kept earning a cut of the group's.
+            match &entry.owner {
+                Some(owner) if channel_addr != owner.as_str() => {
+                    return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+                }
+                None if state.stream != StreamKind::Pplns => {
+                    return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+                }
+                _ => {}
+            }
+            let declared: Vec<bitcoin::TxOut> =
+                match bitcoin::consensus::deserialize(&input.coinbase_tx_outputs) {
+                    Ok(v) => v,
+                    Err(_) => return reject(ERR_INVALID_JOB_PARAM_COINBASE_OUTPUTS),
+                };
+            if crate::jdp::payout_distribution::validate_coinbase_outputs_against_distribution(
+                &declared,
+                &entry.pool_payout,
+                &entry.payouts,
+                &entry.dust_limits,
+                &entry.additional_outputs,
+            )
+            .is_err()
+            {
+                return reject(ERR_INVALID_PAYOUT_DISTRIBUTION);
+            }
+            // Only now, past §7.1 — a fingerprint stamped before the recompute
+            // would name a distribution this coinbase was never proven to pay.
+            entry.payouts_fingerprint
+        }
+    };
 
     // Re-borrow channel mutably (the bridge cross-check above used
     // an immutable reference to state.address; safe because we
@@ -3013,10 +3040,11 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // `handle_push_solution` builds its `CandidateBacking` from.
             // `Bookable` and `UnbookableDistribution` both write the
             // `blocks_entity` row over there; `BaseProtocol` writes nothing.
-            // `bridge_job` being present is the other half: Coinbase-only
-            // mode is refused at `DeclareMiningJob` (§6.3.1), so its token
-            // only ever reaches the allocation map and `PushSolution` can
-            // never claim its block.
+            //
+            // Only a `Declared` backing can be claimed, and that is the other
+            // half of it: Coinbase-only mode is refused at `DeclareMiningJob`
+            // (§6.3.1), so its token only ever reaches the allocation map and
+            // `PushSolution` can never claim its block.
             //
             // NOT `distribution_ref`. That one is the reference this job is
             // VALIDATED against, and the two part ways on a Solo stream:
@@ -3027,14 +3055,19 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // declaration, Solo included. Asking the wrong one said "the
             // mining side records it" for a block the JDP path books anyway
             // — two rows for one block on an insert with no `ON CONFLICT`,
-            // and two block-found notifications.
+            // and two block-found notifications. The two questions read alike
+            // as bare `Option`s, which is why the backing is a type now.
             //
             // It closes the mirror case too: a JDC that negotiated 0x0003 on
             // the MINING connection alone declares without a reference, so
             // `PushSolution` records nothing — but its frame TLV used to make
             // `distribution_ref` `Some`, and the block was recorded by nobody.
             // See `ExtendedJob::jdp_claims_the_block`.
-            jdp_claims_the_block: bridge_job.is_some_and(|job| job.distribution_id.is_some()),
+            jdp_claims_the_block: match backing {
+                crate::bridge::TokenBacking::Declared(job) => job.distribution_id.is_some(),
+                crate::bridge::TokenBacking::BaseAllocation(_)
+                | crate::bridge::TokenBacking::DistributionOnly => false,
+            },
             created_at: now_ms,
             retired_at: None,
         },
