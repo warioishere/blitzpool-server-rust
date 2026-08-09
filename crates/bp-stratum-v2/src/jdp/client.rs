@@ -1012,21 +1012,23 @@ fn accept_declaration(
     // this is the first thing that has to change.
 
     // Mint the `new_mining_job_token` through the shared TokenStore, so a
-    // declared job's token has the same shape and TTL as an allocated one —
-    // but NOT through `allocate`, which enforces the §6.4.2 rate limit.
+    // declared job's token has the same SHAPE as an allocated one — but
+    // neither through `allocate`, which enforces the §6.4.2 rate limit, nor
+    // into the store's map.
     //
-    // That limit belongs to `AllocateMiningJobToken`, the message a CLIENT
+    // The limit belongs to `AllocateMiningJobToken`, the message a CLIENT
     // sends. Drawing the pool's own answer from the same budget meant a JDC
     // that allocated and then declared inside one second had its declaration
     // dropped with no frame at all — and the reference client refills its
     // token queue fire-and-forget from four call sites, several of which fire
     // on the same block change as a declare. The JDC then waits for a
     // response that never comes, and §6.2 sends it to another pool.
-    let new_token = match state
-        .tokens
-        .mint_for_declaration(now_ms, miner_address.clone())
-    {
-        Ok(entry) => entry.token,
+    //
+    // What holds this token afterwards is `state.declared_jobs` (FIFO,
+    // MAX_DECLARED_JOBS) and the bridge — never the token store, which
+    // nothing asks about a declaration token. See `mint_for_declaration`.
+    let new_token = match state.tokens.mint_for_declaration() {
+        Ok(token) => token,
         Err(err) => {
             // Only entropy failure or a saturated counter can reach this now.
             // Both are pool-side faults the JDC cannot act on and cannot see
@@ -1762,6 +1764,138 @@ mod tests {
             out.outbound[0]
         );
         assert_eq!(s.declared_jobs.len(), 1);
+    }
+
+    /// A declaration token is not KEPT in the token store, and the store is
+    /// the only per-connection map a declaration could grow.
+    ///
+    /// Taking the §6.4.2 limit off this path (the fix above) removed the
+    /// only thing bounding how many a client could mint, and the entry was
+    /// write-only anyway: nothing ever looks a declaration token up there.
+    /// `declared_jobs` (FIFO, `MAX_DECLARED_JOBS`) is what holds it.
+    #[test]
+    fn a_declaration_mints_a_token_without_growing_the_token_store() {
+        let mut s = fresh();
+        let _ = handle_setup_connection(&mut s, &good_setup());
+        let out = handle_allocate_token(&mut s, &good_alloc(1), alloc_ctx(), 1_000);
+        let token = match out.outbound[0] {
+            JdpOutboundFrame::AllocateMiningJobTokenSuccess {
+                mining_job_token, ..
+            } => mining_job_token,
+            _ => panic!("expected AllocateMiningJobTokenSuccess"),
+        };
+        assert_eq!(s.tokens.len(), 1, "precondition: the allocate IS stored");
+
+        let wtxid = [0x01; 32];
+        let mut tpl = HashMap::new();
+        tpl.insert(wtxid, vec![0xCA; 16]);
+        for request_id in 3..13u32 {
+            let out = handle_declare_mining_job(
+                &mut s,
+                &declare(request_id, token, vec![wtxid]),
+                &tpl,
+                Some([0xAB; 32]),
+                None,
+                1_100,
+            );
+            assert!(
+                matches!(
+                    out.outbound[0],
+                    JdpOutboundFrame::DeclareMiningJobSuccess { .. }
+                ),
+                "declaration {request_id} must be answered"
+            );
+        }
+        assert_eq!(
+            s.tokens.len(),
+            1,
+            "ten declarations must leave the token store where it was — only the allocate \
+             belongs in it"
+        );
+        assert_eq!(
+            s.declared_jobs.len(),
+            crate::jdp::declarations::MAX_DECLARED_JOBS,
+            "and the FIFO that DOES hold them is the one that caps them"
+        );
+    }
+
+    /// The other half: a `new_mining_job_token` must not itself authorise a
+    /// declaration. Storing it made it resolvable by `lookup_active`, so a
+    /// JDC could chain declarations off declaration tokens — each one minting
+    /// the next, forever, with no allocate in sight.
+    ///
+    /// The reference JDS answers the same way: `is_allocated` consults the
+    /// allocated set only, and activation moves a token out of it
+    /// (`token_management::TokenManager`, sv2-apps v0.7.0). No conformant
+    /// client is affected — the jd-client always declares with a token popped
+    /// from its allocate queue.
+    #[test]
+    fn a_declaration_token_cannot_itself_authorise_a_declaration() {
+        let mut s = fresh();
+        let _ = handle_setup_connection(&mut s, &good_setup());
+        let out = handle_allocate_token(&mut s, &good_alloc(1), alloc_ctx(), 1_000);
+        let allocate_token = match out.outbound[0] {
+            JdpOutboundFrame::AllocateMiningJobTokenSuccess {
+                mining_job_token, ..
+            } => mining_job_token,
+            _ => panic!("expected AllocateMiningJobTokenSuccess"),
+        };
+        let wtxid = [0x01; 32];
+        let mut tpl = HashMap::new();
+        tpl.insert(wtxid, vec![0xCA; 16]);
+        let out = handle_declare_mining_job(
+            &mut s,
+            &declare(3, allocate_token, vec![wtxid]),
+            &tpl,
+            Some([0xAB; 32]),
+            None,
+            1_100,
+        );
+        let declaration_token = match out.outbound[0] {
+            JdpOutboundFrame::DeclareMiningJobSuccess {
+                new_mining_job_token,
+                ..
+            } => new_mining_job_token,
+            ref other => panic!("expected DeclareMiningJobSuccess, got {other:?}"),
+        };
+
+        let out = handle_declare_mining_job(
+            &mut s,
+            &declare(4, declaration_token, vec![wtxid]),
+            &tpl,
+            Some([0xAB; 32]),
+            None,
+            1_200,
+        );
+        match &out.outbound[0] {
+            JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_INVALID_MINING_JOB_TOKEN);
+            }
+            other => panic!("a declaration token must not authorise a declaration, got {other:?}"),
+        }
+    }
+
+    /// The allocate map is bounded by rate × TTL, which needs something to
+    /// actually drop the expired entries. `lookup_active` prunes only the one
+    /// token it was asked about, so a connection that allocates and never
+    /// re-presents used to keep every entry for as long as it stayed open —
+    /// at one per second, a day-long connection is ~86 400 of them.
+    #[test]
+    fn allocating_sweeps_the_tokens_that_outlived_their_ttl() {
+        let mut s = fresh();
+        let _ = handle_setup_connection(&mut s, &good_setup());
+        let _ = handle_allocate_token(&mut s, &good_alloc(1), alloc_ctx(), 1_000);
+        let _ = handle_allocate_token(&mut s, &good_alloc(2), alloc_ctx(), 2_100);
+        assert_eq!(s.tokens.len(), 2, "precondition: both are live");
+
+        // Past both TTLs — the third allocate must not find company.
+        let past_ttl = 2_100 + crate::tokens::DEFAULT_TOKEN_TTL_MS + 1;
+        let _ = handle_allocate_token(&mut s, &good_alloc(3), alloc_ctx(), past_ttl);
+        assert_eq!(
+            s.tokens.len(),
+            1,
+            "the two expired tokens must be gone, leaving only the fresh one"
+        );
     }
 
     /// The mirror, so the fix above did not simply delete the limit: the

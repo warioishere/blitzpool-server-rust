@@ -24,15 +24,19 @@
 //!
 //! - `allocate` enforces the rate limit, generates a fresh token,
 //!   stamps `expires_at_ms = now + TTL`, stores the `(token →
-//!   AllocatedToken)` mapping.
-//! - `lookup_active` checks expiry on read and self-prunes expired
-//!   entries lazily.
-//! - `remove` is for the `DeclareMiningJob` path: once the JDC uses
-//!   the token to declare a job, the JDS issues a NEW token for the
-//!   declared-job side. The original AllocateMiningJobToken token is
-//!   NOT deleted; `remove` is for explicit teardown only.
-//! - `cleanup_expired` is a periodic-tick helper; the lazy
-//!   `lookup_active` is the primary GC path.
+//!   AllocatedToken)` mapping, and sweeps expired entries on the way in.
+//! - `mint_for_declaration` generates the pool's own
+//!   `new_mining_job_token`. Same shape, NO rate limit and NO storage —
+//!   nothing ever looks a declaration token up here, and an unbounded
+//!   write-only map is what it would otherwise be.
+//! - `lookup_active` checks expiry on read and self-prunes the entry it
+//!   was asked about. It only ever sees tokens a JDC presents, so it
+//!   cannot be the thing that bounds the map — `allocate`'s sweep is.
+//! - `remove` is for explicit teardown only. Using a token to declare a
+//!   job does NOT delete it: the JDS issues a separate token for the
+//!   declared-job side and the allocate token lives out its TTL.
+//! - `cleanup_expired` is the sweep itself, also exposed for a
+//!   periodic tick.
 
 use std::collections::HashMap;
 
@@ -234,23 +238,41 @@ impl TokenStore {
     /// `DeclareMiningJob` silently dropped, no frame at all, and waited for
     /// an answer that never came.
     ///
-    /// Nothing was holding the limit up on this path: what a declaration can
-    /// accumulate is capped by
-    /// [`crate::jdp::declarations::MAX_DECLARED_JOBS`] (FIFO, 3), and each
-    /// declare is throttled by its own node validation on a connection that
-    /// processes frames sequentially.
-    pub fn mint_for_declaration(
-        &mut self,
-        now_ms: u64,
-        miner_address: AddressId,
-    ) -> Result<&AllocatedToken, TokenAllocError> {
-        self.mint(now_ms, miner_address, Vec::new())
+    /// It is also **not stored**, and that is not an optimisation. Nothing
+    /// ever looks a declaration token up here: the declare handler's only
+    /// lookup ([`Self::lookup_active`]) resolves the ALLOCATE token a
+    /// `DeclareMiningJob` presents, the mining side resolves the declaration
+    /// through the bridge, and `PushSolution` through
+    /// [`crate::jdp::declarations::DeclaredJobStore`]. So the entry was
+    /// write-only — and, being unbounded once the rate limit came off, the
+    /// one thing on this connection that could grow without end.
+    ///
+    /// Not storing it also closes what storing it opened: a JDC could present
+    /// a `new_mining_job_token` as the `mining_job_token` of the NEXT
+    /// `DeclareMiningJob` and chain declarations off declaration tokens, each
+    /// one minting another. The reference JDS rejects that — `is_allocated`
+    /// consults the allocated set only, and activation moves a token OUT of
+    /// it (`token_management::TokenManager`, sv2-apps v0.7.0) — so this
+    /// matches it rather than diverging.
+    pub fn mint_for_declaration(&mut self) -> Result<Token, TokenAllocError> {
+        self.next_token()
     }
 
     /// Allocate a new token + record it under `(miner_address,
     /// coinbase_outputs)`. Enforces the §6.4.2 rate limit — see
     /// [`Self::mint_for_declaration`] for the path that must not. Bumps the
     /// per-connection counter (BE-encoded into the token prefix).
+    ///
+    /// Sweeps expired entries on the way in, which is what bounds this map:
+    /// the rate limit caps inserts at one per second and the TTL caps their
+    /// lifetime, so together they cap the map — but only if something
+    /// actually drops the expired ones. [`Self::lookup_active`] prunes just
+    /// the token it was asked about, so a connection that allocates and never
+    /// re-presents left every entry behind for as long as it stayed open. One
+    /// sweep per insert is affordable for exactly the reason the map is
+    /// bounded at all: inserts are rate-limited. (The reference JDS reaches
+    /// the same place from the other side, with a 10 s janitor task —
+    /// `token_management::TokenManager`, sv2-apps v0.7.0.)
     pub fn allocate(
         &mut self,
         now_ms: u64,
@@ -267,38 +289,8 @@ impl TokenStore {
             }
         }
         self.last_alloc_ms = Some(now_ms);
-        self.mint(now_ms, miner_address, coinbase_outputs)
-    }
-
-    /// Mint and store a token. One implementation for both entry points, so
-    /// the token SHAPE (counter prefix + entropy suffix) and the TTL cannot
-    /// drift between the client-facing allocate and the pool's own minting.
-    /// The rate limit lives in the caller — it is the only thing that
-    /// legitimately differs.
-    fn mint(
-        &mut self,
-        now_ms: u64,
-        miner_address: AddressId,
-        coinbase_outputs: Vec<u8>,
-    ) -> Result<&AllocatedToken, TokenAllocError> {
-        self.counter = self
-            .counter
-            .checked_add(1)
-            .ok_or(TokenAllocError::CounterSaturated)?;
-        let mut bytes = [0u8; TOKEN_LEN];
-        bytes[..4].copy_from_slice(&self.counter.to_be_bytes());
-        // Fill bytes[4..16] from RNG.
-        if let Some(ref mut rng) = self.rng {
-            rng(&mut bytes[TOKEN_COUNTER_LEN..]).map_err(TokenAllocError::EntropyFailed)?;
-        } else {
-            getrandom::getrandom(&mut bytes[TOKEN_COUNTER_LEN..])
-                .map_err(|e| TokenAllocError::EntropyFailed(e.to_string()))?;
-        }
-        let token = Token(bytes);
-        // NOT stamped here: `last_alloc_ms` is the §6.4.2 budget of the
-        // CLIENT's allocate message, and `allocate` stamps it before calling
-        // in. Stamping here would make a pool-minted declaration token block
-        // the miner's next allocate for a second — the same bug mirrored.
+        self.cleanup_expired(now_ms);
+        let token = self.next_token()?;
         let entry = AllocatedToken {
             token,
             miner_address,
@@ -310,6 +302,33 @@ impl TokenStore {
         // a re-lookup since `insert` returns `Option<V>` (the previous
         // value). Tokens are unique so the lookup always succeeds.
         Ok(self.allocated.get(&token).expect("token was just inserted"))
+    }
+
+    /// The token SHAPE — counter prefix + entropy suffix — in one place, so
+    /// it cannot drift between the client-facing allocate and the pool's own
+    /// minting. Storage, TTL and the rate limit all live in the callers,
+    /// because those are the three things that legitimately differ.
+    ///
+    /// `last_alloc_ms` is deliberately NOT stamped here: it is the §6.4.2
+    /// budget of the CLIENT's allocate message, and `allocate` stamps it
+    /// before calling in. Stamping here would make a pool-minted declaration
+    /// token block the miner's next allocate for a second — the same interop
+    /// bug mirrored.
+    fn next_token(&mut self) -> Result<Token, TokenAllocError> {
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .ok_or(TokenAllocError::CounterSaturated)?;
+        let mut bytes = [0u8; TOKEN_LEN];
+        bytes[..TOKEN_COUNTER_LEN].copy_from_slice(&self.counter.to_be_bytes());
+        // Fill bytes[4..16] from RNG.
+        if let Some(ref mut rng) = self.rng {
+            rng(&mut bytes[TOKEN_COUNTER_LEN..]).map_err(TokenAllocError::EntropyFailed)?;
+        } else {
+            getrandom::getrandom(&mut bytes[TOKEN_COUNTER_LEN..])
+                .map_err(|e| TokenAllocError::EntropyFailed(e.to_string()))?;
+        }
+        Ok(Token(bytes))
     }
 
     /// Look up a token without expiry-check. Returns the entry
