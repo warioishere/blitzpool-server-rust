@@ -1364,6 +1364,59 @@ pub enum WriteError {
     Io(crate::noise::NoiseError),
 }
 
+/// What the bridge does with an allocate token.
+///
+/// A value and not four inline match arms, because three of the four say
+/// "register nothing" and only ONE of those three is a fault. Told apart by
+/// outcome they are indistinguishable — which is how an ext 0x0003 allocate,
+/// whose empty `coinbase_tx_outputs` §2 REQUIRES, came to be logged as a pool
+/// bug on every Coinbase-only 0x0003 connection. As a value each reason is
+/// testable on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AllocationDisposition<'a> {
+    /// Base-protocol Coinbase-only: the allocate is the pool's ONLY record of
+    /// this token (§6.3.1 — that mode never declares), so the mining side
+    /// resolves it here and holds the custom job's coinbase to this script.
+    Register { payout_script: &'a [u8] },
+    /// Full-Template: the declaration is the record, not this. Registering
+    /// its allocate token too would let the JDC skip `DeclareMiningJob`, where
+    /// bitcoin-core validates its transaction set (§6.1), and mine a job no
+    /// node ever saw — no tip binding, no merkle-path check.
+    LeftToTheDeclaration,
+    /// ext 0x0003: §2 requires the allocate's outputs to be empty, so there is
+    /// no designated script by design. The job is judged by the §7.1 recompute
+    /// against the referenced distribution, which is the stronger check —
+    /// registering an allocation would let the weak §6.4.3 test stand in for
+    /// it. Nothing to register, and nothing wrong.
+    JudgedByTheDistribution,
+    /// A base-protocol allocate that designated nothing. The pool built that
+    /// blob, so this is OUR bug, not the client's — and it is invisible from
+    /// the client side, which just gets `invalid-mining-job-token` on every
+    /// job it ever builds.
+    DesignatedNothing,
+}
+
+/// Which of the four an allocate token is. Pure and total on purpose: it takes
+/// only the three flags that decide it, so every combination can be asserted
+/// without a connection, and a case added later has to be classified rather
+/// than fall into an existing arm.
+pub(crate) fn classify_allocation(
+    payout_script: Option<&[u8]>,
+    full_template_mode: bool,
+    payout_distribution_negotiated: bool,
+) -> AllocationDisposition<'_> {
+    match (
+        payout_script,
+        full_template_mode,
+        payout_distribution_negotiated,
+    ) {
+        (Some(payout_script), false, false) => AllocationDisposition::Register { payout_script },
+        (_, true, _) => AllocationDisposition::LeftToTheDeclaration,
+        (_, false, true) => AllocationDisposition::JudgedByTheDistribution,
+        (None, false, false) => AllocationDisposition::DesignatedNothing,
+    }
+}
+
 /// Register the latest declared job in the bridge so the mining
 /// server's `SetCustomMiningJob` handler can find it. Called from
 /// the per-connection task after `dispatch_jdp_inbound` returns —
@@ -1396,44 +1449,39 @@ pub(crate) fn register_bridge_entries(
             // declares (§6.3.1), so this is the only record the mining side
             // will have when its `SetCustomMiningJob` arrives.
             //
-            // Two conditions, and both are load-bearing:
-            //
-            // - `payout_script: Some` — an ext 0x0003 allocate carries no
-            //   designated script (§2 empties the outputs) and must not be
-            //   resolvable this way, or the weak §6.4.3 check would stand in
-            //   for the §7.1 recompute it owes.
-            // - `!full_template_mode` — a Full-Template session MUST go
-            //   through `DeclareMiningJob`, where bitcoin-core validates its
-            //   transaction set (§6.1). Registering its allocate token too
-            //   would let it skip the declaration entirely and mine a job no
-            //   node ever saw, with no tip binding and no merkle-path check.
-            //   `full_template_mode` is the same signal that already gates
-            //   the declare and push-solution paths.
+            // Which of the four this is: [`classify_allocation`], which owns
+            // the reasoning and is asserted over every combination. Note the
+            // negotiation flag is asked EXPLICITLY rather than inferred from
+            // `payout_script: None` — §2 empties the outputs on a negotiated
+            // session, so a legitimate 0x0003 allocate and a broken base one
+            // look identical here.
             JdpSessionEvent::TokenAllocated {
                 token,
                 miner_address,
                 payout_script,
                 expires_at_ms,
-            } => match (payout_script, state.full_template_mode) {
-                (Some(payout_script), false) => {
+            } => match classify_allocation(
+                payout_script.as_deref(),
+                state.full_template_mode,
+                state
+                    .negotiated_extensions
+                    .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS),
+            ) {
+                AllocationDisposition::Register { payout_script } => {
                     reg.register_allocation(
                         *token,
                         AllocatedTokenRef {
                             miner_address: miner_address.clone(),
-                            payout_script: payout_script.clone(),
+                            payout_script: payout_script.to_vec(),
                             jdp_session_id,
                             expires_at_ms: *expires_at_ms,
                         },
                         now_ms(),
                     );
                 }
-                // Full-Template: the declaration is the record, not this.
-                (_, true) => {}
-                // A base session whose allocate designated nothing. The pool
-                // built that blob, so this is our bug, not the client's —
-                // and it is invisible from the client side, which just gets
-                // `invalid-mining-job-token` on every job it ever builds.
-                (None, false) => {
+                AllocationDisposition::LeftToTheDeclaration
+                | AllocationDisposition::JudgedByTheDistribution => {}
+                AllocationDisposition::DesignatedNothing => {
                     warn!(
                         session_id = jdp_session_id,
                         "jdp: base-protocol allocate designated no payout output — the token \
@@ -1994,5 +2042,59 @@ mod tests {
             r.allocation_ref(&negotiated, 1_000).is_none(),
             "an ext 0x0003 allocate has no designated output to register"
         );
+    }
+
+    /// All eight combinations, because three of the four dispositions register
+    /// nothing and the registry cannot tell them apart — only the reason
+    /// differs, and only ONE of them is a fault.
+    ///
+    /// The row this pins is `(script: None, Coinbase-only, negotiated)`.
+    /// §2 REQUIRES an ext 0x0003 allocate to carry empty
+    /// `coinbase_tx_outputs`, so it has no designated script — and reading
+    /// that absence as "the pool built a broken blob" made every Coinbase-only
+    /// 0x0003 connection log a pool bug and predict `invalid-mining-job-token`
+    /// on every job it would ever build. Those jobs are served: the §6 TLV
+    /// rides the frame in that mode and the §7.1 recompute judges them.
+    #[test]
+    fn an_allocate_is_classified_by_all_three_flags() {
+        use AllocationDisposition as D;
+        const SCRIPT: &[u8] = &[0x00, 0x14, 0xAB];
+
+        // (payout_script, full_template_mode, negotiated) → disposition
+        let cases: [(Option<&[u8]>, bool, bool, D); 8] = [
+            // Coinbase-only, base protocol: the one row that registers.
+            (
+                Some(SCRIPT),
+                false,
+                false,
+                D::Register {
+                    payout_script: SCRIPT,
+                },
+            ),
+            // Coinbase-only + ext 0x0003: NOT a fault — §2 empties the
+            // outputs and §7.1 does the judging.
+            (None, false, true, D::JudgedByTheDistribution),
+            // The same session shape with a script somehow present is still
+            // the distribution's to judge — registering would let the weak
+            // §6.4.3 check stand in for the §7.1 recompute.
+            (Some(SCRIPT), false, true, D::JudgedByTheDistribution),
+            // Full-Template: the declaration is the record, whatever else
+            // is true. Registering would let the JDC skip §6.1 validation.
+            (Some(SCRIPT), true, false, D::LeftToTheDeclaration),
+            (Some(SCRIPT), true, true, D::LeftToTheDeclaration),
+            (None, true, false, D::LeftToTheDeclaration),
+            (None, true, true, D::LeftToTheDeclaration),
+            // The only fault: a base allocate the pool designated nothing in.
+            (None, false, false, D::DesignatedNothing),
+        ];
+
+        for (script, full_template, negotiated, want) in cases {
+            assert_eq!(
+                classify_allocation(script, full_template, negotiated),
+                want,
+                "script={:?} full_template={full_template} negotiated={negotiated}",
+                script.map(|s| s.len())
+            );
+        }
     }
 }
