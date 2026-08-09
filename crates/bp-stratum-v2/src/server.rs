@@ -2406,6 +2406,20 @@ mod tests {
             .unwrap(),
         );
         bridge.write().unwrap().publish_pool_wide(entry);
+        // The allocate the JDC took this token from. §2 empties its outputs,
+        // so it carries no designated script — but it is still the pool's
+        // record that the token exists and whose it is, without which the
+        // handler refuses the job as `invalid-mining-job-token`.
+        bridge.write().unwrap().register_allocation(
+            Token([7u8; 16]),
+            crate::bridge::AllocatedTokenRef {
+                miner_address: AddressId::new(ADDR.to_string()).unwrap(),
+                kind: crate::bridge::AllocationKind::JudgedByDistribution,
+                jdp_session_id: 1,
+                expires_at_ms: u64::MAX,
+            },
+            0,
+        );
 
         let make_input = |req: u32| SetCustomMiningJobInput {
             channel_id: cid,

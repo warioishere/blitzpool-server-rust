@@ -673,7 +673,10 @@ async fn jdp_push_distribution_end_to_end() {
             .expect("a Coinbase-only allocate must reach the mining side");
         assert_eq!(allocation.miner_address.as_str(), REGTEST_ADDR);
         assert!(
-            !allocation.payout_script.is_empty(),
+            matches!(
+                &allocation.kind,
+                bp_stratum_v2::bridge::AllocationKind::DesignatedOutput(s) if !s.is_empty()
+            ),
             "the registered script is what the custom job's coinbase is held to"
         );
         // The token's own hour-long TTL travels with it, so the map cannot

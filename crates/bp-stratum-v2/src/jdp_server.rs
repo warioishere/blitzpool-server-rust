@@ -57,8 +57,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::bridge::{
-    AllocatedTokenRef, DistributionAcceptance, DistributionScope, JdpDeclaredJobRegistry,
-    PayoutDistributionEntry, RegisteredDeclaredJob,
+    AllocatedTokenRef, AllocationKind, DistributionAcceptance, DistributionScope,
+    JdpDeclaredJobRegistry, PayoutDistributionEntry, RegisteredDeclaredJob,
 };
 use crate::extensions::{
     parse_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
@@ -1385,9 +1385,14 @@ pub(crate) enum AllocationDisposition<'a> {
     LeftToTheDeclaration,
     /// ext 0x0003: §2 requires the allocate's outputs to be empty, so there is
     /// no designated script by design. The job is judged by the §7.1 recompute
-    /// against the referenced distribution, which is the stronger check —
-    /// registering an allocation would let the weak §6.4.3 test stand in for
-    /// it. Nothing to register, and nothing wrong.
+    /// against the referenced distribution, which is the stronger check.
+    ///
+    /// Registered all the same, as [`AllocationKind::JudgedByDistribution`] —
+    /// the §6.4.3 test cannot stand in for §7.1 because the entry says which
+    /// it is. It used to register nothing, on the reasoning that the coinbase
+    /// was already better checked; that reasoning is about the coinbase and
+    /// left the TOKEN unknown to the mining side, which then bound neither the
+    /// miner address nor the chain tip for such a job.
     JudgedByTheDistribution,
     /// A base-protocol allocate that designated nothing. The pool built that
     /// blob, so this is OUR bug, not the client's — and it is invisible from
@@ -1472,15 +1477,26 @@ pub(crate) fn register_bridge_entries(
                         *token,
                         AllocatedTokenRef {
                             miner_address: miner_address.clone(),
-                            payout_script: payout_script.to_vec(),
+                            kind: AllocationKind::DesignatedOutput(payout_script.to_vec()),
                             jdp_session_id,
                             expires_at_ms: *expires_at_ms,
                         },
                         now_ms(),
                     );
                 }
-                AllocationDisposition::LeftToTheDeclaration
-                | AllocationDisposition::JudgedByTheDistribution => {}
+                AllocationDisposition::JudgedByTheDistribution => {
+                    reg.register_allocation(
+                        *token,
+                        AllocatedTokenRef {
+                            miner_address: miner_address.clone(),
+                            kind: AllocationKind::JudgedByDistribution,
+                            jdp_session_id,
+                            expires_at_ms: *expires_at_ms,
+                        },
+                        now_ms(),
+                    );
+                }
+                AllocationDisposition::LeftToTheDeclaration => {}
                 AllocationDisposition::DesignatedNothing => {
                     warn!(
                         session_id = jdp_session_id,
@@ -2004,44 +2020,84 @@ mod tests {
         assert_eq!(entry.declared_prev_hash, Some([0xCC; 32]));
     }
 
-    /// The same call registers a BASE-protocol allocate, which is the only
-    /// record Coinbase-only mode leaves — it never declares. Both
-    /// directions, because "everything registers" would read the same as
-    /// "base allocations register": an ext 0x0003 allocate carries no
-    /// designated script (§2 requires empty outputs) and must register
-    /// nothing, or the map could wave through a job that owes the §7.1
-    /// recompute.
+    /// Both Coinbase-only allocates reach the mining side, each saying WHICH
+    /// kind it is — and the third shape, a base-protocol allocate that
+    /// designated nothing, still registers nothing.
+    ///
+    /// Driven through TWO sessions on purpose. The 0x0003 case is decided by
+    /// `state.negotiated_extensions`, not by the event, so running it on a
+    /// non-negotiated session classifies it as `DesignatedNothing` and the
+    /// test would pass while proving the opposite of its name — which is what
+    /// the earlier single-session version did.
     #[tokio::test(flavor = "current_thread")]
-    async fn register_bridge_entries_pushes_base_allocations_only() {
-        let state = fresh_session();
+    async fn register_bridge_entries_pushes_both_coinbase_only_kinds() {
         let bridge = fresh_bridge();
         let base = Token([0xBB; 16]);
+        let broken = Token([0xDD; 16]);
         let negotiated = Token([0xCC; 16]);
-        let events = vec![
-            JdpSessionEvent::TokenAllocated {
-                token: base,
-                miner_address: AddressId::new(ADDR.to_string()).unwrap(),
-                payout_script: Some(vec![0x00, 0x14, 0xAB]),
-                expires_at_ms: 9_000,
-            },
-            JdpSessionEvent::TokenAllocated {
+
+        let plain = fresh_session();
+        register_bridge_entries(
+            &plain,
+            &bridge,
+            42,
+            &[
+                JdpSessionEvent::TokenAllocated {
+                    token: base,
+                    miner_address: AddressId::new(ADDR.to_string()).unwrap(),
+                    payout_script: Some(vec![0x00, 0x14, 0xAB]),
+                    expires_at_ms: u64::MAX,
+                },
+                // Base protocol with no designated output: the pool built a
+                // blob it cannot hold a coinbase to. Still nothing to register.
+                JdpSessionEvent::TokenAllocated {
+                    token: broken,
+                    miner_address: AddressId::new(ADDR.to_string()).unwrap(),
+                    payout_script: None,
+                    expires_at_ms: u64::MAX,
+                },
+            ],
+        );
+
+        let mut ext_session = fresh_session();
+        ext_session
+            .negotiated_extensions
+            .insert(SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
+        register_bridge_entries(
+            &ext_session,
+            &bridge,
+            43,
+            &[JdpSessionEvent::TokenAllocated {
                 token: negotiated,
                 miner_address: AddressId::new(ADDR.to_string()).unwrap(),
+                // §2 requires the outputs empty — this is the conformant shape.
                 payout_script: None,
-                expires_at_ms: 9_000,
-            },
-        ];
-        register_bridge_entries(&state, &bridge, 42, &events);
+                expires_at_ms: u64::MAX,
+            }],
+        );
 
         let r = bridge.read().unwrap();
         let entry = r.allocation_ref(&base, 0).expect("base allocate registers");
         assert_eq!(entry.jdp_session_id, 42);
         assert_eq!(entry.miner_address.as_str(), ADDR);
-        assert_eq!(entry.payout_script, vec![0x00, 0x14, 0xAB]);
-        assert!(
-            r.allocation_ref(&negotiated, 1_000).is_none(),
-            "an ext 0x0003 allocate has no designated output to register"
+        assert_eq!(
+            entry.kind,
+            AllocationKind::DesignatedOutput(vec![0x00, 0x14, 0xAB])
         );
+        assert!(
+            r.allocation_ref(&broken, 0).is_none(),
+            "a base-protocol allocate that designated nothing has nothing to hold a coinbase to"
+        );
+        // The ext 0x0003 allocate registers too, and says WHICH kind it is —
+        // so the mining side can bind its miner address and the chain tip
+        // without the §6.4.3 output test ever standing in for §7.1. It used to
+        // register nothing, which left both bindings off that path entirely.
+        let ext = r
+            .allocation_ref(&negotiated, 1_000)
+            .expect("an ext 0x0003 allocate is still a token the pool issued");
+        assert_eq!(ext.kind, AllocationKind::JudgedByDistribution);
+        assert_eq!(ext.miner_address.as_str(), ADDR);
+        assert_eq!(ext.jdp_session_id, 43);
     }
 
     /// All eight combinations, because three of the four dispositions register
