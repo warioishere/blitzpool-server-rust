@@ -565,6 +565,20 @@ async fn main() -> ExitCode {
     // confirmation watcher and the JDP sink get. See `crate::settlement`.
     let settle_signal = crate::settlement::SettlementSignal::new(handles.redis.clone());
 
+    // ONE JDP bridge for the whole process, built here because BOTH servers
+    // that use it are spawned below and neither may build its own. It is the
+    // only channel between them: the JDP server registers declared jobs and
+    // base-protocol allocations, the SV2 mining server resolves a
+    // `SetCustomMiningJob` against them.
+    //
+    // It used to be built twice — once inside `stratum::spawn`, once for
+    // `jdp::spawn` — so the mining side read a registry nobody wrote to and
+    // answered `invalid-mining-job-token` to every custom job any JDC ever
+    // built. Nothing caught it: every test hands ONE bridge to both sides, so
+    // the defect lived entirely in this wiring. Found by pointing the
+    // reference jd-client at a live pool (2026-08-09).
+    let jdp_bridge = stratum_v2::build_bridge();
+
     // Stratum listeners + share producer are the always-on front — front-only.
     let stratum = if is_front {
         match stratum::spawn(
@@ -575,6 +589,7 @@ async fn main() -> ExitCode {
             dispatcher.clone(),
             device_status_gate.clone(),
             settle_signal.clone(),
+            jdp_bridge.clone(),
         )
         .await
         {
@@ -926,7 +941,6 @@ async fn main() -> ExitCode {
     // within [floor, ceiling], coupling the trimmer budget to bitcoin-core's
     // reservation; `None` unless `[pplns.coinbase_autoscale]` is enabled.
     let (jdp, autoscaler) = if is_front {
-        let jdp_bridge = stratum_v2::build_bridge();
         match handles.tdp.clone() {
             Some(tdp_handle) => {
                 let autoscaler = coinbase_autoscaler::maybe_spawn(

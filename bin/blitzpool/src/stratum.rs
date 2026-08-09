@@ -34,12 +34,13 @@
 //! 4. Shutdown: cancel the shared token + drive each per-port server's
 //!    own shutdown to completion.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use bp_config::AppConfig;
 use bp_notifications::dispatcher::NotificationDispatcher;
 use bp_protocol_detect::{detect, Detected};
 use bp_stratum_v1::{PortConfig as Sv1PortConfig, StratumV1Server};
+use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::server::StratumV2MiningServer;
 use socket2::{SockRef, TcpKeepalive};
 use thiserror::Error;
@@ -117,6 +118,7 @@ pub(crate) enum StratumSpawnError {
 /// Spawn the unified SV1+SV2 stratum listeners. Returns an empty
 /// handle when TDP is unavailable (`--skip-tdp`) — both protocols
 /// fail open with warns, the listener bind would be pointless.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn(
     cfg: &AppConfig,
     foundation: &FoundationHandles,
@@ -131,6 +133,13 @@ pub(crate) async fn spawn(
     // apply must invalidate the published payout distributions exactly
     // like a JDP-declared one. Filled once the JDP server exists.
     settle: crate::settlement::SettlementSignal,
+    // THE JDP bridge — the same `Arc` the JDP server registers into, passed
+    // in rather than built here. It is the only channel between the two
+    // servers: `jdp_server` writes declared jobs and base-protocol
+    // allocations, `SetCustomMiningJob` on this side reads them. Two
+    // instances resolve nothing, and the symptom is total —
+    // `invalid-mining-job-token` on every custom job a JDC ever builds.
+    bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
 ) -> Result<StratumHandles, StratumSpawnError> {
     if foundation.tdp.is_none() {
         warn!("stratum: TDP missing (--skip-tdp); skipping unified SV1+SV2 listener bind");
@@ -186,7 +195,6 @@ pub(crate) async fn spawn(
         settle.clone(),
     )?;
     let noise_config = stratum_v2::build_noise_config(cfg)?;
-    let bridge = stratum_v2::build_bridge();
     let sv2_servers = stratum_v2::build_per_port_servers(
         cfg,
         foundation,
