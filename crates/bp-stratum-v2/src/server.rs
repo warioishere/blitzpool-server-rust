@@ -2372,6 +2372,16 @@ mod tests {
         );
         let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
         let cid = s.primary_channel.expect("extended channel opened");
+        {
+            // The pool has served this channel work. In production the
+            // synthetic broadcast at channel open writes these; here the
+            // dispatch test opens the channel without a template, which
+            // is the cold-start state and refused since custom jobs must
+            // have something to pin their block-candidate threshold to.
+            let ch = s.channels.get_mut(&cid).expect("channel just opened");
+            ch.latest_extended_prev_hash = Some([0xAB; 32]);
+            ch.latest_extended_n_bits = Some(0x1d00_ffff);
+        }
 
         // Pool-wide distribution: one weight-9 miner slot behind a
         // weight-1 pool output.
@@ -2646,6 +2656,16 @@ mod tests {
             0,
         );
         let cid = s.primary_channel.expect("extended channel opened");
+        {
+            // The pool has served this channel work. In production the
+            // synthetic broadcast at channel open writes these; here the
+            // dispatch test opens the channel without a template, which
+            // is the cold-start state and refused since custom jobs must
+            // have something to pin their block-candidate threshold to.
+            let ch = s.channels.get_mut(&cid).expect("channel just opened");
+            ch.latest_extended_prev_hash = Some([0xAB; 32]);
+            ch.latest_extended_n_bits = Some(0x1d00_ffff);
+        }
         let owner = bp_common::AddressId::new(ADDR.to_string()).unwrap();
 
         let tailored = |id: u64, published_at_ms: u64| crate::bridge::PayoutDistributionEntry {

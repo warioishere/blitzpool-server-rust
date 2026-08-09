@@ -2666,29 +2666,55 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // pool at every difficulty retarget its node saw before ours did.
     //
     // Rejecting either way is deliberate: a job we cannot pin a threshold to
-    // must not register. `latest_extended_n_bits` and
-    // `latest_extended_prev_hash` are written by the same `is_new_block`
-    // branch of `apply_template_broadcast`, so both are `None` together —
-    // before the pool has served this channel any extended job, and only
-    // then.
-    if let (Some(expected), Some(tip)) = (channel_n_bits, channel_prev_hash) {
-        if input.n_bits != expected {
-            let on_our_tip = input.prev_hash == tip;
-            tracing::warn!(
-                channel_id = input.channel_id,
-                job_n_bits = input.n_bits,
-                pool_n_bits = expected,
-                on_our_tip,
-                "sv2: custom job carries an n_bits the pool is not working on — rejecting (its \
-                 block-candidate threshold would come from the client). Off our tip this is the \
-                 ordinary retarget race, not a client fault."
-            );
-            return reject(if on_our_tip {
-                ERR_INVALID_NBITS
-            } else {
-                ERR_STALE_CHAIN_TIP
-            });
-        }
+    // must not register — INCLUDING when we have no number to compare against
+    // at all. `latest_extended_n_bits` and `latest_extended_prev_hash` are
+    // written by the same `is_new_block` branch of `apply_template_broadcast`,
+    // so both are `None` together: before the pool has served this channel any
+    // extended job, and only then.
+    //
+    // That state is reachable, which is why this is a `let … else` and not an
+    // `if let`. `handle_open_extended_mining_channel` has no template
+    // precondition, and the initial synthetic broadcast in `server.rs` is
+    // guarded by `Some(template)` — so a channel opened before the pool's
+    // first template keeps both fields `None`, and a JDC (which builds jobs
+    // from its OWN Template Provider) can send `SetCustomMiningJob` right
+    // then. Skipping the check there handed the block-candidate threshold to
+    // the client for exactly the jobs created at pool cold start, i.e. when
+    // every JDC reconnects at once.
+    //
+    // The reference JDS refuses in the same situation rather than skipping —
+    // it has no path that waves a job through for want of something to compare
+    // it to (no stored declaration → `invalid-mining-job-token`, not yet
+    // validated → `declared-job-not-yet-validated`; sv2-apps v0.7.0
+    // `job_validation/bitcoin_core_ipc.rs`). We deliberately answer neither of
+    // those codes: this is our own transient not-ready state, not a bad token,
+    // and `stale-chain-tip` is the only classification an SRI jd-client
+    // retries instead of falling back off the pool.
+    let (Some(expected), Some(tip)) = (channel_n_bits, channel_prev_hash) else {
+        tracing::warn!(
+            channel_id = input.channel_id,
+            job_n_bits = input.n_bits,
+            "sv2: custom job on a channel the pool has served no extended job yet — rejecting \
+             retryably (nothing to pin its block-candidate threshold to)"
+        );
+        return reject(ERR_STALE_CHAIN_TIP);
+    };
+    if input.n_bits != expected {
+        let on_our_tip = input.prev_hash == tip;
+        tracing::warn!(
+            channel_id = input.channel_id,
+            job_n_bits = input.n_bits,
+            pool_n_bits = expected,
+            on_our_tip,
+            "sv2: custom job carries an n_bits the pool is not working on — rejecting (its \
+             block-candidate threshold would come from the client). Off our tip this is the \
+             ordinary retarget race, not a client fault."
+        );
+        return reject(if on_our_tip {
+            ERR_INVALID_NBITS
+        } else {
+            ERR_STALE_CHAIN_TIP
+        });
     }
 
     // ext 0x0003 §6 places the `distribution_id` TLV per Job Declaration mode,
@@ -2743,13 +2769,14 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         // shares credited hashrate for work that cannot land — off Solo that
         // is a slice taken from everyone else in the window.
         // `stale-chain-tip` is the retryable classification: the JDC rebuilds
-        // and resubmits. Unknowable (`None`) before the pool has served this
-        // channel any extended job, exactly as the declared path treats a
-        // missing tip.
-        if let Some(tip) = channel_prev_hash {
-            if input.prev_hash != tip {
-                return Some(ERR_STALE_CHAIN_TIP);
-            }
+        // and resubmits.
+        //
+        // `tip` is a value and not an `Option` here: the guard above already
+        // refused every job on a channel the pool has served nothing, so
+        // "unknowable tip" cannot reach this point. It used to, and then this
+        // check silently did not run.
+        if input.prev_hash != tip {
+            return Some(ERR_STALE_CHAIN_TIP);
         }
         None
     };
@@ -5171,6 +5198,20 @@ pub(crate) mod tests {
     }
 
     /// Open one Extended channel against a fresh session.
+    /// A session whose extended channel the pool HAS already served work on.
+    ///
+    /// The tip and `n_bits` are set here because that is the production
+    /// default, not a convenience: `server.rs` fires a synthetic
+    /// `TemplateChange::NewBlock` broadcast at channel open whenever a
+    /// template exists, and that broadcast is what writes both fields. A
+    /// fixture that left them unset modelled the pool's cold-start window in
+    /// EVERY test — which is how a custom job on a channel the pool had served
+    /// nothing went unnoticed: the guard that reads them simply did not run.
+    /// The values match what `custom_job_matching` and `coinbase_only_job`
+    /// build by default.
+    ///
+    /// Tests that want the cold-start state clear the two fields explicitly —
+    /// see `a_custom_job_is_refused_while_the_pool_has_served_the_channel_nothing`.
     fn session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
         let mut s = fresh_session();
         handle_setup_connection(&mut s, &good_setup());
@@ -5179,6 +5220,12 @@ pub(crate) mod tests {
             &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
             vec![0xAA, 0xBB, 0xCC, 0xDD],
         );
+        if let Some(cid) = s.primary_channel {
+            if let Some(ch) = s.channels.get_mut(&cid) {
+                ch.latest_extended_prev_hash = Some([0xAB; 32]);
+                ch.latest_extended_n_bits = Some(0x1d00_ffff);
+            }
+        }
         s
     }
 
@@ -6625,6 +6672,84 @@ pub(crate) mod tests {
                 (other, want) => panic!("n_bits {job_n_bits:#x}: wanted {want:?}, got {other:?}"),
             }
         }
+    }
+
+    /// The same rule, in the state the test above has to set up by hand: the
+    /// pool has served this channel NOTHING yet, so it has no `n_bits` and no
+    /// tip to hold the job to.
+    ///
+    /// Reachable, and not only in fixtures. `handle_open_extended_mining_channel`
+    /// has no template precondition, and the initial synthetic broadcast in
+    /// `server.rs` is guarded by `Some(template)` — so a channel opened before
+    /// the pool's first template keeps both fields `None`. A JDC does not need
+    /// the pool's template to build a job (it has its own Template Provider),
+    /// so it can send `SetCustomMiningJob` inside that window. That is the pool
+    /// cold-start window, i.e. exactly when every JDC reconnects at once.
+    ///
+    /// Both directions in one test: the same frame is accepted once the pool
+    /// HAS served the channel, so this cannot pass by refusing everything.
+    #[test]
+    fn a_custom_job_is_refused_while_the_pool_has_served_the_channel_nothing() {
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let outputs = [txout(312_500_000, designated_script(REGTEST_ADDR))];
+        const POOL_N_BITS: u32 = 0x1d00_ffff;
+        const TRIVIAL: u32 = 0x207f_ffff;
+
+        // Served nothing: both fields back to `None`, the state a channel is in
+        // before the pool's first template. The shared fixture models a SERVED
+        // channel, so this is undone deliberately — the two are written
+        // together by `apply_template_broadcast` and cleared together here. The
+        // job carries the threshold a JDC would pick to turn every share into a
+        // find.
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        {
+            let ch = s.channels.get_mut(&cid).unwrap();
+            ch.latest_extended_prev_hash = None;
+            ch.latest_extended_n_bits = None;
+        }
+        let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
+        input.n_bits = TRIVIAL;
+        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                // `stale-chain-tip` and not `invalid-nbits`: the pool is not
+                // working on anything yet, so the client is not at fault, and
+                // it is the one code an SRI jd-client retries instead of
+                // falling back off the pool.
+                assert_eq!(error_code, ERR_STALE_CHAIN_TIP);
+            }
+            other => {
+                panic!("a job the pool cannot pin a threshold to must be refused, got {other:?}")
+            }
+        }
+        assert!(
+            s.channels.get(&cid).unwrap().extended_jobs.is_empty(),
+            "the job must not register — its block-candidate threshold would be the client's"
+        );
+
+        // Served: the same channel, once the pool has broadcast to it. The
+        // conformant job goes through, so the refusal above is about the
+        // missing reference point and not about custom jobs in general.
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        {
+            let ch = s.channels.get_mut(&cid).unwrap();
+            ch.latest_extended_prev_hash = Some([0xAB; 32]);
+            ch.latest_extended_n_bits = Some(POOL_N_BITS);
+        }
+        let mut input = coinbase_only_job(cid, Token([0x77u8; 16]), &outputs);
+        input.n_bits = POOL_N_BITS;
+        input.prev_hash = [0xAB; 32];
+        let out = handle_set_custom_mining_job(&mut s, &input, None, Some(&alloc), None, 1_000);
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "a job on a channel the pool HAS served must still be accepted, got {:?}",
+            out.outbound[0]
+        );
     }
 
     /// INTEROP: the same mismatch, seen from the OTHER tip, is
