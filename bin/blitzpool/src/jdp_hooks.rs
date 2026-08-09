@@ -833,22 +833,36 @@ impl ProductionJdpBlockSink {
         }
     }
 
-    /// Act on a pushed solution the chain can vouch for: settle the
-    /// distribution it paid, and book it if there is anything to book with.
+    /// Act on a pushed solution the chain can vouch for: book it if there is
+    /// anything to book with, and settle only where nothing else will.
     ///
-    /// ## The two are separate, and that is the point
+    /// ## Why the settle follows the ledger, and does not lead it
     ///
-    /// Booking needs settlement INPUTS (`booking`). Settling needs only the
-    /// fact that a block paid a published distribution — see
-    /// [`CandidateBacking`]. The §10 settle therefore runs for an
-    /// `UnbookableDistribution` too, and it runs even when the ledger write
-    /// reports it wrote nothing.
+    /// `settle()` is not just "close the window": it invalidates every
+    /// published distribution AND forces an immediate republish
+    /// (`DistributionInvalidationHandle::settle`). That republish rebuilds
+    /// from the LIVE ledger — `build_pool_wide` → `PplnsEngine::build_
+    /// distribution` → `find_pplns_balances_with_open_balance`, straight out
+    /// of Postgres.
     ///
-    /// It used to sit inside `if booked`, so neither of those fired it. The
-    /// published weights encode pre-settlement balances; the block's coinbase
-    /// has just paid them out on-chain; leaving the distribution standing
-    /// means the next block pays them a SECOND time. That is not a lost
-    /// record, it is lost money.
+    /// So a settle fired before the ledger write republishes the very
+    /// balances the block just paid. It does not stop the second payout; it
+    /// swaps the standing distribution for an equally stale one. Whatever
+    /// closes that window, it is not this call — see
+    /// [`CandidateBacking::settles_here`].
+    ///
+    /// Booking a JDP block is itself confirmation-gated (`book` →
+    /// `emit_block_found` → `apply_block_found` → `gate_or_apply`, which
+    /// parks), and the watcher settles after the apply
+    /// (`block_confirmation`). A `Bookable` candidate therefore already has
+    /// its settle, in the one place where it reads a ledger that has moved.
+    ///
+    /// [`CandidateBacking::UnbookableDistribution`] is the exception this
+    /// method still owns: no ledger write is ever coming for it, so no later
+    /// settle is either. Leaving it published would keep binding fresh
+    /// declarations to a distribution whose settlement snapshot is provably
+    /// unresolvable — fail-closed is the only defensible answer, and it does
+    /// not depend on balances.
     ///
     /// Both halves stay behind [`Self::block_is_proven`]. A `PushSolution` is
     /// the client's claim until the header is checked against what the chain
@@ -903,11 +917,12 @@ impl ProductionJdpBlockSink {
             );
             return;
         }
-        // §10 first, and unconditionally: the block is proven, so whatever it
-        // paid is spent. A booking failure below must not leave the weights
-        // standing, and a distribution with no settlement inputs still has to
-        // stop being mined.
-        if backing.paid_a_published_distribution() {
+        // §10 for the one backing whose settle nobody else will fire. A
+        // `Bookable` candidate is deliberately NOT settled here: its booking
+        // is confirmation-gated and the watcher settles after the apply,
+        // which is the only moment the forced republish reads a ledger that
+        // has actually moved. See this method's doc.
+        if backing.settles_here() {
             self.settle.settle().await;
         }
         let Some((booking, booker)) = to_book else {
@@ -2407,11 +2422,46 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// The other half of the same split: a booking that WROTE NOTHING must
-    /// still settle. The ledger retry stays open (that is deliberate), but
-    /// the weights are spent either way.
+    /// MONEY: a BOOKABLE block must NOT settle here — the settle belongs
+    /// after the ledger write, and firing it earlier is not a safety margin.
+    ///
+    /// `settle()` invalidates every published distribution AND forces an
+    /// immediate republish, and that republish rebuilds from the live ledger
+    /// (`build_pool_wide` → `find_pplns_balances_with_open_balance`). Before
+    /// the booking has landed, the ledger still holds the balances this
+    /// block's coinbase just paid — so the "fresh" distribution promises them
+    /// again. The standing one is swapped for an equally stale one and
+    /// nothing is closed.
+    ///
+    /// What does close it is the booking, which is confirmation-gated, and
+    /// the watcher settles after the apply.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_booking_that_wrote_nothing_still_settles() {
+    async fn a_bookable_block_leaves_the_settle_to_its_booking() {
+        let booker = Arc::new(RecordingBooker::default());
+        let (sink, bridge, server) =
+            sink_and_published_distribution(Some(booker.clone()), Some(met_by_the_fixture()));
+
+        push(&sink, CandidateBacking::Bookable(a_booking()), 1).await;
+
+        assert_eq!(
+            booker.booked.lock().unwrap().len(),
+            1,
+            "precondition: the booking WAS attempted — otherwise this proves nothing"
+        );
+        assert!(
+            bridge.read().unwrap().current_pool_wide().is_some(),
+            "the distribution must still stand: settling now would republish the same \
+             balances, and the ledger write that makes a republish meaningful has not run"
+        );
+        server.shutdown().await;
+    }
+
+    /// The same for a booking that reported writing NOTHING. It is the
+    /// sharper case: there is not even a parked apply coming, so a settle
+    /// here would republish stale balances with nothing behind it at all. The
+    /// ledger retry stays open, which is what actually recovers this.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_booking_that_wrote_nothing_settles_nothing() {
         let booker = Arc::new(RecordingBooker::that_writes_nothing());
         let (sink, bridge, server) =
             sink_and_published_distribution(Some(booker.clone()), Some(met_by_the_fixture()));
@@ -2424,8 +2474,8 @@ mod tests {
             "precondition: the booking was attempted and reported writing nothing"
         );
         assert!(
-            bridge.read().unwrap().current_pool_wide().is_none(),
-            "a failed ledger write does not un-spend the published weights"
+            bridge.read().unwrap().current_pool_wide().is_some(),
+            "a ledger write that did not happen cannot make a republish meaningful"
         );
         server.shutdown().await;
     }

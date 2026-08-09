@@ -301,20 +301,19 @@ pub struct PayoutBooking {
 /// answer two DIFFERENT questions about them and they do not have the same
 /// answer:
 ///
-/// | backing | book it? | §10 settle? |
+/// | backing | book it? | §10 settle, and where |
 /// |---|---|---|
-/// | [`Self::BaseProtocol`] | no — nothing published | **no** — nothing published to invalidate |
-/// | [`Self::UnbookableDistribution`] | no — its snapshot never landed | **YES** |
-/// | [`Self::Bookable`] | yes | **YES** |
+/// | [`Self::BaseProtocol`] | no — nothing published | never — nothing published to invalidate |
+/// | [`Self::UnbookableDistribution`] | no — its snapshot never landed | **at block-found**, see [`Self::settles_here`] |
+/// | [`Self::Bookable`] | yes | after the booking, with every other block |
 ///
 /// The middle row is why this is a type and not an `Option<PayoutBooking>`.
 /// Deriving both answers from `booking.is_some()` collapsed it into the top
-/// row: a block whose coinbase paid a published distribution on-chain left
-/// that distribution standing, so the weights kept promising balances the
-/// block had already paid — a second payout. `DeclaredJob` has carried
-/// `booking` and `distribution_id` as separate fields since #17 precisely so
-/// the two can be told apart; this is that distinction given a name, at the
-/// place that acts on it.
+/// row, so a block whose coinbase paid a published distribution on-chain left
+/// that distribution standing for good. `DeclaredJob` has carried `booking`
+/// and `distribution_id` as separate fields since #17 precisely so the two
+/// can be told apart; this is that distinction given a name, at the place
+/// that acts on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateBacking {
     /// Base-protocol declaration — no distribution was referenced.
@@ -330,14 +329,44 @@ pub enum CandidateBacking {
 impl CandidateBacking {
     /// Did this block's coinbase pay a distribution the pool PUBLISHED?
     ///
-    /// The §10 question, and deliberately not the same as "can it be
-    /// booked": settling means "these published weights are spent", which is
-    /// true the moment the block lands, whether or not the ledger write
-    /// succeeds or is even possible.
+    /// Not the same question as "can it be booked", and not the same as
+    /// [`Self::settles_here`] either: this one decides whether the block is
+    /// worth assembling and proving at all.
     pub fn paid_a_published_distribution(&self) -> bool {
         match self {
             Self::BaseProtocol => false,
             Self::UnbookableDistribution { .. } | Self::Bookable(_) => true,
+        }
+    }
+
+    /// Must the §10 settle fire at block-found, or does something later own
+    /// it?
+    ///
+    /// Only [`Self::UnbookableDistribution`], and the asymmetry is not a
+    /// preference. Settling invalidates every published distribution AND
+    /// forces an immediate republish, and that republish rebuilds from the
+    /// LIVE ledger. Fired before the ledger write it re-publishes the very
+    /// balances the block just paid — the standing distribution is swapped
+    /// for an equally stale one, and nothing is closed.
+    ///
+    /// - [`Self::Bookable`]: its booking is confirmation-gated, and the
+    ///   confirmation watcher settles after the apply. That is the one moment
+    ///   the republish reads a ledger that has moved, so settling here as
+    ///   well would be churn at best.
+    /// - [`Self::UnbookableDistribution`]: no ledger write is ever coming, so
+    ///   no later settle is either. What this buys is not balance freshness —
+    ///   it cannot be — but fail-closed: fresh declarations stop binding to a
+    ///   distribution whose settlement snapshot is provably unresolvable.
+    /// - [`Self::BaseProtocol`]: nothing was published.
+    ///
+    /// The window between a found block and its confirmation therefore stays
+    /// open, deliberately: closing it means the distribution builder has to
+    /// account for parked blocks, and two blocks inside one confirmation
+    /// window needs a pool share orders of magnitude past this one.
+    pub fn settles_here(&self) -> bool {
+        match self {
+            Self::BaseProtocol | Self::Bookable(_) => false,
+            Self::UnbookableDistribution { .. } => true,
         }
     }
 }
