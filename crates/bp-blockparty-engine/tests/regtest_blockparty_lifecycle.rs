@@ -47,8 +47,8 @@ async fn blockparty_two_member_block_accepted_by_core_and_history_idempotent() {
     let regtest_cfg = RegtestConfig::default();
     if !regtest_cfg.is_available() {
         eprintln!(
-            "skipping blockparty lifecycle regtest — bitcoin-node not found at {}",
-            regtest_cfg.bitcoin_node_path.display()
+            "skipping blockparty lifecycle regtest — {}",
+            regtest_cfg.unavailable_reason()
         );
         return;
     }

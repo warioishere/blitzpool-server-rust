@@ -46,11 +46,7 @@ const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 async fn sv1_server_end_to_end_against_regtest() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
-        eprintln!(
-            "skipping SV1 e2e — bitcoin-node not found at {} (set BITCOIN_NODE_PATH \
-             to override)",
-            cfg.bitcoin_node_path.display()
-        );
+        eprintln!("skipping SV1 e2e — {}", cfg.unavailable_reason());
         return;
     }
 

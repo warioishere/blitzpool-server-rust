@@ -107,9 +107,8 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
     let regtest_cfg = RegtestConfig::default();
     if !regtest_cfg.is_available() {
         eprintln!(
-            "skipping pool-neutral payout regtest — bitcoin-node not found at {} \
-             (set BITCOIN_NODE_PATH to override)",
-            regtest_cfg.bitcoin_node_path.display()
+            "skipping pool-neutral payout regtest — {}",
+            regtest_cfg.unavailable_reason()
         );
         return;
     }

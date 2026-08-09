@@ -214,8 +214,8 @@ async fn notify_fanout_latency_under_load() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping notify-fanout load test — bitcoin-node not found at {}",
-            cfg.bitcoin_node_path.display()
+            "skipping notify-fanout load test — {}",
+            cfg.unavailable_reason()
         );
         return;
     }

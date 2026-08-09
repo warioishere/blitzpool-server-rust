@@ -77,8 +77,8 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
     let regtest_cfg = RegtestConfig::default();
     if !regtest_cfg.is_available() {
         eprintln!(
-            "skipping split e2e regtest — bitcoin-node not found at {} (set BITCOIN_NODE_PATH)",
-            regtest_cfg.bitcoin_node_path.display()
+            "skipping split e2e regtest — {}",
+            regtest_cfg.unavailable_reason()
         );
         return;
     }

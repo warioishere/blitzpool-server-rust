@@ -5,8 +5,10 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 pub enum RegtestError {
     #[error(
-        "bitcoin-node binary not found at {0} (set BITCOIN_NODE_PATH or install bitcoin-core v31 \
-         and ensure libexec/bitcoin-node is reachable)"
+        "bitcoin-node binary not found (searched $PATH and the usual tarball prefixes; last \
+         tried {0}). Set BITCOIN_NODE_PATH, or install a bitcoin-core MULTIPROCESS build: the \
+         harness needs the IPC-enabled `bitcoin-node`, not the legacy `bitcoind` that \
+         Homebrew's `bitcoin` formula ships"
     )]
     BinaryNotFound(PathBuf),
 

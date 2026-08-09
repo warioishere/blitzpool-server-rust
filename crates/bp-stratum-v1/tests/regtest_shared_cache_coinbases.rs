@@ -149,8 +149,8 @@ async fn sv1_shared_cache_keeps_per_finder_coinbases_distinct() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping shared-cache regtest — bitcoin-node not found at {}",
-            cfg.bitcoin_node_path.display()
+            "skipping shared-cache regtest — {}",
+            cfg.unavailable_reason()
         );
         return;
     }

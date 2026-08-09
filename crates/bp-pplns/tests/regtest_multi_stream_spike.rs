@@ -51,10 +51,7 @@ impl PairAcc {
 async fn two_concurrent_tdp_connections_both_get_templates() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
-        eprintln!(
-            "skipping multi-stream spike — bitcoin-node not found at {}",
-            cfg.bitcoin_node_path.display()
-        );
+        eprintln!("skipping multi-stream spike — {}", cfg.unavailable_reason());
         return;
     }
 

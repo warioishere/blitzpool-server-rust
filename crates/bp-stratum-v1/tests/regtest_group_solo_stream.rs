@@ -157,8 +157,8 @@ async fn start_node_or_skip(label: &str) -> Option<RegtestNode> {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping SV1 {label} regtest — bitcoin-node not found at {}",
-            cfg.bitcoin_node_path.display()
+            "skipping SV1 {label} regtest — {}",
+            cfg.unavailable_reason()
         );
         return None;
     }

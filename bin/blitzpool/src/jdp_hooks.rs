@@ -1388,9 +1388,8 @@ mod jdp_validation_regtest {
         let cfg = bp_regtest_harness::RegtestConfig::default();
         if !cfg.is_available() {
             eprintln!(
-                "skipping JDP-validation regtest — bitcoin-node not found at {} \
-                 (set BITCOIN_NODE_PATH to override)",
-                cfg.bitcoin_node_path.display()
+                "skipping JDP-validation regtest — {}",
+                cfg.unavailable_reason()
             );
             return;
         }

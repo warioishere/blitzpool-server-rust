@@ -18,11 +18,7 @@ use tokio::sync::broadcast::error::RecvError;
 async fn tdp_emits_new_template_after_block() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
-        eprintln!(
-            "skipping TDP e2e — bitcoin-node not found at {} (set BITCOIN_NODE_PATH \
-             to override)",
-            cfg.bitcoin_node_path.display()
-        );
+        eprintln!("skipping TDP e2e — {}", cfg.unavailable_reason());
         return;
     }
 
@@ -125,11 +121,7 @@ async fn tdp_emits_new_template_after_block() {
 async fn tdp_reconnects_after_bitcoind_restart() {
     let base = RegtestConfig::default();
     if !base.is_available() {
-        eprintln!(
-            "skipping TDP reconnect e2e — bitcoin-node not found at {} (set BITCOIN_NODE_PATH \
-             to override)",
-            base.bitcoin_node_path.display()
-        );
+        eprintln!("skipping TDP reconnect e2e — {}", base.unavailable_reason());
         return;
     }
 

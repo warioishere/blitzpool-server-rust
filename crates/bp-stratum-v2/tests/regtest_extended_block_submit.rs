@@ -93,9 +93,8 @@ async fn run_block_submit_case(miner_extranonce_size: u8) {
         // `print_stdout` / `print_stderr` lints (enforced by CI's
         // `-D warnings`).
         tracing::warn!(
-            path = %cfg.bitcoin_node_path.display(),
-            "skipping SV2 Extended block-submit regtest — bitcoin-node not found \
-             (set BITCOIN_NODE_PATH to override)"
+            reason = %cfg.unavailable_reason(),
+            "skipping SV2 Extended block-submit regtest"
         );
         return;
     }

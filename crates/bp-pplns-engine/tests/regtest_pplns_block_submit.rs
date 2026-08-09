@@ -76,9 +76,8 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
     let regtest_cfg = RegtestConfig::default();
     if !regtest_cfg.is_available() {
         eprintln!(
-            "skipping PPLNS e2e regtest — bitcoin-node not found at {} \
-             (set BITCOIN_NODE_PATH to override)",
-            regtest_cfg.bitcoin_node_path.display()
+            "skipping PPLNS e2e regtest — {}",
+            regtest_cfg.unavailable_reason()
         );
         return;
     }
@@ -256,8 +255,8 @@ async fn pplns_block_with_real_txs_nonempty_merkle_path_accepted_by_core() {
     let regtest_cfg = RegtestConfig::default();
     if !regtest_cfg.is_available() {
         eprintln!(
-            "skipping PPLNS non-empty-merkle regtest — bitcoin-node not found at {}",
-            regtest_cfg.bitcoin_node_path.display()
+            "skipping PPLNS non-empty-merkle regtest — {}",
+            regtest_cfg.unavailable_reason()
         );
         return;
     }

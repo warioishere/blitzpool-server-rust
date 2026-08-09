@@ -53,11 +53,7 @@ const SRI_TEST_PRV: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
 async fn sv2_extended_channel_end_to_end_against_regtest() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
-        eprintln!(
-            "skipping SV2 extended e2e — bitcoin-node not found at {} \
-             (set BITCOIN_NODE_PATH to override)",
-            cfg.bitcoin_node_path.display()
-        );
+        eprintln!("skipping SV2 extended e2e — {}", cfg.unavailable_reason());
         return;
     }
 

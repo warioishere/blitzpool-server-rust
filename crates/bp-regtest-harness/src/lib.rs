@@ -11,9 +11,25 @@
 //!
 //! # Prerequisites
 //!
-//! - Bitcoin Core v31.0 installed locally. The harness defaults to
-//!   `/home/warioishere/bitcoin-31.0/libexec/bitcoin-node`; override with
-//!   the `BITCOIN_NODE_PATH` environment variable.
+//! - Bitcoin Core **v31 or newer** with the multiprocess `bitcoin-node`
+//!   binary installed locally. The harness finds it by searching `$PATH`
+//!   and the usual tarball prefixes (see [`discover_bitcoin_node`]) — no
+//!   path is hard-coded, so Linux and macOS both work out of the box. Set
+//!   `BITCOIN_NODE_PATH` to name one explicitly; when set it is used
+//!   verbatim and nothing else is searched, which is the knob to reach for
+//!   when the node is a local build outside those prefixes.
+//!
+//!   The version floor is [`MIN_BITCOIN_NODE_MAJOR`] and it is enforced,
+//!   not advisory: v31 moved `Init.makeMining` from `@2` to `@3`, and our
+//!   capnp bindings call `@3`. So a v30 node spawns, serves RPC, creates
+//!   `node.sock` — and then answers TDP startup with a capnp
+//!   `Unimplemented`. Discovery reads `-version` and skips such a node with
+//!   a message saying so.
+//!
+//!   Note `bitcoin-node` is NOT what Homebrew's `bitcoin` formula
+//!   installs — that ships legacy `bitcoind`, which has no IPC. On macOS
+//!   this binary comes from an upstream multiprocess tarball or a local
+//!   build.
 //! - System packages `capnproto` + `libcapnp-dev` are required at *build*
 //!   time by `bitcoin_core_sv2` consumers (TDP / JDP crates) but the
 //!   harness itself does not depend on them.
@@ -50,7 +66,8 @@ mod node;
 mod rpc;
 
 pub use config::{
-    RegtestConfig, BITCOIN_NODE_PATH_ENV, DEFAULT_BITCOIN_NODE_PATH, DEFAULT_STARTUP_TIMEOUT_SECS,
+    discover_bitcoin_node, RegtestConfig, BITCOIN_NODE_PATH_ENV, DEFAULT_STARTUP_TIMEOUT_SECS,
+    MIN_BITCOIN_NODE_MAJOR,
 };
 pub use error::RegtestError;
 pub use node::RegtestNode;

@@ -132,7 +132,7 @@ impl RegtestNode {
         }
     }
 
-    async fn wait_for_ready(&self, timeout: Duration) -> Result<(), RegtestError> {
+    async fn wait_for_ready(&mut self, timeout: Duration) -> Result<(), RegtestError> {
         let deadline = Instant::now() + timeout;
         let cookie_path = self.cookie_path();
 
@@ -181,24 +181,34 @@ impl RegtestNode {
         Ok(())
     }
 
-    fn check_alive(&self) -> Result<(), RegtestError> {
-        // SAFETY-NOTE: `try_wait` does not block; we only need to peek for
-        // process death. `child` is always `Some` between construction and
-        // shutdown.
-        if let Some(child) = self.child.as_ref() {
-            // try_wait requires &mut, but we only have &self here. We use a
-            // workaround: send SIGCHLD is not available without raw libc, so
-            // we accept that this check is best-effort by checking the pid
-            // through /proc.
-            let pid = child.id();
-            let alive = std::fs::metadata(format!("/proc/{pid}")).is_ok();
-            if !alive {
-                return Err(RegtestError::ExitedDuringStartup(format!(
-                    "bitcoin-node pid {pid} no longer running"
-                )));
+    /// Peek for process death without blocking. `child` is always `Some`
+    /// between construction and shutdown.
+    ///
+    /// This used to `stat /proc/<pid>` because `try_wait` needs `&mut self`
+    /// and the caller only had `&self`. **`/proc` does not exist on macOS**,
+    /// so the probe failed for every healthy node and `wait_for_ready`
+    /// aborted a node that was still starting normally — the whole regtest
+    /// suite errored out instead of running. Taking `&mut self` up through
+    /// `wait_for_ready` (its one caller owns the node outright) costs
+    /// nothing and buys the portable answer plus the real exit status.
+    fn check_alive(&mut self) -> Result<(), RegtestError> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        let pid = child.id();
+        match child.try_wait() {
+            // Still running.
+            Ok(None) => Ok(()),
+            Ok(Some(status)) => Err(RegtestError::ExitedDuringStartup(format!(
+                "bitcoin-node pid {pid} exited with {status}"
+            ))),
+            // Only reachable if the child was already reaped elsewhere; not
+            // evidence of a startup failure, so don't report one.
+            Err(e) => {
+                debug!(error = %e, pid, "regtest: try_wait failed, assuming alive");
+                Ok(())
             }
         }
-        Ok(())
     }
 
     /// IPC socket path that bitcoin-node creates when `-ipcbind=unix` is

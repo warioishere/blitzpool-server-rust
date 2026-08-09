@@ -40,9 +40,8 @@ async fn get_block_header_reports_confirmations_orphan_and_not_found() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping get_block_header regtest — bitcoin-node not found at {} (set \
-             BITCOIN_NODE_PATH to override)",
-            cfg.bitcoin_node_path.display()
+            "skipping get_block_header regtest — {}",
+            cfg.unavailable_reason()
         );
         return;
     }

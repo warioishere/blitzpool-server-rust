@@ -50,8 +50,8 @@ async fn pending_party_admin_routes_block_to_pool_fee_accepted_by_core() {
     let regtest_cfg = RegtestConfig::default();
     if !regtest_cfg.is_available() {
         eprintln!(
-            "skipping pending-guard regtest — bitcoin-node not found at {}",
-            regtest_cfg.bitcoin_node_path.display()
+            "skipping pending-guard regtest — {}",
+            regtest_cfg.unavailable_reason()
         );
         return;
     }

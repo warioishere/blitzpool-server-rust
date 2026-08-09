@@ -42,11 +42,7 @@ const MINER_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 async fn coinbase_from_core31_template_is_bip54_compliant_and_accepted() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
-        eprintln!(
-            "skipping BIP-54 regtest — bitcoin-node not found at {} (set BITCOIN_NODE_PATH \
-             to override)",
-            cfg.bitcoin_node_path.display()
-        );
+        eprintln!("skipping BIP-54 regtest — {}", cfg.unavailable_reason());
         return;
     }
 

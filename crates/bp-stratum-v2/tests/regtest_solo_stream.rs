@@ -113,8 +113,8 @@ async fn sv2_solo_connection_routes_to_solo_stream_and_block_accepted() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping SV2 solo-stream regtest — bitcoin-node not found at {}",
-            cfg.bitcoin_node_path.display()
+            "skipping SV2 solo-stream regtest — {}",
+            cfg.unavailable_reason()
         );
         return;
     }

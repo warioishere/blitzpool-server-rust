@@ -95,8 +95,8 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping autoscale coupling regtest — bitcoin-node not found at {}",
-            cfg.bitcoin_node_path.display()
+            "skipping autoscale coupling regtest — {}",
+            cfg.unavailable_reason()
         );
         return;
     }

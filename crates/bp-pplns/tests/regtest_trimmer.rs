@@ -112,8 +112,8 @@ async fn pplns_blockspace_cut_pure_p2wpkh_fits_about_396_in_budget_50000() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping PPLNS blockspace-cut regtest (pure P2WPKH) — bitcoin-node not found at {}",
-            cfg.bitcoin_node_path.display()
+            "skipping PPLNS blockspace-cut regtest (pure P2WPKH) — {}",
+            cfg.unavailable_reason()
         );
         return;
     }
@@ -150,8 +150,8 @@ async fn pplns_blockspace_cut_pure_p2tr_caps_at_about_285_in_budget_50000() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping PPLNS blockspace-cut regtest (pure P2TR) — bitcoin-node not found at {}",
-            cfg.bitcoin_node_path.display()
+            "skipping PPLNS blockspace-cut regtest (pure P2TR) — {}",
+            cfg.unavailable_reason()
         );
         return;
     }
@@ -181,8 +181,8 @@ async fn pplns_blockspace_cut_mixed_5050_lands_between_extremes() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping PPLNS blockspace-cut regtest (mixed P2WPKH/P2TR) — bitcoin-node not found at {}",
-            cfg.bitcoin_node_path.display()
+            "skipping PPLNS blockspace-cut regtest (mixed P2WPKH/P2TR) — {}",
+            cfg.unavailable_reason()
         );
         return;
     }

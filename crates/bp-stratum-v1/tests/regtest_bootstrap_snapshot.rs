@@ -43,9 +43,8 @@ async fn sv1_translator_bootstraps_current_template_from_late_snapshot() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping SV1 bootstrap-snapshot regtest — bitcoin-node not found at {} \
-             (set BITCOIN_NODE_PATH to override)",
-            cfg.bitcoin_node_path.display()
+            "skipping SV1 bootstrap-snapshot regtest — {}",
+            cfg.unavailable_reason()
         );
         return;
     }

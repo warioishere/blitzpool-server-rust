@@ -5,18 +5,14 @@
 
 use std::time::Duration;
 
-use bp_regtest_harness::{RegtestConfig, RegtestNode};
+use bp_regtest_harness::{RegtestConfig, RegtestNode, MIN_BITCOIN_NODE_MAJOR};
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::print_stderr)] // skip-message is the whole point of the print
 async fn spawn_mine_shutdown() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
-        eprintln!(
-            "skipping regtest smoke test — bitcoin-node not found at {} (set \
-             BITCOIN_NODE_PATH to override)",
-            cfg.bitcoin_node_path.display()
-        );
+        eprintln!("skipping regtest smoke test — {}", cfg.unavailable_reason());
         return;
     }
 
@@ -39,9 +35,14 @@ async fn spawn_mine_shutdown() {
         .get_network_info()
         .await
         .expect("getnetworkinfo should succeed");
+    // The node we were handed must be the one `is_available` vouched for.
+    // That gate reads the `-version` banner; this reads `getnetworkinfo` off
+    // the running process, so agreement between them is what rules out
+    // "discovery found a v31 and then something else got spawned".
+    let min_version = u64::from(MIN_BITCOIN_NODE_MAJOR) * 10_000;
     assert!(
-        info.version >= 310_000,
-        "expected v31+, got {}",
+        info.version >= min_version,
+        "harness reported this node available but it is {}, below v{MIN_BITCOIN_NODE_MAJOR}",
         info.version
     );
 

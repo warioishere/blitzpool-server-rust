@@ -57,9 +57,8 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
     let regtest_cfg = RegtestConfig::default();
     if !regtest_cfg.is_available() {
         eprintln!(
-            "skipping group-solo e2e regtest — bitcoin-node not found at {} \
-             (set BITCOIN_NODE_PATH to override)",
-            regtest_cfg.bitcoin_node_path.display()
+            "skipping group-solo e2e regtest — {}",
+            regtest_cfg.unavailable_reason()
         );
         return;
     }

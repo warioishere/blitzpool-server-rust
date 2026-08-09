@@ -357,9 +357,8 @@ mod tests {
 
     #[test]
     fn cookie_auth_reads_well_formed_file() {
-        let mut file = tempfile_in_default();
+        let (mut file, path) = tempfile_in_default();
         file.write_all(b"__cookie__:abcdef1234567890\n").unwrap();
-        let path = file_path(&file);
         let cfg = BitcoinRpcConfig {
             url: "http://127.0.0.1:18443".to_string(),
             auth: RpcAuth::Cookie(path),
@@ -373,9 +372,8 @@ mod tests {
 
     #[test]
     fn cookie_auth_rejects_malformed_file() {
-        let mut file = tempfile_in_default();
+        let (mut file, path) = tempfile_in_default();
         file.write_all(b"no-colon-anywhere").unwrap();
-        let path = file_path(&file);
         let cfg = BitcoinRpcConfig {
             url: "http://127.0.0.1:18443".to_string(),
             auth: RpcAuth::Cookie(path),
@@ -399,16 +397,16 @@ mod tests {
     }
 
     // Tiny helpers — keep tests independent of `tempfile` crate.
-    fn tempfile_in_default() -> std::fs::File {
+    //
+    // The path is returned alongside the handle rather than recovered from
+    // the fd. It used to come back via `read_link("/proc/self/fd/<fd>")`,
+    // which does not exist on macOS — so both callers failed there, on a
+    // helper, with nothing wrong in the code under test. The path was known
+    // at create time all along; carrying it is shorter as well as portable.
+    fn tempfile_in_default() -> (std::fs::File, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("bp-bitcoin-test-cookie-{}", rand_suffix()));
-        std::fs::File::create(path).unwrap()
-    }
-    fn file_path(file: &std::fs::File) -> std::path::PathBuf {
-        // Recover the path by re-opening via the fd's procfs entry on
-        // Linux; non-portable but fine for our test env.
-        use std::os::fd::AsRawFd;
-        let fd = file.as_raw_fd();
-        std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap()
+        let file = std::fs::File::create(&path).unwrap();
+        (file, path)
     }
     fn rand_suffix() -> String {
         std::time::SystemTime::now()

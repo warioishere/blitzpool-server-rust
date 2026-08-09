@@ -58,11 +58,7 @@ const MINER_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 async fn single_output_coinbase_no_fee_accepted_by_core() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
-        eprintln!(
-            "skipping v1-solo regtest — bitcoin-node not found at {} (set BITCOIN_NODE_PATH \
-             to override)",
-            cfg.bitcoin_node_path.display()
-        );
+        eprintln!("skipping v1-solo regtest — {}", cfg.unavailable_reason());
         return;
     }
 
@@ -78,11 +74,7 @@ async fn single_output_coinbase_no_fee_accepted_by_core() {
 async fn fee_split_two_output_coinbase_accepted_by_core() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
-        eprintln!(
-            "skipping v1-solo regtest — bitcoin-node not found at {} (set BITCOIN_NODE_PATH \
-             to override)",
-            cfg.bitcoin_node_path.display()
-        );
+        eprintln!("skipping v1-solo regtest — {}", cfg.unavailable_reason());
         return;
     }
 
@@ -262,9 +254,8 @@ async fn coinbase_with_all_5_address_types_accepted_by_core() {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping 5-address-type regtest — bitcoin-node not found at {} (set BITCOIN_NODE_PATH \
-             to override)",
-            cfg.bitcoin_node_path.display()
+            "skipping 5-address-type regtest — {}",
+            cfg.unavailable_reason()
         );
         return;
     }
