@@ -103,16 +103,18 @@ pub struct ExtendedJob {
     /// JDP `PushSolution` path, so the mining side must NOT record it too
     /// (the `blocks_entity` insert has no `ON CONFLICT`).
     ///
-    /// This is deliberately not "is there a distribution?". `PushSolution`
-    /// claims a solution by matching it against a **declared job**, and it
-    /// drops anything arriving on a connection that is not in Full-Template
-    /// mode. So a distribution alone does not mean the JDP side will see the
-    /// block:
+    /// Two conditions, and both are about the DECLARATION — never about the
+    /// job in hand. `PushSolution` claims a solution by matching it against a
+    /// **declared job** and drops anything arriving on a connection that is
+    /// not in Full-Template mode; and what it then writes is decided by that
+    /// declaration's own `distribution_id`
+    /// ([`crate::jdp::dynamic_outputs::CandidateBacking`]: `Bookable` and
+    /// `UnbookableDistribution` both record, `BaseProtocol` records nothing).
     ///
     /// | job came from | JDP claims it | who records |
     /// |---|---|---|
-    /// | declared + ext 0x0003 | yes, books it against the distribution | JDP |
-    /// | declared, base protocol | no — nothing to book | mining side |
+    /// | declared, declaration referenced a distribution | yes | JDP |
+    /// | declared, base protocol | no — `BaseProtocol`, nothing to record | mining side |
     /// | Coinbase-only + ext 0x0003 | **no** — §6.3.1, that mode never declares | mining side |
     /// | Coinbase-only, base protocol | no — never declares | mining side |
     ///
@@ -121,6 +123,16 @@ pub struct ExtendedJob {
     /// then recorded nowhere — no `blocks_entity` row, no notification, and
     /// (worse) no §10 settle, so the published weights kept encoding
     /// balances the block had already paid out.
+    ///
+    /// Reading it as "did the §7.1 gate resolve a distribution for this
+    /// job?" — i.e. `distribution_ref` in
+    /// `crate::mining::client::handle_set_custom_mining_job` — broke row ONE
+    /// on a Solo stream, in the other direction: `resolve_distribution_reference`
+    /// deliberately declines to inherit a declaration's reference there,
+    /// while the JDP side stamps one on every accepted 0x0003 declaration,
+    /// Solo included. Both sides then recorded the block: two `blocks_entity`
+    /// rows and two notifications. The two questions look identical and are
+    /// not; this field answers only the JDP one.
     ///
     /// Always `false` for pool-built jobs, which carry a `template_id` and
     /// take the ordinary submit path instead.

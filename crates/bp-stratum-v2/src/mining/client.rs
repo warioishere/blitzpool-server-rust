@@ -2977,18 +2977,33 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // propagates the block itself.
             coinbase_tx_value_remaining: 0,
             template_id: None, // custom job — no pool-side template reference
-            // Decides who records a block found on this job. `PushSolution`
-            // matches a solution against a DECLARED job and drops anything
-            // off a non-Full-Template connection, so a distribution alone is
-            // not enough — the token must also resolve to a declaration.
-            //
-            // `bridge_job.is_some()` is exactly that test: Coinbase-only
+            // Decides who records a block found on this job, and it asks the
+            // DECLARATION's own distribution reference — the one field
+            // `handle_push_solution` builds its `CandidateBacking` from.
+            // `Bookable` and `UnbookableDistribution` both write the
+            // `blocks_entity` row over there; `BaseProtocol` writes nothing.
+            // `bridge_job` being present is the other half: Coinbase-only
             // mode is refused at `DeclareMiningJob` (§6.3.1), so its token
-            // only ever reaches the allocation map, never the declared-job
-            // one. Reading the distribution alone left a Coinbase-only
-            // 0x0003 block with nobody to record it.
+            // only ever reaches the allocation map and `PushSolution` can
+            // never claim its block.
+            //
+            // NOT `distribution_ref`. That one is the reference this job is
+            // VALIDATED against, and the two part ways on a Solo stream:
+            // `resolve_distribution_reference` refuses to inherit a
+            // declaration's reference there (inheriting it would subject a
+            // Solo job to the §7.2/§10 window for the first time), while the
+            // JDP side stamps `distribution_id` on every accepted 0x0003
+            // declaration, Solo included. Asking the wrong one said "the
+            // mining side records it" for a block the JDP path books anyway
+            // — two rows for one block on an insert with no `ON CONFLICT`,
+            // and two block-found notifications.
+            //
+            // It closes the mirror case too: a JDC that negotiated 0x0003 on
+            // the MINING connection alone declares without a reference, so
+            // `PushSolution` records nothing — but its frame TLV used to make
+            // `distribution_ref` `Some`, and the block was recorded by nobody.
             // See `ExtendedJob::jdp_claims_the_block`.
-            jdp_claims_the_block: bridge_job.is_some() && distribution_ref.is_some(),
+            jdp_claims_the_block: bridge_job.is_some_and(|job| job.distribution_id.is_some()),
             created_at: now_ms,
             retired_at: None,
         },
@@ -6753,20 +6768,93 @@ pub(crate) mod tests {
         );
     }
 
-    /// Row 1, the negative control for the test above: **declared + ext
-    /// 0x0003**. Same distribution, same coinbase — the one difference is a
-    /// declaration behind the token, and that flips who records it. Without
-    /// this pair, "the mining side records custom-job blocks" would read the
-    /// same as "the mining side records them twice".
+    /// Row 1, the negative control for the test above: **declared, and the
+    /// DECLARATION referenced a distribution**. Same distribution, same
+    /// coinbase — the one difference is a declaration behind the token, and
+    /// that flips who records it. Without this pair, "the mining side records
+    /// custom-job blocks" would read the same as "the mining side records
+    /// them twice".
+    ///
+    /// The reference rides the DECLARATION and not the frame, because that is
+    /// where §6 puts it for Full-Template and because it is the field
+    /// `handle_push_solution` reads. The fixture used to stamp it on the
+    /// frame instead, which describes no conformant client and — worse — made
+    /// the test pass for a declaration the JDP path would have classified
+    /// `BaseProtocol` and recorded nowhere.
+    ///
+    /// Both streams, because they are the two answers
+    /// `resolve_distribution_reference` gives and only one of them used to
+    /// reach this flag: off Solo it inherits the declaration's reference,
+    /// on Solo it deliberately does not. The JDP side makes no such
+    /// distinction, so reading its answer instead of the declaration's own
+    /// field wrote the `blocks_entity` row twice for every Solo JDC.
     #[test]
     fn a_declared_distribution_job_is_left_to_the_jdp_path() {
+        for stream in [StreamKind::Pplns, StreamKind::Solo] {
+            let mut s = negotiated_session_with_extended_channel();
+            s.stream = stream;
+            let cid = s.primary_channel.unwrap();
+            let entry = distribution_entry(None);
+            // Declared WITH the conformant coinbase, so the declaration
+            // binding and §7.1 both pass and the only variable left is the
+            // declaration itself.
+            let blob = conformant_outputs(&entry, 312_500_000);
+            let bridge = declared_under_distribution(
+                bridge_entry_declaring(
+                    Token([1u8; 16]),
+                    REGTEST_ADDR,
+                    42,
+                    &FIXTURE_SCRIPT_SIG_PREFIX,
+                    &blob,
+                ),
+                9,
+            );
+            let acc = accepted(entry);
+            // No frame TLV — §6 puts a Full-Template job's reference on
+            // `DeclareMiningJob`.
+            let input = custom_job_matching(cid, &bridge);
+
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                Some(&job_ref_for(&bridge)),
+                None,
+                Some(&acc),
+                1_000,
+            );
+            assert!(
+                matches!(
+                    out.outbound[0],
+                    OutboundFrame::SetCustomMiningJobSuccess { .. }
+                ),
+                "{stream:?}: got {:?}",
+                out.outbound[0]
+            );
+            assert!(
+                stored_custom_job(&s, cid).jdp_claims_the_block,
+                "{stream:?}: a declared job's solution arrives as PushSolution and is recorded \
+                 there — recording it here as well would write the blocks_entity row twice"
+            );
+        }
+    }
+
+    /// The other half of the same rule, and the one that pins WHICH question
+    /// the flag asks: a declaration with no distribution reference is
+    /// `BaseProtocol` on the JDP side and records nothing there — so the
+    /// mining side must record it, even though the frame's own TLV made the
+    /// §7.1 gate resolve a distribution for the job.
+    ///
+    /// Reachable for real: a JDC that negotiated 0x0003 on the mining
+    /// connection but not on the JDP one declares without a reference (§2
+    /// forbids it there) and may still send the TLV here. Keying the flag on
+    /// the resolved reference left such a block recorded by nobody.
+    #[test]
+    fn a_frame_tlv_does_not_hand_an_undeclared_distribution_to_the_jdp_path() {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let entry = distribution_entry(None);
-        // Declared WITH the conformant coinbase, so the declaration binding
-        // and §7.1 both pass and the only variable left is the declaration
-        // itself.
         let blob = conformant_outputs(&entry, 312_500_000);
+        // Declared WITHOUT a distribution — `distribution_id: None`.
         let bridge = bridge_entry_declaring(
             Token([1u8; 16]),
             REGTEST_ADDR,
@@ -6791,9 +6879,9 @@ pub(crate) mod tests {
             OutboundFrame::SetCustomMiningJobSuccess { .. }
         ));
         assert!(
-            stored_custom_job(&s, cid).jdp_claims_the_block,
-            "a declared job's solution arrives as PushSolution and is booked there — \
-             recording it here as well would write the blocks_entity row twice"
+            !stored_custom_job(&s, cid).jdp_claims_the_block,
+            "PushSolution reads the DECLARATION's reference, and this one has none — leaving \
+             the block to the JDP path records it nowhere"
         );
     }
 
