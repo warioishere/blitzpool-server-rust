@@ -21,12 +21,15 @@
 //!    - **base protocol** → the single §6.4.3 designated payout output
 //!      at 0 sats, paying the miner itself, consensus-serialised through
 //!      [`bp_stratum_v2::jdp::dynamic_outputs::encode_coinbase_outputs`].
-//!      Only a Solo miner gets one: §6.4.3 designates exactly one output
-//!      and the JD-client writes the whole template revenue into it, so a
-//!      shared payout list cannot be expressed and the allocate is
-//!      refused instead. The list is resolved at the pool's CURRENT
-//!      template revenue ([`ChainView::reference_revenue`]) — resolving
-//!      is not a read-only operation, see [`ProductionJdpAllocateResolver`].
+//!      Only a Solo miner gets one, and two independent checks say so:
+//!      the miner's stream must be Solo (which is what the mining side
+//!      will serve a base custom job on), and its payout list must fit
+//!      the single output §6.4.3 designates — the JD-client writes the
+//!      whole template revenue into that one, so a shared list cannot be
+//!      expressed. Either failing refuses the allocate. The list is
+//!      resolved at the pool's CURRENT template revenue
+//!      ([`ChainView::reference_revenue`]) — resolving is not a
+//!      read-only operation, see [`ProductionJdpAllocateResolver`].
 //!
 //!    Production rejects JDC connections with unparseable identifiers
 //!    (the spec says "JDS MAY accept any identifier"; we choose to
@@ -75,7 +78,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::pow::CompactTarget;
 use bitcoin::{BlockHash, Network as BitcoinNetwork, TxMerkleNode};
 use bp_bitcoin::BitcoinRpc;
-use bp_common::{AddressId, Sats};
+use bp_common::{AddressId, Sats, StreamKind};
 use bp_stratum_v2::jdp::client::{parse_user_identifier_as_address, AllocateTokenContext};
 use bp_stratum_v2::jdp::dynamic_outputs::{
     encode_coinbase_outputs, CandidateBacking, DynamicOutput, PayoutBooking,
@@ -227,16 +230,62 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         // 0-value; the JDC then allocates the template's revenue into the
         // designated one.
         //
-        // So the question this path has to answer is not "which mode is
-        // this?" but "does this miner's payout fit in ONE output?" — and
-        // the only thing that can answer it is the payout resolver itself.
-        // Asking the mode instead (`resolve_stream`) reads as the same
-        // question and is not: a Blockparty admin whose party is still
-        // DRAFT resolves to the Solo *mode* while `resolve_payouts` routes
-        // 100 % of the block to the pool fee address, precisely so the
-        // admin cannot pocket it before the members confirm. Going through
-        // the resolver keeps that guard — and every future one — on this
-        // path, instead of quietly reimplementing a subset of it.
+        // TWO questions, in this order, and they are not the same one.
+        //
+        // First: will the mining side serve a base-protocol custom job on
+        // this miner's stream at all? `handle_set_custom_mining_job` answers
+        // `custom-jobs-require-solo` off Solo, and an SRI jd-client treats
+        // that — like every code but `stale-chain-tip` — as a reason to leave
+        // the pool. Granting a token there hands out one that every job built
+        // on it is refused with, which is worse than refusing the token.
+        //
+        // It is asked HERE and not left to the mining side for two reasons:
+        //
+        // - The payout list cannot answer it. Today the two agree for PPLNS
+        //   and Group-Solo by accident of shape (`payout_entries_at` emits
+        //   the pool output unconditionally, so such a list never holds
+        //   exactly one entry that is the miner) — but Blockparty falls back
+        //   to `solo_payouts` on four error paths, and with no dev fee
+        //   configured that is exactly the shape §6.4.3 can carry, on a
+        //   stream that will refuse it.
+        // - The call below is not free and not a query: for PPLNS it runs
+        //   `build_distribution`, which WRITES the settlement snapshot (see
+        //   the struct doc). A refusal closes the connection and an SRI
+        //   jd-client reconnects, so an allocate that was never going to be
+        //   servable would repeat that write once per reconnect, forever —
+        //   the §6.4.2 rate limit cannot throttle it, because it lives in
+        //   `TokenStore::allocate`, which such an allocate never reaches.
+        //
+        // `match` and not `!= Solo`: a stream added later has to be
+        // classified deliberately rather than default into being served.
+        let servable = match bp_stratum_v2::hooks::PayoutResolver::resolve_stream(
+            &*self.payout_resolver,
+            &miner_address,
+        ) {
+            StreamKind::Solo => true,
+            StreamKind::Pplns | StreamKind::GroupSolo | StreamKind::Blockparty => false,
+        };
+        if !servable {
+            warn!(
+                user_identifier,
+                "JDP allocate: base protocol is Solo-only (a shared window needs every payout \
+                 slot pinned, and §6.4.3 expresses one output) — refusing the token rather than \
+                 issuing one every SetCustomMiningJob would be refused with; use ext 0x0003"
+            );
+            return AllocateOutcome::Refused {
+                reason: "base-protocol JDP is served on the Solo stream only",
+            };
+        }
+
+        // Second, and this is the one the payout list owns: does this
+        // miner's payout fit in ONE output? The stream gate above does NOT
+        // subsume it, and must not be read as doing so — a Blockparty admin
+        // whose party is still DRAFT resolves to the Solo *mode*, i.e. it
+        // passes the gate, while `resolve_payouts` routes 100 % of the block
+        // to the pool fee address precisely so the admin cannot pocket it
+        // before the members confirm. Going through the resolver keeps that
+        // guard — and every future one — on this path, instead of quietly
+        // reimplementing a subset of it.
         //
         // The reward decides no output here — the JDC fills in the real one
         // from its own template. It is NOT free to invent, though: for PPLNS
@@ -1329,6 +1378,11 @@ mod base_allocate_tests {
     struct FixedPayouts {
         entries: Vec<PayoutEntry>,
         asked_at: StdMutex<Vec<u64>>,
+        /// The stream this miner's shares enter. Spelled out rather than
+        /// left to the trait default, because the default is `Pplns` and
+        /// the base path is Solo-only — a double that took the default
+        /// would refuse every fixture below for the wrong reason.
+        stream: StreamKind,
     }
 
     #[async_trait]
@@ -1340,6 +1394,10 @@ mod base_allocate_tests {
         ) -> bp_mining_job::ResolvedPayouts {
             self.asked_at.lock().unwrap().push(reward_sats);
             bp_mining_job::ResolvedPayouts::unsnapshotted(self.entries.clone())
+        }
+
+        fn resolve_stream(&self, _miner_address: &AddressId) -> StreamKind {
+            self.stream
         }
     }
 
@@ -1358,6 +1416,7 @@ mod base_allocate_tests {
     }
 
     /// A resolver on a pool that HAS a template, which is the ordinary case.
+    /// Solo, because that is the only stream the base path serves.
     fn pays(entries: &[(&str, u64)]) -> ProductionJdpAllocateResolver {
         resolver_with(entries, Some(TEMPLATE_REVENUE)).0
     }
@@ -1366,6 +1425,14 @@ mod base_allocate_tests {
     fn resolver_with(
         entries: &[(&str, u64)],
         revenue: Option<u64>,
+    ) -> (ProductionJdpAllocateResolver, Arc<FixedPayouts>) {
+        resolver_on(entries, revenue, StreamKind::Solo)
+    }
+
+    fn resolver_on(
+        entries: &[(&str, u64)],
+        revenue: Option<u64>,
+        stream: StreamKind,
     ) -> (ProductionJdpAllocateResolver, Arc<FixedPayouts>) {
         let payouts = Arc::new(FixedPayouts {
             entries: entries
@@ -1376,6 +1443,7 @@ mod base_allocate_tests {
                 })
                 .collect(),
             asked_at: StdMutex::new(Vec::new()),
+            stream,
         });
         (
             ProductionJdpAllocateResolver {
@@ -1615,6 +1683,117 @@ mod base_allocate_tests {
             payouts.asked_at.lock().unwrap().is_empty(),
             "0x0003 resolves no payout list, so it writes no snapshot either"
         );
+    }
+
+    /// The base path is Solo-only, and the refusal has to happen HERE — the
+    /// mining side's `custom-jobs-require-solo` is fatal for an SRI
+    /// jd-client, so a token issued off Solo is a token every job built on it
+    /// dies with.
+    ///
+    /// The payout list is deliberately the ONE shape §6.4.3 can carry: a
+    /// single payee who is the miner. That is what a Blockparty group falls
+    /// back to on its four `solo_payouts` error paths when no dev fee is
+    /// configured — i.e. the list agrees while the stream does not, which is
+    /// exactly why the list cannot answer this question.
+    #[tokio::test]
+    async fn a_shared_stream_is_refused_a_base_protocol_token() {
+        for stream in [
+            StreamKind::Pplns,
+            StreamKind::GroupSolo,
+            StreamKind::Blockparty,
+        ] {
+            let (resolver, payouts) =
+                resolver_on(&[(MINER, 312_500_000)], Some(TEMPLATE_REVENUE), stream);
+            let outcome = resolver
+                .resolve_allocate_context(MINER, "127.0.0.1:1", false)
+                .await;
+            assert!(
+                matches!(outcome, AllocateOutcome::Refused { .. }),
+                "{stream:?}: the mining side would refuse every job on this token"
+            );
+            // The other half of the same fix: the refusal must cost nothing.
+            // `resolve_payouts` WRITES the PPLNS settlement snapshot, and a
+            // refusal closes the connection — an SRI jd-client reconnects, so
+            // a resolve here would repeat that write per reconnect with no
+            // rate limit in reach (§6.4.2 lives in `TokenStore::allocate`,
+            // which a refused allocate never reaches).
+            assert!(
+                payouts.asked_at.lock().unwrap().is_empty(),
+                "{stream:?}: a refused allocate must not resolve — the call itself is the write"
+            );
+        }
+    }
+
+    /// The negative control: the very same payout list on the Solo stream IS
+    /// served. Without it, "shared streams are refused" would read the same
+    /// as "the base path is off".
+    #[tokio::test]
+    async fn the_same_payout_list_is_served_on_the_solo_stream() {
+        let (resolver, payouts) = resolver_on(
+            &[(MINER, 312_500_000)],
+            Some(TEMPLATE_REVENUE),
+            StreamKind::Solo,
+        );
+        let ctx = granted(
+            resolver
+                .resolve_allocate_context(MINER, "127.0.0.1:1", false)
+                .await,
+        );
+        assert_eq!(
+            designated_script(&ctx),
+            bp_mining_job::address_to_script(BitcoinNetwork::Regtest, MINER).unwrap()
+        );
+        assert_eq!(
+            payouts.asked_at.lock().unwrap().as_slice(),
+            &[TEMPLATE_REVENUE],
+            "a servable allocate still goes through the payout list"
+        );
+    }
+
+    /// The stream gate must not swallow the payout-list guard it now sits in
+    /// front of. A Blockparty admin whose party is still DRAFT resolves to
+    /// the Solo *stream*, so it passes the gate — and `resolve_payouts` then
+    /// routes 100 % of the block to the pool fee address, which §6.4.3 cannot
+    /// enforce. Both checks have to fire, in that order.
+    #[tokio::test]
+    async fn a_solo_stream_routed_away_from_the_miner_is_still_refused() {
+        let (resolver, payouts) = resolver_on(
+            &[(OTHER, 312_500_000)],
+            Some(TEMPLATE_REVENUE),
+            StreamKind::Solo,
+        );
+        let outcome = resolver
+            .resolve_allocate_context(MINER, "127.0.0.1:1", false)
+            .await;
+        assert!(
+            matches!(outcome, AllocateOutcome::Refused { .. }),
+            "the pending-party route must still be caught by the payout list"
+        );
+        assert_eq!(
+            payouts.asked_at.lock().unwrap().len(),
+            1,
+            "and it must have been REACHED — a stream gate that short-circuits it would \
+             refuse for the wrong reason and hide the guard"
+        );
+    }
+
+    /// A negotiated session is unaffected: §2 empties the outputs, the pool's
+    /// published distribution carries the payouts, and every stream is served
+    /// — the Solo-only rule belongs to the base path alone.
+    #[tokio::test]
+    async fn a_negotiated_session_is_served_on_a_shared_stream() {
+        let (resolver, payouts) = resolver_on(
+            &[(OTHER, 3_125_000), (MINER, 309_375_000)],
+            Some(TEMPLATE_REVENUE),
+            StreamKind::Pplns,
+        );
+        let ctx = granted(
+            resolver
+                .resolve_allocate_context(MINER, "127.0.0.1:1", true)
+                .await,
+        );
+        assert!(ctx.coinbase_outputs.is_empty());
+        assert!(payouts.asked_at.lock().unwrap().is_empty());
     }
 }
 
