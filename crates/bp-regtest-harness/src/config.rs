@@ -3,8 +3,13 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Environment variable that, when set, is used verbatim as the
-/// `bitcoin-node` path and skips [`discover_bitcoin_node`] entirely.
+/// Environment variable that, when set, names the `bitcoin-node` path and
+/// skips the [`discover_bitcoin_node`] search entirely.
+///
+/// Used as given, with one exception: a leading `~` is expanded against
+/// `$HOME`, because a tilde that reaches this process was quoted and would
+/// otherwise name a path that cannot exist. Notably the version floor is
+/// *not* applied — see [`discover_bitcoin_node`].
 pub const BITCOIN_NODE_PATH_ENV: &str = "BITCOIN_NODE_PATH";
 
 /// Where `discover_bitcoin_node` looks, in order, when
@@ -86,7 +91,7 @@ pub fn discover_bitcoin_node() -> (PathBuf, bool) {
     // reinstate the confusing failure. So a named binary is simply used, and
     // a mismatch surfaces as the capnp error rather than as a wrong guess.
     if let Ok(from_env) = std::env::var(BITCOIN_NODE_PATH_ENV) {
-        let p = PathBuf::from(from_env);
+        let p = named_node_path(&from_env, std::env::var("HOME").ok().as_deref());
         let ok = p.exists() && is_executable(&p);
         return (p, ok);
     }
@@ -109,6 +114,27 @@ pub fn discover_bitcoin_node() -> (PathBuf, bool) {
         .or(first)
         .unwrap_or_else(|| PathBuf::from("bitcoin-node"));
     (named, false)
+}
+
+/// Resolve a [`BITCOIN_NODE_PATH_ENV`] value to the path to spawn.
+///
+/// Split from the env read so the rule is testable: the workspace denies
+/// `unsafe_code` and Rust 1.85 made `set_var` unsafe, so a test cannot
+/// mutate the environment to reach it.
+///
+/// A leading `~` is expanded — a tilde only survives into a child process
+/// when it was quoted (`BITCOIN_NODE_PATH='~/b/bitcoin-node'`, or fish's
+/// `set -x` with the value in quotes), and left literal it names a path
+/// that cannot exist, so every regtest skips while reporting "not found"
+/// against a path the operator can see is right. `candidates()` already
+/// expands `~` for the search list; the override was the one place a
+/// correct-looking path silently meant nothing.
+///
+/// Without `$HOME` the literal is kept rather than mangled, so the skip
+/// message still shows what was asked for.
+fn named_node_path(value: &str, home: Option<&str>) -> PathBuf {
+    let named = PathBuf::from(value);
+    expand_home(&named, home).unwrap_or(named)
 }
 
 /// Present, executable, and new enough — the single definition of "this
@@ -628,5 +654,35 @@ mod tests {
         );
         // Needs `$HOME` and hasn't got it: dropped, not mangled.
         assert_eq!(expand_home(Path::new("~/x"), None), None);
+    }
+
+    /// A quoted `~` in the override must reach `$HOME`, not a directory
+    /// literally named `~`.
+    ///
+    /// Driven through `named_node_path` rather than `expand_home`, because
+    /// the bug was not in expansion — that always worked — but in the
+    /// override never calling it. A test on `expand_home` alone passed
+    /// throughout.
+    #[test]
+    fn a_quoted_tilde_in_the_override_is_expanded() {
+        assert_eq!(
+            named_node_path("~/b/bitcoin-node", Some("/home/u")),
+            PathBuf::from("/home/u/b/bitcoin-node"),
+            "a quoted `~` must expand, or the named binary can never exist"
+        );
+        // The negative control that makes the assert above mean something:
+        // an already-expanded path is the common case and must be untouched,
+        // so this cannot pass by rewriting every path.
+        assert_eq!(
+            named_node_path("/opt/bitcoin-31.1/bin/bitcoin-node", Some("/home/u")),
+            PathBuf::from("/opt/bitcoin-31.1/bin/bitcoin-node"),
+            "an absolute path is the operator's decision — pass it through"
+        );
+        // No `$HOME`: keep the literal, so `unavailable_reason` can echo
+        // what was asked for instead of a fabricated path.
+        assert_eq!(
+            named_node_path("~/b/bitcoin-node", None),
+            PathBuf::from("~/b/bitcoin-node")
+        );
     }
 }
