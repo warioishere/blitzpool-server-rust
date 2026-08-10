@@ -297,16 +297,28 @@ impl RegtestConfig {
             return format!("{path} is not executable");
         }
         match node_major_version(&self.bitcoin_node_path) {
-            Some(major) if major < MIN_BITCOIN_NODE_MAJOR => format!(
-                "{path} is v{major}; the SV2 IPC bindings call `Init.makeMining @3`, which only \
-                 exists from v{MIN_BITCOIN_NODE_MAJOR} on. Point \
-                 {BITCOIN_NODE_PATH_ENV} at a v{MIN_BITCOIN_NODE_MAJOR}+ multiprocess build (that \
-                 also bypasses this check, for a master build whose `v30.99` banner cannot say \
-                 which side of the renumbering it is on)"
-            ),
+            Some(major) if major < MIN_BITCOIN_NODE_MAJOR => {
+                too_old_reason(&self.bitcoin_node_path, major)
+            }
             _ => format!("{path} looks usable — nothing to explain"),
         }
     }
+}
+
+/// The "too old" half of [`RegtestConfig::unavailable_reason`], split out so a
+/// test can assert the wording against a known-old version without needing a
+/// v30 binary on the machine — which is what lets the "`/bin/sh` is not called
+/// too old" control compare against a string it has actually seen produced,
+/// rather than a phrase that may no longer appear anywhere.
+fn too_old_reason(path: &Path, major: u32) -> String {
+    let path = path.display();
+    format!(
+        "{path} is v{major}; the SV2 IPC bindings call `Init.makeMining @3`, which only \
+         exists from v{MIN_BITCOIN_NODE_MAJOR} on. Point \
+         {BITCOIN_NODE_PATH_ENV} at a v{MIN_BITCOIN_NODE_MAJOR}+ multiprocess build (that \
+         also bypasses this check, for a master build whose `v30.99` banner cannot say \
+         which side of the renumbering it is on)"
+    )
 }
 
 #[cfg(unix)]
@@ -519,13 +531,24 @@ mod tests {
             reason.contains("not found") && reason.contains(BITCOIN_NODE_PATH_ENV),
             "a missing binary should name the override env var: {reason}"
         );
+        // The phrase the control below looks for, taken from the code that
+        // produces it rather than retyped. An earlier version of this test
+        // searched for wording that `unavailable_reason` never emits, so the
+        // control passed no matter what the function did.
+        let too_old = too_old_reason(Path::new("/bin/sh"), MIN_BITCOIN_NODE_MAJOR - 1);
+        let hallmark = "the SV2 IPC bindings call";
+        assert!(
+            too_old.contains(hallmark),
+            "positive control: a genuinely too-old binary must say so, else the \
+             negative control below cannot fail: {too_old}"
+        );
+
         // A path that exists and is executable but is not bitcoin-node at
         // all: `-version` yields no version token, so it is NOT called too
         // old. `/bin/sh` is present on every unix this suite runs on.
         let sh = RegtestConfig::default().with_bitcoin_node_path("/bin/sh");
         assert!(
-            !sh.unavailable_reason()
-                .contains("the SV2 IPC bindings need"),
+            !sh.unavailable_reason().contains(hallmark),
             "an unclassifiable binary must not be reported as too old"
         );
     }
