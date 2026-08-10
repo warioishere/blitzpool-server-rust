@@ -473,11 +473,23 @@ mod tests {
             parse_major_version("some custom build, no version token"),
             None
         );
-        // `is_usable` folds that `None` to "yes" — pinned here because the
-        // opposite default is the tempting one.
+        // Pinned through `is_usable` itself, not through an `Option`
+        // identity. `None::<u32>.is_none_or(..)` was the original assertion
+        // here, and it is true for every predicate you could write, so it
+        // held even when `is_usable` was mutated to reject unparseable
+        // banners outright — the one behaviour this test names. `/bin/sh` is
+        // executable and prints no `v`-numeric token, so it is a real
+        // unclassifiable binary rather than a stand-in.
+        let sh = Path::new("/bin/sh");
+        assert_eq!(
+            node_major_version(sh),
+            None,
+            "precondition: /bin/sh must be unclassifiable for this test to mean anything"
+        );
         assert!(
-            None::<u32>.is_none_or(|major: u32| major >= MIN_BITCOIN_NODE_MAJOR),
-            "an unknown version must not be treated as too old"
+            is_usable(sh),
+            "an unclassifiable banner must count as usable — silently skipping is the \
+             worse failure, because a skipped test passes"
         );
     }
 
@@ -531,17 +543,26 @@ mod tests {
             reason.contains("not found") && reason.contains(BITCOIN_NODE_PATH_ENV),
             "a missing binary should name the override env var: {reason}"
         );
-        // The phrase the control below looks for, taken from the code that
-        // produces it rather than retyped. An earlier version of this test
-        // searched for wording that `unavailable_reason` never emits, so the
-        // control passed no matter what the function did.
-        let too_old = too_old_reason(Path::new("/bin/sh"), MIN_BITCOIN_NODE_MAJOR - 1);
+        // Positive control, driven through `unavailable_reason` against a
+        // binary that really answers `-version` with a v30 banner. Calling
+        // `too_old_reason` directly (an earlier version of this test) proved
+        // only that the string exists: the `major < MIN` arm was never
+        // reached, so weakening its guard — or deleting the arm — left every
+        // test green while a rejected v30 reported "looks usable".
         let hallmark = "the SV2 IPC bindings call";
+        let stub = v30_banner_stub();
+        let old = RegtestConfig::default().with_bitcoin_node_path(&stub);
         assert!(
-            too_old.contains(hallmark),
-            "positive control: a genuinely too-old binary must say so, else the \
-             negative control below cannot fail: {too_old}"
+            !old.is_available(),
+            "a v30 banner must fail the floor: {}",
+            stub.display()
         );
+        let reason = old.unavailable_reason();
+        assert!(
+            reason.contains(hallmark) && reason.contains("is v30"),
+            "a too-old binary must name its version and why it cannot work: {reason}"
+        );
+        std::fs::remove_file(&stub).ok();
 
         // A path that exists and is executable but is not bitcoin-node at
         // all: `-version` yields no version token, so it is NOT called too
@@ -551,6 +572,42 @@ mod tests {
             !sh.unavailable_reason().contains(hallmark),
             "an unclassifiable binary must not be reported as too old"
         );
+    }
+
+    /// An executable that answers `-version` with a real v30 banner.
+    ///
+    /// The floor exists to reject a node that passes every other check, so
+    /// the only honest way to test it is to run something that answers like
+    /// one. Cheaper and more portable than requiring a v30 install: the
+    /// machine that has one is exactly the machine this needs to work
+    /// without.
+    fn v30_banner_stub() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("bp-v30-stub-{}", stub_suffix()));
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho 'Bitcoin Core daemon version v30.2 bitcoin-node'\n",
+        )
+        .expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+        }
+        path
+    }
+
+    /// Unique per call. A bare nanosecond timestamp is not enough: macOS
+    /// advances that clock in 1µs steps and pads zeroes, so two tests in the
+    /// same microsecond would share a stub path and race.
+    fn stub_suffix() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     #[test]

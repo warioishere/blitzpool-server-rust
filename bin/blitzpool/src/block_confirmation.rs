@@ -520,7 +520,10 @@ mod declared_block_booking_regtest {
                 .try_init();
             let regtest_cfg = RegtestConfig::default();
             if !regtest_cfg.is_available() {
-                eprintln!("skipping declared-block booking regtest — bitcoin-node not found");
+                eprintln!(
+                    "skipping declared-block booking regtest — {}",
+                    regtest_cfg.unavailable_reason()
+                );
                 return None;
             }
             let redis = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, redis_db).await?;

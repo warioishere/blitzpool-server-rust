@@ -531,7 +531,10 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
 
     let regtest_cfg = RegtestConfig::default();
     if !regtest_cfg.is_available() {
-        eprintln!("skipping PPLNS ledger-equality regtest — bitcoin-node not found");
+        eprintln!(
+            "skipping PPLNS ledger-equality regtest — {}",
+            regtest_cfg.unavailable_reason()
+        );
         return;
     }
     let Some(redis_conn) = connect_redis_or_skip(REDIS_TEST_DB_LEDGER).await else {
