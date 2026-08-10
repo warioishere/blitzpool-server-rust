@@ -520,6 +520,13 @@ mod declared_block_booking_regtest {
                 .try_init();
             let regtest_cfg = RegtestConfig::default();
             if !regtest_cfg.is_available() {
+                // Keep in step with `GroupChain::setup` below: the skip
+                // reason has to come from `unavailable_reason()`, never a
+                // hard-coded "not found". A v30 node, a non-executable
+                // path and a `-version` that would not run are all
+                // "available == false" for different reasons, and naming
+                // the wrong one sends the reader after a missing file.
+                // The two copies drifted apart within a day once before.
                 eprintln!(
                     "skipping declared-block booking regtest — {}",
                     regtest_cfg.unavailable_reason()
@@ -1159,7 +1166,10 @@ mod declared_block_booking_regtest {
                 .try_init();
             let regtest_cfg = RegtestConfig::default();
             if !regtest_cfg.is_available() {
-                eprintln!("skipping declared-block booking regtest — bitcoin-node not found");
+                eprintln!(
+                    "skipping declared-block booking regtest — {}",
+                    regtest_cfg.unavailable_reason()
+                );
                 return None;
             }
             let redis = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, redis_db).await?;
