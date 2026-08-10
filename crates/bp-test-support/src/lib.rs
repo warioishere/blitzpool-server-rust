@@ -144,6 +144,42 @@ pub async fn wait_for_any_paired_template(
     res.expect("TDP must emit a paired NewTemplate + SetNewPrevHash before the timeout")
 }
 
+/// Clear every trace of a Blockparty admin address, so a test that owns
+/// `addrs` can re-create its group from scratch.
+///
+/// Deletes from `blockparty_group` by admin address, NOT from
+/// `blockparty_member` — `blockparty_member` has
+/// `ON DELETE CASCADE` from `blockparty_group`, so removing the parent is
+/// strictly more thorough than removing the child, and removing only the
+/// child leaves the parent behind.
+///
+/// That difference was a permanent, cross-branch failure. Measured
+/// 2026-08-10: the two blockparty regtests pick a **fixed** admin address
+/// (`deterministic_p2wpkh_regtest([0xa1; 32])` /  `[0xc1; 32]`) and
+/// `blockparty_group` has `UQ_blockparty_group_admin_address`, so one
+/// interrupted run left an orphaned group row and every later run — on any
+/// branch, including unmodified `main` — failed `create_group` with
+/// `AdminAddressTaken` forever after. Cleaning by member address could not
+/// help: the row holding the constraint was the one it did not touch.
+///
+/// The member address is still worth passing: a non-admin address may hold
+/// `UQ_blockparty_member_address` under a group whose own admin is not in
+/// `addrs`, which no `blockparty_group` delete would reach.
+pub async fn cleanup_blockparty_rows(pool: &PgPool, addrs: &[&str]) {
+    for a in addrs {
+        // Parent first — cascades to blockparty_member, _invitation,
+        // _join_link and _block_history for that group.
+        let _ = sqlx::query(r#"DELETE FROM blockparty_group WHERE "adminAddress" = $1"#)
+            .bind(*a)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+            .bind(*a)
+            .execute(pool)
+            .await;
+    }
+}
+
 /// Per-test-binary logical-DB ranges.
 ///
 /// `connect_redis_or_skip` **flushes** the DB it opens, so two tests

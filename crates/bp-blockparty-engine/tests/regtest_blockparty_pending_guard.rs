@@ -31,8 +31,8 @@ use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_share::Target;
 use bp_template_distribution::{TdpConfig, TdpHandle};
 use bp_test_support::{
-    brute_force_nonce, connect_pg_or_skip, deterministic_p2wpkh_regtest, poll_for_height,
-    wait_for_paired_template,
+    brute_force_nonce, cleanup_blockparty_rows, connect_pg_or_skip, deterministic_p2wpkh_regtest,
+    poll_for_height, wait_for_paired_template,
 };
 use sqlx::PgPool;
 
@@ -63,7 +63,7 @@ async fn pending_party_admin_routes_block_to_pool_fee_accepted_by_core() {
     let addr_bob = deterministic_p2wpkh_regtest([0xc2; 32]);
     let addr_fee = deterministic_p2wpkh_regtest([0xcf; 32]);
     let name = format!("bp-regtest-pending-{}", uuid::Uuid::new_v4());
-    cleanup_member_rows(&pg, &[&addr_admin, &addr_bob]).await;
+    cleanup_blockparty_rows(&pg, &[&addr_admin, &addr_bob]).await;
 
     let fee_addr_id = AddressId::new(addr_fee.clone()).expect("fee addr");
     let svc = Arc::new(BlockpartyService::new(
@@ -205,13 +205,4 @@ async fn cleanup_group(pool: &PgPool, name: &str) {
         .bind(name)
         .execute(pool)
         .await;
-}
-
-async fn cleanup_member_rows(pool: &PgPool, addrs: &[&str]) {
-    for a in addrs {
-        let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
-            .bind(*a)
-            .execute(pool)
-            .await;
-    }
 }
