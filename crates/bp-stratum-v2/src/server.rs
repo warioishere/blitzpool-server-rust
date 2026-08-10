@@ -2666,6 +2666,13 @@ mod tests {
             ch.latest_extended_prev_hash = Some([0xAB; 32]);
             ch.latest_extended_n_bits = Some(0x1d00_ffff);
         }
+        // Group-Solo, because this test uses a TAILORED distribution and an
+        // INHERITED reference. Those two constrain the stream from opposite
+        // sides: a tailored entry is only built for Solo and Group-Solo, while
+        // `resolve_distribution_reference` refuses to inherit on Solo. Group-
+        // Solo is the one stream where both hold, so the scope resolution this
+        // test is about can be exercised at all.
+        s.stream = bp_common::StreamKind::GroupSolo;
         let owner = bp_common::AddressId::new(ADDR.to_string()).unwrap();
 
         let tailored = |id: u64, published_at_ms: u64| crate::bridge::PayoutDistributionEntry {

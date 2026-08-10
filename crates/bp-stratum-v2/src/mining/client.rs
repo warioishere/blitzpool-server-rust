@@ -2980,21 +2980,58 @@ pub fn handle_set_custom_mining_job<C: Clock>(
                 _ => return reject(ERR_STALE_PAYOUT_DISTRIBUTION),
             };
             // The distribution must match the accounting THIS connection's
-            // shares enter. A tailored entry names its miner. A pool-wide
-            // entry (`owner: None`) is the PPLNS window's, so only a PPLNS
-            // stream may reference it — "every connection may reference it"
-            // is true of the acceptance window, not of the accounting.
-            // Without the stream check a Group-Solo connection could point
-            // at the pool-wide distribution: its blocks would pay the PPLNS
-            // window while its shares kept earning a cut of the group's.
-            match &entry.owner {
-                Some(owner) if channel_addr != owner.as_str() => {
+            // shares enter — "every connection may reference it" is true of
+            // the acceptance window, not of the accounting.
+            //
+            // Both halves of that are decided here, over the PAIR, because
+            // both are questions about a mode and neither is checkable on its
+            // own. A guard like `if state.stream == Pplns` would be an
+            // `if mode ==` in disguise: a stream added later would slip
+            // through it silently. As a pair the match is exhaustive over
+            // `StreamKind`, so a new stream has to be classified rather than
+            // default into being served.
+            //
+            // - A **pool-wide** entry (`owner: None`) is the PPLNS window's.
+            //   Without this a Group-Solo connection could point at it: its
+            //   blocks would pay the PPLNS window while its shares kept
+            //   earning a cut of the group's.
+            // - A **tailored** entry names its miner, and the pool only ever
+            //   builds one for a mode that pays a single miner — Solo and
+            //   Group-Solo (`jdp_distribution_for`; PPLNS gets the pool-wide
+            //   push, Blockparty gets none). So a tailored entry on a shared
+            //   stream is a contradiction, and the address match does NOT
+            //   rule it out: the address is the same miner either way.
+            //
+            //   It is reachable, and not exotically. The JDP side picks
+            //   tailored-vs-pool-wide from the mode gate at ALLOCATE time,
+            //   and a JDC allocates before its mining channel exists
+            //   (measured: ~8 s, in both JDP modes), so the gate is empty and
+            //   answers Solo. A PPLNS miner therefore gets a Solo-tailored
+            //   distribution published for it, and the republish path leaves
+            //   that entry alone while it is current. This arm is what makes
+            //   that guess harmless: the mining side is where the mode is
+            //   known for certain, because the port has already spoken.
+            match (&entry.owner, state.stream) {
+                (Some(owner), StreamKind::Solo | StreamKind::GroupSolo) => {
+                    if channel_addr != owner.as_str() {
+                        return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+                    }
+                }
+                (Some(_), StreamKind::Pplns | StreamKind::Blockparty) => {
+                    tracing::warn!(
+                        channel_id = input.channel_id,
+                        stream = ?state.stream,
+                        "sv2: custom job references a tailored distribution on a stream that has \
+                         none — the pool builds tailored distributions only for Solo and \
+                         Group-Solo, so this one was published against a stale or unresolved \
+                         mode; rejecting rather than paying one miner out of a shared window"
+                    );
                     return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
                 }
-                None if state.stream != StreamKind::Pplns => {
+                (None, StreamKind::Pplns) => {}
+                (None, StreamKind::Solo | StreamKind::GroupSolo | StreamKind::Blockparty) => {
                     return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
                 }
-                _ => {}
             }
             let declared: Vec<bitcoin::TxOut> =
                 match bitcoin::consensus::deserialize(&input.coinbase_tx_outputs) {
@@ -7508,7 +7545,12 @@ pub(crate) mod tests {
     /// The owning miner's channel may reference its tailored distribution.
     #[test]
     fn set_custom_mining_job_tailored_owner_match_accepts() {
+        // Solo, because that is a stream a tailored distribution is BUILT for.
+        // The address match alone is not what makes it acceptable — see
+        // `a_tailored_distribution_is_refused_on_a_shared_stream` for the
+        // other direction, which this fixture used to be on by default.
         let mut s = negotiated_session_with_extended_channel();
+        s.stream = StreamKind::Solo;
         let cid = s.primary_channel.unwrap();
         let entry = distribution_entry(Some(AddressId::new(REGTEST_ADDR.to_string()).unwrap()));
         let blob = conformant_outputs(&entry, 312_500_000);
@@ -7528,6 +7570,69 @@ pub(crate) mod tests {
             out.outbound[0],
             OutboundFrame::SetCustomMiningJobSuccess { .. }
         ));
+    }
+
+    /// A tailored distribution belongs to a mode that pays ONE miner. The
+    /// pool builds one only for Solo and Group-Solo (`jdp_distribution_for`:
+    /// PPLNS rides the pool-wide push, Blockparty gets none), so a tailored
+    /// entry on a shared stream is a contradiction — and the owner check does
+    /// not catch it, because the address is the same miner either way.
+    ///
+    /// Why it is reachable: the JDP side decides tailored-vs-pool-wide from
+    /// the mode gate at ALLOCATE time, and a JDC allocates ~8 s before its
+    /// mining channel exists (measured against the reference client, both JDP
+    /// modes). The gate is empty then and answers Solo, so a PPLNS miner gets
+    /// a Solo-tailored distribution published for it. Left unchecked, its
+    /// shares earn a cut of the PPLNS window while its own blocks pay only
+    /// itself.
+    ///
+    /// Both directions over every stream, so this cannot pass by refusing
+    /// tailored entries outright.
+    #[test]
+    fn a_tailored_distribution_is_refused_on_a_shared_stream() {
+        for (stream, accepted_expected) in [
+            (StreamKind::Solo, true),
+            (StreamKind::GroupSolo, true),
+            (StreamKind::Pplns, false),
+            (StreamKind::Blockparty, false),
+        ] {
+            let mut s = negotiated_session_with_extended_channel();
+            s.stream = stream;
+            let cid = s.primary_channel.unwrap();
+            // Tailored to THIS channel's own address — the owner check passes
+            // in every arm, so only the stream rule can tell them apart.
+            let entry = distribution_entry(Some(AddressId::new(REGTEST_ADDR.to_string()).unwrap()));
+            let blob = conformant_outputs(&entry, 312_500_000);
+            let acc = accepted(entry);
+            let mut input = custom_job_input(cid, Token([1u8; 16]));
+            input.distribution_id = Some(9);
+            input.coinbase_tx_outputs = blob;
+
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                None,
+                Some(&distribution_allocation(REGTEST_ADDR, 1)),
+                Some(&acc),
+                1_000,
+            );
+            match (&out.outbound[0], accepted_expected) {
+                (OutboundFrame::SetCustomMiningJobSuccess { .. }, true) => {}
+                (OutboundFrame::SetCustomMiningJobError { error_code, .. }, false) => {
+                    assert_eq!(
+                        error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH,
+                        "{stream:?}"
+                    );
+                    assert!(
+                        s.channels.get(&cid).unwrap().extended_jobs.is_empty(),
+                        "{stream:?}: a refused job must not register"
+                    );
+                }
+                (other, want) => {
+                    panic!("{stream:?}: wanted accepted={want}, got {other:?}")
+                }
+            }
+        }
     }
 
     /// A Full-Template job (bridge entry present) must be §7.1-validated on
