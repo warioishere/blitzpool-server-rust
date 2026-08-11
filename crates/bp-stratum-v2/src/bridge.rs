@@ -865,6 +865,17 @@ impl JdpDeclaredJobRegistry {
         self.pool_wide_denied.remove(&jdp_session_id);
     }
 
+    /// Whether the session is currently denied the pool-wide distribution.
+    ///
+    /// Exists so a caller that re-decides per inbound frame can find out
+    /// under a READ lock that there is nothing to change. A session waiting
+    /// for its mode re-denies itself on every frame it sends, and taking the
+    /// write lock to re-insert an id that is already in the set serializes
+    /// the registry against the mining side for no state change at all.
+    pub fn is_pool_wide_denied(&self, jdp_session_id: u32) -> bool {
+        self.pool_wide_denied.contains(&jdp_session_id)
+    }
+
     /// Drop a session's tailored slot when it stops being a tailored session
     /// — its miner turned out to be, or became, a PPLNS one.
     ///

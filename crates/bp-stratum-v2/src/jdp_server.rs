@@ -669,16 +669,53 @@ enum SessionDistribution {
     /// the miner opening its channel.
     AwaitingMode,
     /// Nothing published because the build FAILED, or no distribution id was
-    /// available. Deliberately NOT retried per frame: unlike `AwaitingMode`
-    /// this one runs the whole distribution build before it fails, and a JDC
-    /// sends frames continuously — retrying there turns one failure into a
-    /// rebuild per frame. The publisher's tick picks it up instead.
+    /// available. Retried on the session's own frames like `AwaitingMode`, but
+    /// on a throttle ([`rebuild_due`]): unlike `AwaitingMode` this one runs the
+    /// whole distribution build before it fails, and a JDC sends frames
+    /// continuously, so retrying it unthrottled turns one failure into a
+    /// rebuild per frame.
     ///
     /// Splitting this from `AwaitingMode` is the point of the type. They were
     /// briefly one variant, and that is precisely the collapse this enum was
     /// introduced to prevent — two states that look alike from outside and
-    /// need opposite treatment.
+    /// need different treatment.
     Denied,
+}
+
+/// How long a session that was refused a distribution waits before the pool
+/// tries to build it one again, on its own frames.
+///
+/// Below the publisher's 60 s default, because the publisher is the path this
+/// backs up — and above anything a JDC's frame rate could turn into a rebuild
+/// storm.
+const DENIED_REBUILD_INTERVAL_MS: u64 = 30_000;
+
+/// Whether an inbound frame should make the pool re-decide what this session
+/// is served.
+///
+/// A `match`, and exhaustive, because the four states want four different
+/// answers and a fifth added later must be classified rather than inherit
+/// whichever one the `if` happened to be written around:
+///
+/// - `AwaitingMode` — every frame. The check is a mode lookup that returns
+///   before anything is built, and the answer normally arrives within
+///   milliseconds of the miner opening its channel.
+/// - `Denied` — throttled, because this one runs the WHOLE distribution build
+///   before it fails, and a JDC sends frames continuously. Retried at all
+///   because the alternative was not retrying: the publisher's tick is the
+///   only other path, and it skips a tick whose fingerprint is unchanged — on
+///   a quiet window a session refused once stays refused with nothing left to
+///   wake it.
+/// - `Tailored` / `PoolWide` — never here. A session that is being served
+///   re-decides when its slot is invalidated (§10), not on its own traffic.
+fn rebuild_due(served: &SessionDistribution, now_ms: u64, last_rebuild_ms: u64) -> bool {
+    match served {
+        SessionDistribution::AwaitingMode => true,
+        SessionDistribution::Denied => {
+            now_ms.saturating_sub(last_rebuild_ms) >= DENIED_REBUILD_INTERVAL_MS
+        }
+        SessionDistribution::Tailored(_) | SessionDistribution::PoolWide => false,
+    }
 }
 
 /// Makes "this session is still waiting for its mode" visible.
@@ -848,10 +885,22 @@ async fn republish_tailored(
         // retries on the next inbound frame, by which time the miner has
         // usually opened its channel and the port has spoken.
         TailoredDistribution::ModeUnknown => {
-            bridge
-                .write()
+            // Read first. This arm runs on EVERY inbound frame while the mode
+            // is undecided, and after the first one there is nothing to write
+            // — a write lock per frame would serialize the registry against
+            // the mining side to re-insert an id that is already in the set.
+            // Racing readers both deciding to write is harmless: the write is
+            // an idempotent insert.
+            let already_denied = bridge
+                .read()
                 .expect("bridge RwLock poisoned")
-                .deny_pool_wide(session_id);
+                .is_pool_wide_denied(session_id);
+            if !already_denied {
+                bridge
+                    .write()
+                    .expect("bridge RwLock poisoned")
+                    .deny_pool_wide(session_id);
+            }
             return SessionDistribution::AwaitingMode;
         }
         TailoredDistribution::Unavailable => {
@@ -941,6 +990,11 @@ async fn run_jdp_connection(
     // session is (correctly) not listening for.
     let mut identity: Option<AddressId> = None;
     let mut awaiting = AwaitingModeWatch::new();
+    // When the pool last tried to build this session a distribution, so the
+    // refused case can be retried on the session's own frames without
+    // rebuilding once per frame. Stamped after every attempt, whatever it
+    // returned.
+    let mut last_rebuild_ms: u64 = 0;
     // The pool-wide distribution id last written to this client, so a session
     // arriving on that stream can be told whether it is behind. `None` while
     // it is holding something else (nothing yet, or a tailored push).
@@ -1005,6 +1059,7 @@ async fn run_jdp_connection(
                     )
                     .await;
                     served = next;
+                    last_rebuild_ms = now_ms();
                     awaiting.observe(&served, &session_id_hex, &miner, now_ms());
                     continue;
                 }
@@ -1218,19 +1273,24 @@ async fn run_jdp_connection(
                         )
                         .await;
                         served = next;
+                        last_rebuild_ms = now_ms();
                         awaiting.observe(&served, &session_id_hex, miner_address, now_ms());
                     }
 
-                    // Retry an undecided mode on EVERY inbound frame, not on
-                    // the publisher's 60 s tick. A JDC allocates ~8 s before
-                    // its mining channel opens, so at allocate time the mode
-                    // is routinely unknown — but it becomes known milliseconds
+                    // Re-decide on the session's OWN frames, not only on the
+                    // publisher's 60 s tick. A JDC allocates ~8 s before its
+                    // mining channel opens, so at allocate time the mode is
+                    // routinely unknown — but it becomes known milliseconds
                     // after that channel opens, and the JDC keeps sending. On
                     // the tick alone the client would spend up to a minute
                     // with no distribution, declare without one, and a PPLNS
                     // address would be refused `custom-jobs-require-solo` —
-                    // trading a wrong distribution for a fatal one.
-                    if let (Some(miner), SessionDistribution::AwaitingMode) = (&identity, &served) {
+                    // trading a wrong distribution for a fatal one. `Denied`
+                    // rides the same path on a throttle; `rebuild_due` owns
+                    // which state gets which treatment.
+                    if let (Some(miner), true) =
+                        (&identity, rebuild_due(&served, now_ms(), last_rebuild_ms))
+                    {
                         let miner = miner.clone();
                         let next = republish_tailored(
                             &hooks,
@@ -1243,6 +1303,7 @@ async fn run_jdp_connection(
                         )
                         .await;
                         served = next;
+                        last_rebuild_ms = now_ms();
                         awaiting.observe(&served, &session_id_hex, &miner, now_ms());
                     }
                 }
@@ -2225,6 +2286,58 @@ mod tests {
         assert!(state
             .negotiated_extensions
             .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS));
+    }
+
+    /// The four states get four answers, and the two that rebuild get them for
+    /// different reasons. Without the `Denied` arm a session refused once has
+    /// only the publisher's tick left — and that tick is skipped whenever the
+    /// fingerprint is unchanged, so on a quiet window nothing wakes it at all.
+    #[test]
+    fn only_the_states_that_have_something_to_gain_rebuild_on_a_frame() {
+        let miner = AddressId::new(ADDR.to_string()).unwrap();
+        // Undecided: every frame, the check returns before anything is built.
+        assert!(rebuild_due(&SessionDistribution::AwaitingMode, 0, 0));
+        assert!(rebuild_due(&SessionDistribution::AwaitingMode, 1, 0));
+
+        // Refused: not on the next frame, but not never either.
+        assert!(!rebuild_due(&SessionDistribution::Denied, 1_000, 1_000));
+        assert!(!rebuild_due(
+            &SessionDistribution::Denied,
+            1_000 + DENIED_REBUILD_INTERVAL_MS - 1,
+            1_000
+        ));
+        assert!(rebuild_due(
+            &SessionDistribution::Denied,
+            1_000 + DENIED_REBUILD_INTERVAL_MS,
+            1_000
+        ));
+
+        // Being served: its own traffic decides nothing. A tailored slot is
+        // re-decided when a §10 settlement invalidates it, and a pool-wide one
+        // rides the publisher's pushes.
+        for served in [
+            SessionDistribution::Tailored(miner.clone()),
+            SessionDistribution::PoolWide,
+        ] {
+            assert!(!rebuild_due(&served, u64::MAX, 0), "{served:?}");
+        }
+    }
+
+    /// The denial is readable without taking the write lock — the whole point
+    /// of the accessor, since a session awaiting its mode asks once per frame.
+    #[test]
+    fn a_denial_can_be_read_before_deciding_to_write_it() {
+        let mut reg = JdpDeclaredJobRegistry::new();
+        assert!(!reg.is_pool_wide_denied(7), "a fresh session is not denied");
+        reg.deny_pool_wide(7);
+        assert!(reg.is_pool_wide_denied(7));
+        reg.deny_pool_wide(7);
+        assert!(
+            reg.is_pool_wide_denied(7),
+            "denying twice is a no-op, not a flip"
+        );
+        reg.allow_pool_wide(7);
+        assert!(!reg.is_pool_wide_denied(7));
     }
 
     /// A healthy JDC start must not warn. It allocates ~8 s before its mining
