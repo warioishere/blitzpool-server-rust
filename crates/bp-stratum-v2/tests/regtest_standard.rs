@@ -16,13 +16,15 @@
 //!      with pool-allocated extranonce-prefix.
 //!   4. `current_template` snapshot is populated after `generate_to_self`.
 //!
-//! Block-acceptance (TDP `submit_solution` for a winning share) is
-//! deferred to the SV2-extended e2e test + the existing
-//! `bp-mining-job/tests/regtest_e2e.rs` (transitivity argument:
-//! that test proves "ANY valid MiningJob bytes →
-//! bitcoin-core accepts", and this test proves "SV2 wire roundtrip
-//! produces the same MiningJob bytes the mining-job crate's helpers
-//! emit").
+//! Block-acceptance is deliberately NOT argued from transitivity here —
+//! that argument was refuted on 2026-05-17, when the SV2-Extended submit
+//! path turned out to reconstruct the coinbase differently from
+//! `bp-mining-job`'s helpers and produced blocks core rejected (see
+//! `regtest_extended_block_submit.rs`). A Standard-channel share is
+//! carried all the way to an accepted block in
+//! `regtest_stream_routing.rs`, which drives a real `SubmitSharesStandard`
+//! and asserts the tip rises. What this test owns instead is the wire
+//! contract of the handshake itself — the fields below.
 //!
 //! Skipped (with a printed warning) when `bitcoin-node` is not installed
 //! at the host's default location or via `BITCOIN_NODE_PATH`.

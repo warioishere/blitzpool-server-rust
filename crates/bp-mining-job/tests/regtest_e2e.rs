@@ -21,10 +21,12 @@
 //!    with the floor-rounding remainder lumped on `outs[0]` per
 //!    [`bp_mining_job`]'s convention.
 //!
-//! Tests #3 (prefix/suffix round-trip) are already covered by the unit-level
-//! `coinbase_with_extranonce_parses_as_valid_bitcoin_tx` test — and #4
-//! (all 5 address types) is deferred as a follow-up since it needs a
-//! wallet-side derivation step we don't currently expose.
+//! 3. **All 5 address types** — P2PKH, P2SH, P2WPKH, P2TR and P2WSH in one
+//!    coinbase, so the per-type script derivation is validated by core
+//!    rather than by our own encoder.
+//!
+//! The prefix/suffix round-trip is covered at unit level by
+//! `coinbase_with_extranonce_parses_as_valid_bitcoin_tx`.
 //!
 //! Skipped (with a printed warning) when `bitcoin-node` is not installed
 //! at the host's default location or via `BITCOIN_NODE_PATH`.

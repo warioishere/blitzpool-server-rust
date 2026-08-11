@@ -14,10 +14,12 @@
 //!    `coinbase_tx_prefix` + `coinbase_tx_suffix` (so the miner can
 //!    roll their portion of the extranonce locally without a pool
 //!    round-trip).
-//! 3. **Shares** can be rolled by the miner — but block-acceptance is
-//!    transitive via `bp-mining-job/tests/regtest_e2e.rs` (the same
-//!    transitivity argument), so we don't drive a SubmitSharesExtended
-//!    here.
+//! 3. **Shares** can be rolled by the miner. Block-acceptance for that
+//!    path is NOT argued from transitivity — that argument was refuted on
+//!    2026-05-17 — it is proven directly in
+//!    `regtest_extended_block_submit.rs`, which drives
+//!    `validate_submit_extended` and submits the bytes it produces. This
+//!    test owns the Open / NewExtendedMiningJob wire contract.
 //!
 //! Skipped (with a printed warning) when `bitcoin-node` isn't installed.
 
