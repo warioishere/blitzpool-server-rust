@@ -663,9 +663,22 @@ enum SessionDistribution {
     Tailored(AddressId),
     /// This miner is PPLNS: the pool-wide push IS its accounting.
     PoolWide,
-    /// Nothing published, and nothing should be — either the mode is not
-    /// known yet (retry on the next frame) or the build failed.
-    None,
+    /// The mode is not known YET. Nothing is published, and the caller retries
+    /// on the next inbound frame — the check is a map lookup, so doing it per
+    /// frame is free, and the answer normally arrives within milliseconds of
+    /// the miner opening its channel.
+    AwaitingMode,
+    /// Nothing published because the build FAILED, or no distribution id was
+    /// available. Deliberately NOT retried per frame: unlike `AwaitingMode`
+    /// this one runs the whole distribution build before it fails, and a JDC
+    /// sends frames continuously — retrying there turns one failure into a
+    /// rebuild per frame. The publisher's tick picks it up instead.
+    ///
+    /// Splitting this from `AwaitingMode` is the point of the type. They were
+    /// briefly one variant, and that is precisely the collapse this enum was
+    /// introduced to prevent — two states that look alike from outside and
+    /// need opposite treatment.
+    Denied,
 }
 
 /// Build and push a fresh tailored distribution for `miner` on this session.
@@ -701,7 +714,7 @@ async fn republish_tailored(
                 .write()
                 .expect("bridge RwLock poisoned")
                 .deny_pool_wide(session_id);
-            return SessionDistribution::None;
+            return SessionDistribution::AwaitingMode;
         }
         TailoredDistribution::Unavailable => {
             warn!(
@@ -713,7 +726,7 @@ async fn republish_tailored(
                 .write()
                 .expect("bridge RwLock poisoned")
                 .deny_pool_wide(session_id);
-            return SessionDistribution::None;
+            return SessionDistribution::Denied;
         }
     };
     let Some(distribution_id) = hooks.distribution_source.next_distribution_id().await else {
@@ -725,7 +738,7 @@ async fn republish_tailored(
             .write()
             .expect("bridge RwLock poisoned")
             .deny_pool_wide(session_id);
-        return SessionDistribution::None;
+        return SessionDistribution::Denied;
     };
     let entry = entry_from_built(
         distribution_id,
@@ -777,7 +790,7 @@ async fn run_jdp_connection(
     // pool-wide push — §4 "latest MUST be used" makes its own stream
     // authoritative, and for a Solo or Group-Solo miner the pool-wide one is
     // the PPLNS window's, not theirs.
-    let mut served = SessionDistribution::None;
+    let mut served = SessionDistribution::AwaitingMode;
     // The miner this session belongs to, learned from the first allocate and
     // never cleared. Kept so a §10 settlement can be answered with a FRESH
     // tailored distribution, and so an undecided mode can be re-asked —
@@ -1059,7 +1072,7 @@ async fn run_jdp_connection(
                     // with no distribution, declare without one, and a PPLNS
                     // address would be refused `custom-jobs-require-solo` —
                     // trading a wrong distribution for a fatal one.
-                    if let (Some(miner), SessionDistribution::None) = (&identity, &served) {
+                    if let (Some(miner), SessionDistribution::AwaitingMode) = (&identity, &served) {
                         let miner = miner.clone();
                         served = republish_tailored(
                             &hooks,
