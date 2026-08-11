@@ -83,6 +83,23 @@ pub trait PayoutResolver: Send + Sync {
     fn resolve_stream(&self, _miner_address: &AddressId) -> StreamKind {
         StreamKind::Pplns
     }
+
+    /// The same question as [`Self::resolve_stream`], with "not yet" as an
+    /// answer it is allowed to give.
+    ///
+    /// The mode cache learns an address from the PORT a mining session opens
+    /// on, so before any session exists for an address there is nothing to
+    /// read — and `resolve_stream` cannot say so, because a `StreamKind` has
+    /// no such value: it returns the Solo default and a caller cannot tell
+    /// that apart from a miner who really is Solo. On the JDP allocate path,
+    /// which runs ~8 s BEFORE the mining channel opens, that is the normal
+    /// case rather than the edge one.
+    ///
+    /// Default: whatever `resolve_stream` says, since a resolver with no mode
+    /// cache behind it (every test double) always knows its own answer.
+    fn resolve_stream_known(&self, miner_address: &AddressId) -> Option<StreamKind> {
+        Some(self.resolve_stream(miner_address))
+    }
 }
 
 // ── BlockSubmissionSink ─────────────────────────────────────────────

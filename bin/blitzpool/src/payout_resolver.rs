@@ -569,6 +569,16 @@ impl bp_stratum_v2::hooks::PayoutResolver for ProductionPayoutResolver {
     fn resolve_stream(&self, miner_address: &AddressId) -> bp_common::StreamKind {
         bp_common::StreamKind::for_mode(self.mode_gate.lookup_mode(miner_address.as_str()).mode)
     }
+
+    /// `lookup_known`, so an address the gate has never been told about comes
+    /// back as `None` instead of as Solo. The gate learns an address from the
+    /// port a mining session opens on; a JDP connection has no port to derive
+    /// a mode from, and the allocate runs before the mining channel exists.
+    fn resolve_stream_known(&self, miner_address: &AddressId) -> Option<bp_common::StreamKind> {
+        self.mode_gate
+            .lookup_known(miner_address.as_str())
+            .map(|result| bp_common::StreamKind::for_mode(result.mode))
+    }
 }
 
 // ─── Ext 0x0003 distribution source (push model) ──────────────────

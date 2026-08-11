@@ -90,7 +90,7 @@ use bp_stratum_v2::jdp_server::{
 use bp_stratum_v2::mining::submit::assemble_witness_coinbase;
 use bp_stratum_v2::tokens::Token;
 use bp_template_distribution::{TdpHandle, TemplateTxCache};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::payout_resolver::ProductionPayoutResolver;
 
@@ -256,25 +256,53 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
         //   the §6.4.2 rate limit cannot throttle it, because it lives in
         //   `TokenStore::allocate`, which such an allocate never reaches.
         //
-        // ⚠️ A FIRST line, and it cannot be more than that. The mode gate
-        // learns an address from the PORT a mining session opens on
-        // (`mode_from_port`) and answers Solo for one it has never seen; a JDP
-        // connection has no port to derive a mode from. So a JDC that reaches
-        // the allocate before any mining session exists for its address IS
-        // served — measured against the reference client (2026-08-09). What
-        // makes the outcome right in that window is the mining side's
-        // `custom-jobs-require-solo`; what this saves, in the ordinary case
-        // where the miner is already connected, is a token nobody can use and
-        // the `resolve_payouts` write below.
+        // ⚠️ A FIRST line, and it cannot be more than that — because the mode
+        // is not always known here. The gate learns an address from the PORT a
+        // mining session opens on (`mode_from_port`), and a JDP connection has
+        // no port to derive a mode from, so a JDC that reaches the allocate
+        // before any mining session exists for its address gets `None`
+        // (measured against the reference client: ~8 s, every start).
+        //
+        // `resolve_stream_known` and not `resolve_stream`, even though the
+        // answer for `None` is the same "serve it" the Solo default produced:
+        // the two are not the same statement. This path deliberately differs
+        // from the ext 0x0003 one, which publishes NOTHING until the mode is
+        // known — and the difference is only defensible if the unknown case is
+        // written down rather than left to fall out of a default.
+        //
+        // Why it legitimately differs:
+        //
+        // - ext 0x0003 has no second gate. The published distribution IS the
+        //   money: whatever it says, the coinbase pays. Guessing there loses
+        //   satoshis in either direction, so the fix was to wait.
+        // - The base protocol always has one. `handle_set_custom_mining_job`
+        //   refuses off `accounting_stream`, and a mining channel BY
+        //   DEFINITION means a mining session exists — so that gate is never
+        //   the one working off a guess. The worst a served-too-early token
+        //   costs is a token whose jobs are later refused; no coinbase is ever
+        //   built on it.
+        // - And waiting is not free here. An allocate is request/response with
+        //   no "try again" answer (SV2 defines none), so "wait" means closing
+        //   the connection — which would close it on every JDC start, for the
+        //   ~8 s before its miner shows up.
         //
         // `match` and not `!= Solo`: a stream added later has to be
         // classified deliberately rather than default into being served.
-        let servable = match bp_stratum_v2::hooks::PayoutResolver::resolve_stream(
+        let servable = match bp_stratum_v2::hooks::PayoutResolver::resolve_stream_known(
             &*self.payout_resolver,
             &miner_address,
         ) {
-            StreamKind::Solo => true,
-            StreamKind::Pplns | StreamKind::GroupSolo | StreamKind::Blockparty => false,
+            Some(StreamKind::Solo) => true,
+            Some(StreamKind::Pplns | StreamKind::GroupSolo | StreamKind::Blockparty) => false,
+            None => {
+                debug!(
+                    user_identifier,
+                    "JDP allocate: no mining session for this address yet, so its mode is \
+                     unknown — serving the base-protocol token on the strength of the mining \
+                     side's Solo gate, which by then has a session to read"
+                );
+                true
+            }
         };
         if !servable {
             warn!(
@@ -1455,6 +1483,11 @@ mod base_allocate_tests {
         /// the base path is Solo-only — a double that took the default
         /// would refuse every fixture below for the wrong reason.
         stream: StreamKind,
+        /// Whether the mode gate has ever heard of this address. `false` is
+        /// the ~8 s window at the start of every JDC: it allocates before its
+        /// mining channel opens, and the gate learns an address from the port
+        /// that channel arrives on.
+        mode_known: bool,
     }
 
     #[async_trait]
@@ -1470,6 +1503,10 @@ mod base_allocate_tests {
 
         fn resolve_stream(&self, _miner_address: &AddressId) -> StreamKind {
             self.stream
+        }
+
+        fn resolve_stream_known(&self, _miner_address: &AddressId) -> Option<StreamKind> {
+            self.mode_known.then_some(self.stream)
         }
     }
 
@@ -1506,6 +1543,15 @@ mod base_allocate_tests {
         revenue: Option<u64>,
         stream: StreamKind,
     ) -> (ProductionJdpAllocateResolver, Arc<FixedPayouts>) {
+        resolver_on_known(entries, revenue, stream, true)
+    }
+
+    fn resolver_on_known(
+        entries: &[(&str, u64)],
+        revenue: Option<u64>,
+        stream: StreamKind,
+        mode_known: bool,
+    ) -> (ProductionJdpAllocateResolver, Arc<FixedPayouts>) {
         let payouts = Arc::new(FixedPayouts {
             entries: entries
                 .iter()
@@ -1516,6 +1562,7 @@ mod base_allocate_tests {
                 .collect(),
             asked_at: StdMutex::new(Vec::new()),
             stream,
+            mode_known,
         });
         (
             ProductionJdpAllocateResolver {
@@ -1794,6 +1841,49 @@ mod base_allocate_tests {
                 "{stream:?}: a refused allocate must not resolve — the call itself is the write"
             );
         }
+    }
+
+    /// An address the mode gate has never heard of is served on the base
+    /// protocol — deliberately, and not by falling into the Solo default.
+    ///
+    /// This path answers the unknown mode differently from the ext 0x0003 one,
+    /// which publishes nothing until it knows, and the difference is the
+    /// point: there the published distribution IS the money, here
+    /// `handle_set_custom_mining_job` still has to pass the job, and a mining
+    /// channel by definition means a mining session exists — so the gate that
+    /// decides is never the one working off a guess. The cost of being wrong
+    /// here is a token whose jobs are refused, not a coinbase paying the wrong
+    /// people.
+    ///
+    /// And the alternative is worse: an allocate is request/response with no
+    /// "try again later" answer, so waiting means closing the connection — on
+    /// every JDC start, for the ~8 s before its miner shows up.
+    #[tokio::test]
+    async fn an_address_with_no_mining_session_is_served_a_base_protocol_token() {
+        // The stream this double would report IS the shared one — so if the
+        // gate's answer were read instead of its "not yet", this allocate
+        // would be refused and the test would fail for the right reason.
+        let (resolver, payouts) = resolver_on_known(
+            &[(MINER, 312_500_000)],
+            Some(TEMPLATE_REVENUE),
+            StreamKind::Pplns,
+            false,
+        );
+        let ctx = granted(
+            resolver
+                .resolve_allocate_context(MINER, "127.0.0.1:1", false)
+                .await,
+        );
+        assert_eq!(
+            designated_script(&ctx),
+            bp_mining_job::address_to_script(BitcoinNetwork::Regtest, MINER).unwrap(),
+            "the designated output is the miner's own — §6.4.3 has one to give"
+        );
+        assert_eq!(
+            payouts.asked_at.lock().unwrap().as_slice(),
+            &[TEMPLATE_REVENUE],
+            "the payout-list guard still runs; only the stream question was unanswerable"
+        );
     }
 
     /// The negative control: the very same payout list on the Solo stream IS
