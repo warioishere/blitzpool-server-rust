@@ -485,11 +485,27 @@ impl BlitzpoolModeGate {
     }
 
     fn lookup(&self, address: &str) -> MiningModeResult {
-        let guard = self.inner.lock().expect("mode-gate mutex poisoned");
-        guard
-            .get(address)
-            .map(|e| e.mode.clone())
+        self.lookup_known(address)
             .unwrap_or_else(MiningModeResult::solo)
+    }
+
+    /// The mode ONLY if this address has a live mining session — `None` when
+    /// the gate has never been told, which is a different answer from Solo.
+    ///
+    /// The gate is session-scoped (`set_mode` on register, `clear_mode` on
+    /// deregister), and for Solo vs PPLNS there is no persistent record to
+    /// fall back on: the port the miner connects to IS the declaration. So an
+    /// address the gate does not know is genuinely undecided, and
+    /// [`Self::lookup`]'s Solo default is a guess.
+    ///
+    /// Callers that only need to route a live connection can keep guessing —
+    /// by then a session exists, so the guess never fires. A caller that acts
+    /// BEFORE the session exists must not: the JDP allocate publishes a payout
+    /// distribution off this answer, and a JDC allocates ~8 s before its
+    /// mining channel opens, so it would publish against a guess every time.
+    pub(crate) fn lookup_known(&self, address: &str) -> Option<MiningModeResult> {
+        let guard = self.inner.lock().expect("mode-gate mutex poisoned");
+        guard.get(address).map(|e| e.mode.clone())
     }
 
     /// Does this address's payout mode keep a ledger the pool books into?
@@ -1090,6 +1106,53 @@ mod tests {
     /// gate's live API is `lookup_mode`. This reads the resolved mode.
     fn mode_of(gate: &BlitzpoolModeGate, address: &str) -> MiningMode {
         gate.lookup_mode(address).mode
+    }
+
+    /// The Solo default above is a GUESS, and one caller must not take it.
+    ///
+    /// `lookup_known` is how that caller asks instead. The distinction is not
+    /// cosmetic: the JDP allocate publishes a payout distribution off this
+    /// answer, and a JDC allocates ~8 s before its mining channel opens — so
+    /// at that moment the gate knows nothing about EVERY address, and a Solo
+    /// answer would publish a Solo plan for a PPLNS miner or a Group-Solo
+    /// finder. Both are money errors, in opposite directions.
+    ///
+    /// Asserted against `lookup_mode` in the same test so the two cannot
+    /// quietly converge on one answer again.
+    #[test]
+    fn lookup_known_tells_unknown_apart_from_solo() {
+        let gate = BlitzpoolModeGate::new();
+
+        assert_eq!(
+            gate.lookup_known("bc1qnobody"),
+            None,
+            "an address with no mining session is UNDECIDED, not Solo"
+        );
+        assert_eq!(
+            mode_of(&gate, "bc1qnobody"),
+            MiningMode::Solo,
+            "precondition: the guessing accessor still guesses — otherwise this \
+             test would pass with both answers collapsed"
+        );
+
+        // A real Solo miner is a different answer, and must read as one.
+        gate.set_mode("bc1qsolo", MiningModeResult::solo());
+        assert_eq!(
+            gate.lookup_known("bc1qsolo").map(|r| r.mode),
+            Some(MiningMode::Solo)
+        );
+
+        // And the mode the guess would have got wrong.
+        gate.set_mode("bc1qpplns", MiningModeResult::pplns());
+        assert_eq!(
+            gate.lookup_known("bc1qpplns").map(|r| r.mode),
+            Some(MiningMode::Pplns)
+        );
+
+        // Cleared with the session — a disconnected miner is undecided again,
+        // which is why this cannot be answered from history either.
+        gate.clear_mode("bc1qpplns");
+        assert_eq!(gate.lookup_known("bc1qpplns"), None);
     }
 
     #[test]

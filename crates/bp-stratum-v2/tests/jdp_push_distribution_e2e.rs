@@ -781,7 +781,7 @@ fn entry_with_id(id: u64) -> PayoutDistributionEntry {
         reference_reward_sats: REFERENCE_REWARD,
         payouts_fingerprint: Some(FINGERPRINT),
         bookable: true,
-        owner: None,
+        accounting: bp_stratum_v2::bridge::DistributionAccounting::PoolWide,
         jdp_session_id: None,
         published_at_ms: 2_000,
     }

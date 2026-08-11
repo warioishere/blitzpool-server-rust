@@ -1371,7 +1371,7 @@ mod tests {
             reference_reward_sats: 312_500_000,
             payouts_fingerprint: Some([id as u8; 32]),
             bookable: true,
-            owner: None,
+            accounting: crate::bridge::DistributionAccounting::PoolWide,
             jdp_session_id: None,
             published_at_ms: 1_000,
         }

@@ -448,7 +448,7 @@ mod tests {
                 reference_reward_sats: 312_500_000,
                 payouts_fingerprint: Some([1u8; 32]),
                 bookable: true,
-                owner: None,
+                accounting: bp_stratum_v2::bridge::DistributionAccounting::PoolWide,
                 jdp_session_id: None,
                 published_at_ms: 1_001,
             });

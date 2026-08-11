@@ -57,8 +57,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::bridge::{
-    AllocatedTokenRef, AllocationKind, DistributionAcceptance, DistributionScope,
-    JdpDeclaredJobRegistry, PayoutDistributionEntry, RegisteredDeclaredJob,
+    AllocatedTokenRef, AllocationKind, DistributionAcceptance, DistributionAccounting,
+    DistributionScope, JdpDeclaredJobRegistry, PayoutDistributionEntry, RegisteredDeclaredJob,
 };
 use crate::extensions::{
     parse_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
@@ -207,13 +207,36 @@ fn sane_publish_interval(interval: Duration) -> Duration {
 pub enum TailoredDistribution {
     /// PPLNS-mode miner: the pool-wide distribution IS their accounting.
     PoolWide,
-    /// A distribution tailored to this miner.
-    Built(Box<BuiltPayoutDistribution>),
+    /// A distribution tailored to this miner, carrying WHICH accounting it
+    /// was built for. The kind travels with the build because the caller
+    /// cannot re-derive it: Solo and Group-Solo produce different payout
+    /// vectors for the same one address, so an owner address alone cannot
+    /// tell the two apart later — see [`DistributionAccounting`].
+    Built {
+        accounting: DistributionAccounting,
+        built: Box<BuiltPayoutDistribution>,
+    },
     /// The tailored build could not be produced. This miner's shares do
     /// not enter the PPLNS window, so the pool-wide distribution is the
     /// wrong answer — the session must be served nothing until a later
     /// build succeeds.
     Unavailable,
+    /// The pool does not know this address's payout mode yet, so it cannot
+    /// know WHICH distribution is the right one.
+    ///
+    /// Distinct from `Unavailable` because the cure is different: that one is
+    /// a build that failed and may fail again, this one resolves by itself the
+    /// moment a mining session registers, and the caller should retry rather
+    /// than give up on the session.
+    ///
+    /// It is the normal state at JDC startup, not an edge case. Solo and PPLNS
+    /// are told apart only by the port a MINER connects to, the mode gate is
+    /// session-scoped, and a JDC allocates ~8 s before its mining channel
+    /// exists — so at allocate time the pool routinely knows nothing. Guessing
+    /// there is a money error in either direction: a tailored plan pays one
+    /// miner out of a shared window, the pool-wide one pays a Solo miner's
+    /// block into the PPLNS window.
+    ModeUnknown,
 }
 
 /// Build the pool's payout distributions for the ext 0x0003 push model.
@@ -563,7 +586,13 @@ impl StratumV2JdpServer {
                     continue;
                 };
                 last_fingerprint = built.payouts_fingerprint;
-                let entry = entry_from_built(distribution_id, built, None, None, now_ms());
+                let entry = entry_from_built(
+                    distribution_id,
+                    built,
+                    DistributionAccounting::PoolWide,
+                    None,
+                    now_ms(),
+                );
                 inner
                     .bridge
                     .write()
@@ -621,9 +650,25 @@ impl StratumV2JdpServer {
 
 // ── Per-connection task ─────────────────────────────────────────────
 
-/// Build and push a fresh tailored distribution for `miner` on this
-/// session. Returns `false` when the session was left WITHOUT one — the
-/// caller must not then treat it as tailored-and-served.
+/// What a session is being served, and why. Three outcomes rather than a
+/// bool, because "served nothing" hides two states whose cures differ: a
+/// build that failed and may fail again, and a mode that is not known YET and
+/// resolves by itself the moment a mining session registers.
+///
+/// Collapsing them is what published a Solo distribution to every JDC that
+/// allocated before its miner connected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionDistribution {
+    /// A tailored slot is published for this miner.
+    Tailored(AddressId),
+    /// This miner is PPLNS: the pool-wide push IS its accounting.
+    PoolWide,
+    /// Nothing published, and nothing should be — either the mode is not
+    /// known yet (retry on the next frame) or the build failed.
+    None,
+}
+
+/// Build and push a fresh tailored distribution for `miner` on this session.
 ///
 /// Used both on the first allocate and after a §10 settlement, which
 /// invalidates a tailored slot exactly like the pool-wide one while the
@@ -635,9 +680,9 @@ async fn republish_tailored(
     session_id: u32,
     session_id_hex: &str,
     miner: &AddressId,
-) -> bool {
-    let built = match hooks.distribution_source.build_for_miner(miner).await {
-        TailoredDistribution::Built(b) => *b,
+) -> SessionDistribution {
+    let (accounting, built) = match hooks.distribution_source.build_for_miner(miner).await {
+        TailoredDistribution::Built { accounting, built } => (accounting, *built),
         // The miner's mode changed under us (now PPLNS): the pool-wide
         // push is its accounting again.
         TailoredDistribution::PoolWide => {
@@ -645,7 +690,18 @@ async fn republish_tailored(
                 .write()
                 .expect("bridge RwLock poisoned")
                 .allow_pool_wide(session_id);
-            return false;
+            return SessionDistribution::PoolWide;
+        }
+        // Not known YET. Publish nothing and keep pool-wide denied: both
+        // guesses are a money error, in opposite directions. The caller
+        // retries on the next inbound frame, by which time the miner has
+        // usually opened its channel and the port has spoken.
+        TailoredDistribution::ModeUnknown => {
+            bridge
+                .write()
+                .expect("bridge RwLock poisoned")
+                .deny_pool_wide(session_id);
+            return SessionDistribution::None;
         }
         TailoredDistribution::Unavailable => {
             warn!(
@@ -657,7 +713,7 @@ async fn republish_tailored(
                 .write()
                 .expect("bridge RwLock poisoned")
                 .deny_pool_wide(session_id);
-            return false;
+            return SessionDistribution::None;
         }
     };
     let Some(distribution_id) = hooks.distribution_source.next_distribution_id().await else {
@@ -669,12 +725,12 @@ async fn republish_tailored(
             .write()
             .expect("bridge RwLock poisoned")
             .deny_pool_wide(session_id);
-        return false;
+        return SessionDistribution::None;
     };
     let entry = entry_from_built(
         distribution_id,
         built,
-        Some(miner.clone()),
+        accounting,
         Some(session_id),
         now_ms(),
     );
@@ -690,7 +746,7 @@ async fn republish_tailored(
         warn!("jdp {session_id_hex} tailored republish write: {err:?}");
     }
     debug!(distribution_id, "jdp {session_id_hex} tailored republished");
-    true
+    SessionDistribution::Tailored(miner.clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -716,15 +772,18 @@ async fn run_jdp_connection(
     let (mut reader, mut writer) = noise.into_split();
 
     let mut state = JdpSessionState::new(session_id);
-    // Whether this session got a tailored distribution (Solo or
-    // Group-Solo); the pool-wide push then stops for it —
-    // §4 "latest MUST be used" makes the tailored stream authoritative.
-    let mut tailored_active = false;
-    // The miner a tailored distribution was built for. Kept so a §10
-    // settlement can be answered with a FRESH tailored distribution —
+    // What this session is being served. Once an identity is known, a
+    // session that is NOT on the pool-wide distribution must not receive the
+    // pool-wide push — §4 "latest MUST be used" makes its own stream
+    // authoritative, and for a Solo or Group-Solo miner the pool-wide one is
+    // the PPLNS window's, not theirs.
+    let mut served = SessionDistribution::None;
+    // The miner this session belongs to, learned from the first allocate and
+    // never cleared. Kept so a §10 settlement can be answered with a FRESH
+    // tailored distribution, and so an undecided mode can be re-asked —
     // the publisher only ever republishes the pool-wide one, which this
     // session is (correctly) not listening for.
-    let mut tailored_miner: Option<AddressId> = None;
+    let mut identity: Option<AddressId> = None;
 
     loop {
         tokio::select! {
@@ -746,7 +805,9 @@ async fn run_jdp_connection(
                 {
                     continue;
                 }
-                if tailored_active {
+                // No identity yet: nothing else can be right, so the
+                // pool-wide push stands (that is also the PPLNS default).
+                if identity.is_some() && !matches!(served, SessionDistribution::PoolWide) {
                     // A tailored session ignores the pool-wide push —
                     // §4 "latest MUST be used" makes its own stream
                     // authoritative. But the publisher fires this watch
@@ -764,10 +825,15 @@ async fn run_jdp_connection(
                     if still_current {
                         continue;
                     }
-                    let Some(miner) = tailored_miner.clone() else {
+                    let Some(miner) = identity.clone() else {
                         continue;
                     };
-                    if !republish_tailored(
+                    // Also the slow backstop for an undecided mode: if the
+                    // mode was unknown at allocate time and no frame has
+                    // arrived since, this retries it on the publisher's tick.
+                    // `None` on the way out is deliberate — better no
+                    // distribution than the PPLNS one.
+                    served = republish_tailored(
                         &hooks,
                         &bridge,
                         &mut writer,
@@ -775,12 +841,7 @@ async fn run_jdp_connection(
                         &session_id_hex,
                         &miner,
                     )
-                    .await
-                    {
-                        // Left denied / unpublished on purpose — better
-                        // no distribution than the PPLNS one.
-                        tailored_active = false;
-                    }
+                    .await;
                     continue;
                 }
                 let current = bridge
@@ -977,7 +1038,8 @@ async fn run_jdp_connection(
                         // mode from the miner's address and books nothing at
                         // all, so the PPLNS miners are paid on-chain and
                         // their ledger never hears about it.
-                        if republish_tailored(
+                        identity = Some(miner_address.clone());
+                        served = republish_tailored(
                             &hooks,
                             &bridge,
                             &mut writer,
@@ -985,11 +1047,29 @@ async fn run_jdp_connection(
                             &session_id_hex,
                             miner_address,
                         )
-                        .await
-                        {
-                            tailored_active = true;
-                            tailored_miner = Some(miner_address.clone());
-                        }
+                        .await;
+                    }
+
+                    // Retry an undecided mode on EVERY inbound frame, not on
+                    // the publisher's 60 s tick. A JDC allocates ~8 s before
+                    // its mining channel opens, so at allocate time the mode
+                    // is routinely unknown — but it becomes known milliseconds
+                    // after that channel opens, and the JDC keeps sending. On
+                    // the tick alone the client would spend up to a minute
+                    // with no distribution, declare without one, and a PPLNS
+                    // address would be refused `custom-jobs-require-solo` —
+                    // trading a wrong distribution for a fatal one.
+                    if let (Some(miner), SessionDistribution::None) = (&identity, &served) {
+                        let miner = miner.clone();
+                        served = republish_tailored(
+                            &hooks,
+                            &bridge,
+                            &mut writer,
+                            session_id,
+                            &session_id_hex,
+                            &miner,
+                        )
+                        .await;
                     }
                 }
                 fan_out_events(outcome.events, &hooks).await;
@@ -1209,7 +1289,7 @@ fn resolve_distribution_acceptance(
 fn entry_from_built(
     distribution_id: u64,
     built: BuiltPayoutDistribution,
-    owner: Option<AddressId>,
+    accounting: DistributionAccounting,
     jdp_session_id: Option<u32>,
     published_at_ms: u64,
 ) -> PayoutDistributionEntry {
@@ -1222,7 +1302,7 @@ fn entry_from_built(
         reference_reward_sats: built.reference_reward_sats,
         payouts_fingerprint: built.payouts_fingerprint,
         bookable: built.bookable,
-        owner,
+        accounting,
         jdp_session_id,
         published_at_ms,
     }
@@ -1585,7 +1665,7 @@ mod tests {
             reference_reward_sats: 312_500_000,
             payouts_fingerprint: Some([id as u8; 32]),
             bookable: true,
-            owner: None,
+            accounting: DistributionAccounting::PoolWide,
             jdp_session_id: None,
             published_at_ms: 1_000,
         }

@@ -54,8 +54,9 @@ pub(crate) use bp_mining_job::SoloFeeConfig;
 use bp_mining_job::{solo_payouts, PayoutEntry, ResolvedPayouts};
 use bp_pplns::CoinbaseDistributionEntry;
 use bp_pplns_engine::engine::PplnsEngine;
+use bp_stratum_v2::bridge::DistributionAccounting;
 use bp_stratum_v2::jdp_server::TailoredDistribution;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::engines::BlitzpoolModeGate;
@@ -201,6 +202,11 @@ enum JdpDistributionFor {
     Tailored(TailoredMode),
     /// Nothing at all — and deliberately not the pool-wide one either.
     Nothing,
+    /// The pool does not know this address's mode yet, so it cannot know
+    /// which of the above applies. Distinct from `Nothing`: that is a
+    /// decision, this is the absence of one, and it resolves the moment a
+    /// mining session registers.
+    ModeUnknown,
 }
 
 /// What the pool serves a mode over JDP, decided before anything is built.
@@ -226,12 +232,17 @@ enum JdpDistributionFor {
 /// pool-wide distribution too (see [`TailoredDistribution`]), so it can
 /// declare nothing at all rather than declare something the pool cannot
 /// account for.
-fn jdp_distribution_for(mode: MiningMode) -> JdpDistributionFor {
+fn jdp_distribution_for(mode: Option<MiningMode>) -> JdpDistributionFor {
     match mode {
-        MiningMode::Pplns => JdpDistributionFor::PoolWide,
-        MiningMode::Solo => JdpDistributionFor::Tailored(TailoredMode::Solo),
-        MiningMode::GroupSolo => JdpDistributionFor::Tailored(TailoredMode::GroupSolo),
-        MiningMode::Blockparty => JdpDistributionFor::Nothing,
+        // No mining session for this address, so no port has declared its
+        // mode. Taking the gate's Solo default here published a Solo plan for
+        // whoever allocated first — and a JDC allocates ~8 s before its
+        // channel opens, so that was every JDC, every start.
+        None => JdpDistributionFor::ModeUnknown,
+        Some(MiningMode::Pplns) => JdpDistributionFor::PoolWide,
+        Some(MiningMode::Solo) => JdpDistributionFor::Tailored(TailoredMode::Solo),
+        Some(MiningMode::GroupSolo) => JdpDistributionFor::Tailored(TailoredMode::GroupSolo),
+        Some(MiningMode::Blockparty) => JdpDistributionFor::Nothing,
     }
 }
 
@@ -697,13 +708,28 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
         // path below returns `Unavailable`, never `PoolWide`: serving the
         // pool-wide distribution to such a miner pays its block to the
         // PPLNS window and books it under the PPLNS fingerprint.
-        let lookup = self.resolver.mode_gate.lookup_mode(miner_address.as_str());
-        let tailored = match jdp_distribution_for(lookup.mode) {
+        // ⚠️ `lookup_known`, not `lookup_mode`: this runs at ALLOCATE time,
+        // before the miner's mining session exists, and `lookup_mode` answers
+        // Solo for an address it has never seen. Publishing off that guess is
+        // how a PPLNS miner came to be handed a Solo distribution — and a
+        // Group-Solo finder one that pays him instead of his group.
+        let known = self.resolver.mode_gate.lookup_known(miner_address.as_str());
+        let mode = known.as_ref().map(|r| r.mode);
+        let tailored = match jdp_distribution_for(mode) {
+            JdpDistributionFor::ModeUnknown => {
+                debug!(
+                    miner = miner_address.as_str(),
+                    "jdp distribution source: no mining session for this address yet — \
+                     publishing nothing until its mode is known (the port decides it, and no \
+                     port has spoken)"
+                );
+                return TailoredDistribution::ModeUnknown;
+            }
             JdpDistributionFor::PoolWide => return TailoredDistribution::PoolWide,
             JdpDistributionFor::Nothing => {
                 warn!(
                     miner = miner_address.as_str(),
-                    mode = ?lookup.mode,
+                    mode = ?mode,
                     "jdp distribution source: this mode is not served over JDP — serving NO \
                      distribution"
                 );
@@ -720,9 +746,13 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
         };
         let built = match tailored {
             TailoredMode::GroupSolo => {
-                let Some(group_id) = lookup
-                    .group_id
-                    .as_deref()
+                // Total rather than an unwrap: `ModeUnknown` already
+                // returned above, so `known` is Some here — but expressing
+                // that with `expect` would put a panic on the money path for
+                // an invariant the compiler cannot see.
+                let Some(group_id) = known
+                    .as_ref()
+                    .and_then(|r| r.group_id.as_deref())
                     .and_then(|gid| Uuid::parse_str(gid).ok())
                 else {
                     warn!(
@@ -781,7 +811,18 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
             }
         };
         match built {
-            Some(b) => TailoredDistribution::Built(Box::new(b)),
+            // The kind travels with the build: Solo and Group-Solo produce
+            // different payout vectors for the same address, and the mining
+            // side cannot tell them apart from the owner alone.
+            Some(b) => TailoredDistribution::Built {
+                accounting: match tailored {
+                    TailoredMode::Solo => DistributionAccounting::Solo(miner_address.clone()),
+                    TailoredMode::GroupSolo => {
+                        DistributionAccounting::GroupSolo(miner_address.clone())
+                    }
+                },
+                built: Box::new(b),
+            },
             // `lower_*` failed (unusable address / weight overflow).
             // Still not the pool-wide distribution's problem.
             None => TailoredDistribution::Unavailable,
@@ -888,22 +929,44 @@ mod tests {
     #[test]
     fn jdp_answers_every_mode_with_exactly_one_distribution() {
         assert_eq!(
-            jdp_distribution_for(MiningMode::Pplns),
+            jdp_distribution_for(Some(MiningMode::Pplns)),
             JdpDistributionFor::PoolWide,
             "PPLNS rides the shared window — that IS its accounting"
         );
         assert_eq!(
-            jdp_distribution_for(MiningMode::Solo),
+            jdp_distribution_for(Some(MiningMode::Solo)),
             JdpDistributionFor::Tailored(TailoredMode::Solo)
         );
         assert_eq!(
-            jdp_distribution_for(MiningMode::GroupSolo),
+            jdp_distribution_for(Some(MiningMode::GroupSolo)),
             JdpDistributionFor::Tailored(TailoredMode::GroupSolo)
         );
         assert_eq!(
-            jdp_distribution_for(MiningMode::Blockparty),
+            jdp_distribution_for(Some(MiningMode::Blockparty)),
             JdpDistributionFor::Nothing,
             "a rental is not served over JDP, and must not fall back to pool-wide"
+        );
+
+        // The fifth answer, and the one that used to be missing: no mining
+        // session for this address, so no port has said which mode it is.
+        //
+        // This is not an edge case but the state at every JDC start — a JDC
+        // allocates ~8 s before it opens its mining channel, and the gate only
+        // learns an address when a session registers. Answering anything here
+        // is a guess, and both guesses cost money in opposite directions: a
+        // tailored plan pays one miner out of a shared window, the pool-wide
+        // one pays a Solo miner's block into the PPLNS window. So the answer
+        // is "not yet", and the caller retries.
+        assert_eq!(
+            jdp_distribution_for(None),
+            JdpDistributionFor::ModeUnknown,
+            "an undecided mode must not resolve to any distribution — it used to \
+             take the mode gate's Solo default and publish a Solo plan for it"
+        );
+        assert_ne!(
+            jdp_distribution_for(None),
+            jdp_distribution_for(Some(MiningMode::Solo)),
+            "unknown and Solo must stay distinct answers — collapsing them IS the bug"
         );
     }
 
@@ -913,8 +976,8 @@ mod tests {
     #[test]
     fn the_two_tailored_modes_are_distinct() {
         assert_ne!(
-            jdp_distribution_for(MiningMode::Solo),
-            jdp_distribution_for(MiningMode::GroupSolo)
+            jdp_distribution_for(Some(MiningMode::Solo)),
+            jdp_distribution_for(Some(MiningMode::GroupSolo))
         );
     }
 

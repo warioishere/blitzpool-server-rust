@@ -2991,45 +2991,55 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // `StreamKind`, so a new stream has to be classified rather than
             // default into being served.
             //
-            // - A **pool-wide** entry (`owner: None`) is the PPLNS window's.
-            //   Without this a Group-Solo connection could point at it: its
-            //   blocks would pay the PPLNS window while its shares kept
-            //   earning a cut of the group's.
-            // - A **tailored** entry names its miner, and the pool only ever
-            //   builds one for a mode that pays a single miner — Solo and
-            //   Group-Solo (`jdp_distribution_for`; PPLNS gets the pool-wide
-            //   push, Blockparty gets none). So a tailored entry on a shared
-            //   stream is a contradiction, and the address match does NOT
-            //   rule it out: the address is the same miner either way.
+            // The entry carries the accounting it was BUILT for, so this is a
+            // direct comparison and not an inference from the owner address.
+            // That distinction is the whole point: a Solo plan and a
+            // Group-Solo plan are both tailored to the same one address, and
+            // an owner check waves the wrong one through — a Solo plan mined
+            // on a Group-Solo stream pays the finder alone instead of
+            // splitting across the group.
             //
-            //   It is reachable, and not exotically. The JDP side picks
-            //   tailored-vs-pool-wide from the mode gate at ALLOCATE time,
-            //   and a JDC allocates before its mining channel exists
-            //   (measured: ~8 s, in both JDP modes), so the gate is empty and
-            //   answers Solo. A PPLNS miner therefore gets a Solo-tailored
-            //   distribution published for it, and the republish path leaves
-            //   that entry alone while it is current. This arm is what makes
-            //   that guess harmless: the mining side is where the mode is
-            //   known for certain, because the port has already spoken.
-            match (&entry.owner, state.stream) {
-                (Some(owner), StreamKind::Solo | StreamKind::GroupSolo) => {
+            // Reachable, and not exotically. The JDP side picks which plan to
+            // build from the mode gate at ALLOCATE time, and a JDC allocates
+            // before its mining channel exists (measured: ~8 s, in both JDP
+            // modes), so the gate is empty and answers Solo. Whatever the
+            // address really is, it gets a Solo plan. This match is where that
+            // guess is caught, because the mining side is the one place the
+            // mode is certain — the port has already spoken.
+            //
+            // Every pair is spelled out. A new stream or a new accounting kind
+            // then fails to compile instead of landing in a catch-all.
+            use crate::bridge::DistributionAccounting as Acct;
+            match (&entry.accounting, state.stream) {
+                // The plan and the stream agree: only the address is left.
+                (Acct::Solo(owner), StreamKind::Solo)
+                | (Acct::GroupSolo(owner), StreamKind::GroupSolo) => {
                     if channel_addr != owner.as_str() {
                         return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
                     }
                 }
-                (Some(_), StreamKind::Pplns | StreamKind::Blockparty) => {
+                // Pool-wide is the PPLNS window's. Without this a Group-Solo
+                // connection could point at it: its blocks would pay the PPLNS
+                // window while its shares kept earning a cut of the group's.
+                (Acct::PoolWide, StreamKind::Pplns) => {}
+
+                (Acct::PoolWide, StreamKind::Solo)
+                | (Acct::PoolWide, StreamKind::GroupSolo)
+                | (Acct::PoolWide, StreamKind::Blockparty)
+                | (Acct::Solo(_), StreamKind::Pplns)
+                | (Acct::Solo(_), StreamKind::GroupSolo)
+                | (Acct::Solo(_), StreamKind::Blockparty)
+                | (Acct::GroupSolo(_), StreamKind::Pplns)
+                | (Acct::GroupSolo(_), StreamKind::Solo)
+                | (Acct::GroupSolo(_), StreamKind::Blockparty) => {
                     tracing::warn!(
                         channel_id = input.channel_id,
                         stream = ?state.stream,
-                        "sv2: custom job references a tailored distribution on a stream that has \
-                         none — the pool builds tailored distributions only for Solo and \
-                         Group-Solo, so this one was published against a stale or unresolved \
-                         mode; rejecting rather than paying one miner out of a shared window"
+                        accounting = ?entry.accounting,
+                        "sv2: custom job references a distribution built for different \
+                         accounting than this connection's — published against a stale or \
+                         unresolved mode; rejecting rather than paying the wrong set of miners"
                     );
-                    return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
-                }
-                (None, StreamKind::Pplns) => {}
-                (None, StreamKind::Solo | StreamKind::GroupSolo | StreamKind::Blockparty) => {
                     return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
                 }
             }
@@ -6972,7 +6982,9 @@ pub(crate) mod tests {
 
     /// Registry entry with one weight-9 miner slot behind a weight-1 pool
     /// output. `owner: None` = pool-wide, `Some` = tailored (§3.1).
-    fn distribution_entry(owner: Option<AddressId>) -> crate::bridge::PayoutDistributionEntry {
+    fn distribution_entry(
+        accounting: crate::bridge::DistributionAccounting,
+    ) -> crate::bridge::PayoutDistributionEntry {
         crate::bridge::PayoutDistributionEntry {
             distribution_id: 9,
             pool_payout: WeightedOutput {
@@ -6988,7 +7000,7 @@ pub(crate) mod tests {
             reference_reward_sats: 312_500_000,
             payouts_fingerprint: Some([0x5A; 32]),
             bookable: true,
-            owner,
+            accounting,
             jdp_session_id: None,
             published_at_ms: 1_000,
         }
@@ -7063,7 +7075,7 @@ pub(crate) mod tests {
     fn a_coinbase_only_distribution_job_is_recorded_by_the_mining_side_and_bookable() {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let fingerprint = entry.payouts_fingerprint.expect("fixture must carry one");
         let blob = conformant_outputs(&entry, 312_500_000);
         let acc = accepted(entry);
@@ -7124,7 +7136,7 @@ pub(crate) mod tests {
             let mut s = negotiated_session_with_extended_channel();
             s.stream = stream;
             let cid = s.primary_channel.unwrap();
-            let entry = distribution_entry(None);
+            let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
             // Declared WITH the conformant coinbase, so the declaration
             // binding and §7.1 both pass and the only variable left is the
             // declaration itself.
@@ -7182,7 +7194,7 @@ pub(crate) mod tests {
     fn a_frame_tlv_does_not_hand_an_undeclared_distribution_to_the_jdp_path() {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
         // Declared WITHOUT a distribution — `distribution_id: None`.
         let bridge = bridge_entry_declaring(
@@ -7276,7 +7288,7 @@ pub(crate) mod tests {
     /// started being registered — the coinbase is identical in all three.
     #[test]
     fn a_distribution_backed_job_is_bound_to_the_tip_and_the_token() {
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
 
         for (job_tip, alloc_addr, expected) in [
@@ -7330,7 +7342,7 @@ pub(crate) mod tests {
     fn a_distribution_reference_does_not_authorise_a_token_the_pool_never_issued() {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
         let acc = accepted(entry);
         let mut input = custom_job_input(cid, Token([0xEE; 16]));
@@ -7356,7 +7368,7 @@ pub(crate) mod tests {
     fn set_custom_mining_job_conformant_distribution_coinbase_accepts() {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
         let acc = accepted(entry);
         let mut input = custom_job_input(cid, Token([1u8; 16]));
@@ -7382,7 +7394,9 @@ pub(crate) mod tests {
     fn set_custom_mining_job_nonconformant_coinbase_rejects() {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        let acc = accepted(distribution_entry(None));
+        let acc = accepted(distribution_entry(
+            crate::bridge::DistributionAccounting::PoolWide,
+        ));
         // Default input carries an empty `coinbase_tx_outputs` ([0x00]) —
         // the recomputed vector always expects at least the pool output.
         let mut input = custom_job_input(cid, Token([1u8; 16]));
@@ -7410,7 +7424,9 @@ pub(crate) mod tests {
     fn set_custom_mining_job_undecodable_coinbase_outputs_rejects() {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        let acc = accepted(distribution_entry(None));
+        let acc = accepted(distribution_entry(
+            crate::bridge::DistributionAccounting::PoolWide,
+        ));
         let mut input = custom_job_input(cid, Token([1u8; 16]));
         input.distribution_id = Some(9);
         input.coinbase_tx_outputs = vec![0x01]; // count=1, no TxOut bytes
@@ -7436,7 +7452,7 @@ pub(crate) mod tests {
     fn set_custom_mining_job_stale_distribution_rejects() {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
         let mut input = custom_job_input(cid, Token([1u8; 16]));
         input.distribution_id = Some(9);
@@ -7490,7 +7506,7 @@ pub(crate) mod tests {
     fn set_custom_mining_job_distribution_tlv_without_negotiation_rejects() {
         let mut s = session_with_extended_channel(); // 0x0003 NOT negotiated
         let cid = s.primary_channel.unwrap();
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
         let acc = accepted(entry);
         let mut input = custom_job_input(cid, Token([1u8; 16]));
@@ -7520,7 +7536,9 @@ pub(crate) mod tests {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let other = "bcrt1qvs8k07ggszru23v9p42vpg4jxts9y2k8kkujja";
-        let entry = distribution_entry(Some(AddressId::new(other.to_string()).unwrap()));
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::Solo(
+            AddressId::new(other.to_string()).unwrap(),
+        ));
         let blob = conformant_outputs(&entry, 312_500_000);
         let acc = accepted(entry);
         let mut input = custom_job_input(cid, Token([1u8; 16]));
@@ -7552,7 +7570,9 @@ pub(crate) mod tests {
         let mut s = negotiated_session_with_extended_channel();
         s.stream = StreamKind::Solo;
         let cid = s.primary_channel.unwrap();
-        let entry = distribution_entry(Some(AddressId::new(REGTEST_ADDR.to_string()).unwrap()));
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::Solo(
+            AddressId::new(REGTEST_ADDR.to_string()).unwrap(),
+        ));
         let blob = conformant_outputs(&entry, 312_500_000);
         let acc = accepted(entry);
         let mut input = custom_job_input(cid, Token([1u8; 16]));
@@ -7572,36 +7592,48 @@ pub(crate) mod tests {
         ));
     }
 
-    /// A tailored distribution belongs to a mode that pays ONE miner. The
-    /// pool builds one only for Solo and Group-Solo (`jdp_distribution_for`:
-    /// PPLNS rides the pool-wide push, Blockparty gets none), so a tailored
-    /// entry on a shared stream is a contradiction — and the owner check does
-    /// not catch it, because the address is the same miner either way.
+    /// A published distribution belongs to ONE accounting, and the entry says
+    /// which. This walks the whole matrix: three accounting kinds against four
+    /// streams, twelve pairs, each asserted in the direction it belongs.
     ///
-    /// Why it is reachable: the JDP side decides tailored-vs-pool-wide from
-    /// the mode gate at ALLOCATE time, and a JDC allocates ~8 s before its
-    /// mining channel exists (measured against the reference client, both JDP
-    /// modes). The gate is empty then and answers Solo, so a PPLNS miner gets
-    /// a Solo-tailored distribution published for it. Left unchecked, its
-    /// shares earn a cut of the PPLNS window while its own blocks pay only
-    /// itself.
+    /// The owner address alone cannot decide it. A Solo plan and a Group-Solo
+    /// plan are both tailored to the same one address and differ only in who
+    /// the block pays — the miner alone, or the group by round shares. An
+    /// owner check passes both, which is why this compares the accounting.
     ///
-    /// Both directions over every stream, so this cannot pass by refusing
-    /// tailored entries outright.
+    /// Why it is reachable, and not exotically: the JDP side picks which plan
+    /// to build from the mode gate at ALLOCATE time, and a JDC allocates ~8 s
+    /// before its mining channel exists (measured against the reference
+    /// client, both JDP modes). The gate is empty then and answers Solo, so
+    /// EVERY address gets a Solo plan in that window — a PPLNS miner whose
+    /// shares would earn a cut of the window while its block paid only
+    /// itself, and a Group-Solo finder whose block would pay him instead of
+    /// his group.
     #[test]
-    fn a_tailored_distribution_is_refused_on_a_shared_stream() {
-        for (stream, accepted_expected) in [
-            (StreamKind::Solo, true),
-            (StreamKind::GroupSolo, true),
-            (StreamKind::Pplns, false),
-            (StreamKind::Blockparty, false),
-        ] {
+    fn a_distribution_is_only_served_to_the_accounting_it_was_built_for() {
+        use crate::bridge::DistributionAccounting as Acct;
+        let me = || AddressId::new(REGTEST_ADDR.to_string()).unwrap();
+
+        let cases = [
+            (Acct::PoolWide, StreamKind::Pplns, true),
+            (Acct::PoolWide, StreamKind::Solo, false),
+            (Acct::PoolWide, StreamKind::GroupSolo, false),
+            (Acct::PoolWide, StreamKind::Blockparty, false),
+            (Acct::Solo(me()), StreamKind::Solo, true),
+            (Acct::Solo(me()), StreamKind::Pplns, false),
+            (Acct::Solo(me()), StreamKind::GroupSolo, false),
+            (Acct::Solo(me()), StreamKind::Blockparty, false),
+            (Acct::GroupSolo(me()), StreamKind::GroupSolo, true),
+            (Acct::GroupSolo(me()), StreamKind::Pplns, false),
+            (Acct::GroupSolo(me()), StreamKind::Solo, false),
+            (Acct::GroupSolo(me()), StreamKind::Blockparty, false),
+        ];
+
+        for (accounting, stream, accepted_expected) in cases {
             let mut s = negotiated_session_with_extended_channel();
             s.stream = stream;
             let cid = s.primary_channel.unwrap();
-            // Tailored to THIS channel's own address — the owner check passes
-            // in every arm, so only the stream rule can tell them apart.
-            let entry = distribution_entry(Some(AddressId::new(REGTEST_ADDR.to_string()).unwrap()));
+            let entry = distribution_entry(accounting.clone());
             let blob = conformant_outputs(&entry, 312_500_000);
             let acc = accepted(entry);
             let mut input = custom_job_input(cid, Token([1u8; 16]));
@@ -7621,17 +7653,52 @@ pub(crate) mod tests {
                 (OutboundFrame::SetCustomMiningJobError { error_code, .. }, false) => {
                     assert_eq!(
                         error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH,
-                        "{stream:?}"
+                        "{accounting:?} on {stream:?}"
                     );
                     assert!(
                         s.channels.get(&cid).unwrap().extended_jobs.is_empty(),
-                        "{stream:?}: a refused job must not register"
+                        "{accounting:?} on {stream:?}: a refused job must not register"
                     );
                 }
                 (other, want) => {
-                    panic!("{stream:?}: wanted accepted={want}, got {other:?}")
+                    panic!("{accounting:?} on {stream:?}: wanted accepted={want}, got {other:?}")
                 }
             }
+        }
+    }
+
+    /// The address still has to match on the stream the plan DOES belong to —
+    /// the accounting check narrows the pairs, it does not replace the owner
+    /// check.
+    #[test]
+    fn a_matching_accounting_still_checks_the_owner() {
+        use crate::bridge::DistributionAccounting as Acct;
+        let stranger =
+            AddressId::new("bcrt1qvs8k07ggszru23v9p42vpg4jxts9y2k8kkujja".to_string()).unwrap();
+
+        let mut s = negotiated_session_with_extended_channel();
+        s.stream = StreamKind::Solo;
+        let cid = s.primary_channel.unwrap();
+        let entry = distribution_entry(Acct::Solo(stranger));
+        let blob = conformant_outputs(&entry, 312_500_000);
+        let acc = accepted(entry);
+        let mut input = custom_job_input(cid, Token([1u8; 16]));
+        input.distribution_id = Some(9);
+        input.coinbase_tx_outputs = blob;
+
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            None,
+            Some(&distribution_allocation(REGTEST_ADDR, 1)),
+            Some(&acc),
+            1_000,
+        );
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+            }
+            other => panic!("another miner's Solo plan must be refused, got {other:?}"),
         }
     }
 
@@ -7666,7 +7733,7 @@ pub(crate) mod tests {
             &FIXTURE_SCRIPT_SIG_PREFIX,
             &self_paying,
         );
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let acc = accepted(entry);
         let mut input = custom_job_matching(cid, &bridge);
         input.distribution_id = Some(9);
@@ -7694,7 +7761,7 @@ pub(crate) mod tests {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
         let bridge =
             bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob);
@@ -7755,7 +7822,7 @@ pub(crate) mod tests {
     /// pin it to the inheritance.
     #[test]
     fn full_template_custom_job_inherits_its_declarations_distribution() {
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
         let token = Token([1u8; 16]);
         let declared =
@@ -7844,7 +7911,9 @@ pub(crate) mod tests {
             &input,
             Some(&job_ref_for(&declared)),
             None,
-            Some(&accepted(distribution_entry(None))),
+            Some(&accepted(distribution_entry(
+                crate::bridge::DistributionAccounting::PoolWide,
+            ))),
             1_000,
         );
         match &out.outbound[0] {
@@ -7869,7 +7938,7 @@ pub(crate) mod tests {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
         let declared = declared_under_unbookable_distribution(
             bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob),
@@ -7914,7 +7983,7 @@ pub(crate) mod tests {
         let mut s = session_with_extended_channel(); // 0x0003 NOT negotiated here
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
         let declared = declared_under_distribution(
             bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob),
@@ -7954,7 +8023,7 @@ pub(crate) mod tests {
             .push(SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
         let declared = declared_under_distribution(
             bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob),
@@ -7989,7 +8058,7 @@ pub(crate) mod tests {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
         let declared = declared_under_distribution(
             bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob),
@@ -8027,7 +8096,7 @@ pub(crate) mod tests {
             let mut s = negotiated_session_with_extended_channel();
             s.stream = stream;
             let cid = s.primary_channel.unwrap();
-            let entry = distribution_entry(None);
+            let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
             let blob = conformant_outputs(&entry, 312_500_000);
             let acc = accepted(entry);
             let mut input = custom_job_input(cid, Token([1u8; 16]));
@@ -8092,7 +8161,7 @@ pub(crate) mod tests {
         let mut s = negotiated_session_with_extended_channel();
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let blob = conformant_outputs(&entry, 312_500_000);
         let acc = accepted(entry);
         let mut input = custom_job_input(cid, token);
@@ -8146,7 +8215,7 @@ pub(crate) mod tests {
     #[test]
     fn a_swapped_coinbase_paying_the_same_distribution_is_still_rejected() {
         let token = Token([1u8; 16]);
-        let entry = distribution_entry(None);
+        let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
         let declared_blob = conformant_outputs(&entry, 312_500_000);
         let halved_blob = conformant_outputs(&entry, 156_250_000);
         assert_ne!(declared_blob, halved_blob, "the two revenues must differ");

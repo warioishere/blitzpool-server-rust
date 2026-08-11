@@ -2400,7 +2400,7 @@ mod tests {
             reference_reward_sats: 312_500_000,
             payouts_fingerprint: Some([0x5A; 32]),
             bookable: true,
-            owner: None,
+            accounting: crate::bridge::DistributionAccounting::PoolWide,
             jdp_session_id: None,
             published_at_ms: 0,
         };
@@ -2690,7 +2690,7 @@ mod tests {
             reference_reward_sats: 312_500_000,
             payouts_fingerprint: Some([0x5A; 32]),
             bookable: true,
-            owner: Some(owner.clone()),
+            accounting: crate::bridge::DistributionAccounting::GroupSolo(owner.clone()),
             jdp_session_id: Some(OLD_SESSION),
             published_at_ms,
         };
