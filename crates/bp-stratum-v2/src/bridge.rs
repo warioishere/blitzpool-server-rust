@@ -865,6 +865,25 @@ impl JdpDeclaredJobRegistry {
         self.pool_wide_denied.remove(&jdp_session_id);
     }
 
+    /// Drop a session's tailored slot when it stops being a tailored session
+    /// — its miner turned out to be, or became, a PPLNS one.
+    ///
+    /// Clearing the denial is not enough on its own. `distribution_acceptance`
+    /// under [`DistributionScope::JdpSession`] prefers a session's tailored
+    /// slot whenever its `latest` is `Some`, so a slot left behind keeps
+    /// answering for every pool-wide id the session is subsequently pushed —
+    /// and every one of them resolves `Stale`. The session then declares
+    /// against distributions the pool believes it is serving correctly and is
+    /// refused for the life of the connection.
+    ///
+    /// Returns whether a slot was actually removed, so the caller can log a
+    /// real transition rather than a no-op.
+    pub fn clear_tailored(&mut self, jdp_session_id: u32) -> bool {
+        self.tailored_distributions
+            .remove(&jdp_session_id)
+            .is_some()
+    }
+
     /// Drop every entry owned by a closing JDP session. Returns the
     /// count removed — useful for diagnostics + the IO layer's
     /// connection-close log.

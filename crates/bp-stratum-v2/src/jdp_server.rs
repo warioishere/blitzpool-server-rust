@@ -54,7 +54,7 @@ use stratum_core::parsers_sv2::{parse_message_frame_with_tlvs, AnyMessage};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::bridge::{
     AllocatedTokenRef, AllocationKind, DistributionAcceptance, DistributionAccounting,
@@ -681,6 +681,81 @@ enum SessionDistribution {
     Denied,
 }
 
+/// Makes "this session is still waiting for its mode" visible.
+///
+/// `AwaitingMode` is the NORMAL first answer for every JDC — it allocates ~8 s
+/// before its mining channel opens, so warning on entry would fire once per
+/// healthy start and mean nothing. What is not normal is STAYING there. An
+/// address that never opens a mining session — a JDC pointed at the pool with
+/// no miner behind it, or one whose miner mines somewhere else — waits
+/// forever: it is denied the pool-wide distribution the whole time, publishes
+/// nothing, and every trace of that is at `debug`. From outside it is
+/// indistinguishable from a healthy session that happens not to be declaring,
+/// which is the worst property a permanent refusal can have.
+///
+/// So the wait is timed and reported once, with the one thing an operator can
+/// act on: the pool learns Solo from PPLNS from the PORT a miner connects on,
+/// and until some miner opens a session for this address there is no answer to
+/// be had. The recovery is reported too, so the log says how long it took
+/// rather than trailing off.
+struct AwaitingModeWatch {
+    /// When the current wait started. `None` = not waiting.
+    since_ms: Option<u64>,
+    /// Whether THIS wait has already been reported. Reset with the wait, so a
+    /// session that flaps gets one line per episode, not one per frame — the
+    /// retry runs on every inbound frame.
+    warned: bool,
+}
+
+impl AwaitingModeWatch {
+    /// Comfortably past the ~8 s a healthy JDC needs, and under the
+    /// publisher's 60 s tick so the per-frame retry is what trips it.
+    const WARN_AFTER_MS: u64 = 30_000;
+
+    fn new() -> Self {
+        Self {
+            since_ms: None,
+            warned: false,
+        }
+    }
+
+    /// Feed EVERY `served` transition through here, including the ones that
+    /// resolve it.
+    fn observe(
+        &mut self,
+        served: &SessionDistribution,
+        session_id_hex: &str,
+        miner: &AddressId,
+        now: u64,
+    ) {
+        let SessionDistribution::AwaitingMode = served else {
+            if self.warned {
+                info!(
+                    miner = miner.as_str(),
+                    waited_ms = now.saturating_sub(self.since_ms.unwrap_or(now)),
+                    "jdp {session_id_hex} payout mode known now — serving it again"
+                );
+            }
+            self.since_ms = None;
+            self.warned = false;
+            return;
+        };
+        let since = *self.since_ms.get_or_insert(now);
+        let waited_ms = now.saturating_sub(since);
+        if !self.warned && waited_ms >= Self::WARN_AFTER_MS {
+            self.warned = true;
+            warn!(
+                miner = miner.as_str(),
+                waited_ms,
+                "jdp {session_id_hex} has no known payout mode — it is served no payout \
+                 distribution and cannot declare. The pool learns Solo from PPLNS off the port \
+                 a miner connects on, so this clears only once a miner opens a mining session \
+                 for this address"
+            );
+        }
+    }
+}
+
 /// Build and push a fresh tailored distribution for `miner` on this session.
 ///
 /// Used both on the first allocate and after a §10 settlement, which
@@ -693,16 +768,79 @@ async fn republish_tailored(
     session_id: u32,
     session_id_hex: &str,
     miner: &AddressId,
+    // The pool-wide distribution id this session was last WRITTEN, or `None`
+    // if what it is holding is not a pool-wide one (none was ever pushed, or a
+    // tailored push has replaced it since — §4 gives the client ONE current
+    // distribution, not one per stream). Updated in place, so the catch-up
+    // below can tell "already has it" from "is holding something else".
+    last_pool_wide_written: &mut Option<u64>,
 ) -> SessionDistribution {
     let (accounting, built) = match hooks.distribution_source.build_for_miner(miner).await {
         TailoredDistribution::Built { accounting, built } => (accounting, *built),
-        // The miner's mode changed under us (now PPLNS): the pool-wide
-        // push is its accounting again.
+        // This miner rides the pool-wide distribution — either it always did
+        // (its mode simply became known) or it changed under us and is PPLNS
+        // now. Three things have to happen together, and leaving any one out
+        // strands the session:
+        //
+        // 1. **Drop a tailored slot it may still hold.** `distribution_accep-
+        //    tance` under `JdpSession` scope PREFERS that slot, so one left
+        //    behind answers for every pool-wide id pushed afterwards — and
+        //    every one of them resolves `Stale`.
+        // 2. **Lift the denial**, or the acceptance answers `Unknown`.
+        // 3. **Push the current distribution NOW**, unless the session
+        //    demonstrably already holds it. Everything that reaches this arm
+        //    from somewhere other than the pool-wide stream is holding
+        //    something else: a session that was awaiting its mode was excluded
+        //    from the pool-wide pushes and holds an id that has since fallen
+        //    out of the §7.2 window, and a tailored one holds its own plan,
+        //    which §4 makes authoritative for it. Only `stale-chain-tip` is a
+        //    benign declare error for an SRI jd-client;
+        //    `stale-payout-distribution` ends the session. Waiting for the
+        //    next publish is not a recovery — the publisher skips a tick whose
+        //    fingerprint is unchanged, so on a quiet window there is no next
+        //    publish.
         TailoredDistribution::PoolWide => {
-            bridge
-                .write()
-                .expect("bridge RwLock poisoned")
-                .allow_pool_wide(session_id);
+            let current = {
+                let mut guard = bridge.write().expect("bridge RwLock poisoned");
+                let had_tailored = guard.clear_tailored(session_id);
+                guard.allow_pool_wide(session_id);
+                if had_tailored {
+                    debug!(
+                        "jdp {session_id_hex} tailored slot dropped — this miner is on the \
+                         pool-wide distribution now"
+                    );
+                }
+                guard.current_pool_wide()
+            };
+            match current {
+                // Already holding it — a session that has been on the
+                // pool-wide stream all along receives its pushes like every
+                // other, and re-sending the same id per frame would be
+                // traffic for its own sake.
+                Some(entry) if *last_pool_wide_written == Some(entry.distribution_id) => {}
+                Some(entry) => {
+                    let wire = wire_from_entry(&entry);
+                    if let Err(err) = write_jdp_outbound_frames(
+                        writer,
+                        vec![JdpOutboundFrame::SetPayoutDistribution(wire)],
+                    )
+                    .await
+                    {
+                        warn!("jdp {session_id_hex} pool-wide catch-up write: {err:?}");
+                    } else {
+                        *last_pool_wide_written = Some(entry.distribution_id);
+                        debug!(
+                            distribution_id = entry.distribution_id,
+                            "jdp {session_id_hex} pool-wide catch-up pushed"
+                        );
+                    }
+                }
+                // Nothing published yet at all. The session is allowed on the
+                // pool-wide stream, so the publisher's first push reaches it.
+                None => {
+                    debug!("jdp {session_id_hex} on the pool-wide distribution, none published yet")
+                }
+            }
             return SessionDistribution::PoolWide;
         }
         // Not known YET. Publish nothing and keep pool-wide denied: both
@@ -758,6 +896,11 @@ async fn republish_tailored(
     {
         warn!("jdp {session_id_hex} tailored republish write: {err:?}");
     }
+    // Whatever pool-wide id this session was holding, it is not holding it any
+    // more — §4 makes the LATEST push the one it must use. If it ever comes
+    // back to the pool-wide distribution it has to be pushed one again, even
+    // an id it has already seen.
+    *last_pool_wide_written = None;
     debug!(distribution_id, "jdp {session_id_hex} tailored republished");
     SessionDistribution::Tailored(miner.clone())
 }
@@ -797,6 +940,11 @@ async fn run_jdp_connection(
     // the publisher only ever republishes the pool-wide one, which this
     // session is (correctly) not listening for.
     let mut identity: Option<AddressId> = None;
+    let mut awaiting = AwaitingModeWatch::new();
+    // The pool-wide distribution id last written to this client, so a session
+    // arriving on that stream can be told whether it is behind. `None` while
+    // it is holding something else (nothing yet, or a tailored push).
+    let mut last_pool_wide_written: Option<u64> = None;
 
     loop {
         tokio::select! {
@@ -846,15 +994,18 @@ async fn run_jdp_connection(
                     // arrived since, this retries it on the publisher's tick.
                     // `None` on the way out is deliberate — better no
                     // distribution than the PPLNS one.
-                    served = republish_tailored(
+                    let next = republish_tailored(
                         &hooks,
                         &bridge,
                         &mut writer,
                         session_id,
                         &session_id_hex,
                         &miner,
+                        &mut last_pool_wide_written,
                     )
                     .await;
+                    served = next;
+                    awaiting.observe(&served, &session_id_hex, &miner, now_ms());
                     continue;
                 }
                 let current = bridge
@@ -868,6 +1019,7 @@ async fn run_jdp_connection(
                         warn!("jdp {session_id_hex} distribution push write: {err:?}");
                         break;
                     }
+                    last_pool_wide_written = Some(entry.distribution_id);
                 }
             }
             frame_recv = reader.read_frame() => {
@@ -973,9 +1125,12 @@ async fn run_jdp_connection(
                         .expect("bridge RwLock poisoned")
                         .current_pool_wide();
                     match current {
-                        Some(entry) => outcome.outbound.push(
-                            JdpOutboundFrame::SetPayoutDistribution(wire_from_entry(&entry)),
-                        ),
+                        Some(entry) => {
+                            last_pool_wide_written = Some(entry.distribution_id);
+                            outcome.outbound.push(JdpOutboundFrame::SetPayoutDistribution(
+                                wire_from_entry(&entry),
+                            ));
+                        }
                         // Negotiation offered 0x0003 only when a
                         // distribution was publishable; hitting this
                         // means it vanished in between — loud, and the
@@ -1052,15 +1207,18 @@ async fn run_jdp_connection(
                         // all, so the PPLNS miners are paid on-chain and
                         // their ledger never hears about it.
                         identity = Some(miner_address.clone());
-                        served = republish_tailored(
+                        let next = republish_tailored(
                             &hooks,
                             &bridge,
                             &mut writer,
                             session_id,
                             &session_id_hex,
                             miner_address,
+                            &mut last_pool_wide_written,
                         )
                         .await;
+                        served = next;
+                        awaiting.observe(&served, &session_id_hex, miner_address, now_ms());
                     }
 
                     // Retry an undecided mode on EVERY inbound frame, not on
@@ -1074,15 +1232,18 @@ async fn run_jdp_connection(
                     // trading a wrong distribution for a fatal one.
                     if let (Some(miner), SessionDistribution::AwaitingMode) = (&identity, &served) {
                         let miner = miner.clone();
-                        served = republish_tailored(
+                        let next = republish_tailored(
                             &hooks,
                             &bridge,
                             &mut writer,
                             session_id,
                             &session_id_hex,
                             &miner,
+                            &mut last_pool_wide_written,
                         )
                         .await;
+                        served = next;
+                        awaiting.observe(&served, &session_id_hex, &miner, now_ms());
                     }
                 }
                 fan_out_events(outcome.events, &hooks).await;
@@ -2064,6 +2225,83 @@ mod tests {
         assert!(state
             .negotiated_extensions
             .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS));
+    }
+
+    /// A healthy JDC start must not warn. It allocates ~8 s before its mining
+    /// channel opens, so `AwaitingMode` on the first frames is the normal
+    /// path — a line there would fire once per JDC and train the operator to
+    /// ignore the one that matters.
+    #[test]
+    fn a_short_wait_for_the_mode_is_not_reported() {
+        let mut w = AwaitingModeWatch::new();
+        let miner = AddressId::new(ADDR.to_string()).unwrap();
+        for t in [0, 3_000, 8_000] {
+            w.observe(&SessionDistribution::AwaitingMode, "jdp-test", &miner, t);
+        }
+        assert!(!w.warned, "8 s is the measured normal, not an anomaly");
+        w.observe(
+            &SessionDistribution::Tailored(miner.clone()),
+            "jdp-test",
+            &miner,
+            8_100,
+        );
+        assert_eq!(w.since_ms, None, "a resolved wait must reset");
+    }
+
+    /// A wait that outlasts the threshold is reported exactly once, however
+    /// many frames arrive — the retry runs on EVERY inbound frame, so a line
+    /// per observation would be a line per frame.
+    #[test]
+    fn a_stuck_session_is_reported_once_and_its_recovery_too() {
+        let mut w = AwaitingModeWatch::new();
+        let miner = AddressId::new(ADDR.to_string()).unwrap();
+        w.observe(
+            &SessionDistribution::AwaitingMode,
+            "jdp-test",
+            &miner,
+            1_000,
+        );
+        assert!(!w.warned);
+        w.observe(
+            &SessionDistribution::AwaitingMode,
+            "jdp-test",
+            &miner,
+            1_000 + AwaitingModeWatch::WARN_AFTER_MS,
+        );
+        assert!(w.warned, "the threshold must trip it");
+        assert_eq!(w.since_ms, Some(1_000), "the wait's start must not move");
+
+        // Recovery clears BOTH, so a second episode on the same connection is
+        // reported again instead of being swallowed by the first one's flag.
+        w.observe(&SessionDistribution::PoolWide, "jdp-test", &miner, 999_000);
+        assert!(!w.warned);
+        assert_eq!(w.since_ms, None);
+        w.observe(
+            &SessionDistribution::AwaitingMode,
+            "jdp-test",
+            &miner,
+            999_500,
+        );
+        assert_eq!(
+            w.since_ms,
+            Some(999_500),
+            "a new episode starts its own clock"
+        );
+    }
+
+    /// `Denied` is not `AwaitingMode`. It has its own warning at the point it
+    /// happens (the build failed, and it says why); counting it as a wait for
+    /// the mode would report the wrong cure — "no miner has connected for this
+    /// address" — for a session whose mode is perfectly well known.
+    #[test]
+    fn a_denied_session_is_not_counted_as_awaiting_its_mode() {
+        let mut w = AwaitingModeWatch::new();
+        let miner = AddressId::new(ADDR.to_string()).unwrap();
+        for t in [0, 60_000, 600_000] {
+            w.observe(&SessionDistribution::Denied, "jdp-test", &miner, t);
+        }
+        assert!(!w.warned);
+        assert_eq!(w.since_ms, None);
     }
 
     /// The §3.1 wire form mirrors the registry entry: weights ride in

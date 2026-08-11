@@ -1191,3 +1191,348 @@ async fn a_session_is_served_nothing_until_its_mode_is_known() {
     accept_handle.abort();
     server.shutdown().await;
 }
+
+/// What the mode gate answers for this session's miner, switchable mid-test.
+///
+/// Three answers because the transitions between them are the thing under
+/// test: a session starts not knowing, and the answer it eventually gets can
+/// be either a tailored plan or "you are on the pool-wide one".
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GateAnswer {
+    Unknown,
+    Tailored,
+    PoolWide,
+}
+
+struct FlippableSource {
+    answer: std::sync::Mutex<GateAnswer>,
+    next_id: AtomicU64,
+    /// Bumped to make the pool-wide fingerprint change, which is the ONLY
+    /// thing that makes the publisher publish again. Left alone, the publisher
+    /// goes quiet — the state a real pool is in whenever its window is quiet,
+    /// and the state that makes "the session catches itself up" testable at
+    /// all: with the publisher still pushing, a missing catch-up would be
+    /// papered over by the next tick.
+    generation: AtomicU64,
+    miner: AddressId,
+}
+
+impl FlippableSource {
+    fn set(&self, answer: GateAnswer) {
+        *self.answer.lock().unwrap() = answer;
+    }
+
+    fn built(&self) -> BuiltPayoutDistribution {
+        let mut fingerprint = FINGERPRINT;
+        fingerprint[0] = self.generation.load(Ordering::SeqCst) as u8;
+        BuiltPayoutDistribution {
+            pool_payout: pool_slot(),
+            payouts: miner_slots(),
+            dust_limits: dust_limits(),
+            additional_outputs: Vec::new(),
+            reference_reward_sats: REFERENCE_REWARD,
+            payouts_fingerprint: Some(fingerprint),
+            bookable: true,
+        }
+    }
+}
+
+#[async_trait]
+impl PayoutDistributionSource for FlippableSource {
+    async fn build_pool_wide(&self) -> Option<BuiltPayoutDistribution> {
+        Some(self.built())
+    }
+
+    async fn build_for_miner(&self, _miner_address: &AddressId) -> TailoredDistribution {
+        match *self.answer.lock().unwrap() {
+            GateAnswer::Unknown => TailoredDistribution::ModeUnknown,
+            GateAnswer::PoolWide => TailoredDistribution::PoolWide,
+            GateAnswer::Tailored => TailoredDistribution::Built {
+                accounting: bp_stratum_v2::bridge::DistributionAccounting::Solo(self.miner.clone()),
+                built: Box::new(self.built()),
+            },
+        }
+    }
+
+    async fn next_distribution_id(&self) -> Option<u64> {
+        Some(self.next_id.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+/// Bring a JDC up to the point where it has negotiated 0x0003 and consumed the
+/// §3.1 initial pool-wide push. Returns the id it saw.
+async fn negotiated_jdc(addr: std::net::SocketAddr) -> (Reader, Writer, u64) {
+    let (mut reader, mut writer) = connect_jdc(addr).await;
+    write_msg(&mut writer, setup_connection(addr.port())).await;
+    expect_setup_success(read_jdc(&mut reader).await);
+    write_msg(
+        &mut writer,
+        AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
+            ExtensionsNegotiation::RequestExtensions(
+                RequestExtensions {
+                    request_id: 1,
+                    requested_extensions: vec![SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS]
+                        .try_into()
+                        .unwrap(),
+                }
+                .into_static(),
+            ),
+        )),
+    )
+    .await;
+    match read_jdc(&mut reader).await {
+        JdcInbound::Message(AnyMessage::Extensions(_)) => {}
+        other => panic!("expected RequestExtensionsSuccess, got {other:?}"),
+    }
+    let first = match read_jdc(&mut reader).await {
+        JdcInbound::PayoutDistribution(d) => d.distribution_id,
+        other => panic!("§3.1: expected the pool-wide distribution, got {other:?}"),
+    };
+    (reader, writer, first)
+}
+
+async fn allocate(reader: &mut Reader, writer: &mut Writer, request_id: u32) -> Vec<u8> {
+    write_msg(
+        writer,
+        AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobToken(
+            AllocateMiningJobToken {
+                request_id,
+                user_identifier: REGTEST_ADDR.to_string().try_into().unwrap(),
+            }
+            .into_static(),
+        )),
+    )
+    .await;
+    match read_jdc(reader).await {
+        JdcInbound::Message(AnyMessage::JobDeclaration(
+            JobDeclaration::AllocateMiningJobTokenSuccess(s),
+        )) => s.mining_job_token.as_bytes().to_vec(),
+        other => panic!("expected AllocateMiningJobTokenSuccess #{request_id}, got {other:?}"),
+    }
+}
+
+/// Read frames until a `SetPayoutDistribution` shows up, or give up.
+async fn next_distribution(reader: &mut Reader, within: Duration) -> Option<u64> {
+    for _ in 0..4 {
+        match try_read_jdc(reader, within).await {
+            Some(JdcInbound::PayoutDistribution(d)) => return Some(d.distribution_id),
+            Some(_) => continue,
+            None => return None,
+        }
+    }
+    None
+}
+
+fn spawn_jdp_server(
+    source: Arc<FlippableSource>,
+    bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
+    interval: Duration,
+) -> StratumV2JdpServer {
+    let noise_config = NoiseConfig::parse_strings(TEST_PUB, TEST_PRV, DEFAULT_CERT_VALIDITY)
+        .expect("noise config");
+    let mut hooks = JdpServerHooks::no_op();
+    hooks.distribution_source = source;
+    hooks.prev_hash_provider = Arc::new(FixedPrevHash);
+    hooks.allocate_resolver = Arc::new(BaseModeAllocateResolver);
+    StratumV2JdpServer::spawn(noise_config, hooks, bridge, interval)
+}
+
+async fn accept_loop(
+    server: StratumV2JdpServer,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((socket, peer)) = listener.accept().await else {
+                break;
+            };
+            socket.set_nodelay(true).ok();
+            server.accept_connection(socket, peer.to_string());
+        }
+    });
+    (addr, handle)
+}
+
+/// The coinbase suffix that conforms to the fixed test weights — every
+/// distribution in these tests carries the same ones.
+fn suffix_for_test_weights() -> Vec<u8> {
+    let pool = bitcoin::TxOut {
+        value: bitcoin::Amount::from_sat(pool_slot().weight),
+        script_pubkey: bitcoin::ScriptBuf::from_bytes(pool_slot().script_pubkey),
+    };
+    conformant_suffix(&pool, &miner_slots(), &dust_limits())
+}
+
+/// §6.4.2 rate-limits token issuance to 1/s per connection, and an over-limit
+/// request is dropped in silence. Everything that takes a token — an allocate,
+/// and an accepted declare — has to be spaced out or the test reads the NEXT
+/// frame as the answer to a request that was never answered.
+async fn respect_token_rate_limit() {
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+}
+
+/// A session that waited out its mode and turns out to be PPLNS must be caught
+/// up on the CURRENT pool-wide distribution, not merely un-denied.
+///
+/// While it waited it was excluded from the pool-wide pushes — correctly, the
+/// pool did not know they were its. So the last id it holds is whatever was
+/// current when it connected, and by the time the mode arrives that id has
+/// fallen out of the §7.2 window. Lifting the denial alone leaves it declaring
+/// against a stale id and answered `stale-payout-distribution`, which is not a
+/// benign error: `stale-chain-tip` is the only code an SRI jd-client retries,
+/// every other one sends it off the pool into solo fallback.
+///
+/// The publisher goes quiet before the flip (an unchanged fingerprint is not
+/// republished), so the frame the client receives cannot have come from a tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_that_waited_out_its_mode_is_caught_up_on_the_pool_wide_distribution() {
+    let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
+    let source = Arc::new(FlippableSource {
+        answer: std::sync::Mutex::new(GateAnswer::Unknown),
+        next_id: AtomicU64::new(FIRST_ID),
+        generation: AtomicU64::new(0),
+        miner: AddressId::new(REGTEST_ADDR.to_string()).expect("miner address"),
+    });
+    let server = spawn_jdp_server(source.clone(), bridge.clone(), Duration::from_millis(200));
+    wait_until(Duration::from_secs(5), || {
+        bridge.read().unwrap().current_pool_wide().is_some()
+    })
+    .await;
+    let (addr, accept_handle) = accept_loop(server.clone()).await;
+
+    let (mut reader, mut writer, first_seen) = negotiated_jdc(addr).await;
+    allocate(&mut reader, &mut writer, 2).await;
+    assert!(
+        try_read_jdc(&mut reader, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "nothing may be published while the mode is unknown"
+    );
+
+    // The window moves on without it. This is the gap the catch-up exists for:
+    // the id the client holds stops being current, and it has no way to learn
+    // that on its own.
+    source.generation.store(1, Ordering::SeqCst);
+    wait_until(Duration::from_secs(5), || {
+        bridge
+            .read()
+            .unwrap()
+            .current_pool_wide()
+            .map(|e| e.distribution_id)
+            > Some(first_seen)
+    })
+    .await;
+    let current = bridge
+        .read()
+        .unwrap()
+        .current_pool_wide()
+        .expect("a pool-wide distribution")
+        .distribution_id;
+    assert!(current > first_seen, "the window must have moved on");
+    assert!(
+        try_read_jdc(&mut reader, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "an undecided session must not receive the pool-wide pushes either"
+    );
+
+    // ── The miner connects, on the PPLNS port ─────────────────────────
+    source.set(GateAnswer::PoolWide);
+    respect_token_rate_limit().await;
+    let token = allocate(&mut reader, &mut writer, 3).await;
+    assert_eq!(
+        next_distribution(&mut reader, Duration::from_secs(3)).await,
+        Some(current),
+        "the session must be handed the CURRENT pool-wide distribution — the publisher \
+         is quiet, so nothing else is going to hand it one"
+    );
+
+    // And it must be usable, which is the point of pushing it: the denial is
+    // lifted and the id resolves for this session.
+    respect_token_rate_limit().await;
+    write_declare(
+        &mut writer,
+        10,
+        &token,
+        &suffix_for_test_weights(),
+        Some(current),
+    )
+    .await;
+    expect_declare_success(read_jdc(&mut reader).await, 10);
+
+    accept_handle.abort();
+    server.shutdown().await;
+}
+
+/// A miner that ends up on the PPLNS window loses its tailored slot — clearing
+/// the denial is not enough.
+///
+/// `distribution_acceptance` under `JdpSession` scope PREFERS a session's
+/// tailored slot whenever it has one, and does so without looking at the
+/// settlement epoch. A slot left behind therefore answers for every pool-wide
+/// id the session is pushed afterwards, and answers `Stale` to all of them:
+/// the session is refused for the life of the connection while the pool
+/// believes it is serving it correctly.
+///
+/// Reached here through a §10 settlement, which is what invalidates a tailored
+/// slot and makes the session re-ask what it should be served — by which time
+/// the answer has changed.
+///
+/// The declare at the end is what pins it: the id the pool has just pushed,
+/// against the coinbase the pool published, must be accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tailored_session_that_becomes_pplns_drops_its_tailored_slot() {
+    let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
+    let source = Arc::new(FlippableSource {
+        answer: std::sync::Mutex::new(GateAnswer::Tailored),
+        next_id: AtomicU64::new(FIRST_ID),
+        generation: AtomicU64::new(0),
+        miner: AddressId::new(REGTEST_ADDR.to_string()).expect("miner address"),
+    });
+    let server = spawn_jdp_server(source.clone(), bridge.clone(), Duration::from_millis(200));
+    wait_until(Duration::from_secs(5), || {
+        bridge.read().unwrap().current_pool_wide().is_some()
+    })
+    .await;
+    let (addr, accept_handle) = accept_loop(server.clone()).await;
+
+    let (mut reader, mut writer, pool_wide_id) = negotiated_jdc(addr).await;
+    let token = allocate(&mut reader, &mut writer, 2).await;
+    let tailored_id = next_distribution(&mut reader, Duration::from_secs(3))
+        .await
+        .expect("a Solo miner must be served a tailored distribution");
+    assert!(tailored_id > pool_wide_id);
+
+    // ── The miner is PPLNS by the time the settlement lands ───────────
+    source.set(GateAnswer::PoolWide);
+    server.distribution_handle().settle();
+
+    let served = next_distribution(&mut reader, Duration::from_secs(5))
+        .await
+        .expect("the settlement must leave the session with a distribution again");
+    let current = bridge
+        .read()
+        .unwrap()
+        .current_pool_wide()
+        .expect("the settlement forces a fresh publish")
+        .distribution_id;
+    assert_eq!(
+        served, current,
+        "the session must be moved onto the pool-wide distribution"
+    );
+
+    respect_token_rate_limit().await;
+    write_declare(
+        &mut writer,
+        10,
+        &token,
+        &suffix_for_test_weights(),
+        Some(current),
+    )
+    .await;
+    expect_declare_success(read_jdc(&mut reader).await, 10);
+
+    accept_handle.abort();
+    server.shutdown().await;
+}
