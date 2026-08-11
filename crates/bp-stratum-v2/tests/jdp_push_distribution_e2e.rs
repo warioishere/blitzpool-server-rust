@@ -38,7 +38,7 @@
 //! Needs no bitcoin-node / TDP / PG — declare-time validation runs
 //! entirely against the published distribution.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -965,4 +965,229 @@ async fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// A distribution source that only knows the miner's mode once the test says
+/// so — standing in for the mode gate, which learns an address when its
+/// mining session registers.
+struct ModeGatedSource {
+    known: AtomicBool,
+    next_id: AtomicU64,
+    miner: AddressId,
+}
+
+#[async_trait]
+impl PayoutDistributionSource for ModeGatedSource {
+    async fn build_pool_wide(&self) -> Option<BuiltPayoutDistribution> {
+        Some(BuiltPayoutDistribution {
+            pool_payout: pool_slot(),
+            payouts: miner_slots(),
+            dust_limits: dust_limits(),
+            additional_outputs: Vec::new(),
+            reference_reward_sats: REFERENCE_REWARD,
+            payouts_fingerprint: Some(FINGERPRINT),
+            bookable: true,
+        })
+    }
+
+    async fn build_for_miner(&self, _miner_address: &AddressId) -> TailoredDistribution {
+        if !self.known.load(Ordering::SeqCst) {
+            return TailoredDistribution::ModeUnknown;
+        }
+        TailoredDistribution::Built {
+            accounting: bp_stratum_v2::bridge::DistributionAccounting::Solo(self.miner.clone()),
+            built: Box::new(BuiltPayoutDistribution {
+                pool_payout: pool_slot(),
+                payouts: miner_slots(),
+                dust_limits: dust_limits(),
+                additional_outputs: Vec::new(),
+                reference_reward_sats: REFERENCE_REWARD,
+                payouts_fingerprint: Some(FINGERPRINT),
+                bookable: true,
+            }),
+        }
+    }
+
+    async fn next_distribution_id(&self) -> Option<u64> {
+        Some(self.next_id.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+/// Read a frame, or `None` if none arrives within `within`. `read_jdc` panics
+/// on timeout, which is the right default everywhere else — here the absence
+/// of a frame is the assertion.
+async fn try_read_jdc(reader: &mut Reader, within: Duration) -> Option<JdcInbound> {
+    match tokio::time::timeout(within, reader.read_frame()).await {
+        Err(_) => None,
+        Ok(frame) => {
+            let mut sv2_frame = match frame.expect("read_frame") {
+                Frame::Sv2(f) => f,
+                Frame::HandShake(_) => panic!("unexpected handshake frame"),
+            };
+            let header = sv2_frame.get_header().expect("header");
+            if header.ext_type_without_channel_msg() == SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS {
+                let payload = sv2_frame.payload();
+                return Some(JdcInbound::PayoutDistribution(
+                    SetPayoutDistribution::deserialize(payload).expect("SetPayoutDistribution"),
+                ));
+            }
+            let (msg, _tlvs) =
+                parse_message_frame_with_tlvs(header, sv2_frame.payload(), &[]).expect("parse");
+            Some(JdcInbound::Message(msg))
+        }
+    }
+}
+
+/// The session loop must publish NOTHING while the miner's mode is unknown,
+/// and publish as soon as it becomes known — driven by the next inbound frame,
+/// not by a timer.
+///
+/// This is the state machine itself, over a real Noise connection, because
+/// that is the part the pure decision tests cannot reach: `build_for_miner`
+/// answering `ModeUnknown` is one thing, the loop then holding back the push,
+/// keeping pool-wide denied and retrying on the next frame is another.
+///
+/// ⭐ The publisher interval here is **one hour**. So the distribution that
+/// arrives in the second half cannot have come from the publisher's tick —
+/// only the per-frame retry can have produced it. That is the whole point of
+/// the mechanism: on the tick alone a JDC would sit for up to a minute with no
+/// distribution, declare without one, and a PPLNS address would be refused
+/// `custom-jobs-require-solo` — a wrong distribution traded for a fatal one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_is_served_nothing_until_its_mode_is_known() {
+    let noise_config = NoiseConfig::parse_strings(TEST_PUB, TEST_PRV, DEFAULT_CERT_VALIDITY)
+        .expect("noise config");
+    let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
+    let source = Arc::new(ModeGatedSource {
+        known: AtomicBool::new(false),
+        next_id: AtomicU64::new(FIRST_ID),
+        miner: AddressId::new(REGTEST_ADDR.to_string()).expect("miner address"),
+    });
+
+    let mut hooks = JdpServerHooks::no_op();
+    hooks.distribution_source = source.clone();
+    hooks.prev_hash_provider = Arc::new(FixedPrevHash);
+    hooks.allocate_resolver = Arc::new(BaseModeAllocateResolver);
+
+    let server = StratumV2JdpServer::spawn(
+        noise_config,
+        hooks,
+        bridge.clone(),
+        // One hour: nothing in this test can come from the publisher's tick.
+        Duration::from_secs(3600),
+    );
+    wait_until(Duration::from_secs(5), || {
+        bridge.read().unwrap().current_pool_wide().is_some()
+    })
+    .await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let server_accept = server.clone();
+    let accept_handle = tokio::spawn(async move {
+        loop {
+            let Ok((socket, peer)) = listener.accept().await else {
+                break;
+            };
+            socket.set_nodelay(true).ok();
+            server_accept.accept_connection(socket, peer.to_string());
+        }
+    });
+
+    let (mut reader, mut writer) = connect_jdc(addr).await;
+    write_msg(&mut writer, setup_connection(addr.port())).await;
+    expect_setup_success(read_jdc(&mut reader).await);
+
+    write_msg(
+        &mut writer,
+        AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
+            ExtensionsNegotiation::RequestExtensions(
+                RequestExtensions {
+                    request_id: 1,
+                    requested_extensions: vec![SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS]
+                        .try_into()
+                        .unwrap(),
+                }
+                .into_static(),
+            ),
+        )),
+    )
+    .await;
+    match read_jdc(&mut reader).await {
+        JdcInbound::Message(AnyMessage::Extensions(_)) => {}
+        other => panic!("expected RequestExtensionsSuccess, got {other:?}"),
+    }
+    // Before any allocate the pool does not know WHO this is, so the pool-wide
+    // push is all it can offer and §3.1 requires it right here.
+    match read_jdc(&mut reader).await {
+        JdcInbound::PayoutDistribution(d) => assert_eq!(d.distribution_id, FIRST_ID),
+        other => panic!("§3.1: expected the pool-wide distribution, got {other:?}"),
+    }
+
+    // ── Identity known, mode NOT known ────────────────────────────────
+    write_msg(
+        &mut writer,
+        AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobToken(
+            AllocateMiningJobToken {
+                request_id: 2,
+                user_identifier: REGTEST_ADDR.to_string().try_into().unwrap(),
+            }
+            .into_static(),
+        )),
+    )
+    .await;
+    match read_jdc(&mut reader).await {
+        JdcInbound::Message(AnyMessage::JobDeclaration(
+            JobDeclaration::AllocateMiningJobTokenSuccess(_),
+        )) => {}
+        other => panic!("expected AllocateMiningJobTokenSuccess, got {other:?}"),
+    }
+    assert!(
+        try_read_jdc(&mut reader, Duration::from_millis(400))
+            .await
+            .is_none(),
+        "the pool must publish NOTHING while the mode is unknown — guessing costs \
+         money in either direction, so there is no safe default to fall back on"
+    );
+
+    // ── The miner connects: the port has spoken ───────────────────────
+    source.known.store(true, Ordering::SeqCst);
+
+    // Any inbound frame is the trigger. A second allocate is the one a real
+    // JDC sends anyway, on its next tip change.
+    write_msg(
+        &mut writer,
+        AnyMessage::JobDeclaration(JobDeclaration::AllocateMiningJobToken(
+            AllocateMiningJobToken {
+                request_id: 3,
+                user_identifier: REGTEST_ADDR.to_string().try_into().unwrap(),
+            }
+            .into_static(),
+        )),
+    )
+    .await;
+
+    let mut tailored = None;
+    for _ in 0..3 {
+        match try_read_jdc(&mut reader, Duration::from_secs(3)).await {
+            Some(JdcInbound::PayoutDistribution(d)) => {
+                tailored = Some(d);
+                break;
+            }
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    let tailored = tailored.expect(
+        "once the mode is known the session must be served — and with the publisher \
+         on a one-hour interval, only the per-frame retry can have produced this",
+    );
+    assert!(
+        tailored.distribution_id > FIRST_ID,
+        "the tailored distribution must be a fresh id, got {}",
+        tailored.distribution_id
+    );
+
+    accept_handle.abort();
+    server.shutdown().await;
 }
