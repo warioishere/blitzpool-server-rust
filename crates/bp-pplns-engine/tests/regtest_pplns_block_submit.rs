@@ -44,30 +44,30 @@ use std::time::Duration;
 use bitcoin::Network;
 use bp_common::{AddressId, Sats};
 use bp_mining_job::{
-    build_mining_job_from_tdp, merkle_root_from_coinbase, PayoutEntry, TdpCoinbaseTemplate,
-    EXTRANONCE_SLOT_LEN,
+    build_mining_job_from_tdp, PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
 };
 use bp_pplns::DEFAULT_MIN_PAYOUT_SATS;
 use bp_pplns_engine::config::PplnsEngineConfig;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_pplns_engine::window::NetworkDifficulty;
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
-use bp_share::{Difficulty, Target};
+use bp_share::Difficulty;
 use bp_template_distribution::{NewTemplate, TdpConfig, TdpHandle, TemplateUpdate};
 use sqlx::PgPool;
 use tokio::sync::broadcast;
 
 use bp_test_support::{
-    brute_force_nonce, connect_pg_or_skip, connect_redis_or_skip, deterministic_p2wpkh_regtest,
-    poll_for_height, wait_for_paired_template,
+    connect_pg_or_skip, connect_redis_in_range_or_skip, deterministic_p2wpkh_regtest,
+    mine_and_submit_payouts, redis_db, wait_for_paired_template,
 };
 
-/// Reserved logical DB for this test — doesn't collide with the
-/// existing window-integration tests (which take 0..=7).
-const REDIS_TEST_DB: u8 = 9;
+/// This binary's own numbering inside [`redis_db::RT_PPLNS_BLOCK_SUBMIT`].
+/// The three numbers only have to be distinct from each other — the base
+/// keeps them clear of every other test binary.
+const REDIS_TEST_DB: u8 = 0;
 /// Separate logical DB for the non-empty-merkle-path variant so it can run
 /// in parallel with the sibling test without colliding on FLUSHDB.
-const REDIS_TEST_DB_TXS: u8 = 10;
+const REDIS_TEST_DB_TXS: u8 = 1;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
@@ -82,7 +82,9 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
         return;
     }
     // ── Skip if Redis / PG aren't reachable ──────────────────────
-    let Some(redis_conn) = connect_redis_or_skip(REDIS_TEST_DB).await else {
+    let Some(redis_conn) =
+        connect_redis_in_range_or_skip(redis_db::RT_PPLNS_BLOCK_SUBMIT, REDIS_TEST_DB).await
+    else {
         return;
     };
     let Some(pg) = connect_pg_or_skip().await else {
@@ -214,13 +216,14 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
         .collect();
 
     // ── Build the MiningJob + brute-force a regtest-target nonce ──
-    let (_height, _witness_coinbase) = mine_and_submit(
+    let _accepted = mine_and_submit_payouts(
         &node,
         &tdp,
         &template,
         &prev_hash,
         &payouts,
         "pplns-e2e-regtest",
+        [0u8; 32],
     )
     .await;
 
@@ -260,7 +263,9 @@ async fn pplns_block_with_real_txs_nonempty_merkle_path_accepted_by_core() {
         );
         return;
     }
-    let Some(redis_conn) = connect_redis_or_skip(REDIS_TEST_DB_TXS).await else {
+    let Some(redis_conn) =
+        connect_redis_in_range_or_skip(redis_db::RT_PPLNS_BLOCK_SUBMIT, REDIS_TEST_DB_TXS).await
+    else {
         return;
     };
     let Some(pg) = connect_pg_or_skip().await else {
@@ -362,13 +367,14 @@ async fn pplns_block_with_real_txs_nonempty_merkle_path_accepted_by_core() {
         .collect();
 
     // ── Build coinbase, reconstruct the root over the NON-EMPTY branch ──
-    let (_height, _witness_coinbase) = mine_and_submit(
+    let _accepted = mine_and_submit_payouts(
         &node,
         &tdp,
         &template,
         &prev_hash,
         &payouts,
         "pplns-merkle-regtest",
+        [0u8; 32],
     )
     .await;
 
@@ -444,73 +450,8 @@ fn coinbase_template_from(t: &NewTemplate) -> TdpCoinbaseTemplate<'_> {
     }
 }
 
-/// Build the coinbase from `payouts`, grind a regtest-target nonce, submit via
-/// TDP and wait for the tip to rise. Returns the new height and the exact
-/// witness-form coinbase that was submitted, so callers can assert against the
-/// bytes bitcoin-core accepted.
-///
-/// Panics with the sibling tests' wording if the tip does not advance — a
-/// stuck tip means the engine-built distribution produced a coinbase the chain
-/// rejected (sat-sum drift, dust output, malformed script, ...).
-async fn mine_and_submit(
-    node: &RegtestNode,
-    tdp: &TdpHandle,
-    template: &NewTemplate,
-    prev_hash: &bp_template_distribution::SetNewPrevHash,
-    payouts: &[PayoutEntry],
-    pool_identifier: &str,
-) -> (u32, Vec<u8>) {
-    let coinbase_template = coinbase_template_from(template);
-    let job = build_mining_job_from_tdp(
-        Network::Regtest,
-        payouts,
-        &coinbase_template,
-        pool_identifier,
-        EXTRANONCE_SLOT_LEN,
-        [0u8; 32],
-    )
-    .expect("build_mining_job_from_tdp");
-
-    let en1 = [0u8; 4];
-    let en2 = [0u8; 8];
-    let coinbase_txid = job.coinbase_txid_with_extranonce(&en1, &en2);
-    let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &template.merkle_path);
-    let target = Target::from_le_bytes(prev_hash.target);
-    let nonce = brute_force_nonce(
-        template.version,
-        &prev_hash.prev_hash,
-        &merkle_root,
-        prev_hash.header_timestamp,
-        prev_hash.n_bits,
-        &target,
-    )
-    .expect("must find a regtest-target-matching nonce within 1M tries");
-
-    let witness_coinbase = job.witness_coinbase_with_extranonce(&en1, &en2);
-    let before_height = node.current_height().await.expect("current_height");
-    tdp.submit_solution(
-        template.template_id,
-        template.version,
-        prev_hash.header_timestamp,
-        nonce,
-        witness_coinbase.clone(),
-    )
-    .await
-    .expect("submit_solution");
-
-    let after = poll_for_height(node, before_height + 1, Duration::from_secs(20))
-        .await
-        .expect(
-            "bitcoin-core must accept the block — a stuck tip means the \
-             engine-built distribution produced a coinbase the chain \
-             rejected (sat-sum drift, dust output, malformed script, ...)",
-        );
-    assert_eq!(after, before_height + 1);
-    (after, witness_coinbase)
-}
-
 /// Separate logical DB for the coinbase↔ledger equality variant.
-const REDIS_TEST_DB_LEDGER: u8 = 11;
+const REDIS_TEST_DB_LEDGER: u8 = 2;
 
 /// E2E: the ledger books exactly what the block's coinbase paid — even
 /// after a later distribution build displaced the shared snapshot key.
@@ -537,7 +478,9 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
         );
         return;
     }
-    let Some(redis_conn) = connect_redis_or_skip(REDIS_TEST_DB_LEDGER).await else {
+    let Some(redis_conn) =
+        connect_redis_in_range_or_skip(redis_db::RT_PPLNS_BLOCK_SUBMIT, REDIS_TEST_DB_LEDGER).await
+    else {
         return;
     };
     let Some(pg) = connect_pg_or_skip().await else {
@@ -635,27 +578,29 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
         .expect("jdc-style build");
     assert_eq!(jdc_style.payouts_fingerprint(), fingerprint);
 
-    let (height, witness_coinbase) = mine_and_submit(
+    let accepted = mine_and_submit_payouts(
         &node,
         &tdp,
         &template,
         &prev_hash,
         &payouts,
         "pplns-ledger-regtest",
+        fingerprint,
     )
     .await;
 
     // ── Book it from the REAL accepted coinbase, using the
     //    fingerprint the job carried ─────────────────────────────
-    let coinbase_tx = bitcoin::Transaction::consensus_decode(&mut witness_coinbase.as_slice())
-        .expect("submitted coinbase must decode");
+    let coinbase_tx =
+        bitcoin::Transaction::consensus_decode(&mut accepted.witness_coinbase.as_slice())
+            .expect("submitted coinbase must decode");
     let actual = bp_coinbase_snapshot::ActualCoinbase::from_coinbase(
         &coinbase_tx,
         bitcoin::Network::Regtest,
     );
     assert_eq!(actual.total_value_sats, reward_sats);
     let _prepared = engine
-        .on_block_found(height as i32, &actual, None, Some(fingerprint))
+        .on_block_found(accepted.height as i32, &actual, None, Some(fingerprint))
         .await
         .expect("the mined job's own distribution must resolve for booking");
     // (apply happens inside on_block_found now)
@@ -665,7 +610,7 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
         r#"SELECT address, "paidSats" FROM pplns_payout_history
            WHERE "blockHeight" = $1 AND "rowType" = 'coinbase'"#,
     )
-    .bind(height as i32)
+    .bind(accepted.height as i32)
     .fetch_all(&pg)
     .await
     .expect("read audit rows");
@@ -689,7 +634,7 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
     tdp.shutdown().expect("TDP clean shutdown");
     node.shutdown().await.expect("regtest clean shutdown");
     let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
-        .bind(height as i32)
+        .bind(accepted.height as i32)
         .execute(&pg)
         .await;
     cleanup_pplns_state(&pg, &payouts).await;

@@ -26,31 +26,26 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bitcoin::Network;
 use bp_common::{AddressId, Sats};
-use bp_mining_job::{
-    build_mining_job_from_tdp, merkle_root_from_coinbase, PayoutEntry, TdpCoinbaseTemplate,
-    EXTRANONCE_SLOT_LEN,
-};
+use bp_mining_job::PayoutEntry;
 use bp_pplns::DEFAULT_MIN_PAYOUT_SATS;
 use bp_pplns_engine::config::PplnsEngineConfig;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_pplns_engine::hooks::PplnsAcceptedShareSink;
 use bp_pplns_engine::window::NetworkDifficulty;
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
-use bp_share::Target;
 use bp_share_hook::{MiningMode, SharedAcceptedShareOwned, SharedAcceptedShareSink};
 use bp_share_stream::{AcceptedShareConsumer, AcceptedShareProducer};
 use bp_template_distribution::{TdpConfig, TdpHandle};
 use sqlx::PgPool;
 
 use bp_test_support::{
-    brute_force_nonce, connect_pg_or_skip, connect_redis_or_skip, deterministic_p2wpkh_regtest,
-    poll_for_height, wait_for_paired_template,
+    connect_pg_or_skip, connect_redis_in_range_or_skip, deterministic_p2wpkh_regtest,
+    mine_and_submit_payouts, redis_db, wait_for_paired_template,
 };
 
 /// Logical DB for this test — distinct from the other regtest + window tests.
-const REDIS_TEST_DB: u8 = 8;
+const REDIS_TEST_DB: u8 = 0;
 const STREAM_KEY: &str = "t4:split:accepted";
 
 fn mk_share(share_id: &str, address: &str, diff: f64) -> SharedAcceptedShareOwned {
@@ -82,7 +77,9 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
         );
         return;
     }
-    let Some(redis_conn) = connect_redis_or_skip(REDIS_TEST_DB).await else {
+    let Some(redis_conn) =
+        connect_redis_in_range_or_skip(redis_db::RT_SPLIT_E2E, REDIS_TEST_DB).await
+    else {
         return;
     };
     let Some(pg) = connect_pg_or_skip().await else {
@@ -227,56 +224,18 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
             sats: *s,
         })
         .collect();
-    let coinbase_template = TdpCoinbaseTemplate {
-        coinbase_prefix: &template.coinbase_prefix,
-        coinbase_tx_version: template.coinbase_tx_version,
-        coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,
-        coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
-        coinbase_tx_outputs: &template.coinbase_tx_outputs,
-        coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
-        coinbase_tx_locktime: template.coinbase_tx_locktime,
-    };
-    let job = build_mining_job_from_tdp(
-        Network::Regtest,
+    let accepted = mine_and_submit_payouts(
+        &node,
+        &tdp,
+        &template,
+        &prev_hash,
         &payouts,
-        &coinbase_template,
         "split-e2e-regtest",
-        EXTRANONCE_SLOT_LEN,
         [0u8; 32],
     )
-    .expect("build_mining_job_from_tdp");
-    let en1 = [0u8; 4];
-    let en2 = [0u8; 8];
-    let coinbase_txid = job.coinbase_txid_with_extranonce(&en1, &en2);
-    let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &template.merkle_path);
-    let target = Target::from_le_bytes(prev_hash.target);
-    let nonce = brute_force_nonce(
-        template.version,
-        &prev_hash.prev_hash,
-        &merkle_root,
-        prev_hash.header_timestamp,
-        prev_hash.n_bits,
-        &target,
-    )
-    .expect("find a regtest-target nonce within 1M tries");
-
-    // ── Submit + assert bitcoin-core accepts the split-derived block ──
-    let witness_coinbase = job.witness_coinbase_with_extranonce(&en1, &en2);
-    let submitted_coinbase = witness_coinbase.clone();
-    let before_height = node.current_height().await.expect("current_height");
-    tdp.submit_solution(
-        template.template_id,
-        template.version,
-        prev_hash.header_timestamp,
-        nonce,
-        witness_coinbase,
-    )
-    .await
-    .expect("submit_solution");
-    let after = poll_for_height(&node, before_height + 1, Duration::from_secs(20))
-        .await
-        .expect("bitcoin-core must accept the split-path coinbase (stuck tip = rejected)");
-    assert_eq!(after, before_height + 1);
+    .await;
+    let after = accepted.height;
+    let submitted_coinbase = accepted.witness_coinbase;
 
     // ── Satellite applies the block-found ledger from the REAL
     //    coinbase (weight-model settlement) ─────────────────────────

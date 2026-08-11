@@ -52,10 +52,7 @@ use bitcoin::consensus::Decodable;
 use bitcoin::Network;
 use bp_coinbase_snapshot::ActualCoinbase;
 use bp_common::{AddressId, Sats};
-use bp_mining_job::{
-    build_mining_job_from_tdp, merkle_root_from_coinbase, PayoutEntry, TdpCoinbaseTemplate,
-    EXTRANONCE_SLOT_LEN,
-};
+use bp_mining_job::PayoutEntry;
 use bp_pplns::{
     output_weight_for_address, WeightDistribution, WeightEntry, BUDGET_SAFETY_MARGIN_WU,
     COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT, COINBASE_WITNESS_COMMITMENT_WEIGHT,
@@ -65,19 +62,19 @@ use bp_pplns_engine::config::PplnsEngineConfig;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_pplns_engine::window::NetworkDifficulty;
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
-use bp_share::{claim_sats, Target};
-use bp_template_distribution::{NewTemplate, SetNewPrevHash, TdpConfig, TdpHandle};
+use bp_share::claim_sats;
+use bp_template_distribution::{TdpConfig, TdpHandle};
 use sqlx::PgPool;
 
 use bp_test_support::{
-    brute_force_nonce, connect_pg_or_skip, connect_redis_or_skip, deterministic_p2wpkh_regtest,
-    poll_for_height, wait_for_paired_template,
+    connect_pg_or_skip, connect_redis_in_range_or_skip, deterministic_p2wpkh_regtest,
+    mine_and_submit_payouts, redis_db, wait_for_paired_template,
 };
 
 /// Redis logical DB for this test. Cargo runs test binaries one after
 /// another, so what matters is that no test in THIS binary shares it —
 /// this file has exactly one test.
-const REDIS_TEST_DB: u8 = 13;
+const REDIS_TEST_DB: u8 = 0;
 
 /// Diff-1-weighted window shares. The 3:1 between the two large miners
 /// makes the redistribution checkable by eye; the third miner is small
@@ -112,7 +109,9 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
         );
         return;
     }
-    let Some(redis_conn) = connect_redis_or_skip(REDIS_TEST_DB).await else {
+    let Some(redis_conn) =
+        connect_redis_in_range_or_skip(redis_db::RT_POOL_NEUTRAL_PAYOUT, REDIS_TEST_DB).await
+    else {
         return;
     };
     let Some(pg) = connect_pg_or_skip().await else {
@@ -258,22 +257,24 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
     );
 
     let payouts_1 = payout_entries(weights_1, reward_1);
-    let (mined_height_1, coinbase_1) = mine_and_submit(
+    let accepted_1 = mine_and_submit_payouts(
         &node,
         &tdp,
         &template_1,
         &prev_hash_1,
         &payouts_1,
         "pool-neutral-regtest",
+        [0u8; 32],
     )
     .await;
-    assert_eq!(mined_height_1 as i32, height_1);
+    assert_eq!(accepted_1.height as i32, height_1);
 
     // Settlement input is the coinbase the chain accepted, decoded from
     // the bytes that were submitted — not a reconstruction of what the
     // pool meant to pay. That distinction is the point of this test.
-    let coinbase_tx_1 = bitcoin::Transaction::consensus_decode(&mut coinbase_1.as_slice())
-        .expect("the submitted coinbase must decode");
+    let coinbase_tx_1 =
+        bitcoin::Transaction::consensus_decode(&mut accepted_1.witness_coinbase.as_slice())
+            .expect("the submitted coinbase must decode");
     let actual_1 = ActualCoinbase::from_coinbase(&coinbase_tx_1, Network::Regtest);
     assert_eq!(
         actual_1.total_value_sats, reward_1,
@@ -429,19 +430,21 @@ async fn withheld_miner_is_funded_by_the_other_miners_not_by_the_pool() {
     );
 
     let payouts_2 = payout_entries(weights_2, reward_2);
-    let (mined_height_2, coinbase_2) = mine_and_submit(
+    let accepted_2 = mine_and_submit_payouts(
         &node,
         &tdp,
         &template_2,
         &prev_hash_2,
         &payouts_2,
         "pool-neutral-regtest",
+        [0u8; 32],
     )
     .await;
-    assert_eq!(mined_height_2 as i32, height_2);
+    assert_eq!(accepted_2.height as i32, height_2);
 
-    let coinbase_tx_2 = bitcoin::Transaction::consensus_decode(&mut coinbase_2.as_slice())
-        .expect("the submitted coinbase must decode");
+    let coinbase_tx_2 =
+        bitcoin::Transaction::consensus_decode(&mut accepted_2.witness_coinbase.as_slice())
+            .expect("the submitted coinbase must decode");
     let actual_2 = ActualCoinbase::from_coinbase(&coinbase_tx_2, Network::Regtest);
     let t_2 = actual_2.total_value_sats;
     assert_eq!(t_2, reward_2);
@@ -605,75 +608,4 @@ async fn delete_payout_history(pool: &PgPool, heights: &[i32]) {
             .execute(pool)
             .await;
     }
-}
-
-/// Build the coinbase from `payouts`, grind a regtest-target nonce, submit
-/// via the TDP and wait for the tip to rise. Returns the new height and the
-/// exact witness-form coinbase bytes bitcoin-core accepted.
-///
-/// The tip assertion is not decoration: a coinbase whose outputs don't sum
-/// to the template value, or that carries a dust output, is rejected with
-/// no error the pool ever sees — the tip simply doesn't move.
-async fn mine_and_submit(
-    node: &RegtestNode,
-    tdp: &TdpHandle,
-    template: &NewTemplate,
-    prev_hash: &SetNewPrevHash,
-    payouts: &[PayoutEntry],
-    pool_identifier: &str,
-) -> (u32, Vec<u8>) {
-    let coinbase_template = TdpCoinbaseTemplate {
-        coinbase_prefix: &template.coinbase_prefix,
-        coinbase_tx_version: template.coinbase_tx_version,
-        coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,
-        coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
-        coinbase_tx_outputs: &template.coinbase_tx_outputs,
-        coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
-        coinbase_tx_locktime: template.coinbase_tx_locktime,
-    };
-    let job = build_mining_job_from_tdp(
-        Network::Regtest,
-        payouts,
-        &coinbase_template,
-        pool_identifier,
-        EXTRANONCE_SLOT_LEN,
-        [0u8; 32],
-    )
-    .expect("build_mining_job_from_tdp");
-
-    let en1 = [0u8; 4];
-    let en2 = [0u8; 8];
-    let coinbase_txid = job.coinbase_txid_with_extranonce(&en1, &en2);
-    let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &template.merkle_path);
-    let target = Target::from_le_bytes(prev_hash.target);
-    let nonce = brute_force_nonce(
-        template.version,
-        &prev_hash.prev_hash,
-        &merkle_root,
-        prev_hash.header_timestamp,
-        prev_hash.n_bits,
-        &target,
-    )
-    .expect("must find a regtest-target-matching nonce within 1M tries");
-
-    let witness_coinbase = job.witness_coinbase_with_extranonce(&en1, &en2);
-    let before_height = node.current_height().await.expect("current_height");
-    tdp.submit_solution(
-        template.template_id,
-        template.version,
-        prev_hash.header_timestamp,
-        nonce,
-        witness_coinbase.clone(),
-    )
-    .await
-    .expect("submit_solution");
-
-    let after = poll_for_height(node, before_height + 1, Duration::from_secs(20))
-        .await
-        .expect(
-            "bitcoin-core must accept the block — a stuck tip means the \
-             engine-built distribution produced a coinbase the chain rejected",
-        );
-    assert_eq!(after, before_height + 1);
-    (after, witness_coinbase)
 }

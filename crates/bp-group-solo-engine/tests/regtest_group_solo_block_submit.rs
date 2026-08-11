@@ -33,23 +33,19 @@ use bitcoin::Network;
 use bp_common::{AddressId, Sats};
 use bp_group_solo_engine::config::GroupSoloEngineConfig;
 use bp_group_solo_engine::engine::GroupSoloEngine;
-use bp_mining_job::{
-    build_mining_job_from_tdp, merkle_root_from_coinbase, PayoutEntry, TdpCoinbaseTemplate,
-    EXTRANONCE_SLOT_LEN,
-};
+use bp_mining_job::PayoutEntry;
 use bp_pplns::DEFAULT_MIN_PAYOUT_SATS;
 use bp_regtest_harness::{RegtestConfig, RegtestNode};
-use bp_share::Target;
 use bp_template_distribution::{TdpConfig, TdpHandle};
 use bp_test_support::{
-    brute_force_nonce, connect_pg_or_skip, connect_redis_or_skip, deterministic_p2wpkh_regtest,
-    poll_for_height, wait_for_paired_template,
+    connect_pg_or_skip, connect_redis_in_range_or_skip, deterministic_p2wpkh_regtest,
+    mine_and_submit_payouts, redis_db, wait_for_paired_template,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Distinct from the PPLNS e2e's `9` so the two can run in parallel.
-const REDIS_TEST_DB: u8 = 10;
+const REDIS_TEST_DB: u8 = 0;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
@@ -62,7 +58,9 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
         );
         return;
     }
-    let Some(redis_conn) = connect_redis_or_skip(REDIS_TEST_DB).await else {
+    let Some(redis_conn) =
+        connect_redis_in_range_or_skip(redis_db::RT_GROUP_SOLO_BLOCK_SUBMIT, REDIS_TEST_DB).await
+    else {
         return;
     };
     let Some(pg) = connect_pg_or_skip().await else {
@@ -229,64 +227,20 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
             sats: *s,
         })
         .collect();
-    let coinbase_template = TdpCoinbaseTemplate {
-        coinbase_prefix: &template.coinbase_prefix,
-        coinbase_tx_version: template.coinbase_tx_version,
-        coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,
-        coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
-        coinbase_tx_outputs: &template.coinbase_tx_outputs,
-        coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
-        coinbase_tx_locktime: template.coinbase_tx_locktime,
-    };
     // The job carries the distribution's settlement identity — the
     // fingerprint a block found on it books through.
-    let job = build_mining_job_from_tdp(
-        Network::Regtest,
+    let accepted = mine_and_submit_payouts(
+        &node,
+        &tdp,
+        &template,
+        &prev_hash,
         &payouts,
-        &coinbase_template,
         "group-solo-e2e-regtest",
-        EXTRANONCE_SLOT_LEN,
         fingerprint,
     )
-    .expect("build_mining_job_from_tdp");
-
-    let en1 = [0u8; 4];
-    let en2 = [0u8; 8];
-    let coinbase_txid = job.coinbase_txid_with_extranonce(&en1, &en2);
-    let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &template.merkle_path);
-    let target = Target::from_le_bytes(prev_hash.target);
-    let nonce = brute_force_nonce(
-        template.version,
-        &prev_hash.prev_hash,
-        &merkle_root,
-        prev_hash.header_timestamp,
-        prev_hash.n_bits,
-        &target,
-    )
-    .expect("must find a regtest-target-matching nonce within 1M tries");
-
-    // ── Submit + assert chain tip advances ───────────────────────
-    let witness_coinbase = job.witness_coinbase_with_extranonce(&en1, &en2);
-    let before_height = node.current_height().await.expect("current_height");
-
-    tdp.submit_solution(
-        template.template_id,
-        template.version,
-        prev_hash.header_timestamp,
-        nonce,
-        witness_coinbase.clone(),
-    )
-    .await
-    .expect("submit_solution");
-
-    let after = poll_for_height(&node, before_height + 1, Duration::from_secs(20))
-        .await
-        .expect(
-            "bitcoin-core must accept the block — a stuck tip means the \
-             group-solo distribution produced a coinbase the chain \
-             rejected (finder-bonus math drift, dust output, ...)",
-        );
-    assert_eq!(after, before_height + 1);
+    .await;
+    let after = accepted.height;
+    let witness_coinbase = accepted.witness_coinbase;
 
     // ── Settle from the REAL accepted coinbase (scaled path) ─────
     //
