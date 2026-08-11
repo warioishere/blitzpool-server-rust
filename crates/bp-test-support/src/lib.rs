@@ -153,6 +153,131 @@ pub async fn poll_for_height(
     None
 }
 
+/// A block bitcoin-core accepted, and the bytes it accepted.
+pub struct AcceptedBlock {
+    /// The tip after acceptance — always `height_before + 1`.
+    pub height: u32,
+    /// Exactly the coinbase transaction core validated. Settlement tests
+    /// read their expectations out of THIS, never out of what the pool
+    /// intended to pay.
+    pub witness_coinbase: Vec<u8>,
+    /// Big-endian hex, the same shape the production block-sink computes.
+    pub block_hash_hex: String,
+}
+
+/// Assemble the coinbase paying exactly `payouts` over `template`,
+/// brute-force a nonce that meets the regtest target, submit it through
+/// `tdp`, and require bitcoin-core to extend the chain by one.
+///
+/// This is the step every money regtest ends with, and it used to be
+/// copy-pasted into each of them — two of the copies were byte-identical
+/// down to the parameter list. It is one function because the failure it
+/// reports is subtle and worth wording once: `submit_solution` is
+/// fire-and-forget, so a coinbase whose outputs do not sum to the template
+/// value, or that carries a dust output or a malformed script, is rejected
+/// with no error the pool ever sees — the tip simply does not move.
+///
+/// `fingerprint` is the distribution's settlement identity, carried in the
+/// job so a block found on it books through the distribution it actually
+/// paid. Pass `[0u8; 32]` where the test does not settle.
+///
+/// Uses zero extranonces. Callers that need to vary them, that assert on
+/// the assembled job before submitting, or that expect core to REJECT
+/// (`regtest_budget_autoscale`) drive the pieces themselves.
+pub async fn mine_and_submit_payouts(
+    node: &RegtestNode,
+    tdp: &bp_template_distribution::TdpHandle,
+    template: &NewTemplate,
+    prev_hash: &SetNewPrevHash,
+    payouts: &[bp_mining_job::PayoutEntry],
+    pool_identifier: &str,
+    fingerprint: [u8; 32],
+) -> AcceptedBlock {
+    let coinbase_template = bp_mining_job::TdpCoinbaseTemplate {
+        coinbase_prefix: &template.coinbase_prefix,
+        coinbase_tx_version: template.coinbase_tx_version,
+        coinbase_tx_input_sequence: template.coinbase_tx_input_sequence,
+        coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
+        coinbase_tx_outputs: &template.coinbase_tx_outputs,
+        coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
+        coinbase_tx_locktime: template.coinbase_tx_locktime,
+    };
+    let job = bp_mining_job::build_mining_job_from_tdp(
+        bitcoin::Network::Regtest,
+        payouts,
+        &coinbase_template,
+        pool_identifier,
+        bp_mining_job::EXTRANONCE_SLOT_LEN,
+        fingerprint,
+    )
+    .expect("build_mining_job_from_tdp");
+
+    let en1 = [0u8; 4];
+    let en2 = [0u8; 8];
+    let coinbase_txid = job.coinbase_txid_with_extranonce(&en1, &en2);
+    let merkle_root =
+        bp_mining_job::merkle_root_from_coinbase(&coinbase_txid, &template.merkle_path);
+    let target = Target::from_le_bytes(prev_hash.target);
+    let nonce = brute_force_nonce(
+        template.version,
+        &prev_hash.prev_hash,
+        &merkle_root,
+        prev_hash.header_timestamp,
+        prev_hash.n_bits,
+        &target,
+    )
+    .expect("must find a regtest-target-matching nonce within 1M tries");
+
+    let witness_coinbase = job.witness_coinbase_with_extranonce(&en1, &en2);
+    let before_height = node.current_height().await.expect("current_height");
+    tdp.submit_solution(
+        template.template_id,
+        template.version,
+        prev_hash.header_timestamp,
+        nonce,
+        witness_coinbase.clone(),
+    )
+    .await
+    .expect("submit_solution");
+
+    let height = poll_for_height(node, before_height + 1, Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "bitcoin-core must accept the block ({pool_identifier}) — a stuck tip at \
+                 {before_height} means the coinbase was rejected: outputs not summing to \
+                 the template value, a dust output, or a malformed script"
+            )
+        });
+    assert_eq!(height, before_height + 1);
+
+    let header_bytes = build_block_header(
+        template.version as i32,
+        0,
+        &prev_hash.prev_hash,
+        &merkle_root,
+        prev_hash.header_timestamp,
+        prev_hash.n_bits,
+        nonce,
+    );
+    let mut hash = bp_share::sha256d(&header_bytes);
+    hash.reverse();
+
+    AcceptedBlock {
+        height,
+        witness_coinbase,
+        block_hash_hex: hex_lower(&hash),
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 /// Wait for a paired **future** `NewTemplate` + matching `SetNewPrevHash`
 /// (the strict variant — what fires on a tip change). Panics on timeout.
 pub async fn wait_for_paired_template(
@@ -283,6 +408,20 @@ pub mod redis_db {
     pub const PPLNS_ENGINE: u16 = 8 * RANGE;
     pub const PPLNS_STREAM_EQUIV: u16 = 9 * RANGE;
     pub const PPLNS_WINDOW: u16 = 10 * RANGE;
+
+    // The regtest binaries. These used to call `connect_redis_or_skip` with a
+    // RAW index (8, 9, 10, 11, 13) and so landed inside `BLITZPOOL_BIN`'s
+    // range — `regtest_pplns_block_submit`'s 10 and
+    // `regtest_group_solo_block_submit`'s 10 were literally the same database,
+    // and both flush. Nothing ever broke because `cargo test` runs test
+    // BINARIES one after another, so the collision partners were never awake
+    // at the same time. That is a property of the runner, not of the tests:
+    // `cargo-nextest` runs binaries concurrently and would surface all of it
+    // at once.
+    pub const RT_PPLNS_BLOCK_SUBMIT: u16 = 11 * RANGE;
+    pub const RT_SPLIT_E2E: u16 = 12 * RANGE;
+    pub const RT_POOL_NEUTRAL_PAYOUT: u16 = 13 * RANGE;
+    pub const RT_GROUP_SOLO_BLOCK_SUBMIT: u16 = 14 * RANGE;
 }
 
 /// How many logical databases this Redis actually has.
@@ -340,6 +479,33 @@ async fn redis_database_count() -> u16 {
 /// binary's tests.
 pub async fn connect_redis_in_range_or_skip(base: u16, test_db: u8) -> Option<ConnectionManager> {
     connect_redis_or_skip_raw(redis_db_in_range(base, test_db).await).await
+}
+
+/// Like [`connect_redis_in_range_or_skip`] but WITHOUT the `FLUSHDB`.
+///
+/// For the narrow case of sibling tests in one binary that deliberately
+/// share an index: each namespaces its keys (by front id, by prefix) and
+/// asserts only on its own, so flushing would buy no isolation and would
+/// wipe whatever a sibling is halfway through.
+///
+/// Sharing is only safe *within* one binary, and only when every test on
+/// that index agrees not to flush. Reach for [`connect_redis_in_range_or_skip`]
+/// unless the sharing is deliberate — a flush arriving mid-test reads as an
+/// impossible result (a key that was just written coming back missing), which
+/// is a genuinely hard failure to place.
+pub async fn connect_redis_in_range_no_flush(base: u16, test_db: u8) -> Option<ConnectionManager> {
+    let index = redis_db_in_range(base, test_db).await;
+    let url_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_DEFAULT_URL.to_string());
+    let url = format!("{url_base}/{index}");
+    let client = match Client::open(url.clone()) {
+        Ok(c) => c,
+        Err(e) => return skip_or_fail(format!("redis client open {url}: {e}")),
+    };
+    match tokio::time::timeout(Duration::from_secs(2), ConnectionManager::new(client)).await {
+        Ok(Ok(c)) => Some(c),
+        Ok(Err(e)) => skip_or_fail(format!("redis connect {url}: {e}")),
+        Err(_) => skip_or_fail(format!("redis connect timed out at {url}")),
+    }
 }
 
 /// The raw logical-DB index for `test_db` inside `base`'s range, folded
