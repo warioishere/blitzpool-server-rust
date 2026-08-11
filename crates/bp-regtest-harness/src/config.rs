@@ -384,29 +384,76 @@ mod tests {
         assert!(!cfg.is_available());
     }
 
-    /// No absolute path may be baked in for one developer's machine.
+    /// No one developer's home directory may be baked into discovery.
     ///
-    /// This is the regression: the default used to be
-    /// `/home/warioishere/bitcoin-31.0/libexec/bitcoin-node`, so ~29
+    /// This is the regression: the default used to be an absolute
+    /// `/home/<a-specific-user>/bitcoin-31.0/libexec/bitcoin-node`, so ~29
     /// regtests skipped on every other machine — and a skipped test PASSES,
     /// so the suite went green while proving nothing. Discovery has to come
     /// from the environment, never from a literal.
+    ///
+    /// Asserted against `CANDIDATE_PREFIXES`, the only place a literal can
+    /// live. Testing the *expanded* `candidates()` for a username cannot
+    /// work: `~/.local` is supposed to expand to `/home/<you>/.local`, and a
+    /// `$PATH` full of `$HOME` entries expands the same way, so the check
+    /// fires on correct behaviour — and only ever on the one machine whose
+    /// name it hard-codes, staying inert everywhere else. Measured
+    /// 2026-08-10 on the Linux box, where a `$PATH` entry under `$HOME`
+    /// (`~/.bun/bin`) failed it while nothing was wrong; without
+    /// `--no-fail-fast` it aborted the run at 12 binaries of 28, which reads
+    /// exactly like a discovery regression and was not one.
     #[test]
     fn candidates_are_derived_from_the_environment_not_hard_coded() {
-        for c in candidates() {
-            let s = c.to_string_lossy();
+        for prefix in CANDIDATE_PREFIXES {
+            // `~` is the portable way to name "this user's home". An
+            // absolute path into a per-user root names somebody in
+            // particular, which is the bug.
             assert!(
-                !s.contains("warioishere"),
-                "a specific developer's home directory is baked into discovery: {s}"
+                !prefix.starts_with("/home/") && !prefix.starts_with("/Users/"),
+                "{prefix} hard-codes one user's home directory — use a `~` prefix, \
+                 which expands per user"
             );
         }
-        // And the search is non-trivial: `$PATH` alone contributes several
-        // entries on any real machine, so an empty list would mean the
-        // whole mechanism silently does nothing.
-        assert!(
-            candidates().len() > CANDIDATE_PREFIXES.len(),
-            "discovery should probe $PATH in addition to the fixed prefixes"
-        );
+        // Positive direction, so this cannot pass by the prefix list being
+        // empty: `$PATH` must really contribute candidates.
+        //
+        // Counting is not enough — every prefix yields
+        // `CANDIDATE_SUFFIXES.len()` entries, so the total already exceeds the
+        // prefix count with `$PATH` ignored entirely. Nor is "some `$PATH`
+        // entry is in the list": `/usr/local` is a prefix AND `/usr/local/bin`
+        // is on most `$PATH`s, and `~/.local` likewise, so that assert matches
+        // a prefix-derived path and survives deleting the `$PATH` loop —
+        // measured, it did. Only a directory no prefix can produce
+        // distinguishes them.
+        let home = std::env::var("HOME").ok();
+        let prefix_derived: Vec<PathBuf> = CANDIDATE_PREFIXES
+            .iter()
+            .filter_map(|p| expand_home(Path::new(p), home.as_deref()))
+            .flat_map(|base| CANDIDATE_SUFFIXES.iter().map(move |s| base.join(s)))
+            .collect();
+        if let Some(path_var) = std::env::var_os("PATH") {
+            let all = candidates();
+            let only_from_path = std::env::split_paths(&path_var)
+                .filter_map(|d| expand_home(&d, home.as_deref()))
+                .map(|d| d.join("bitcoin-node"))
+                .filter(|c| !prefix_derived.contains(c));
+            let mut checked = 0usize;
+            let mut found = false;
+            for c in only_from_path {
+                checked += 1;
+                if all.contains(&c) {
+                    found = true;
+                    break;
+                }
+            }
+            // `checked == 0` means every `$PATH` entry happens to coincide
+            // with a fixed prefix, so there is nothing this can prove.
+            assert!(
+                found || checked == 0,
+                "none of the {checked} $PATH-only directories reached the candidate \
+                 list — the $PATH search is dead"
+            );
+        }
     }
 
     /// Every prefix must be probed for BOTH layouts.
