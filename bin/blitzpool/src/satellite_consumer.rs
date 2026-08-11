@@ -127,9 +127,8 @@ mod tests {
     use bp_common::MiningMode;
     use bp_share_hook::{SharedAcceptedShare, SharedAcceptedShareOwned};
     use bp_share_stream::AcceptedShareProducer;
+    use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
     use tokio::sync::Mutex as AsyncMutex;
-
-    const REDIS_URL: &str = "redis://127.0.0.1:16379";
 
     /// Records the `share_id` of every share it receives, in arrival order.
     struct RecordingSink {
@@ -141,36 +140,6 @@ mod tests {
         async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
             self.seen.lock().await.push(share.share_id.to_string());
         }
-    }
-
-    async fn connect_redis_or_skip(db: u8) -> Option<ConnectionManager> {
-        // Fold this binary's local number into its own DB range —
-        // see `bp_test_support::redis_db`. Two binaries both using
-        // 0..15 flush each other mid-run.
-        let db =
-            bp_test_support::redis_db_in_range(bp_test_support::redis_db::BLITZPOOL_BIN, db).await;
-        let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-        let client = redis::Client::open(format!("{base}/{db}")).ok()?;
-        let mut conn = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            ConnectionManager::new(client),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            _ => {
-                eprintln!("redis unreachable — skipping satellite-consumer test");
-                return None;
-            }
-        };
-        if redis::cmd("FLUSHDB")
-            .query_async::<()>(&mut conn)
-            .await
-            .is_err()
-        {
-            return None;
-        }
-        Some(conn)
     }
 
     fn sample(share_id: &str) -> SharedAcceptedShareOwned {
@@ -205,7 +174,7 @@ mod tests {
     /// share, in order, and shut down cleanly on cancel.
     #[tokio::test]
     async fn both_groups_consume_all_shares_in_order() {
-        let Some(conn) = connect_redis_or_skip(7).await else {
+        let Some(conn) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 7).await else {
             return;
         };
 
@@ -252,7 +221,7 @@ mod tests {
     /// `drain_pending`.
     #[tokio::test]
     async fn pending_backlog_is_replayed_on_restart() {
-        let Some(conn) = connect_redis_or_skip(8).await else {
+        let Some(conn) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 8).await else {
             return;
         };
 

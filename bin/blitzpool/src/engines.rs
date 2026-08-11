@@ -777,6 +777,7 @@ mod tests {
     use super::*;
     use bp_common::MiningMode;
     use bp_share_stream::AcceptedShareConsumer;
+    use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
 
     /// The settlement gate refuses to book a coinbase paying less than
     /// the block's own subsidy, so this mapping decides whether the
@@ -1016,40 +1017,6 @@ mod tests {
         assert_eq!(composite.sinks.load().len(), 2, "new readers see both");
     }
 
-    const REDIS_URL: &str = "redis://127.0.0.1:16379";
-
-    /// Connect a flushed Redis logical DB, or `None` to skip (Redis
-    /// unavailable / CI without services).
-    async fn connect_redis_or_skip(db: u8) -> Option<redis::aio::ConnectionManager> {
-        // Fold this binary's local number into its own DB range —
-        // see `bp_test_support::redis_db`. Two binaries both using
-        // 0..15 flush each other mid-run.
-        let db =
-            bp_test_support::redis_db_in_range(bp_test_support::redis_db::BLITZPOOL_BIN, db).await;
-        let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-        let client = redis::Client::open(format!("{base}/{db}")).ok()?;
-        let mut conn = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            redis::aio::ConnectionManager::new(client),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            _ => {
-                eprintln!("redis unreachable — skipping engines stream test");
-                return None;
-            }
-        };
-        if redis::cmd("FLUSHDB")
-            .query_async::<()>(&mut conn)
-            .await
-            .is_err()
-        {
-            return None;
-        }
-        Some(conn)
-    }
-
     /// Core mode: the producing composite stamps `share_id` + `mode` at the
     /// single fan-out point and publishes the owned share onto the shared
     /// accepted-share stream — exactly what the Satellite consumes. Proven
@@ -1058,7 +1025,7 @@ mod tests {
     /// stamped fields survived.
     #[tokio::test]
     async fn producing_composite_stamps_and_publishes_to_stream() {
-        let Some(conn) = connect_redis_or_skip(6).await else {
+        let Some(conn) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 6).await else {
             return;
         };
 

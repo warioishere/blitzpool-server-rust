@@ -111,6 +111,7 @@ pub(crate) fn spawn(
 
 #[cfg(test)]
 mod tests {
+    use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -118,14 +119,12 @@ mod tests {
     use bp_notifications::command::ChatLanguageMap;
     use bp_notifications::dispatcher::{DispatcherConfig, NotificationDispatcher};
     use bp_share_stream::{Consumed, StreamConsumer, StreamProducer, BLOCK_FOUND_STREAM_KEY};
-    use redis::aio::ConnectionManager;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
 
     use super::*;
     use crate::block_sink::{BlockFoundApplier, BlockFoundEvent};
 
-    const REDIS_URL: &str = "redis://127.0.0.1:16379";
     const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
     const ADDR: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
 
@@ -153,21 +152,6 @@ mod tests {
         let ledger = BlockFoundApplier::new(None, None, None, None, None);
         // Must return cleanly (no panic, no dispatcher access).
         ledger.notify_block_found(&solo_event()).await;
-    }
-
-    async fn connect_redis_or_skip(db: u8) -> Option<ConnectionManager> {
-        // Fold this binary's local number into its own DB range —
-        // see `bp_test_support::redis_db`. Two binaries both using
-        // 0..15 flush each other mid-run.
-        let db =
-            bp_test_support::redis_db_in_range(bp_test_support::redis_db::BLITZPOOL_BIN, db).await;
-        let client = redis::Client::open(format!("{REDIS_URL}/{db}")).ok()?;
-        let mut conn = tokio::time::timeout(Duration::from_secs(2), ConnectionManager::new(client))
-            .await
-            .ok()?
-            .ok()?;
-        let _: () = redis::cmd("FLUSHDB").query_async(&mut conn).await.ok()?;
-        Some(conn)
     }
 
     async fn connect_pg_or_skip() -> Option<PgPool> {
@@ -215,7 +199,7 @@ mod tests {
     /// rely on.
     #[tokio::test]
     async fn block_found_dual_group_routes_ledger_and_notify() {
-        let Some(redis) = connect_redis_or_skip(10).await else {
+        let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 10).await else {
             eprintln!("redis unreachable — skipping block-found dual-group test");
             return;
         };

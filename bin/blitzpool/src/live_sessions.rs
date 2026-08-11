@@ -414,41 +414,13 @@ impl RedisLiveSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bp_test_support::{
+        connect_redis_in_range_no_flush, connect_redis_in_range_or_skip, redis_db,
+    };
     use std::time::Duration as StdDuration;
     use tokio::io::AsyncWriteExt;
 
-    const REDIS_URL: &str = "redis://127.0.0.1:16379";
     const ADDR: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
-
-    /// Connect and take the index over — FLUSHDB on entry. For tests that
-    /// assert on the union as a whole, which only means anything if no
-    /// other front's key is present. There are only 16 Redis databases and
-    /// every test target in this binary runs as a thread in one process,
-    /// so an index taken here is taken from the whole binary; prefer
-    /// [`connect_redis_or_skip_shared`] where the test can tolerate
-    /// company.
-    async fn connect_redis_or_skip(db: u8) -> Option<ConnectionManager> {
-        let mut conn = connect_redis_or_skip_shared(db).await?;
-        let _: () = redis::cmd("FLUSHDB").query_async(&mut conn).await.ok()?;
-        Some(conn)
-    }
-
-    /// Connect without flushing. Safe to share an index, as long as the
-    /// caller namespaces by its own front id and never asserts on
-    /// anything but its own devices — flushing would buy no isolation
-    /// there and would wipe whatever a sibling is mid-way through.
-    async fn connect_redis_or_skip_shared(db: u8) -> Option<ConnectionManager> {
-        // Fold this binary's local number into its own DB range —
-        // see `bp_test_support::redis_db`. Two binaries both using
-        // 0..15 flush each other mid-run.
-        let db =
-            bp_test_support::redis_db_in_range(bp_test_support::redis_db::BLITZPOOL_BIN, db).await;
-        let client = redis::Client::open(format!("{REDIS_URL}/{db}")).ok()?;
-        tokio::time::timeout(StdDuration::from_secs(2), ConnectionManager::new(client))
-            .await
-            .ok()?
-            .ok()
-    }
 
     /// A no-op inner hook — the registry decorates the real persistence,
     /// and these tests are about the set it maintains alongside it.
@@ -469,7 +441,7 @@ mod tests {
     /// offline. Drives the real trait methods, not a re-implementation.
     #[tokio::test]
     async fn a_device_leaves_the_live_set_only_with_its_last_session() {
-        let Some(redis) = connect_redis_or_skip(13).await else {
+        let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 13).await else {
             eprintln!("redis unreachable — skipping");
             return;
         };
@@ -520,21 +492,22 @@ mod tests {
     /// unit test can stage.
     #[tokio::test]
     async fn a_key_the_incremental_path_creates_always_expires() {
-        // Shares DB 1 with the two socket tests: this one only ever reads
-        // the TTL of its own key, so a sibling's key in the index is
-        // irrelevant — and none of the three flushes.
-        let Some(mut redis) = connect_redis_or_skip_shared(1).await else {
+        // Its own database, not a shared one. This test used to sit on a
+        // non-flushing connection to DB 1 on the argument that it "only
+        // reads the TTL of its own key" — but `cache_sync`'s tests are in
+        // this same binary, take DB 1 too, and DO flush. The flush landed
+        // between the register below and the TTL read, the key was gone,
+        // and TTL answered -2.
+        let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 9).await
+        else {
             eprintln!("redis unreachable — skipping");
             return;
         };
         // No publish() first: this is the narrow case where a session
         // registers before the publisher's first tick, so the register is
-        // what brings the key into existence. A key left by a previous run
-        // would already have a TTL and make that vacuously true.
-        let _: Result<(), _> = redis::cmd("DEL")
-            .arg("device:live:front-fresh")
-            .query_async::<()>(&mut redis)
-            .await;
+        // what brings the key into existence. The connect above flushed the
+        // database, so a key left by a previous run cannot make that
+        // vacuously true.
         let reg = registry(redis.clone(), "front-fresh");
         reg.register_session("s1", ADDR, "rig-a", None).await;
 
@@ -545,8 +518,9 @@ mod tests {
             .expect("ttl");
         assert!(
             ttl > 0,
-            "the key exists without a TTL ({ttl}) — a dead front would \
-             claim these miners forever"
+            "register_session left no TTL on the key it created (TTL {ttl}: \
+             -1 = no expiry, -2 = no such key) — a dead front would claim \
+             these miners forever"
         );
     }
 
@@ -555,7 +529,7 @@ mod tests {
     /// pool during a front deploy.
     #[tokio::test]
     async fn an_absent_publisher_is_unknown_not_empty() {
-        let Some(redis) = connect_redis_or_skip(14).await else {
+        let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 14).await else {
             eprintln!("redis unreachable — skipping");
             return;
         };
@@ -578,7 +552,7 @@ mod tests {
     /// asserts the count is never anything but whole.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_republish_is_never_observed_partially() {
-        let Some(redis) = connect_redis_or_skip(15).await else {
+        let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 15).await else {
             eprintln!("redis unreachable — skipping");
             return;
         };
@@ -623,7 +597,8 @@ mod tests {
         // DB 2, not 12: every test target in this binary runs as a thread
         // in one process and FLUSHDBs its index on entry, so two sharing
         // an index wipe each other. `cache_sync` already owns 12.
-        let Some(mut redis) = connect_redis_or_skip(2).await else {
+        let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 2).await
+        else {
             eprintln!("redis unreachable — skipping");
             return;
         };
@@ -668,7 +643,7 @@ mod tests {
     /// never a correct answer, no matter when the read lands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_key_that_vanishes_mid_read_is_unknown_not_empty() {
-        let Some(redis) = connect_redis_or_skip(3).await else {
+        let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 3).await else {
             eprintln!("redis unreachable — skipping");
             return;
         };
@@ -763,7 +738,7 @@ mod tests {
     /// own state and not about a missed incremental SREM.
     #[tokio::test]
     async fn re_authorizing_under_a_new_worker_leaves_nothing_behind() {
-        let Some(redis) = connect_redis_or_skip(4).await else {
+        let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 4).await else {
             eprintln!("redis unreachable — skipping");
             return;
         };
@@ -795,9 +770,10 @@ mod tests {
 
     impl Hangup {
         /// Own front key + own worker per mode, so the two tests below can
-        /// share one Redis index instead of eating two of the sixteen.
-        /// Neither asserts on the union as a whole — only on its own
-        /// device — so a sibling's key in there is harmless.
+        /// share one Redis index. Neither asserts on the union as a whole —
+        /// only on its own device — so a sibling's key in there is harmless.
+        /// That holds only because both connect WITHOUT flushing; see
+        /// `connect_redis_in_range_no_flush`.
         fn scope(self) -> (&'static str, &'static str) {
             match self {
                 Hangup::Fin => ("front-hangup-fin", "rig-fin"),
@@ -814,8 +790,9 @@ mod tests {
     /// trait methods, because what is under test is not the registry: it
     /// is whether the SV1 connection's exit path reaches
     /// `deregister_session` on every route out of its loop.
-    async fn device_leaves_the_live_set_after(hangup: Hangup, redis_db: u8) -> bool {
-        let Some(redis) = connect_redis_or_skip_shared(redis_db).await else {
+    async fn device_leaves_the_live_set_after(hangup: Hangup, index: u8) -> bool {
+        let Some(redis) = connect_redis_in_range_no_flush(redis_db::BLITZPOOL_BIN, index).await
+        else {
             eprintln!("redis unreachable — skipping");
             return true; // treated as "nothing to assert", see call sites
         };

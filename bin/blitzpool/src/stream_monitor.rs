@@ -165,42 +165,11 @@ pub(crate) async fn collect_lag(redis: &ConnectionManager, keys: &[&str]) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const REDIS_URL: &str = "redis://127.0.0.1:16379";
-
-    async fn connect_redis_or_skip(db: u8) -> Option<ConnectionManager> {
-        // Fold this binary's local number into its own DB range —
-        // see `bp_test_support::redis_db`. Two binaries both using
-        // 0..15 flush each other mid-run.
-        let db =
-            bp_test_support::redis_db_in_range(bp_test_support::redis_db::BLITZPOOL_BIN, db).await;
-        let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-        let client = redis::Client::open(format!("{base}/{db}")).ok()?;
-        let mut conn = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            ConnectionManager::new(client),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            _ => {
-                eprintln!("redis unreachable — skipping stream-monitor test");
-                return None;
-            }
-        };
-        if redis::cmd("FLUSHDB")
-            .query_async::<()>(&mut conn)
-            .await
-            .is_err()
-        {
-            return None;
-        }
-        Some(conn)
-    }
+    use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
 
     #[tokio::test]
     async fn collect_lag_reports_undelivered_entries() {
-        let Some(conn) = connect_redis_or_skip(5).await else {
+        let Some(conn) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 5).await else {
             return;
         };
         let key = "bp:test:monitor:stream";

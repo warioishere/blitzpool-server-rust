@@ -72,31 +72,14 @@ pub(crate) fn spawn(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
 
     use bp_share_stream::{StreamConsumer, DEVICE_STATUS_STREAM_KEY};
     use bp_stratum_v1::DeviceStatusSink;
-    use redis::aio::ConnectionManager;
 
     use crate::device_status::{DeviceStatusStreamEvent, ProducingDeviceStatusSink};
 
-    const REDIS_URL: &str = "redis://127.0.0.1:16379";
     const ADDR: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
-
-    async fn connect_redis_or_skip(db: u8) -> Option<ConnectionManager> {
-        // Fold this binary's local number into its own DB range —
-        // see `bp_test_support::redis_db`. Two binaries both using
-        // 0..15 flush each other mid-run.
-        let db =
-            bp_test_support::redis_db_in_range(bp_test_support::redis_db::BLITZPOOL_BIN, db).await;
-        let client = redis::Client::open(format!("{REDIS_URL}/{db}")).ok()?;
-        let mut conn = tokio::time::timeout(Duration::from_secs(2), ConnectionManager::new(client))
-            .await
-            .ok()?
-            .ok()?;
-        let _: () = redis::cmd("FLUSHDB").query_async(&mut conn).await.ok()?;
-        Some(conn)
-    }
 
     /// End-to-end over real Redis: the split front's producing sink
     /// publishes online + offline events, and a consumer drains them back with
@@ -108,7 +91,7 @@ mod tests {
         // DB 11: every test target in this binary runs as a thread in one
         // process and FLUSHDBs its index on entry, so two sharing an index
         // wipe each other's stream. `redis_backup` already owns 9.
-        let Some(redis) = connect_redis_or_skip(11).await else {
+        let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 11).await else {
             eprintln!("redis unreachable — skipping device-status round-trip test");
             return;
         };

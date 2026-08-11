@@ -297,30 +297,14 @@ async fn rebuild_blockparty(blockparty: Option<&Arc<dyn BlockpartyApi>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const REDIS_URL: &str = "redis://127.0.0.1:16379";
-
-    async fn connect_redis_or_skip(db: u8) -> Option<ConnectionManager> {
-        // Fold this binary's local number into its own DB range —
-        // see `bp_test_support::redis_db`. Two binaries both using
-        // 0..15 flush each other mid-run.
-        let db =
-            bp_test_support::redis_db_in_range(bp_test_support::redis_db::BLITZPOOL_BIN, db).await;
-        let client = redis::Client::open(format!("{REDIS_URL}/{db}")).ok()?;
-        let mut conn = tokio::time::timeout(Duration::from_secs(2), ConnectionManager::new(client))
-            .await
-            .ok()?
-            .ok()?;
-        let _: () = redis::cmd("FLUSHDB").query_async(&mut conn).await.ok()?;
-        Some(conn)
-    }
+    use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
 
     /// The notifier publishes `group` + `blockparty` invalidations onto the
     /// stream, and a consumer reads them back intact — the exact path the Front
     /// drains to rebuild its routing caches.
     #[tokio::test]
     async fn notifier_publishes_invalidations_a_consumer_reads() {
-        let Some(redis) = connect_redis_or_skip(12).await else {
+        let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 12).await else {
             eprintln!("redis unreachable — skipping cache-sync test");
             return;
         };
@@ -361,7 +345,7 @@ mod tests {
     /// delivered once, not once per front" is.
     #[tokio::test]
     async fn two_consumers_in_one_group_split_the_entries() {
-        let Some(redis) = connect_redis_or_skip(1).await else {
+        let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 1).await else {
             eprintln!("redis unreachable — skipping consumer-group semantics test");
             return;
         };
@@ -423,7 +407,7 @@ mod tests {
         // those out; the collision was a sibling. The publish+read below
         // still RETRIES, which costs a round on a wipe rather than a red
         // test while a broken mechanism never produces an entry.
-        let Some(redis) = connect_redis_or_skip(16).await else {
+        let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 16).await else {
             eprintln!("redis unreachable — skipping settlement cross-process test");
             return;
         };
