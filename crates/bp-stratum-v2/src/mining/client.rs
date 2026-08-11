@@ -574,10 +574,36 @@ pub struct MiningSessionState<C: Clock> {
     pub address: Option<AddressId>,
     pub worker_name: String,
     pub vendor: String,
-    /// TDP template stream this connection mines on. Resolved once from the
-    /// OpenChannel address (`StreamKind::for_mode`) and then fixed, so the
+    /// TDP **template** stream this connection mines on. Resolved once from
+    /// the OpenChannel address (`StreamKind::for_mode`) and then fixed, so the
     /// block-submit handle always matches the template the job was built on.
+    ///
+    /// Fixed because it is not a lone value: it names the `template_rx` the
+    /// connection is reading and the submit handle its solutions go to. Moving
+    /// it means swapping those with it, which is why a mode that changes
+    /// mid-connection does NOT move it — see [`Self::accounting_stream`].
     pub stream: StreamKind,
+    /// Which accounting this connection's shares actually enter, re-resolved
+    /// from the mode gate on every `SetCustomMiningJob`.
+    ///
+    /// The same value as [`Self::stream`] in the ordinary case, and
+    /// deliberately a separate field because the two answer different
+    /// questions and go out of step for two reasons that both happen:
+    ///
+    /// - A live address changes mode. `cache_sync`'s reconcile calls
+    ///   `override_mode` so a solo miner that joins a group routes its shares
+    ///   to the group *from the next share*, without a reconnect. The template
+    ///   stream cannot follow (see above), so judging that connection's custom
+    ///   jobs by `stream` judges it by the mode it had at OpenChannel.
+    /// - The alt stream is not wired. The OpenChannel swap logs a warning and
+    ///   leaves the connection on the PPLNS template stream — but a Group-Solo
+    ///   miner parked there is still Group-Solo, and reading `stream` would
+    ///   let it reference the pool-wide (PPLNS) distribution.
+    ///
+    /// Every accounting question — the base-protocol Solo gate, the §7.2
+    /// reference inheritance and the accounting/stream pair — reads THIS one.
+    /// Only the template and submit routing read `stream`.
+    pub accounting_stream: StreamKind,
 
     // Negotiated state from SetupConnection
     pub setup_complete: bool,
@@ -680,6 +706,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             worker_name: String::new(),
             vendor: String::new(),
             stream: StreamKind::Pplns,
+            accounting_stream: StreamKind::Pplns,
             setup_complete: false,
             used_version: 0,
             version_rolling: false,
@@ -713,6 +740,18 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             last_difficulty_check_ms: 0,
             share_logs: false,
         }
+    }
+
+    /// Put this connection on `stream`, template routing and accounting
+    /// together — the ordinary case, where the two agree.
+    ///
+    /// The IO layer calls this once at OpenChannel; only the per-frame
+    /// re-resolve moves [`Self::accounting_stream`] on its own. Having one
+    /// call for the agreeing case is what stops a caller from setting the
+    /// template stream and silently leaving the accounting on the boot value.
+    pub fn set_stream(&mut self, stream: StreamKind) {
+        self.stream = stream;
+        self.accounting_stream = stream;
     }
 
     /// Whether the post-share inline vardiff check may run again.
@@ -2918,8 +2957,15 @@ pub fn handle_set_custom_mining_job<C: Clock>(
         // more than the one output — so those shares would enter PPLNS/group
         // accounting behind a coinbase nobody validated the split of. ext
         // 0x0003 is what expresses it.
+        //
+        // `accounting_stream` and not `stream`: this asks whose money the
+        // block pays, not which template it was built on. A solo miner that
+        // joins a group mid-connection keeps the Solo template stream (the
+        // swap is not repeatable) while its shares route to the group from
+        // the next share — reading `stream` here would keep serving it a
+        // one-output coinbase paying itself, out of a group's block.
         None => {
-            if state.stream != StreamKind::Solo {
+            if state.accounting_stream != StreamKind::Solo {
                 return reject(ERR_CUSTOM_JOB_REQUIRES_SOLO);
             }
             None
@@ -3009,8 +3055,15 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             //
             // Every pair is spelled out. A new stream or a new accounting kind
             // then fails to compile instead of landing in a catch-all.
+            //
+            // Against `accounting_stream`, the mode gate's answer for THIS
+            // frame, not the template stream frozen at OpenChannel. The JDP
+            // side builds the plan from the same gate, so the two agree; held
+            // against the frozen one, a mode that changed mid-connection
+            // would make the pool reject its OWN correct plan — and every
+            // code but `stale-chain-tip` sends an SRI jd-client off the pool.
             use crate::bridge::DistributionAccounting as Acct;
-            match (&entry.accounting, state.stream) {
+            match (&entry.accounting, state.accounting_stream) {
                 // The plan and the stream agree: only the address is left.
                 (Acct::Solo(owner), StreamKind::Solo)
                 | (Acct::GroupSolo(owner), StreamKind::GroupSolo) => {
@@ -3034,7 +3087,7 @@ pub fn handle_set_custom_mining_job<C: Clock>(
                 | (Acct::GroupSolo(_), StreamKind::Blockparty) => {
                     tracing::warn!(
                         channel_id = input.channel_id,
-                        stream = ?state.stream,
+                        stream = ?state.accounting_stream,
                         accounting = ?entry.accounting,
                         "sv2: custom job references a distribution built for different \
                          accounting than this connection's — published against a stale or \
@@ -6422,7 +6475,7 @@ pub(crate) mod tests {
     /// job passes off Solo.
     pub(crate) fn solo_session_with_extended_channel() -> MiningSessionState<Arc<TestClock>> {
         let mut s = session_with_extended_channel();
-        s.stream = StreamKind::Solo;
+        s.set_stream(StreamKind::Solo);
         s
     }
 
@@ -6870,7 +6923,11 @@ pub(crate) mod tests {
     #[test]
     fn a_coinbase_only_job_off_solo_is_still_refused() {
         let mut s = session_with_extended_channel();
-        assert_ne!(s.stream, StreamKind::Solo, "fixture must be non-Solo");
+        assert_ne!(
+            s.accounting_stream,
+            StreamKind::Solo,
+            "fixture must be non-Solo"
+        );
         let cid = s.primary_channel.unwrap();
         let token = Token([0x77u8; 16]);
         let alloc = base_allocation(REGTEST_ADDR, 42);
@@ -6929,7 +6986,11 @@ pub(crate) mod tests {
     fn set_custom_mining_job_without_distribution_rejected_off_solo() {
         // Default-stream session = PPLNS.
         let mut s = session_with_extended_channel();
-        assert_ne!(s.stream, StreamKind::Solo, "fixture must be non-Solo");
+        assert_ne!(
+            s.accounting_stream,
+            StreamKind::Solo,
+            "fixture must be non-Solo"
+        );
         let cid = s.primary_channel.unwrap();
         let token = Token([1u8; 16]);
         let entry = bridge_entry_for(token, REGTEST_ADDR, 42);
@@ -7134,7 +7195,7 @@ pub(crate) mod tests {
     fn a_declared_distribution_job_is_left_to_the_jdp_path() {
         for stream in [StreamKind::Pplns, StreamKind::Solo] {
             let mut s = negotiated_session_with_extended_channel();
-            s.stream = stream;
+            s.set_stream(stream);
             let cid = s.primary_channel.unwrap();
             let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
             // Declared WITH the conformant coinbase, so the declaration
@@ -7568,7 +7629,7 @@ pub(crate) mod tests {
         // `a_tailored_distribution_is_refused_on_a_shared_stream` for the
         // other direction, which this fixture used to be on by default.
         let mut s = negotiated_session_with_extended_channel();
-        s.stream = StreamKind::Solo;
+        s.set_stream(StreamKind::Solo);
         let cid = s.primary_channel.unwrap();
         let entry = distribution_entry(crate::bridge::DistributionAccounting::Solo(
             AddressId::new(REGTEST_ADDR.to_string()).unwrap(),
@@ -7631,7 +7692,7 @@ pub(crate) mod tests {
 
         for (accounting, stream, accepted_expected) in cases {
             let mut s = negotiated_session_with_extended_channel();
-            s.stream = stream;
+            s.set_stream(stream);
             let cid = s.primary_channel.unwrap();
             let entry = distribution_entry(accounting.clone());
             let blob = conformant_outputs(&entry, 312_500_000);
@@ -7677,7 +7738,7 @@ pub(crate) mod tests {
             AddressId::new("bcrt1qvs8k07ggszru23v9p42vpg4jxts9y2k8kkujja".to_string()).unwrap();
 
         let mut s = negotiated_session_with_extended_channel();
-        s.stream = StreamKind::Solo;
+        s.set_stream(StreamKind::Solo);
         let cid = s.primary_channel.unwrap();
         let entry = distribution_entry(Acct::Solo(stranger));
         let blob = conformant_outputs(&entry, 312_500_000);
@@ -7699,6 +7760,103 @@ pub(crate) mod tests {
                 assert_eq!(error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
             }
             other => panic!("another miner's Solo plan must be refused, got {other:?}"),
+        }
+    }
+
+    /// A solo miner that joins a group WHILE CONNECTED is judged by the mode
+    /// it has now, not by the one its channel opened on.
+    ///
+    /// `cache_sync`'s reconcile calls `BlitzpoolModeGate::override_mode` for
+    /// exactly this: the running connection's shares route to the group from
+    /// the next share, with no reconnect. Its TDP template stream cannot
+    /// follow — that value names the `template_rx` being read and the submit
+    /// handle solutions go to — so `stream` still says Solo while the JDP side
+    /// is already publishing a Group-Solo plan, built from the same gate.
+    ///
+    /// Both directions are asserted here, because the check has to keep
+    /// refusing at the same time as it starts accepting: judged against the
+    /// FROZEN stream the pool refuses its own correct plan (and every code but
+    /// `stale-chain-tip` sends an SRI jd-client off the pool for good), while
+    /// dropping the check entirely would let the stale Solo plan through and
+    /// pay the finder a block his group earned.
+    #[test]
+    fn a_mode_that_changes_mid_connection_decides_the_accounting() {
+        use crate::bridge::DistributionAccounting as Acct;
+        let me = || AddressId::new(REGTEST_ADDR.to_string()).unwrap();
+
+        // Opened Solo, then joined a group: the gate says GroupSolo, the
+        // template stream is still Solo.
+        for (accounting, accept) in [(Acct::GroupSolo(me()), true), (Acct::Solo(me()), false)] {
+            let mut s = negotiated_session_with_extended_channel();
+            s.set_stream(StreamKind::Solo);
+            s.accounting_stream = StreamKind::GroupSolo;
+            let cid = s.primary_channel.unwrap();
+            let entry = distribution_entry(accounting.clone());
+            let blob = conformant_outputs(&entry, 312_500_000);
+            let acc = accepted(entry);
+            let mut input = custom_job_input(cid, Token([1u8; 16]));
+            input.distribution_id = Some(9);
+            input.coinbase_tx_outputs = blob;
+
+            let out = handle_set_custom_mining_job(
+                &mut s,
+                &input,
+                None,
+                Some(&distribution_allocation(REGTEST_ADDR, 1)),
+                Some(&acc),
+                1_000,
+            );
+            match (&out.outbound[0], accept) {
+                (OutboundFrame::SetCustomMiningJobSuccess { .. }, true) => {}
+                (OutboundFrame::SetCustomMiningJobError { error_code, .. }, false) => {
+                    assert_eq!(error_code, ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+                }
+                (other, want) => {
+                    panic!("{accounting:?} after the flip: wanted {want}, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// The base-protocol Solo gate reads the same live mode. A JDC on the base
+    /// protocol is only served because §6.4.3's one designated output pays the
+    /// miner itself, so a self-chosen split can only shortchange itself. The
+    /// moment that miner joins a group the sentence stops being true — the
+    /// block is the group's and the one output is his.
+    #[test]
+    fn joining_a_group_closes_the_base_protocol_solo_gate() {
+        let alloc = base_allocation(REGTEST_ADDR, 42);
+        let job = |cid| {
+            coinbase_only_job(
+                cid,
+                Token([0x77u8; 16]),
+                &[txout(312_500_000, designated_script(REGTEST_ADDR))],
+            )
+        };
+
+        // Precondition: on the Solo stream this exact job IS served — so the
+        // refusal below is the flip's doing and not the fixture's.
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        let out = handle_set_custom_mining_job(&mut s, &job(cid), None, Some(&alloc), None, 1_000);
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "fixture must be servable before the flip, got {:?}",
+            out.outbound[0]
+        );
+
+        let mut s = solo_session_with_extended_channel();
+        let cid = s.primary_channel.unwrap();
+        s.accounting_stream = StreamKind::GroupSolo;
+        let out = handle_set_custom_mining_job(&mut s, &job(cid), None, Some(&alloc), None, 1_000);
+        match &out.outbound[0] {
+            OutboundFrame::SetCustomMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_CUSTOM_JOB_REQUIRES_SOLO);
+            }
+            other => panic!("a group member must not be served a base-protocol job, got {other:?}"),
         }
     }
 
@@ -8064,7 +8222,7 @@ pub(crate) mod tests {
             bridge_entry_declaring(token, REGTEST_ADDR, 42, &FIXTURE_SCRIPT_SIG_PREFIX, &blob),
             9,
         );
-        assert_ne!(s.stream, StreamKind::Solo);
+        assert_ne!(s.accounting_stream, StreamKind::Solo);
         let mut input = custom_job_matching(cid, &declared);
         input.distribution_id = None;
         let out = handle_set_custom_mining_job(
@@ -8094,7 +8252,7 @@ pub(crate) mod tests {
             StreamKind::Blockparty,
         ] {
             let mut s = negotiated_session_with_extended_channel();
-            s.stream = stream;
+            s.set_stream(stream);
             let cid = s.primary_channel.unwrap();
             let entry = distribution_entry(crate::bridge::DistributionAccounting::PoolWide);
             let blob = conformant_outputs(&entry, 312_500_000);

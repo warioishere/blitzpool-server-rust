@@ -710,6 +710,21 @@ async fn run_mining_connection(
                     custom.distribution_id = tlvs
                         .as_deref()
                         .and_then(crate::extensions::parse_distribution_id_tlv);
+                    // Re-ask the mode gate whose money this connection's
+                    // blocks pay, for THIS frame. The template stream cannot
+                    // be re-resolved (it names the `template_rx` being read
+                    // and the submit handle), but the accounting can and must
+                    // be: `cache_sync` flips a live solo miner to group-solo
+                    // when it joins a group, without a reconnect, and from
+                    // that moment the plan the JDP side publishes is a
+                    // Group-Solo one. Judged against the OpenChannel value the
+                    // pool would refuse its own correct plan — fatal for an
+                    // SRI jd-client. In-memory gate lookup; a custom job
+                    // arrives once per template, not per share.
+                    if let Some(address) = state.address.clone() {
+                        state.accounting_stream =
+                            hooks.payout_resolver.resolve_stream(&address);
+                    }
                 }
                 // Per-share SubmitSharesExtended trace, gated by
                 // share_logs — would flood at production hashrate
@@ -828,6 +843,15 @@ async fn run_mining_connection(
                             .await;
                         if state.stream.is_pplns() {
                             let resolved = hooks.payout_resolver.resolve_stream(&address);
+                            // The accounting follows the mode whether or not
+                            // the template swap below succeeds. It does not
+                            // always: an alt stream that is not wired leaves
+                            // the connection on the PPLNS template, and a
+                            // Group-Solo miner parked there is still
+                            // Group-Solo — reading the template stream for
+                            // accounting would let it reference the pool-wide
+                            // (PPLNS) distribution.
+                            state.accounting_stream = resolved;
                             if !resolved.is_pplns() {
                                 if let Some(alt) = alt_streams.remove(&resolved) {
                                     template_rx = alt.rx;
@@ -1177,7 +1201,10 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
                 let distribution = crate::bridge::resolve_distribution_reference(
                     input.distribution_id,
                     bridge_job.as_ref(),
-                    state.stream,
+                    // The accounting stream: "does this stream feed shared
+                    // accounting" is a money question, and the frozen
+                    // template stream answers the OpenChannel-time one.
+                    state.accounting_stream,
                     state
                         .negotiated_extensions
                         .contains(&crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS),
@@ -2672,7 +2699,7 @@ mod tests {
         // `resolve_distribution_reference` refuses to inherit on Solo. Group-
         // Solo is the one stream where both hold, so the scope resolution this
         // test is about can be exercised at all.
-        s.stream = bp_common::StreamKind::GroupSolo;
+        s.set_stream(bp_common::StreamKind::GroupSolo);
         let owner = bp_common::AddressId::new(ADDR.to_string()).unwrap();
 
         let tailored = |id: u64, published_at_ms: u64| crate::bridge::PayoutDistributionEntry {
