@@ -1,17 +1,40 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Regtest: SV2 per-mode stream routing — Blockparty (Phase 2).
+//! Regtest: SV2 per-mode stream routing — Solo, Group-Solo and Blockparty
+//! through ONE driver.
 //!
-//! The Blockparty counterpart of `regtest_solo_stream.rs`. Proves that a
-//! connection whose `OpenStandardMiningChannel` address resolves to
-//! **Blockparty** is routed onto the dedicated Blockparty template stream by
-//! `run_mining_connection`, and a block it finds is submitted through the
-//! **Blockparty TDP handle** and accepted by bitcoin-core.
+//! The SV2 counterpart of `bp-stratum-v1/tests/regtest_stream_routing.rs`.
+//! Same scenario, different protocol side, and the protocol side is the whole
+//! reason both exist: here the stream swap is triggered by
+//! `OpenStandardMiningChannel` in `run_mining_connection` (over a Noise-XK
+//! session), not by `mining.authorize` in `run_connection`.
 //!
-//! Guards: a recording block-sink captures the `StreamKind` of every
-//! block-submit (`Blockparty` proves the OpenChannel swap fired), and the chain
-//! advancing proves the Blockparty handle knew the job's `template_id`
-//! (template_ids collide across streams — a mis-routed submit would be rejected).
+//! Two independent guards make each proof tight:
+//!   1. A recording block-sink captures the `StreamKind` of every block-submit.
+//!      The mode's own kind proves the OpenChannel swap fired; had it not, the
+//!      sink would record `Pplns` — the stream every connection boots on
+//!      before its mode is resolved — and the test fails.
+//!   2. The chain advancing proves the mode's handle actually knew the job's
+//!      `template_id` — template_ids collide across streams, so a mis-routed
+//!      submit would be rejected and the height would not move.
+//!
+//! The three modes differ only in the reservation their stream advertises and
+//! in how many outputs the coinbase carries, so they share [`run_scenario`]:
+//!
+//!   * **Solo** pays one output, against a tiny fixed reservation.
+//!   * **Group-Solo** additionally proves a ~50-member P2TR coinbase fits the
+//!     production 10 000-WU reservation through the SV2 coinbase builder.
+//!   * **Blockparty** routes at the production 8 000-WU reservation.
+//!
+//! Sharing the loop is deliberate: as three files these carried three copies of
+//! the same miner loop, and the copies had already begun to diverge — only Solo
+//! and Blockparty classified each `SubmitShares*` response, so a Group-Solo run
+//! that failed reported "height did not rise" with nothing to say why. The one
+//! driver here classifies for all three.
+//!
+//! Skipped (with a printed warning) when `bitcoin-node` is not installed.
+
+#![allow(clippy::print_stderr)]
 
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -46,34 +69,94 @@ const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 const SRI_TEST_PUB: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
 const SRI_TEST_PRV: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
 
-struct BlockpartyResolver;
+/// The per-mode inputs of one scenario. Everything else in [`run_scenario`] is
+/// identical across the three, which is why they share it.
+#[derive(Clone, Copy)]
+struct ModeCase {
+    /// The stream the connection must be routed onto.
+    stream: StreamKind,
+    /// `max_additional_size` advertised on that stream's TDP handle.
+    reservation_bytes: u32,
+    /// Log prefix + skip-message label.
+    label: &'static str,
+}
+
+/// Solo pays a single output, so a tiny reservation is all it needs.
+const SOLO: ModeCase = ModeCase {
+    stream: StreamKind::Solo,
+    reservation_bytes: 1_000,
+    label: "solo",
+};
+
+/// ≈ `tdp_constraint_for_budget(10_000 WU)`: 10_000/4 + 256. The production
+/// Group-Solo reservation. Holds ~50 P2TR member outputs (50 × 43 B = 2150 B).
+const GROUP_SOLO: ModeCase = ModeCase {
+    stream: StreamKind::GroupSolo,
+    reservation_bytes: 2_756,
+    label: "group-solo",
+};
+
+/// ≈ `tdp_constraint_for_budget(8_000 WU)`: 8_000/4 + 256. The production
+/// Blockparty reservation.
+const BLOCKPARTY: ModeCase = ModeCase {
+    stream: StreamKind::Blockparty,
+    reservation_bytes: 2_256,
+    label: "blockparty",
+};
+
+/// Routes every address to `stream` and splits the block's OWN revenue across
+/// `addresses`, so the payout vector consumes the template value exactly
+/// whatever the subsidy and fees happen to be.
+struct FixedResolver {
+    stream: StreamKind,
+    addresses: Vec<String>,
+}
 
 #[async_trait]
-impl PayoutResolver for BlockpartyResolver {
+impl PayoutResolver for FixedResolver {
     async fn resolve_payouts(
         &self,
-        miner_address: &AddressId,
+        _miner_address: &AddressId,
         reward_sats: u64,
     ) -> ResolvedPayouts {
-        ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-            address: miner_address.as_str().to_string(),
-            sats: reward_sats,
-        }])
+        ResolvedPayouts::unsnapshotted(split_reward(&self.addresses, reward_sats))
     }
 
     fn resolve_stream(&self, _miner_address: &AddressId) -> StreamKind {
-        StreamKind::Blockparty
+        self.stream
     }
 }
 
-struct RecordingAltSink {
-    tdp: TdpHandle,
+/// Split `reward_sats` evenly across `addresses`, the remainder onto the first.
+/// The sum is `reward_sats` exactly — anything else is `bad-cb-amount`.
+fn split_reward(addresses: &[String], reward_sats: u64) -> Vec<PayoutEntry> {
+    let n = addresses.len() as u64;
+    let each = reward_sats / n;
+    let remainder = reward_sats - each * n;
+    addresses
+        .iter()
+        .enumerate()
+        .map(|(i, address)| PayoutEntry {
+            address: address.clone(),
+            sats: if i == 0 { each + remainder } else { each },
+        })
+        .collect()
+}
+
+/// Records the routed stream and submits the solution through the handle that
+/// stream owns — the test-side mirror of production's `select_handle`.
+struct RecordingSink {
+    tdp_default: TdpHandle,
     tdp_alt: TdpHandle,
+    /// The one stream this scenario gave a dedicated handle to. Held as a
+    /// value and compared, not matched as a mode: a fourth `StreamKind` cannot
+    /// silently fall through to the default handle here.
+    alt: StreamKind,
     recorded: Arc<Mutex<Vec<StreamKind>>>,
 }
 
 #[async_trait]
-impl BlockSubmissionSink for RecordingAltSink {
+impl BlockSubmissionSink for RecordingSink {
     async fn submit_block(
         &self,
         accept: &ShareAccept,
@@ -86,10 +169,10 @@ impl BlockSubmissionSink for RecordingAltSink {
         if accept.witness_coinbase.is_empty() || accept.template_id.is_none() {
             return;
         }
-        let handle = if stream == StreamKind::Blockparty {
+        let handle = if stream == self.alt {
             &self.tdp_alt
         } else {
-            &self.tdp
+            &self.tdp_default
         };
         let h = &accept.header;
         let version = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
@@ -107,25 +190,140 @@ impl BlockSubmissionSink for RecordingAltSink {
     }
 }
 
+// ── the three modes ─────────────────────────────────────────────────────
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::print_stderr)]
+async fn sv2_solo_connection_routes_to_solo_stream_and_block_accepted() {
+    let Some(node) = start_node_or_skip(SOLO, "routing").await else {
+        return;
+    };
+    let outcome = run_scenario(&node, SOLO, vec![REGTEST_ADDR.to_string()]).await;
+    node.shutdown().await.ok();
+    assert_routed_and_landed(SOLO, &outcome);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sv2_group_solo_connection_routes_to_group_solo_stream_and_block_accepted() {
+    let Some(node) = start_node_or_skip(GROUP_SOLO, "routing").await else {
+        return;
+    };
+    let outcome = run_scenario(&node, GROUP_SOLO, vec![REGTEST_ADDR.to_string()]).await;
+    node.shutdown().await.ok();
+    assert_routed_and_landed(GROUP_SOLO, &outcome);
+}
+
+/// ~50 distinct P2TR (bech32m) members — the worst-case 172-WU output type.
+/// 50 × 43 B = 2150 B of coinbase outputs, which must fit the production
+/// 10 000-WU reservation (2756 B). Validity proof for the documented
+/// "~50 members" capacity over the SV2 coinbase builder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sv2_group_solo_max_size_multi_output_coinbase_accepted() {
+    let Some(node) = start_node_or_skip(GROUP_SOLO, "max-size multi-output").await else {
+        return;
+    };
+    const MEMBERS: usize = 50;
+    let members = mint_p2tr_members(&node, MEMBERS).await;
+    let outcome = run_scenario(&node, GROUP_SOLO, members).await;
+    node.shutdown().await.ok();
+    eprintln!(
+        "[sv2-group-solo] {MEMBERS}-output coinbase accepted: height {} → {}",
+        outcome.before, outcome.after
+    );
+    assert_routed_and_landed(GROUP_SOLO, &outcome);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepted() {
+    let Some(node) = start_node_or_skip(BLOCKPARTY, "routing").await else {
+        return;
+    };
+    let outcome = run_scenario(&node, BLOCKPARTY, vec![REGTEST_ADDR.to_string()]).await;
+    node.shutdown().await.ok();
+    assert_routed_and_landed(BLOCKPARTY, &outcome);
+}
+
+// ── driver ──────────────────────────────────────────────────────────────
+
+/// What one scenario observed. The submit tallies are carried out so a failing
+/// assertion can say *why* no block landed instead of only that none did.
+struct Outcome {
+    recorded: Vec<StreamKind>,
+    before: u32,
+    after: u32,
+    successes: u32,
+    errors: Vec<String>,
+}
+
+/// Start a regtest node + mine 101 for IBD-exit + maturity, or return `None`
+/// (and print a skip line) when bitcoin-node isn't installed.
+async fn start_node_or_skip(case: ModeCase, what: &str) -> Option<RegtestNode> {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
         eprintln!(
-            "skipping SV2 blockparty-stream regtest — {}",
+            "skipping SV2 {} {what} regtest — {}",
+            case.label,
             cfg.unavailable_reason()
         );
-        return;
+        return None;
     }
-
     let node = RegtestNode::start_with(RegtestConfig::default())
         .await
         .expect("regtest start");
     node.generate_to_self(101)
         .await
         .expect("mine 101 for IBD-exit + maturity");
+    Some(node)
+}
 
+/// Mint `n` distinct P2TR (bech32m) addresses from the node's wallet.
+async fn mint_p2tr_members(node: &RegtestNode, n: usize) -> Vec<String> {
+    let mut members = Vec::with_capacity(n);
+    for _ in 0..n {
+        members.push(
+            node.new_address("bech32m")
+                .await
+                .expect("mint bech32m member address"),
+        );
+    }
+    members
+}
+
+fn assert_routed_and_landed(case: ModeCase, outcome: &Outcome) {
+    let Outcome {
+        recorded,
+        before,
+        after,
+        successes,
+        errors,
+    } = outcome;
+    let want = case.stream;
+    let label = case.label;
+    eprintln!(
+        "[sv2-{label}] recorded streams = {recorded:?}, height {before} → {after}, \
+         submits {successes} success, errors={errors:?}"
+    );
+    assert!(
+        recorded.contains(&want),
+        "block-submit must be routed via the {want:?} stream (OpenChannel swap); \
+         recorded {recorded:?}"
+    );
+    assert!(
+        recorded.iter().all(|s| *s == want),
+        "a {want:?} connection must never submit via the boot (Pplns) stream; \
+         recorded {recorded:?}"
+    );
+    assert!(
+        after > before,
+        "bitcoin-core must accept the {want:?}-stream block via the {want:?} handle \
+         (height {before} → {after}; submits {successes} success, errors={errors:?})"
+    );
+}
+
+/// Spin up two TDP streams (default + `case.stream` at its own reservation),
+/// the SV2 server with a `FixedResolver` plus a recording sink, and drive one
+/// Noise miner through SetupConnection / OpenStandardMiningChannel / submit
+/// until a block lands.
+async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>) -> Outcome {
     let tdp_default = TdpHandle::spawn(
         TdpConfig::new(node.ipc_socket_path())
             .with_fee_threshold(1)
@@ -141,12 +339,11 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
             .with_fee_threshold(1)
             .with_min_interval_secs(1)
             .with_coinbase_constraints(TdpCoinbaseConstraints {
-                // ≈ tdp_constraint_for_budget(8_000 WU): 8_000/4 + 256.
-                max_additional_size: 2_256,
+                max_additional_size: case.reservation_bytes,
                 max_additional_sigops: 0,
             }),
     )
-    .expect("spawn blockparty TDP");
+    .expect("spawn per-mode TDP");
 
     let updates_rx = tdp_default.subscribe();
     let alt_updates_rx = tdp_alt.subscribe();
@@ -156,12 +353,16 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
 
     let recorded: Arc<Mutex<Vec<StreamKind>>> = Arc::new(Mutex::new(Vec::new()));
     let hooks = MiningServerHooks {
-        block_sink: Arc::new(RecordingAltSink {
-            tdp: tdp_default.clone(),
+        block_sink: Arc::new(RecordingSink {
+            tdp_default: tdp_default.clone(),
             tdp_alt: tdp_alt.clone(),
+            alt: case.stream,
             recorded: recorded.clone(),
         }),
-        payout_resolver: Arc::new(BlockpartyResolver),
+        payout_resolver: Arc::new(FixedResolver {
+            stream: case.stream,
+            addresses,
+        }),
         ..MiningServerHooks::no_op()
     };
     let noise_config =
@@ -173,11 +374,7 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
         noise_config,
         updates_rx,
         tdp_default.current_snapshot(),
-        vec![(
-            StreamKind::Blockparty,
-            alt_updates_rx,
-            tdp_alt.current_snapshot(),
-        )],
+        vec![(case.stream, alt_updates_rx, tdp_alt.current_snapshot())],
         hooks,
         bridge,
         std::sync::Arc::new(bp_mining_job::MiningJobCache::new()),
@@ -212,7 +409,6 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
         .expect("noise handshake");
     let (mut reader, mut writer) = noise.into_split();
 
-    // SetupConnection → success.
     write_any_message(
         &mut writer,
         AnyMessage::Common(CommonMessages::SetupConnection(
@@ -234,7 +430,7 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
     .await;
     let _ = read_any_message(&mut reader).await; // SetupConnectionSuccess
 
-    // OpenStandardMiningChannel with the Blockparty address → triggers the swap.
+    // OpenStandardMiningChannel with the mode's address → triggers the swap.
     write_any_message(
         &mut writer,
         AnyMessage::Mining(Mining::OpenStandardMiningChannel(
@@ -251,7 +447,8 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
     )
     .await;
 
-    // Capture the first NewMiningJob (built from the Blockparty template post-swap).
+    // Capture the first NewMiningJob (built from the mode's template post-swap):
+    // it carries channel_id + job_id + version + min_ntime we need to submit.
     let mut job: Option<(u32, u32, u32)> = None;
     let mut ntime: Option<u32> = None;
     let _ = tokio::time::timeout(Duration::from_secs(8), async {
@@ -278,8 +475,14 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
     .await;
     let (channel_id, job_id, version) = job.expect("NewMiningJob within 8s");
     let ntime = ntime.expect("min_ntime via job or SetNewPrevHash");
+    eprintln!(
+        "[sv2-{}] captured job: channel_id={channel_id} job_id={job_id} \
+         version={version:#x} ntime={ntime}",
+        case.label
+    );
 
-    eprintln!("[sv2-blockparty] captured job: channel_id={channel_id} job_id={job_id} version={version:#x} ntime={ntime}");
+    // Submit nonces until the chain advances (a block landed via the mode's
+    // handle). ~50% of nonces clear the regtest target → lands within a few.
     let before = node.current_height().await.expect("height");
     let mut landed = None;
     let mut successes = 0u32;
@@ -299,6 +502,7 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
             })),
         )
         .await;
+        // Drain the server's responses for a short window, classifying each.
         let _ = tokio::time::timeout(Duration::from_millis(500), async {
             loop {
                 match read_any_message(&mut reader).await {
@@ -306,11 +510,15 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
                         errors.push(String::from_utf8_lossy(e.error_code.as_bytes()).to_string());
                     }
                     AnyMessage::Mining(Mining::SubmitSharesSuccess(_)) => successes += 1,
+                    // Track job refresh so we don't submit against a stale id.
+                    // A future job keeps the previous ntime until its
+                    // SetNewPrevHash arrives (handled below).
                     AnyMessage::Mining(Mining::NewMiningJob(j)) => {
                         let nt = j.min_ntime.clone().into_inner().unwrap_or(nt);
                         latest_job = (j.channel_id, j.job_id, j.version, nt);
                     }
-                    // Future-job activation supplies the ntime.
+                    // Future-job activation supplies the ntime for the
+                    // just-received job.
                     AnyMessage::Mining(Mining::SetNewPrevHash(p)) => {
                         let (cid, jid, ver, _) = latest_job;
                         latest_job = (cid, jid, ver, p.min_ntime);
@@ -320,12 +528,11 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
             }
         })
         .await;
-        if let Some(h) = poll_for_height(&node, before + 1, Duration::from_millis(400)).await {
+        if let Some(h) = poll_for_height(node, before + 1, Duration::from_millis(400)).await {
             landed = Some(h);
             break;
         }
     }
-    eprintln!("[sv2-blockparty] submits: {successes} success, errors={errors:?}");
 
     drop(writer);
     drop(reader);
@@ -334,25 +541,17 @@ async fn sv2_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
     tdp_alt.shutdown().ok();
     let after = landed.unwrap_or(before);
     let recorded = recorded.lock().unwrap().clone();
-    node.shutdown().await.ok();
     let _ = accept_handle.await;
-
-    eprintln!("[sv2-blockparty] recorded streams = {recorded:?}, height {before} → {after}");
-    assert!(
-        recorded.contains(&StreamKind::Blockparty),
-        "block-submit must be routed via the Blockparty stream (OpenChannel swap); recorded {recorded:?}"
-    );
-    assert!(
-        recorded.iter().all(|s| *s == StreamKind::Blockparty),
-        "a Blockparty connection must never submit via the Default stream; recorded {recorded:?}"
-    );
-    assert!(
-        after > before,
-        "bitcoin-core must accept the Blockparty-stream block via the Blockparty handle ({before} → {after})"
-    );
+    Outcome {
+        recorded,
+        before,
+        after,
+        successes,
+        errors,
+    }
 }
 
-// ── helpers (mirror regtest_solo_stream.rs) ─────────────────────────────
+// ── helpers (mirror regtest_standard.rs) ────────────────────────────────
 
 async fn write_any_message(
     writer: &mut stratum_apps::network_helpers::noise_stream::NoiseTcpWriteHalf<

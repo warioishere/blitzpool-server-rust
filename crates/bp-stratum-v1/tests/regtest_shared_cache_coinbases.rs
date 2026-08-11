@@ -276,7 +276,7 @@ async fn sv1_shared_cache_keeps_per_finder_coinbases_distinct() {
     );
 }
 
-// ── helpers (mirrors regtest_solo_stream.rs) ────────────────────────
+// ── helpers (mirrors regtest_stream_routing.rs) ─────────────────────
 
 async fn read_frame(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Value {
     let mut line = String::new();
