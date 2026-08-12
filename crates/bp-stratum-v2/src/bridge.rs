@@ -254,6 +254,12 @@ impl DistributionReference {
 /// A reference is inherited from the declaration only where that is both
 /// permitted and load-bearing — see the two guards below. Everywhere else the
 /// job is judged exactly as it was before this path existed.
+///
+/// **`stream` must be the connection's `accounting_stream`, in both callers.**
+/// "Decided once" is a property of the arguments, not of the function: passing
+/// the frozen template stream in one caller and the accounting stream in the
+/// other made them resolve different things the moment a mode moved
+/// mid-connection, which is the drift this function was written to prevent.
 pub fn resolve_distribution_reference(
     frame_tlv: Option<u64>,
     bridge_job: Option<&BridgeJobRef>,

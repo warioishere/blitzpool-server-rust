@@ -2772,10 +2772,19 @@ pub fn handle_set_custom_mining_job<C: Clock>(
     // this connection use the extension at all. `resolve_distribution_reference`
     // owns both guards, and the IO layer resolved the acceptance above through
     // the same call, so the id validated here is the id that was resolved.
+    //
+    // `accounting_stream`, the same operand the IO layer passes. It read
+    // `state.stream` here until the two were measured apart: whether a stream
+    // feeds shared accounting is an accounting question, and the frozen
+    // template stream answers the OpenChannel-time one. On a mode that moved
+    // mid-connection the two callers then resolved DIFFERENT things —
+    // `custom-jobs-require-solo` for a correct Group-Solo plan one way,
+    // `stale-payout-distribution` for a resolved id the other — which is
+    // exactly the drift this function exists to prevent.
     let distribution_ref = crate::bridge::resolve_distribution_reference(
         input.distribution_id,
         bridge_job,
-        state.stream,
+        state.accounting_stream,
         state
             .negotiated_extensions
             .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS),
@@ -7816,6 +7825,111 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// The same flip, on a Full-Template job — where the §6 TLV rides on
+    /// `DeclareMiningJob` and the reference is INHERITED from the declaration
+    /// rather than read off this frame.
+    ///
+    /// A separate test because the case above cannot reach this code at all:
+    /// its `distribution_id` is a frame TLV, and `resolve_distribution_
+    /// reference` returns on that before it ever looks at a stream. So the
+    /// operand it is given went unexercised, and the two callers of that
+    /// function drifted apart unnoticed — the IO layer resolving the
+    /// acceptance from `accounting_stream`, the handler judging it by the
+    /// frozen `stream`.
+    ///
+    /// Both directions, because each produced a different wrong answer:
+    /// `custom-jobs-require-solo` for a correct Group-Solo plan (the handler
+    /// saw Solo, inherited nothing, and fell into the base-protocol gate),
+    /// and `stale-payout-distribution` the other way (the handler inherited a
+    /// reference the IO layer had resolved no acceptance for). Both are fatal
+    /// for an SRI jd-client.
+    #[test]
+    fn a_full_template_job_inherits_against_the_live_mode_not_the_frozen_stream() {
+        use crate::bridge::DistributionAccounting as Acct;
+        let me = || AddressId::new(REGTEST_ADDR.to_string()).unwrap();
+
+        // Opened Solo, joined a group. The JDP side has published the
+        // Group-Solo plan the new mode calls for; the template stream is
+        // frozen at Solo and must not be what decides.
+        let mut s = negotiated_session_with_extended_channel();
+        s.set_stream(StreamKind::Solo);
+        s.accounting_stream = StreamKind::GroupSolo;
+        let cid = s.primary_channel.unwrap();
+        let entry = distribution_entry(Acct::GroupSolo(me()));
+        let blob = conformant_outputs(&entry, 312_500_000);
+        let declared = declared_under_distribution(
+            bridge_entry_declaring(
+                Token([1u8; 16]),
+                REGTEST_ADDR,
+                42,
+                &FIXTURE_SCRIPT_SIG_PREFIX,
+                &blob,
+            ),
+            9,
+        );
+        let acc = accepted(entry);
+        let input = custom_job_matching(cid, &declared);
+        assert_eq!(
+            input.distribution_id, None,
+            "a Full-Template JDC puts the TLV on the declare, not here — without that this \
+             test would take the frame-TLV path and prove nothing"
+        );
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &input,
+            Some(&job_ref_for(&declared)),
+            None,
+            Some(&acc),
+            1_000,
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "the pool must not refuse the plan it published for this miner's own mode, got {:?}",
+            out.outbound[0]
+        );
+
+        // The other way: left the group, so the accounting is Solo again while
+        // the template stream is frozen at GroupSolo. A Solo stream inherits
+        // nothing — which is what the IO layer concluded too, so it resolved
+        // no acceptance and passes `None`. Judged by the frozen stream the
+        // handler inherits a reference anyway and refuses that `None`.
+        let mut s = negotiated_session_with_extended_channel();
+        s.set_stream(StreamKind::GroupSolo);
+        s.accounting_stream = StreamKind::Solo;
+        let cid = s.primary_channel.unwrap();
+        let entry = distribution_entry(Acct::Solo(me()));
+        let blob = conformant_outputs(&entry, 312_500_000);
+        let declared = declared_under_distribution(
+            bridge_entry_declaring(
+                Token([2u8; 16]),
+                REGTEST_ADDR,
+                43,
+                &FIXTURE_SCRIPT_SIG_PREFIX,
+                &blob,
+            ),
+            9,
+        );
+        let out = handle_set_custom_mining_job(
+            &mut s,
+            &custom_job_matching(cid, &declared),
+            Some(&job_ref_for(&declared)),
+            None,
+            None, // what the IO layer resolves once the accounting is Solo
+            1_000,
+        );
+        assert!(
+            matches!(
+                out.outbound[0],
+                OutboundFrame::SetCustomMiningJobSuccess { .. }
+            ),
+            "a Solo accounting inherits no reference, so there is nothing to call stale, got {:?}",
+            out.outbound[0]
+        );
     }
 
     /// The base-protocol Solo gate reads the same live mode. A JDC on the base
