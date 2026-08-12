@@ -474,6 +474,63 @@ impl DistributionAccounting {
     }
 }
 
+/// Does a distribution built for `accounting` belong to a miner on `stream`?
+///
+/// The one place the question "whose money does this plan pay, and is that
+/// this miner?" is answered, and it has three callers that would otherwise
+/// each answer it their own way:
+///
+/// - `SetCustomMiningJob` — may this connection MINE this plan?
+/// - the JDP declare — may this session DECLARE a coinbase paying it?
+/// - the JDP connection loop — is the plan it is serving still the right one?
+///
+/// The declare caller is not redundant with the mining one. A block found on
+/// a Full-Template job is booked from its DECLARATION alone (`PushSolution` →
+/// `handle_push_solution`), so it never passes the mining-side check; without
+/// this question asked at declare time, a plan built for the wrong accounting
+/// can still be blessed and booked.
+///
+/// Decided over the PAIR, because both halves are questions about a mode and
+/// neither is checkable on its own. A guard like `if stream == Pplns` would be
+/// an `if mode ==` in disguise: a stream added later would slip through it
+/// silently. As a pair the match is exhaustive over `StreamKind`, so a new
+/// stream has to be classified rather than default into being served.
+///
+/// The entry carries the accounting it was BUILT for, so this is a direct
+/// comparison and not an inference from the owner address. That distinction is
+/// the whole point: a Solo plan and a Group-Solo plan are both tailored to the
+/// same one address, and an owner check waves the wrong one through — a Solo
+/// plan mined on a Group-Solo stream pays the finder alone instead of
+/// splitting across the group. The owner check itself stays at the call site
+/// that has an address to check.
+///
+/// Every pair is spelled out. A new stream or a new accounting kind then fails
+/// to compile instead of landing in a catch-all.
+pub fn accounting_matches_stream(
+    accounting: &DistributionAccounting,
+    stream: bp_common::StreamKind,
+) -> bool {
+    use bp_common::StreamKind as Sk;
+    use DistributionAccounting as Acct;
+    match (accounting, stream) {
+        (Acct::Solo(_), Sk::Solo) | (Acct::GroupSolo(_), Sk::GroupSolo) => true,
+        // Pool-wide is the PPLNS window's. Without this a Group-Solo
+        // connection could point at it: its blocks would pay the PPLNS window
+        // while its shares kept earning a cut of the group's.
+        (Acct::PoolWide, Sk::Pplns) => true,
+
+        (Acct::PoolWide, Sk::Solo)
+        | (Acct::PoolWide, Sk::GroupSolo)
+        | (Acct::PoolWide, Sk::Blockparty)
+        | (Acct::Solo(_), Sk::Pplns)
+        | (Acct::Solo(_), Sk::GroupSolo)
+        | (Acct::Solo(_), Sk::Blockparty)
+        | (Acct::GroupSolo(_), Sk::Pplns)
+        | (Acct::GroupSolo(_), Sk::Solo)
+        | (Acct::GroupSolo(_), Sk::Blockparty) => false,
+    }
+}
+
 /// One published `SetPayoutDistribution` (ext 0x0003 §3.1), tracked
 /// pool-wide so both the JDP declare path and the mining-side
 /// `SetCustomMiningJob` path can resolve a `distribution_id` TLV to

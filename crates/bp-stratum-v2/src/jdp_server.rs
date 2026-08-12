@@ -259,6 +259,21 @@ pub trait PayoutDistributionSource: Send + Sync {
     /// [`TailoredDistribution`] — `PoolWide` and `Unavailable` are NOT
     /// interchangeable.
     async fn build_for_miner(&self, miner_address: &AddressId) -> TailoredDistribution;
+    /// Which accounting this address is on RIGHT NOW, without building
+    /// anything — `None` when the pool has no live mining session for it and
+    /// therefore no answer (the same distinction [`TailoredDistribution::
+    /// ModeUnknown`] draws).
+    ///
+    /// A session is served ONE plan, decided when its mode first became
+    /// known, and a mode can move underneath it: the cache-sync reconcile
+    /// flips a live miner between Solo and Group-Solo the moment its group
+    /// membership changes, deliberately without a reconnect. So the plan on
+    /// file has to be re-asked, and it is asked per inbound frame rather than
+    /// pushed at the gate: a lost push leaves a session serving the wrong plan
+    /// forever and silently, while a missed poll simply happens again on the
+    /// next frame. The cost is the reason it can be per-frame — this is a
+    /// lookup that builds nothing.
+    async fn current_mode(&self, miner_address: &AddressId) -> Option<bp_common::StreamKind>;
     /// `None` ⇒ the allocator is unavailable; the publish is skipped
     /// (the previously-published distribution stays valid).
     async fn next_distribution_id(&self) -> Option<u64>;
@@ -462,6 +477,12 @@ impl PayoutDistributionSource for NoOpJdpHooks {
         // either, so there is nothing to fall back TO.
         TailoredDistribution::PoolWide
     }
+    async fn current_mode(&self, _miner_address: &AddressId) -> Option<bp_common::StreamKind> {
+        // No mode gate wired, so the honest answer is "no answer" — which
+        // leaves whatever a session is being served alone, exactly as this
+        // no-op leaves everything else alone.
+        None
+    }
     async fn next_distribution_id(&self) -> Option<u64> {
         None
     }
@@ -659,8 +680,11 @@ impl StratumV2JdpServer {
 /// allocated before its miner connected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SessionDistribution {
-    /// A tailored slot is published for this miner.
-    Tailored(AddressId),
+    /// A tailored slot is published for this miner, carrying the accounting
+    /// it was BUILT for — which is what makes "is this still the right plan?"
+    /// answerable later. The owner address travels inside it, so nothing is
+    /// lost by not holding one separately.
+    Tailored(DistributionAccounting),
     /// This miner is PPLNS: the pool-wide push IS its accounting.
     PoolWide,
     /// The mode is not known YET. Nothing is published, and the caller retries
@@ -682,6 +706,23 @@ enum SessionDistribution {
     Denied,
 }
 
+impl SessionDistribution {
+    /// Is a plan on file for this session with the pool?
+    ///
+    /// The two "serving nothing" states are not merely the absence of one: a
+    /// plan on file is REFERENCEABLE — `distribution_acceptance` will answer
+    /// with it, and §7.2 keeps the immediately-previous one answerable too. So
+    /// when a plan stops being the right one it has to be dropped, not just
+    /// superseded, and this is the question that decides whether there is
+    /// anything to drop.
+    fn is_serving_a_plan(&self) -> bool {
+        match self {
+            Self::Tailored(_) | Self::PoolWide => true,
+            Self::AwaitingMode | Self::Denied => false,
+        }
+    }
+}
+
 /// How long a session that was refused a distribution waits before the pool
 /// tries to build it one again, on its own frames.
 ///
@@ -691,7 +732,7 @@ enum SessionDistribution {
 const DENIED_REBUILD_INTERVAL_MS: u64 = 30_000;
 
 /// Whether an inbound frame should make the pool re-decide what this session
-/// is served.
+/// is served, given the accounting its address is on right now.
 ///
 /// A `match`, and exhaustive, because the four states want four different
 /// answers and a fifth added later must be classified rather than inherit
@@ -706,15 +747,53 @@ const DENIED_REBUILD_INTERVAL_MS: u64 = 30_000;
 ///   only other path, and it skips a tick whose fingerprint is unchanged — on
 ///   a quiet window a session refused once stays refused with nothing left to
 ///   wake it.
-/// - `Tailored` / `PoolWide` — never here. A session that is being served
-///   re-decides when its slot is invalidated (§10), not on its own traffic.
-fn rebuild_due(served: &SessionDistribution, now_ms: u64, last_rebuild_ms: u64) -> bool {
+/// - `Tailored` / `PoolWide` — only when the mode MOVED. These used to answer
+///   `false` unconditionally, on the reasoning that a served session
+///   re-decides when its slot is invalidated (§10). That holds for a
+///   settlement and for nothing else: `cache_sync::reconcile_gate_modes`
+///   flips a live address between Solo and Group-Solo on a group join or
+///   leave, deliberately without a reconnect, and until the pool next found a
+///   block the session kept being served the plan for the mode it no longer
+///   had.
+fn rebuild_due(
+    served: &SessionDistribution,
+    current_mode: Option<bp_common::StreamKind>,
+    now_ms: u64,
+    last_rebuild_ms: u64,
+) -> bool {
     match served {
         SessionDistribution::AwaitingMode => true,
         SessionDistribution::Denied => {
             now_ms.saturating_sub(last_rebuild_ms) >= DENIED_REBUILD_INTERVAL_MS
         }
-        SessionDistribution::Tailored(_) | SessionDistribution::PoolWide => false,
+        SessionDistribution::Tailored(accounting) => mode_moved_away(accounting, current_mode),
+        SessionDistribution::PoolWide => {
+            mode_moved_away(&DistributionAccounting::PoolWide, current_mode)
+        }
+    }
+}
+
+/// Has this address's mode moved away from the one `accounting` was built for?
+///
+/// `None` is NOT a move. It means the gate has no live mining session for the
+/// address — the miner's rig dropped, or is between reconnects — and the
+/// pool's answer is "I don't know", which is exactly the state
+/// [`TailoredDistribution::ModeUnknown`] exists to keep apart from a decision.
+/// Treating it as a move would throw away a perfectly good plan every time a
+/// miner behind a JDC blips, and protects nothing: a mode that really changes
+/// comes back as a DIFFERENT `Some` and is caught here.
+///
+/// The comparison itself is [`crate::bridge::accounting_matches_stream`] —
+/// the same table the mining side judges a custom job by and the declare path
+/// judges a coinbase by, so a session cannot be served a plan those two would
+/// then refuse.
+fn mode_moved_away(
+    accounting: &DistributionAccounting,
+    current_mode: Option<bp_common::StreamKind>,
+) -> bool {
+    match current_mode {
+        None => false,
+        Some(stream) => !crate::bridge::accounting_matches_stream(accounting, stream),
     }
 }
 
@@ -795,9 +874,14 @@ impl AwaitingModeWatch {
 
 /// Build and push a fresh tailored distribution for `miner` on this session.
 ///
-/// Used both on the first allocate and after a §10 settlement, which
-/// invalidates a tailored slot exactly like the pool-wide one while the
-/// publisher only ever republishes the latter.
+/// Three callers, one implementation: the first allocate; a §10 settlement,
+/// which invalidates a tailored slot exactly like the pool-wide one while the
+/// publisher only ever republishes the latter; and the session's own frames,
+/// which retry an undecided or refused build and answer a mode that moved.
+///
+/// It rebuilds from the mode gate every time, so it needs to be told nothing
+/// about WHY it was called. What the mode-moved caller has to do on top is
+/// drop the plan on file first — see [`SessionDistribution::is_serving_a_plan`].
 async fn republish_tailored(
     hooks: &JdpServerHooks,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
@@ -930,7 +1014,7 @@ async fn republish_tailored(
     let entry = entry_from_built(
         distribution_id,
         built,
-        accounting,
+        accounting.clone(),
         Some(session_id),
         now_ms(),
     );
@@ -951,7 +1035,7 @@ async fn republish_tailored(
     // an id it has already seen.
     *last_pool_wide_written = None;
     debug!(distribution_id, "jdp {session_id_hex} tailored republished");
-    SessionDistribution::Tailored(miner.clone())
+    SessionDistribution::Tailored(accounting)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1154,6 +1238,25 @@ async fn run_jdp_connection(
                 let negotiated_before = state
                     .negotiated_extensions
                     .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
+                // What accounting this session's address is on, asked once
+                // per frame and used twice: the declare path below is judged
+                // against it, and the re-decide after the dispatch acts on it.
+                //
+                // Read BEFORE the frame is handled, because the declare is one
+                // of the frames it judges — and asked at all because a served
+                // session's plan is otherwise decided once and never revisited,
+                // while `cache_sync` flips a live address between Solo and
+                // Group-Solo on a group join without any reconnect.
+                //
+                // `identity` is `None` only until the first allocate, and a
+                // declare cannot precede one (its token would not resolve).
+                let current_mode = match (&identity, negotiated_before) {
+                    (Some(miner), true) => hooks.distribution_source.current_mode(miner).await,
+                    // Nothing to ask about: no miner yet, or a session that
+                    // never negotiated 0x0003 and so holds no plan to be wrong
+                    // about.
+                    _ => None,
+                };
                 let mut outcome = dispatch_jdp_inbound(
                     &mut state,
                     inbound,
@@ -1161,6 +1264,7 @@ async fn run_jdp_connection(
                     &bridge,
                     session_id,
                     &remote_addr,
+                    current_mode,
                     now_ms(),
                 )
                 .await;
@@ -1278,20 +1382,51 @@ async fn run_jdp_connection(
                     }
 
                     // Re-decide on the session's OWN frames, not only on the
-                    // publisher's 60 s tick. A JDC allocates ~8 s before its
-                    // mining channel opens, so at allocate time the mode is
-                    // routinely unknown — but it becomes known milliseconds
-                    // after that channel opens, and the JDC keeps sending. On
-                    // the tick alone the client would spend up to a minute
-                    // with no distribution, declare without one, and a PPLNS
-                    // address would be refused `custom-jobs-require-solo` —
-                    // trading a wrong distribution for a fatal one. `Denied`
-                    // rides the same path on a throttle; `rebuild_due` owns
-                    // which state gets which treatment.
-                    if let (Some(miner), true) =
-                        (&identity, rebuild_due(&served, now_ms(), last_rebuild_ms))
-                    {
+                    // publisher's 60 s tick. Two states reach this:
+                    //
+                    // - Served nothing yet. A JDC allocates ~8 s before its
+                    //   mining channel opens, so at allocate time the mode is
+                    //   routinely unknown — but it becomes known milliseconds
+                    //   after that channel opens, and the JDC keeps sending. On
+                    //   the tick alone the client would spend up to a minute
+                    //   with no distribution, declare without one, and a PPLNS
+                    //   address would be refused `custom-jobs-require-solo` —
+                    //   trading a wrong distribution for a fatal one. `Denied`
+                    //   rides the same path on a throttle.
+                    // - Served a plan whose MODE HAS MOVED. `cache_sync` flips
+                    //   a live address between Solo and Group-Solo on a group
+                    //   join or leave, deliberately without a reconnect; until
+                    //   this existed the session kept being served the plan for
+                    //   the mode it no longer had, and only a §10 settlement or
+                    //   a reconnect ever corrected it.
+                    //
+                    // `rebuild_due` owns which state gets which treatment, off
+                    // the mode read before the dispatch.
+                    if let (Some(miner), true) = (
+                        &identity,
+                        rebuild_due(&served, current_mode, now_ms(), last_rebuild_ms),
+                    ) {
                         let miner = miner.clone();
+                        // A plan on file AND a rebuild due can only mean the
+                        // mode moved — that is the sole condition under which
+                        // `rebuild_due` says yes for a served state. The plan
+                        // pays the wrong set of miners from here on, and
+                        // superseding it is not enough: §7.2 keeps the
+                        // immediately-previous entry acceptable, which is
+                        // exactly long enough to declare against once more.
+                        if served.is_serving_a_plan() {
+                            let dropped = bridge
+                                .write()
+                                .expect("bridge RwLock poisoned")
+                                .clear_tailored(session_id);
+                            info!(
+                                miner = miner.as_str(),
+                                ?current_mode,
+                                dropped,
+                                "jdp {session_id_hex} payout mode moved under a session that was \
+                                 being served — dropping the plan built for the old one"
+                            );
+                        }
                         let next = republish_tailored(
                             &hooks,
                             &bridge,
@@ -1336,6 +1471,11 @@ async fn dispatch_jdp_inbound(
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
     session_id: u32,
     remote_addr: &str,
+    // The accounting this session's address is on right now, resolved by the
+    // caller once per frame. Handed to the declare path, which is where a
+    // coinbase is blessed and therefore the last place a plan built for a mode
+    // that has since moved can still be caught.
+    current_mode: Option<bp_common::StreamKind>,
     now_ms: u64,
 ) -> JdpHandlerOutcome {
     match inbound {
@@ -1428,6 +1568,7 @@ async fn dispatch_jdp_inbound(
                 &template_txs,
                 current_prev_hash,
                 distribution,
+                current_mode,
                 now_ms,
             )
         }
@@ -1493,6 +1634,7 @@ async fn dispatch_jdp_inbound(
                 &input,
                 current_prev_hash,
                 distribution,
+                current_mode,
                 now_ms,
             )
         }
@@ -2012,6 +2154,7 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
+            None,
             1_000,
         )
         .await;
@@ -2116,6 +2259,7 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
+            None,
             1_000,
         )
         .await;
@@ -2157,6 +2301,7 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
+            None,
             1_000,
         )
         .await;
@@ -2187,6 +2332,7 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
+            None,
             1_000,
         )
         .await;
@@ -2211,6 +2357,7 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
+            None,
             0,
         )
         .await;
@@ -2245,6 +2392,7 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
+            None,
             1_000,
         )
         .await;
@@ -2273,6 +2421,7 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
+            None,
             2_000,
         )
         .await;
@@ -2295,32 +2444,101 @@ mod tests {
     #[test]
     fn only_the_states_that_have_something_to_gain_rebuild_on_a_frame() {
         let miner = AddressId::new(ADDR.to_string()).unwrap();
+        let solo = Some(bp_common::StreamKind::Solo);
         // Undecided: every frame, the check returns before anything is built.
-        assert!(rebuild_due(&SessionDistribution::AwaitingMode, 0, 0));
-        assert!(rebuild_due(&SessionDistribution::AwaitingMode, 1, 0));
+        assert!(rebuild_due(&SessionDistribution::AwaitingMode, solo, 0, 0));
+        assert!(rebuild_due(&SessionDistribution::AwaitingMode, solo, 1, 0));
 
         // Refused: not on the next frame, but not never either.
-        assert!(!rebuild_due(&SessionDistribution::Denied, 1_000, 1_000));
         assert!(!rebuild_due(
             &SessionDistribution::Denied,
+            solo,
+            1_000,
+            1_000
+        ));
+        assert!(!rebuild_due(
+            &SessionDistribution::Denied,
+            solo,
             1_000 + DENIED_REBUILD_INTERVAL_MS - 1,
             1_000
         ));
         assert!(rebuild_due(
             &SessionDistribution::Denied,
+            solo,
             1_000 + DENIED_REBUILD_INTERVAL_MS,
             1_000
         ));
 
-        // Being served: its own traffic decides nothing. A tailored slot is
-        // re-decided when a §10 settlement invalidates it, and a pool-wide one
-        // rides the publisher's pushes.
-        for served in [
-            SessionDistribution::Tailored(miner.clone()),
-            SessionDistribution::PoolWide,
+        // Being served the plan its mode calls for: its own traffic decides
+        // nothing, however long it keeps sending.
+        for (served, mode) in [
+            (
+                SessionDistribution::Tailored(DistributionAccounting::Solo(miner.clone())),
+                bp_common::StreamKind::Solo,
+            ),
+            (
+                SessionDistribution::Tailored(DistributionAccounting::GroupSolo(miner.clone())),
+                bp_common::StreamKind::GroupSolo,
+            ),
+            (SessionDistribution::PoolWide, bp_common::StreamKind::Pplns),
         ] {
-            assert!(!rebuild_due(&served, u64::MAX, 0), "{served:?}");
+            assert!(
+                !rebuild_due(&served, Some(mode), u64::MAX, 0),
+                "{served:?} on {mode:?}"
+            );
         }
+    }
+
+    /// The mode moving under a served session is the ONE thing that re-opens
+    /// it — every pair that is not the one it was built for, in both
+    /// directions, so a fix that only caught the group-join direction fails
+    /// here.
+    #[test]
+    fn a_served_session_rebuilds_exactly_when_its_mode_moved() {
+        use bp_common::StreamKind as Sk;
+        let miner = AddressId::new(ADDR.to_string()).unwrap();
+        let served_for = |accounting: DistributionAccounting| match accounting {
+            DistributionAccounting::PoolWide => SessionDistribution::PoolWide,
+            tailored => SessionDistribution::Tailored(tailored),
+        };
+        for (accounting, built_for) in [
+            (DistributionAccounting::Solo(miner.clone()), Sk::Solo),
+            (
+                DistributionAccounting::GroupSolo(miner.clone()),
+                Sk::GroupSolo,
+            ),
+            (DistributionAccounting::PoolWide, Sk::Pplns),
+        ] {
+            let served = served_for(accounting);
+            for now in [Sk::Solo, Sk::GroupSolo, Sk::Pplns, Sk::Blockparty] {
+                assert_eq!(
+                    rebuild_due(&served, Some(now), u64::MAX, 0),
+                    now != built_for,
+                    "{served:?} was built for {built_for:?}, gate now says {now:?}"
+                );
+            }
+            // …and "the gate has never heard of this address" is not a move.
+            // A miner behind a JDC that drops for a moment must not cost the
+            // session the plan it is correctly being served.
+            assert!(
+                !rebuild_due(&served, None, u64::MAX, 0),
+                "{served:?} must survive an unknown mode"
+            );
+        }
+    }
+
+    /// Only a served session has a plan on file to drop — and it is the
+    /// dropping that matters: §7.2 keeps the immediately-previous entry
+    /// acceptable, so a plan merely superseded is still declarable against.
+    #[test]
+    fn only_a_served_session_has_a_plan_to_drop() {
+        let miner = AddressId::new(ADDR.to_string()).unwrap();
+        assert!(SessionDistribution::PoolWide.is_serving_a_plan());
+        assert!(
+            SessionDistribution::Tailored(DistributionAccounting::Solo(miner)).is_serving_a_plan()
+        );
+        assert!(!SessionDistribution::AwaitingMode.is_serving_a_plan());
+        assert!(!SessionDistribution::Denied.is_serving_a_plan());
     }
 
     /// The denial is readable without taking the write lock — the whole point
@@ -2353,7 +2571,7 @@ mod tests {
         }
         assert!(!w.warned, "8 s is the measured normal, not an anomaly");
         w.observe(
-            &SessionDistribution::Tailored(miner.clone()),
+            &SessionDistribution::Tailored(DistributionAccounting::Solo(miner.clone())),
             "jdp-test",
             &miner,
             8_100,

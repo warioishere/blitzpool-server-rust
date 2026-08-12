@@ -3042,28 +3042,16 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // both are questions about a mode and neither is checkable on its
             // own. A guard like `if state.stream == Pplns` would be an
             // `if mode ==` in disguise: a stream added later would slip
-            // through it silently. As a pair the match is exhaustive over
-            // `StreamKind`, so a new stream has to be classified rather than
-            // default into being served.
-            //
-            // The entry carries the accounting it was BUILT for, so this is a
-            // direct comparison and not an inference from the owner address.
-            // That distinction is the whole point: a Solo plan and a
-            // Group-Solo plan are both tailored to the same one address, and
-            // an owner check waves the wrong one through — a Solo plan mined
-            // on a Group-Solo stream pays the finder alone instead of
-            // splitting across the group.
+            // through it silently — see `accounting_matches_stream`, which
+            // owns the pair and is shared with the JDP declare path.
             //
             // Reachable, and not exotically. The JDP side picks which plan to
             // build from the mode gate at ALLOCATE time, and a JDC allocates
             // before its mining channel exists (measured: ~8 s, in both JDP
-            // modes), so the gate is empty and answers Solo. Whatever the
-            // address really is, it gets a Solo plan. This match is where that
-            // guess is caught, because the mining side is the one place the
-            // mode is certain — the port has already spoken.
-            //
-            // Every pair is spelled out. A new stream or a new accounting kind
-            // then fails to compile instead of landing in a catch-all.
+            // modes), so the gate may not know the mode yet. This check is
+            // where a plan built against the wrong one is caught, because the
+            // mining side is a place the mode is certain — the port has
+            // already spoken.
             //
             // Against `accounting_stream`, the mode gate's answer for THIS
             // frame, not the template stream frozen at OpenChannel. The JDP
@@ -3071,39 +3059,33 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // against the frozen one, a mode that changed mid-connection
             // would make the pool reject its OWN correct plan — and every
             // code but `stale-chain-tip` sends an SRI jd-client off the pool.
-            use crate::bridge::DistributionAccounting as Acct;
-            match (&entry.accounting, state.accounting_stream) {
-                // The plan and the stream agree: only the address is left.
-                (Acct::Solo(owner), StreamKind::Solo)
-                | (Acct::GroupSolo(owner), StreamKind::GroupSolo) => {
+            if !crate::bridge::accounting_matches_stream(&entry.accounting, state.accounting_stream)
+            {
+                tracing::warn!(
+                    channel_id = input.channel_id,
+                    stream = ?state.accounting_stream,
+                    accounting = ?entry.accounting,
+                    "sv2: custom job references a distribution built for different \
+                     accounting than this connection's — published against a stale or \
+                     unresolved mode; rejecting rather than paying the wrong set of miners"
+                );
+                return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
+            }
+            // The accounting fits this connection; only the address is left,
+            // and only a tailored plan names one. A `match` and not
+            // `owner()`-plus-`if`: which accountings name an owner is the
+            // same question `accounting_matches_stream` answers over the
+            // pair, and an `is_some()` on the owner reads like a mode test
+            // while answering a different one.
+            match &entry.accounting {
+                crate::bridge::DistributionAccounting::Solo(owner)
+                | crate::bridge::DistributionAccounting::GroupSolo(owner) => {
                     if channel_addr != owner.as_str() {
                         return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
                     }
                 }
-                // Pool-wide is the PPLNS window's. Without this a Group-Solo
-                // connection could point at it: its blocks would pay the PPLNS
-                // window while its shares kept earning a cut of the group's.
-                (Acct::PoolWide, StreamKind::Pplns) => {}
-
-                (Acct::PoolWide, StreamKind::Solo)
-                | (Acct::PoolWide, StreamKind::GroupSolo)
-                | (Acct::PoolWide, StreamKind::Blockparty)
-                | (Acct::Solo(_), StreamKind::Pplns)
-                | (Acct::Solo(_), StreamKind::GroupSolo)
-                | (Acct::Solo(_), StreamKind::Blockparty)
-                | (Acct::GroupSolo(_), StreamKind::Pplns)
-                | (Acct::GroupSolo(_), StreamKind::Solo)
-                | (Acct::GroupSolo(_), StreamKind::Blockparty) => {
-                    tracing::warn!(
-                        channel_id = input.channel_id,
-                        stream = ?state.accounting_stream,
-                        accounting = ?entry.accounting,
-                        "sv2: custom job references a distribution built for different \
-                         accounting than this connection's — published against a stale or \
-                         unresolved mode; rejecting rather than paying the wrong set of miners"
-                    );
-                    return reject(ERR_INVALID_JOB_PARAM_TOKEN_MISMATCH);
-                }
+                // Pool-wide names nobody — every PPLNS connection shares it.
+                crate::bridge::DistributionAccounting::PoolWide => {}
             }
             let declared: Vec<bitcoin::TxOut> =
                 match bitcoin::consensus::deserialize(&input.coinbase_tx_outputs) {

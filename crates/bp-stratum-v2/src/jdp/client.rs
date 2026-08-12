@@ -686,12 +686,14 @@ pub fn parse_user_identifier_as_address(user_identifier: &str) -> Option<Address
 ///   (emits `DeclareMiningJobSuccess` + `JobDeclared` event).
 /// - Some wtxids missing → emit `ProvideMissingTransactions` and
 ///   stash a [`PendingState`] for the follow-up Success frame.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_declare_mining_job(
     state: &mut JdpSessionState,
     input: &DeclareMiningJobInput,
     template_txs: &HashMap<[u8; 32], Vec<u8>>,
     current_prev_hash: Option<[u8; 32]>,
     distribution: Option<DistributionAcceptance>,
+    current_mode: Option<bp_common::StreamKind>,
     now_ms: u64,
 ) -> JdpHandlerOutcome {
     // §2: a distribution reference from a client that never negotiated
@@ -741,6 +743,7 @@ pub fn handle_declare_mining_job(
             miner_address,
             current_prev_hash,
             distribution,
+            current_mode,
             now_ms,
         );
     }
@@ -799,6 +802,7 @@ pub fn handle_provide_missing_transactions_success(
     input: &ProvideMissingTransactionsSuccessInput,
     current_prev_hash: Option<[u8; 32]>,
     distribution: Option<DistributionAcceptance>,
+    current_mode: Option<bp_common::StreamKind>,
     now_ms: u64,
 ) -> JdpHandlerOutcome {
     let pending = match state.pending_declaration.take() {
@@ -835,6 +839,7 @@ pub fn handle_provide_missing_transactions_success(
         pending.miner_address,
         current_prev_hash,
         distribution,
+        current_mode,
         now_ms,
     )
 }
@@ -860,6 +865,10 @@ fn accept_declaration(
     miner_address: AddressId,
     current_prev_hash: Option<[u8; 32]>,
     distribution: Option<DistributionAcceptance>,
+    // The stream this address's mode maps to right now, or `None` when the
+    // pool has no live mining session for it. Resolved by the IO layer from
+    // the same mode gate the JDP side builds its plans from.
+    current_mode: Option<bp_common::StreamKind>,
     now_ms: u64,
 ) -> JdpHandlerOutcome {
     // The coinbase must rebuild, on EVERY connection — not just the 0x0003
@@ -950,6 +959,45 @@ fn accept_declaration(
                 });
             }
         };
+        // The plan must belong to the accounting this address is on RIGHT
+        // NOW, not to the one it was on when the plan was built.
+        //
+        // This is the ONLY place that question is asked for a block found
+        // through `PushSolution`. That path books from the declaration alone
+        // (`handle_push_solution` → `CandidateBacking::Bookable`) and never
+        // touches the mining side, so the `SetCustomMiningJob` check is not a
+        // net for it: a Solo plan left standing after its owner joined a group
+        // would be blessed here and its block booked, paying the finder a
+        // block the group earned. Group-Solo keeps no ledger, so nothing
+        // repairs that afterwards.
+        //
+        // Same function as the mining side (`accounting_matches_stream`) —
+        // one table, three callers.
+        let mode_still_fits = match current_mode {
+            // No live mining session for this address. That is the absence of
+            // an answer, not a changed one, and the two must not be collapsed
+            // — a miner that briefly drops would otherwise invalidate a
+            // perfectly good plan on every reconnect. A mode that actually
+            // moves shows up as a DIFFERENT `Some`, and is caught below.
+            None => true,
+            Some(stream) => crate::bridge::accounting_matches_stream(&entry.accounting, stream),
+        };
+        if !mode_still_fits {
+            tracing::warn!(
+                request_id = input.request_id,
+                distribution_id = entry.distribution_id,
+                accounting = ?entry.accounting,
+                ?current_mode,
+                "jdp: declared against a distribution built for a different accounting than \
+                 this address is on now — its mode moved mid-session; rejecting rather than \
+                 blessing a coinbase that pays the wrong set of miners"
+            );
+            return JdpHandlerOutcome::with_frame(JdpOutboundFrame::DeclareMiningJobError {
+                request_id: input.request_id,
+                error_code: ERR_STALE_PAYOUT_DISTRIBUTION.to_string(),
+                error_details: b"distribution was built for a different payout mode".to_vec(),
+            });
+        }
         match validate_coinbase_outputs_against_distribution(
             &declared_coinbase.tx.output,
             &entry.pool_payout,
@@ -1665,7 +1713,7 @@ mod tests {
         // need a valid token to test this path.
         let bogus_token = Token([0u8; 16]);
         let input = declare(1, bogus_token, vec![]);
-        let out = handle_declare_mining_job(&mut s, &input, &HashMap::new(), None, None, 0);
+        let out = handle_declare_mining_job(&mut s, &input, &HashMap::new(), None, None, None, 0);
         match &out.outbound[0] {
             JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_UNSUPPORTED_FEATURE_FLAGS);
@@ -1680,7 +1728,7 @@ mod tests {
         handle_setup_connection(&mut s, &good_setup());
         let bogus = Token([1u8; 16]);
         let input = declare(2, bogus, vec![]);
-        let out = handle_declare_mining_job(&mut s, &input, &HashMap::new(), None, None, 0);
+        let out = handle_declare_mining_job(&mut s, &input, &HashMap::new(), None, None, None, 0);
         match &out.outbound[0] {
             JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_MINING_JOB_TOKEN);
@@ -1699,7 +1747,8 @@ mod tests {
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         tpl.insert(wtxid_b, vec![0xFE; 16]);
         let input = declare(3, token, vec![wtxid_a, wtxid_b]);
-        let out = handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, 3_000);
+        let out =
+            handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, None, 3_000);
         match &out.outbound[0] {
             JdpOutboundFrame::DeclareMiningJobSuccess {
                 request_id,
@@ -1748,7 +1797,8 @@ mod tests {
         let mut tpl = HashMap::new();
         tpl.insert(wtxid, vec![0xCA; 16]);
         let input = declare(3, token, vec![wtxid]);
-        let out = handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, 1_100);
+        let out =
+            handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, None, 1_100);
 
         assert!(
             !out.outbound.is_empty(),
@@ -1795,6 +1845,7 @@ mod tests {
                 &declare(request_id, token, vec![wtxid]),
                 &tpl,
                 Some([0xAB; 32]),
+                None,
                 None,
                 1_100,
             );
@@ -1849,6 +1900,7 @@ mod tests {
             &tpl,
             Some([0xAB; 32]),
             None,
+            None,
             1_100,
         );
         let declaration_token = match out.outbound[0] {
@@ -1864,6 +1916,7 @@ mod tests {
             &declare(4, declaration_token, vec![wtxid]),
             &tpl,
             Some([0xAB; 32]),
+            None,
             None,
             1_200,
         );
@@ -1922,6 +1975,7 @@ mod tests {
             &tpl,
             Some([0xAB; 32]),
             None,
+            None,
             1_100,
         );
 
@@ -1960,6 +2014,7 @@ mod tests {
             &HashMap::new(),
             Some([0xAB; 32]),
             None,
+            None,
             3_000,
         );
         match &out.outbound[0] {
@@ -1996,6 +2051,7 @@ mod tests {
                 &HashMap::new(),
                 Some([0xAB; 32]),
                 Some(acceptance),
+                None,
                 3_000,
             );
             match &out.outbound[0] {
@@ -2024,6 +2080,7 @@ mod tests {
             &HashMap::new(),
             Some([0xAB; 32]),
             None,
+            None,
             3_000,
         );
         match &out.outbound[0] {
@@ -2033,6 +2090,85 @@ mod tests {
             f => panic!("expected DeclareMiningJobError, got {f:?}"),
         }
         assert_eq!(s.declared_jobs.len(), 0);
+    }
+
+    /// A plan built for one payout mode must not bless a coinbase once the
+    /// address is on another — and this is the ONLY place that can be caught.
+    ///
+    /// A block found on a Full-Template job is booked from its DECLARATION
+    /// (`handle_push_solution` reads `DeclaredJob::booking`, which is stamped
+    /// right here) and never passes the mining side, so the
+    /// `SetCustomMiningJob` accounting check is no net for it. A Solo plan
+    /// still standing after its owner joined a group would be blessed here and
+    /// its block booked — paying the finder alone a block the group earned,
+    /// and Group-Solo keeps no ledger to repair that from.
+    ///
+    /// All three answers, because two of them are easy to lose:
+    /// - the mode it was built for → accepted, or the pool refuses its own
+    ///   correct plan on every declare,
+    /// - a DIFFERENT mode → refused,
+    /// - no mode at all → accepted. "The gate has never heard of this address"
+    ///   is the absence of an answer, not a changed one; treating it as a
+    ///   change would refuse every declare whose miner briefly dropped.
+    #[test]
+    fn a_declare_is_judged_against_the_mode_the_address_is_on_now() {
+        use bp_common::StreamKind as Sk;
+        let tailored = |id: u64| crate::bridge::PayoutDistributionEntry {
+            accounting: crate::bridge::DistributionAccounting::Solo(addr()),
+            ..distribution_entry(id)
+        };
+        let conformant = {
+            let e = tailored(7);
+            let outputs = compute_payout_vector(
+                &e.pool_payout,
+                &e.payouts,
+                &e.dust_limits,
+                &e.additional_outputs,
+                312_500_000,
+            )
+            .unwrap();
+            coinbase_suffix(&bitcoin::consensus::serialize(&outputs))
+        };
+
+        for (mode, accept) in [
+            (Some(Sk::Solo), true),
+            (None, true),
+            (Some(Sk::GroupSolo), false),
+            (Some(Sk::Pplns), false),
+            (Some(Sk::Blockparty), false),
+        ] {
+            let mut s = fresh();
+            let token = complete_setup_and_allocate(&mut s);
+            negotiate_0x0003(&mut s);
+            let mut input = declare(3, token, vec![]);
+            input.distribution_id = Some(7);
+            input.coinbase_tx_suffix = conformant.clone();
+            let out = handle_declare_mining_job(
+                &mut s,
+                &input,
+                &HashMap::new(),
+                Some([0xAB; 32]),
+                accepted(tailored(7)),
+                mode,
+                3_000,
+            );
+            match (&out.outbound[0], accept) {
+                (JdpOutboundFrame::DeclareMiningJobSuccess { .. }, true) => {
+                    // Accepting is only half of it: the booking stamped here
+                    // is what a `PushSolution` books the block from.
+                    assert_eq!(s.declared_jobs.len(), 1, "{mode:?}");
+                }
+                (JdpOutboundFrame::DeclareMiningJobError { error_code, .. }, false) => {
+                    assert_eq!(error_code, ERR_STALE_PAYOUT_DISTRIBUTION, "{mode:?}");
+                    assert_eq!(
+                        s.declared_jobs.len(),
+                        0,
+                        "{mode:?}: a refused declaration must leave nothing bookable"
+                    );
+                }
+                (other, want) => panic!("{mode:?}: wanted accept={want}, got {other:?}"),
+            }
+        }
     }
 
     /// §7.1 recompute-and-compare: a declared coinbase matching the
@@ -2066,6 +2202,7 @@ mod tests {
             &HashMap::new(),
             Some([0xAB; 32]),
             accepted(distribution_entry(7)),
+            None,
             3_000,
         );
         match &out.outbound[0] {
@@ -2090,6 +2227,7 @@ mod tests {
             &HashMap::new(),
             Some([0xAB; 32]),
             accepted(distribution_entry(7)),
+            None,
             4_000,
         );
         assert!(
@@ -2141,6 +2279,7 @@ mod tests {
                 &HashMap::new(),
                 Some([0xAB; 32]),
                 distribution,
+                None,
                 3_000,
             );
             match &out.outbound[0] {
@@ -2165,6 +2304,7 @@ mod tests {
             &declare(3, token, vec![]),
             &HashMap::new(),
             Some([0xAB; 32]),
+            None,
             None,
             3_000,
         );
@@ -2194,6 +2334,7 @@ mod tests {
             &HashMap::new(),
             Some([0xAB; 32]),
             accepted(distribution_entry(7)),
+            None,
             3_000,
         );
         match &out.outbound[0] {
@@ -2234,6 +2375,7 @@ mod tests {
             &HashMap::new(),
             Some([0xAB; 32]),
             accepted(entry),
+            None,
             3_000,
         );
         assert!(
@@ -2287,6 +2429,7 @@ mod tests {
                 &HashMap::new(),
                 Some([0xAB; 32]),
                 None,
+                None,
                 3_000,
             );
             match &out.outbound[0] {
@@ -2308,6 +2451,7 @@ mod tests {
             &HashMap::new(),
             Some([0xAB; 32]),
             None,
+            None,
             3_000,
         );
         assert!(matches!(
@@ -2325,7 +2469,8 @@ mod tests {
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         let input = declare(4, token, vec![wtxid_a, wtxid_b]);
-        let out = handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, 3_000);
+        let out =
+            handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, None, 3_000);
         match &out.outbound[0] {
             JdpOutboundFrame::ProvideMissingTransactions {
                 request_id,
@@ -2361,6 +2506,7 @@ mod tests {
             &tpl,
             Some([0xAB; 32]),
             None,
+            None,
             3_000,
         );
         assert_eq!(
@@ -2373,6 +2519,7 @@ mod tests {
             &declare(5, token, vec![known, missing]),
             &tpl,
             Some([0xAB; 32]),
+            None,
             None,
             3_100,
         );
@@ -2391,6 +2538,7 @@ mod tests {
                 transaction_list: vec![vec![0xBB; 16]],
             },
             Some([0xAB; 32]),
+            None,
             None,
             3_200,
         );
@@ -2413,7 +2561,8 @@ mod tests {
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         let input = declare(5, token, vec![wtxid_a, wtxid_b]);
-        let _ = handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, 3_000);
+        let _ =
+            handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, None, 3_000);
         let success = ProvideMissingTransactionsSuccessInput {
             request_id: 5,
             transaction_list: vec![vec![0xFE; 16]],
@@ -2422,6 +2571,7 @@ mod tests {
             &mut s,
             &success,
             Some([0xAB; 32]),
+            None,
             None,
             4_000,
         );
@@ -2448,7 +2598,8 @@ mod tests {
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         let input = declare(5, token, vec![wtxid_a, wtxid_b]);
         // Declared under tip 0xAB…
-        let _ = handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, 3_000);
+        let _ =
+            handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, None, 3_000);
         let success = ProvideMissingTransactionsSuccessInput {
             request_id: 5,
             transaction_list: vec![vec![0xFE; 16]],
@@ -2458,6 +2609,7 @@ mod tests {
             &mut s,
             &success,
             Some([0xCD; 32]),
+            None,
             None,
             4_000,
         );
@@ -2503,6 +2655,7 @@ mod tests {
             &tpl,
             Some([0xAB; 32]),
             accepted(entry),
+            None,
             3_000,
         );
         assert!(s.pending_declaration.is_some());
@@ -2516,6 +2669,7 @@ mod tests {
             &success,
             Some([0xAB; 32]),
             Some(DistributionAcceptance::Stale),
+            None,
             4_000,
         );
         match &out.outbound[0] {
@@ -2549,6 +2703,7 @@ mod tests {
             &tpl,
             Some([0xAB; 32]),
             accepted(distribution_entry(7)),
+            None,
             3_000,
         );
         let success = ProvideMissingTransactionsSuccessInput {
@@ -2560,6 +2715,7 @@ mod tests {
             &success,
             Some([0xAB; 32]),
             accepted(distribution_entry(7)),
+            None,
             4_000,
         );
         match &out.outbound[0] {
@@ -2591,7 +2747,8 @@ mod tests {
             request_id: 99,
             transaction_list: vec![vec![]],
         };
-        let out = handle_provide_missing_transactions_success(&mut s, &success, None, None, 0);
+        let out =
+            handle_provide_missing_transactions_success(&mut s, &success, None, None, None, 0);
         assert!(out.outbound.is_empty());
     }
 
@@ -2608,6 +2765,7 @@ mod tests {
             &HashMap::new(),
             Some([0xAB; 32]),
             None,
+            None,
             3_000,
         );
         // Pending expects 2 missing (positions 0,1) but we provide 1.
@@ -2619,6 +2777,7 @@ mod tests {
             &mut s,
             &bad_success,
             Some([0xAB; 32]),
+            None,
             None,
             4_000,
         );
@@ -2686,6 +2845,7 @@ mod tests {
             &tpl,
             Some([0xAB; 32]),
             None,
+            None,
             3_000,
         );
 
@@ -2730,7 +2890,8 @@ mod tests {
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 8]);
         let input = declare(7, token, vec![wtxid_a]);
-        let _ = handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, 3_000);
+        let _ =
+            handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, None, 3_000);
         let extranonce = vec![0xEE; 8];
         let solution = PushSolutionInput {
             extranonce: extranonce.clone(),
@@ -2781,7 +2942,8 @@ mod tests {
         // into pending. Without ProvideMissingTransactions.Success,
         // raw_transactions[1] never gets populated.
         let input = declare(8, token, vec![wtxid_a, wtxid_b]);
-        let _ = handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, 3_000);
+        let _ =
+            handle_declare_mining_job(&mut s, &input, &tpl, Some([0xAB; 32]), None, None, 3_000);
         // No declared_jobs entry yet (still pending) → push_solution
         // can't find a matching job → drops. Pin that path.
         assert_eq!(s.declared_jobs.len(), 0);
