@@ -23,8 +23,8 @@
 //!   * **Solo** pays one output, against a tiny fixed reservation.
 //!   * **Group-Solo** additionally proves a ~50-member P2TR coinbase fits the
 //!     production 10 000-WU reservation.
-//!   * **Blockparty** does the same at ~40 members / 8 000 WU. Blockparty does
-//!     NOT weight-trim, so there the reservation is a hard ceiling.
+//!   * **Blockparty** does the same at 40 members / 8 000 WU — but for a
+//!     different reason: Blockparty has no member cap at all.
 //!
 //! One driver is the point, not a convenience. These were three files with
 //! three copies of the same miner loop, and `e1d3614` fixed two of them:
@@ -231,10 +231,19 @@ async fn sv1_blockparty_connection_routes_to_blockparty_stream_and_block_accepte
     assert_routed_and_landed(BLOCKPARTY, &outcome);
 }
 
-/// ~40 distinct P2TR members against the production 8 000-WU reservation
-/// (2256 B). Blockparty does NOT weight-trim, so the reservation is a hard
-/// ceiling — this is the proof the default
-/// `[blockparty].coinbase_weight_budget` is safe for the documented capacity.
+/// 40 distinct P2TR members against the production 8 000-WU reservation.
+///
+/// Unlike Group-Solo, Blockparty enforces no member cap: `add_member` never
+/// counts, and `CoinbaseReservation::ensure_capacity_for_members` instead
+/// RAISES the reservation as a party grows (high-water, floored at
+/// `[blockparty].coinbase_weight_budget`, capped at 50 000 WU ≈ 285 members).
+/// So the reservation is a floor with headroom, not a ceiling.
+///
+/// That raise reaches bitcoin-core's templates only after ~one TDP cycle, so
+/// what has to hold is that a realistic party never needs it. The floor sizes
+/// to `328 + 188 + (n+1)·172 + 200` WU, i.e. 41 members at 8 000 WU — this
+/// test sits just under that and proves the common case is covered by the
+/// floor alone, with no (lagging) raise in the path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sv1_blockparty_max_size_multi_output_coinbase_accepted() {
     let Some(node) = start_node_or_skip(BLOCKPARTY, "max-size multi-output").await else {
