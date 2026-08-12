@@ -1503,21 +1503,54 @@ async fn a_session_that_waited_out_its_mode_is_caught_up_on_the_pool_wide_distri
     server.shutdown().await;
 }
 
-/// A miner that ends up on the PPLNS window loses its tailored slot — clearing
-/// the denial is not enough.
+/// Bring a session to: served the Solo plan its address was on, gate then
+/// flipped to Group-Solo, nothing sent since the flip.
 ///
-/// `distribution_acceptance` under `JdpSession` scope PREFERS a session's
-/// tailored slot whenever it has one, and does so without looking at the
-/// settlement epoch. A slot left behind therefore answers for every pool-wide
-/// id the session is pushed afterwards, and answers `Stale` to all of them:
-/// the session is refused for the life of the connection while the pool
-/// believes it is serving it correctly.
-///
-/// Reached here through a §10 settlement, which is what invalidates a tailored
-/// slot and makes the session re-ask what it should be served — by which time
-/// the answer has changed.
-///
-/// The plan built for the mode that moved is DROPPED, not merely superseded.
+/// The prologue of every mode-move test, and shared because each of them
+/// stands up a real JDP server on a real socket — duplicated, a change to the
+/// harness has to be made twice or one test silently stops testing the flip it
+/// names.
+async fn served_solo_then_joined_a_group(
+    source: &Arc<FlippableSource>,
+    bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
+    addr: std::net::SocketAddr,
+) -> (Reader, Writer, Vec<u8>, u64) {
+    wait_until(Duration::from_secs(5), || {
+        bridge.read().unwrap().current_pool_wide().is_some()
+    })
+    .await;
+    let (mut reader, mut writer, _) = negotiated_jdc(addr).await;
+    let token = allocate(&mut reader, &mut writer, 2).await;
+    let solo_id = next_distribution(&mut reader, Duration::from_secs(3))
+        .await
+        .expect("a Solo miner must be served a tailored distribution");
+
+    // Nothing else is going to wake this session: no settlement is fired, and
+    // the publisher has nothing new to say (an unchanged fingerprint is not
+    // republished). Whatever arrives after the flip came from the session's
+    // own traffic.
+    assert!(
+        try_read_jdc(&mut reader, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "the publisher must be quiet, or a push after the flip proves nothing"
+    );
+
+    source.set(GateAnswer::GroupSolo);
+    (reader, writer, token, solo_id)
+}
+
+fn flippable_source() -> Arc<FlippableSource> {
+    Arc::new(FlippableSource {
+        answer: std::sync::Mutex::new(GateAnswer::Solo),
+        next_id: AtomicU64::new(FIRST_ID),
+        generation: AtomicU64::new(0),
+        miner: AddressId::new(REGTEST_ADDR.to_string()).expect("miner address"),
+    })
+}
+
+/// The plan built for the mode that moved is DROPPED, not merely superseded —
+/// and on BOTH paths that republish one.
 ///
 /// §7.2 keeps the immediately-previous entry of a slot acceptable, so
 /// republishing over a stale plan leaves it declarable for one more
@@ -1526,75 +1559,78 @@ async fn a_session_that_waited_out_its_mode_is_caught_up_on_the_pool_wide_distri
 /// live mining session for this address" is not an answer. A miner going
 /// offline is not exotic; it is a rig rebooting.
 ///
-/// So: join a group, then take the miner offline, then declare against the
-/// plan from before the join. With the drop the id is gone. Without it the
-/// coinbase paying the finder alone gets blessed — and a `PushSolution` books
-/// a block from a blessed declaration without the mining side ever seeing it.
+/// ⚠️ Both drivers, and the ALLOCATE one is the reason this test is a loop.
+/// The allocate arm republishes the tailored plan on every token request and
+/// knew nothing about modes moving, while the re-ask arm that did know then
+/// found nothing left to do — an SRI jd-client allocates before nearly every
+/// declare, so in production the flip was almost always observed there. The
+/// drop lives in `republish_tailored` for exactly that reason: one place, all
+/// three callers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_plan_for_a_mode_that_moved_is_dropped_not_superseded() {
-    let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
-    let source = Arc::new(FlippableSource {
-        answer: std::sync::Mutex::new(GateAnswer::Solo),
-        next_id: AtomicU64::new(FIRST_ID),
-        generation: AtomicU64::new(0),
-        miner: AddressId::new(REGTEST_ADDR.to_string()).expect("miner address"),
-    });
-    let server = spawn_jdp_server(source.clone(), bridge.clone(), Duration::from_millis(200));
-    wait_until(Duration::from_secs(5), || {
-        bridge.read().unwrap().current_pool_wide().is_some()
-    })
-    .await;
-    let (addr, accept_handle) = accept_loop(server.clone()).await;
+    for drive_with_allocate in [false, true] {
+        let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
+        let source = flippable_source();
+        let server = spawn_jdp_server(source.clone(), bridge.clone(), Duration::from_millis(200));
+        let (addr, accept_handle) = accept_loop(server.clone()).await;
+        let (mut reader, mut writer, token, solo_id) =
+            served_solo_then_joined_a_group(&source, &bridge, addr).await;
 
-    let (mut reader, mut writer, _) = negotiated_jdc(addr).await;
-    let token = allocate(&mut reader, &mut writer, 2).await;
-    let solo_id = next_distribution(&mut reader, Duration::from_secs(3))
-        .await
-        .expect("a Solo miner must be served a tailored distribution");
+        // The session's own next frame is what makes the pool re-ask.
+        respect_token_rate_limit().await;
+        let token = if drive_with_allocate {
+            allocate(&mut reader, &mut writer, 3).await
+        } else {
+            write_declare(
+                &mut writer,
+                10,
+                &token,
+                &suffix_for_test_weights(),
+                Some(solo_id),
+            )
+            .await;
+            read_jdc(&mut reader).await; // the refusal — asserted below
+            token
+        };
+        let group_id = next_distribution(&mut reader, Duration::from_secs(3))
+            .await
+            .expect("the moved mode must be answered with a fresh plan");
+        assert!(
+            group_id > solo_id,
+            "allocate={drive_with_allocate}: the group plan must be a NEW distribution"
+        );
 
-    // Joins the group, and its next frame makes the pool re-ask.
-    source.set(GateAnswer::GroupSolo);
-    respect_token_rate_limit().await;
-    write_declare(
-        &mut writer,
-        10,
-        &token,
-        &suffix_for_test_weights(),
-        Some(solo_id),
-    )
-    .await;
-    read_jdc(&mut reader).await; // the refusal — asserted by the test above
-    let group_id = next_distribution(&mut reader, Duration::from_secs(3))
-        .await
-        .expect("the moved mode must be answered with a fresh plan");
-    assert!(group_id > solo_id);
+        // ── The rig reboots: the gate forgets the address ─────────────
+        // The declare check has nothing to judge by now, so the drop is the
+        // only thing left between the old plan and a blessed coinbase.
+        source.set(GateAnswer::Unknown);
+        respect_token_rate_limit().await;
+        write_declare(
+            &mut writer,
+            11,
+            &token,
+            &suffix_for_test_weights(),
+            Some(solo_id),
+        )
+        .await;
+        match read_jdc(&mut reader).await {
+            JdcInbound::Message(AnyMessage::JobDeclaration(
+                JobDeclaration::DeclareMiningJobError(e),
+            )) => assert_eq!(
+                e.error_code.as_utf8_or_hex(),
+                "stale-payout-distribution",
+                "allocate={drive_with_allocate}: the pre-join plan must be gone, not sitting \
+                 in the grace window"
+            ),
+            other => panic!(
+                "allocate={drive_with_allocate}: the pre-join plan must not be declarable, \
+                 got {other:?}"
+            ),
+        }
 
-    // ── The rig reboots: the gate forgets the address ─────────────────
-    // The declare check has nothing to judge by now, so the drop is the only
-    // thing left standing between the old plan and a blessed coinbase.
-    source.set(GateAnswer::Unknown);
-    respect_token_rate_limit().await;
-    write_declare(
-        &mut writer,
-        11,
-        &token,
-        &suffix_for_test_weights(),
-        Some(solo_id),
-    )
-    .await;
-    match read_jdc(&mut reader).await {
-        JdcInbound::Message(AnyMessage::JobDeclaration(JobDeclaration::DeclareMiningJobError(
-            e,
-        ))) => assert_eq!(
-            e.error_code.as_utf8_or_hex(),
-            "stale-payout-distribution",
-            "the plan from before the join must be gone, not sitting in the grace window"
-        ),
-        other => panic!("the pre-join plan must not be declarable, got {other:?}"),
+        accept_handle.abort();
+        server.shutdown().await;
     }
-
-    accept_handle.abort();
-    server.shutdown().await;
 }
 
 /// A session already being served re-asks its mode, and a group join mid-flight
@@ -1607,54 +1643,19 @@ async fn the_plan_for_a_mode_that_moved_is_dropped_not_superseded() {
 /// side refused every custom job built on it — fatal for an SRI jd-client,
 /// which treats every code but `stale-chain-tip` as a reason to leave the pool.
 ///
-/// The publisher is left quiet on purpose (an unchanged fingerprint is not
-/// republished), so the frame the client receives cannot have come from a tick
-/// — and no settlement is fired, which is the OTHER thing that used to be the
-/// only cure. What is left is the session's own traffic.
-///
-/// The two declares at the end are the point of dropping the old plan rather
-/// than merely superseding it: §7.2 keeps the immediately-previous entry
-/// acceptable, so a plan left in the grace window is still declarable against
-/// — one more coinbase paying the finder a block his group earned.
+/// Driven by a DECLARE and deliberately not by an allocate: an allocate
+/// rebuilds the tailored plan unconditionally, so a test driven by one would
+/// pass with the re-ask removed and prove nothing. A declare is also the frame
+/// that matters — it is where a coinbase gets blessed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_served_session_is_handed_a_new_plan_when_its_mode_moves() {
     let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
-    let source = Arc::new(FlippableSource {
-        answer: std::sync::Mutex::new(GateAnswer::Solo),
-        next_id: AtomicU64::new(FIRST_ID),
-        generation: AtomicU64::new(0),
-        miner: AddressId::new(REGTEST_ADDR.to_string()).expect("miner address"),
-    });
+    let source = flippable_source();
     let server = spawn_jdp_server(source.clone(), bridge.clone(), Duration::from_millis(200));
-    wait_until(Duration::from_secs(5), || {
-        bridge.read().unwrap().current_pool_wide().is_some()
-    })
-    .await;
     let (addr, accept_handle) = accept_loop(server.clone()).await;
+    let (mut reader, mut writer, token, solo_id) =
+        served_solo_then_joined_a_group(&source, &bridge, addr).await;
 
-    let (mut reader, mut writer, _pool_wide_id) = negotiated_jdc(addr).await;
-    let token = allocate(&mut reader, &mut writer, 2).await;
-    let solo_id = next_distribution(&mut reader, Duration::from_secs(3))
-        .await
-        .expect("a Solo miner must be served a tailored distribution");
-
-    // Nothing else is going to wake this session: no settlement, and the
-    // publisher has nothing new to say.
-    assert!(
-        try_read_jdc(&mut reader, Duration::from_millis(300))
-            .await
-            .is_none(),
-        "the publisher must be quiet, or the push below proves nothing"
-    );
-
-    // ── The join is approved: the gate flips under the live session ───
-    source.set(GateAnswer::GroupSolo);
-
-    // A DECLARE is what carries the session forward here, and deliberately not
-    // another allocate: an allocate rebuilds the tailored plan unconditionally
-    // (it always did), so a test driven by one would pass with the re-ask
-    // removed and prove nothing. A declare is also the frame that matters —
-    // it is where a coinbase gets blessed.
     respect_token_rate_limit().await;
     write_declare(
         &mut writer,
@@ -1681,10 +1682,7 @@ async fn a_served_session_is_handed_a_new_plan_when_its_mode_moves() {
     let group_id = next_distribution(&mut reader, Duration::from_secs(3))
         .await
         .expect("the moved mode must be answered with a fresh plan");
-    assert!(
-        group_id > solo_id,
-        "the group plan must be a NEW distribution ({group_id} vs {solo_id})"
-    );
+    assert!(group_id > solo_id);
 
     // …and the session is not merely broken: the plan it was just handed
     // works, which is the whole difference from hanging until a reconnect.
@@ -1705,6 +1703,20 @@ async fn a_served_session_is_handed_a_new_plan_when_its_mode_moves() {
     server.shutdown().await;
 }
 
+/// A miner that ends up on the PPLNS window loses its tailored slot — clearing
+/// the denial is not enough.
+///
+/// `distribution_acceptance` under `JdpSession` scope PREFERS a session's
+/// tailored slot whenever it has one, and does so without looking at the
+/// settlement epoch. A slot left behind therefore answers for every pool-wide
+/// id the session is pushed afterwards, and answers `Stale` to all of them:
+/// the session is refused for the life of the connection while the pool
+/// believes it is serving it correctly.
+///
+/// Reached here through a §10 settlement, which is what invalidates a tailored
+/// slot and makes the session re-ask what it should be served — by which time
+/// the answer has changed.
+///
 /// The declare at the end is what pins it: the id the pool has just pushed,
 /// against the coinbase the pool published, must be accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

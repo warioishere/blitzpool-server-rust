@@ -680,13 +680,18 @@ impl StratumV2JdpServer {
 /// allocated before its miner connected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SessionDistribution {
-    /// A tailored slot is published for this miner, carrying the accounting
-    /// it was BUILT for — which is what makes "is this still the right plan?"
-    /// answerable later. The owner address travels inside it, so nothing is
-    /// lost by not holding one separately.
-    Tailored(DistributionAccounting),
-    /// This miner is PPLNS: the pool-wide push IS its accounting.
-    PoolWide,
+    /// A plan is on file for this session, carrying the accounting it was
+    /// BUILT for — which is what makes "is this still the right plan?"
+    /// answerable later. `PoolWide` means the pool-wide push IS this miner's
+    /// accounting (PPLNS); the tailored kinds carry their owner address, so
+    /// nothing is lost by not holding one separately.
+    ///
+    /// One variant and not a tailored/pool-wide pair: they are the same
+    /// concept — the accounting being served — and splitting them made every
+    /// consumer re-join them, including one that had to synthesize a
+    /// `DistributionAccounting::PoolWide` out of thin air to ask the shared
+    /// question.
+    Served(DistributionAccounting),
     /// The mode is not known YET. Nothing is published, and the caller retries
     /// on the next inbound frame — the check is a map lookup, so doing it per
     /// frame is free, and the answer normally arrives within milliseconds of
@@ -707,18 +712,18 @@ enum SessionDistribution {
 }
 
 impl SessionDistribution {
-    /// Is a plan on file for this session with the pool?
+    /// The accounting this session is being served, or `None` while it is
+    /// served nothing.
     ///
-    /// The two "serving nothing" states are not merely the absence of one: a
-    /// plan on file is REFERENCEABLE — `distribution_acceptance` will answer
+    /// The two "serving nothing" states are not merely the absence of a plan:
+    /// a plan on file is REFERENCEABLE — `distribution_acceptance` answers
     /// with it, and §7.2 keeps the immediately-previous one answerable too. So
     /// when a plan stops being the right one it has to be dropped, not just
-    /// superseded, and this is the question that decides whether there is
-    /// anything to drop.
-    fn is_serving_a_plan(&self) -> bool {
+    /// superseded.
+    fn accounting(&self) -> Option<&DistributionAccounting> {
         match self {
-            Self::Tailored(_) | Self::PoolWide => true,
-            Self::AwaitingMode | Self::Denied => false,
+            Self::Served(accounting) => Some(accounting),
+            Self::AwaitingMode | Self::Denied => None,
         }
     }
 }
@@ -766,34 +771,11 @@ fn rebuild_due(
         SessionDistribution::Denied => {
             now_ms.saturating_sub(last_rebuild_ms) >= DENIED_REBUILD_INTERVAL_MS
         }
-        SessionDistribution::Tailored(accounting) => mode_moved_away(accounting, current_mode),
-        SessionDistribution::PoolWide => {
-            mode_moved_away(&DistributionAccounting::PoolWide, current_mode)
+        // The one shared table, so a session is never served a plan the
+        // mining side or the declare path would then refuse.
+        SessionDistribution::Served(accounting) => {
+            !crate::bridge::accounting_fits_mode(accounting, current_mode)
         }
-    }
-}
-
-/// Has this address's mode moved away from the one `accounting` was built for?
-///
-/// `None` is NOT a move. It means the gate has no live mining session for the
-/// address — the miner's rig dropped, or is between reconnects — and the
-/// pool's answer is "I don't know", which is exactly the state
-/// [`TailoredDistribution::ModeUnknown`] exists to keep apart from a decision.
-/// Treating it as a move would throw away a perfectly good plan every time a
-/// miner behind a JDC blips, and protects nothing: a mode that really changes
-/// comes back as a DIFFERENT `Some` and is caught here.
-///
-/// The comparison itself is [`crate::bridge::accounting_matches_stream`] —
-/// the same table the mining side judges a custom job by and the declare path
-/// judges a coinbase by, so a session cannot be served a plan those two would
-/// then refuse.
-fn mode_moved_away(
-    accounting: &DistributionAccounting,
-    current_mode: Option<bp_common::StreamKind>,
-) -> bool {
-    match current_mode {
-        None => false,
-        Some(stream) => !crate::bridge::accounting_matches_stream(accounting, stream),
     }
 }
 
@@ -882,6 +864,7 @@ impl AwaitingModeWatch {
 /// It rebuilds from the mode gate every time, so it needs to be told nothing
 /// about WHY it was called. What the mode-moved caller has to do on top is
 /// drop the plan on file first — see [`SessionDistribution::is_serving_a_plan`].
+#[allow(clippy::too_many_arguments)]
 async fn republish_tailored(
     hooks: &JdpServerHooks,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
@@ -889,6 +872,19 @@ async fn republish_tailored(
     session_id: u32,
     session_id_hex: &str,
     miner: &AddressId,
+    // What this session is being served RIGHT NOW. Compared against what the
+    // rebuild produces, so a plan that stops being the right one is dropped
+    // rather than merely superseded — §7.2 keeps the immediately-previous
+    // entry of a slot acceptable, which is exactly long enough to declare
+    // against once more.
+    //
+    // The comparison lives here and not at a call site because there are
+    // three call sites and only one of them ever knew a mode had moved. The
+    // allocate path republishes unconditionally on every token request, and an
+    // SRI jd-client allocates before nearly every declare — so a flip observed
+    // on an allocate frame slid the old-mode plan into the grace slot with
+    // nothing left to notice.
+    serving: &SessionDistribution,
     // The pool-wide distribution id this session was last WRITTEN, or `None`
     // if what it is holding is not a pool-wide one (none was ever pushed, or a
     // tailored push has replaced it since — §4 gives the client ONE current
@@ -962,7 +958,7 @@ async fn republish_tailored(
                     debug!("jdp {session_id_hex} on the pool-wide distribution, none published yet")
                 }
             }
-            return SessionDistribution::PoolWide;
+            return SessionDistribution::Served(DistributionAccounting::PoolWide);
         }
         // Not known YET. Publish nothing and keep pool-wide denied: both
         // guesses are a money error, in opposite directions. The caller
@@ -1021,6 +1017,22 @@ async fn republish_tailored(
     let wire = wire_from_entry(&entry);
     {
         let mut guard = bridge.write().expect("bridge RwLock poisoned");
+        // Same lock as the publish, so there is no window in which the session
+        // has neither plan. Only when the accounting actually changed: a
+        // rebuild for the SAME accounting (a §10 settlement, a fresh allocate)
+        // legitimately supersedes, and §7.2's grace entry is what a
+        // declaration already in flight resolves against.
+        if serving.accounting().is_some_and(|was| *was != accounting) {
+            let dropped = guard.clear_tailored(session_id);
+            info!(
+                miner = miner.as_str(),
+                was = ?serving.accounting(),
+                now = ?accounting,
+                dropped,
+                "jdp {session_id_hex} payout mode moved — the plan built for the old one is \
+                 dropped, not superseded"
+            );
+        }
         guard.publish_tailored(session_id, entry);
         guard.allow_pool_wide(session_id);
     }
@@ -1035,7 +1047,7 @@ async fn republish_tailored(
     // an id it has already seen.
     *last_pool_wide_written = None;
     debug!(distribution_id, "jdp {session_id_hex} tailored republished");
-    SessionDistribution::Tailored(accounting)
+    SessionDistribution::Served(accounting)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1106,7 +1118,10 @@ async fn run_jdp_connection(
                 }
                 // No identity yet: nothing else can be right, so the
                 // pool-wide push stands (that is also the PPLNS default).
-                if identity.is_some() && !matches!(served, SessionDistribution::PoolWide) {
+                if identity.is_some() && !matches!(
+                    served,
+                    SessionDistribution::Served(DistributionAccounting::PoolWide)
+                ) {
                     // A tailored session ignores the pool-wide push —
                     // §4 "latest MUST be used" makes its own stream
                     // authoritative. But the publisher fires this watch
@@ -1139,6 +1154,7 @@ async fn run_jdp_connection(
                         session_id,
                         &session_id_hex,
                         &miner,
+                        &served,
                         &mut last_pool_wide_written,
                     )
                     .await;
@@ -1238,18 +1254,17 @@ async fn run_jdp_connection(
                 let negotiated_before = state
                     .negotiated_extensions
                     .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS);
-                // What accounting this session's address is on, asked once
-                // per frame and used twice: the declare path below is judged
-                // against it, and the re-decide after the dispatch acts on it.
+                // What accounting the session's OWN plan was built for is
+                // still current — asked once per frame, and about `identity`
+                // because that is what the plan on file belongs to. The declare
+                // path asks its own question about its own token's address; the
+                // two are not the same address in general, which is why they
+                // are two lookups and not one value passed around.
                 //
-                // Read BEFORE the frame is handled, because the declare is one
-                // of the frames it judges — and asked at all because a served
-                // session's plan is otherwise decided once and never revisited,
-                // while `cache_sync` flips a live address between Solo and
-                // Group-Solo on a group join without any reconnect.
-                //
-                // `identity` is `None` only until the first allocate, and a
-                // declare cannot precede one (its token would not resolve).
+                // Asked at all because a served session's plan is otherwise
+                // decided once and never revisited, while `cache_sync` flips a
+                // live address between Solo and Group-Solo on a group join
+                // without any reconnect.
                 let current_mode = match (&identity, negotiated_before) {
                     (Some(miner), true) => hooks.distribution_source.current_mode(miner).await,
                     // Nothing to ask about: no miner yet, or a session that
@@ -1264,7 +1279,6 @@ async fn run_jdp_connection(
                     &bridge,
                     session_id,
                     &remote_addr,
-                    current_mode,
                     now_ms(),
                 )
                 .await;
@@ -1373,6 +1387,7 @@ async fn run_jdp_connection(
                             session_id,
                             &session_id_hex,
                             miner_address,
+                            &served,
                             &mut last_pool_wide_written,
                         )
                         .await;
@@ -1407,26 +1422,7 @@ async fn run_jdp_connection(
                         rebuild_due(&served, current_mode, now_ms(), last_rebuild_ms),
                     ) {
                         let miner = miner.clone();
-                        // A plan on file AND a rebuild due can only mean the
-                        // mode moved — that is the sole condition under which
-                        // `rebuild_due` says yes for a served state. The plan
-                        // pays the wrong set of miners from here on, and
-                        // superseding it is not enough: §7.2 keeps the
-                        // immediately-previous entry acceptable, which is
-                        // exactly long enough to declare against once more.
-                        if served.is_serving_a_plan() {
-                            let dropped = bridge
-                                .write()
-                                .expect("bridge RwLock poisoned")
-                                .clear_tailored(session_id);
-                            info!(
-                                miner = miner.as_str(),
-                                ?current_mode,
-                                dropped,
-                                "jdp {session_id_hex} payout mode moved under a session that was \
-                                 being served — dropping the plan built for the old one"
-                            );
-                        }
+                        let was = served.clone();
                         let next = republish_tailored(
                             &hooks,
                             &bridge,
@@ -1434,10 +1430,39 @@ async fn run_jdp_connection(
                             session_id,
                             &session_id_hex,
                             &miner,
+                            &was,
                             &mut last_pool_wide_written,
                         )
                         .await;
                         served = next;
+                        // A plan on file AND a rebuild due can only mean the
+                        // mode moved — that is the sole condition under which
+                        // `rebuild_due` says yes for a served state. If the
+                        // rebuild produced a plan, `republish_tailored` has
+                        // already replaced the old one; if it produced NOTHING
+                        // (the build failed, or the mode went unknown between
+                        // the probe and the build) the old one still has to
+                        // go. It pays the wrong set of miners, and the pool
+                        // has no replacement to offer instead.
+                        //
+                        // Dropped after the attempt, not before, so a rebuild
+                        // that succeeds never opens a window in which the
+                        // session has no plan at all.
+                        if was.accounting().is_some() && served.accounting().is_none() {
+                            let dropped = bridge
+                                .write()
+                                .expect("bridge RwLock poisoned")
+                                .clear_tailored(session_id);
+                            warn!(
+                                miner = miner.as_str(),
+                                was = ?was.accounting(),
+                                ?current_mode,
+                                dropped,
+                                "jdp {session_id_hex} payout mode moved but no plan could be \
+                                 built for the new one — dropping the old plan and serving \
+                                 nothing rather than a coinbase paying the wrong miners"
+                            );
+                        }
                         last_rebuild_ms = now_ms();
                         awaiting.observe(&served, &session_id_hex, &miner, now_ms());
                     }
@@ -1471,11 +1496,6 @@ async fn dispatch_jdp_inbound(
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
     session_id: u32,
     remote_addr: &str,
-    // The accounting this session's address is on right now, resolved by the
-    // caller once per frame. Handed to the declare path, which is where a
-    // coinbase is blessed and therefore the last place a plan built for a mode
-    // that has since moved can still be caught.
-    current_mode: Option<bp_common::StreamKind>,
     now_ms: u64,
 ) -> JdpHandlerOutcome {
     match inbound {
@@ -1562,6 +1582,15 @@ async fn dispatch_jdp_inbound(
             let current_prev_hash = hooks.prev_hash_provider.current_prev_hash().await;
             let distribution =
                 resolve_distribution_acceptance(bridge, session_id, input.distribution_id);
+            // The mode of the address THIS TOKEN belongs to — not of whichever
+            // address allocated last on this connection. One session may hold
+            // tokens for several addresses (the allocate carries the address,
+            // and nothing binds a connection to one), and the handler resolves
+            // the declaration's miner from the token. Judging that declaration
+            // against another address's mode refuses a correct plan and never
+            // recovers.
+            let current_mode =
+                current_mode_for_token(state, hooks, &input.mining_job_token, now_ms).await;
             handle_declare_mining_job(
                 state,
                 &input,
@@ -1629,6 +1658,17 @@ async fn dispatch_jdp_inbound(
                 .and_then(|p| p.input.distribution_id);
             let distribution =
                 resolve_distribution_acceptance(bridge, session_id, pending_distribution_id);
+            // Same rule as the declare above: the miner is the one the pending
+            // declaration was accepted for, which `accept_declaration` reads
+            // back out of it.
+            let pending_miner = state
+                .pending_declaration
+                .as_ref()
+                .map(|p| p.miner_address.clone());
+            let current_mode = match pending_miner {
+                Some(miner) => hooks.distribution_source.current_mode(&miner).await,
+                None => None,
+            };
             handle_provide_missing_transactions_success(
                 state,
                 &input,
@@ -1643,6 +1683,26 @@ async fn dispatch_jdp_inbound(
         // here.
         InboundJdpFrame::PushSolution(input) => handle_push_solution(state, &input),
     }
+}
+
+/// The accounting the address behind `token` is on right now.
+///
+/// Keyed on the TOKEN and not on the connection: an allocate carries its own
+/// miner address and nothing binds a JDP session to a single one, so the
+/// session-scoped "last address that allocated" answers a different question
+/// than the declare asks. `None` when the token is unknown or expired — the
+/// handler refuses it on its own grounds a moment later.
+async fn current_mode_for_token(
+    state: &mut JdpSessionState,
+    hooks: &JdpServerHooks,
+    token: &Token,
+    now_ms: u64,
+) -> Option<bp_common::StreamKind> {
+    let miner = state
+        .tokens
+        .lookup_active(token, now_ms)
+        .map(|t| t.miner_address.clone())?;
+    hooks.distribution_source.current_mode(&miner).await
 }
 
 /// Resolve a §6 `distribution_id` reference against the bridge's
@@ -2154,7 +2214,6 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
-            None,
             1_000,
         )
         .await;
@@ -2259,7 +2318,6 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
-            None,
             1_000,
         )
         .await;
@@ -2301,7 +2359,6 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
-            None,
             1_000,
         )
         .await;
@@ -2332,7 +2389,6 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
-            None,
             1_000,
         )
         .await;
@@ -2357,7 +2413,6 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
-            None,
             0,
         )
         .await;
@@ -2392,7 +2447,6 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
-            None,
             1_000,
         )
         .await;
@@ -2421,7 +2475,6 @@ mod tests {
             &bridge,
             1,
             "1.2.3.4:5555",
-            None,
             2_000,
         )
         .await;
@@ -2473,14 +2526,17 @@ mod tests {
         // nothing, however long it keeps sending.
         for (served, mode) in [
             (
-                SessionDistribution::Tailored(DistributionAccounting::Solo(miner.clone())),
+                SessionDistribution::Served(DistributionAccounting::Solo(miner.clone())),
                 bp_common::StreamKind::Solo,
             ),
             (
-                SessionDistribution::Tailored(DistributionAccounting::GroupSolo(miner.clone())),
+                SessionDistribution::Served(DistributionAccounting::GroupSolo(miner.clone())),
                 bp_common::StreamKind::GroupSolo,
             ),
-            (SessionDistribution::PoolWide, bp_common::StreamKind::Pplns),
+            (
+                SessionDistribution::Served(DistributionAccounting::PoolWide),
+                bp_common::StreamKind::Pplns,
+            ),
         ] {
             assert!(
                 !rebuild_due(&served, Some(mode), u64::MAX, 0),
@@ -2498,8 +2554,10 @@ mod tests {
         use bp_common::StreamKind as Sk;
         let miner = AddressId::new(ADDR.to_string()).unwrap();
         let served_for = |accounting: DistributionAccounting| match accounting {
-            DistributionAccounting::PoolWide => SessionDistribution::PoolWide,
-            tailored => SessionDistribution::Tailored(tailored),
+            DistributionAccounting::PoolWide => {
+                SessionDistribution::Served(DistributionAccounting::PoolWide)
+            }
+            tailored => SessionDistribution::Served(tailored),
         };
         for (accounting, built_for) in [
             (DistributionAccounting::Solo(miner.clone()), Sk::Solo),
@@ -2527,18 +2585,88 @@ mod tests {
         }
     }
 
+    /// The declare's mode is looked up for the address of the TOKEN it names,
+    /// not for whichever address allocated last on the connection.
+    ///
+    /// Nothing binds a JDP session to a single payout address — the allocate
+    /// carries one, and a client may allocate for two. The session-scoped
+    /// `identity` (which the loop keeps for its OWN plan) is then the wrong
+    /// operand for the declare: address A's correct, current plan gets judged
+    /// against address B's mode and refused `stale-payout-distribution`, fatal
+    /// for an SRI jd-client and permanent, because every later declare re-reads
+    /// B's mode.
+    #[tokio::test]
+    async fn a_declares_mode_comes_from_its_own_tokens_address() {
+        struct PerAddress;
+        #[async_trait]
+        impl PayoutDistributionSource for PerAddress {
+            async fn build_pool_wide(&self) -> Option<BuiltPayoutDistribution> {
+                None
+            }
+            async fn build_for_miner(&self, _: &AddressId) -> TailoredDistribution {
+                TailoredDistribution::ModeUnknown
+            }
+            async fn current_mode(&self, miner: &AddressId) -> Option<bp_common::StreamKind> {
+                match miner.as_str() {
+                    ADDR => Some(bp_common::StreamKind::Solo),
+                    _ => Some(bp_common::StreamKind::Pplns),
+                }
+            }
+            async fn next_distribution_id(&self) -> Option<u64> {
+                None
+            }
+        }
+        let mut hooks = JdpServerHooks::no_op();
+        hooks.distribution_source = Arc::new(PerAddress);
+
+        let other = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vaxwd45v";
+        let mut state = JdpSessionState::new(1);
+        let a = state
+            .tokens
+            .allocate(1_000, AddressId::new(ADDR.to_string()).unwrap(), vec![0u8])
+            .expect("token for A")
+            .token;
+        // §6.4.2 rate-limits token issuance to 1/s per connection.
+        let b = state
+            .tokens
+            .allocate(3_000, AddressId::new(other.to_string()).unwrap(), vec![0u8])
+            .expect("token for B")
+            .token;
+
+        assert_eq!(
+            current_mode_for_token(&mut state, &hooks, &a, 3_000).await,
+            Some(bp_common::StreamKind::Solo),
+            "A's token must be judged by A's mode, even though B allocated last"
+        );
+        assert_eq!(
+            current_mode_for_token(&mut state, &hooks, &b, 3_000).await,
+            Some(bp_common::StreamKind::Pplns)
+        );
+        assert_eq!(
+            current_mode_for_token(&mut state, &hooks, &Token([0xEE; 16]), 3_000).await,
+            None,
+            "an unknown token has no address to ask about"
+        );
+    }
+
     /// Only a served session has a plan on file to drop — and it is the
     /// dropping that matters: §7.2 keeps the immediately-previous entry
     /// acceptable, so a plan merely superseded is still declarable against.
     #[test]
     fn only_a_served_session_has_a_plan_to_drop() {
         let miner = AddressId::new(ADDR.to_string()).unwrap();
-        assert!(SessionDistribution::PoolWide.is_serving_a_plan());
-        assert!(
-            SessionDistribution::Tailored(DistributionAccounting::Solo(miner)).is_serving_a_plan()
-        );
-        assert!(!SessionDistribution::AwaitingMode.is_serving_a_plan());
-        assert!(!SessionDistribution::Denied.is_serving_a_plan());
+        for accounting in [
+            DistributionAccounting::PoolWide,
+            DistributionAccounting::Solo(miner.clone()),
+            DistributionAccounting::GroupSolo(miner),
+        ] {
+            assert_eq!(
+                SessionDistribution::Served(accounting.clone()).accounting(),
+                Some(&accounting)
+            );
+        }
+        assert_eq!(SessionDistribution::AwaitingMode.accounting(), None);
+        assert_eq!(SessionDistribution::Denied.accounting(), None);
     }
 
     /// The denial is readable without taking the write lock — the whole point
@@ -2571,7 +2699,7 @@ mod tests {
         }
         assert!(!w.warned, "8 s is the measured normal, not an anomaly");
         w.observe(
-            &SessionDistribution::Tailored(DistributionAccounting::Solo(miner.clone())),
+            &SessionDistribution::Served(DistributionAccounting::Solo(miner.clone())),
             "jdp-test",
             &miner,
             8_100,
@@ -2604,7 +2732,12 @@ mod tests {
 
         // Recovery clears BOTH, so a second episode on the same connection is
         // reported again instead of being swallowed by the first one's flag.
-        w.observe(&SessionDistribution::PoolWide, "jdp-test", &miner, 999_000);
+        w.observe(
+            &SessionDistribution::Served(DistributionAccounting::PoolWide),
+            "jdp-test",
+            &miner,
+            999_000,
+        );
         assert!(!w.warned);
         assert_eq!(w.since_ms, None);
         w.observe(

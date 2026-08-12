@@ -251,23 +251,40 @@ impl DistributionReference {
 /// gates on it). Split in two they would drift into resolving one
 /// distribution and validating against another.
 ///
-/// A reference is inherited from the declaration only where that is both
-/// permitted and load-bearing — see the two guards below. Everywhere else the
-/// job is judged exactly as it was before this path existed.
+/// A reference is inherited from the declaration wherever §2 lets this
+/// connection use the extension at all. Everything else about the job is
+/// judged exactly as it was before this path existed.
 ///
-/// **`stream` must be the connection's `accounting_stream`, in both callers.**
-/// "Decided once" is a property of the arguments, not of the function: passing
-/// the frozen template stream in one caller and the accounting stream in the
-/// other made them resolve different things the moment a mode moved
-/// mid-connection, which is the drift this function was written to prevent.
+/// **It takes no stream, and must not.** It used to skip inheritance on a Solo
+/// stream, on the reasoning that a Solo job pays its own finder and had always
+/// been served without a reference — so subjecting it to the §7.2/§10 window
+/// would be a new way to refuse a job that used to work. Two things were wrong
+/// with that:
+///
+/// 1. It made the answer depend on an operand the two callers could disagree
+///    about, and they did. One passed the frozen template stream, the other the
+///    live accounting; on a mode that moved mid-connection they resolved
+///    different things.
+/// 2. It is not a Solo job's own plan that the carve-out let through. A
+///    connection whose accounting reads Solo may be holding a declaration bound
+///    to a POOL-WIDE plan — its address flipped after the declare — and
+///    dropping the reference there sent it to the base-protocol arm, which
+///    serves a Solo connection with no acceptance check and no §7.1 recompute.
+///    The coinbase then pays the PPLNS window on-chain while the booking
+///    resolves Solo and writes nothing, so the window's claims survive and the
+///    pool pays them a second time.
+///
+/// The rule that replaces it is simpler and has no operand to get wrong: **a
+/// job whose declaration referenced a distribution is judged against it.** Solo
+/// included — which is what the acceptance window costs, and it is the same
+/// cost every other mode already pays.
 pub fn resolve_distribution_reference(
     frame_tlv: Option<u64>,
     bridge_job: Option<&BridgeJobRef>,
-    stream: bp_common::StreamKind,
     negotiated_on_this_connection: bool,
 ) -> Option<DistributionReference> {
-    // What the JDC actually sent wins, on every stream. The §2 negotiation
-    // gate judges it in the handler, as it did before this path existed.
+    // What the JDC actually sent wins. The §2 negotiation gate judges it in the
+    // handler, as it did before this path existed.
     if let Some(distribution_id) = frame_tlv {
         return Some(DistributionReference::FromFrame { distribution_id });
     }
@@ -278,25 +295,6 @@ pub fn resolve_distribution_reference(
     // base-protocol custom-job path and its Solo gate, which is where it
     // landed before too.
     if !negotiated_on_this_connection {
-        return None;
-    }
-
-    // The reference is only load-bearing where the Solo gate would otherwise
-    // refuse, i.e. on a stream whose shares enter shared accounting. A Solo
-    // stream pays its own finder, has no shared window to freeload on, and
-    // has always been served without any distribution reference. Inheriting
-    // one there would subject it — for the first time — to the §7.2/§10
-    // acceptance window and the owner/stream checks, every one of them a new
-    // way to refuse a job that used to be served. A refusal here is fatal for
-    // an SRI jd-client, so this stays a `match`: a stream kind added later
-    // must be classified deliberately rather than default into inheriting.
-    let feeds_shared_accounting = match stream {
-        bp_common::StreamKind::Solo => false,
-        bp_common::StreamKind::Pplns
-        | bp_common::StreamKind::GroupSolo
-        | bp_common::StreamKind::Blockparty => true,
-    };
-    if !feeds_shared_accounting {
         return None;
     }
 
@@ -528,6 +526,31 @@ pub fn accounting_matches_stream(
         | (Acct::GroupSolo(_), Sk::Pplns)
         | (Acct::GroupSolo(_), Sk::Solo)
         | (Acct::GroupSolo(_), Sk::Blockparty) => false,
+    }
+}
+
+/// Is a plan built for `accounting` still the right one, given what the pool
+/// knows about the address's mode right now?
+///
+/// The `None` half is the whole reason this exists as one function. `None`
+/// means the mode gate has no live mining session for the address — the rig
+/// rebooted, or is between reconnects — and that is the ABSENCE of an answer,
+/// not a changed one. Treating it as a change tears up a correct plan every
+/// time a miner blips; a mode that really moves comes back as a different
+/// `Some` and is caught by the pair.
+///
+/// Two callers ask it, and they used to ask it separately and in opposite
+/// polarity: the JDP loop deciding whether to rebuild, and the declare path
+/// deciding whether to bless a coinbase. Split, a maintainer revisiting the
+/// `None` rule changes one and the compiler says nothing — and the declare
+/// path keeps blessing what the rebuild path already considers stale.
+pub fn accounting_fits_mode(
+    accounting: &DistributionAccounting,
+    current_mode: Option<bp_common::StreamKind>,
+) -> bool {
+    match current_mode {
+        None => true,
+        Some(stream) => accounting_matches_stream(accounting, stream),
     }
 }
 
@@ -985,7 +1008,6 @@ impl JdpDeclaredJobRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bp_common::StreamKind;
     use std::collections::HashMap as Map;
 
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
@@ -1148,66 +1170,61 @@ mod tests {
         let job_ref = declared_ref(Some(9), 7);
 
         assert_eq!(
-            resolve_distribution_reference(Some(11), Some(&job_ref), StreamKind::Pplns, true),
+            resolve_distribution_reference(Some(11), Some(&job_ref), true),
             Some(DistributionReference::FromFrame {
                 distribution_id: 11
             }),
             "a TLV on the frame is the JDC's own statement about THIS job"
         );
         assert_eq!(
-            resolve_distribution_reference(None, Some(&job_ref), StreamKind::Pplns, true),
+            resolve_distribution_reference(None, Some(&job_ref), true),
             Some(DistributionReference::FromDeclaration {
                 distribution_id: 9,
                 jdp_session_id: 7,
             })
         );
+        assert_eq!(resolve_distribution_reference(None, None, true), None);
         assert_eq!(
-            resolve_distribution_reference(None, None, StreamKind::Pplns, true),
-            None
-        );
-        assert_eq!(
-            resolve_distribution_reference(
-                None,
-                Some(&declared_ref(None, 7)),
-                StreamKind::Pplns,
-                true
-            ),
+            resolve_distribution_reference(None, Some(&declared_ref(None, 7)), true),
             None,
             "a base-protocol declaration references nothing to inherit"
         );
     }
 
-    /// A Solo stream pays its own finder and has always been served without
-    /// any distribution reference. Inheriting one would drag it into the §2
-    /// gate, the §7.2/§10 window and the owner checks for the first time —
-    /// each a new way to refuse a job that used to be served, and fatal for
-    /// an SRI jd-client. Its own TLV still counts, exactly as before.
+    /// What a declaration referenced is inherited on EVERY stream, including
+    /// Solo — the resolver takes no stream at all.
+    ///
+    /// It used to skip Solo, so that a Solo job kept being served without ever
+    /// consulting the acceptance window. What that actually let through was a
+    /// connection whose accounting had FLIPPED to Solo while holding a
+    /// declaration bound to a pool-wide plan: the reference was dropped, the
+    /// base-protocol arm served it with no §7.1 recompute, and the coinbase
+    /// paid the PPLNS window on-chain while the booking resolved Solo and
+    /// wrote nothing — the window's claims survive and the pool pays twice.
+    ///
+    /// A job that referenced nothing is still untouched; that is the property
+    /// the carve-out was reaching for, and it needs no stream to express.
     #[test]
-    fn a_solo_stream_inherits_nothing_but_still_honours_its_own_tlv() {
+    fn a_declarations_reference_is_inherited_on_every_stream() {
         let job_ref = declared_ref(Some(9), 7);
-
         assert_eq!(
-            resolve_distribution_reference(None, Some(&job_ref), StreamKind::Solo, true),
-            None
+            resolve_distribution_reference(None, Some(&job_ref), true),
+            Some(DistributionReference::FromDeclaration {
+                distribution_id: 9,
+                jdp_session_id: 7,
+            }),
         );
         assert_eq!(
-            resolve_distribution_reference(Some(11), Some(&job_ref), StreamKind::Solo, true),
+            resolve_distribution_reference(Some(11), Some(&job_ref), true),
             Some(DistributionReference::FromFrame {
                 distribution_id: 11
             })
         );
-        // Every stream whose shares DO enter shared accounting inherits, so
-        // the carve-out above is about Solo and not about "non-PPLNS".
-        for stream in [
-            StreamKind::Pplns,
-            StreamKind::GroupSolo,
-            StreamKind::Blockparty,
-        ] {
-            assert!(
-                resolve_distribution_reference(None, Some(&job_ref), stream, true).is_some(),
-                "{stream:?} feeds shared accounting and must inherit"
-            );
-        }
+        assert_eq!(
+            resolve_distribution_reference(None, Some(&declared_ref(None, 7)), true),
+            None,
+            "a declaration that referenced nothing stays a base-protocol job"
+        );
     }
 
     /// §2: a JDC that negotiated the extension on only one connection MUST NOT
@@ -1221,11 +1238,11 @@ mod tests {
         let job_ref = declared_ref(Some(9), 7);
 
         assert_eq!(
-            resolve_distribution_reference(None, Some(&job_ref), StreamKind::Pplns, false),
+            resolve_distribution_reference(None, Some(&job_ref), false),
             None
         );
         assert_eq!(
-            resolve_distribution_reference(Some(11), Some(&job_ref), StreamKind::Pplns, false),
+            resolve_distribution_reference(Some(11), Some(&job_ref), false),
             Some(DistributionReference::FromFrame {
                 distribution_id: 11
             }),

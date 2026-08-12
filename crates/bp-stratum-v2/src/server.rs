@@ -1201,10 +1201,6 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
                 let distribution = crate::bridge::resolve_distribution_reference(
                     input.distribution_id,
                     bridge_job.as_ref(),
-                    // The accounting stream: "does this stream feed shared
-                    // accounting" is a money question, and the frozen
-                    // template stream answers the OpenChannel-time one.
-                    state.accounting_stream,
                     state
                         .negotiated_extensions
                         .contains(&crate::extensions::SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS),

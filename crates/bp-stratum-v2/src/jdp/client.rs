@@ -971,18 +971,12 @@ fn accept_declaration(
         // block the group earned. Group-Solo keeps no ledger, so nothing
         // repairs that afterwards.
         //
-        // Same function as the mining side (`accounting_matches_stream`) —
-        // one table, three callers.
-        let mode_still_fits = match current_mode {
-            // No live mining session for this address. That is the absence of
-            // an answer, not a changed one, and the two must not be collapsed
-            // — a miner that briefly drops would otherwise invalidate a
-            // perfectly good plan on every reconnect. A mode that actually
-            // moves shows up as a DIFFERENT `Some`, and is caught below.
-            None => true,
-            Some(stream) => crate::bridge::accounting_matches_stream(&entry.accounting, stream),
-        };
-        if !mode_still_fits {
+        // `accounting_fits_mode`, shared with the JDP loop's rebuild decision —
+        // including its rule that an unknown mode is not a changed one. That
+        // rule was written out here as well, and one copy is exactly one too
+        // many: revisit it in one place and the compiler says nothing while the
+        // declare path keeps blessing what the rebuild path calls stale.
+        if !crate::bridge::accounting_fits_mode(&entry.accounting, current_mode) {
             tracing::warn!(
                 request_id = input.request_id,
                 distribution_id = entry.distribution_id,
