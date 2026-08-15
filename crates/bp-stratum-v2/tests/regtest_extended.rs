@@ -31,7 +31,7 @@ use bp_regtest_harness::{RegtestConfig, RegtestNode};
 use bp_share::Difficulty;
 use bp_stratum_v2::bridge::JdpDeclaredJobRegistry;
 use bp_stratum_v2::hooks::MiningServerHooks;
-use bp_stratum_v2::mining::client::{PortConfig, FLAG_REQUIRES_VERSION_ROLLING};
+use bp_stratum_v2::mining::client::PortConfig;
 use bp_stratum_v2::noise::{NoiseConfig, DEFAULT_CERT_VALIDITY};
 use bp_stratum_v2::server::{ServerConfig, StratumV2MiningServer};
 use bp_template_distribution::{TdpConfig, TdpHandle};
@@ -143,7 +143,12 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
             protocol: Protocol::MiningProtocol,
             min_version: 2,
             max_version: 2,
-            flags: FLAG_REQUIRES_VERSION_ROLLING,
+            // Deliberately NO flags — not REQUIRES_VERSION_ROLLING either.
+            // §5.3.1's flag means "I need version rolling", so a client that
+            // omits it has said nothing, and the job it gets must still allow
+            // rolling. Asserted below; this is also what makes this test fail
+            // against the code that derived the job flag from this field.
+            flags: 0,
             endpoint_host: "127.0.0.1".to_string().try_into().unwrap(),
             endpoint_port: addr.port(),
             vendor: "regtest-miner-ext".to_string().try_into().unwrap(),
@@ -279,12 +284,15 @@ async fn sv2_extended_channel_end_to_end_against_regtest() {
         "pool must honor the requested min_extranonce_size (10) exactly, not cap it"
     );
 
-    // NewExtendedMiningJob carries the version-rolling-allowed flag
-    // we set in the SetupConnection (FLAG_REQUIRES_VERSION_ROLLING).
+    // Every extended job allows BIP-323 rolling, and this connection asked
+    // for nothing (`flags: 0`). The flag the pool used to derive this from
+    // only ever said "I require rolling"; not saying it is not a refusal, and
+    // `version_rolling_allowed: false` would have ordered a capable miner to
+    // give up 24 bits of search space for nothing.
     assert_eq!(
         seen_version_rolling_allowed,
         Some(true),
-        "version_rolling_allowed must reflect the negotiated SetupConnection flag"
+        "version_rolling_allowed must be true even for a client that set no flags"
     );
     // Merkle path is non-empty for any non-genesis template (the
     // regtest chain has at least one in-block tx by the time we

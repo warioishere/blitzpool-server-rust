@@ -87,8 +87,44 @@ pub const PROTOCOL_TEMPLATE_DISTRIBUTION: u8 = 2;
 pub const FLAG_REQUIRES_STANDARD_JOBS: u32 = 1 << 0;
 /// Miner REQUIRES work selection (BIP-310 §3 — JDC integration).
 pub const FLAG_REQUIRES_WORK_SELECTION: u32 = 1 << 1;
-/// Miner REQUIRES BIP-320 version-rolling support.
+/// Miner REQUIRES BIP-323 version-rolling support.
+///
+/// Nothing reads this bit — it is kept as the wire definition, not as
+/// negotiated state. Granting it is unconditional
+/// ([`VERSION_ROLLING_ALLOWED`]), so there is nothing left for a handler to
+/// decide from it.
 pub const FLAG_REQUIRES_VERSION_ROLLING: u32 = 1 << 2;
+
+/// `NewExtendedMiningJob.version_rolling_allowed` (§5.3.16) for every extended
+/// job this pool serves, whatever the client asked for at `SetupConnection`.
+///
+/// It used to be `flags & FLAG_REQUIRES_VERSION_ROLLING`, which turned "didn't
+/// ask" into "may not". §5.3.1 does not support that reading: the flag is
+/// one-directional — "the client REQUIRES version rolling ... and the server
+/// MUST NOT send jobs which do not allow version rolling" — so its ABSENCE
+/// licenses nothing. §5.3.16 meanwhile makes the `false` a real order: "the
+/// downstream node MUST use version as it is defined by this message". A
+/// miner that can roll but never bothered to set the flag was being told to
+/// give up 24 bits of search space.
+///
+/// It was also a restriction we never enforced: `validate_submit_extended`
+/// builds the header from `submission.version` verbatim and compares nothing
+/// against the job's, so a client that ignored the `false` was credited
+/// regardless. The only clients it ever cost were the compliant ones.
+///
+/// Both references serve `true` unconditionally — sv2-apps v0.7.0
+/// (`pool/src/lib/channel_manager/mining_message_handler.rs`, "version rolling
+/// always allowed") and ckpool, which derives it from its own `version_mask`
+/// policy and never from the client's flag. Our own `SetupConnection.Success`
+/// has always answered the same way, clearing
+/// [`FLAG_SUCCESS_REQUIRES_FIXED_VERSION`] — "we accept changes to the version
+/// field" — which the per-job `false` then contradicted.
+///
+/// Serving `true` is only ever more permissive, so nothing has to be tightened
+/// for it to be honest. Enforcing the flag on submitted shares (ckpool does,
+/// sv2-apps does not) would be the opposite move — a narrowing of what counts
+/// as a valid share — and is deliberately not part of this.
+pub const VERSION_ROLLING_ALLOWED: bool = true;
 
 // `SetupConnection.Success.flags` (SV2 spec §5.3.2, server→client) is a
 // SEPARATE capability bitset whose bit meanings are UNRELATED to the client
@@ -608,7 +644,11 @@ pub struct MiningSessionState<C: Clock> {
     // Negotiated state from SetupConnection
     pub setup_complete: bool,
     pub used_version: u16,
-    pub version_rolling: bool,
+    // No `version_rolling`: `FLAG_REQUIRES_VERSION_ROLLING` was parsed into
+    // session state and read by exactly one thing — the per-job
+    // `version_rolling_allowed`, which is now [`VERSION_ROLLING_ALLOWED`] for
+    // every job. Keeping the field would leave a negotiated-looking flag that
+    // decides nothing.
     pub work_selection: bool,
     pub requires_standard_jobs: bool,
     pub is_tdp_client: bool,
@@ -709,7 +749,6 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             accounting_stream: StreamKind::Pplns,
             setup_complete: false,
             used_version: 0,
-            version_rolling: false,
             work_selection: false,
             requires_standard_jobs: false,
             is_tdp_client: false,
@@ -859,7 +898,6 @@ pub fn handle_setup_connection<C: Clock>(
     state.vendor = input.vendor.clone();
     state.requires_standard_jobs = (input.flags & FLAG_REQUIRES_STANDARD_JOBS) != 0;
     state.work_selection = (input.flags & FLAG_REQUIRES_WORK_SELECTION) != 0;
-    state.version_rolling = (input.flags & FLAG_REQUIRES_VERSION_ROLLING) != 0;
 
     // Build `Success.flags` fresh — NEVER echo `input.flags`. The success
     // bitset (SV2 §5.3.2) is a distinct server-capability field: bit 0 is
@@ -2085,9 +2123,6 @@ pub fn apply_template_broadcast<C: Clock>(
 
     let template = &broadcast.template;
     let is_new_block = matches!(broadcast.change, TemplateChange::NewBlock);
-    // Snapshot connection-wide fields before the loop so they don't
-    // interleave with the per-channel mutable borrows.
-    let version_rolling = state.version_rolling;
 
     // `only_channel = Some(id)` restricts the fan-out to one channel
     // (used by the OpenChannel post-handler to send the initial job
@@ -2309,7 +2344,7 @@ pub fn apply_template_broadcast<C: Clock>(
                     channel_id,
                     job_id,
                     version: template.version,
-                    version_rolling_allowed: version_rolling,
+                    version_rolling_allowed: VERSION_ROLLING_ALLOWED,
                     merkle_path,
                     coinbase_tx_prefix: tx_prefix,
                     coinbase_tx_suffix: tx_suffix,
@@ -2441,7 +2476,7 @@ pub fn apply_template_broadcast<C: Clock>(
                             channel_id: new_id,
                             job_id: jid,
                             version: ver,
-                            version_rolling_allowed: version_rolling,
+                            version_rolling_allowed: VERSION_ROLLING_ALLOWED,
                             merkle_path: mp,
                             coinbase_tx_prefix: cp,
                             coinbase_tx_suffix: cs,
@@ -2508,7 +2543,7 @@ pub fn apply_template_broadcast<C: Clock>(
             channel_id: gid,
             job_id: group_job_id,
             version: template.version,
-            version_rolling_allowed: version_rolling,
+            version_rolling_allowed: VERSION_ROLLING_ALLOWED,
             merkle_path,
             coinbase_tx_prefix: tx_prefix,
             coinbase_tx_suffix: tx_suffix,
@@ -3355,7 +3390,6 @@ pub(crate) mod tests {
         ));
         assert!(matches!(out.events[0], SessionEvent::SetupComplete));
         assert!(s.setup_complete);
-        assert!(s.version_rolling);
     }
 
     /// SV2 §5.3.2: `Success.flags` is the SERVER bitset and MUST NOT echo the
@@ -3382,7 +3416,6 @@ pub(crate) mod tests {
         }
         // Request flags are still parsed into session state.
         assert!(s.requires_standard_jobs);
-        assert!(s.version_rolling);
     }
 
     /// A work-selection (custom-job) connection can only carry custom jobs on
@@ -5459,6 +5492,55 @@ pub(crate) mod tests {
         assert_eq!(ch.latest_extended_n_bits, Some(0x1d00_ffff));
     }
 
+    /// A client that never set `REQUIRES_VERSION_ROLLING` still gets
+    /// `version_rolling_allowed: true`.
+    ///
+    /// This is the negative control for [`VERSION_ROLLING_ALLOWED`]. Against
+    /// the code it replaced — `version_rolling_allowed: state.version_rolling`,
+    /// itself `flags & FLAG_REQUIRES_VERSION_ROLLING` — this session sends
+    /// `flags: 0`, so the job came back `false` and this test fails. It has to
+    /// build its own session because every other extended-job test goes
+    /// through `good_setup()`, which DOES set the flag: on those, both
+    /// implementations agree and nothing is pinned.
+    #[test]
+    fn version_rolling_is_allowed_for_a_client_that_never_asked_for_it() {
+        let mut s = fresh_session();
+        let mut setup = good_setup();
+        setup.flags = 0;
+        // Precondition: the flag really is absent. Without this the test would
+        // still pass if `good_setup()` ever stopped setting it, proving
+        // nothing about a client that did not ask.
+        assert_eq!(setup.flags & FLAG_REQUIRES_VERSION_ROLLING, 0);
+        handle_setup_connection(&mut s, &setup);
+        let _ = handle_open_extended_mining_channel(
+            &mut s,
+            &open_ext(1, &format!("{REGTEST_ADDR}.w")),
+            vec![0xAA, 0xBB, 0xCC, 0xDD],
+        );
+
+        let mj = synthetic_mining_job_inputs();
+        let out = apply_template_broadcast(
+            &mut s,
+            &broadcast(TemplateChange::NewBlock, [0xCC; 32]),
+            &mj,
+            1_000,
+            None,
+        );
+        let allowed = out.outbound.iter().find_map(|f| match f {
+            OutboundFrame::NewExtendedMiningJob {
+                version_rolling_allowed,
+                ..
+            } => Some(*version_rolling_allowed),
+            _ => None,
+        });
+        assert_eq!(
+            allowed,
+            Some(true),
+            "an extended job must allow BIP-323 rolling even when the client \
+             never required it — §5.3.1's flag says 'I need this', not 'I may'"
+        );
+    }
+
     /// NewBlock against an Extended channel splits the coinbase at the
     /// channel's extranonce-prefix boundary + records an ExtendedJob
     /// per-channel so later share submit can reconstruct.
@@ -5502,10 +5584,12 @@ pub(crate) mod tests {
                 assert_eq!(*channel_id, gid);
                 assert_eq!(*job_id, 1);
                 assert_eq!(*version, 0x2000_0000);
-                assert!(
-                    *version_rolling_allowed,
-                    "version-rolling flag set in setup"
-                );
+                // Not a setup-flag assertion any more, and must not be read
+                // as one: the value is `VERSION_ROLLING_ALLOWED` regardless
+                // of what `good_setup()` sends. The flag-independence is
+                // pinned by
+                // `version_rolling_is_allowed_for_a_client_that_never_asked_for_it`.
+                assert!(*version_rolling_allowed);
                 assert_eq!(merkle_path.len(), 2);
                 // The miner reconstructs the coinbase as
                 //   coinbase_tx_prefix + channel.extranonce_prefix
