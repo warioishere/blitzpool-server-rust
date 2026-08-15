@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"time\" AS \"time!\",\n            shares AS \"shares!\",\n            \"acceptedCount\" AS \"accepted_count!\",\n            \"rejectedCount\" AS \"rejected_count!\",\n            \"rejectedJobNotFoundCount\" AS \"rejected_job_not_found_count!\",\n            \"rejectedJobNotFoundDiff1\" AS \"rejected_job_not_found_diff1!\",\n            \"rejectedDuplicateShareCount\" AS \"rejected_duplicate_share_count!\",\n            \"rejectedDuplicateShareDiff1\" AS \"rejected_duplicate_share_diff1!\",\n            \"rejectedLowDifficultyShareCount\" AS \"rejected_low_difficulty_share_count!\",\n            \"rejectedLowDifficultyShareDiff1\" AS \"rejected_low_difficulty_share_diff1!\"\n           FROM client_statistics_entity\n           WHERE \"deletedAt\" IS NULL AND address = $1 AND \"time\" >= $2\n           ORDER BY \"time\" ASC",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"time\" AS \"time!\",\n            shares AS \"shares!\",\n            \"acceptedCount\" AS \"accepted_count!\",\n            \"rejectedCount\" AS \"rejected_count!\",\n            \"rejectedJobNotFoundCount\" AS \"rejected_job_not_found_count!\",\n            \"rejectedJobNotFoundDiff1\" AS \"rejected_job_not_found_diff1!\",\n            \"rejectedDuplicateShareCount\" AS \"rejected_duplicate_share_count!\",\n            \"rejectedDuplicateShareDiff1\" AS \"rejected_duplicate_share_diff1!\",\n            \"rejectedLowDifficultyShareCount\" AS \"rejected_low_difficulty_share_count!\",\n            \"rejectedLowDifficultyShareDiff1\" AS \"rejected_low_difficulty_share_diff1!\",\n            \"rejectedVersionRollingCount\" AS \"rejected_version_rolling_count!\",\n            \"rejectedVersionRollingDiff1\" AS \"rejected_version_rolling_diff1!\"\n           FROM client_statistics_entity WHERE id = $1 LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -87,12 +87,21 @@
         "ordinal": 16,
         "name": "rejected_low_difficulty_share_diff1!",
         "type_info": "Float4"
+      },
+      {
+        "ordinal": 17,
+        "name": "rejected_version_rolling_count!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 18,
+        "name": "rejected_version_rolling_diff1!",
+        "type_info": "Float4"
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Int8"
+        "Int4"
       ]
     },
     "nullable": [
@@ -112,8 +121,10 @@
       false,
       false,
       false,
+      false,
+      false,
       false
     ]
   },
-  "hash": "a1a333dffd4b5b287565f678b6ef6a86e8e53b6f9c473bd498a81fea8580c398"
+  "hash": "2d76725ae57927b5e8fffe8890af065495af717ac8f878a09bffcb16bc2d6022"
 }

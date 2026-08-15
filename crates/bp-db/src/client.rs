@@ -193,7 +193,9 @@ pub async fn find_client_statistics_since(
             "rejectedDuplicateShareCount" AS "rejected_duplicate_share_count!",
             "rejectedDuplicateShareDiff1" AS "rejected_duplicate_share_diff1!",
             "rejectedLowDifficultyShareCount" AS "rejected_low_difficulty_share_count!",
-            "rejectedLowDifficultyShareDiff1" AS "rejected_low_difficulty_share_diff1!"
+            "rejectedLowDifficultyShareDiff1" AS "rejected_low_difficulty_share_diff1!",
+            "rejectedVersionRollingCount" AS "rejected_version_rolling_count!",
+            "rejectedVersionRollingDiff1" AS "rejected_version_rolling_diff1!"
            FROM client_statistics_entity
            WHERE "deletedAt" IS NULL AND "time" >= $1
            ORDER BY "time" ASC"#,
@@ -206,7 +208,7 @@ pub async fn find_client_statistics_since(
 
 /// Minimal projection for `/api/info/workers`: only the slot time + identity
 /// columns needed to count DISTINCT addresses / (address, worker) per slot.
-/// Selecting three columns instead of the full 17-column stats row cuts the
+/// Selecting three columns instead of the full 19-column stats row cuts the
 /// transferred payload ~4× for the same row set, and there's no `ORDER BY`
 /// (the caller buckets into a map, order is irrelevant) so PG skips a sort.
 #[derive(Clone, Debug, FromRow)]
@@ -263,7 +265,9 @@ pub async fn find_client_statistics_since_for_address(
             "rejectedDuplicateShareCount" AS "rejected_duplicate_share_count!",
             "rejectedDuplicateShareDiff1" AS "rejected_duplicate_share_diff1!",
             "rejectedLowDifficultyShareCount" AS "rejected_low_difficulty_share_count!",
-            "rejectedLowDifficultyShareDiff1" AS "rejected_low_difficulty_share_diff1!"
+            "rejectedLowDifficultyShareDiff1" AS "rejected_low_difficulty_share_diff1!",
+            "rejectedVersionRollingCount" AS "rejected_version_rolling_count!",
+            "rejectedVersionRollingDiff1" AS "rejected_version_rolling_diff1!"
            FROM client_statistics_entity
            WHERE "deletedAt" IS NULL AND address = $1 AND "time" >= $2
            ORDER BY "time" ASC"#,
@@ -363,6 +367,10 @@ pub struct ClientStatisticsRow {
     pub rejected_low_difficulty_share_count: i32,
     #[sqlx(rename = "rejectedLowDifficultyShareDiff1")]
     pub rejected_low_difficulty_share_diff1: f32,
+    #[sqlx(rename = "rejectedVersionRollingCount")]
+    pub rejected_version_rolling_count: i32,
+    #[sqlx(rename = "rejectedVersionRollingDiff1")]
+    pub rejected_version_rolling_diff1: f32,
 }
 
 pub async fn find_client_statistics(
@@ -388,7 +396,9 @@ pub async fn find_client_statistics(
             "rejectedDuplicateShareCount" AS "rejected_duplicate_share_count!",
             "rejectedDuplicateShareDiff1" AS "rejected_duplicate_share_diff1!",
             "rejectedLowDifficultyShareCount" AS "rejected_low_difficulty_share_count!",
-            "rejectedLowDifficultyShareDiff1" AS "rejected_low_difficulty_share_diff1!"
+            "rejectedLowDifficultyShareDiff1" AS "rejected_low_difficulty_share_diff1!",
+            "rejectedVersionRollingCount" AS "rejected_version_rolling_count!",
+            "rejectedVersionRollingDiff1" AS "rejected_version_rolling_diff1!"
            FROM client_statistics_entity WHERE id = $1 LIMIT 1"#,
         id
     )

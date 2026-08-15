@@ -153,12 +153,14 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
             ..Default::default()
         };
         match reason {
-            // `client_statistics_entity` only has three rejected*
-            // column pairs — Stale shares fold into the JobNotFound
-            // bucket here so the per-session counter stays
-            // wire-code-stable. The pool-wide
-            // `pool_rejected_statistics_entity` keeps Stale as its
-            // own row.
+            // ⚠️ DEBT: Stale has no column pair of its own, so it folds
+            // into the JobNotFound bucket here and the two are
+            // indistinguishable in the per-session counters. That fold
+            // predates the table having room for more pairs — migration
+            // 0010 added one for version rolling and Stale should get the
+            // same treatment. The pool-wide
+            // `pool_rejected_statistics_entity` already keeps Stale as its
+            // own row, so only these counters are affected.
             RejectedReason::JobNotFound | RejectedReason::Stale => {
                 delta.rejected_job_not_found_count = 1.0;
                 delta.rejected_job_not_found_diff1 = difficulty;
@@ -167,9 +169,19 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
                 delta.rejected_duplicate_share_count = 1.0;
                 delta.rejected_duplicate_share_diff1 = difficulty;
             }
+            // Same reason Stale folds above: there is no fourth column
+            // pair. Version-rolling rejects land in the low-difficulty
             RejectedReason::LowDifficulty => {
                 delta.rejected_low_difficulty_share_count = 1.0;
                 delta.rejected_low_difficulty_share_diff1 = difficulty;
+            }
+            // Its own pair (migration 0010), not folded: such a share's
+            // proof-of-work may be perfectly good, so an operator seeing it
+            // in the low-difficulty bucket would read normal churn where a
+            // miner is ignoring the mask it negotiated.
+            RejectedReason::VersionRollingNotAllowed => {
+                delta.rejected_version_rolling_count = 1.0;
+                delta.rejected_version_rolling_diff1 = difficulty;
             }
         }
         self.accumulators.client_statistics.add(key, &delta);

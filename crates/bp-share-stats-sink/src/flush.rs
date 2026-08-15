@@ -229,6 +229,8 @@ async fn flush_client_statistics(
             rejected_duplicate_share_diff1: rec.rejected_duplicate_share_diff1 as f32,
             rejected_low_difficulty_share_count: rec.rejected_low_difficulty_share_count as i32,
             rejected_low_difficulty_share_diff1: rec.rejected_low_difficulty_share_diff1 as f32,
+            rejected_version_rolling_count: rec.rejected_version_rolling_count as i32,
+            rejected_version_rolling_diff1: rec.rejected_version_rolling_diff1 as f32,
         })
         .collect();
 

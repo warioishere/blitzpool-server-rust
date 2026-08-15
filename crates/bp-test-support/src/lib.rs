@@ -119,7 +119,6 @@ pub fn brute_force_nonce(
     for nonce in 0..1_000_000u32 {
         let header = build_block_header(
             version as i32,
-            0,
             prev_hash,
             merkle_root,
             timestamp,
@@ -253,7 +252,6 @@ pub async fn mine_and_submit_payouts(
 
     let header_bytes = build_block_header(
         template.version as i32,
-        0,
         &prev_hash.prev_hash,
         &merkle_root,
         prev_hash.header_timestamp,

@@ -3,7 +3,39 @@
 //! Direct 80-byte block-header assembly for the share-validation hot path.
 //! No `bitcoin::Block` / `Transaction` allocations.
 
-/// Assemble the canonical 80-byte block header.
+/// The lowest `nVersion` bitcoin-core will accept in a block header, read
+/// as a **signed** `i32`. Below it the block is rejected with
+/// `bad-version(0x%08x)` and the pool loses the block silently, because
+/// `submit_solution` is fire-and-forget.
+///
+/// From `ContextualCheckBlockHeader` in core v31.0 (`src/validation.cpp`),
+/// where `CBlockHeader::nVersion` is declared `int32_t`:
+///
+/// ```text
+/// if ((block.nVersion < 2 && DeploymentActiveAfter(..., DEPLOYMENT_HEIGHTINCB)) ||
+///     (block.nVersion < 3 && DeploymentActiveAfter(..., DEPLOYMENT_DERSIG)) ||
+///     (block.nVersion < 4 && DeploymentActiveAfter(..., DEPLOYMENT_CLTV)))
+/// ```
+///
+/// The `< 4` rung is gated on CLTV being active; every network the pool can
+/// reach has it, so 4 is the operative floor.
+///
+/// ⚠️ **This is a property of the resulting version, not of which bits a
+/// miner rolled.** Measured against core v31 with a template version of
+/// `0x20000000`: rolling bit 29 lands on `0x00000000` (rejected), bit 31 on
+/// `0xA0000000` (rejected, negative as `i32`), bit 30 on `0x60000000`
+/// (**accepted**). Against a template of `0x30000000` the same bit 29 gives
+/// `0x10000000` and is accepted. No function of the rolled delta alone can
+/// tell those apart.
+pub const MIN_CONSENSUS_BLOCK_VERSION: i32 = 4;
+
+/// Whether a block carrying this header version can be submitted at all.
+/// See [`MIN_CONSENSUS_BLOCK_VERSION`].
+pub fn version_meets_consensus_floor(version: u32) -> bool {
+    (version as i32) >= MIN_CONSENSUS_BLOCK_VERSION
+}
+
+/// Assemble the canonical 80-byte block header from a finished `version`.
 ///
 /// Wire layout (matches `bitcoin::block::Header::consensus_encode` byte for byte):
 ///
@@ -16,19 +48,33 @@
 /// | 72..76 | bits         | UInt32LE  |
 /// | 76..80 | nonce        | UInt32LE  |
 ///
-/// `version_mask` is XOR'd into `version` when non-zero (BIP-310 version rolling).
+/// ⚠️ **`version` is used verbatim — no version-rolling arithmetic happens
+/// here, deliberately.** This function used to take a `version_mask` and
+/// XOR it in, which is not what BIP-310 specifies
+/// (`nVersion = (job_version & ~mask) | (version_bits & mask)`) and agreed
+/// with it only while the job version set no bit inside the mask.
+///
+/// The two protocols reach a finished version differently and neither
+/// needs a mask here:
+///
+/// - **SV1** submits `version_bits`, a masked subset, so
+///   `bp_stratum_v1::submit` applies BIP-310's reconstruction against the
+///   session's negotiated mask and passes the result.
+/// - **SV2** submits the *full* nVersion (spec: `SubmitSharesStandard.version`
+///   is the "Full nVersion field"), so there is nothing to reconstruct.
+///
+/// Keeping a mask parameter would let either caller reintroduce XOR
+/// semantics silently. There is nothing to pass, so there is no parameter.
 pub fn build_block_header(
     version: i32,
-    version_mask: u32,
     prev_hash: &[u8; 32],
     merkle_root: &[u8; 32],
     timestamp: u32,
     bits: u32,
     nonce: u32,
 ) -> [u8; 80] {
-    let v = (version as u32) ^ version_mask;
     let mut h = [0u8; 80];
-    h[0..4].copy_from_slice(&v.to_le_bytes());
+    h[0..4].copy_from_slice(&(version as u32).to_le_bytes());
     h[4..36].copy_from_slice(prev_hash);
     h[36..68].copy_from_slice(merkle_root);
     h[68..72].copy_from_slice(&timestamp.to_le_bytes());
@@ -50,7 +96,7 @@ mod tests {
                 .try_into()
                 .unwrap();
         let header = build_block_header(
-            1, 0, &[0u8; 32], &merkle, 0x495fab29, // timestamp
+            1, &[0u8; 32], &merkle, 0x495fab29, // timestamp
             0x1d00ffff, // bits
             0x7c2bac1d, // nonce
         );
@@ -64,15 +110,19 @@ mod tests {
     }
 
     #[test]
-    fn version_mask_xor_applied() {
-        let h = build_block_header(0x20000000, 0x00400000, &[0u8; 32], &[0u8; 32], 0, 0, 0);
-        let expected_version: u32 = 0x20000000 ^ 0x00400000;
-        assert_eq!(&h[0..4], &expected_version.to_le_bytes());
-    }
-
-    #[test]
-    fn version_mask_zero_is_no_op() {
-        let h = build_block_header(0x20000000, 0, &[0u8; 32], &[0u8; 32], 0, 0, 0);
-        assert_eq!(&h[0..4], &0x20000000u32.to_le_bytes());
+    fn the_consensus_floor_is_the_signed_comparison_core_makes() {
+        // Core reads nVersion as int32 and rejects `< 4`. An unsigned
+        // comparison would call 0x80000000 the largest version there is
+        // instead of the smallest.
+        assert!(!version_meets_consensus_floor(0));
+        assert!(!version_meets_consensus_floor(3));
+        assert!(version_meets_consensus_floor(4));
+        assert!(version_meets_consensus_floor(0x2000_0000));
+        for v in [0x8000_0000u32, 0xA000_0000, u32::MAX] {
+            assert!(
+                !version_meets_consensus_floor(v),
+                "0x{v:08x} is negative as i32 and must fail the floor"
+            );
+        }
     }
 }

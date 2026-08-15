@@ -346,7 +346,7 @@ pub struct StandardJobContext<'a> {
 /// 2. Duplicate-check the dedup tuple against the channel's submission
 ///    cache. Hit → [`RejectReason::StaleShare`].
 /// 3. Reject if `classification == StaleRejected`.
-/// 4. Build the 80-byte header from `(version XOR version_mask,
+/// 4. Build the 80-byte header from `(submission.version,
 ///    prev_hash, stored_merkle_root, ntime, n_bits, nonce)`.
 /// 5. Compute `sha256d(header)` and the implied submission difficulty.
 /// 6. Compare against `difficulty_to_target(job_difficulty)`. Miss →
@@ -388,10 +388,13 @@ pub fn validate_submit_standard(
         return ShareValidation::Rejected(RejectReason::StaleShare.into());
     }
 
-    let version_mask = submission.version ^ (job_ctx.template_version as u32);
+    // `submission.version` is the FULL nVersion (SV2 spec:
+    // `SubmitSharesStandard.version` is the "Full nVersion field"), so it
+    // goes into the header as-is. The old code XOR'd it against the
+    // template version and then XOR'd it back, which was an identity
+    // dressed up as version-rolling arithmetic.
     let header = build_block_header(
-        job_ctx.template_version,
-        version_mask,
+        submission.version as i32,
         &job_ctx.prev_hash,
         stored_merkle_root,
         submission.ntime,
@@ -591,13 +594,11 @@ pub fn validate_submit_extended(
     let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &ext_job.merkle_path);
 
     // 4. Assemble the 80-byte header. Version-mask is XOR'd against
-    //    the job's template version (BIP-310). `validate_submit_standard`
-    //    folds the same algebra (version XOR mask == submission.version
-    //    when mask = submission.version ^ template.version).
-    let version_mask = submission.version ^ ext_job.version;
+    //    `submission.version` verbatim — the extended twin of the standard
+    //    path above, and for the same reason: SV2 submits the full nVersion,
+    //    so there is nothing to reconstruct against `ext_job.version`.
     let header = build_block_header(
-        ext_job.version as i32,
-        version_mask,
+        submission.version as i32,
         &ext_job.prev_hash,
         &merkle_root,
         submission.ntime,
@@ -1060,28 +1061,50 @@ mod tests {
         assert_eq!(ch.submission_cache.len(), 0);
     }
 
-    /// Header byte-shape: version XOR-mask is applied (BIP-310). The
-    /// submitted-version field is the FINAL header version when
-    /// `submission.version != template.version`. We test by passing
-    /// a submission version with a non-zero rolled bit and verifying
-    /// the header[0..4] matches the submission version (LE).
+    /// The header version is `submission.version`, verbatim.
+    ///
+    /// SV2 submits the full nVersion (spec: `SubmitSharesStandard.version`
+    /// is the "Full nVersion field"), so no reconstruction happens — unlike
+    /// SV1, which submits a masked subset and rebuilds per BIP-310.
+    ///
+    /// Both directions are covered, and the second is the one that pins the
+    /// difference from an OR-based pool: a miner must be able to **clear** a
+    /// bit the template set. ckpool's SV1 path (`*data32 |= version_mask`)
+    /// cannot express that; taking the submitted version verbatim can.
     #[test]
-    fn standard_header_applies_version_rolling_mask() {
-        let mut ch = std_channel();
-        let merkle = [0xDD; 32];
-        let mut sub = std_submission();
-        sub.version = 0x2000_0001; // version-rolled by 1 bit
+    fn standard_header_version_is_the_submitted_version_verbatim() {
         let ctx = std_ctx(JobClassification::Active);
-        let out = validate_submit_standard(&mut ch, &sub, easy_diff(), &merkle, &ctx);
-        let accept = match out {
+        let merkle = [0xDD; 32];
+
+        // Sets a bit the template (0x2000_0000) does not have.
+        let mut ch = std_channel();
+        let mut sub = std_submission();
+        sub.version = 0x2000_0001;
+        let accept = match validate_submit_standard(&mut ch, &sub, easy_diff(), &merkle, &ctx) {
             ShareValidation::Accepted(a) => a,
             _ => panic!("expected Accept"),
         };
-        // header[0..4] LE == 0x2000_0001 because the mask propagates the
-        // bit difference: template=0x2000_0000, submitted=0x2000_0001,
-        // mask = 0x0000_0001, applied: 0x2000_0000 XOR 0x0000_0001 = 0x2000_0001.
-        let v = u32::from_le_bytes(accept.header[0..4].try_into().unwrap());
-        assert_eq!(v, 0x2000_0001);
+        assert_eq!(
+            u32::from_le_bytes(accept.header[0..4].try_into().unwrap()),
+            0x2000_0001
+        );
+
+        // Clears a bit the template DOES have. `std_ctx` builds its job at
+        // template version 0x2000_0000, so dropping bit 29 lands on
+        // 0x0000_0000 — which an OR would leave at 0x2000_0000.
+        let mut ch = std_channel();
+        let mut sub = std_submission();
+        sub.version = 0x0000_0000;
+        let accept = match validate_submit_standard(&mut ch, &sub, easy_diff(), &merkle, &ctx) {
+            ShareValidation::Accepted(a) => a,
+            _ => panic!("expected Accept"),
+        };
+        assert_eq!(
+            u32::from_le_bytes(accept.header[0..4].try_into().unwrap()),
+            0x0000_0000,
+            "a cleared template bit must survive into the header — an OR-based \
+             reconstruction would put it back"
+        );
     }
 
     /// `is_block_candidate` flips to true when submission ≥ network.

@@ -238,14 +238,14 @@ async fn pool_rejected_stats_composite_key_increment() {
 // ── client_statistics_entity (13 cols, batchable) ────────────────────
 
 #[tokio::test]
-async fn client_stats_insert_then_increment_all_9_fields() {
+async fn client_stats_insert_then_increment_all_11_fields() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
     let mut tx = pool.begin().await.expect("begin tx");
     let slot = unique_slot(4);
 
-    let mk = |shares: f32, accepted: i32, rejected: i32, jnf: i32, dup: i32, low: i32| {
+    let mk = |shares: f32, accepted: i32, rejected: i32, jnf: i32, dup: i32, low: i32, vr: i32| {
         ClientStatsUpsert {
             address: "test_cs_alice".to_string(),
             client_name: "w1".to_string(),
@@ -260,21 +260,27 @@ async fn client_stats_insert_then_increment_all_9_fields() {
             rejected_duplicate_share_diff1: dup as f32 * 0.25,
             rejected_low_difficulty_share_count: low,
             rejected_low_difficulty_share_diff1: low as f32 * 0.1,
+            // Distinct multiplier from every other pair, so a swapped bind
+            // or a wrong `$n` index shows up as a wrong number rather than
+            // an accidentally-equal one.
+            rejected_version_rolling_count: vr,
+            rejected_version_rolling_diff1: vr as f32 * 0.75,
         }
     };
 
-    bulk_upsert_client_statistics_entity(&mut *tx, &[mk(100.0, 5, 3, 1, 1, 1)])
+    bulk_upsert_client_statistics_entity(&mut *tx, &[mk(100.0, 5, 3, 1, 1, 1, 2)])
         .await
         .expect("first");
     // Second call: every numeric field accumulates.
-    bulk_upsert_client_statistics_entity(&mut *tx, &[mk(50.0, 2, 0, 0, 0, 0)])
+    bulk_upsert_client_statistics_entity(&mut *tx, &[mk(50.0, 2, 0, 0, 0, 0, 3)])
         .await
         .expect("second");
 
     let row = sqlx::query(
         r#"SELECT shares, "acceptedCount", "rejectedCount",
                   "rejectedJobNotFoundCount", "rejectedDuplicateShareCount",
-                  "rejectedLowDifficultyShareCount"
+                  "rejectedLowDifficultyShareCount",
+                  "rejectedVersionRollingCount", "rejectedVersionRollingDiff1"
            FROM client_statistics_entity
            WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3 AND "time" = $4"#,
     )
@@ -292,12 +298,18 @@ async fn client_stats_insert_then_increment_all_9_fields() {
     let jnf: i32 = row.get("rejectedJobNotFoundCount");
     let dup: i32 = row.get("rejectedDuplicateShareCount");
     let low: i32 = row.get("rejectedLowDifficultyShareCount");
+    let vr: i32 = row.get("rejectedVersionRollingCount");
+    let vr_diff: f32 = row.get("rejectedVersionRollingDiff1");
     assert!((shares - 150.0).abs() < 0.01);
     assert_eq!(accepted, 7);
     assert_eq!(rejected, 3);
     assert_eq!(jnf, 1);
     assert_eq!(dup, 1);
     assert_eq!(low, 1);
+    // 2 + 3, at a multiplier no other pair uses — a swapped bind would land
+    // on one of the others' values instead.
+    assert_eq!(vr, 5);
+    assert!((vr_diff - 3.75).abs() < 0.001, "got {vr_diff}");
 
     tx.rollback().await.expect("rollback");
 }
@@ -324,6 +336,8 @@ async fn client_stats_distinct_keys_stay_independent() {
         rejected_duplicate_share_diff1: 0.0,
         rejected_low_difficulty_share_count: 0,
         rejected_low_difficulty_share_diff1: 0.0,
+        rejected_version_rolling_count: 0,
+        rejected_version_rolling_diff1: 0.0,
     };
     // Two sessions for the same address+worker → 2 distinct PK rows.
     let mut variant = base.clone();
@@ -764,6 +778,8 @@ async fn seed_aggregates_client_statistics_into_worker_shares() {
             rejected_duplicate_share_diff1: 0.0,
             rejected_low_difficulty_share_count: 1,
             rejected_low_difficulty_share_diff1: 0.5,
+            rejected_version_rolling_count: 0,
+            rejected_version_rolling_diff1: 0.0,
         },
         ClientStatsUpsert {
             address: "test_seed_alice".to_string(),
@@ -779,6 +795,8 @@ async fn seed_aggregates_client_statistics_into_worker_shares() {
             rejected_duplicate_share_diff1: 0.0,
             rejected_low_difficulty_share_count: 1,
             rejected_low_difficulty_share_diff1: 0.75,
+            rejected_version_rolling_count: 0,
+            rejected_version_rolling_diff1: 0.0,
         },
     ];
     bulk_upsert_client_statistics_entity(&mut *tx, &stats)

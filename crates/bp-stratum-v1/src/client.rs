@@ -28,10 +28,10 @@ use crate::config::{PortConfig, ServerConfig};
 use crate::frame::{
     parse_request, write_authorize_response, write_configure_response, write_error,
     write_extranonce_subscribe_response, write_set_difficulty, write_submit_success,
-    write_subscribe_response, AuthorizeRequest, ConfigureRequest, FrameParseError, RpcId,
-    SV1Request, SubmitRequest, SubscribeRequest, SuggestDifficultyRequest, ERR_OTHER_UNKNOWN,
-    ERR_UNAUTHORIZED_WORKER, REJECT_INVALID_ADDR, REJECT_NOT_SUBSCRIBED, REJECT_SUGGEST_DISABLED,
-    REJECT_UNAUTHORIZED, VALIDATION_INVALID_AUTHORIZE,
+    write_subscribe_response, AuthorizeRequest, ConfigureRequest, FrameParseError, RequestedMask,
+    RpcId, SV1Request, SubmitRequest, SubscribeRequest, SuggestDifficultyRequest,
+    ERR_OTHER_UNKNOWN, ERR_UNAUTHORIZED_WORKER, REJECT_INVALID_ADDR, REJECT_NOT_SUBSCRIBED,
+    REJECT_SUGGEST_DISABLED, REJECT_UNAUTHORIZED, VALIDATION_INVALID_AUTHORIZE,
 };
 use crate::jobs::JobRegistry;
 use crate::notify::{build_notify_frame, ActiveSV1Template};
@@ -51,6 +51,29 @@ use bp_vardiff::{Clock, VarDiffEngine};
 /// the caller to flush; inbound bytes are parsed and dispatched
 /// upstream.
 pub struct SessionState<C: Clock> {
+    /// BIP-310 `last_mask`: which version bits this session may change.
+    ///
+    /// Starts at the pool's advertised mask, and every `mining.configure`
+    /// **replaces** it with `server_mask & miner_mask` for that request.
+    /// A repeated configure is a fresh negotiation, so the value can move
+    /// in either direction — it is always exactly the mask the miner was
+    /// last told, which is the only thing it can act on.
+    ///
+    /// ⚠️ Starting at the advertised mask rather than at zero is deliberate,
+    /// and it is a compatibility decision, not a reading of the BIP.
+    /// BIP-310 ties the 6th `mining.submit` parameter to a mask "received
+    /// from the server", so a miner that never ran `mining.configure` has
+    /// literally received none — the strict reading is zero. ckpool, which
+    /// virtually every SV1 firmware is tested against, instead validates
+    /// every submit against the pool's own mask and never negotiates at all
+    /// (`stratifier.c`: `((~ckpool.version_mask) & version_mask32) != 0` →
+    /// `SE_INVALID_VERSION_MASK`). Starting at zero would therefore reject a
+    /// non-configuring roller that the reference pool accepts.
+    ///
+    /// So: lenient exactly where ckpool is lenient, strict only about a mask
+    /// we actually answered with.
+    pub version_rolling_mask: u32,
+
     // Identity
     pub session_id_hex: String,
     pub extranonce1: [u8; 4],
@@ -139,6 +162,7 @@ impl<C: Clock> SessionState<C> {
         .with_initial_difficulty(initial);
 
         Self {
+            version_rolling_mask: server_config.version_rolling_mask,
             session_id_hex,
             extranonce1,
             session_start_ms,
@@ -175,18 +199,6 @@ impl<C: Clock> SessionState<C> {
     /// this.
     pub fn is_authorized(&self) -> bool {
         self.authorization.is_some()
-    }
-
-    /// Convenience: build the read-only session context that
-    /// [`validate_submit`] expects.
-    pub fn submit_context(&self) -> SessionContext<'_> {
-        SessionContext {
-            extranonce1: &self.extranonce1,
-            session_difficulty: self.session_difficulty,
-            old_session_difficulty: self.old_session_difficulty,
-            diff_change_job_id: self.diff_change_job_id,
-            share_logs: self.share_logs,
-        }
     }
 }
 
@@ -454,11 +466,50 @@ pub fn handle_configure<C: Clock>(
     server_config: &ServerConfig,
     request: ConfigureRequest,
 ) -> HandlerOutcome {
+    // BIP-310: "The server responds to the configuration message by sending
+    // a mask with common bits intersection of the miner's mask and its a
+    // mask (`response = server_mask & miner_mask`)."
+    //
+    // The pool used to answer with its own mask unconditionally, which is
+    // only accidentally correct: it happens to equal the intersection while
+    // every shipping firmware asks for exactly the mask we advertise. A
+    // miner that asks for a subset was told it may roll more than it
+    // requested.
+    //
+    // An absent mask field is `ffffffff` per BIP-310, so it intersects to
+    // the pool's full mask.
+    //
+    // A field that is present but unreadable is treated the same way — and
+    // deliberately NOT as `ffffffff` on one side or `0` on the other. Both
+    // extremes are wrong here: upgrading it to "everything" would let a
+    // typo widen what a miner is granted beyond the pool's own mask, while
+    // collapsing it to "nothing" answers `00000000` and costs a miner its
+    // version rolling entirely — over a mask string with one digit too
+    // many. Falling back to the advertised mask grants exactly what every
+    // miner that sends no mask at all already gets, so an unreadable field
+    // cannot change what anyone is allowed to do. It is logged, because a
+    // miner that cannot spell its own mask is worth knowing about.
+    let requested = match request.requested_version_rolling_mask() {
+        RequestedMask::Requested(mask) => mask,
+        RequestedMask::Absent => u32::MAX,
+        RequestedMask::Malformed => {
+            tracing::warn!(
+                params = %request.params,
+                "mining.configure carried an unreadable version-rolling.mask; \
+                 falling back to the advertised mask"
+            );
+            u32::MAX
+        }
+    };
+    let negotiated = server_config.version_rolling_mask & requested;
+
+    // BIP-310's `last_mask` for the rest of the session. Assigned, not
+    // narrowed against the previous value: a repeated `mining.configure` is
+    // a fresh negotiation and its answer is what the miner will act on, so
+    // the stored mask has to be the one we just sent.
+    state.version_rolling_mask = negotiated;
     state.configuration = Some(request.clone());
-    HandlerOutcome::with_frame(write_configure_response(
-        &request.id,
-        server_config.version_rolling_mask,
-    ))
+    HandlerOutcome::with_frame(write_configure_response(&request.id, negotiated))
 }
 
 // ── Authorize ────────────────────────────────────────────────────────
@@ -619,6 +670,7 @@ pub fn handle_submit<C: Clock>(
         old_session_difficulty: state.old_session_difficulty,
         diff_change_job_id: state.diff_change_job_id,
         share_logs: state.share_logs,
+        version_rolling_mask: state.version_rolling_mask,
     };
     let validation = validate_submit(
         &request,
@@ -654,7 +706,19 @@ pub fn handle_submit<C: Clock>(
             // `LowDifficulty` means the opposite — the miner is hashing and
             // cannot reach the difficulty at all, which is the very state
             // the descent has to act on rather than be silenced by.
-            if !matches!(reject.reason, RejectReason::LowDifficulty) {
+            // `VersionRollingNotAllowed` is returned BEFORE the header is
+            // built or hashed, so nothing was demonstrated about the target
+            // at all — crediting it would let a session rolling outside its
+            // mask reject 100 % of its shares while resetting the no-share
+            // evidence on every one, and the silence-easing descent could
+            // never walk it down.
+            let demonstrates_target = match reject.reason {
+                RejectReason::DuplicateShare | RejectReason::JobNotFound | RejectReason::Stale => {
+                    true
+                }
+                RejectReason::LowDifficulty | RejectReason::VersionRollingNotAllowed => false,
+            };
+            if demonstrates_target {
                 state.vardiff.note_target_reached();
             }
             out.push_frame(write_error(&id, reject.wire_code, reject.wire_message));
@@ -1270,8 +1334,8 @@ mod tests {
 
     // ── Configure ─────────────────────────────────────────────────────
 
-    #[test]
-    fn configure_writes_version_rolling_response() {
+    /// Drive `handle_configure` and return `(response frame, negotiated mask)`.
+    fn configure(params: serde_json::Value) -> (String, u32) {
         let port = solo_port(16384.0);
         let mut state = fresh_state(TestClock::new(0), &port);
         let out = handle_configure(
@@ -1279,12 +1343,166 @@ mod tests {
             &server_config(),
             ConfigureRequest {
                 id: RpcId::from(7),
-                params: serde_json::json!([]),
+                params,
             },
         );
-        let s = std::str::from_utf8(&out.outbound_frames[0]).unwrap();
+        (
+            std::str::from_utf8(&out.outbound_frames[0])
+                .unwrap()
+                .to_string(),
+            state.version_rolling_mask,
+        )
+    }
+
+    /// The mask hex the pool answered with.
+    fn negotiated_mask_hex(params: serde_json::Value) -> String {
+        let (s, _) = configure(params);
+        assert!(
+            s.contains("\"version-rolling\":true"),
+            "response must advertise the extension: {s}"
+        );
+        let marker = "\"version-rolling.mask\":\"";
+        let start = s.find(marker).expect("mask field present") + marker.len();
+        s[start..start + 8].to_string()
+    }
+
+    /// A session that has not run `mining.configure` starts at the pool's
+    /// advertised mask, not at zero.
+    ///
+    /// This is the ckpool-compatibility decision and this is the line that
+    /// carries it: ckpool never negotiates and validates every submit
+    /// against its own mask, so a zero start would reject a non-configuring
+    /// roller that the reference pool accepts. Flip `SessionState::new` to
+    /// zero — the strict BIP-310 reading — and this fails.
+    /// An unreadable `version-rolling.mask` must cost the miner nothing.
+    ///
+    /// Both extremes are wrong: reading it as `ffffffff` would let a typo
+    /// widen what the miner is granted, and reading it as `0` would answer
+    /// `00000000` and take its version rolling away over a malformed
+    /// string. The advertised mask is what a miner sending no mask at all
+    /// already gets, so an unreadable field changes nothing for anybody.
+    #[test]
+    fn an_unreadable_mask_falls_back_to_the_advertised_mask() {
+        for bad in [
+            serde_json::json!("1fffe0000"), // one digit too many
+            serde_json::json!("zzzz"),      // not hex
+            serde_json::json!(""),          // empty
+            serde_json::json!(536862720),   // not a string
+            serde_json::json!(" 1fffe000"), // stray whitespace
+        ] {
+            let (frame, stored) = configure(serde_json::json!([
+                ["version-rolling"],
+                {"version-rolling.mask": bad}
+            ]));
+            assert_eq!(
+                stored,
+                server_config().version_rolling_mask,
+                "unreadable mask {bad} must not narrow the session"
+            );
+            assert!(
+                frame.contains("\"version-rolling.mask\":\"1fffe000\""),
+                "unreadable mask {bad} must still be answered with the advertised \
+                 mask, got: {frame}"
+            );
+        }
+
+        // Negative control: a mask we CAN read is still honoured, so the
+        // cases above are about unreadability and not about the parser
+        // having stopped working.
+        assert_eq!(
+            negotiated_mask_hex(serde_json::json!([
+                ["version-rolling"],
+                {"version-rolling.mask": "00c00000"}
+            ])),
+            "00c00000"
+        );
+    }
+
+    #[test]
+    fn a_fresh_session_starts_at_the_advertised_mask() {
+        let port = solo_port(16384.0);
+        let state = fresh_state(TestClock::new(0), &port);
+        assert_eq!(
+            state.version_rolling_mask,
+            server_config().version_rolling_mask
+        );
+        assert_ne!(state.version_rolling_mask, 0);
+    }
+
+    #[test]
+    fn configure_writes_version_rolling_response() {
+        let (s, stored) = configure(serde_json::json!([]));
         assert!(s.contains("\"version-rolling\":true"));
         assert!(s.contains("\"version-rolling.mask\":\"1fffe000\""));
+        // The negotiated mask becomes BIP-310's `last_mask` for the session.
+        assert_eq!(stored, 0x1fffe000);
+    }
+
+    /// BIP-310: "The server responds to the configuration message by sending
+    /// a mask with common bits intersection of the miner's mask and its a
+    /// mask (`response = server_mask & miner_mask`)."
+    ///
+    /// The pool used to answer with its own mask no matter what was asked.
+    #[test]
+    fn the_response_is_the_intersection_of_server_and_miner_mask() {
+        // What every shipping firmware asks for — unchanged, and the reason
+        // this fix is invisible to them.
+        assert_eq!(
+            negotiated_mask_hex(serde_json::json!([
+                ["version-rolling"],
+                {"version-rolling.mask": "1fffe000"}
+            ])),
+            "1fffe000"
+        );
+        // Asks for a subset -> gets exactly that subset. Answering with more
+        // than was asked for is what BIP-310 forbids, and it is what the
+        // pool did before.
+        assert_eq!(
+            negotiated_mask_hex(serde_json::json!([
+                ["version-rolling"],
+                {"version-rolling.mask": "00c00000"}
+            ])),
+            "00c00000"
+        );
+        // Asks for bits the pool does not grant -> those drop out, the rest
+        // survives.
+        assert_eq!(
+            negotiated_mask_hex(serde_json::json!([
+                ["version-rolling"],
+                {"version-rolling.mask": "ffffe000"}
+            ])),
+            "1fffe000"
+        );
+    }
+
+    /// BIP-310 makes the mask field OPTIONAL with default `"ffffffff"`:
+    /// "A miner doesn't have to send the mask, in this case a default full
+    /// mask is used."
+    ///
+    /// Reading an absent field as zero instead would answer such a miner
+    /// with `00000000` and switch its version rolling off — the one way
+    /// this change could break somebody.
+    #[test]
+    fn an_absent_mask_field_means_everything_not_nothing() {
+        for params in [
+            serde_json::json!([["version-rolling"], {}]),
+            serde_json::json!([]),
+        ] {
+            assert_eq!(
+                negotiated_mask_hex(params.clone()),
+                "1fffe000",
+                "absent mask must intersect to the full server mask for {params}"
+            );
+        }
+        // Negative control: an *explicit* zero is honoured as zero, so the
+        // cases above really are about absence.
+        assert_eq!(
+            negotiated_mask_hex(serde_json::json!([
+                ["version-rolling"],
+                {"version-rolling.mask": "00000000"}
+            ])),
+            "00000000"
+        );
     }
 
     // ── Extranonce subscribe ──────────────────────────────────────────

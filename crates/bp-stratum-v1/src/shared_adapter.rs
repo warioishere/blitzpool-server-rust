@@ -89,6 +89,7 @@ fn map_sv1_reject(reason: RejectReason) -> RejectedReason {
         RejectReason::JobNotFound | RejectReason::Stale => RejectedReason::JobNotFound,
         RejectReason::DuplicateShare => RejectedReason::DuplicateShare,
         RejectReason::LowDifficulty => RejectedReason::LowDifficulty,
+        RejectReason::VersionRollingNotAllowed => RejectedReason::VersionRollingNotAllowed,
     }
 }
 

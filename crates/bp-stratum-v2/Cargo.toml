@@ -76,6 +76,9 @@ hex = { workspace = true }
 proptest = { workspace = true }
 smallvec = { workspace = true }
 bp-share = { workspace = true }
+# Regtest assertions read bitcoin-core RPC results (getblockheader,
+# getblockchaininfo) as raw JSON.
+serde_json = { workspace = true }
 criterion = "0.5"
 
 [[bench]]

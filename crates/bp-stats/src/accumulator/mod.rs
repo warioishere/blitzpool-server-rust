@@ -43,6 +43,15 @@ pub enum RejectedReason {
     /// existed) so operators can tell normal block-transition churn
     /// from a real miner bug.
     Stale,
+    /// Miner changed block-header version bits outside the mask it
+    /// negotiated (BIP-310: "If a miner changes bits with mask value 0,
+    /// the server will reject the submit").
+    ///
+    /// Its own bucket rather than folded into `LowDifficulty`: the share's
+    /// proof-of-work may be perfectly good, and the two point at different
+    /// causes — a difficulty miss is normal churn, this is a miner ignoring
+    /// what it negotiated.
+    VersionRollingNotAllowed,
 }
 
 impl RejectedReason {
@@ -54,6 +63,7 @@ impl RejectedReason {
             Self::DuplicateShare => "DuplicateShare",
             Self::LowDifficulty => "LowDifficultyShare",
             Self::Stale => "Stale",
+            Self::VersionRollingNotAllowed => "VersionRollingNotAllowed",
         }
     }
 }
@@ -74,5 +84,9 @@ mod tests {
         assert_eq!(RejectedReason::DuplicateShare.as_str(), "DuplicateShare");
         assert_eq!(RejectedReason::LowDifficulty.as_str(), "LowDifficultyShare");
         assert_eq!(RejectedReason::Stale.as_str(), "Stale");
+        assert_eq!(
+            RejectedReason::VersionRollingNotAllowed.as_str(),
+            "VersionRollingNotAllowed"
+        );
     }
 }

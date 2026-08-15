@@ -48,6 +48,9 @@ pub const REJECT_LOW_DIFF: &str = "Difficulty too low";
 pub const REJECT_STALE: &str = "stale";
 pub const REJECT_UNAUTHORIZED: &str = "Unauthorized worker";
 pub const REJECT_NOT_SUBSCRIBED: &str = "Not subscribed";
+/// Emitted when a miner changes version bits outside the mask it negotiated
+/// (BIP-310). New string — no historical tooling parses it yet.
+pub const REJECT_VERSION_ROLLING: &str = "Version rolling not allowed";
 pub const REJECT_SUGGEST_DISABLED: &str = "Suggest difficulty is disabled for this connection";
 pub const REJECT_INVALID_ADDR: &str = "Invalid Bitcoin address";
 
@@ -127,14 +130,65 @@ pub struct SubscribeRequest {
     pub user_agent: String,
 }
 
+/// What a `mining.configure` carried in `version-rolling.mask`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestedMask {
+    /// A readable mask.
+    Requested(u32),
+    /// No `version-rolling.mask` field. BIP-310 reads this as `ffffffff`.
+    Absent,
+    /// The field was present but unreadable. **Not** the same as absent.
+    Malformed,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConfigureRequest {
     pub id: RpcId,
-    /// The full `params` array, preserved verbatim. The current pool
-    /// implementation ignores its contents and always returns a fixed
-    /// `{version-rolling: true, mask}` result, but keeping the raw value
-    /// lets downstream tooling inspect what the miner asked for.
+    /// The full `params` array, preserved verbatim.
+    /// [`Self::requested_version_rolling_mask`] reads the one BIP-310 field
+    /// `handle_configure` needs; the raw value is kept so downstream tooling
+    /// can inspect anything else the miner asked for.
     pub params: serde_json::Value,
+}
+
+impl ConfigureRequest {
+    /// The `version-rolling.mask` the miner asked for, per BIP-310.
+    ///
+    /// `Absent` carries BIP-310's default: the field is OPTIONAL with
+    /// default `"ffffffff"` — "A miner doesn't have to send the mask, in
+    /// this case a default full mask is used" — so an absent field means
+    /// *everything*, never *nothing*.
+    ///
+    /// `Malformed` is kept apart from it on purpose. The BIP's default is
+    /// defined for a field that is not there; a field that IS there and
+    /// unreadable (`"1fffe0000"`, `"zzzz"`, a non-string) says the miner
+    /// meant something the pool could not read, and silently upgrading that
+    /// to "grant everything" hands it bits it never asked for.
+    pub fn requested_version_rolling_mask(&self) -> RequestedMask {
+        let Some(field) = self
+            .params
+            .get(1)
+            .and_then(|p| p.get("version-rolling.mask"))
+        else {
+            return RequestedMask::Absent;
+        };
+        let Some(text) = field.as_str() else {
+            return RequestedMask::Malformed;
+        };
+        // Exactly one optional `0x`, case-insensitively; `from_str_radix`
+        // would otherwise also accept a leading `+`.
+        let digits = text
+            .strip_prefix("0x")
+            .or_else(|| text.strip_prefix("0X"))
+            .unwrap_or(text);
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+            return RequestedMask::Malformed;
+        }
+        match u32::from_str_radix(digits, 16) {
+            Ok(mask) => RequestedMask::Requested(mask),
+            Err(_) => RequestedMask::Malformed,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

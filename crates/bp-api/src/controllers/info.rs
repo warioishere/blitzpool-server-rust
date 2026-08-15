@@ -1117,6 +1117,7 @@ pub(crate) const REJECT_REASON_KEYS: &[&str] = &[
     "UnauthorizedWorker",
     "NotSubscribed",
     "Stale",
+    "VersionRollingNotAllowed",
 ];
 
 /// Normalise the reason string stored on `pool_rejected_statistics_entity`
@@ -1130,6 +1131,7 @@ pub(crate) fn normalise_reject_reason(raw: &str) -> &'static str {
         "JobNotFound" => "JobNotFound",
         "DuplicateShare" => "DuplicateShare",
         "LowDifficultyShare" => "LowDifficultyShare",
+        "VersionRollingNotAllowed" => "VersionRollingNotAllowed",
         "UnauthorizedWorker" => "UnauthorizedWorker",
         "NotSubscribed" => "NotSubscribed",
         "Stale" => "Stale",

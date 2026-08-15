@@ -29,7 +29,8 @@ use bp_share::{calculate_difficulty, difficulty_to_target, Difficulty, Target};
 
 use crate::frame::{
     SubmitRequest, ERR_DUPLICATE_SHARE, ERR_JOB_NOT_FOUND, ERR_LOW_DIFFICULTY_SHARE,
-    REJECT_DUPLICATE, REJECT_JOB_NOT_FOUND, REJECT_LOW_DIFF, REJECT_STALE,
+    ERR_OTHER_UNKNOWN, REJECT_DUPLICATE, REJECT_JOB_NOT_FOUND, REJECT_LOW_DIFF, REJECT_STALE,
+    REJECT_VERSION_ROLLING,
 };
 use crate::jobs::{JobClassification, JobRegistry};
 use crate::notify::ActiveSV1Template;
@@ -77,6 +78,14 @@ pub enum RejectReason {
     JobNotFound,
     Stale,
     LowDifficulty,
+    /// Miner changed version bits outside the mask it negotiated. BIP-310
+    /// on the `version-rolling.mask` return value: "Bits set to 1 are
+    /// allowed to be changed by the miner. **If a miner changes bits with
+    /// mask value 0, the server will reject the submit.**"
+    ///
+    /// SV1 has no dedicated wire code for this, so it goes out as
+    /// [`ERR_OTHER_UNKNOWN`] with its own message.
+    VersionRollingNotAllowed,
 }
 
 impl RejectReason {
@@ -86,6 +95,7 @@ impl RejectReason {
             RejectReason::DuplicateShare => ERR_DUPLICATE_SHARE,
             RejectReason::JobNotFound | RejectReason::Stale => ERR_JOB_NOT_FOUND,
             RejectReason::LowDifficulty => ERR_LOW_DIFFICULTY_SHARE,
+            RejectReason::VersionRollingNotAllowed => ERR_OTHER_UNKNOWN,
         }
     }
 
@@ -97,6 +107,7 @@ impl RejectReason {
             RejectReason::JobNotFound => REJECT_JOB_NOT_FOUND,
             RejectReason::Stale => REJECT_STALE,
             RejectReason::LowDifficulty => REJECT_LOW_DIFF,
+            RejectReason::VersionRollingNotAllowed => REJECT_VERSION_ROLLING,
         }
     }
 }
@@ -199,6 +210,12 @@ pub struct SessionContext<'a> {
     /// `✅ Share accepted` traces below; rejections always log at WARN
     /// regardless.
     pub share_logs: bool,
+    /// BIP-310 `last_mask` — which version bits this session may change.
+    /// The pool's advertised mask until `mining.configure` narrows it to the
+    /// intersection with what the miner asked for. See
+    /// `SessionState::version_rolling_mask` for why it does not start at
+    /// zero.
+    pub version_rolling_mask: u32,
 }
 
 // ── Duplicate-share cache (per session) ──────────────────────────────
@@ -362,7 +379,7 @@ pub fn validate_submit(
 
     // 4. Parse the wire-hex fields. We've already validated string-ness
     // at the frame layer; here we check semantic well-formedness.
-    let Some((version_mask, nonce, ntime, extranonce2)) = parse_submit_fields(submit) else {
+    let Some((version_bits, nonce, ntime, extranonce2)) = parse_submit_fields(submit) else {
         tracing::warn!(
             worker = %submit.worker,
             job_id = %submit.job_id,
@@ -371,14 +388,61 @@ pub fn validate_submit(
         return ShareValidation::Rejected(RejectReason::LowDifficulty.into());
     };
 
+    // 4a. BIP-310 calls the sixth `mining.submit` parameter `version_bits`,
+    // and binds it to the mask this session negotiated (`last_mask`):
+    //
+    //     version_bits & ~last_mask == 0
+    //
+    // "Bits set to 1 are allowed to be changed by the miner. If a miner
+    // changes bits with mask value 0, the server will reject the submit."
+    //
+    // `last_mask` is the pool's advertised mask until `mining.configure`
+    // replaces it, so a miner that never configured is held to the same
+    // bits ckpool holds it to rather than to none — see
+    // `SessionState::version_rolling_mask`. A zero `version_bits`, what a
+    // non-rolling miner sends, passes under every mask.
+    let last_mask = session.version_rolling_mask;
+    if version_bits & !last_mask != 0 {
+        tracing::warn!(
+            worker = %submit.worker,
+            job_id = %submit.job_id,
+            version_bits = format_args!("0x{version_bits:08x}"),
+            last_mask = format_args!("0x{last_mask:08x}"),
+            "❌ Share rejected: version-rolling-not-allowed (bits outside the negotiated mask)"
+        );
+        return ShareValidation::Rejected(RejectReason::VersionRollingNotAllowed.into());
+    }
+
     // 5. Assemble header.
+    //
+    // ⚠️ This is deliberately NOT BIP-310's reconstruction. The BIP defines
+    //
+    //     nVersion = (job_version & ~last_mask) | (version_bits & last_mask)
+    //
+    // and that is correct only if the miner echoes back the template's
+    // in-mask bits it kept. It does not survive the common case otherwise:
+    // a non-rolling miner sends `version_bits = 0`, and against a template
+    // that signals inside the mask — core's regtest sets bit 28, any future
+    // mainnet deployment on bits 13-28 does too — the masked OR CLEARS that
+    // bit, so the pool hashes a different header than the one it put in
+    // `mining.notify` and every share from that miner rejects.
+    //
+    // ckpool, which effectively every SV1 firmware is tested against, does
+    // `job_version | version_bits`, which is robust to both conventions but
+    // cannot express clearing a bit. XOR below is robust to `version_bits = 0`
+    // the same way and additionally lets a miner clear a bit it was granted.
+    //
+    // All three agree while the template sets no bit inside the mask, which
+    // is mainnet today. Moving to the BIP formula needs to know what real
+    // firmware puts in `version_bits` first — measuring that is its own job,
+    // and guessing wrong costs every share of whoever guessed differently.
+    let n_version = lookup.template.version ^ version_bits;
     let coinbase_hash = lookup
         .mining_job
         .coinbase_txid_with_extranonce(session.extranonce1, &extranonce2);
     let merkle_root = merkle_root_from_coinbase(&coinbase_hash, &lookup.template.merkle_path);
     let header = build_block_header(
-        lookup.template.version as i32,
-        version_mask,
+        n_version as i32,
         &lookup.template.prev_hash,
         &merkle_root,
         ntime,
@@ -657,6 +721,9 @@ mod tests {
             old_session_difficulty: 0.0,
             diff_change_job_id: None,
             share_logs: false,
+            // A session that ran `mining.configure` normally — what the
+            // tests below assume unless they say otherwise.
+            version_rolling_mask: crate::config::DEFAULT_VERSION_ROLLING_MASK,
         }
     }
 
@@ -668,6 +735,9 @@ mod tests {
             old_session_difficulty: 1.0e30,
             diff_change_job_id: None,
             share_logs: false,
+            // A session that ran `mining.configure` normally — what the
+            // tests below assume unless they say otherwise.
+            version_rolling_mask: crate::config::DEFAULT_VERSION_ROLLING_MASK,
         }
     }
 
@@ -788,6 +858,171 @@ mod tests {
     }
 
     // ── Rejection paths ───────────────────────────────────────────────
+
+    // ── BIP-310 version rolling ───────────────────────────────────────
+
+    /// Build a submit that rolls exactly `version_bits`.
+    fn submit_rolling<'a>(job_id_hex: &'a str, version_bits_hex: &'a str) -> SubmitRequest<'a> {
+        SubmitRequest {
+            id: RpcId::from(1),
+            worker: "addr.w".into(),
+            job_id: job_id_hex,
+            extranonce2_hex: "1122334455667788",
+            ntime_hex: "65a1b2c3",
+            nonce_hex: "deadbeef",
+            version_mask_hex: version_bits_hex,
+        }
+    }
+
+    /// BIP-310 on the `version-rolling.mask` return value: "Bits set to 1
+    /// are allowed to be changed by the miner. **If a miner changes bits
+    /// with mask value 0, the server will reject the submit.**"
+    ///
+    /// Both directions in one test, so it cannot pass on a precondition
+    /// that quietly did not hold.
+    #[test]
+    fn bits_outside_the_negotiated_mask_are_rejected() {
+        let (reg, jid) = populated_registry(1.0);
+        let session = easy_session(); // negotiated 0x1fffe000
+        let mut cache = SessionShareCache::new();
+
+        // Inside the mask -> accepted, at session diff 0 any hash passes.
+        let inside = validate_submit(
+            &submit_rolling(&jid, "1fffe000"),
+            &session,
+            &mut cache,
+            &reg,
+            1_500,
+        );
+        assert!(
+            matches!(inside, ShareValidation::Accepted(_)),
+            "rolling within the negotiated mask must still be accepted"
+        );
+
+        // One bit outside -> rejected. 0x00000001 is a signalling bit the
+        // pool never grants.
+        let outside = validate_submit(
+            &submit_rolling(&jid, "00000001"),
+            &session,
+            &mut cache,
+            &reg,
+            1_500,
+        );
+        match outside {
+            ShareValidation::Rejected(r) => {
+                assert_eq!(r.reason, RejectReason::VersionRollingNotAllowed)
+            }
+            _ => panic!("a bit outside the negotiated mask must be rejected"),
+        }
+    }
+
+    /// Narrowing is the only direction `mining.configure` moves the mask,
+    /// and a miner is held to what it was actually answered with.
+    #[test]
+    fn a_negotiated_subset_is_what_the_miner_is_held_to() {
+        let (reg, jid) = populated_registry(1.0);
+        let session = SessionContext {
+            // What `handle_configure` stores after the miner asked for a
+            // subset of the pool's mask.
+            version_rolling_mask: 0x00c0_0000,
+            ..easy_session()
+        };
+        let mut cache = SessionShareCache::new();
+
+        let inside = validate_submit(
+            &submit_rolling(&jid, "00c00000"),
+            &session,
+            &mut cache,
+            &reg,
+            1_500,
+        );
+        assert!(matches!(inside, ShareValidation::Accepted(_)));
+
+        // Inside the POOL's mask but outside the one this session was
+        // answered with. ckpool would take it; BIP-310 says the miner may
+        // only set bits from the mask it received, and we told it 0x00c00000.
+        let outside = validate_submit(
+            &submit_rolling(&jid, "00002000"),
+            &session,
+            &mut cache,
+            &reg,
+            1_500,
+        );
+        assert!(matches!(
+            outside,
+            ShareValidation::Rejected(ShareReject {
+                reason: RejectReason::VersionRollingNotAllowed,
+                ..
+            })
+        ));
+    }
+
+    /// The header version must equal what the miner was handed in
+    /// `mining.notify` when it rolls nothing — including on a template that
+    /// signals inside the advertised mask.
+    ///
+    /// This is the case BIP-310's masked OR gets wrong: with
+    /// `version_bits = 0` it clears the template's in-mask bit, the pool
+    /// hashes a header the miner never saw, and every share rejects. The
+    /// production code therefore does not use that formula; see the comment
+    /// at the reconstruction. This test drives `validate_submit`, so
+    /// swapping the reconstruction back makes it fail.
+    #[test]
+    fn a_non_rolling_miner_keeps_the_templates_in_mask_bits() {
+        // Template signalling on bit 28, as core's regtest does once
+        // `testdummy` is STARTED. Bit 28 is inside the advertised mask.
+        const DIRTY_TEMPLATE: u32 = 0x3000_0000;
+        assert_ne!(
+            DIRTY_TEMPLATE & crate::config::DEFAULT_VERSION_ROLLING_MASK,
+            0,
+            "precondition: the template sets a bit the miner is allowed to roll"
+        );
+
+        let reg = JobRegistry::from_server_config(&server_config());
+        let mut active = template_with_network_diff(1.0);
+        active.version = DIRTY_TEMPLATE;
+        let tid = reg.add_template(active.clone(), 1_000);
+        let jid = reg.add_job(mining_job_from(&active), tid, 1_000);
+
+        let session = easy_session();
+        let mut cache = SessionShareCache::new();
+        let accept = match validate_submit(
+            &submit_rolling(&jid, "00000000"),
+            &session,
+            &mut cache,
+            &reg,
+            1_500,
+        ) {
+            ShareValidation::Accepted(a) => a,
+            other => panic!("a non-rolling share must be accepted, got {other:?}"),
+        };
+
+        let built = u32::from_le_bytes(accept.header[0..4].try_into().unwrap());
+        assert_eq!(
+            built,
+            DIRTY_TEMPLATE,
+            "the pool must hash the version it published; BIP-310's masked OR \
+             would give 0x{:08x} here",
+            DIRTY_TEMPLATE & !crate::config::DEFAULT_VERSION_ROLLING_MASK
+        );
+
+        // Negative control: a miner that DOES roll still moves the version,
+        // so the assertion above is not passing on a dead code path.
+        let rolled = match validate_submit(
+            &submit_rolling(&jid, "00002000"),
+            &session,
+            &mut cache,
+            &reg,
+            1_500,
+        ) {
+            ShareValidation::Accepted(a) => a,
+            other => panic!("rolling inside the mask must be accepted, got {other:?}"),
+        };
+        assert_eq!(
+            u32::from_le_bytes(rolled.header[0..4].try_into().unwrap()),
+            DIRTY_TEMPLATE ^ 0x0000_2000
+        );
+    }
 
     #[test]
     fn rejects_duplicate_share_before_any_other_check() {
@@ -965,6 +1200,7 @@ mod tests {
             extranonce1: &[0x12, 0x34, 0x56, 0x78],
             session_difficulty: 1.0e30,
             old_session_difficulty: 0.0,
+            version_rolling_mask: crate::config::DEFAULT_VERSION_ROLLING_MASK,
             diff_change_job_id: Some(2),
             share_logs: false,
         };
@@ -989,6 +1225,7 @@ mod tests {
             extranonce1: &[0x12, 0x34, 0x56, 0x78],
             session_difficulty: 1.0e30,
             old_session_difficulty: 0.0,
+            version_rolling_mask: crate::config::DEFAULT_VERSION_ROLLING_MASK,
             diff_change_job_id: Some(1),
             share_logs: false,
         };

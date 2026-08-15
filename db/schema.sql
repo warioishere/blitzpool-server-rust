@@ -205,7 +205,9 @@ CREATE TABLE public.client_statistics_entity (
     "rejectedDuplicateShareCount" integer DEFAULT 0 NOT NULL,
     "rejectedDuplicateShareDiff1" real DEFAULT '0'::real NOT NULL,
     "rejectedLowDifficultyShareCount" integer DEFAULT 0 CONSTRAINT "client_statistics_entity_rejectedLowDifficultyShareCou_not_null" NOT NULL,
-    "rejectedLowDifficultyShareDiff1" real DEFAULT '0'::real CONSTRAINT "client_statistics_entity_rejectedLowDifficultyShareDif_not_null" NOT NULL
+    "rejectedLowDifficultyShareDiff1" real DEFAULT '0'::real CONSTRAINT "client_statistics_entity_rejectedLowDifficultyShareDif_not_null" NOT NULL,
+    "rejectedVersionRollingCount" integer DEFAULT 0 NOT NULL,
+    "rejectedVersionRollingDiff1" real DEFAULT '0'::real NOT NULL
 );
 
 

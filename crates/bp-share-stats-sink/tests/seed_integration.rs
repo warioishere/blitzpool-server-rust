@@ -103,6 +103,8 @@ async fn seed_fires_when_worker_shares_empty_and_client_stats_present() {
             rejected_duplicate_share_diff1: 0.0,
             rejected_low_difficulty_share_count: 1,
             rejected_low_difficulty_share_diff1: 0.5,
+            rejected_version_rolling_count: 0,
+            rejected_version_rolling_diff1: 0.0,
         },
         ClientStatsUpsert {
             address: "test_seed_fire_bob".to_string(),
@@ -118,6 +120,8 @@ async fn seed_fires_when_worker_shares_empty_and_client_stats_present() {
             rejected_duplicate_share_diff1: 0.0,
             rejected_low_difficulty_share_count: 0,
             rejected_low_difficulty_share_diff1: 0.0,
+            rejected_version_rolling_count: 0,
+            rejected_version_rolling_diff1: 0.0,
         },
     ];
     bulk_upsert_client_statistics_entity(&mut *tx, &stats)
