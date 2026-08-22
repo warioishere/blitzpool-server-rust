@@ -1463,33 +1463,43 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
                 distribution.as_ref(),
                 now_ms,
             );
-            // A declared job's token authorises exactly ONE custom job, the
-            // rule the reference JDS enforces (`token_manager.deactivate` plus
-            // `take_declared_custom_job` on every `SetCustomMiningJob`,
-            // sv2-apps v0.7.0). A conformant JDC never re-uses one: each send
+            // A token authorises exactly ONE custom job, whichever record
+            // answered for it. A conformant JDC never re-uses one: each send
             // either pops a fresh allocate token or follows a fresh
             // declaration.
             //
+            // Through `classify_backing`, the same exhaustive question the
+            // handler asked a moment ago — not `bridge_job.is_some()`, which
+            // reads as that question and answers a narrower one. It answered
+            // it narrowly for real: a declaration's token was spent here
+            // while a Coinbase-only allocate token was only ever read, so
+            // that half of the rule did not hold at all.
+            //
             // Consumed only on SUCCESS — a rejected job must leave the token
-            // usable, or a stale-chain-tip retry (which SRI's jd-client
-            // treats as non-fatal and expects to be able to repeat) would
-            // answer `invalid-mining-job-token` instead.
+            // usable, or a stale-chain-tip retry, which a JDC treats as
+            // non-fatal and expects to be able to repeat, would answer
+            // `invalid-mining-job-token` instead.
             //
             // Only the BRIDGE entry goes. The JDP session's own
             // `declared_jobs` store keeps the declaration, because that is
-            // what `PushSolution` reassembles the found block from. SRI can
-            // drop both because it does nothing with a solution
-            // (`handle_push_solution` is a `// todo` stub); we cannot.
-            if bridge_job.is_some()
-                && matches!(
-                    outcome.outbound.first(),
-                    Some(OutboundFrame::SetCustomMiningJobSuccess { .. })
-                )
-            {
-                bridge
-                    .write()
-                    .expect("bridge RwLock poisoned")
-                    .consume_declared_job(&input.mining_job_token);
+            // what `PushSolution` reassembles the found block from.
+            if matches!(
+                outcome.outbound.first(),
+                Some(OutboundFrame::SetCustomMiningJobSuccess { .. })
+            ) {
+                let mut guard = bridge.write().expect("bridge RwLock poisoned");
+                match crate::bridge::classify_backing(bridge_job.as_ref(), allocation.as_ref()) {
+                    Some(crate::bridge::TokenBacking::Declared(_)) => {
+                        guard.consume_declared_job(&input.mining_job_token);
+                    }
+                    Some(crate::bridge::TokenBacking::BaseAllocation { .. })
+                    | Some(crate::bridge::TokenBacking::DistributionAllocation(_)) => {
+                        guard.consume_allocation(&input.mining_job_token);
+                    }
+                    // Unbacked tokens never reach a Success — the handler
+                    // fails closed on them.
+                    None => {}
+                }
             }
             outcome
         }
@@ -2881,6 +2891,13 @@ mod tests {
     /// Distributions are multi-use — a second job referencing the same id
     /// passes too — until a ext 0x0003/Implementation Notes settlement
     /// invalidation turns the same reference into `stale-payout-distribution`.
+    ///
+    /// TOKENS are not, and the two are asserted together on purpose: each job
+    /// below brings its own, and re-sending a spent one is refused
+    /// `invalid-mining-job-token`. An allocate token backing a Coinbase-only
+    /// job used to be read and never consumed, so it authorised jobs for its
+    /// whole hour while the declared-job token beside it was spent on first
+    /// use — the same rule, half applied.
     #[test]
     fn dispatch_set_custom_mining_job_resolves_distribution_multi_use() {
         use crate::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
@@ -2976,21 +2993,27 @@ mod tests {
         // still the pool's record that the token exists and whose it is,
         // without which the handler refuses the job as
         // `invalid-mining-job-token`.
-        bridge.write().unwrap().register_allocation(
-            Token([7u8; 16]),
-            crate::bridge::AllocatedTokenRef {
-                miner_address: AddressId::new(ADDR.to_string()).unwrap(),
-                kind: crate::bridge::AllocationKind::JudgedByDistribution,
-                jdp_session_id: 1,
-                expires_at_ms: u64::MAX,
-            },
-            0,
-        );
+        //
+        // One per job: a token authorises exactly one `SetCustomMiningJob`,
+        // so the multi-use property under test is the DISTRIBUTION's, and
+        // reusing a token here would test the wrong thing.
+        for req in 1..=3u8 {
+            bridge.write().unwrap().register_allocation(
+                Token([req; 16]),
+                crate::bridge::AllocatedTokenRef {
+                    miner_address: AddressId::new(ADDR.to_string()).unwrap(),
+                    kind: crate::bridge::AllocationKind::JudgedByDistribution,
+                    jdp_session_id: 1,
+                    expires_at_ms: u64::MAX,
+                },
+                0,
+            );
+        }
 
         let make_input = |req: u32| SetCustomMiningJobInput {
             channel_id: cid,
             request_id: req,
-            mining_job_token: Token([7u8; 16]),
+            mining_job_token: Token([req as u8; 16]),
             version: 0x2000_0000,
             prev_hash: [0xAB; 32],
             min_ntime: 0x6500_0001,
@@ -3022,6 +3045,30 @@ mod tests {
                 ),
                 "reference {req} must be accepted (multi-use)"
             );
+        }
+
+        // …but the TOKENS those two jobs rode on are spent. Re-sending the
+        // first is refused, and the distribution is not what refused it —
+        // it is still live, as the settlement step below proves by taking it
+        // away and getting a different code.
+        let out = dispatch_inbound_frame(
+            &mut s,
+            InboundMiningFrame::SetCustomMiningJob(make_input(1)),
+            &alloc,
+            &bridge,
+            0,
+        );
+        match &out.outbound[0] {
+            crate::mining::client::OutboundFrame::SetCustomMiningJobError {
+                error_code, ..
+            } => assert_eq!(
+                error_code,
+                crate::mining::client::ERR_INVALID_MINING_JOB_TOKEN,
+                "a token authorises one custom job"
+            ),
+            other => {
+                panic!("a spent allocate token must not authorise a second job, got {other:?}")
+            }
         }
 
         // ext 0x0003/Implementation Notes: a settlement invalidates every

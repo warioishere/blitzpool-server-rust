@@ -777,6 +777,19 @@ impl JdpDeclaredJobRegistry {
         self.allocations.insert(token, entry);
     }
 
+    /// Drop an allocation's entry once its token has authorised a custom
+    /// job. The mirror of [`Self::consume_declared_job`], for the backing a
+    /// Coinbase-only job carries instead of a declaration — one token, one
+    /// `SetCustomMiningJob`, whichever of the two records answered for it.
+    ///
+    /// Without this the two halves of the same rule disagreed: a declared
+    /// job's token was spent, an allocate token was only read, so a
+    /// Coinbase-only job could be re-sent on one token until the hour ran
+    /// out.
+    pub fn consume_allocation(&mut self, token: &Token) -> bool {
+        self.allocations.remove(token).is_some()
+    }
+
     /// The base-protocol allocation behind a token, if any. `None` for an
     /// unknown/evicted token, for an EXPIRED one, and for every ext 0x0003
     /// allocation.
