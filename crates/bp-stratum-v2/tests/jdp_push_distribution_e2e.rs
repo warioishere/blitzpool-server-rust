@@ -55,7 +55,8 @@ use bp_stratum_v2::extensions::{
 };
 use bp_stratum_v2::jdp::client::{
     parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, SolutionHeader,
-    ERR_INVALID_PAYOUT_DISTRIBUTION, ERR_STALE_PAYOUT_DISTRIBUTION, FLAG_DECLARE_TX_DATA,
+    ERR_INVALID_MINING_JOB_TOKEN, ERR_INVALID_PAYOUT_DISTRIBUTION, ERR_STALE_PAYOUT_DISTRIBUTION,
+    FLAG_DECLARE_TX_DATA,
 };
 use bp_stratum_v2::jdp::dynamic_outputs::{
     encode_coinbase_outputs, CandidateBacking, DynamicOutput, PayoutBooking,
@@ -408,15 +409,13 @@ async fn jdp_push_distribution_end_to_end() {
         ERR_INVALID_PAYOUT_DISTRIBUTION,
     );
 
-    // An ACCEPTED declaration issues its job token through the shared
-    // per-connection TokenStore, which rate-limits to 1/s
-    // (SV2 JDP/AllocateMiningJobToken) and silently drops the declaration when
-    // exceeded — space the token-allocating declares out accordingly.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // Declare #9 spent its token even though it was refused. Declare #10
+    // brings its own.
+    let token = next_token(&mut reader, &mut writer, 3).await;
 
     // Declare #10: conformant coinbase + TLV(FIRST_ID) → accepted.
     write_declare(&mut writer, 10, &token, &suffix, Some(FIRST_ID)).await;
-    let declared_token = expect_declare_success(read_jdc(&mut reader).await, 10);
+    let declared_token = expect_declare_success(read_declare_answer(&mut reader).await, 10);
 
     // ── The JDP → Mining seam ─────────────────────────────────────────
     //
@@ -525,18 +524,21 @@ async fn jdp_push_distribution_end_to_end() {
         bridge.write().unwrap().publish_pool_wide(entry_with_id(id));
     }
 
-    // Declare #12 referencing k-2 → stale.
+    // Declare #12 referencing k-2 → stale. The allocate that pays for it
+    // republishes the plan that just slid; drain that push so it is not
+    // mistaken for the answer.
+    let token = next_token(&mut reader, &mut writer, 4).await;
     write_declare(&mut writer, 12, &token, &suffix, Some(FIRST_ID)).await;
     expect_declare_error(
-        read_jdc(&mut reader).await,
+        read_declare_answer(&mut reader).await,
         12,
         ERR_STALE_PAYOUT_DISTRIBUTION,
     );
 
     // Declare #13 referencing k-1 (the grace slot) → still accepted.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let token = next_token(&mut reader, &mut writer, 5).await;
     write_declare(&mut writer, 13, &token, &suffix, Some(FIRST_ID + 1)).await;
-    expect_declare_success(read_jdc(&mut reader).await, 13);
+    expect_declare_success(read_declare_answer(&mut reader).await, 13);
 
     // ── Connection 2: TLV without negotiation → rejected (ext 0x0003/Negotiation) ───
     let (mut reader2, mut writer2) = connect_jdc(addr).await;
@@ -1375,6 +1377,36 @@ async fn allocate(reader: &mut Reader, writer: &mut Writer, request_id: u32) -> 
     }
 }
 
+/// Read until the JDS answers the declaration, skipping any distribution push
+/// that lands on the way.
+///
+/// The two are not ordered against each other: an allocate republishes the
+/// session's tailored plan, so a `SetPayoutDistribution` can arrive between a
+/// declare and its answer. Draining with a timeout instead made every such
+/// site a fixed wait where nothing was pending and a race where something
+/// was, and swallowed genuinely misdelivered frames on top.
+async fn read_declare_answer(reader: &mut Reader) -> JdcInbound {
+    for _ in 0..4 {
+        match read_jdc(reader).await {
+            JdcInbound::PayoutDistribution(_) => continue,
+            other => return other,
+        }
+    }
+    panic!("no answer to the declaration arrived");
+}
+
+/// A fresh allocate token, spaced out for the SV2 JDP/AllocateMiningJobToken
+/// rate limit.
+///
+/// Every `DeclareMiningJob` needs its own: an allocate token identifies one
+/// piece of work, so declaring against it spends it — whichever way that
+/// declaration ends — the same way a conformant JDC uses them, popping one
+/// off its queue per declaration.
+async fn next_token(reader: &mut Reader, writer: &mut Writer, request_id: u32) -> Vec<u8> {
+    respect_token_rate_limit().await;
+    allocate(reader, writer, request_id).await
+}
+
 /// Read frames until a `SetPayoutDistribution` shows up, or give up.
 async fn next_distribution(reader: &mut Reader, within: Duration) -> Option<u64> {
     for _ in 0..4 {
@@ -1607,7 +1639,7 @@ async fn the_plan_for_a_mode_that_moved_is_dropped_not_superseded() {
         // The session's own next frame is what makes the pool re-ask.
         respect_token_rate_limit().await;
         let token = if drive_with_allocate {
-            allocate(&mut reader, &mut writer, 3).await
+            Some(allocate(&mut reader, &mut writer, 3).await)
         } else {
             write_declare(
                 &mut writer,
@@ -1618,7 +1650,10 @@ async fn the_plan_for_a_mode_that_moved_is_dropped_not_superseded() {
             )
             .await;
             read_jdc(&mut reader).await; // the refusal — asserted below
-            token
+                                         // That declare spent its token. The replacement is allocated
+                                         // AFTER the plan push below, so this leg stays declare-driven for
+                                         // the thing it is testing.
+            None
         };
         let group_id = next_distribution(&mut reader, Duration::from_secs(3))
             .await
@@ -1627,6 +1662,10 @@ async fn the_plan_for_a_mode_that_moved_is_dropped_not_superseded() {
             group_id > solo_id,
             "allocate={drive_with_allocate}: the group plan must be a NEW distribution"
         );
+        let token = match token {
+            Some(token) => token,
+            None => next_token(&mut reader, &mut writer, 6).await,
+        };
 
         // ── The rig reboots: the gate forgets the address ─────────────
         // The declare check has nothing to judge by now, so the drop is the
@@ -1641,7 +1680,7 @@ async fn the_plan_for_a_mode_that_moved_is_dropped_not_superseded() {
             Some(solo_id),
         )
         .await;
-        match read_jdc(&mut reader).await {
+        match read_declare_answer(&mut reader).await {
             JdcInbound::Message(AnyMessage::JobDeclaration(
                 JobDeclaration::DeclareMiningJobError(e),
             )) => assert_eq!(
@@ -1714,10 +1753,19 @@ async fn a_served_session_is_handed_a_new_plan_when_its_mode_moves() {
 
     // …and the session is not merely broken: the plan it was just handed
     // works, which is the whole difference from hanging until a reconnect.
-    // Same token — a refused declare must not burn one, or the recovery would
-    // cost a round-trip the SV2 JDP/AllocateMiningJobToken rate limit charges
-    // a second for.
-    respect_token_rate_limit().await;
+    //
+    // On its OWN token, because the refused declare above spent the one it
+    // named — a declaration spends its token whichever way it ends. That
+    // costs the recovery nothing a conformant client feels: it holds a queue
+    // of tokens and refills it fire-and-forget after every pop, so the next
+    // one is already in hand.
+    let token = next_token(&mut reader, &mut writer, 6).await;
+    // Not a drain: the allocate arm republishes the tailored plan, and if it
+    // did, the declare below has to name what the pool holds NOW rather than
+    // the id read a moment ago.
+    let group_id = next_distribution(&mut reader, Duration::from_millis(500))
+        .await
+        .unwrap_or(group_id);
     write_declare(
         &mut writer,
         11,
@@ -1726,7 +1774,120 @@ async fn a_served_session_is_handed_a_new_plan_when_its_mode_moves() {
         Some(group_id),
     )
     .await;
-    expect_declare_success(read_jdc(&mut reader).await, 11);
+    expect_declare_success(read_declare_answer(&mut reader).await, 11);
+
+    accept_handle.abort();
+    server.shutdown().await;
+}
+
+/// An allocate token authorises ONE declaration. The second one on the same
+/// token is answered `invalid-mining-job-token`, on the wire, end to end.
+///
+/// SV2 JDP/Full-Template Mode gives a JDC "a token (allocated by JDS), so it
+/// can use it to identify some unique work" — one token, one piece of work.
+/// Ours let a token carry declarations for its whole 1 h TTL, and the pool's
+/// only limit on that side sits on `AllocateMiningJobToken`, a message the
+/// JDC then no longer had to send. Every declaration costs a snapshot of the
+/// pool's template transactions, a clone of each of them, and — where a
+/// validation socket is configured — a bitcoin-core round-trip.
+///
+/// No conformant client notices: it pops one token per `DeclareMiningJob` and
+/// refills its queue fire-and-forget, so it has never had a second
+/// declaration to spend one on.
+///
+/// Both directions are pinned here, because the second half is worthless
+/// without the first: the SAME frame that is refused the second time is
+/// accepted the first time, so the refusal cannot be coming from the
+/// declaration's own content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_declaration_on_the_same_token_is_refused() {
+    let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
+    let source = flippable_source();
+    let server = spawn_jdp_server(source.clone(), bridge.clone(), Duration::from_millis(200));
+    wait_until(Duration::from_secs(5), || {
+        bridge.read().unwrap().current_pool_wide().is_some()
+    })
+    .await;
+    let (addr, accept_handle) = accept_loop(server.clone()).await;
+
+    let (mut reader, mut writer, pool_wide_id) = negotiated_jdc(addr).await;
+    let token = allocate(&mut reader, &mut writer, 2).await;
+    let tailored_id = next_distribution(&mut reader, Duration::from_secs(3))
+        .await
+        .expect("a Solo miner must be served a tailored distribution");
+    assert!(tailored_id > pool_wide_id);
+
+    let suffix = suffix_for_test_weights();
+    write_declare(&mut writer, 10, &token, &suffix, Some(tailored_id)).await;
+    expect_declare_success(read_jdc(&mut reader).await, 10);
+
+    // Byte for byte the same declaration, on the same token. Only the
+    // request_id differs, so nothing about the job can explain the answer.
+    write_declare(&mut writer, 11, &token, &suffix, Some(tailored_id)).await;
+    expect_declare_error(
+        read_jdc(&mut reader).await,
+        11,
+        ERR_INVALID_MINING_JOB_TOKEN,
+    );
+
+    // …and a fresh allocate makes that very declaration work again, so what
+    // was spent was the token and nothing else about the session.
+    let token = next_token(&mut reader, &mut writer, 3).await;
+    write_declare(&mut writer, 12, &token, &suffix, Some(tailored_id)).await;
+    expect_declare_success(read_declare_answer(&mut reader).await, 12);
+
+    accept_handle.abort();
+    server.shutdown().await;
+}
+
+/// The other half: the token a declaration is ANSWERED with must not authorise
+/// the next one.
+///
+/// A `new_mining_job_token` is minted through the same generator as an
+/// allocate, so nothing about its bytes says which of the two it is. What
+/// separates them is that the pool never files it under the allocations, and
+/// this is the only test that would notice if it started: it presents the
+/// token the JDS actually put on the wire, not one built beside the store.
+/// Chaining declarations off declaration tokens would mint a fresh one every
+/// time, with no allocate in sight and nothing rate-limiting it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_declaration_token_cannot_itself_authorise_a_declaration() {
+    let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
+    let source = flippable_source();
+    let server = spawn_jdp_server(source.clone(), bridge.clone(), Duration::from_millis(200));
+    wait_until(Duration::from_secs(5), || {
+        bridge.read().unwrap().current_pool_wide().is_some()
+    })
+    .await;
+    let (addr, accept_handle) = accept_loop(server.clone()).await;
+
+    let (mut reader, mut writer, _) = negotiated_jdc(addr).await;
+    let token = allocate(&mut reader, &mut writer, 2).await;
+    let tailored_id = next_distribution(&mut reader, Duration::from_secs(3))
+        .await
+        .expect("a Solo miner must be served a tailored distribution");
+
+    let suffix = suffix_for_test_weights();
+    write_declare(&mut writer, 10, &token, &suffix, Some(tailored_id)).await;
+    let declaration_token = expect_declare_success(read_jdc(&mut reader).await, 10);
+    assert_ne!(
+        declaration_token, token,
+        "precondition: the pool answers with a token of its own"
+    );
+
+    write_declare(
+        &mut writer,
+        11,
+        &declaration_token,
+        &suffix,
+        Some(tailored_id),
+    )
+    .await;
+    expect_declare_error(
+        read_jdc(&mut reader).await,
+        11,
+        ERR_INVALID_MINING_JOB_TOKEN,
+    );
 
     accept_handle.abort();
     server.shutdown().await;

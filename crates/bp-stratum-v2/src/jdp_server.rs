@@ -69,10 +69,11 @@ use crate::extensions::{
     parse_distribution_id_tlv, SetPayoutDistribution, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS,
 };
 use crate::jdp::client::{
-    handle_allocate_token, handle_declare_mining_job, handle_provide_missing_transactions_success,
-    handle_push_solution, handle_request_extensions, handle_setup_connection,
-    parse_user_identifier_as_address, AllocateTokenContext, DeclarationContext, DeclarationRef,
-    JdpHandlerOutcome, JdpOutboundFrame, JdpSessionEvent, JdpSessionState, SolutionHeader,
+    declare_refused_by_session, handle_allocate_token, handle_declare_mining_job,
+    handle_provide_missing_transactions_success, handle_push_solution, handle_request_extensions,
+    handle_setup_connection, parse_user_identifier_as_address, AllocateTokenContext,
+    DeclarationContext, DeclarationRef, JdpHandlerOutcome, JdpOutboundFrame, JdpSessionEvent,
+    JdpSessionState, SolutionHeader,
 };
 use crate::jdp::dynamic_outputs::CandidateBacking;
 use crate::jdp::payout_distribution::WeightedOutput;
@@ -81,7 +82,6 @@ use crate::jdp_server_codec::{
     decode_jdp_inbound, encode_jdp_outbound, encode_jdp_outbound_ext_0x0003, InboundJdpFrame,
 };
 use crate::noise::{accept_pool_noise, NoiseConfig, NoiseTcpWriteHalf};
-use crate::tokens::Token;
 
 // ── JDP-server hooks ────────────────────────────────────────────────
 
@@ -1619,17 +1619,47 @@ async fn dispatch_jdp_inbound(
             }
         }
         InboundJdpFrame::DeclareMiningJob(input) => {
+            // FIRST, before anything this frame could cost us. One allocate
+            // token authorises exactly ONE declaration attempt
+            // (SV2 JDP/Full-Template Mode: a token identifies "some unique
+            // work"), so resolving it and spending it are the same act —
+            // `take_active`.
+            //
+            // Everything below is expensive and none of it is free to a
+            // stranger: the snapshot clones the pool's whole template-tx map,
+            // `partition_against_template` clones every transaction the pool
+            // already holds, and the validator hands the lot to bitcoin-core
+            // over IPC. Resolving the token afterwards — as this did — meant
+            // a token nobody was ever issued bought all three, and a token
+            // that WAS issued bought them again on every frame for an hour.
+            // A declaration is authorised before it is judged, not after.
+            //
+            // Ahead of the spend: neither of these two needs a token, and
+            // answering them after it turns one misconfigured connection into
+            // two unrelated-looking fatal codes on successive frames.
+            if let Some(refusal) = declare_refused_by_session(state, &input) {
+                return refusal;
+            }
+            let Some(declaring) = state.tokens.take_active(&input.mining_job_token, now_ms) else {
+                return JdpHandlerOutcome::declare_error(
+                    input.request_id,
+                    crate::jdp::client::ERR_INVALID_MINING_JOB_TOKEN,
+                    b"mining_job_token was never issued, has expired, or was already used \
+                      to declare a job",
+                );
+            };
             let template_txs = hooks.template_tx_provider.snapshot().await;
+            // Once, here, for both the node and the handler. It clones the raw
+            // bytes of every transaction the pool already holds — megabytes on
+            // mainnet — and computing it on both sides paid that twice per
+            // declaration.
+            let partition = partition_against_template(&input.wtxid_list, &template_txs);
             // SV2 JDP/Job Declarator Server: hand the declaration to a Bitcoin
             // node before committing to it. Whatever the local template
             // already covers is supplied, so the node only reports what it is
             // genuinely missing. Rejection short-circuits: nothing is
             // registered, so there is no state to roll back.
             if let Some(validator) = hooks.job_validator.as_ref() {
-                // Inside the gate: `partition_against_template` clones the raw
-                // bytes of every transaction the pool already holds, and with
-                // no validator wired there is nobody to hand them to.
-                let partition = partition_against_template(&input.wtxid_list, &template_txs);
                 if let Some(refusal) = node_refuses_declaration(
                     validator,
                     session_id,
@@ -1648,16 +1678,18 @@ async fn dispatch_jdp_inbound(
             // The mode of the address THIS TOKEN belongs to — not of whichever
             // address allocated last on this connection. One session may hold
             // tokens for several addresses (the allocate carries the address,
-            // and nothing binds a connection to one), and the handler resolves
-            // the declaration's miner from the token. Judging that declaration
+            // and nothing binds a connection to one). Judging a declaration
             // against another address's mode refuses a correct plan and never
             // recovers.
-            let current_mode =
-                current_mode_for_token(state, hooks, &input.mining_job_token, now_ms).await;
+            let current_mode = hooks
+                .distribution_source
+                .current_mode(&declaring.miner_address)
+                .await;
             handle_declare_mining_job(
                 state,
                 &input,
-                &template_txs,
+                &declaring.miner_address,
+                partition,
                 DeclarationContext {
                     current_prev_hash,
                     distribution,
@@ -1677,11 +1709,26 @@ async fn dispatch_jdp_inbound(
             // to. Validation is opt-in, so the ungated shape would pay that
             // on every round-trip of the default configuration.
             //
-            // `None` from either step means there is nothing to re-validate —
-            // no pending round-trip, or a payload that does not fit the merge
-            // — and the handler refuses it on its own grounds a moment later.
+            // `None` from any step means there is nothing to re-validate —
+            // no pending round-trip, a `request_id` that answers a different
+            // one, or a payload that does not fit the merge — and the handler
+            // refuses it on its own grounds a moment later.
+            //
+            // The `request_id` equality belongs HERE and not only in the
+            // handler, for the same reason the declare arm spends its token
+            // before doing any of this: a `Success` naming a request the
+            // session never asked about is answered with no frame at all, and
+            // the handler puts the pending round-trip straight back. Left to
+            // the handler alone, one declaration bought an unbounded number
+            // of node round-trips and merge-sized clones off a single token —
+            // the position count is the only other gate, and the pool itself
+            // announced that number in the `ProvideMissingTransactions` it
+            // sent.
             let completed = hooks.job_validator.as_ref().and_then(|validator| {
                 let pending = state.pending_declaration.as_ref()?;
+                if pending.pending.request_id != input.request_id {
+                    return None;
+                }
                 let merged = merge_provided_with_known(
                     pending.pending.clone(),
                     input.transaction_list.clone(),
@@ -1785,26 +1832,6 @@ async fn node_refuses_declaration(
         &error_code,
         b"declared job rejected by the pool's bitcoin node",
     ))
-}
-
-/// The accounting the address behind `token` is on right now.
-///
-/// Keyed on the TOKEN and not on the connection: an allocate carries its own
-/// miner address and nothing binds a JDP session to a single one, so the
-/// session-scoped "last address that allocated" answers a different question
-/// than the declare asks. `None` when the token is unknown or expired — the
-/// handler refuses it on its own grounds a moment later.
-async fn current_mode_for_token(
-    state: &mut JdpSessionState,
-    hooks: &JdpServerHooks,
-    token: &Token,
-    now_ms: u64,
-) -> Option<bp_common::StreamKind> {
-    let miner = state
-        .tokens
-        .lookup_active(token, now_ms)
-        .map(|t| t.miner_address.clone())?;
-    hooks.distribution_source.current_mode(&miner).await
 }
 
 /// Resolve an ext 0x0003/distribution_id TLV Field reference
@@ -2149,6 +2176,7 @@ pub(crate) fn register_bridge_entries(
 mod tests {
     use super::*;
     use crate::jdp::client::AllocateMiningJobTokenInput;
+    use crate::tokens::Token;
 
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
@@ -2399,10 +2427,21 @@ mod tests {
         }
     }
 
-    fn declare_input() -> crate::jdp::client::DeclareMiningJobInput {
+    /// Issue a real token to `ADDR` on this session. Declares have to name
+    /// one the pool actually handed out — the dispatch spends it before it
+    /// spends anything else.
+    fn issue_token(state: &mut JdpSessionState, now_ms: u64) -> Token {
+        state
+            .tokens
+            .allocate(now_ms, AddressId::new(ADDR.to_string()).unwrap(), vec![0u8])
+            .expect("allocate")
+            .token
+    }
+
+    fn declare_input(token: Token) -> crate::jdp::client::DeclareMiningJobInput {
         crate::jdp::client::DeclareMiningJobInput {
             request_id: 11,
-            mining_job_token: Token([0xAA; 16]),
+            mining_job_token: token,
             version: 0x2000_0000,
             coinbase_tx_prefix: vec![0xBB; 8],
             coinbase_tx_suffix: vec![0xCC; 8],
@@ -2419,6 +2458,7 @@ mod tests {
         let mut state = fresh_session();
         let _ = handle_setup_connection(&mut state, &jdp_setup());
         state.full_template_mode = true;
+        let token = issue_token(&mut state, 1_000);
         let validator = StubValidator::new(JobVerdict::Rejected("invalid-coinbase-tx".to_string()));
         let mut hooks = JdpServerHooks::no_op();
         hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
@@ -2426,7 +2466,7 @@ mod tests {
 
         let outcome = dispatch_jdp_inbound(
             &mut state,
-            InboundJdpFrame::DeclareMiningJob(declare_input()),
+            InboundJdpFrame::DeclareMiningJob(declare_input(token)),
             &hooks,
             &bridge,
             1,
@@ -2461,13 +2501,14 @@ mod tests {
         let mut state = fresh_session();
         let _ = handle_setup_connection(&mut state, &jdp_setup());
         state.full_template_mode = true;
+        let token = issue_token(&mut state, 1_000);
         let hooks = JdpServerHooks::no_op();
         assert!(hooks.job_validator.is_none());
         let bridge = fresh_bridge();
 
         let outcome = dispatch_jdp_inbound(
             &mut state,
-            InboundJdpFrame::DeclareMiningJob(declare_input()),
+            InboundJdpFrame::DeclareMiningJob(declare_input(token)),
             &hooks,
             &bridge,
             1,
@@ -2490,6 +2531,7 @@ mod tests {
         let mut state = fresh_session();
         let _ = handle_setup_connection(&mut state, &jdp_setup());
         state.full_template_mode = true;
+        let token = issue_token(&mut state, 1_000);
         let validator = StubValidator::new(JobVerdict::NeedsTransactions);
         let mut hooks = JdpServerHooks::no_op();
         hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
@@ -2497,7 +2539,7 @@ mod tests {
 
         let outcome = dispatch_jdp_inbound(
             &mut state,
-            InboundJdpFrame::DeclareMiningJob(declare_input()),
+            InboundJdpFrame::DeclareMiningJob(declare_input(token)),
             &hooks,
             &bridge,
             1,
@@ -2512,6 +2554,241 @@ mod tests {
             "a node that lacks transactions must not fail the declaration: {:?}",
             outcome.outbound
         );
+    }
+
+    fn refused_for_token(outcome: &JdpHandlerOutcome) -> bool {
+        outcome.outbound.iter().any(|f| {
+            matches!(
+                f,
+                JdpOutboundFrame::DeclareMiningJobError { error_code, .. }
+                    if error_code == crate::jdp::client::ERR_INVALID_MINING_JOB_TOKEN
+            )
+        })
+    }
+
+    fn declare_error_code(outcome: &JdpHandlerOutcome) -> &str {
+        match outcome.outbound.first() {
+            Some(JdpOutboundFrame::DeclareMiningJobError { error_code, .. }) => error_code,
+            other => panic!("expected a DeclareMiningJobError, got {other:?}"),
+        }
+    }
+
+    async fn declare_with(
+        state: &mut JdpSessionState,
+        hooks: &JdpServerHooks,
+        bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
+        token: Token,
+        now_ms: u64,
+    ) -> JdpHandlerOutcome {
+        dispatch_jdp_inbound(
+            state,
+            InboundJdpFrame::DeclareMiningJob(declare_input(token)),
+            hooks,
+            bridge,
+            1,
+            "1.2.3.4:5555",
+            now_ms,
+        )
+        .await
+    }
+
+    /// An allocate token authorises ONE declaration. The second one on the
+    /// same token is refused `invalid-mining-job-token` — and refused BEFORE
+    /// the node is asked, which is the half that matters for what it costs.
+    ///
+    /// Without this the token lived out its 1 h TTL and carried as many
+    /// declarations as the JDC cared to send, each one a bitcoin-core IPC
+    /// round-trip plus a clone of every transaction the pool holds, while
+    /// the only limit on the JDP side — one allocate per second — sat on a
+    /// message the client no longer had to send. A conformant JDC never
+    /// notices: it pops one token per `DeclareMiningJob` and refills its
+    /// queue, so it has never had a second declaration to spend one on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_allocate_token_carries_exactly_one_declaration() {
+        let mut state = fresh_session();
+        let _ = handle_setup_connection(&mut state, &jdp_setup());
+        state.full_template_mode = true;
+        let token = issue_token(&mut state, 1_000);
+        let validator = StubValidator::new(JobVerdict::Accepted);
+        let mut hooks = JdpServerHooks::no_op();
+        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+        let bridge = fresh_bridge();
+
+        let first = declare_with(&mut state, &hooks, &bridge, token, 1_100).await;
+        assert_eq!(
+            validator.calls(),
+            1,
+            "precondition: the first declaration DID reach the node"
+        );
+        assert!(
+            !refused_for_token(&first),
+            "precondition: the first declaration's token resolved, got {:?}",
+            first.outbound
+        );
+
+        let second = declare_with(&mut state, &hooks, &bridge, token, 1_200).await;
+        assert_eq!(
+            declare_error_code(&second),
+            crate::jdp::client::ERR_INVALID_MINING_JOB_TOKEN,
+            "a second declaration on a spent allocate token must be refused"
+        );
+        assert_eq!(
+            validator.calls(),
+            1,
+            "and refused without asking the node a second time"
+        );
+    }
+
+    /// A `ProvideMissingTransactions.Success` answering a request the session
+    /// never asked about must not reach the node either.
+    ///
+    /// The declaration's token is spent by its FIRST leg, so this leg carries
+    /// none — which made it the way around the rule. It is answered with no
+    /// frame at all and the handler puts the pending round-trip straight
+    /// back, so a JDC could send it forever; the only other gate is the
+    /// position count, and the pool announced that number itself in the
+    /// `ProvideMissingTransactions` it sent. One declaration, unbounded node
+    /// round-trips and merge-sized clones.
+    ///
+    /// Both directions: the matching `request_id` MUST reach the node, or
+    /// this would pass with the second leg's validation removed altogether —
+    /// and that leg is the one a JDC could otherwise use to hide an invalid
+    /// transaction by declaring it as one the pool was missing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_provide_missing_success_for_another_request_never_reaches_the_node() {
+        let mut state = fresh_session();
+        let _ = handle_setup_connection(&mut state, &jdp_setup());
+        state.full_template_mode = true;
+        let token = issue_token(&mut state, 1_000);
+        let validator = StubValidator::new(JobVerdict::Accepted);
+        let mut hooks = JdpServerHooks::no_op();
+        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+        let bridge = fresh_bridge();
+
+        // The declare leg: no template txs are wired, so the single declared
+        // wtxid is missing and a round-trip goes out.
+        let first = declare_with(&mut state, &hooks, &bridge, token, 1_100).await;
+        assert!(
+            matches!(
+                first.outbound.first(),
+                Some(JdpOutboundFrame::ProvideMissingTransactions { .. })
+            ),
+            "precondition: a round-trip must be in flight, got {:?}",
+            first.outbound
+        );
+        assert_eq!(
+            validator.calls(),
+            1,
+            "precondition: the declare reached the node"
+        );
+
+        let answer = |request_id| {
+            InboundJdpFrame::ProvideMissingTransactionsSuccess(
+                crate::jdp::client::ProvideMissingTransactionsSuccessInput {
+                    request_id,
+                    transaction_list: vec![vec![0xAB; 32]],
+                },
+            )
+        };
+
+        // Wrong request_id, right position count: no node call, no frame,
+        // and the round-trip is still in flight afterwards — which is exactly
+        // what let this repeat.
+        let out = dispatch_jdp_inbound(
+            &mut state,
+            answer(9_999),
+            &hooks,
+            &bridge,
+            1,
+            "1.2.3.4:5555",
+            1_200,
+        )
+        .await;
+        assert!(out.outbound.is_empty(), "got {:?}", out.outbound);
+        assert_eq!(
+            validator.calls(),
+            1,
+            "a Success for another request must not be handed to the node"
+        );
+        assert!(
+            state.pending_declaration.is_some(),
+            "precondition for the loop this guards: the round-trip survives"
+        );
+
+        // The real answer still goes through.
+        let _ = dispatch_jdp_inbound(
+            &mut state,
+            answer(11),
+            &hooks,
+            &bridge,
+            1,
+            "1.2.3.4:5555",
+            1_300,
+        )
+        .await;
+        assert_eq!(
+            validator.calls(),
+            2,
+            "the matching Success must be re-validated"
+        );
+    }
+
+    /// A declaration the SESSION's own shape refuses costs no token: the two
+    /// gates that need none are answered before the spend.
+    ///
+    /// Otherwise one misconfigured connection reports two unrelated-looking
+    /// fatal codes on successive frames — the real reason first, then
+    /// `invalid-mining-job-token`, which sends the operator to the token
+    /// store.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_declaration_refused_by_the_session_shape_costs_no_token() {
+        let mut state = fresh_session();
+        let mut setup = jdp_setup();
+        setup.flags = 0; // Coinbase-only: DeclareMiningJob is never used
+        let _ = handle_setup_connection(&mut state, &setup);
+        let token = issue_token(&mut state, 1_000);
+        let validator = StubValidator::new(JobVerdict::Accepted);
+        let mut hooks = JdpServerHooks::no_op();
+        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+        let bridge = fresh_bridge();
+
+        for request in 1..=2 {
+            let outcome = declare_with(&mut state, &hooks, &bridge, token, 1_100).await;
+            assert_eq!(
+                declare_error_code(&outcome),
+                crate::jdp::client::ERR_UNSUPPORTED_FEATURE_FLAGS,
+                "declare {request}: the reason must stay the same reason"
+            );
+        }
+        assert_eq!(
+            state.tokens.len(),
+            1,
+            "a refusal the token had nothing to do with must not spend it"
+        );
+        assert_eq!(validator.calls(), 0, "and must not reach the node");
+    }
+
+    /// A token nobody was issued buys nothing. It used to buy a full node
+    /// round-trip — the validation ran before the token was so much as
+    /// looked at, so this cost the pool a bitcoin-core IPC call per frame
+    /// from anyone who could open a JDP connection.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_token_nobody_was_issued_never_reaches_the_node() {
+        let mut state = fresh_session();
+        let _ = handle_setup_connection(&mut state, &jdp_setup());
+        state.full_template_mode = true;
+        let validator = StubValidator::new(JobVerdict::Accepted);
+        let mut hooks = JdpServerHooks::no_op();
+        hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+        let bridge = fresh_bridge();
+
+        let outcome = declare_with(&mut state, &hooks, &bridge, Token([0xEE; 16]), 1_100).await;
+
+        assert_eq!(
+            declare_error_code(&outcome),
+            crate::jdp::client::ERR_INVALID_MINING_JOB_TOKEN
+        );
+        assert_eq!(validator.calls(), 0, "the node must not be asked at all");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2710,9 +2987,10 @@ mod tests {
     /// B's mode.
     #[tokio::test]
     async fn a_declares_mode_comes_from_its_own_tokens_address() {
-        struct PerAddress;
+        /// Records which address the mode was asked about.
+        struct AskedAbout(std::sync::Mutex<Vec<String>>);
         #[async_trait]
-        impl PayoutDistributionSource for PerAddress {
+        impl PayoutDistributionSource for AskedAbout {
             async fn build_pool_wide(&self) -> Option<BuiltPayoutDistribution> {
                 None
             }
@@ -2720,45 +2998,86 @@ mod tests {
                 TailoredDistribution::ModeUnknown
             }
             async fn current_mode(&self, miner: &AddressId) -> Option<bp_common::StreamKind> {
-                match miner.as_str() {
-                    ADDR => Some(bp_common::StreamKind::Solo),
-                    _ => Some(bp_common::StreamKind::Pplns),
-                }
+                self.0.lock().unwrap().push(miner.as_str().to_string());
+                Some(bp_common::StreamKind::Solo)
             }
             async fn next_distribution_id(&self) -> Option<u64> {
                 None
             }
         }
+        let source = Arc::new(AskedAbout(std::sync::Mutex::new(Vec::new())));
         let mut hooks = JdpServerHooks::no_op();
-        hooks.distribution_source = Arc::new(PerAddress);
+        hooks.distribution_source = source.clone();
+        let bridge = fresh_bridge();
 
         let other = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vaxwd45v";
-        let mut state = JdpSessionState::new(1);
+        let mut state = fresh_session();
+        let _ = handle_setup_connection(&mut state, &jdp_setup());
+        state.full_template_mode = true;
         let a = state
             .tokens
             .allocate(1_000, AddressId::new(ADDR.to_string()).unwrap(), vec![0u8])
             .expect("token for A")
             .token;
         // SV2 JDP/AllocateMiningJobToken rate-limits token issuance to 1/s per
-        // connection.
+        // connection. B allocates LAST, so a session-scoped answer would name
+        // B.
         let b = state
             .tokens
             .allocate(3_000, AddressId::new(other.to_string()).unwrap(), vec![0u8])
             .expect("token for B")
             .token;
 
+        let _ = dispatch_jdp_inbound(
+            &mut state,
+            InboundJdpFrame::DeclareMiningJob(declare_input(a)),
+            &hooks,
+            &bridge,
+            1,
+            "1.2.3.4:5555",
+            3_000,
+        )
+        .await;
         assert_eq!(
-            current_mode_for_token(&mut state, &hooks, &a, 3_000).await,
-            Some(bp_common::StreamKind::Solo),
-            "A's token must be judged by A's mode, even though B allocated last"
+            source.0.lock().unwrap().as_slice(),
+            [ADDR.to_string()],
+            "A's declaration must be judged by A's mode, even though B allocated last"
         );
+
+        // …and B's token resolves to B. Without this the test passes for a
+        // regression that answers with the FIRST token's address, or with any
+        // constant that happens to equal A's.
+        let _ = dispatch_jdp_inbound(
+            &mut state,
+            InboundJdpFrame::DeclareMiningJob(declare_input(b)),
+            &hooks,
+            &bridge,
+            1,
+            "1.2.3.4:5555",
+            3_000,
+        )
+        .await;
         assert_eq!(
-            current_mode_for_token(&mut state, &hooks, &b, 3_000).await,
-            Some(bp_common::StreamKind::Pplns)
+            source.0.lock().unwrap().as_slice(),
+            [ADDR.to_string(), other.to_string()],
+            "two tokens on one session must resolve to two addresses"
         );
+
+        // And a token nobody was issued has no address to ask about — the
+        // dispatch refuses it before it asks anything.
+        let _ = dispatch_jdp_inbound(
+            &mut state,
+            InboundJdpFrame::DeclareMiningJob(declare_input(Token([0xEE; 16]))),
+            &hooks,
+            &bridge,
+            1,
+            "1.2.3.4:5555",
+            3_000,
+        )
+        .await;
         assert_eq!(
-            current_mode_for_token(&mut state, &hooks, &Token([0xEE; 16]), 3_000).await,
-            None,
+            source.0.lock().unwrap().len(),
+            2,
             "an unknown token has no address to ask about"
         );
     }

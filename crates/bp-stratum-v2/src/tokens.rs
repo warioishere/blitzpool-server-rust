@@ -28,12 +28,12 @@
 //!   `new_mining_job_token`. Same shape, NO rate limit and NO storage —
 //!   nothing ever looks a declaration token up here, and an unbounded
 //!   write-only map is what it would otherwise be.
-//! - `lookup_active` checks expiry on read and self-prunes the entry it
-//!   was asked about. It only ever sees tokens a JDC presents, so it
-//!   cannot be the thing that bounds the map — `allocate`'s sweep is.
-//! - `remove` is for explicit teardown only. Using a token to declare a
-//!   job does NOT delete it: the JDS issues a separate token for the
-//!   declared-job side and the allocate token lives out its TTL.
+//! - `take_active` CONSUMES the token a `DeclareMiningJob` presents —
+//!   one allocate authorises one declaration attempt, and the pool answers
+//!   the declared-job side with a separate token of its own. For a session
+//!   that declares, this is what keeps the map small: one entry in, one
+//!   entry out. `allocate`'s sweep covers the rest — tokens allocated and
+//!   never presented, which nothing else would ever touch.
 //! - `cleanup_expired` is the sweep itself, also exposed for a
 //!   periodic tick.
 
@@ -213,8 +213,8 @@ impl TokenStore {
     /// waited for an answer that never came.
     ///
     /// It is also **not stored**, and that is not an optimisation. Nothing
-    /// ever looks a declaration token up here: the declare handler's only
-    /// lookup ([`Self::lookup_active`]) resolves the ALLOCATE token a
+    /// ever looks a declaration token up here: the declare path's only
+    /// resolution ([`Self::take_active`]) consumes the ALLOCATE token a
     /// `DeclareMiningJob` presents, the mining side resolves the declaration
     /// through the bridge, and `PushSolution` through
     /// [`crate::jdp::declarations::DeclaredJobStore`]. So the entry was
@@ -238,16 +238,16 @@ impl TokenStore {
     /// not. Bumps the per-connection counter (BE-encoded into the token
     /// prefix).
     ///
-    /// Sweeps expired entries on the way in, which is what bounds this map:
-    /// the rate limit caps inserts at one per second and the TTL caps their
-    /// lifetime, so together they cap the map — but only if something
-    /// actually drops the expired ones. [`Self::lookup_active`] prunes just
-    /// the token it was asked about, so a connection that allocates and never
-    /// re-presents left every entry behind for as long as it stayed open. One
-    /// sweep per insert is affordable for exactly the reason the map is
-    /// bounded at all: inserts are rate-limited. (The reference JDS reaches
-    /// the same place from the other side, with a 10 s janitor task —
-    /// `token_management::TokenManager`, sv2-apps v0.7.0.)
+    /// Sweeps expired entries on the way in. A session that declares empties
+    /// the map as it fills it — [`Self::take_active`] removes the entry it
+    /// resolves — so what this sweep is for is the tokens NOBODY presents: a
+    /// connection that allocates and never declares left every entry behind
+    /// for as long as it stayed open, and nothing else would have touched
+    /// them. The rate limit caps inserts at one per second and the TTL caps
+    /// their lifetime, so the two together cap the map, but only once
+    /// something actually drops the expired ones. One sweep per insert is
+    /// affordable for exactly the reason the map is bounded at all: inserts
+    /// are rate-limited.
     pub fn allocate(
         &mut self,
         now_ms: u64,
@@ -310,40 +310,48 @@ impl TokenStore {
     /// regardless of `expires_at_ms`.
     ///
     /// No production caller, and none is wanted: every path that resolves a
-    /// token a JDC presented must honour expiry, which is
-    /// [`Self::lookup_active`]. What needs this is the TESTS — it is the only
-    /// expiry-blind window into the map, so it is what tells "the entry was
-    /// pruned" apart from "the entry is there but expired". `lookup_active`
-    /// answers `None` to both, which is exactly the distinction
-    /// `lookup_active_self_prunes_expired` and the `cleanup_expired` tests
-    /// are making.
+    /// token a JDC presented must honour expiry AND consume it, which is
+    /// [`Self::take_active`]. What needs this is the TESTS — it is the only
+    /// non-consuming window into the map, so it is what tells "the entry is
+    /// still there" apart from "it was taken", and "it was pruned" apart from
+    /// "it is there but expired". `take_active` answers `None` to the last
+    /// two alike, which is exactly the distinction
+    /// `taking_a_token_removes_it` and the `cleanup_expired` tests are
+    /// making.
     pub fn lookup(&self, token: &Token) -> Option<&AllocatedToken> {
         self.allocated.get(token)
     }
 
-    /// Look up a token AND check expiry. On expiry self-prunes the
-    /// entry and returns `None`.
-    pub fn lookup_active(&mut self, token: &Token, now_ms: u64) -> Option<&AllocatedToken> {
-        let expired = self
-            .allocated
-            .get(token)
-            .map(|entry| entry.is_expired(now_ms))
-            .unwrap_or(true);
-        if expired {
-            self.allocated.remove(token);
-            return None;
-        }
-        self.allocated.get(token)
-    }
-
-    /// Explicitly drop a token. Idempotent for unknown tokens.
-    /// Returns the entry that was dropped (or `None`).
-    pub fn remove(&mut self, token: &Token) -> Option<AllocatedToken> {
-        self.allocated.remove(token)
+    /// TAKE the token a declaration presents: remove it from the map and
+    /// hand back its entry, unless it had already expired.
+    ///
+    /// Consuming rather than reading IS the rule. An allocate token
+    /// authorises exactly ONE declaration attempt: SV2 JDP/Full-Template Mode
+    /// describes it as "a token (allocated by JDS), so it can use it to
+    /// identify some unique work", and a token that identifies one piece of
+    /// work cannot answer for the next one. It is spent whichever way that
+    /// declaration ends, accepted or refused. A read-only lookup let a single
+    /// token carry declarations for its whole 1 h TTL, which is not what a
+    /// `mining_job_token` identifies.
+    ///
+    /// Removing before judging expiry subsumes what the old read-only lookup
+    /// did on the side: an expired entry is dropped either way.
+    ///
+    /// ⚠️ The mining side looks like the same rule and is not. A token there
+    /// likewise authorises exactly one `SetCustomMiningJob`, but it SURVIVES
+    /// a rejection: `stale-chain-tip` on that side means the JDC retries the
+    /// SAME custom job on the SAME token, so consuming it would turn a benign
+    /// tip race into the fatal fallback every declaration error but that one
+    /// triggers. Here `stale-chain-tip` means the JDC rebuilds against its
+    /// new template and declares with the next token it holds, so there is
+    /// nothing to keep the spent one for.
+    pub fn take_active(&mut self, token: &Token, now_ms: u64) -> Option<AllocatedToken> {
+        let entry = self.allocated.remove(token)?;
+        (!entry.is_expired(now_ms)).then_some(entry)
     }
 
     /// Sweep expired entries. Returns the count removed. Use as a
-    /// periodic tick if `lookup_active` isn't enough on its own —
+    /// periodic tick if `take_active` isn't enough on its own —
     /// e.g. when the connection is being inspected without a fresh
     /// request.
     pub fn cleanup_expired(&mut self, now_ms: u64) -> usize {
@@ -471,7 +479,7 @@ mod tests {
         assert!(alloc.is_expired(101), "1 ms past expires");
     }
 
-    // ── lookup / lookup_active ─────────────────────────────────────
+    // ── lookup / take_active ───────────────────────────────────────
 
     /// `lookup` finds active tokens.
     #[test]
@@ -482,36 +490,51 @@ mod tests {
         assert_eq!(entry.coinbase_outputs, vec![1, 2, 3]);
     }
 
-    /// `lookup_active` returns None + self-prunes for expired entries.
+    /// `take_active` hands the entry back ONCE. The second attempt on the
+    /// same token finds nothing — that is the whole rule an allocate token
+    /// carries: it identifies one piece of work, not a session's worth.
     #[test]
-    fn lookup_active_self_prunes_expired() {
+    fn taking_a_token_removes_it() {
+        let mut s = fresh_store_with_rng(0x00);
+        let token = s.allocate(0, addr(), vec![1, 2, 3]).unwrap().token;
+        let taken = s.take_active(&token, 100).expect("first take resolves");
+        assert_eq!(taken.coinbase_outputs, vec![1, 2, 3]);
+        assert!(
+            s.take_active(&token, 100).is_none(),
+            "a second declaration on the same allocate token must find nothing"
+        );
+        assert!(
+            s.lookup(&token).is_none(),
+            "and the entry is gone, not merely hidden"
+        );
+        assert_eq!(s.len(), 0);
+    }
+
+    /// An expired token is dropped rather than handed out — and the boundary
+    /// timestamp is still active, same rule as `AllocatedToken::is_expired`.
+    #[test]
+    fn take_active_refuses_and_prunes_an_expired_token() {
         let mut s = TokenStore::with_config(0, 1_000);
         s.set_rng(Some(const_rng(0x00)));
+        let boundary = s.allocate(0, addr(), vec![]).unwrap().token;
+        assert!(
+            s.take_active(&boundary, 1_000).is_some(),
+            "the boundary millisecond is still active"
+        );
+
         let token = s.allocate(0, addr(), vec![]).unwrap().token;
         // Way past TTL.
-        assert!(s.lookup_active(&token, 5_000).is_none());
-        // Already pruned — second lookup also None.
+        assert!(s.take_active(&token, 5_000).is_none());
+        // Pruned on the way out, not left behind for the sweep.
         assert!(s.lookup(&token).is_none());
         assert_eq!(s.len(), 0);
     }
 
-    /// `lookup_active` for unknown token returns None without panic.
+    /// `take_active` for an unknown token returns None without panic.
     #[test]
-    fn lookup_active_unknown_is_none() {
+    fn take_active_unknown_is_none() {
         let mut s = TokenStore::new();
-        assert!(s.lookup_active(&Token([0xFF; TOKEN_LEN]), 0).is_none());
-    }
-
-    // ── remove ─────────────────────────────────────────────────────
-
-    /// `remove` drops + returns the entry; idempotent for unknown.
-    #[test]
-    fn remove_drops_and_returns_entry() {
-        let mut s = fresh_store_with_rng(0x00);
-        let token = s.allocate(0, addr(), vec![]).unwrap().token;
-        assert!(s.remove(&token).is_some());
-        assert!(s.remove(&token).is_none());
-        assert_eq!(s.len(), 0);
+        assert!(s.take_active(&Token([0xFF; TOKEN_LEN]), 0).is_none());
     }
 
     // ── cleanup_expired ────────────────────────────────────────────

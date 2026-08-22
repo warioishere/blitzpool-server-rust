@@ -62,9 +62,7 @@ use crate::bridge::DistributionAcceptance;
 use super::declarations::{DeclaredJob, DeclaredJobStore};
 use super::dynamic_outputs::{declared_coinbase_tx, CandidateBacking, PayoutBooking};
 use super::payout_distribution::validate_coinbase_outputs_against_distribution;
-use super::tx_validation::{
-    merge_provided_with_known, partition_against_template, PendingDeclaration,
-};
+use super::tx_validation::{merge_provided_with_known, PartitionResult, PendingDeclaration};
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -101,8 +99,10 @@ pub const ERR_UNSUPPORTED_VERSION: &str = "unsupported-version";
 /// negotiating `DECLARE_TX_DATA` (Full-Template mode).
 pub const ERR_UNSUPPORTED_FEATURE_FLAGS: &str = "unsupported-feature-flags";
 
-/// `invalid-mining-job-token` — the token referenced doesn't exist or
-/// has expired (`DeclareMiningJob.Error`).
+/// `invalid-mining-job-token` — the token referenced was never issued, has
+/// expired, or was already SPENT by an earlier declaration
+/// (`DeclareMiningJob.Error`). The last is the common one: a token authorises
+/// one declaration.
 pub const ERR_INVALID_MINING_JOB_TOKEN: &str = "invalid-mining-job-token";
 
 /// `invalid-job-param-value-coinbase_tx_outputs` — the declared coinbase
@@ -778,18 +778,64 @@ pub struct DeclarationContext {
     pub now_ms: u64,
 }
 
+/// The two refusals a `DeclareMiningJob` earns from the SESSION alone.
+///
+/// Split out because neither question needs the declaration's token, and the
+/// caller resolves that token by SPENDING it. Answering these after the spend
+/// turns one misconfigured connection into two unrelated-looking fatal codes
+/// on successive frames — the real reason on the first, then
+/// `invalid-mining-job-token`, which points at the token store instead.
+///
+/// - a `distribution_id` TLV on a connection that never negotiated ext 0x0003
+///   → `invalid-payout-distribution`. The IO layer captures the TLV
+///   unconditionally, not filtered by the negotiated set, precisely so this
+///   can see it.
+/// - Coinbase-only mode (`!full_template_mode`) → `unsupported-feature-flags`.
+pub fn declare_refused_by_session(
+    state: &JdpSessionState,
+    input: &DeclareMiningJobInput,
+) -> Option<JdpHandlerOutcome> {
+    if input.distribution_id.is_some()
+        && !state
+            .negotiated_extensions
+            .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
+    {
+        return Some(JdpHandlerOutcome::declare_error(
+            input.request_id,
+            ERR_INVALID_PAYOUT_DISTRIBUTION,
+            b"distribution_id TLV requires negotiated ext 0x0003",
+        ));
+    }
+    if !state.full_template_mode {
+        return Some(JdpHandlerOutcome::declare_error(
+            input.request_id,
+            ERR_UNSUPPORTED_FEATURE_FLAGS,
+            b"DeclareMiningJob requires Full-Template mode (DECLARE_TX_DATA flag)",
+        ));
+    }
+    None
+}
+
 /// Handle `DeclareMiningJob`.
 ///
-/// **Caller-resolved context**: the IO layer snapshots the JDS's
-/// local template-tx cache (`wtxid → raw_tx` map) and passes it in
-/// via `template_txs`. The handler does the wtxid partition + decides
-/// whether to round-trip via `ProvideMissingTransactions` or accept
-/// the declaration immediately.
+/// **Caller-resolved context.** The IO layer has already run
+/// [`declare_refused_by_session`], resolved the `mining_job_token` by
+/// SPENDING it ([`crate::tokens::TokenStore::take_active`]) and partitioned
+/// the declared wtxids against its template cache. The handler decides
+/// whether to round-trip via `ProvideMissingTransactions` or accept the
+/// declaration immediately.
 ///
-/// - Coinbase-only mode (`!full_template_mode`) → `DeclareMiningJobError`
-///   with `unsupported-feature-flags`.
-/// - Unknown / expired token → `DeclareMiningJobError` with
-///   `invalid-mining-job-token`.
+/// All three happen out there rather than in here for the same reason: the
+/// node round-trip sits between them and this handler, and none of it may be
+/// bought by a token the pool never issued or has already spent. The
+/// partition arrives by value because the caller needs it too — computing it
+/// on both sides cloned the raw bytes of every known transaction twice per
+/// declaration.
+///
+/// `declaring_miner` is the address the spent token was issued to, never the
+/// connection's: a session may hold tokens for several addresses, and the
+/// allocate is what carries one.
+///
 /// - Partition is fully covered → accept declaration immediately
 ///   (emits `DeclareMiningJobSuccess` + `JobDeclared` event).
 /// - Some wtxids missing → emit `ProvideMissingTransactions` and
@@ -797,49 +843,11 @@ pub struct DeclarationContext {
 pub fn handle_declare_mining_job(
     state: &mut JdpSessionState,
     input: &DeclareMiningJobInput,
-    template_txs: &HashMap<[u8; 32], Vec<u8>>,
+    declaring_miner: &AddressId,
+    partition: PartitionResult,
     ctx: DeclarationContext,
 ) -> JdpHandlerOutcome {
-    // ext 0x0003/Negotiation: a distribution reference from a client that
-    // never negotiated ext 0x0003 MUST be rejected. The IO layer captures the
-    // TLV unconditionally (not filtered by the negotiated set) precisely so
-    // this gate can see it.
-    if input.distribution_id.is_some()
-        && !state
-            .negotiated_extensions
-            .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
-    {
-        return JdpHandlerOutcome::declare_error(
-            input.request_id,
-            ERR_INVALID_PAYOUT_DISTRIBUTION,
-            b"distribution_id TLV requires negotiated ext 0x0003",
-        );
-    }
-    if !state.full_template_mode {
-        return JdpHandlerOutcome::declare_error(
-            input.request_id,
-            ERR_UNSUPPORTED_FEATURE_FLAGS,
-            b"DeclareMiningJob requires Full-Template mode (DECLARE_TX_DATA flag)",
-        );
-    }
-
-    let allocated = match state
-        .tokens
-        .lookup_active(&input.mining_job_token, ctx.now_ms)
-    {
-        Some(entry) => entry.clone(),
-        None => {
-            return JdpHandlerOutcome::declare_error(
-                input.request_id,
-                ERR_INVALID_MINING_JOB_TOKEN,
-                b"Token not found or expired",
-            );
-        }
-    };
-
-    let miner_address = allocated.miner_address.clone();
-
-    let partition = partition_against_template(&input.wtxid_list, template_txs);
+    let miner_address = declaring_miner.clone();
 
     if partition.fully_covered() {
         return accept_declaration(state, input, partition.known_raw_txs, miner_address, ctx);
@@ -1449,12 +1457,20 @@ mod tests {
     /// the new token.
     fn complete_setup_and_allocate(s: &mut JdpSessionState) -> Token {
         let _ = handle_setup_connection(s, &good_setup());
-        let out = handle_allocate_token(s, &good_alloc(1), alloc_ctx(), 1_000);
-        match out.outbound[0] {
-            JdpOutboundFrame::AllocateMiningJobTokenSuccess {
+        allocate_another(s, 1, 1_000)
+    }
+
+    /// One more token on an already-set-up session. A JDC that declares
+    /// twice allocates twice — that is what a token IS — and
+    /// SV2 JDP/AllocateMiningJobToken rate-limits allocation to 1/s, so the
+    /// caller has to move `now_ms` on by at least that.
+    fn allocate_another(s: &mut JdpSessionState, request_id: u32, now_ms: u64) -> Token {
+        let out = handle_allocate_token(s, &good_alloc(request_id), alloc_ctx(), now_ms);
+        match out.outbound.first() {
+            Some(JdpOutboundFrame::AllocateMiningJobTokenSuccess {
                 mining_job_token, ..
-            } => mining_job_token,
-            _ => panic!("expected AllocateMiningJobTokenSuccess"),
+            }) => *mining_job_token,
+            other => panic!("expected AllocateMiningJobTokenSuccess, got {other:?}"),
         }
     }
 
@@ -1516,6 +1532,34 @@ mod tests {
             current_mode: None,
             now_ms,
         }
+    }
+
+    /// Stand-in for the three things the IO layer does ahead of the handler:
+    /// the session-shape gates, resolving the `mining_job_token` by SPENDING
+    /// it ([`TokenStore::take_active`]), and the wtxid partition.
+    ///
+    /// It calls the same functions the dispatch calls, so nothing is
+    /// re-implemented here — only the refusal frame for an unresolvable token
+    /// is, and that is the dispatch's own test. What this buys is that a
+    /// handler test cannot quietly declare twice on one token: the second
+    /// `expect` panics, which is the rule stated where the tests trip over
+    /// it.
+    fn declared(
+        s: &mut JdpSessionState,
+        input: &DeclareMiningJobInput,
+        template_txs: &HashMap<[u8; 32], Vec<u8>>,
+        ctx: DeclarationContext,
+    ) -> JdpHandlerOutcome {
+        if let Some(refusal) = declare_refused_by_session(s, input) {
+            return refusal;
+        }
+        let declaring = s
+            .tokens
+            .take_active(&input.mining_job_token, ctx.now_ms)
+            .expect("a declaration must name a token the pool issued and has not spent");
+        let partition =
+            crate::jdp::tx_validation::partition_against_template(&input.wtxid_list, template_txs);
+        handle_declare_mining_job(s, input, &declaring.miner_address, partition, ctx)
     }
 
     /// A coinbase suffix whose outputs are the ext 0x0003/Payout Computation
@@ -1819,12 +1863,13 @@ mod tests {
         let mut setup = good_setup();
         setup.flags = 0; // Coinbase-only mode
         handle_setup_connection(&mut s, &setup);
-        // Need a token first — but we can't allocate in coinbase-only?
-        // The handler runs the full-template check FIRST so it doesn't
-        // need a valid token to test this path.
-        let bogus_token = Token([0u8; 16]);
-        let input = declare(1, bogus_token, vec![]);
-        let out = handle_declare_mining_job(
+        // Allocation is not mode-gated, so a Coinbase-only session can hold a
+        // token — and it costs one to find out its declaration is refused,
+        // since the token is spent before the handler runs. Harmless: that
+        // mode reads this entry nowhere. Its allocation lives in the bridge.
+        let token = allocate_another(&mut s, 1, 1_000);
+        let input = declare(1, token, vec![]);
+        let out = declared(
             &mut s,
             &input,
             &HashMap::new(),
@@ -1842,29 +1887,6 @@ mod tests {
     }
 
     #[test]
-    fn declare_unknown_token_returns_invalid_mining_job_token() {
-        let mut s = fresh();
-        handle_setup_connection(&mut s, &good_setup());
-        let bogus = Token([1u8; 16]);
-        let input = declare(2, bogus, vec![]);
-        let out = handle_declare_mining_job(
-            &mut s,
-            &input,
-            &HashMap::new(),
-            DeclarationContext {
-                current_prev_hash: None,
-                ..ctx(0)
-            },
-        );
-        match &out.outbound[0] {
-            JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
-                assert_eq!(error_code, ERR_INVALID_MINING_JOB_TOKEN);
-            }
-            _ => panic!("expected Error"),
-        }
-    }
-
-    #[test]
     fn declare_fully_covered_accepts_immediately() {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
@@ -1874,7 +1896,7 @@ mod tests {
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         tpl.insert(wtxid_b, vec![0xFE; 16]);
         let input = declare(3, token, vec![wtxid_a, wtxid_b]);
-        let out = handle_declare_mining_job(&mut s, &input, &tpl, ctx(3_000));
+        let out = declared(&mut s, &input, &tpl, ctx(3_000));
         match &out.outbound[0] {
             JdpOutboundFrame::DeclareMiningJobSuccess {
                 request_id,
@@ -1925,7 +1947,7 @@ mod tests {
         let mut tpl = HashMap::new();
         tpl.insert(wtxid, vec![0xCA; 16]);
         let input = declare(3, token, vec![wtxid]);
-        let out = handle_declare_mining_job(&mut s, &input, &tpl, ctx(1_100));
+        let out = declared(&mut s, &input, &tpl, ctx(1_100));
 
         assert!(
             !out.outbound.is_empty(),
@@ -1967,12 +1989,14 @@ mod tests {
         let wtxid = [0x01; 32];
         let mut tpl = HashMap::new();
         tpl.insert(wtxid, vec![0xCA; 16]);
+        let mut token = token;
         for request_id in 3..13u32 {
-            let out = handle_declare_mining_job(
+            let now = 1_000 + u64::from(request_id) * 1_100;
+            let out = declared(
                 &mut s,
                 &declare(request_id, token, vec![wtxid]),
                 &tpl,
-                ctx(1_100),
+                ctx(now),
             );
             assert!(
                 matches!(
@@ -1981,13 +2005,18 @@ mod tests {
                 ),
                 "declaration {request_id} must be answered"
             );
+            // The delta is the subject: one allocate in, one allocate out,
+            // and the minted declaration token in neither direction. A net
+            // figure at the end would also be satisfied by a store that took
+            // eleven and dropped ten of the wrong ones.
+            assert_eq!(
+                s.tokens.len(),
+                0,
+                "declaration {request_id} spent its allocate and stored nothing of its own"
+            );
+            token = allocate_another(&mut s, request_id, now + 100);
+            assert_eq!(s.tokens.len(), 1, "and the refill puts back exactly one");
         }
-        assert_eq!(
-            s.tokens.len(),
-            1,
-            "ten declarations must leave the token store where it was — only the allocate \
-             belongs in it"
-        );
         assert_eq!(
             s.declared_jobs.len(),
             crate::jdp::declarations::MAX_DECLARED_JOBS,
@@ -1995,61 +2024,9 @@ mod tests {
         );
     }
 
-    /// The other half: a `new_mining_job_token` must not itself authorise a
-    /// declaration. Storing it made it resolvable by `lookup_active`, so a
-    /// JDC could chain declarations off declaration tokens — each one minting
-    /// the next, forever, with no allocate in sight.
-    ///
-    /// The reference JDS answers the same way: `is_allocated` consults the
-    /// allocated set only, and activation moves a token out of it
-    /// (`token_management::TokenManager`, sv2-apps v0.7.0). No conformant
-    /// client is affected — the jd-client always declares with a token popped
-    /// from its allocate queue.
-    #[test]
-    fn a_declaration_token_cannot_itself_authorise_a_declaration() {
-        let mut s = fresh();
-        let _ = handle_setup_connection(&mut s, &good_setup());
-        let out = handle_allocate_token(&mut s, &good_alloc(1), alloc_ctx(), 1_000);
-        let allocate_token = match out.outbound[0] {
-            JdpOutboundFrame::AllocateMiningJobTokenSuccess {
-                mining_job_token, ..
-            } => mining_job_token,
-            _ => panic!("expected AllocateMiningJobTokenSuccess"),
-        };
-        let wtxid = [0x01; 32];
-        let mut tpl = HashMap::new();
-        tpl.insert(wtxid, vec![0xCA; 16]);
-        let out = handle_declare_mining_job(
-            &mut s,
-            &declare(3, allocate_token, vec![wtxid]),
-            &tpl,
-            ctx(1_100),
-        );
-        let declaration_token = match out.outbound[0] {
-            JdpOutboundFrame::DeclareMiningJobSuccess {
-                new_mining_job_token,
-                ..
-            } => new_mining_job_token,
-            ref other => panic!("expected DeclareMiningJobSuccess, got {other:?}"),
-        };
-
-        let out = handle_declare_mining_job(
-            &mut s,
-            &declare(4, declaration_token, vec![wtxid]),
-            &tpl,
-            ctx(1_200),
-        );
-        match &out.outbound[0] {
-            JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
-                assert_eq!(error_code, ERR_INVALID_MINING_JOB_TOKEN);
-            }
-            other => panic!("a declaration token must not authorise a declaration, got {other:?}"),
-        }
-    }
-
     /// The allocate map is bounded by rate × TTL, which needs something to
-    /// actually drop the expired entries. `lookup_active` prunes only the one
-    /// token it was asked about, so a connection that allocates and never
+    /// actually drop the expired entries. `take_active` only ever touches the
+    /// one token it was asked about, so a connection that allocates and never
     /// re-presents used to keep every entry for as long as it stayed open —
     /// at one per second, a day-long connection is ~86 400 of them.
     #[test]
@@ -2088,8 +2065,7 @@ mod tests {
         let wtxid = [0x01; 32];
         let mut tpl = HashMap::new();
         tpl.insert(wtxid, vec![0xCA; 16]);
-        let _ =
-            handle_declare_mining_job(&mut s, &declare(3, token, vec![wtxid]), &tpl, ctx(1_100));
+        let _ = declared(&mut s, &declare(3, token, vec![wtxid]), &tpl, ctx(1_100));
 
         // A second allocate still inside the second: refused, as
         // SV2 JDP/AllocateMiningJobToken asks.
@@ -2121,7 +2097,7 @@ mod tests {
         negotiate_0x0003(&mut s);
         // `declare()` carries no distribution_id TLV.
         let input = declare(2, token, vec![]);
-        let out = handle_declare_mining_job(&mut s, &input, &HashMap::new(), ctx(3_000));
+        let out = declared(&mut s, &input, &HashMap::new(), ctx(3_000));
         match &out.outbound[0] {
             JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_INVALID_PAYOUT_DISTRIBUTION);
@@ -2144,13 +2120,17 @@ mod tests {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
         negotiate_0x0003(&mut s);
-        let mut input = declare(2, token, vec![]);
-        input.distribution_id = Some(7);
-        for acceptance in [
+        let mut token = token;
+        for (attempt, acceptance) in [
             DistributionAcceptance::Stale,
             DistributionAcceptance::Unknown,
-        ] {
-            let out = handle_declare_mining_job(
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut input = declare(2, token, vec![]);
+            input.distribution_id = Some(7);
+            let out = declared(
                 &mut s,
                 &input,
                 &HashMap::new(),
@@ -2165,6 +2145,8 @@ mod tests {
                 }
                 f => panic!("expected stale DeclareMiningJobError, got {f:?}"),
             }
+            // A refusal spends the token too, so the next attempt allocates.
+            token = allocate_another(&mut s, 3 + attempt as u32, 2_100 + attempt as u64 * 1_100);
         }
         assert_eq!(s.declared_jobs.len(), 0);
     }
@@ -2179,7 +2161,7 @@ mod tests {
         negotiate_0x0003(&mut s);
         let mut input = declare(2, token, vec![]);
         input.distribution_id = Some(7);
-        let out = handle_declare_mining_job(&mut s, &input, &HashMap::new(), ctx(3_000));
+        let out = declared(&mut s, &input, &HashMap::new(), ctx(3_000));
         match &out.outbound[0] {
             JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
                 assert_eq!(error_code, ERR_STALE_PAYOUT_DISTRIBUTION);
@@ -2240,7 +2222,7 @@ mod tests {
             let mut input = declare(3, token, vec![]);
             input.distribution_id = Some(7);
             input.coinbase_tx_suffix = conformant.clone();
-            let out = handle_declare_mining_job(
+            let out = declared(
                 &mut s,
                 &input,
                 &HashMap::new(),
@@ -2294,7 +2276,7 @@ mod tests {
         let mut bad = declare(3, token, vec![]);
         bad.distribution_id = Some(7);
         bad.coinbase_tx_suffix = coinbase_suffix(&bitcoin::consensus::serialize(&swapped));
-        let out = handle_declare_mining_job(
+        let out = declared(
             &mut s,
             &bad,
             &HashMap::new(),
@@ -2316,11 +2298,13 @@ mod tests {
         );
 
         // Accept: the ext 0x0003/Payout Computation vector as recomputed
-        // validates by construction.
+        // validates by construction. A refused declaration spends its token
+        // just as an accepted one does, so the retry brings its own.
+        let token = allocate_another(&mut s, 2, 2_100);
         let mut good = declare(4, token, vec![]);
         good.distribution_id = Some(7);
         good.coinbase_tx_suffix = matching_suffix(&entry, 5_000_000_000);
-        let out = handle_declare_mining_job(
+        let out = declared(
             &mut s,
             &good,
             &HashMap::new(),
@@ -2372,7 +2356,7 @@ mod tests {
             } else {
                 None
             };
-            let out = handle_declare_mining_job(
+            let out = declared(
                 &mut s,
                 &input,
                 &HashMap::new(),
@@ -2398,7 +2382,7 @@ mod tests {
     fn declare_rebuildable_coinbase_accepted_on_a_base_connection() {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
-        let out = handle_declare_mining_job(
+        let out = declared(
             &mut s,
             &declare(3, token, vec![]),
             &HashMap::new(),
@@ -2424,7 +2408,7 @@ mod tests {
         let token = complete_setup_and_allocate(&mut s);
         let mut input = declare(2, token, vec![]);
         input.distribution_id = Some(7);
-        let out = handle_declare_mining_job(
+        let out = declared(
             &mut s,
             &input,
             &HashMap::new(),
@@ -2465,7 +2449,7 @@ mod tests {
         let mut input = declare(3, token, vec![]);
         input.distribution_id = Some(7);
         input.coinbase_tx_suffix = matching_suffix(&entry, 5_000_000_000);
-        let out = handle_declare_mining_job(
+        let out = declared(
             &mut s,
             &input,
             &HashMap::new(),
@@ -2519,7 +2503,7 @@ mod tests {
             let mut input = declare(4, token, vec![]);
             input.coinbase_tx_prefix = prefix;
             input.coinbase_tx_suffix = suffix;
-            let out = handle_declare_mining_job(&mut s, &input, &HashMap::new(), ctx(3_000));
+            let out = declared(&mut s, &input, &HashMap::new(), ctx(3_000));
             match &out.outbound[0] {
                 JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
                     assert_eq!(error_code, ERR_INVALID_JOB_PARAM_COINBASE, "{label}");
@@ -2533,7 +2517,7 @@ mod tests {
         // accepted, so the refusals above are about the coinbase.
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
-        let out = handle_declare_mining_job(
+        let out = declared(
             &mut s,
             &declare(5, token, vec![]),
             &HashMap::new(),
@@ -2554,7 +2538,7 @@ mod tests {
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         let input = declare(4, token, vec![wtxid_a, wtxid_b]);
-        let out = handle_declare_mining_job(&mut s, &input, &tpl, ctx(3_000));
+        let out = declared(&mut s, &input, &tpl, ctx(3_000));
         match &out.outbound[0] {
             JdpOutboundFrame::ProvideMissingTransactions {
                 request_id,
@@ -2584,18 +2568,21 @@ mod tests {
         let mut tpl = HashMap::new();
         tpl.insert(known, vec![0xCA; 16]);
 
-        handle_declare_mining_job(
+        declared(
             &mut s,
             &declare(4, token, vec![known, missing]),
             &tpl,
             ctx(3_000),
         );
+        // The pipelining JDC's second declaration rides its next token — the
+        // first one went with the declaration it is about to abandon.
+        let token = allocate_another(&mut s, 2, 3_050);
         assert_eq!(
             s.pending_declaration.as_ref().unwrap().pending.request_id,
             4
         );
 
-        handle_declare_mining_job(
+        declared(
             &mut s,
             &declare(5, token, vec![known, missing]),
             &tpl,
@@ -2636,7 +2623,7 @@ mod tests {
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         let input = declare(5, token, vec![wtxid_a, wtxid_b]);
-        let _ = handle_declare_mining_job(&mut s, &input, &tpl, ctx(3_000));
+        let _ = declared(&mut s, &input, &tpl, ctx(3_000));
         let success = ProvideMissingTransactionsSuccessInput {
             request_id: 5,
             transaction_list: vec![vec![0xFE; 16]],
@@ -2665,7 +2652,7 @@ mod tests {
         tpl.insert(wtxid_a, vec![0xCA; 16]);
         let input = declare(5, token, vec![wtxid_a, wtxid_b]);
         // Declared under tip 0xAB…
-        let _ = handle_declare_mining_job(&mut s, &input, &tpl, ctx(3_000));
+        let _ = declared(&mut s, &input, &tpl, ctx(3_000));
         let success = ProvideMissingTransactionsSuccessInput {
             request_id: 5,
             transaction_list: vec![vec![0xFE; 16]],
@@ -2716,7 +2703,7 @@ mod tests {
         input.distribution_id = Some(7);
         input.coinbase_tx_suffix = matching_suffix(&entry, 5_000_000_000);
         // Accepted at declare time…
-        let _ = handle_declare_mining_job(
+        let _ = declared(
             &mut s,
             &input,
             &tpl,
@@ -2764,7 +2751,7 @@ mod tests {
         let mut input = declare(5, token, vec![wtxid_a, wtxid_b]);
         input.distribution_id = Some(7);
         input.coinbase_tx_suffix = matching_suffix(&entry, 5_000_000_000);
-        let _ = handle_declare_mining_job(
+        let _ = declared(
             &mut s,
             &input,
             &tpl,
@@ -2832,7 +2819,7 @@ mod tests {
         let wtxid_a = [0x01; 32];
         let wtxid_b = [0x02; 32];
         let input = declare(6, token, vec![wtxid_a, wtxid_b]);
-        let _ = handle_declare_mining_job(&mut s, &input, &HashMap::new(), ctx(3_000));
+        let _ = declared(&mut s, &input, &HashMap::new(), ctx(3_000));
         // Pending expects 2 missing (positions 0,1) but we provide 1.
         let bad_success = ProvideMissingTransactionsSuccessInput {
             request_id: 6,
@@ -2901,8 +2888,7 @@ mod tests {
         let wtxid_a = [0x01; 32];
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 8]);
-        let _ =
-            handle_declare_mining_job(&mut s, &declare(7, token, vec![wtxid_a]), &tpl, ctx(3_000));
+        let _ = declared(&mut s, &declare(7, token, vec![wtxid_a]), &tpl, ctx(3_000));
 
         // Drop every token the session holds — the declaration must still
         // know whose it is.
@@ -2947,7 +2933,7 @@ mod tests {
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 8]);
         let input = declare(7, token, vec![wtxid_a]);
-        let _ = handle_declare_mining_job(&mut s, &input, &tpl, ctx(3_000));
+        let _ = declared(&mut s, &input, &tpl, ctx(3_000));
         let extranonce = vec![0xEE; 8];
         let solution = PushSolutionInput {
             extranonce: extranonce.clone(),
@@ -2999,7 +2985,7 @@ mod tests {
         // into pending. Without ProvideMissingTransactions.Success,
         // raw_transactions[1] never gets populated.
         let input = declare(8, token, vec![wtxid_a, wtxid_b]);
-        let _ = handle_declare_mining_job(&mut s, &input, &tpl, ctx(3_000));
+        let _ = declared(&mut s, &input, &tpl, ctx(3_000));
         // No declared_jobs entry yet (still pending) → push_solution
         // can't find a matching job → drops. Pin that path.
         assert_eq!(s.declared_jobs.len(), 0);
