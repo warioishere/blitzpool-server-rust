@@ -69,8 +69,8 @@ use crate::extensions::{
 use crate::jdp::client::{
     handle_allocate_token, handle_declare_mining_job, handle_provide_missing_transactions_success,
     handle_push_solution, handle_request_extensions, handle_setup_connection,
-    parse_user_identifier_as_address, AllocateTokenContext, JdpHandlerOutcome, JdpOutboundFrame,
-    JdpSessionEvent, JdpSessionState,
+    parse_user_identifier_as_address, AllocateTokenContext, DeclarationContext, JdpHandlerOutcome,
+    JdpOutboundFrame, JdpSessionEvent, JdpSessionState,
 };
 use crate::jdp::dynamic_outputs::CandidateBacking;
 use crate::jdp::payout_distribution::WeightedOutput;
@@ -1620,10 +1620,12 @@ async fn dispatch_jdp_inbound(
                 state,
                 &input,
                 &template_txs,
-                current_prev_hash,
-                distribution,
-                current_mode,
-                now_ms,
+                DeclarationContext {
+                    current_prev_hash,
+                    distribution,
+                    current_mode,
+                    now_ms,
+                },
             )
         }
         InboundJdpFrame::ProvideMissingTransactionsSuccess(input) => {
@@ -1697,10 +1699,12 @@ async fn dispatch_jdp_inbound(
             handle_provide_missing_transactions_success(
                 state,
                 &input,
-                current_prev_hash,
-                distribution,
-                current_mode,
-                now_ms,
+                DeclarationContext {
+                    current_prev_hash,
+                    distribution,
+                    current_mode,
+                    now_ms,
+                },
             )
         }
         // The handler matches the solution to a declaration and reads the
