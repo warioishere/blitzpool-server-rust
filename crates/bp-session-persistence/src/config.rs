@@ -42,6 +42,12 @@ pub struct SessionPersistenceConfig {
     /// `row_debounce` it bounds the birth latency (debounce + one tick).
     /// Default 5 s.
     pub row_flush_interval: Duration,
+    /// TTL of the per-session `client:live:*` Redis hashes. Production
+    /// wires this to the `kill_dead_clients` staleness cutoff so both
+    /// liveness definitions agree: a session's hash expires on the same
+    /// clock its PG row becomes sweep-eligible. Only the touch flush
+    /// refreshes it. Default 300 s.
+    pub live_ttl: Duration,
 }
 
 impl Default for SessionPersistenceConfig {
@@ -53,6 +59,7 @@ impl Default for SessionPersistenceConfig {
             reconcile_hashrate_on_boot: false,
             row_debounce: Duration::from_secs(15),
             row_flush_interval: Duration::from_secs(5),
+            live_ttl: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -81,6 +88,14 @@ impl SessionPersistenceConfig {
         if self.row_flush_interval.is_zero() {
             return Err(SessionPersistenceError::Config(
                 "row_flush_interval must be > 0".to_string(),
+            ));
+        }
+        // A TTL at or below the flush cadence can only be a mistake:
+        // every live hash would expire between two touch flushes and the
+        // whole pool would flicker in and out of existence.
+        if self.live_ttl <= self.touch_flush_interval {
+            return Err(SessionPersistenceError::Config(
+                "live_ttl must be > touch_flush_interval".to_string(),
             ));
         }
         Ok(())
@@ -129,5 +144,23 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn live_ttl_at_or_below_flush_interval_rejected() {
+        // Equal is already broken: the hash can expire in the instant
+        // before the refreshing flush lands.
+        let cfg = SessionPersistenceConfig {
+            touch_flush_interval: Duration::from_secs(30),
+            live_ttl: Duration::from_secs(30),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+
+        let cfg = SessionPersistenceConfig {
+            live_ttl: Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 }

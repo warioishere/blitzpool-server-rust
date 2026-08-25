@@ -29,11 +29,14 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tracing::warn;
 
+use redis::aio::ConnectionManager;
+
 use crate::config::SessionPersistenceConfig;
 use crate::diff_stat_buffer::{run_flush_loop as run_diff_stat_flush_loop, DiffStatBuffer};
 use crate::error::SessionPersistenceError;
 use crate::hashrate_sampler::{run_sample_loop, HashrateSampler};
 use crate::hooks::{ClientDifficultyStatisticsSink, ClientRowTouchSink, SessionPersistenceHook};
+use crate::live_store::LiveSessionStore;
 use crate::row_debounce::{run_birth_loop, RowDebounce};
 use crate::touch_buffer::{run_flush_loop, TouchBuffer};
 
@@ -44,17 +47,24 @@ pub struct SessionPersistenceEngine {
     hashrate_sampler: Arc<HashrateSampler>,
     diff_stat_buffer: Arc<DiffStatBuffer>,
     row_debounce: Arc<RowDebounce>,
+    live_store: Option<Arc<LiveSessionStore>>,
 }
 
 impl SessionPersistenceEngine {
     /// Build the engine without spawning any background task. Use
     /// [`Self::spawn`] for the production path; this is for unit tests
     /// that wire the hooks but don't need the flusher.
+    ///
+    /// `redis` enables the `client:live:*` mirror of the share hot path
+    /// (see [`crate::live_store`]); `None` is the off switch — every PG
+    /// write behaves identically either way.
     pub fn new(
         config: SessionPersistenceConfig,
         pool: PgPool,
+        redis: Option<ConnectionManager>,
     ) -> Result<Self, SessionPersistenceError> {
         config.validate()?;
+        let live_store = redis.map(|conn| Arc::new(LiveSessionStore::new(conn, config.live_ttl)));
         Ok(Self {
             pool,
             config,
@@ -62,6 +72,7 @@ impl SessionPersistenceEngine {
             hashrate_sampler: Arc::new(HashrateSampler::default()),
             diff_stat_buffer: Arc::new(DiffStatBuffer::default()),
             row_debounce: Arc::new(RowDebounce::default()),
+            live_store,
         })
     }
 
@@ -71,8 +82,9 @@ impl SessionPersistenceEngine {
     pub async fn spawn(
         config: SessionPersistenceConfig,
         pool: PgPool,
+        redis: Option<ConnectionManager>,
     ) -> Result<SessionPersistenceEngineHandle, SessionPersistenceError> {
-        let engine = Self::new(config, pool)?;
+        let engine = Self::new(config, pool, redis)?;
         Ok(engine.spawn_internal())
     }
 
@@ -85,6 +97,7 @@ impl SessionPersistenceEngine {
             diff_stat_buffer: self.diff_stat_buffer,
             row_debounce: self.row_debounce,
             row_debounce_age: self.config.row_debounce,
+            live_store: self.live_store,
             shutdown: Arc::new(std::sync::Mutex::new(ShutdownState::default())),
         }
     }
@@ -107,6 +120,7 @@ impl SessionPersistenceEngine {
         let touch_join = tokio::spawn(run_flush_loop(
             self.touch_buffer.clone(),
             self.pool.clone(),
+            self.live_store.clone(),
             self.config.touch_flush_interval,
             touch_rx,
         ));
@@ -115,6 +129,7 @@ impl SessionPersistenceEngine {
         let sampler_join = tokio::spawn(run_sample_loop(
             self.hashrate_sampler.clone(),
             self.pool.clone(),
+            self.live_store.clone(),
             self.config.hashrate_sample_interval,
             self.config.reconcile_hashrate_on_boot,
             sampler_rx,
@@ -135,6 +150,7 @@ impl SessionPersistenceEngine {
             diff_stat_buffer: self.diff_stat_buffer,
             row_debounce: self.row_debounce,
             row_debounce_age: self.config.row_debounce,
+            live_store: self.live_store,
             shutdown: Arc::new(std::sync::Mutex::new(ShutdownState {
                 txs: vec![birth_tx, touch_tx, sampler_tx, diff_tx],
                 joins: vec![birth_join, touch_join, sampler_join, diff_join],
@@ -168,6 +184,7 @@ pub struct SessionPersistenceEngineHandle {
     diff_stat_buffer: Arc<DiffStatBuffer>,
     row_debounce: Arc<RowDebounce>,
     row_debounce_age: Duration,
+    live_store: Option<Arc<LiveSessionStore>>,
     shutdown: Arc<std::sync::Mutex<ShutdownState>>,
 }
 
@@ -198,6 +215,28 @@ impl SessionPersistenceEngineHandle {
     /// session younger than the debounce is NOT written.
     pub async fn flush_due_births(&self) -> u64 {
         crate::row_debounce::flush_once(&self.row_debounce, &self.pool, self.row_debounce_age).await
+    }
+
+    /// Run one touch-flush pass — exactly what a timer tick does (PG
+    /// bulk UPDATE + Redis live-hash mirror). The deterministic drain
+    /// the integration tests use; harmless in production, it writes the
+    /// same data a tick would, just earlier.
+    pub async fn flush_touches_now(&self) -> u64 {
+        crate::touch_buffer::flush_once(&self.touch_buffer, &self.pool, self.live_store.as_deref())
+            .await
+    }
+
+    /// Close one hashrate sample window over `window_secs` — exactly
+    /// what a sampler tick does. Deterministic-test twin of
+    /// [`Self::flush_touches_now`].
+    pub async fn sample_hashrate_now(&self, window_secs: f64) {
+        crate::hashrate_sampler::sample_and_write(
+            &self.hashrate_sampler,
+            &self.pool,
+            window_secs,
+            self.live_store.as_deref(),
+        )
+        .await
     }
 
     /// Hook impl that touches the per-session `client_entity` row on

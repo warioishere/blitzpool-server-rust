@@ -397,13 +397,25 @@ async fn spawn_session_persistence(
 ) -> Result<SessionPersistenceEngineHandle, EngineError> {
     let cfg = SessionPersistenceConfig {
         reconcile_hashrate_on_boot,
+        // Same clock as the kill_dead_clients sweep: a session's live
+        // hash expires exactly when its PG row becomes sweep-eligible.
+        live_ttl: crate::crons::STALE_CLIENT_TTL,
         ..SessionPersistenceConfig::default()
     };
     info!(
         reconcile_hashrate_on_boot,
+        live_ttl_secs = cfg.live_ttl.as_secs(),
         "session-persistence: spawning engine"
     );
-    let handle = SessionPersistenceEngine::spawn(cfg, handles.db.pool().clone()).await?;
+    // The shared multiplexed manager, not a dedicated connection — the
+    // live-hash scripts are short non-blocking commands; dedicated
+    // connections are reserved for blocking XREAD consumers.
+    let handle = SessionPersistenceEngine::spawn(
+        cfg,
+        handles.db.pool().clone(),
+        Some(handles.redis.clone()),
+    )
+    .await?;
     Ok(handle)
 }
 

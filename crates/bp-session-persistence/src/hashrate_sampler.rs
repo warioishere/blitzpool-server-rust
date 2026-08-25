@@ -36,6 +36,7 @@ use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
 
+use crate::live_store::LiveSessionStore;
 use crate::touch_buffer::{TouchKey, TouchKeyRef};
 
 /// Hashes per unit of difficulty-1 work (2^32). `Σdiff × this / seconds`
@@ -156,14 +157,34 @@ impl HashrateSampler {
     }
 }
 
-/// One sample pass: close windows, then persist the writes in one bulk
-/// UPDATE. On write failure the values are simply stale until the next
-/// window overwrites them — a hashrate estimate is ephemeral, so (unlike
-/// a best-difficulty sample) there's nothing to rebuffer.
-async fn sample_and_write(sampler: &HashrateSampler, pool: &PgPool, window_secs: f64) {
+/// One sample pass: close windows, mirror the writes into the Redis
+/// live hashes, then persist them in one bulk UPDATE. On failure of
+/// either write the values are simply stale until the next window
+/// overwrites them — a hashrate estimate is ephemeral, so (unlike a
+/// best-difficulty sample) there's nothing to rebuffer, on either side.
+/// The fade writes travel this path too, so a stopped session's Redis
+/// `hash_rate` fades R → R/2 → 0 exactly like the PG column; after the
+/// drop the key simply ages out on its touch-derived TTL (no DEL — the
+/// sampler must not shorten liveness any more than it may extend it).
+pub(crate) async fn sample_and_write(
+    sampler: &HashrateSampler,
+    pool: &PgPool,
+    window_secs: f64,
+    live: Option<&LiveSessionStore>,
+) {
     let writes = sampler.sample(window_secs);
     if writes.is_empty() {
         return;
+    }
+
+    if let Some(store) = live {
+        if let Err(e) = store.write_hashrate_batch(&writes).await {
+            warn!(
+                error = %e,
+                sampled = writes.len(),
+                "live-session Redis hashrate write failed; hashes stale until next window"
+            );
+        }
     }
     let n = writes.len();
     let mut addresses = Vec::with_capacity(n);
@@ -212,6 +233,7 @@ async fn sample_and_write(sampler: &HashrateSampler, pool: &PgPool, window_secs:
 pub(crate) async fn run_sample_loop(
     sampler: Arc<HashrateSampler>,
     pool: PgPool,
+    live: Option<Arc<LiveSessionStore>>,
     sample_interval: Duration,
     reconcile_on_boot: bool,
     mut shutdown_rx: oneshot::Receiver<()>,
@@ -235,7 +257,7 @@ pub(crate) async fn run_sample_loop(
                 let now = Instant::now();
                 let elapsed = now.saturating_duration_since(last_tick).as_secs_f64();
                 last_tick = now;
-                sample_and_write(&sampler, &pool, elapsed).await;
+                sample_and_write(&sampler, &pool, elapsed, live.as_deref()).await;
             }
             _ = &mut shutdown_rx => {
                 debug!("hashrate sample loop received shutdown");

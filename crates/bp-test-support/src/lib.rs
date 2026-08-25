@@ -420,6 +420,12 @@ pub mod redis_db {
     pub const RT_SPLIT_E2E: u16 = 12 * RANGE;
     pub const RT_POOL_NEUTRAL_PAYOUT: u16 = 13 * RANGE;
     pub const RT_GROUP_SOLO_BLOCK_SUBMIT: u16 = 14 * RANGE;
+
+    /// `bp-session-persistence`'s `live_store_integration`. ⚠️ This is
+    /// the LAST free 32-slice of the 512-DB test container
+    /// (`15 * 32 + 31 = 511`) — the next binary that needs a base must
+    /// recreate `bp-test-redis` with `--databases` raised past 512.
+    pub const SESSION_PERSISTENCE: u16 = 15 * RANGE;
 }
 
 /// How many logical databases this Redis actually has.

@@ -79,7 +79,10 @@ const KILL_DEAD_TICK: Duration = Duration::from_secs(60);
 
 /// Staleness cutoff for the `kill_dead_clients` sweep — sessions
 /// whose `updatedAt` is older than this are eligible for soft-delete.
-const STALE_CLIENT_TTL: Duration = Duration::from_secs(5 * 60);
+/// Also wired into the session-persistence engine as the TTL of the
+/// `client:live:*` Redis hashes, so the two liveness definitions run on
+/// the same clock (see `engines::spawn_session_persistence`).
+pub(crate) const STALE_CLIENT_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Per-cron startup phase offsets (seconds) — picked as small prime
 /// numbers so concurrent tick collisions across compound periods are

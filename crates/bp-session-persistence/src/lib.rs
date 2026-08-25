@@ -28,6 +28,7 @@ pub mod engine;
 pub mod error;
 mod hashrate_sampler;
 pub mod hooks;
+mod live_store;
 mod row_debounce;
 mod touch_buffer;
 

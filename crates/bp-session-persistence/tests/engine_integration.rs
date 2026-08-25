@@ -68,9 +68,10 @@ async fn engine_session_persistence_hook_debounces_then_soft_deletes() {
     let prefix = "test_sp_eng_";
     cleanup(&pool, prefix).await;
 
-    let handle = SessionPersistenceEngine::spawn(SessionPersistenceConfig::default(), pool.clone())
-        .await
-        .expect("spawn engine");
+    let handle =
+        SessionPersistenceEngine::spawn(SessionPersistenceConfig::default(), pool.clone(), None)
+            .await
+            .expect("spawn engine");
     let hook = handle.session_persistence_hook();
     let address = format!("{prefix}alice");
 
@@ -152,9 +153,10 @@ async fn a_probe_session_leaves_no_row_while_a_survivor_gets_one() {
     let prefix = "test_sp_probe_";
     cleanup(&pool, prefix).await;
 
-    let handle = SessionPersistenceEngine::spawn(SessionPersistenceConfig::default(), pool.clone())
-        .await
-        .expect("spawn engine");
+    let handle =
+        SessionPersistenceEngine::spawn(SessionPersistenceConfig::default(), pool.clone(), None)
+            .await
+            .expect("spawn engine");
     let hook = handle.session_persistence_hook();
     let address = format!("{prefix}carol");
 
@@ -199,9 +201,10 @@ async fn two_workers_on_one_session_both_get_rows_and_one_teardown_retires_both(
     let prefix = "test_sp_twoworker_";
     cleanup(&pool, prefix).await;
 
-    let handle = SessionPersistenceEngine::spawn(SessionPersistenceConfig::default(), pool.clone())
-        .await
-        .expect("spawn engine");
+    let handle =
+        SessionPersistenceEngine::spawn(SessionPersistenceConfig::default(), pool.clone(), None)
+            .await
+            .expect("spawn engine");
     let hook = handle.session_persistence_hook();
     let address = format!("{prefix}dave");
 
@@ -253,9 +256,10 @@ async fn a_poisoned_birth_row_is_isolated_and_dropped_after_bounded_retries() {
     let prefix = "test_sp_poison_";
     cleanup(&pool, prefix).await;
 
-    let handle = SessionPersistenceEngine::spawn(SessionPersistenceConfig::default(), pool.clone())
-        .await
-        .expect("spawn engine");
+    let handle =
+        SessionPersistenceEngine::spawn(SessionPersistenceConfig::default(), pool.clone(), None)
+            .await
+            .expect("spawn engine");
     let hook = handle.session_persistence_hook();
     let address = format!("{prefix}eve");
     let oversized_worker = "w".repeat(65); // varchar(64) → 22001
@@ -314,9 +318,10 @@ async fn engine_re_register_under_same_session_id_clears_soft_delete() {
     let prefix = "test_sp_reuse_";
     cleanup(&pool, prefix).await;
 
-    let handle = SessionPersistenceEngine::spawn(SessionPersistenceConfig::default(), pool.clone())
-        .await
-        .expect("spawn engine");
+    let handle =
+        SessionPersistenceEngine::spawn(SessionPersistenceConfig::default(), pool.clone(), None)
+            .await
+            .expect("spawn engine");
     let hook = handle.session_persistence_hook();
     let address = format!("{prefix}bob");
 
@@ -354,7 +359,7 @@ async fn engine_invalid_config_rejected() {
         touch_flush_interval: Duration::ZERO,
         ..Default::default()
     };
-    let result = SessionPersistenceEngine::spawn(bad, pool).await;
+    let result = SessionPersistenceEngine::spawn(bad, pool, None).await;
     assert!(result.is_err());
 }
 
@@ -367,7 +372,7 @@ async fn engine_shutdown_is_a_drop_no_op() {
         return;
     };
     {
-        let _h = SessionPersistenceEngine::spawn(SessionPersistenceConfig::default(), pool)
+        let _h = SessionPersistenceEngine::spawn(SessionPersistenceConfig::default(), pool, None)
             .await
             .expect("spawn");
         // Goes out of scope here without an explicit shutdown.
@@ -410,6 +415,7 @@ async fn diff_stats_sink_keeps_per_slot_maximum() {
             ..Default::default()
         },
         pool.clone(),
+        None,
     )
     .await
     .expect("spawn engine");

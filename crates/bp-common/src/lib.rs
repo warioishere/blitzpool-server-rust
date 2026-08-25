@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 pub mod extranonce;
 pub use extranonce::{ExtranonceAllocator, ExtranonceError};
 
+pub mod live_client_key;
+
 #[cfg(feature = "sqlx")]
 mod sqlx_impls;
 

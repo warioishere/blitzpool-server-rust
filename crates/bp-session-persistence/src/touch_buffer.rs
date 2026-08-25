@@ -27,6 +27,8 @@ use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
 
+use crate::live_store::LiveSessionStore;
+
 /// Buffer key. Matches the natural PK of the per-share UPDATE
 /// (address + clientName + sessionId).
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -205,13 +207,35 @@ impl TouchBuffer {
     }
 }
 
-/// One flush pass. Drains the buffer, executes the bulk UPDATE, and
-/// rebuffers the snapshot if the UPDATE fails. Returns the number of
-/// rows the DB reported affected.
-async fn flush_once(buffer: &TouchBuffer, pool: &PgPool) -> u64 {
+/// One flush pass. Drains the buffer, mirrors the snapshot into the
+/// Redis live hashes, executes the bulk UPDATE, and rebuffers the
+/// snapshot if the UPDATE fails. Returns the number of rows the DB
+/// reported affected.
+///
+/// The two writes are independent by design. A Redis failure never
+/// touches the PG path or the rebuffer decision (a dropped batch costs
+/// nothing durable — the next flush rewrites the same fields, and
+/// `best_difficulty` is max-merged server-side). Conversely a PG
+/// failure doesn't hold the Redis mirror back: the rebuffered snapshot
+/// re-flushes the same values, which is idempotent on the Redis side.
+pub(crate) async fn flush_once(
+    buffer: &TouchBuffer,
+    pool: &PgPool,
+    live: Option<&LiveSessionStore>,
+) -> u64 {
     let snapshot = buffer.drain();
     if snapshot.is_empty() {
         return 0;
+    }
+
+    if let Some(store) = live {
+        if let Err(e) = store.write_touch_batch(&snapshot).await {
+            warn!(
+                error = %e,
+                buffered = snapshot.len(),
+                "live-session Redis touch write failed; hashes stale until next flush"
+            );
+        }
     }
 
     let n = snapshot.len();
@@ -267,6 +291,7 @@ async fn flush_once(buffer: &TouchBuffer, pool: &PgPool) -> u64 {
 pub(crate) async fn run_flush_loop(
     buffer: std::sync::Arc<TouchBuffer>,
     pool: PgPool,
+    live: Option<std::sync::Arc<LiveSessionStore>>,
     flush_interval: Duration,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
@@ -275,7 +300,7 @@ pub(crate) async fn run_flush_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                flush_once(&buffer, &pool).await;
+                flush_once(&buffer, &pool, live.as_deref()).await;
             }
             _ = &mut shutdown_rx => {
                 debug!("client touch flush loop received shutdown");
@@ -283,7 +308,10 @@ pub(crate) async fn run_flush_loop(
             }
         }
     }
-    let drained = flush_once(&buffer, &pool).await;
+    // The shutdown drain mirrors to Redis too — it is the last TTL
+    // refresh those sessions get, after which they age out on the TTL
+    // exactly as their PG `updatedAt` freezes until the sweep.
+    let drained = flush_once(&buffer, &pool, live.as_deref()).await;
     debug!(final_drained = drained, "client touch flush loop exited");
 }
 
