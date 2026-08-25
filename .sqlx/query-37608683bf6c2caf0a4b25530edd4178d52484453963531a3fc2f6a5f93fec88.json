@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"userAgent\" AS \"user_agent?\",\n            \"startTime\" AS \"start_time!\"\n           FROM client_entity\n           WHERE \"updatedAt\" < $1 AND \"deletedAt\" IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "client_name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "session_id!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "user_agent?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "start_time!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "37608683bf6c2caf0a4b25530edd4178d52484453963531a3fc2f6a5f93fec88"
+}

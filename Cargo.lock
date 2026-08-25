@@ -485,6 +485,7 @@ dependencies = [
  "bp-api",
  "bp-bitcoin",
  "bp-blockparty-engine",
+ "bp-client-live",
  "bp-coinbase-snapshot",
  "bp-common",
  "bp-config",

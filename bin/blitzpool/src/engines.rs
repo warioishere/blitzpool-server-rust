@@ -167,10 +167,7 @@ pub(crate) async fn spawn(
     let pplns = spawn_pplns(cfg, handles, read_only).await?;
     let group_solo = spawn_group_solo(cfg, handles, read_only).await?;
     let stats = spawn_stats(cfg, handles).await?;
-    // Only the Front role feeds + writes hashRate, so only it reconciles
-    // stale hashRate on boot (see run_sample_loop); a non-writing role
-    // zeroing the column would wipe the Front's live values.
-    let session_persistence = spawn_session_persistence(handles, cfg.has_role(Role::Front)).await?;
+    let session_persistence = spawn_session_persistence(handles).await?;
 
     // Only the front builds the Stratum fan-out sinks, and it always produces
     // to the Redis streams (the Satellite consumes them). A pure back / api
@@ -393,17 +390,14 @@ async fn spawn_stats(
 
 async fn spawn_session_persistence(
     handles: &FoundationHandles,
-    reconcile_hashrate_on_boot: bool,
 ) -> Result<SessionPersistenceEngineHandle, EngineError> {
     let cfg = SessionPersistenceConfig {
-        reconcile_hashrate_on_boot,
         // Same clock as the kill_dead_clients sweep: a session's live
-        // hash expires exactly when its PG row becomes sweep-eligible.
+        // hash expires exactly when its birth row becomes sweep-eligible.
         live_ttl: crate::crons::STALE_CLIENT_TTL,
         ..SessionPersistenceConfig::default()
     };
     info!(
-        reconcile_hashrate_on_boot,
         live_ttl_secs = cfg.live_ttl.as_secs(),
         "session-persistence: spawning engine"
     );

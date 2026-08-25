@@ -89,7 +89,6 @@ pub use blockparty::{
     BlockpartyGroupRow, BlockpartyJoinLinkRow, BlockpartyMemberRow, BlockpartySplitSnapshot,
 };
 pub use client::{
-    bulk_set_client_hashrate, bulk_touch_clients_for_share,
     bulk_upsert_client_difficulty_statistics, bulk_upsert_clients, delete_client_for_session,
     delete_old_client_difficulty_statistics, delete_old_client_rejected_statistics,
     delete_old_client_statistics, delete_old_clients, delete_old_pool_mode_hashrate,
@@ -98,7 +97,7 @@ pub use client::{
     find_client_rejected_statistics_since_for_address, find_client_statistics,
     find_client_statistics_since, find_client_statistics_since_for_address,
     find_clients_by_address, find_pool_worker_rows_since, find_session_keys_for_addresses,
-    find_worker_shares, kill_dead_clients, reset_all_client_hashrate, touch_client_for_share,
+    find_stale_active_sessions, find_worker_shares, soft_delete_sessions,
     update_sv2_user_agent_by_address, upsert_client, ClientDifficultyStatisticsRow,
     ClientRejectedStatisticsRow, ClientRow, ClientStatisticsRow, ClientUpsert, DeviceFirstSeenRow,
     PoolWorkerRow, WorkerSharesRow,

@@ -202,7 +202,6 @@ fn to_upsert(key: &TouchKey, row: &PendingRow) -> ClientUpsert {
         session_id: key.session_id.clone(),
         user_agent: row.user_agent.clone(),
         start_time_ms: row.start_time_ms,
-        current_difficulty: None,
     }
 }
 

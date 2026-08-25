@@ -12,10 +12,10 @@
 //!
 //! - `RowDebounce` → one bulk `INSERT … ON CONFLICT` for the due row
 //!   births every `row_flush_interval` (default 5 s).
-//! - `TouchBuffer` → one bulk `UPDATE client_entity … FROM unnest(...)`
-//!   every `touch_flush_interval` (default 30 s).
-//! - `HashrateSampler` → one bulk `UPDATE client_entity` per
-//!   `hashrate_sample_interval` (default 60 s).
+//! - `TouchBuffer` → one batched write into the `client:live:*` Redis
+//!   hashes every `touch_flush_interval` (default 30 s).
+//! - `HashrateSampler` → one batched `hash_rate` write into the same
+//!   hashes per `hashrate_sample_interval` (default 60 s).
 //! - `DiffStatBuffer` → one bulk upsert into
 //!   `client_difficulty_statistics_entity` every
 //!   `diff_stat_flush_interval` (default 30 s). Batched since 2026-08-05;
@@ -55,15 +55,21 @@ impl SessionPersistenceEngine {
     /// [`Self::spawn`] for the production path; this is for unit tests
     /// that wire the hooks but don't need the flusher.
     ///
-    /// `redis` enables the `client:live:*` mirror of the share hot path
-    /// (see [`crate::live_store`]); `None` is the off switch — every PG
-    /// write behaves identically either way.
+    /// `redis` carries the `client:live:*` live store the share hot
+    /// path writes into (see [`crate::live_store`]). `None` degrades the
+    /// engine to births/soft-deletes/diff-stats only — the live session
+    /// stats are dropped with a warning, never buffered unboundedly.
     pub fn new(
         config: SessionPersistenceConfig,
         pool: PgPool,
         redis: Option<ConnectionManager>,
     ) -> Result<Self, SessionPersistenceError> {
         config.validate()?;
+        if redis.is_none() {
+            warn!(
+                "session-persistence: no Redis handle — live session stats will not be published"
+            );
+        }
         let live_store = redis.map(|conn| Arc::new(LiveSessionStore::new(conn, config.live_ttl)));
         Ok(Self {
             pool,
@@ -119,7 +125,6 @@ impl SessionPersistenceEngine {
         let (touch_tx, touch_rx) = oneshot::channel();
         let touch_join = tokio::spawn(run_flush_loop(
             self.touch_buffer.clone(),
-            self.pool.clone(),
             self.live_store.clone(),
             self.config.touch_flush_interval,
             touch_rx,
@@ -128,10 +133,8 @@ impl SessionPersistenceEngine {
         let (sampler_tx, sampler_rx) = oneshot::channel();
         let sampler_join = tokio::spawn(run_sample_loop(
             self.hashrate_sampler.clone(),
-            self.pool.clone(),
             self.live_store.clone(),
             self.config.hashrate_sample_interval,
-            self.config.reconcile_hashrate_on_boot,
             sampler_rx,
         ));
 
@@ -217,13 +220,12 @@ impl SessionPersistenceEngineHandle {
         crate::row_debounce::flush_once(&self.row_debounce, &self.pool, self.row_debounce_age).await
     }
 
-    /// Run one touch-flush pass — exactly what a timer tick does (PG
-    /// bulk UPDATE + Redis live-hash mirror). The deterministic drain
-    /// the integration tests use; harmless in production, it writes the
-    /// same data a tick would, just earlier.
+    /// Run one touch-flush pass — exactly what a timer tick does
+    /// (batched write into the `client:live:*` hashes). The
+    /// deterministic drain the integration tests use; harmless in
+    /// production, it writes the same data a tick would, just earlier.
     pub async fn flush_touches_now(&self) -> u64 {
-        crate::touch_buffer::flush_once(&self.touch_buffer, &self.pool, self.live_store.as_deref())
-            .await
+        crate::touch_buffer::flush_once(&self.touch_buffer, self.live_store.as_deref()).await
     }
 
     /// Close one hashrate sample window over `window_secs` — exactly
@@ -232,14 +234,13 @@ impl SessionPersistenceEngineHandle {
     pub async fn sample_hashrate_now(&self, window_secs: f64) {
         crate::hashrate_sampler::sample_and_write(
             &self.hashrate_sampler,
-            &self.pool,
             window_secs,
             self.live_store.as_deref(),
         )
         .await
     }
 
-    /// Hook impl that touches the per-session `client_entity` row on
+    /// Hook impl that touches the per-session `client:live:*` hash on
     /// every accepted share. Writes are buffered and flushed every
     /// `touch_flush_interval` (default 30s) by the engine's background
     /// task.

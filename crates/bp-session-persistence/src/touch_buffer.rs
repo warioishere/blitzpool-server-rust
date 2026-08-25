@@ -3,26 +3,27 @@
 //! Buffered share-touch flusher.
 //!
 //! On the share hot path we collect per-session updates (best-diff sample,
-//! current vardiff target, channel count, `updatedAt`) in a shared
+//! current vardiff target, channel count, last-seen) in a shared
 //! [`TouchBuffer`] and flush them every [`flush_interval`](super::config)
-//! via a single bulk `UPDATE ... FROM unnest(...)` statement, instead of
-//! N synchronous DB hits per second on a busy pool.
+//! into the per-session `client:live:*` Redis hashes (see
+//! [`crate::live_store`]), instead of N synchronous writes per second on
+//! a busy pool. Postgres holds only the birth row; nothing here touches
+//! it.
 //!
 //! Buffer collapses duplicates per `(address, clientName, sessionId)` —
-//! the latest sample wins for `currentDifficulty`/`channelCount`/`updatedAt`,
-//! the maximum wins for `bestDifficulty`. On flush failure, the snapshot
-//! is folded back into the live buffer for retry on the next tick.
+//! the latest sample wins for `current_difficulty`/`channel_count`/
+//! `updated_at`, the maximum wins for `best_difficulty`. On flush
+//! failure, the snapshot is folded back into the live buffer for retry
+//! on the next tick.
 //!
-//! `hashRate` is **not** handled here — it's owned by the
+//! `hash_rate` is **not** handled here — it's owned by the
 //! [`crate::hashrate_sampler`], which writes a self-zeroing 2-min moving
 //! average on its own cadence. Writing it from both paths would let the
 //! 30s touch flush clobber the sampler's value every other tick.
 
 use std::sync::Mutex;
 
-use bp_db::bulk_touch_clients_for_share;
 use hashbrown::{Equivalent, HashMap};
-use sqlx::PgPool;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
@@ -207,77 +208,37 @@ impl TouchBuffer {
     }
 }
 
-/// One flush pass. Drains the buffer, mirrors the snapshot into the
-/// Redis live hashes, executes the bulk UPDATE, and rebuffers the
-/// snapshot if the UPDATE fails. Returns the number of rows the DB
-/// reported affected.
+/// One flush pass. Drains the buffer, writes the snapshot into the
+/// `client:live:*` Redis hashes, and rebuffers it if the write fails
+/// (the merge rules are commutative, so folding back and retrying next
+/// tick loses nothing). Returns the number of sessions written.
 ///
-/// The two writes are independent by design. A Redis failure never
-/// touches the PG path or the rebuffer decision (a dropped batch costs
-/// nothing durable — the next flush rewrites the same fields, and
-/// `best_difficulty` is max-merged server-side). Conversely a PG
-/// failure doesn't hold the Redis mirror back: the rebuffered snapshot
-/// re-flushes the same values, which is idempotent on the Redis side.
-pub(crate) async fn flush_once(
-    buffer: &TouchBuffer,
-    pool: &PgPool,
-    live: Option<&LiveSessionStore>,
-) -> u64 {
+/// Without a live store there is nothing to write TO: the snapshot is
+/// dropped with a warning rather than rebuffered — a buffer nobody ever
+/// drains would grow without bound.
+pub(crate) async fn flush_once(buffer: &TouchBuffer, live: Option<&LiveSessionStore>) -> u64 {
     let snapshot = buffer.drain();
     if snapshot.is_empty() {
         return 0;
     }
-
-    if let Some(store) = live {
-        if let Err(e) = store.write_touch_batch(&snapshot).await {
-            warn!(
-                error = %e,
-                buffered = snapshot.len(),
-                "live-session Redis touch write failed; hashes stale until next flush"
-            );
-        }
-    }
-
     let n = snapshot.len();
-    let mut addresses = Vec::with_capacity(n);
-    let mut client_names = Vec::with_capacity(n);
-    let mut session_ids = Vec::with_capacity(n);
-    let mut share_diffs = Vec::with_capacity(n);
-    let mut current_diffs = Vec::with_capacity(n);
-    let mut channel_counts = Vec::with_capacity(n);
-    let mut updated_ats = Vec::with_capacity(n);
-
-    for (k, v) in &snapshot {
-        addresses.push(k.address.clone());
-        client_names.push(k.client_name.clone());
-        session_ids.push(k.session_id.clone());
-        share_diffs.push(v.share_diff);
-        current_diffs.push(v.current_diff);
-        channel_counts.push(v.channel_count);
-        updated_ats.push(v.updated_at_ms);
-    }
-
-    match bulk_touch_clients_for_share(
-        pool,
-        &addresses,
-        &client_names,
-        &session_ids,
-        &share_diffs,
-        &current_diffs,
-        &channel_counts,
-        &updated_ats,
-    )
-    .await
-    {
-        Ok(rows) => {
-            debug!(buffered = n, affected = rows, "client touch buffer flushed");
-            rows
+    let Some(store) = live else {
+        warn!(
+            dropped = n,
+            "no live store configured; session touch samples dropped"
+        );
+        return 0;
+    };
+    match store.write_touch_batch(&snapshot).await {
+        Ok(()) => {
+            debug!(buffered = n, "client touch buffer flushed to live hashes");
+            n as u64
         }
         Err(e) => {
             warn!(
                 error = %e,
                 buffered = n,
-                "client touch buffer flush failed; rebuffering for retry"
+                "live-session touch write failed; rebuffering for retry"
             );
             buffer.rebuffer(snapshot);
             0
@@ -290,7 +251,6 @@ pub(crate) async fn flush_once(
 /// the residual buffer.
 pub(crate) async fn run_flush_loop(
     buffer: std::sync::Arc<TouchBuffer>,
-    pool: PgPool,
     live: Option<std::sync::Arc<LiveSessionStore>>,
     flush_interval: Duration,
     mut shutdown_rx: oneshot::Receiver<()>,
@@ -300,7 +260,7 @@ pub(crate) async fn run_flush_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                flush_once(&buffer, &pool, live.as_deref()).await;
+                flush_once(&buffer, live.as_deref()).await;
             }
             _ = &mut shutdown_rx => {
                 debug!("client touch flush loop received shutdown");
@@ -308,10 +268,9 @@ pub(crate) async fn run_flush_loop(
             }
         }
     }
-    // The shutdown drain mirrors to Redis too — it is the last TTL
-    // refresh those sessions get, after which they age out on the TTL
-    // exactly as their PG `updatedAt` freezes until the sweep.
-    let drained = flush_once(&buffer, &pool, live.as_deref()).await;
+    // The shutdown drain is the last TTL refresh those sessions get;
+    // afterwards they age out on the TTL like any silent session.
+    let drained = flush_once(&buffer, live.as_deref()).await;
     debug!(final_drained = drained, "client touch flush loop exited");
 }
 

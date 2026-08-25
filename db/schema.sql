@@ -139,11 +139,7 @@ CREATE TABLE public.client_entity (
     "sessionId" character varying(8) NOT NULL,
     "userAgent" character varying(128),
     "startTime" bigint NOT NULL,
-    "firstSeen" bigint,
-    "bestDifficulty" real DEFAULT '0'::real NOT NULL,
-    "hashRate" double precision DEFAULT '0'::double precision NOT NULL,
-    "currentDifficulty" real,
-    "channelCount" integer DEFAULT 1 NOT NULL
+    "firstSeen" bigint
 );
 
 

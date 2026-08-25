@@ -2,7 +2,8 @@
 
 //! Live per-session hashrate sampler.
 //!
-//! Owns the `client_entity.hashRate` column. On every accepted share we
+//! Owns the `hash_rate` field of the `client:live:*` hashes. On every
+//! accepted share we
 //! accumulate the share's **credited** difficulty (`effective_difficulty`)
 //! into a persistent per-session bucket. Every `sample_interval`
 //! (default 60 s) each bucket is turned into a hashrate estimate
@@ -25,13 +26,11 @@
 //! two empty windows (R → R/2 → 0); the entry is kept one window longer to
 //! re-write the 0 (a retry if the terminal write failed), then dropped.
 //! That is what makes the reported hashrate self-zeroing and
-//! reconnect-immune without waiting for `kill_dead_clients` to sweep the row.
+//! reconnect-immune without waiting for the key's TTL to expire.
 
 use std::sync::{Arc, Mutex};
 
-use bp_db::{bulk_set_client_hashrate, reset_all_client_hashrate};
 use hashbrown::HashMap;
-use sqlx::PgPool;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
@@ -49,7 +48,7 @@ const HASH_PER_DIFFICULTY_1: f64 = 4_294_967_296.0;
 /// (R → R/2 → 0); we keep the session for a third window that re-writes the
 /// 0, so a transient DB failure on the terminal 0-write gets one automatic
 /// retry before the entry is dropped (the entry going stale otherwise would
-/// freeze a dead rig at R/2 until `kill_dead_clients` sweeps it).
+/// freeze a dead rig at R/2 until the key's TTL expires).
 const MAX_EMPTY_WINDOWS: u32 = 3;
 
 /// Per-session sampling state. Persists across windows so a stopped
@@ -157,18 +156,16 @@ impl HashrateSampler {
     }
 }
 
-/// One sample pass: close windows, mirror the writes into the Redis
-/// live hashes, then persist them in one bulk UPDATE. On failure of
-/// either write the values are simply stale until the next window
+/// One sample pass: close windows, write the rates into the Redis live
+/// hashes. On failure the values are simply stale until the next window
 /// overwrites them — a hashrate estimate is ephemeral, so (unlike a
-/// best-difficulty sample) there's nothing to rebuffer, on either side.
-/// The fade writes travel this path too, so a stopped session's Redis
-/// `hash_rate` fades R → R/2 → 0 exactly like the PG column; after the
-/// drop the key simply ages out on its touch-derived TTL (no DEL — the
-/// sampler must not shorten liveness any more than it may extend it).
+/// best-difficulty sample) there's nothing to rebuffer. The fade writes
+/// travel this path too, so a stopped session's `hash_rate` fades
+/// R → R/2 → 0; after the drop the key simply ages out on its
+/// touch-derived TTL (no DEL — the sampler must not shorten liveness
+/// any more than it may extend it).
 pub(crate) async fn sample_and_write(
     sampler: &HashrateSampler,
-    pool: &PgPool,
     window_secs: f64,
     live: Option<&LiveSessionStore>,
 ) {
@@ -176,41 +173,18 @@ pub(crate) async fn sample_and_write(
     if writes.is_empty() {
         return;
     }
-
-    if let Some(store) = live {
-        if let Err(e) = store.write_hashrate_batch(&writes).await {
-            warn!(
-                error = %e,
-                sampled = writes.len(),
-                "live-session Redis hashrate write failed; hashes stale until next window"
-            );
-        }
-    }
-    let n = writes.len();
-    let mut addresses = Vec::with_capacity(n);
-    let mut client_names = Vec::with_capacity(n);
-    let mut session_ids = Vec::with_capacity(n);
-    let mut hash_rates = Vec::with_capacity(n);
-    // Consume `writes` by value: `sample()` already cloned each key out of
-    // the map, so move those Strings into the columnar vecs instead of
-    // cloning them a second time.
-    for (k, hr) in writes {
-        addresses.push(k.address);
-        client_names.push(k.client_name);
-        session_ids.push(k.session_id);
-        hash_rates.push(hr);
-    }
-    match bulk_set_client_hashrate(pool, &addresses, &client_names, &session_ids, &hash_rates).await
-    {
-        Ok(rows) => debug!(
-            sampled = n,
-            affected = rows,
+    let Some(store) = live else {
+        return;
+    };
+    match store.write_hashrate_batch(&writes).await {
+        Ok(()) => debug!(
+            sampled = writes.len(),
             "hashrate sampler flushed live rates"
         ),
         Err(e) => warn!(
             error = %e,
-            sampled = n,
-            "hashrate sampler write failed; values stale until next window"
+            sampled = writes.len(),
+            "live-session hashrate write failed; values stale until next window"
         ),
     }
 }
@@ -222,31 +196,19 @@ pub(crate) async fn sample_and_write(
 /// runtime stall that would understate elapsed and overstate the rate.
 /// Missed ticks are skipped rather than burst-fired.
 ///
-/// When `reconcile_on_boot` is set (the Front role — the sole hashRate
-/// writer), it first zeroes any hashRate the previous process left in the
-/// DB: the in-memory map starts empty, so a session that never reconnects
-/// would otherwise keep its stale value (and stay summed into the pool
-/// total) until `kill_dead_clients` sweeps it.
+/// No boot reconcile any more: a previous process's leftover rates live
+/// in TTL'd Redis keys that age out on their own within minutes — the
+/// ghost-value problem the old PG column needed a startup reset for
+/// cannot exist here.
 ///
 /// Returns when `shutdown_rx` resolves — no final flush, the values are
 /// ephemeral and recomputed from live shares on the next boot.
 pub(crate) async fn run_sample_loop(
     sampler: Arc<HashrateSampler>,
-    pool: PgPool,
     live: Option<Arc<LiveSessionStore>>,
     sample_interval: Duration,
-    reconcile_on_boot: bool,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
-    if reconcile_on_boot {
-        match reset_all_client_hashrate(&pool).await {
-            Ok(n) => debug!(
-                cleared = n,
-                "hashrate sampler: zeroed stale hashRate on boot"
-            ),
-            Err(e) => warn!(error = %e, "hashrate sampler: boot hashRate reset failed"),
-        }
-    }
     let start = Instant::now() + sample_interval;
     let mut ticker = tokio::time::interval_at(start, sample_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -257,7 +219,7 @@ pub(crate) async fn run_sample_loop(
                 let now = Instant::now();
                 let elapsed = now.saturating_duration_since(last_tick).as_secs_f64();
                 last_tick = now;
-                sample_and_write(&sampler, &pool, elapsed, live.as_deref()).await;
+                sample_and_write(&sampler, elapsed, live.as_deref()).await;
             }
             _ = &mut shutdown_rx => {
                 debug!("hashrate sample loop received shutdown");

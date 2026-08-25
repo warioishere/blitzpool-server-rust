@@ -2,11 +2,11 @@
 
 #![allow(clippy::print_stderr)]
 
-//! Dual-write integration tests for the `client:live:*` mirror: every
-//! touch flush and sampler pass must land in BOTH Postgres and the
-//! per-session Redis hash, with the TTL semantics the live store
-//! promises (touch refreshes liveness, the sampler never does), and a
-//! Redis outage must never touch the PG path.
+//! Integration tests for the `client:live:*` live store: every touch
+//! flush and sampler pass must land in the per-session Redis hash with
+//! the TTL semantics the store promises (touch refreshes liveness, the
+//! sampler never does), and a Redis outage must never hang the flush or
+//! touch the PG birth path.
 //!
 //! Needs `bp-test-pg` (15433) and `bp-test-redis` (16379) — every test
 //! skips when a service is unreachable, so watch the passed-count.
@@ -141,18 +141,9 @@ async fn touch_flush_dual_writes_hash_and_ttl() {
         .await;
 
     let rows = handle.flush_touches_now().await;
-    assert_eq!(rows, 1, "touch flush must hit the born PG row");
+    assert_eq!(rows, 1, "flush reports the session it wrote");
 
-    // PG got the touch.
-    let best: f32 =
-        sqlx::query_scalar(r#"SELECT "bestDifficulty" FROM client_entity WHERE "sessionId" = $1"#)
-            .bind("sessL001")
-            .fetch_one(&pool)
-            .await
-            .expect("PG best");
-    assert!((best - 100.5).abs() < 0.01, "PG bestDifficulty, got {best}");
-
-    // Redis got the mirror.
+    // Redis got the touch.
     let key = client_live_key(&address, "rig1", "sessL001");
     let hash = hgetall(&mut redis, &key).await;
     assert_eq!(
@@ -230,23 +221,14 @@ async fn best_difficulty_is_monotone_across_flushes() {
         "a lower later window must not regress best_difficulty"
     );
 
-    // PG agrees via GREATEST.
-    let best: f32 =
-        sqlx::query_scalar(r#"SELECT "bestDifficulty" FROM client_entity WHERE "sessionId" = $1"#)
-            .bind("sessL002")
-            .fetch_one(&pool)
-            .await
-            .expect("PG best");
-    assert!((best - 100.0).abs() < 0.01, "PG GREATEST, got {best}");
-
     handle.shutdown().await;
     cleanup(&pool, prefix).await;
 }
 
 /// The sampler's write must NOT extend a session's liveness — that is
-/// the touch path's job, exactly as `bulk_set_client_hashrate`
-/// deliberately does not bump `updatedAt` in PG. An unconditional
-/// EXPIRE in the hashrate script would reset the 10 s TTL to 300.
+/// the touch path's job (the sampler keeps writing fades for minutes
+/// after the shares stop). An unconditional EXPIRE in the hashrate
+/// script would reset the 10 s TTL to 300.
 #[tokio::test]
 async fn hashrate_write_does_not_refresh_liveness() {
     let Some(pool) = pg_or_skip().await else {
@@ -347,13 +329,14 @@ async fn hashrate_write_on_fresh_key_sets_ttl() {
     cleanup(&pool, prefix).await;
 }
 
-/// A dead Redis must cost nothing but a warning: the PG touch flush has
-/// to land and the call has to return. The connection is established
-/// through a local TCP proxy that is killed after connect — a
-/// `ConnectionManager` cannot be built against an address that never
+/// A dead Redis must cost nothing but a warning: the flush call has to
+/// RETURN (rebuffering its snapshot for the next tick) and the PG birth
+/// path must stay untouched by the outage. The connection is
+/// established through a local TCP proxy that is killed after connect —
+/// a `ConnectionManager` cannot be built against an address that never
 /// accepted.
 #[tokio::test]
-async fn redis_down_does_not_break_pg_flush() {
+async fn redis_down_does_not_hang_the_flush() {
     let Some(pool) = pg_or_skip().await else {
         return;
     };
@@ -432,15 +415,19 @@ async fn redis_down_does_not_break_pg_flush() {
     let rows = tokio::time::timeout(Duration::from_secs(10), handle.flush_touches_now())
         .await
         .expect("flush must not hang on a dead Redis");
-    assert_eq!(rows, 1, "the PG touch must land although Redis is gone");
+    assert_eq!(
+        rows, 0,
+        "nothing written — the snapshot is rebuffered for retry"
+    );
 
-    let best: f32 =
-        sqlx::query_scalar(r#"SELECT "bestDifficulty" FROM client_entity WHERE "sessionId" = $1"#)
+    // The PG birth path is untouched by the Redis outage.
+    let born: i64 =
+        sqlx::query_scalar(r#"SELECT count(*) FROM client_entity WHERE "sessionId" = $1"#)
             .bind("sessL005")
             .fetch_one(&pool)
             .await
-            .expect("PG best");
-    assert!((best - 100.0).abs() < 0.01, "PG got the touch, got {best}");
+            .expect("birth row");
+    assert_eq!(born, 1, "the birth landed although Redis is gone");
 
     handle.shutdown().await;
     cleanup(&pool, prefix).await;

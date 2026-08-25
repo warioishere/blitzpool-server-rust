@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 
 # Foundation handles spawned by `boot.rs`.
 bp-db = { workspace = true }
+bp-client-live = { workspace = true }
 bp-bitcoin = { workspace = true }
 bp-geoip = { workspace = true }
 bp-metrics = { workspace = true }

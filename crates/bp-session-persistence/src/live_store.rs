@@ -14,8 +14,8 @@
 //!   key** — the sampler keeps writing fades for up to 3 windows after
 //!   the shares stop, and letting those writes refresh the TTL would
 //!   extend a dead session's liveness past the touch-derived rule
-//!   (mirror of `bulk_set_client_hashrate` deliberately not bumping
-//!   `updatedAt`).
+//!   (the same split the old PG columns had: the hashrate writer never
+//!   bumped `updatedAt`).
 //!
 //! Both writes are Lua scripts so HSET and EXPIRE land as one
 //! indivisible step: prod Redis runs `volatile-lru`, where a key that
@@ -31,6 +31,12 @@ use bp_common::live_client_key::client_live_key;
 use hashbrown::HashMap;
 use redis::aio::ConnectionManager;
 use tokio::time::Duration;
+
+/// Upper bound for one script invocation. A manager mid-reconnect makes
+/// callers await its full retry ladder (minutes on redis-rs 0.27's
+/// defaults); the flush loops — and the shutdown drain — must fail fast
+/// and rebuffer instead of stalling on it.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::touch_buffer::{TouchEntry, TouchKey};
 
@@ -153,8 +159,13 @@ impl LiveSessionStore {
         for arg in &batch.args {
             invocation.arg(arg);
         }
-        let _: i64 = invocation.invoke_async(&mut conn).await?;
-        Ok(())
+        match tokio::time::timeout(WRITE_TIMEOUT, invocation.invoke_async::<i64>(&mut conn)).await {
+            Ok(result) => {
+                result?;
+                Ok(())
+            }
+            Err(_) => Err((redis::ErrorKind::IoError, "live-store write timed out").into()),
+        }
     }
 
     /// Mirror one touch-flush snapshot into the live hashes. Stops at the

@@ -9,12 +9,12 @@ use crate::error::SessionPersistenceError;
 /// Constructed once at `bin/blitzpool` startup, immutable thereafter.
 #[derive(Clone, Debug)]
 pub struct SessionPersistenceConfig {
-    /// Flush interval for the buffered `client_entity` touch updates.
-    /// Default 30 s.
+    /// Flush interval for the buffered session-touch updates written
+    /// into the `client:live:*` hashes. Default 30 s.
     pub touch_flush_interval: Duration,
     /// Sampling window for the live per-session hashrate. Each tick closes
     /// a window and writes a 2-sample moving average of the per-window
-    /// share rate to `client_entity.hashRate`. Default 60 s — long enough
+    /// share rate to the live hash's `hash_rate` field. Default 60 s — long enough
     /// that vardiff's ~10–15 shares/min keep a window well-populated (30 s
     /// is too few shares → noisy), short enough to stay "live".
     pub hashrate_sample_interval: Duration,
@@ -22,13 +22,6 @@ pub struct SessionPersistenceConfig {
     /// Matches `touch_flush_interval`: both drain the same share window, and
     /// a per-slot max is not more urgent than a session touch.
     pub diff_stat_flush_interval: Duration,
-    /// Whether this process zeroes stale `hashRate` at startup. Only the
-    /// hashRate-writing role (Front) should set this — the sampler map is
-    /// empty on boot, so leftover hashRate from the previous process would
-    /// linger as a ghost until `kill_dead_clients` sweeps it. A non-writing
-    /// role (api/payout/notify) must NOT, or it would wipe the values the
-    /// Front is actively maintaining. Default `false`.
-    pub reconcile_hashrate_on_boot: bool,
     /// How long a session must survive before its `client_entity` row is
     /// written. Probe connections (measured on prod: 95 % gone within
     /// 1 s) never outlive this, so they cost no statement and leave no
@@ -43,10 +36,10 @@ pub struct SessionPersistenceConfig {
     /// Default 5 s.
     pub row_flush_interval: Duration,
     /// TTL of the per-session `client:live:*` Redis hashes. Production
-    /// wires this to the `kill_dead_clients` staleness cutoff so both
-    /// liveness definitions agree: a session's hash expires on the same
-    /// clock its PG row becomes sweep-eligible. Only the touch flush
-    /// refreshes it. Default 300 s.
+    /// wires this to the dead-session sweep's staleness cutoff so both
+    /// clocks agree: a session's hash expires no earlier than its birth
+    /// row becomes sweep-eligible. Only the touch flush refreshes it.
+    /// Default 300 s.
     pub live_ttl: Duration,
 }
 
@@ -56,7 +49,6 @@ impl Default for SessionPersistenceConfig {
             touch_flush_interval: Duration::from_secs(30),
             hashrate_sample_interval: Duration::from_secs(60),
             diff_stat_flush_interval: Duration::from_secs(30),
-            reconcile_hashrate_on_boot: false,
             row_debounce: Duration::from_secs(15),
             row_flush_interval: Duration::from_secs(5),
             live_ttl: Duration::from_secs(5 * 60),

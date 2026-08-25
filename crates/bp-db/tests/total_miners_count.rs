@@ -65,7 +65,6 @@ async fn total_miners_counts_soft_deleted_rows() {
                 session_id: sid.to_string(),
                 user_agent: Some("test-miner/1.0".to_string()),
                 start_time_ms: 1_700_000_000_000,
-                current_difficulty: None,
             },
         )
         .await

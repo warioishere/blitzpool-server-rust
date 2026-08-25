@@ -14,6 +14,7 @@ workspace = true
 bp-common = { workspace = true }
 redis = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 bp-test-support = { workspace = true }

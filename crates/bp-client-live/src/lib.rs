@@ -22,6 +22,8 @@
 //!   text, or a 500, exactly as it did for a failed SQL query.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::time::Duration;
 
 use bp_common::live_client_key::{
     self as live_key, CLIENT_LIVE_PREFIX, F_HASH_RATE, KEY_SEP, SCAN_PATTERN_ALL,
@@ -32,6 +34,24 @@ use redis::aio::ConnectionManager;
 /// `HGET`s per pipeline round trip.
 const FETCH_CHUNK: usize = 500;
 
+/// Upper bound for ONE Redis round-trip. A `ConnectionManager` whose
+/// connection is mid-reconnect makes every caller await its full retry
+/// ladder (minutes on redis-rs 0.27's defaults) before erroring. A
+/// reader must fail fast instead — "no answer" is already a handled
+/// state everywhere this crate is consumed, and a minutes-long hang on
+/// `/api/pool` or the liveness sweep is strictly worse than an error.
+const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run one Redis round-trip under [`ROUND_TRIP_TIMEOUT`].
+async fn bounded<T>(
+    fut: impl Future<Output = Result<T, redis::RedisError>>,
+) -> Result<T, LiveReadError> {
+    match tokio::time::timeout(ROUND_TRIP_TIMEOUT, fut).await {
+        Ok(result) => result.map_err(LiveReadError::from),
+        Err(_) => Err(LiveReadError::Timeout(ROUND_TRIP_TIMEOUT)),
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum LiveReadError {
     /// The process has no Redis handle. Configuration state, not a
@@ -41,6 +61,10 @@ pub enum LiveReadError {
     NotConfigured,
     #[error("redis: {0}")]
     Redis(#[from] redis::RedisError),
+    /// One round-trip exceeded [`ROUND_TRIP_TIMEOUT`] — the connection
+    /// is down or mid-reconnect. Same handling as any Redis error.
+    #[error("redis round-trip exceeded {0:?}")]
+    Timeout(Duration),
 }
 
 /// The `address` component of a live key, or `None` for a key that
@@ -56,18 +80,20 @@ fn address_of(key: &str) -> Option<&str> {
 async fn scan_keys(
     conn: &mut ConnectionManager,
     pattern: &str,
-) -> Result<Vec<String>, redis::RedisError> {
+) -> Result<Vec<String>, LiveReadError> {
     let mut keys = Vec::new();
     let mut cursor: u64 = 0;
     loop {
-        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg(pattern)
-            .arg("COUNT")
-            .arg(200)
-            .query_async(conn)
-            .await?;
+        let (next, batch): (u64, Vec<String>) = bounded(
+            redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(200)
+                .query_async(conn),
+        )
+        .await?;
         keys.extend(batch);
         cursor = next;
         if cursor == 0 {
@@ -76,7 +102,7 @@ async fn scan_keys(
     }
 }
 
-async fn scan_live_keys(conn: &mut ConnectionManager) -> Result<Vec<String>, redis::RedisError> {
+async fn scan_live_keys(conn: &mut ConnectionManager) -> Result<Vec<String>, LiveReadError> {
     scan_keys(conn, SCAN_PATTERN_ALL).await
 }
 
@@ -87,13 +113,13 @@ async fn accumulate_rates(
     conn: &mut ConnectionManager,
     keys: &[String],
     acc: &mut HashMap<String, f64>,
-) -> Result<(), redis::RedisError> {
+) -> Result<(), LiveReadError> {
     for chunk in keys.chunks(FETCH_CHUNK) {
         let mut pipe = redis::pipe();
         for key in chunk {
             pipe.cmd("HGET").arg(key).arg(F_HASH_RATE);
         }
-        let rates: Vec<Option<String>> = pipe.query_async(conn).await?;
+        let rates: Vec<Option<String>> = bounded(pipe.query_async(conn)).await?;
         for (key, rate) in chunk.iter().zip(rates) {
             let (Some(addr), Some(rate)) = (address_of(key), rate) else {
                 continue;
@@ -182,10 +208,36 @@ pub async fn delete_address_live_keys(
         for key in chunk {
             cmd.arg(key);
         }
-        let n: u64 = cmd.query_async(&mut conn).await?;
+        let n: u64 = bounded(cmd.query_async(&mut conn)).await?;
         deleted += n;
     }
     Ok(deleted)
+}
+
+/// Pipelined `EXISTS` for the given `(address, worker, session_id)`
+/// triples, positionally aligned. The liveness sweep uses this to tell
+/// a silently-dead session (stale birth row, no live hash) from an
+/// active one — which is why an error here must make the sweep SKIP,
+/// never sweep: "cannot ask Redis" and "no key" are different answers.
+pub async fn live_keys_exist(
+    redis: Option<&ConnectionManager>,
+    sessions: &[(&str, &str, &str)],
+) -> Result<Vec<bool>, LiveReadError> {
+    if sessions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut conn = redis.ok_or(LiveReadError::NotConfigured)?.clone();
+    let mut out = Vec::with_capacity(sessions.len());
+    for chunk in sessions.chunks(FETCH_CHUNK) {
+        let mut pipe = redis::pipe();
+        for (address, worker, session_id) in chunk {
+            pipe.cmd("EXISTS")
+                .arg(live_key::client_live_key(address, worker, session_id));
+        }
+        let flags: Vec<bool> = bounded(pipe.query_async(&mut conn)).await?;
+        out.extend(flags);
+    }
+    Ok(out)
 }
 
 /// The live half of one session, composed next to its PG birth row.
@@ -242,7 +294,7 @@ pub async fn live_fields_for_sessions(
             pipe.cmd("HGETALL")
                 .arg(live_key::client_live_key(address, worker, session_id));
         }
-        let hashes: Vec<Vec<(String, String)>> = pipe.query_async(&mut conn).await?;
+        let hashes: Vec<Vec<(String, String)>> = bounded(pipe.query_async(&mut conn)).await?;
         out.extend(hashes.into_iter().map(parse_live_fields));
     }
     Ok(out)
