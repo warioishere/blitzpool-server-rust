@@ -952,7 +952,8 @@ where
                 for g in slice {
                     let members = svc.list_members(g.id).await?;
                     let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
-                    let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
+                    let total_hashrate =
+                        bp_client_live::hashrate_for_addresses(s.redis.as_ref(), &addrs).await?;
                     let mut summary = GroupSummary::from(g.clone());
                     summary.creator_address = None; // never expose the creator publicly
                     items.push(PublicGroupEntry {
@@ -1027,7 +1028,8 @@ where
                 }
                 let members = svc.list_members(id).await?;
                 let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
-                let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
+                let total_hashrate =
+                    bp_client_live::hashrate_for_addresses(s.redis.as_ref(), &addrs).await?;
                 let history = bp_db::find_recent_group_block_history(&s.pool, id, 20).await?;
                 let mut summary = GroupSummary::from(group);
                 summary.creator_address = None; // never expose the creator publicly
@@ -1226,8 +1228,9 @@ where
             let group = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
             let members = svc.list_members(id).await?;
             let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
-            let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
-            let per_addr_hashrate = per_address_hashrate(&s.pool, &addrs).await?;
+            let per_addr_hashrate =
+                bp_client_live::hashrate_by_address(s.redis.as_ref(), &addrs).await?;
+            let total_hashrate: f64 = per_addr_hashrate.values().sum();
             let addr_strings: Vec<String> = addrs.iter().map(|a| a.as_str().to_string()).collect();
             let labels = build_member_labels(&addr_strings);
             // Batch the signature-ownership lookup (admin-only, for the
@@ -1317,21 +1320,6 @@ where
     Ok(JsonBytes(bytes))
 }
 
-/// Compute hashrate per address for the supplied list. We currently
-/// fetch them one-by-one — fine for typical group sizes (<50 members);
-/// follow-up bp-db helper for a bulk-fetch could replace this.
-async fn per_address_hashrate(
-    pool: &sqlx::PgPool,
-    addrs: &[AddressId],
-) -> Result<HashMap<String, f64>, ApiError> {
-    let mut out = HashMap::with_capacity(addrs.len());
-    for a in addrs {
-        let hr = bp_db::sum_hashrate_for_addresses(pool, std::slice::from_ref(a)).await?;
-        out.insert(a.as_str().to_string(), hr);
-    }
-    Ok(out)
-}
-
 // ─── GET /api/groups/by-address/:address ─────────────────────────
 
 async fn by_address<H, M>(
@@ -1392,8 +1380,8 @@ where
             let _ = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
             let members = svc.list_members(id).await?;
             let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
-            let total_hashrate = bp_db::sum_hashrate_for_addresses(&s.pool, &addrs).await?;
-            let per_addr = per_address_hashrate(&s.pool, &addrs).await?;
+            let per_addr = bp_client_live::hashrate_by_address(s.redis.as_ref(), &addrs).await?;
+            let total_hashrate: f64 = per_addr.values().sum();
             let addr_strings: Vec<String> = addrs.iter().map(|a| a.as_str().to_string()).collect();
             let labels = build_member_labels(&addr_strings);
             Ok(HashrateResponse {

@@ -31,3 +31,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 sqlx = { workspace = true }
 bp-test-support = { workspace = true }
+# The reader half of the client:live:* schema — the integration tests
+# pin that writer and reader agree on one keyspace.
+bp-client-live = { workspace = true }

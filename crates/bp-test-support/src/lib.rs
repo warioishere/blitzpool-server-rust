@@ -425,6 +425,10 @@ pub mod redis_db {
     /// the LAST free 32-slice of the 512-DB test container
     /// (`15 * 32 + 31 = 511`) — the next binary that needs a base must
     /// recreate `bp-test-redis` with `--databases` raised past 512.
+    ///
+    /// ⚠️ Index **31** of this range is lent to `bp-api`'s smoke test
+    /// (`pool_endpoint_returns_basic_shape`), NO-FLUSH and write-free —
+    /// don't claim it for a session-persistence test.
     pub const SESSION_PERSISTENCE: u16 = 15 * RANGE;
 }
 

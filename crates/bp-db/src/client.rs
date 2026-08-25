@@ -111,21 +111,6 @@ pub async fn find_clients_by_address(
     .map_err(DbError::from)
 }
 
-/// Sum of `hashRate` across every non-soft-deleted client row — powers
-/// the `/api/pool` `totalHashRate` field and operator-dashboard
-/// endpoints.
-pub async fn sum_active_pool_hashrate(pool: &PgPool) -> Result<f64, DbError> {
-    let row = sqlx::query!(
-        r#"SELECT COALESCE(SUM("hashRate"), 0.0)::float8 AS "total!"
-           FROM client_entity
-           WHERE "deletedAt" IS NULL"#,
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(row.total)
-}
-
 /// One row of the user-agent aggregation surfaced by `/api/info` →
 /// `userAgents` (`userAgent`, `count`, `bestDifficulty`, `totalHashRate`).
 #[derive(Clone, Debug, FromRow)]
@@ -312,31 +297,6 @@ pub async fn find_client_rejected_statistics_since_for_address(
     .fetch_all(pool)
     .await
     .map_err(DbError::from)
-}
-
-/// Sum of `hashRate` across non-soft-deleted clients whose `address`
-/// is in the input list. Used by `/pplns_status` (sum across the
-/// PPLNS distribution) + `/group_status` (sum across group members).
-/// Empty input returns `0.0` without hitting PG.
-pub async fn sum_hashrate_for_addresses(
-    pool: &PgPool,
-    addresses: &[AddressId],
-) -> Result<f64, DbError> {
-    if addresses.is_empty() {
-        return Ok(0.0);
-    }
-    let addr_strs: Vec<&str> = addresses.iter().map(|a| a.as_str()).collect();
-    let row = sqlx::query!(
-        r#"SELECT COALESCE(SUM("hashRate"), 0.0)::float8 AS "total!"
-           FROM client_entity
-           WHERE "deletedAt" IS NULL
-             AND address = ANY($1)"#,
-        &addr_strs as &[&str],
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(row.total)
 }
 
 #[derive(Clone, Debug, FromRow)]

@@ -17,15 +17,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bp_client_live::{hashrate_for_addresses, pool_hashrate};
 use bp_common::AddressId;
 use bp_db::{
     find_address_settings, find_clients_by_address, find_group, find_group_member_by_address,
-    find_pplns_group_members_for_group, find_recent_group_block_history, sum_active_pool_hashrate,
-    sum_hashrate_for_addresses, PplnsGroupBlockHistoryRow,
+    find_pplns_group_members_for_group, find_recent_group_block_history, PplnsGroupBlockHistoryRow,
 };
 use bp_group_solo_engine::engine::GroupSoloEngine;
 use bp_pplns_engine::engine::PplnsEngine;
 use chrono::{DateTime, Utc};
+use redis::aio::ConnectionManager;
 use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
@@ -49,8 +50,11 @@ fn default_http_client() -> Client {
 
 // ── /poolhashrate ────────────────────────────────────────────────────
 
-pub(super) async fn build_pool_hashrate(pool: &PgPool, lang: Language) -> String {
-    match sum_active_pool_hashrate(pool).await {
+pub(super) async fn build_pool_hashrate(
+    redis: Option<&ConnectionManager>,
+    lang: Language,
+) -> String {
+    match pool_hashrate(redis).await {
         Ok(total) => format_pool_hashrate(lang, total),
         Err(e) => {
             warn!(target: "bp_notifications::command::read", error = %e, "pool_hashrate");
@@ -405,7 +409,7 @@ fn format_hashrate_th(hash_rate: f64) -> String {
 // ── /pplns_status <address> ──────────────────────────────────────────
 
 pub(super) async fn build_pplns_status(
-    pool: &PgPool,
+    redis: Option<&ConnectionManager>,
     pplns: &Arc<PplnsEngine>,
     lang: Language,
     address: &AddressId,
@@ -416,7 +420,7 @@ pub(super) async fn build_pplns_status(
         reader.address_status(address.as_str()),
         reader.window_stats(),
         reader.current_distribution(),
-        sum_hashrate_for_addresses(pool, std::slice::from_ref(address)),
+        hashrate_for_addresses(redis, std::slice::from_ref(address)),
     );
 
     let status = match status {
@@ -452,7 +456,7 @@ pub(super) async fn build_pplns_status(
     let total_pplns_hashrate = if pplns_addresses.is_empty() {
         0.0
     } else {
-        sum_hashrate_for_addresses(pool, &pplns_addresses)
+        hashrate_for_addresses(redis, &pplns_addresses)
             .await
             .unwrap_or_else(|e| {
                 warn!(target: "bp_notifications::command::read", error = %e, "pplns_status: pool hashrate");
@@ -566,6 +570,7 @@ pub(super) async fn build_pplns_top(pplns: &Arc<PplnsEngine>, lang: Language) ->
 
 pub(super) async fn build_group_status(
     pool: &PgPool,
+    redis: Option<&ConnectionManager>,
     group_solo: &Arc<GroupSoloEngine>,
     lang: Language,
     address: &AddressId,
@@ -624,7 +629,7 @@ pub(super) async fn build_group_status(
     let group_hashrate = if member_addresses.is_empty() {
         0.0
     } else {
-        sum_hashrate_for_addresses(pool, &member_addresses)
+        hashrate_for_addresses(redis, &member_addresses)
             .await
             .unwrap_or(0.0)
     };

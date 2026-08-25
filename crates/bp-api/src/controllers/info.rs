@@ -738,7 +738,7 @@ where
             "POOL_INFO".to_string(),
             TtlKind::PoolInfo,
             async move {
-                let total_hash_rate = bp_db::sum_active_pool_hashrate(&s.pool).await?;
+                let total_hash_rate = bp_client_live::pool_hashrate(s.redis.as_ref()).await?;
                 let total_miners: i64 =
                     sqlx::query_scalar!(r#"SELECT COUNT("userAgent") FROM client_entity"#,)
                         .fetch_one(&s.pool)

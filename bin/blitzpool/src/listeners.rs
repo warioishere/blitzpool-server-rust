@@ -162,6 +162,7 @@ pub(crate) fn spawn(
     // flows into the read-side commands.
     let handler = Arc::new(
         CommandHandler::new(pool.clone(), telegram_adapter.clone(), ntfy_adapter.clone())
+            .with_redis(Some(foundation.redis.clone()))
             .with_engines(
                 engines.pplns.clone().map(Arc::new),
                 Some(Arc::new(engines.group_solo.clone())),

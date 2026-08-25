@@ -445,3 +445,92 @@ async fn redis_down_does_not_break_pg_flush() {
     handle.shutdown().await;
     cleanup(&pool, prefix).await;
 }
+
+/// Writer and reader must agree on ONE keyspace: what the engine's
+/// flushes wrote, `bp_client_live`'s scans must find and sum — per
+/// address, across addresses, and pool-wide (with an uninvolved
+/// address reading 0, not missing).
+#[tokio::test]
+async fn live_reader_agrees_with_the_writer() {
+    let Some(pool) = pg_or_skip().await else {
+        return;
+    };
+    let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 5).await
+    else {
+        return;
+    };
+    let prefix = "test_lv_read_";
+    cleanup(&pool, prefix).await;
+
+    let handle = spawn_engine(&pool, redis.clone()).await;
+    let hook = handle.session_persistence_hook();
+    let sink = handle.client_row_touch_sink();
+    let addr_a = bp_common::AddressId::new(format!("{prefix}a")).unwrap();
+    let addr_b = bp_common::AddressId::new(format!("{prefix}b")).unwrap();
+    let addr_idle = bp_common::AddressId::new(format!("{prefix}idle")).unwrap();
+
+    for (addr, sess) in [
+        (&addr_a, "sessL006"),
+        (&addr_a, "sessL007"),
+        (&addr_b, "sessL008"),
+    ] {
+        hook.register_session(sess, addr.as_str(), "rig1", None)
+            .await;
+        sink.record_accepted(share(addr.as_str(), "rig1", sess, 100.0, 600.0, 1))
+            .await;
+    }
+    handle.flush_births_now().await;
+    handle.flush_touches_now().await;
+    handle.sample_hashrate_now(60.0).await;
+
+    // Each session wrote rate = 600 * 2^32 / 60.
+    let per_session = 600.0 * 4_294_967_296.0 / 60.0;
+    let a_sum = bp_client_live::hashrate_for_addresses(Some(&redis), std::slice::from_ref(&addr_a))
+        .await
+        .expect("read addr_a");
+    assert!(
+        (a_sum - 2.0 * per_session).abs() < 1.0,
+        "addr_a sums its two sessions, got {a_sum}"
+    );
+
+    let by_addr = bp_client_live::hashrate_by_address(
+        Some(&redis),
+        &[addr_a.clone(), addr_b.clone(), addr_idle.clone()],
+    )
+    .await
+    .expect("read by address");
+    assert!((by_addr[addr_a.as_str()] - 2.0 * per_session).abs() < 1.0);
+    assert!((by_addr[addr_b.as_str()] - per_session).abs() < 1.0);
+    assert_eq!(
+        by_addr[addr_idle.as_str()],
+        0.0,
+        "an address with no live session reads 0, not missing"
+    );
+
+    let pool_sum = bp_client_live::pool_hashrate(Some(&redis))
+        .await
+        .expect("pool sum");
+    assert!(
+        (pool_sum - 3.0 * per_session).abs() < 1.0,
+        "pool-wide scan finds all three sessions, got {pool_sum}"
+    );
+
+    // The DEL guard: what the reader saw came from the writer, not from
+    // leftovers — wipe and confirm the reader now reads 0.
+    let _: i64 = redis::cmd("DEL")
+        .arg(client_live_key(addr_a.as_str(), "rig1", "sessL006"))
+        .arg(client_live_key(addr_a.as_str(), "rig1", "sessL007"))
+        .arg(client_live_key(addr_b.as_str(), "rig1", "sessL008"))
+        .query_async(&mut redis)
+        .await
+        .expect("DEL");
+    assert_eq!(
+        bp_client_live::pool_hashrate(Some(&redis))
+            .await
+            .expect("re-read"),
+        0.0
+    );
+
+    handle.shutdown().await;
+    cleanup(&pool, prefix).await;
+}

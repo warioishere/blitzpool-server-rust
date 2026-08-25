@@ -563,6 +563,7 @@ dependencies = [
  "bp-bitcoin",
  "bp-blockparty",
  "bp-blockparty-engine",
+ "bp-client-live",
  "bp-common",
  "bp-config",
  "bp-db",
@@ -576,6 +577,7 @@ dependencies = [
  "bp-share",
  "bp-stats",
  "bp-template-distribution",
+ "bp-test-support",
  "bytes",
  "chrono",
  "chrono-tz",
@@ -643,6 +645,17 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "bp-client-live"
+version = "2.3.2"
+dependencies = [
+ "bp-common",
+ "bp-test-support",
+ "redis",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -834,6 +847,7 @@ version = "2.3.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bp-client-live",
  "bp-common",
  "bp-cron-utils",
  "bp-db",
@@ -844,6 +858,7 @@ dependencies = [
  "futures",
  "jsonwebtoken",
  "lettre",
+ "redis",
  "reqwest",
  "serde",
  "serde_json",
@@ -925,6 +940,7 @@ name = "bp-session-persistence"
 version = "2.3.2"
 dependencies = [
  "async-trait",
+ "bp-client-live",
  "bp-common",
  "bp-db",
  "bp-share",

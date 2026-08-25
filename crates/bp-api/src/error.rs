@@ -48,6 +48,8 @@ pub enum ApiError {
     },
     #[error("database error: {0}")]
     Db(#[from] bp_db::DbError),
+    #[error("live-state read: {0}")]
+    LiveRead(#[from] bp_client_live::LiveReadError),
     #[error("engine error: {0}")]
     PplnsEngine(#[from] bp_pplns_engine::engine::EngineError),
     #[error("group-solo engine: {0}")]
@@ -72,9 +74,11 @@ impl ApiError {
             | Self::Invitation { code, .. }
             | Self::JoinRequest { code, .. }
             | Self::Blockparty { code, .. } => code,
-            Self::Db(_) | Self::PplnsEngine(_) | Self::GroupSoloEngine(_) | Self::Internal(_) => {
-                "internal-error"
-            }
+            Self::Db(_)
+            | Self::LiveRead(_)
+            | Self::PplnsEngine(_)
+            | Self::GroupSoloEngine(_)
+            | Self::Internal(_) => "internal-error",
             Self::Rpc(_) | Self::Unavailable(_) => "upstream-unavailable",
         }
     }
@@ -89,9 +93,11 @@ impl ApiError {
             | Self::Invitation { status, .. }
             | Self::JoinRequest { status, .. }
             | Self::Blockparty { status, .. } => *status,
-            Self::Db(_) | Self::PplnsEngine(_) | Self::GroupSoloEngine(_) | Self::Internal(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Db(_)
+            | Self::LiveRead(_)
+            | Self::PplnsEngine(_)
+            | Self::GroupSoloEngine(_)
+            | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Rpc(_) | Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }

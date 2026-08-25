@@ -14,6 +14,7 @@ workspace = true
 # Internal — engine + service surfaces consumed by API endpoints.
 bp-common = { workspace = true }
 bp-db = { workspace = true }
+bp-client-live = { workspace = true }
 bp-pplns-engine = { workspace = true }
 bp-group-solo-engine = { workspace = true }
 bp-group-mgmt = { workspace = true }
@@ -102,4 +103,5 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+bp-test-support = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

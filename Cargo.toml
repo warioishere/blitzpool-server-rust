@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/bp-common",
+    "crates/bp-client-live",
     "crates/bp-config",
     "crates/bp-db",
     "crates/bp-bitcoin",
@@ -227,6 +228,7 @@ tempfile = "3"
 #   bp-common = { workspace = true }
 # without repeating the path.
 bp-common = { path = "crates/bp-common" }
+bp-client-live = { path = "crates/bp-client-live" }
 bp-config = { path = "crates/bp-config" }
 bp-db = { path = "crates/bp-db" }
 bp-bitcoin = { path = "crates/bp-bitcoin" }

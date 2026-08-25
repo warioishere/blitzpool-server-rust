@@ -345,7 +345,21 @@ async fn pool_endpoint_returns_basic_shape() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
-    let router = build_router(minimal_state(pool));
+    // `/api/pool` reads the live hashrate from the `client:live:*`
+    // Redis hashes. Borrowed NO-FLUSH index: this test writes nothing
+    // and asserts only the wire shape, so any database's content is
+    // fine and no flushing sibling can be harmed by it.
+    let Some(redis) = bp_test_support::connect_redis_in_range_no_flush(
+        bp_test_support::redis_db::SESSION_PERSISTENCE,
+        31,
+    )
+    .await
+    else {
+        return;
+    };
+    let mut state = AppState::<NoopHooks, NoopEmailHooks>::new(pool, "0.0.0");
+    state.redis = Some(redis);
+    let router = build_router(Arc::new(state));
     let resp = router
         .oneshot(
             Request::builder()
@@ -365,6 +379,26 @@ async fn pool_endpoint_returns_basic_shape() {
     assert!(json["totalMiners"].is_number());
     assert!(json["blocksFound"].is_array());
     assert!(json["fee"].is_number());
+}
+
+/// Without a Redis handle the live hashrate is unknowable, and the
+/// endpoint must say so (500), never invent a 0 total.
+#[tokio::test]
+async fn pool_endpoint_without_live_store_returns_500() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let router = build_router(minimal_state(pool));
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/pool")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
