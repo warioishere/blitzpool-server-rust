@@ -121,9 +121,12 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
         let now_ms = now_ms();
         // Worker can be empty in some SV2 paths (no `.<name>` suffix in
-        // user_identity). The session row was registered with the
-        // matching default ("default" in SV2, "" in SV1), so use the
-        // same fallback here for the PK match.
+        // user_identity); the SV2 session row was registered under the
+        // same "default", so the fallback preserves the PK match. SV1
+        // never sends an empty worker any more — its authorize parse
+        // defaults a trailing dot to "worker" (letting "" through birthed
+        // a row no touch could ever hit, and kill_dead_clients swept the
+        // live session).
         let worker = if share.worker.is_empty() {
             "default"
         } else {

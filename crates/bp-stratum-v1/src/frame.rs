@@ -559,8 +559,15 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
                 });
             }
             let raw_username = arr[0].as_str().unwrap().to_string();
+            // A trailing dot ("addr.") gets the same default as no dot at
+            // all: an empty worker name is not a name. Letting "" through
+            // birthed the `client_entity` row under clientName "" while
+            // every share-path write targets a non-empty name — the touch
+            // UPDATE then matches 0 rows, `updatedAt` freezes, and
+            // `kill_dead_clients` sweeps an actively-hashing session.
             let (address, worker) = match raw_username.split_once('.') {
-                Some((a, w)) => (a.to_string(), w.to_string()),
+                Some((a, w)) if !w.is_empty() => (a.to_string(), w.to_string()),
+                Some((a, _)) => (a.to_string(), "worker".to_string()),
                 None => (raw_username.clone(), "worker".to_string()),
             };
             let password = arr.get(1).and_then(|v| v.as_str()).map(String::from);
@@ -939,6 +946,25 @@ mod tests {
             SV1Request::Authorize(a) => {
                 assert_eq!(a.address, "bc1qjustaddress");
                 assert_eq!(a.worker, "worker"); // defaults to 'worker' if missing
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// A trailing dot must never yield an empty worker name: the session
+    /// would register under clientName "" while every share-path write
+    /// targets a non-empty name, so its touches match 0 rows and
+    /// `kill_dead_clients` sweeps the live session after 5 minutes.
+    #[test]
+    fn parse_authorize_with_trailing_dot_gets_the_default_worker_name() {
+        let req = parse_request(
+            r#"{"id":3,"method":"mining.authorize","params":["bc1qjustaddress.","x"]}"#,
+        )
+        .expect("ok");
+        match req {
+            SV1Request::Authorize(a) => {
+                assert_eq!(a.address, "bc1qjustaddress");
+                assert_eq!(a.worker, "worker", "empty worker takes the no-dot default");
             }
             _ => unreachable!(),
         }
