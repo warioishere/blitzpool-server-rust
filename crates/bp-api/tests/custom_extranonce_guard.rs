@@ -61,6 +61,20 @@ fn minimal_state(pool: PgPool) -> Arc<AppState<NoopHooks, NoopEmailHooks>> {
     Arc::new(AppState::<NoopHooks, NoopEmailHooks>::new(pool, "0.0.0"))
 }
 
+/// State with a live-store handle — `/api/client/:address` composes its
+/// worker list from the `client:live:*` hashes. Borrowed NO-FLUSH index
+/// (write-free, content-independent); `None` = Redis unreachable → skip.
+async fn state_with_live_store(pool: PgPool) -> Option<Arc<AppState<NoopHooks, NoopEmailHooks>>> {
+    let redis = bp_test_support::connect_redis_in_range_no_flush(
+        bp_test_support::redis_db::SESSION_PERSISTENCE,
+        31,
+    )
+    .await?;
+    let mut state = AppState::<NoopHooks, NoopEmailHooks>::new(pool, "0.0.0");
+    state.redis = Some(redis);
+    Some(Arc::new(state))
+}
+
 /// Delete any rows a prior (possibly panicking) run left behind, so the test is
 /// re-runnable. The group delete cascades to its members (FK ON DELETE CASCADE).
 async fn cleanup(pool: &PgPool) {
@@ -444,8 +458,12 @@ async fn client_address_reports_the_custom_extranonce_per_worker() {
     .await;
     assert_eq!(st, StatusCode::OK, "set must apply; got {js}");
 
+    let Some(view_state) = state_with_live_store(pool.clone()).await else {
+        cleanup_rows(pool.clone()).await;
+        return;
+    };
     let (st, js) = get_json(
-        build_router(minimal_state(pool.clone())),
+        build_router(view_state),
         &format!("/api/client/{CLIENT_VIEW_ADDR}"),
     )
     .await;

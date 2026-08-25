@@ -58,6 +58,7 @@ impl Default for HourlyStatsCronConfig {
 pub fn spawn_hourly_stats_cron(
     config: HourlyStatsCronConfig,
     pool: PgPool,
+    redis: Option<redis::aio::ConnectionManager>,
     telegram: Option<Arc<TelegramAdapter>>,
     ntfy: Option<Arc<NtfyAdapter>>,
     chat_languages: Arc<Mutex<HashMap<i64, Language>>>,
@@ -74,7 +75,7 @@ pub fn spawn_hourly_stats_cron(
                     if *shutdown_rx.borrow() { break; }
                 }
                 _ = ticker.tick() => {
-                    run_once(&pool, telegram.as_deref(), ntfy.as_deref(), &chat_languages).await;
+                    run_once(&pool, redis.as_ref(), telegram.as_deref(), ntfy.as_deref(), &chat_languages).await;
                 }
             }
         }
@@ -85,6 +86,7 @@ pub fn spawn_hourly_stats_cron(
 
 async fn run_once(
     pool: &PgPool,
+    redis: Option<&redis::aio::ConnectionManager>,
     telegram: Option<&TelegramAdapter>,
     ntfy: Option<&NtfyAdapter>,
     chat_languages: &Arc<Mutex<HashMap<i64, Language>>>,
@@ -93,7 +95,7 @@ async fn run_once(
         match find_telegram_subscriptions_with_hourly_enabled(pool).await {
             Ok(rows) => {
                 for row in rows {
-                    process_telegram_row(pool, adapter, row, chat_languages).await;
+                    process_telegram_row(pool, redis, adapter, row, chat_languages).await;
                 }
             }
             Err(e) => {
@@ -105,7 +107,7 @@ async fn run_once(
         match find_ntfy_subscriptions_with_hourly_enabled(pool).await {
             Ok(rows) => {
                 for row in rows {
-                    process_ntfy_row(pool, adapter, row).await;
+                    process_ntfy_row(pool, redis, adapter, row).await;
                 }
             }
             Err(e) => {
@@ -132,36 +134,42 @@ async fn resolve_telegram_language(
 
 async fn process_telegram_row(
     pool: &PgPool,
+    redis: Option<&redis::aio::ConnectionManager>,
     adapter: &TelegramAdapter,
     sub: bp_db::TelegramSubscriptionRow,
     chat_languages: &Arc<Mutex<HashMap<i64, Language>>>,
 ) {
     let lang = resolve_telegram_language(chat_languages, sub.telegram_chat_id).await;
     if sub.hourly_stats_enabled {
-        let text = build_stats(pool, lang, &sub.address).await;
+        let text = build_stats(pool, redis, lang, &sub.address).await;
         if let Err(e) = adapter.send_text(sub.telegram_chat_id, &text).await {
             warn!(target: "bp_notifications::cron::hourly_stats", error = %e, chat = sub.telegram_chat_id, "telegram stats send");
         }
     }
     if sub.hourly_workers_enabled {
-        let text = build_show_workers(pool, lang, &sub.address).await;
+        let text = build_show_workers(pool, redis, lang, &sub.address).await;
         if let Err(e) = adapter.send_text(sub.telegram_chat_id, &text).await {
             warn!(target: "bp_notifications::cron::hourly_stats", error = %e, chat = sub.telegram_chat_id, "telegram workers send");
         }
     }
 }
 
-async fn process_ntfy_row(pool: &PgPool, adapter: &NtfyAdapter, sub: bp_db::NtfySubscriptionRow) {
+async fn process_ntfy_row(
+    pool: &PgPool,
+    redis: Option<&redis::aio::ConnectionManager>,
+    adapter: &NtfyAdapter,
+    sub: bp_db::NtfySubscriptionRow,
+) {
     let lang = Language::parse(&sub.language);
     let address = sub.address.as_str();
     if sub.hourly_stats_enabled {
-        let text = build_stats(pool, lang, &sub.address).await;
+        let text = build_stats(pool, redis, lang, &sub.address).await;
         if let Err(e) = adapter.publish(address, &text).await {
             warn!(target: "bp_notifications::cron::hourly_stats", error = %e, address, "ntfy stats publish");
         }
     }
     if sub.hourly_workers_enabled {
-        let text = build_show_workers(pool, lang, &sub.address).await;
+        let text = build_show_workers(pool, redis, lang, &sub.address).await;
         if let Err(e) = adapter.publish(address, &text).await {
             warn!(target: "bp_notifications::cron::hourly_stats", error = %e, address, "ntfy workers publish");
         }

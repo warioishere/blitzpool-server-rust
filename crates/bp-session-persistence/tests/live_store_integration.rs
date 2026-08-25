@@ -534,3 +534,49 @@ async fn live_reader_agrees_with_the_writer() {
     handle.shutdown().await;
     cleanup(&pool, prefix).await;
 }
+
+/// The composed-read path: what the engine's flushes wrote, the
+/// positional `live_fields_for_sessions` reader must return field by
+/// field — and a session that never flushed must come back `None` in
+/// its position, not shift the alignment.
+#[tokio::test]
+async fn composed_reader_returns_the_writers_fields_in_position() {
+    let Some(pool) = pg_or_skip().await else {
+        return;
+    };
+    let Some(redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 6).await else {
+        return;
+    };
+    let prefix = "test_lv_comp_";
+    cleanup(&pool, prefix).await;
+
+    let handle = spawn_engine(&pool, redis.clone()).await;
+    let sink = handle.client_row_touch_sink();
+    let address = format!("{prefix}fred");
+
+    sink.record_accepted(share(&address, "rig1", "sessL009", 100.5, 64.0, 2))
+        .await;
+    handle.flush_touches_now().await;
+    handle.sample_hashrate_now(60.0).await;
+
+    let live = bp_client_live::live_fields_for_sessions(
+        Some(&redis),
+        &[
+            (address.as_str(), "rig1", "sessL009"),
+            (address.as_str(), "rig1", "never-flushed"),
+        ],
+    )
+    .await
+    .expect("composed read");
+    assert_eq!(live.len(), 2);
+    let lf = live[0].as_ref().expect("flushed session has live fields");
+    assert!((lf.best_difficulty - 100.5).abs() < 0.01);
+    assert_eq!(lf.current_difficulty, Some(64.0));
+    assert_eq!(lf.channel_count, Some(2));
+    assert!(lf.hash_rate > 0.0, "sampler wrote a rate");
+    assert!(lf.updated_at_ms.is_some());
+    assert_eq!(live[1], None, "unknown session stays None in position");
+
+    handle.shutdown().await;
+    cleanup(&pool, prefix).await;
+}

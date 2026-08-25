@@ -23,7 +23,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bp_common::live_client_key::{CLIENT_LIVE_PREFIX, F_HASH_RATE, KEY_SEP, SCAN_PATTERN_ALL};
+use bp_common::live_client_key::{
+    self as live_key, CLIENT_LIVE_PREFIX, F_HASH_RATE, KEY_SEP, SCAN_PATTERN_ALL,
+};
 use bp_common::AddressId;
 use redis::aio::ConnectionManager;
 
@@ -47,17 +49,21 @@ fn address_of(key: &str) -> Option<&str> {
     key.strip_prefix(CLIENT_LIVE_PREFIX)?.split(KEY_SEP).next()
 }
 
-/// Full `SCAN` of the live keyspace. One pass regardless of how many
-/// addresses the caller filters on afterwards — at pool scale
-/// (~10³ sessions) that beats one `SCAN` per address.
-async fn scan_live_keys(conn: &mut ConnectionManager) -> Result<Vec<String>, redis::RedisError> {
+/// Cursor-complete `SCAN MATCH pattern`. The sum readers pass
+/// [`SCAN_PATTERN_ALL`] — one pass regardless of how many addresses the
+/// caller filters on afterwards, which at pool scale (~10³ sessions)
+/// beats one `SCAN` per address.
+async fn scan_keys(
+    conn: &mut ConnectionManager,
+    pattern: &str,
+) -> Result<Vec<String>, redis::RedisError> {
     let mut keys = Vec::new();
     let mut cursor: u64 = 0;
     loop {
         let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
             .arg(cursor)
             .arg("MATCH")
-            .arg(SCAN_PATTERN_ALL)
+            .arg(pattern)
             .arg("COUNT")
             .arg(200)
             .query_async(conn)
@@ -68,6 +74,10 @@ async fn scan_live_keys(conn: &mut ConnectionManager) -> Result<Vec<String>, red
             return Ok(keys);
         }
     }
+}
+
+async fn scan_live_keys(conn: &mut ConnectionManager) -> Result<Vec<String>, redis::RedisError> {
+    scan_keys(conn, SCAN_PATTERN_ALL).await
 }
 
 /// Pipelined `HGET hash_rate` over `keys`, summed per key's address
@@ -151,6 +161,164 @@ pub async fn hashrate_for_addresses(
     Ok(hashrate_by_address(redis, addresses).await?.values().sum())
 }
 
+/// Delete every live hash under `address`. Returns the number of keys
+/// removed. The delete-all endpoint calls this so a purged miner does
+/// not keep reporting hashrate for up to the TTL — best-effort by
+/// nature (a concurrent flush can rewrite a key moments later; that
+/// one then ages out on its TTL like any other).
+pub async fn delete_address_live_keys(
+    redis: Option<&ConnectionManager>,
+    address: &AddressId,
+) -> Result<u64, LiveReadError> {
+    let mut conn = redis.ok_or(LiveReadError::NotConfigured)?.clone();
+    let keys = scan_keys(
+        &mut conn,
+        &live_key::scan_pattern_for_address(address.as_str()),
+    )
+    .await?;
+    let mut deleted = 0u64;
+    for chunk in keys.chunks(FETCH_CHUNK) {
+        let mut cmd = redis::cmd("DEL");
+        for key in chunk {
+            cmd.arg(key);
+        }
+        let n: u64 = cmd.query_async(&mut conn).await?;
+        deleted += n;
+    }
+    Ok(deleted)
+}
+
+/// The live half of one session, composed next to its PG birth row.
+///
+/// Absence semantics: `hash_rate` / `best_difficulty` default to 0 (the
+/// same default the PG columns carried), the optionals to `None`. A
+/// session whose whole hash is missing comes back as `None` from
+/// [`live_fields_for_sessions`] — no shares inside the TTL, or evicted.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LiveFields {
+    pub hash_rate: f64,
+    pub current_difficulty: Option<f64>,
+    /// `None` on a sampler-created partial hash — render as 1 channel.
+    pub channel_count: Option<i32>,
+    pub best_difficulty: f64,
+    /// Epoch-ms of the freshest accepted share.
+    pub updated_at_ms: Option<i64>,
+}
+
+fn parse_live_fields(pairs: Vec<(String, String)>) -> Option<LiveFields> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut lf = LiveFields::default();
+    for (field, value) in pairs {
+        match field.as_str() {
+            live_key::F_HASH_RATE => lf.hash_rate = value.parse().unwrap_or(0.0),
+            live_key::F_CURRENT_DIFFICULTY => lf.current_difficulty = value.parse().ok(),
+            live_key::F_CHANNEL_COUNT => lf.channel_count = value.parse().ok(),
+            live_key::F_BEST_DIFFICULTY => lf.best_difficulty = value.parse().unwrap_or(0.0),
+            live_key::F_UPDATED_AT_MS => lf.updated_at_ms = value.parse().ok(),
+            _ => {}
+        }
+    }
+    Some(lf)
+}
+
+/// Batch-fetch the live fields for the given `(address, worker,
+/// session_id)` triples. Positional result aligned with the input;
+/// `None` = no live hash for that session. This is the ONE composition
+/// point every "PG birth row + Redis live fields" reader goes through.
+pub async fn live_fields_for_sessions(
+    redis: Option<&ConnectionManager>,
+    sessions: &[(&str, &str, &str)],
+) -> Result<Vec<Option<LiveFields>>, LiveReadError> {
+    if sessions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut conn = redis.ok_or(LiveReadError::NotConfigured)?.clone();
+    let mut out = Vec::with_capacity(sessions.len());
+    for chunk in sessions.chunks(FETCH_CHUNK) {
+        let mut pipe = redis::pipe();
+        for (address, worker, session_id) in chunk {
+            pipe.cmd("HGETALL")
+                .arg(live_key::client_live_key(address, worker, session_id));
+        }
+        let hashes: Vec<Vec<(String, String)>> = pipe.query_async(&mut conn).await?;
+        out.extend(hashes.into_iter().map(parse_live_fields));
+    }
+    Ok(out)
+}
+
+/// One active-session row as the user-agent aggregation consumes it —
+/// the PG side supplies (userAgent, key triple), the live side supplies
+/// the numbers.
+#[derive(Clone, Debug)]
+pub struct UserAgentSessionRow {
+    pub user_agent: Option<String>,
+    pub address: String,
+    pub worker: String,
+    pub session_id: String,
+}
+
+/// One `GROUP BY userAgent` output row — the shape both `/api/info`'s
+/// `userAgents` and `/api/pplns`'s variant serialize.
+#[derive(Clone, Debug)]
+pub struct UserAgentAgg {
+    pub user_agent: Option<String>,
+    pub count: i64,
+    pub best_difficulty: f64,
+    pub total_hash_rate: f64,
+}
+
+/// Group sessions by user agent and aggregate their live numbers —
+/// the ONE implementation replacing the two twin SQL aggregations
+/// (`find_user_agents` and the `/api/pplns` inline variant). Ordered by
+/// `count` descending, like the SQL `ORDER BY count DESC`.
+///
+/// SQL parity quirk kept on purpose: `COUNT("userAgent")` counted
+/// non-NULL values, so the NULL-user-agent group reported `count = 0`
+/// while still carrying its sums. Consumers render that today; changing
+/// it is a display decision, not a refactor side effect.
+pub async fn aggregate_by_user_agent(
+    redis: Option<&ConnectionManager>,
+    rows: &[UserAgentSessionRow],
+) -> Result<Vec<UserAgentAgg>, LiveReadError> {
+    let triples: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|r| (r.address.as_str(), r.worker.as_str(), r.session_id.as_str()))
+        .collect();
+    let live = live_fields_for_sessions(redis, &triples).await?;
+    Ok(group_user_agents(rows, &live))
+}
+
+/// The pure grouping half of [`aggregate_by_user_agent`], split out so
+/// the count/NULL/max semantics are testable without a Redis server.
+fn group_user_agents(
+    rows: &[UserAgentSessionRow],
+    live: &[Option<LiveFields>],
+) -> Vec<UserAgentAgg> {
+    let mut groups: HashMap<Option<&str>, UserAgentAgg> = HashMap::new();
+    for (row, lf) in rows.iter().zip(live) {
+        let entry = groups
+            .entry(row.user_agent.as_deref())
+            .or_insert_with(|| UserAgentAgg {
+                user_agent: row.user_agent.clone(),
+                count: 0,
+                best_difficulty: 0.0,
+                total_hash_rate: 0.0,
+            });
+        if row.user_agent.is_some() {
+            entry.count += 1;
+        }
+        if let Some(lf) = lf {
+            entry.total_hash_rate += lf.hash_rate;
+            entry.best_difficulty = entry.best_difficulty.max(lf.best_difficulty);
+        }
+    }
+    let mut out: Vec<UserAgentAgg> = groups.into_values().collect();
+    out.sort_by_key(|a| std::cmp::Reverse(a.count));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +341,73 @@ mod tests {
     #[test]
     fn foreign_keys_do_not_parse() {
         assert_eq!(address_of("pplns:window:total"), None);
+    }
+
+    #[test]
+    fn live_fields_parse_tolerates_partial_hashes() {
+        // Sampler-created hash: only hash_rate.
+        let lf = parse_live_fields(vec![("hash_rate".into(), "1234.5".into())]).unwrap();
+        assert_eq!(lf.hash_rate, 1234.5);
+        assert_eq!(
+            lf.best_difficulty, 0.0,
+            "absent best defaults like the PG column"
+        );
+        assert_eq!(lf.channel_count, None);
+        // Empty hash = missing key (HGETALL on a missing key is empty).
+        assert_eq!(parse_live_fields(vec![]), None);
+        // Unknown fields are ignored, not an error.
+        let lf = parse_live_fields(vec![
+            ("best_difficulty".into(), "7.5".into()),
+            ("some_future_field".into(), "x".into()),
+        ])
+        .unwrap();
+        assert_eq!(lf.best_difficulty, 7.5);
+    }
+
+    #[test]
+    fn user_agent_grouping_keeps_the_sql_count_semantics() {
+        let row = |ua: Option<&str>, n: usize| UserAgentSessionRow {
+            user_agent: ua.map(String::from),
+            address: format!("addr{n}"),
+            worker: "w".into(),
+            session_id: format!("s{n}"),
+        };
+        let lf = |hr: f64, best: f64| {
+            Some(LiveFields {
+                hash_rate: hr,
+                best_difficulty: best,
+                ..Default::default()
+            })
+        };
+        let rows = vec![
+            row(Some("bitaxe"), 1),
+            row(Some("bitaxe"), 2),
+            row(None, 3),
+            row(Some("nerdminer"), 4),
+        ];
+        // Session 2 has no live hash at all — counted, but contributes
+        // no numbers (a PG-active row whose Redis key expired).
+        let live = vec![lf(10.0, 5.0), None, lf(3.0, 9.0), lf(1.0, 1.0)];
+        let out = group_user_agents(&rows, &live);
+        assert_eq!(out.len(), 3);
+        let bitaxe = out
+            .iter()
+            .find(|g| g.user_agent.as_deref() == Some("bitaxe"))
+            .unwrap();
+        assert_eq!(bitaxe.count, 2, "count counts rows, not live hashes");
+        assert_eq!(bitaxe.total_hash_rate, 10.0);
+        assert_eq!(bitaxe.best_difficulty, 5.0);
+        let null_group = out.iter().find(|g| g.user_agent.is_none()).unwrap();
+        assert_eq!(
+            null_group.count, 0,
+            "SQL COUNT(col) parity: NULL group counts 0"
+        );
+        assert_eq!(null_group.total_hash_rate, 3.0);
+        assert_eq!(
+            out[0].user_agent.as_deref(),
+            Some("bitaxe"),
+            "ordered by count DESC"
+        );
     }
 
     #[tokio::test]

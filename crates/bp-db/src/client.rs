@@ -13,14 +13,13 @@ use sqlx::{postgres::PgPool, FromRow};
 
 use crate::DbError;
 
+/// The birth half of a session. The live half (`hashRate`,
+/// `currentDifficulty`, `channelCount`, per-session `bestDifficulty`,
+/// last-seen) lives in the `client:live:*` Redis hashes — consumers
+/// compose it via `bp_client_live::live_fields_for_sessions`, keyed by
+/// the same `(address, client_name, session_id)` triple.
 #[derive(Clone, Debug, FromRow)]
 pub struct ClientRow {
-    #[sqlx(rename = "deletedAt")]
-    pub deleted_at: Option<i64>,
-    #[sqlx(rename = "createdAt")]
-    pub created_at: i64,
-    #[sqlx(rename = "updatedAt")]
-    pub updated_at: i64,
     pub address: AddressId,
     #[sqlx(rename = "clientName")]
     pub client_name: String,
@@ -30,20 +29,6 @@ pub struct ClientRow {
     pub user_agent: Option<String>,
     #[sqlx(rename = "startTime")]
     pub start_time: i64,
-    #[sqlx(rename = "firstSeen")]
-    pub first_seen: Option<i64>,
-    #[sqlx(rename = "bestDifficulty")]
-    pub best_difficulty: f32,
-    #[sqlx(rename = "hashRate")]
-    pub hash_rate: f64,
-    #[sqlx(rename = "currentDifficulty")]
-    pub current_difficulty: Option<f32>,
-    /// Number of mining channels on this session's connection. `1` for a
-    /// direct miner; `> 1` when a rental proxy bundles several same-rig
-    /// devices onto one connection — the UI flags the difficulty as
-    /// aggregated in that case.
-    #[sqlx(rename = "channelCount")]
-    pub channel_count: i32,
 }
 
 pub async fn find_client(
@@ -55,19 +40,11 @@ pub async fn find_client(
     sqlx::query_as!(
         ClientRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
             address AS "address!: AddressId",
             "clientName" AS "client_name!",
             "sessionId" AS "session_id!",
             "userAgent" AS "user_agent?",
-            "startTime" AS "start_time!",
-            "firstSeen" AS "first_seen?",
-            "bestDifficulty" AS "best_difficulty!",
-            "hashRate" AS "hash_rate!",
-            "currentDifficulty" AS "current_difficulty?",
-            "channelCount" AS "channel_count!"
+            "startTime" AS "start_time!"
            FROM client_entity
            WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3 LIMIT 1"#,
         address.as_str(),
@@ -88,19 +65,11 @@ pub async fn find_clients_by_address(
     sqlx::query_as!(
         ClientRow,
         r#"SELECT
-            "deletedAt" AS "deleted_at?",
-            "createdAt" AS "created_at!",
-            "updatedAt" AS "updated_at!",
             address AS "address!: AddressId",
             "clientName" AS "client_name!",
             "sessionId" AS "session_id!",
             "userAgent" AS "user_agent?",
-            "startTime" AS "start_time!",
-            "firstSeen" AS "first_seen?",
-            "bestDifficulty" AS "best_difficulty!",
-            "hashRate" AS "hash_rate!",
-            "currentDifficulty" AS "current_difficulty?",
-            "channelCount" AS "channel_count!"
+            "startTime" AS "start_time!"
            FROM client_entity
            WHERE address = $1 AND "deletedAt" IS NULL
            ORDER BY "clientName", "sessionId""#,
@@ -111,34 +80,51 @@ pub async fn find_clients_by_address(
     .map_err(DbError::from)
 }
 
-/// One row of the user-agent aggregation surfaced by `/api/info` →
-/// `userAgents` (`userAgent`, `count`, `bestDifficulty`, `totalHashRate`).
-#[derive(Clone, Debug, FromRow)]
-pub struct UserAgentAggRow {
-    #[sqlx(rename = "userAgent")]
-    pub user_agent: Option<String>,
-    pub count: i64,
-    #[sqlx(rename = "bestDifficulty")]
-    pub best_difficulty: Option<f32>,
-    #[sqlx(rename = "totalHashRate")]
-    pub total_hash_rate: Option<f64>,
+/// Every **active** session's `(userAgent, key triple)` — the PG half
+/// of the `/api/info` `userAgents` aggregation; the numbers come from
+/// the `client:live:*` hashes via
+/// `bp_client_live::aggregate_by_user_agent`. The `deletedAt IS NULL`
+/// filter keeps an idle pool from emitting a ghost
+/// `{userAgent: null, count: 0}` entry.
+pub async fn find_active_session_keys(pool: &PgPool) -> Result<Vec<ClientRow>, DbError> {
+    sqlx::query_as!(
+        ClientRow,
+        r#"SELECT
+            address AS "address!: AddressId",
+            "clientName" AS "client_name!",
+            "sessionId" AS "session_id!",
+            "userAgent" AS "user_agent?",
+            "startTime" AS "start_time!"
+           FROM client_entity
+           WHERE "deletedAt" IS NULL"#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)
 }
 
-/// GROUP BY `userAgent` over the **active** rows in `client_entity`
-/// — `deletedAt IS NULL` filter so an idle pool with only soft-deleted
-/// sessions doesn't emit a ghost `{userAgent: null, count: 0}` entry.
-/// Ordered by `count DESC`.
-pub async fn find_user_agents(pool: &PgPool) -> Result<Vec<UserAgentAggRow>, DbError> {
-    sqlx::query_as::<_, UserAgentAggRow>(
+/// Session `(userAgent, key triple)` rows for an address list — the PG
+/// half of `/api/pplns`'s `userAgents` aggregation. ⚠️ Deliberately NO
+/// `deletedAt` filter: the inline SQL this replaces never had one, and
+/// tightening it is a display decision, not a refactor side effect.
+pub async fn find_session_keys_for_addresses(
+    pool: &PgPool,
+    addresses: &[String],
+) -> Result<Vec<ClientRow>, DbError> {
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        ClientRow,
         r#"SELECT
-            "userAgent",
-            COUNT("userAgent") AS count,
-            MAX("bestDifficulty") AS "bestDifficulty",
-            SUM("hashRate") AS "totalHashRate"
+            address AS "address!: AddressId",
+            "clientName" AS "client_name!",
+            "sessionId" AS "session_id!",
+            "userAgent" AS "user_agent?",
+            "startTime" AS "start_time!"
            FROM client_entity
-           WHERE "deletedAt" IS NULL
-           GROUP BY "userAgent"
-           ORDER BY COUNT("userAgent") DESC"#,
+           WHERE address = ANY($1)"#,
+        addresses,
     )
     .fetch_all(pool)
     .await
@@ -947,6 +933,12 @@ pub async fn device_first_seen(
 /// restart. Without it the gate would only ever learn about a device from
 /// a Stratum event, so a miner that died just before the restart — and
 /// will therefore never emit another event — could never be reported.
+///
+/// ⚠️ Since the live fields moved to Redis, `updatedAt` is no longer
+/// touched per share — the `ORDER BY "updatedAt"` inside the aggregate
+/// now picks the user agent of the most recently born or soft-deleted
+/// session rather than the most recently *touched* one. Accepted drift:
+/// this only seasons the seed's user-agent string, never liveness.
 pub async fn device_watch_seed(
     pool: &PgPool,
     addresses: &[String],

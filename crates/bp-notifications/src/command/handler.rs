@@ -1022,7 +1022,9 @@ impl CommandHandler {
             "/difficulty" => super::read::build_current_difficulty(lang).await,
             "/next_difficulty" => super::read::build_next_difficulty(lang).await,
             "/stats" => match self.origin_address(transport).await {
-                Some(addr) => super::read::build_stats(&self.pool, lang, &addr).await,
+                Some(addr) => {
+                    super::read::build_stats(&self.pool, self.redis.as_ref(), lang, &addr).await
+                }
                 None => need_address_text(lang).to_string(),
             },
             "/group_history" => match self.origin_address(transport).await {
@@ -1072,7 +1074,10 @@ impl CommandHandler {
                 }
             }
             "/show_workers" => match self.origin_address(transport).await {
-                Some(addr) => super::read::build_show_workers(&self.pool, lang, &addr).await,
+                Some(addr) => {
+                    super::read::build_show_workers(&self.pool, self.redis.as_ref(), lang, &addr)
+                        .await
+                }
                 None => need_address_text(lang).to_string(),
             },
             _ => deferred_text(lang, name),

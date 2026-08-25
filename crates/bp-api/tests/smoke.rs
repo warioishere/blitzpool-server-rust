@@ -50,6 +50,21 @@ fn minimal_state(pool: PgPool) -> Arc<AppState<NoopHooks, NoopEmailHooks>> {
     Arc::new(AppState::<NoopHooks, NoopEmailHooks>::new(pool, "0.0.0"))
 }
 
+/// State with a live-store handle — for endpoints that read the
+/// `client:live:*` hashes. Borrowed NO-FLUSH index: these tests write
+/// nothing to Redis and tolerate any content, so no flushing sibling is
+/// harmed and none can harm them. `None` = Redis unreachable → skip.
+async fn state_with_live_store(pool: PgPool) -> Option<Arc<AppState<NoopHooks, NoopEmailHooks>>> {
+    let redis = bp_test_support::connect_redis_in_range_no_flush(
+        bp_test_support::redis_db::SESSION_PERSISTENCE,
+        31,
+    )
+    .await?;
+    let mut state = AppState::<NoopHooks, NoopEmailHooks>::new(pool, "0.0.0");
+    state.redis = Some(redis);
+    Some(Arc::new(state))
+}
+
 #[tokio::test]
 async fn version_endpoint_returns_pool_version() {
     let Some(pool) = connect_or_skip().await else {
@@ -346,20 +361,11 @@ async fn pool_endpoint_returns_basic_shape() {
         return;
     };
     // `/api/pool` reads the live hashrate from the `client:live:*`
-    // Redis hashes. Borrowed NO-FLUSH index: this test writes nothing
-    // and asserts only the wire shape, so any database's content is
-    // fine and no flushing sibling can be harmed by it.
-    let Some(redis) = bp_test_support::connect_redis_in_range_no_flush(
-        bp_test_support::redis_db::SESSION_PERSISTENCE,
-        31,
-    )
-    .await
-    else {
+    // Redis hashes; the test asserts only the wire shape.
+    let Some(state) = state_with_live_store(pool).await else {
         return;
     };
-    let mut state = AppState::<NoopHooks, NoopEmailHooks>::new(pool, "0.0.0");
-    state.redis = Some(redis);
-    let router = build_router(Arc::new(state));
+    let router = build_router(state);
     let resp = router
         .oneshot(
             Request::builder()
@@ -555,7 +561,11 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
     .expect("seed stats");
     tx.commit().await.expect("commit");
 
-    let router = build_router(minimal_state(pool.clone()));
+    // The worker page composes live fields from Redis now.
+    let Some(state) = state_with_live_store(pool.clone()).await else {
+        return;
+    };
+    let router = build_router(state);
     let resp = router
         .oneshot(
             Request::builder()

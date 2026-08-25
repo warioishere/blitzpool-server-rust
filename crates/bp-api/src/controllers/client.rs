@@ -357,7 +357,21 @@ where
         .cache
         .get_or_fetch::<ClientResponse, _, ApiError>(key, TtlKind::ClientInfo, async move {
             let clients = find_clients_by_address(&s.pool, &addr).await?;
-            let total_hashrate: f64 = clients.iter().map(|c| c.hash_rate).sum();
+            // Live half from Redis, positionally aligned with `clients`.
+            // A session without a live hash renders as 0/None — it stays
+            // listed while its PG row is active.
+            let triples: Vec<(&str, &str, &str)> = clients
+                .iter()
+                .map(|c| {
+                    (
+                        c.address.as_str(),
+                        c.client_name.as_str(),
+                        c.session_id.as_str(),
+                    )
+                })
+                .collect();
+            let live = bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &triples).await?;
+            let total_hashrate: f64 = live.iter().flatten().map(|lf| lf.hash_rate).sum();
             let settings = find_address_settings(&s.pool, &addr).await?;
             let best_difficulty = settings.as_ref().map(|x| x.best_difficulty.floor() as u64);
             let total_shares = settings.map(|x| x.shares).unwrap_or(0.0);
@@ -378,16 +392,24 @@ where
                 total_hashrate,
                 workers: clients
                     .into_iter()
-                    .map(|c| WorkerEntry {
-                        session_id: c.session_id,
-                        extranonce: overrides.get(&c.client_name).cloned(),
-                        name: c.client_name,
-                        best_difficulty: format!("{:.2}", c.best_difficulty as f64),
-                        hash_rate: c.hash_rate,
-                        current_difficulty: c.current_difficulty.map(|d| d as f64),
-                        channel_count: c.channel_count,
-                        start_time: crate::time_range::format_slot_label(c.start_time),
-                        last_seen: crate::time_range::format_slot_label(c.updated_at),
+                    .zip(live)
+                    .map(|(c, lf)| {
+                        let lf = lf.unwrap_or_default();
+                        WorkerEntry {
+                            session_id: c.session_id,
+                            extranonce: overrides.get(&c.client_name).cloned(),
+                            name: c.client_name,
+                            best_difficulty: format!("{:.2}", lf.best_difficulty),
+                            hash_rate: lf.hash_rate,
+                            current_difficulty: lf.current_difficulty,
+                            channel_count: lf.channel_count.unwrap_or(1),
+                            start_time: crate::time_range::format_slot_label(c.start_time),
+                            // No live hash → the freshest thing known is
+                            // the session's own start.
+                            last_seen: crate::time_range::format_slot_label(
+                                lf.updated_at_ms.unwrap_or(c.start_time),
+                            ),
+                        }
                     })
                     .collect(),
             })
@@ -523,9 +545,23 @@ where
             if matching.is_empty() {
                 return Err(ApiError::NotFound);
             }
-            let best_difficulty = matching
+            // Max over the worker's live per-session bests (a session
+            // without a live hash contributes nothing, like a 0 column).
+            let triples: Vec<(&str, &str, &str)> = matching
                 .iter()
-                .map(|c| c.best_difficulty as f64)
+                .map(|c| {
+                    (
+                        c.address.as_str(),
+                        c.client_name.as_str(),
+                        c.session_id.as_str(),
+                    )
+                })
+                .collect();
+            let live = bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &triples).await?;
+            let best_difficulty = live
+                .iter()
+                .flatten()
+                .map(|lf| lf.best_difficulty)
                 .fold(0.0_f64, f64::max)
                 .floor() as i64;
 
@@ -606,6 +642,16 @@ where
                 let row = find_client(&s.pool, &addr, &worker, &session)
                     .await?
                     .ok_or(ApiError::NotFound)?;
+                let live = bp_client_live::live_fields_for_sessions(
+                    s.redis.as_ref(),
+                    &[(addr.as_str(), worker.as_str(), session.as_str())],
+                )
+                .await?;
+                let live_best = live
+                    .first()
+                    .and_then(|o| o.as_ref())
+                    .map(|lf| lf.best_difficulty)
+                    .unwrap_or(0.0);
 
                 let now = bp_common::now_ms();
                 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
@@ -629,7 +675,7 @@ where
                 Ok(SessionResponse {
                     session_id: row.session_id,
                     name: row.client_name,
-                    best_difficulty: (row.best_difficulty as f64).floor() as i64,
+                    best_difficulty: live_best.floor() as i64,
                     chart_data,
                     start_time: crate::time_range::format_slot_label(row.start_time),
                 })
@@ -787,6 +833,11 @@ where
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    // Best-effort: drop the live hashes too, or the purged miner keeps
+    // reporting hashrate for up to the TTL. Failure only delays that.
+    if let Err(e) = bp_client_live::delete_address_live_keys(state.redis.as_ref(), &addr).await {
+        tracing::warn!(target: "bp_api", error = %e, address = %addr, "delete_all: live-key purge failed");
+    }
     invalidate_address_cache(&state, &addr).await;
     Ok(Json(StatusResponse {
         status: "all-deleted",

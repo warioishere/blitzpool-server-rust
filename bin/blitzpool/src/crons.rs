@@ -359,6 +359,7 @@ pub(crate) async fn spawn(
                 ..HourlyStatsCronConfig::default()
             },
             pool.clone(),
+            Some(foundation.redis.clone()),
             telegram_adapter,
             ntfy_adapter,
             listeners.chat_languages().unwrap_or_default(),

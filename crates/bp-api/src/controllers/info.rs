@@ -13,7 +13,7 @@ use axum::{
 use bp_common::MiningMode;
 use bp_db::{
     find_found_blocks, find_high_scores, find_network_difficulty_tracker,
-    find_pool_mode_hashrate_since, find_user_agents,
+    find_pool_mode_hashrate_since,
 };
 use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
 use serde::Serialize;
@@ -1349,7 +1349,18 @@ where
             TtlKind::SiteInfo,
             async move {
                 let blocks = find_found_blocks(&s.pool).await?;
-                let agents = find_user_agents(&s.pool).await?;
+                let sessions = bp_db::find_active_session_keys(&s.pool).await?;
+                let rows: Vec<bp_client_live::UserAgentSessionRow> = sessions
+                    .into_iter()
+                    .map(|r| bp_client_live::UserAgentSessionRow {
+                        user_agent: r.user_agent,
+                        address: r.address.into_inner(),
+                        worker: r.client_name,
+                        session_id: r.session_id,
+                    })
+                    .collect();
+                let agents =
+                    bp_client_live::aggregate_by_user_agent(s.redis.as_ref(), &rows).await?;
                 let scores = find_high_scores(&s.pool).await?;
                 Ok(InfoResponse {
                     block_data: blocks
@@ -1366,8 +1377,8 @@ where
                         .map(|a| UserAgentEntry {
                             user_agent: a.user_agent,
                             count: a.count,
-                            best_difficulty: a.best_difficulty,
-                            total_hash_rate: a.total_hash_rate,
+                            best_difficulty: Some(a.best_difficulty as f32),
+                            total_hash_rate: Some(a.total_hash_rate),
                         })
                         .collect(),
                     high_scores: scores

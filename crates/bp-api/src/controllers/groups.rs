@@ -1276,7 +1276,26 @@ where
                 // client info by full address.
                 let clients = bp_db::find_clients_by_address(&s.pool, &m.address).await?;
                 let start_time = clients.iter().map(|c| c.start_time).min();
-                let last_seen = clients.iter().map(|c| c.updated_at).max();
+                let triples: Vec<(&str, &str, &str)> = clients
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.address.as_str(),
+                            c.client_name.as_str(),
+                            c.session_id.as_str(),
+                        )
+                    })
+                    .collect();
+                let live =
+                    bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &triples).await?;
+                // Freshest accepted share across the member's sessions;
+                // no live data → the youngest thing known is a start.
+                let last_seen = live
+                    .iter()
+                    .flatten()
+                    .filter_map(|lf| lf.updated_at_ms)
+                    .max()
+                    .or(start_time);
                 let best_difficulty = bp_db::find_address_settings(&s.pool, &m.address)
                     .await?
                     .map(|x| x.best_difficulty)
