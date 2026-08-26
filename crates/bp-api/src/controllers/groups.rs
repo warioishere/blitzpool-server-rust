@@ -960,8 +960,10 @@ where
                     .iter()
                     .flat_map(|(_, members)| members.iter().map(|m| m.address.clone()))
                     .collect();
-                let by_address =
-                    bp_client_live::hashrate_by_address(s.redis.as_ref(), &everyone).await?;
+                let by_address = crate::error::or_degraded(
+                    bp_client_live::hashrate_by_address(s.redis.as_ref(), &everyone).await,
+                    || zeroed(&everyone),
+                )?;
                 let mut items = Vec::with_capacity(rosters.len());
                 for (g, members) in rosters {
                     let total_hashrate: f64 = members
@@ -1042,8 +1044,10 @@ where
                 }
                 let members = svc.list_members(id).await?;
                 let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
-                let total_hashrate =
-                    bp_client_live::hashrate_for_addresses(s.redis.as_ref(), &addrs).await?;
+                let total_hashrate = crate::error::or_degraded(
+                    bp_client_live::hashrate_for_addresses(s.redis.as_ref(), &addrs).await,
+                    || 0.0,
+                )?;
                 let history = bp_db::find_recent_group_block_history(&s.pool, id, 20).await?;
                 let mut summary = GroupSummary::from(group);
                 summary.creator_address = None; // never expose the creator publicly
@@ -1242,8 +1246,10 @@ where
             let group = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
             let members = svc.list_members(id).await?;
             let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
-            let per_addr_hashrate =
-                bp_client_live::hashrate_by_address(s.redis.as_ref(), &addrs).await?;
+            let per_addr_hashrate = crate::error::or_degraded(
+                bp_client_live::hashrate_by_address(s.redis.as_ref(), &addrs).await,
+                || zeroed(&addrs),
+            )?;
             let total_hashrate: f64 = per_addr_hashrate.values().sum();
             let addr_strings: Vec<String> = addrs.iter().map(|a| a.as_str().to_string()).collect();
             let labels = build_member_labels(&addr_strings);
@@ -1261,8 +1267,10 @@ where
             // one Redis pipeline each, awaited in sequence.
             let sessions =
                 bp_db::find_active_sessions_for_addresses(&s.pool, &addr_strings).await?;
-            let live =
-                bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &sessions).await?;
+            let live = crate::error::or_degraded(
+                bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &sessions).await,
+                || vec![None; sessions.len()],
+            )?;
             let mut start_times: HashMap<&str, i64> = HashMap::new();
             let mut last_seen_by_address: HashMap<&str, i64> = HashMap::new();
             for (c, lf) in sessions.iter().zip(&live) {
@@ -1356,6 +1364,15 @@ where
     Ok(JsonBytes(bytes))
 }
 
+/// Every requested address at zero — the shape `hashrate_by_address`
+/// returns when nothing is live, used as the degraded fallback.
+fn zeroed(addrs: &[AddressId]) -> HashMap<String, f64> {
+    addrs
+        .iter()
+        .map(|a| (a.as_str().to_string(), 0.0))
+        .collect()
+}
+
 // ─── GET /api/groups/by-address/:address ─────────────────────────
 
 async fn by_address<H, M>(
@@ -1416,7 +1433,10 @@ where
             let _ = svc.get_group(id).await?.ok_or(ApiError::NotFound)?;
             let members = svc.list_members(id).await?;
             let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
-            let per_addr = bp_client_live::hashrate_by_address(s.redis.as_ref(), &addrs).await?;
+            let per_addr = crate::error::or_degraded(
+                bp_client_live::hashrate_by_address(s.redis.as_ref(), &addrs).await,
+                || zeroed(&addrs),
+            )?;
             let total_hashrate: f64 = per_addr.values().sum();
             let addr_strings: Vec<String> = addrs.iter().map(|a| a.as_str().to_string()).collect();
             let labels = build_member_labels(&addr_strings);

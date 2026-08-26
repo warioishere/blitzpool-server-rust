@@ -42,9 +42,16 @@ pub const F_HASH_RATE: &str = "hash_rate";
 pub const F_CURRENT_DIFFICULTY: &str = "current_difficulty";
 /// Hash field: channel count of the session's freshest share.
 pub const F_CHANNEL_COUNT: &str = "channel_count";
-/// Hash field: per-session best share difficulty. Monotone — the writer
-/// max-merges against the stored value, mirroring the `GREATEST` the
-/// `client_entity` column gets.
+/// Hash field: per-session best share difficulty. Monotone WITHIN the
+/// key's life — the writer max-merges against the stored value.
+///
+/// Deliberately ephemeral: a Redis restart or an eviction resets it to
+/// 0 and it climbs again from the shares seen afterwards. That is
+/// acceptable because the value was always scoped to one session (every
+/// reconnect started it over anyway) and nothing durable reads it. The
+/// all-time best per address lives in `address_settings_entity` and is
+/// untouched by any of this — if the two ever need to agree, that is
+/// the one to trust.
 pub const F_BEST_DIFFICULTY: &str = "best_difficulty";
 /// Hash field: epoch-ms timestamp of the freshest accepted share.
 pub const F_UPDATED_AT_MS: &str = "updated_at_ms";

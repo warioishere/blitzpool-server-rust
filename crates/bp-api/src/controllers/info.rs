@@ -738,7 +738,10 @@ where
             "POOL_INFO".to_string(),
             TtlKind::PoolInfo,
             async move {
-                let total_hash_rate = bp_client_live::pool_hashrate(s.redis.as_ref()).await?;
+                let total_hash_rate = crate::error::or_degraded(
+                    bp_client_live::pool_hashrate(s.redis.as_ref()).await,
+                    || 0.0,
+                )?;
                 let total_miners: i64 =
                     sqlx::query_scalar!(r#"SELECT COUNT("userAgent") FROM client_entity"#,)
                         .fetch_one(&s.pool)
@@ -1359,8 +1362,10 @@ where
                         session_id: r.session_id,
                     })
                     .collect();
-                let agents =
-                    bp_client_live::aggregate_by_user_agent(s.redis.as_ref(), &rows).await?;
+                let agents = crate::error::or_degraded(
+                    bp_client_live::aggregate_by_user_agent(s.redis.as_ref(), &rows).await,
+                    || bp_client_live::aggregate_offline(&rows),
+                )?;
                 let scores = find_high_scores(&s.pool).await?;
                 Ok(InfoResponse {
                     block_data: blocks

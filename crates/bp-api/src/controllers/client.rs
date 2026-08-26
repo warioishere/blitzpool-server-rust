@@ -360,7 +360,10 @@ where
             // Live half from Redis, positionally aligned with `clients`.
             // A session without a live hash renders as 0/None — it stays
             // listed while its PG row is active.
-            let live = bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &clients).await?;
+            let live = crate::error::or_degraded(
+                bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &clients).await,
+                || vec![None; clients.len()],
+            )?;
             let total_hashrate: f64 = live.iter().flatten().map(|lf| lf.hash_rate).sum();
             let settings = find_address_settings(&s.pool, &addr).await?;
             let best_difficulty = settings.as_ref().map(|x| x.best_difficulty.floor() as u64);
@@ -537,8 +540,10 @@ where
             }
             // Max over the worker's live per-session bests (a session
             // without a live hash contributes nothing, like a 0 column).
-            let live =
-                bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &matching).await?;
+            let live = crate::error::or_degraded(
+                bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &matching).await,
+                || vec![None; matching.len()],
+            )?;
             let best_difficulty = live
                 .iter()
                 .flatten()
@@ -623,11 +628,14 @@ where
                 let row = find_client(&s.pool, &addr, &worker, &session)
                     .await?
                     .ok_or(ApiError::NotFound)?;
-                let live = bp_client_live::live_fields_for_sessions(
-                    s.redis.as_ref(),
-                    &[(addr.as_str(), worker.as_str(), session.as_str())],
-                )
-                .await?;
+                let live = crate::error::or_degraded(
+                    bp_client_live::live_fields_for_sessions(
+                        s.redis.as_ref(),
+                        &[(addr.as_str(), worker.as_str(), session.as_str())],
+                    )
+                    .await,
+                    || vec![None],
+                )?;
                 let live_best = live
                     .first()
                     .and_then(|o| o.as_ref())

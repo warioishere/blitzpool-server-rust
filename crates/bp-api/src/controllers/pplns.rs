@@ -204,16 +204,18 @@ where
                 session_id: r.session_id,
             })
             .collect();
-        bp_client_live::aggregate_by_user_agent(state.redis.as_ref(), &rows)
-            .await?
-            .into_iter()
-            .map(|a| UserAgentEntry {
-                user_agent: a.user_agent,
-                count: a.count.to_string(),
-                best_difficulty: Some(a.best_difficulty.floor() as u64),
-                total_hash_rate: Some(a.total_hash_rate),
-            })
-            .collect()
+        crate::error::or_degraded(
+            bp_client_live::aggregate_by_user_agent(state.redis.as_ref(), &rows).await,
+            || bp_client_live::aggregate_offline(&rows),
+        )?
+        .into_iter()
+        .map(|a| UserAgentEntry {
+            user_agent: a.user_agent,
+            count: a.count.to_string(),
+            best_difficulty: Some(a.best_difficulty.floor() as u64),
+            total_hash_rate: Some(a.total_hash_rate),
+        })
+        .collect()
     };
     Ok(RootResponse {
         enabled: true,

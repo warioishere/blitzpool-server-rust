@@ -348,6 +348,14 @@ pub async fn aggregate_by_user_agent(
     Ok(group_user_agents(rows, &live))
 }
 
+/// The same grouping with NO live data — what a reader shows while the
+/// live store is unreachable: who is connected is known from Postgres,
+/// what they are hashing is not.
+pub fn aggregate_offline(rows: &[UserAgentSessionRow]) -> Vec<UserAgentAgg> {
+    let none: Vec<Option<LiveFields>> = vec![None; rows.len()];
+    group_user_agents(rows, &none)
+}
+
 /// The pure grouping half of [`aggregate_by_user_agent`], split out so
 /// the count/NULL/max semantics are testable without a Redis server.
 fn group_user_agents(
