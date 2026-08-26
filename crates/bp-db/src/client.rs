@@ -31,6 +31,18 @@ pub struct ClientRow {
     pub start_time: i64,
 }
 
+impl bp_common::live_client_key::SessionKey for ClientRow {
+    fn address(&self) -> &str {
+        self.address.as_str()
+    }
+    fn worker(&self) -> &str {
+        &self.client_name
+    }
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
 pub async fn find_client(
     pool: &PgPool,
     address: &AddressId,
@@ -103,11 +115,17 @@ pub async fn find_active_session_keys(pool: &PgPool) -> Result<Vec<ClientRow>, D
     .map_err(DbError::from)
 }
 
-/// Session `(userAgent, key triple)` rows for an address list — the PG
-/// half of `/api/pplns`'s `userAgents` aggregation. ⚠️ Deliberately NO
-/// `deletedAt` filter: the inline SQL this replaces never had one, and
-/// tightening it is a display decision, not a refactor side effect.
-pub async fn find_session_keys_for_addresses(
+/// Active session rows for an address list — the PG half of
+/// `/api/pplns`'s `userAgents` aggregation and of the group roster's
+/// per-member session stats.
+///
+/// The inline SQL this replaced had no `deletedAt` filter, and while it
+/// summed and counted the same rows that was merely generous. It is not
+/// any more: the numbers come from the live hashes, which a retired
+/// session no longer has, so counting its ghost row would report
+/// `count: 31` next to one session's hashrate. Count and sums have to
+/// describe the same population.
+pub async fn find_active_sessions_for_addresses(
     pool: &PgPool,
     addresses: &[String],
 ) -> Result<Vec<ClientRow>, DbError> {
@@ -123,7 +141,7 @@ pub async fn find_session_keys_for_addresses(
             "userAgent" AS "user_agent?",
             "startTime" AS "start_time!"
            FROM client_entity
-           WHERE address = ANY($1)"#,
+           WHERE address = ANY($1) AND "deletedAt" IS NULL"#,
         addresses,
     )
     .fetch_all(pool)
@@ -623,14 +641,56 @@ where
     upsert_clients_stmt(executor, std::slice::from_ref(row)).await
 }
 
+/// Advisory-lock key serialising the multi-row writers of
+/// `client_entity`: the row-birth upsert, the dead-session sweep, and
+/// its repair half.
+///
+/// Postgres takes row locks in processing order, and each of these
+/// builds its arrays from an unordered source (a `HashMap` for the
+/// births, a query result for the sweep), so two of them running
+/// concurrently over shared rows can deadlock. That is measured, not
+/// theoretical: 46 deadlocks in ~90 minutes on the prod accounting
+/// process (2026-08-05), back when the touch flush and the hashrate
+/// sampler collided every 60 s.
+///
+/// Sorting the inputs would NOT fix it — the planner may reorder the
+/// join, so input order does not determine lock order. Serialising the
+/// writers does. A process-local mutex would not do either: births run
+/// on the Front, the sweep on the accounting role, i.e. two processes.
+///
+/// ⚠️ Any future multi-row writer of `client_entity` MUST take this
+/// lock too.
+///
+/// The hot writers this lock was born for are gone (the live fields
+/// live in Redis now), so it no longer sits between two 30 s/60 s
+/// statements over the same 700 rows — it now serialises ~9 births per
+/// minute against a once-per-minute sweep that usually touches nothing.
+const CLIENT_ENTITY_BULK_WRITE_LOCK: i64 = 0x636c_6e74_6277; // "clntbw"
+
+/// Take [`CLIENT_ENTITY_BULK_WRITE_LOCK`] for the rest of `tx`. The
+/// `_xact_` variant releases on commit OR rollback, so an error path
+/// cannot leak the lock and wedge the other writer.
+async fn take_client_entity_bulk_write_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), DbError> {
+    sqlx::query!(
+        "SELECT pg_advisory_xact_lock($1)",
+        CLIENT_ENTITY_BULK_WRITE_LOCK
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(DbError::from)?;
+    Ok(())
+}
+
 /// Insert / upsert N client rows in one statement — the row-birth flush
-/// of the session-persistence debounce. The sole bulk writer of
-/// `client_entity` since the live fields moved to the `client:live:*`
-/// Redis hashes; the advisory lock that once serialised it against the
-/// touch/hashrate bulk UPDATEs went with them (one writer needs no
-/// serialisation, and a single statement is atomic on its own).
+/// of the session-persistence debounce.
 pub async fn bulk_upsert_clients(pool: &PgPool, rows: &[ClientUpsert]) -> Result<u64, DbError> {
-    upsert_clients_stmt(pool, rows).await
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    take_client_entity_bulk_write_lock(&mut tx).await?;
+    let n = upsert_clients_stmt(&mut *tx, rows).await?;
+    tx.commit().await.map_err(DbError::from)?;
+    Ok(n)
 }
 
 /// Soft-delete every `client_entity` row matching `sessionId`. Sets
@@ -690,15 +750,14 @@ where
 /// Soft-delete the given sessions (parallel key arrays), skipping any
 /// that were re-registered or soft-deleted in the meantime. The verdict
 /// half of the dead-session sweep — see [`find_stale_active_sessions`].
-pub async fn soft_delete_sessions<'e, E>(
-    executor: E,
+pub async fn soft_delete_sessions(
+    pool: &PgPool,
     addresses: &[String],
     client_names: &[String],
     session_ids: &[String],
-) -> Result<u64, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
+) -> Result<u64, DbError> {
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    take_client_entity_bulk_write_lock(&mut tx).await?;
     let result = sqlx::query!(
         r#"UPDATE client_entity AS t
            SET "deletedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
@@ -717,9 +776,100 @@ where
         client_names,
         session_ids,
     )
-    .execute(executor)
+    .execute(&mut *tx)
     .await
     .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
+    Ok(result.rows_affected())
+}
+
+/// One soft-deleted session, for the sweep's repair half.
+#[derive(Clone, Debug, FromRow)]
+pub struct DeletedSessionRow {
+    pub address: AddressId,
+    #[sqlx(rename = "clientName")]
+    pub client_name: String,
+    #[sqlx(rename = "sessionId")]
+    pub session_id: String,
+    #[sqlx(rename = "deletedAt")]
+    pub deleted_at: i64,
+}
+
+impl bp_common::live_client_key::SessionKey for DeletedSessionRow {
+    fn address(&self) -> &str {
+        self.address.as_str()
+    }
+    fn worker(&self) -> &str {
+        &self.client_name
+    }
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+/// Sessions soft-deleted at or after `since_ms` — the input to the
+/// sweep's REPAIR half ([`revive_sessions`]).
+///
+/// The live fields left Postgres, and with them the touch UPDATE that
+/// used to carry `"deletedAt" = NULL` and undo a wrong sweep on its next
+/// 30 s pass. Nothing else ever cleared the flag, so a session
+/// soft-deleted by mistake — Redis restarted empty, its key was evicted
+/// — stayed invisible for the rest of its TCP connection, i.e. days.
+/// The sweep now reconciles in both directions instead.
+pub async fn find_recently_deleted_sessions(
+    pool: &PgPool,
+    since_ms: i64,
+) -> Result<Vec<DeletedSessionRow>, DbError> {
+    sqlx::query_as!(
+        DeletedSessionRow,
+        r#"SELECT
+            address AS "address!: AddressId",
+            "clientName" AS "client_name!",
+            "sessionId" AS "session_id!",
+            "deletedAt" AS "deleted_at!"
+           FROM client_entity
+           WHERE "deletedAt" IS NOT NULL AND "deletedAt" >= $1"#,
+        since_ms,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::from)
+}
+
+/// Clear `deletedAt` for the given sessions — the repair half of the
+/// dead-session sweep. The caller decides who qualifies; the rule is
+/// "its live hash has been written SINCE the soft-delete", which only a
+/// session that kept mining can satisfy.
+pub async fn revive_sessions(
+    pool: &PgPool,
+    addresses: &[String],
+    client_names: &[String],
+    session_ids: &[String],
+) -> Result<u64, DbError> {
+    let mut tx = pool.begin().await.map_err(DbError::from)?;
+    take_client_entity_bulk_write_lock(&mut tx).await?;
+    let result = sqlx::query!(
+        r#"UPDATE client_entity AS t
+           SET "deletedAt" = NULL,
+               "updatedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
+           FROM (
+               SELECT
+                   unnest($1::text[]) AS address,
+                   unnest($2::text[]) AS "clientName",
+                   unnest($3::text[]) AS "sessionId"
+           ) AS u
+           WHERE t.address      = u.address
+             AND t."clientName" = u."clientName"
+             AND t."sessionId"  = u."sessionId"
+             AND t."deletedAt" IS NOT NULL"#,
+        addresses,
+        client_names,
+        session_ids,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::from)?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok(result.rows_affected())
 }
 

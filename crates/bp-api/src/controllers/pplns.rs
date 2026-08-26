@@ -194,7 +194,7 @@ where
     let user_agents = if addresses.is_empty() {
         Vec::new()
     } else {
-        let sessions = bp_db::find_session_keys_for_addresses(&state.pool, &addresses).await?;
+        let sessions = bp_db::find_active_sessions_for_addresses(&state.pool, &addresses).await?;
         let rows: Vec<bp_client_live::UserAgentSessionRow> = sessions
             .into_iter()
             .map(|r| bp_client_live::UserAgentSessionRow {

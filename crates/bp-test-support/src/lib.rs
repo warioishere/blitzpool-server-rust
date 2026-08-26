@@ -426,9 +426,12 @@ pub mod redis_db {
     /// (`15 * 32 + 31 = 511`) — the next binary that needs a base must
     /// recreate `bp-test-redis` with `--databases` raised past 512.
     ///
-    /// ⚠️ Index **31** of this range is lent to `bp-api`'s smoke test
-    /// (`pool_endpoint_returns_basic_shape`), NO-FLUSH and write-free —
-    /// don't claim it for a session-persistence test.
+    /// ⚠️ Index **31** of this range is lent to TWO `bp-api` test
+    /// binaries — `smoke.rs` and `custom_extranonce_guard.rs` — both
+    /// NO-FLUSH and write-free, since their endpoints now need a live
+    /// store to answer at all. Don't claim it for a session-persistence
+    /// test, and don't add a write to either borrower without moving
+    /// them apart first.
     pub const SESSION_PERSISTENCE: u16 = 15 * RANGE;
 }
 

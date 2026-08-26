@@ -194,17 +194,7 @@ async fn live_fields_for_workers(
     redis: Option<&ConnectionManager>,
     workers: &[bp_db::ClientRow],
 ) -> Vec<Option<bp_client_live::LiveFields>> {
-    let triples: Vec<(&str, &str, &str)> = workers
-        .iter()
-        .map(|c| {
-            (
-                c.address.as_str(),
-                c.client_name.as_str(),
-                c.session_id.as_str(),
-            )
-        })
-        .collect();
-    match bp_client_live::live_fields_for_sessions(redis, &triples).await {
+    match bp_client_live::live_fields_for_sessions(redis, workers).await {
         Ok(v) => v,
         Err(e) => {
             warn!(target: "bp_notifications::command::read", error = %e, "live fields lookup");

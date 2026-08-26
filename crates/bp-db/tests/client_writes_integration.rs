@@ -11,8 +11,9 @@
 use bp_common::AddressId;
 use bp_db::{
     bulk_upsert_client_difficulty_statistics, delete_client_for_session,
-    find_addresses_for_ntfy_listener, find_stale_active_sessions, soft_delete_sessions,
-    update_sv2_user_agent_by_address, upsert_client, upsert_ntfy_subscription, ClientUpsert,
+    find_addresses_for_ntfy_listener, find_recently_deleted_sessions, find_stale_active_sessions,
+    revive_sessions, soft_delete_sessions, update_sv2_user_agent_by_address, upsert_client,
+    upsert_ntfy_subscription, ClientUpsert,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
@@ -495,26 +496,47 @@ async fn delete_client_for_session_skips_already_deleted_rows() {
 // these two calls; the PG halves are pinned here: age selects
 // CANDIDATES only, and the soft-delete hits exactly the given triples.
 
+/// Seed a row straight on the pool (the sweep writers own their own
+/// transaction for the bulk-write lock, so a rollback-tx test cannot
+/// drive them) and age its `updatedAt` into candidate territory.
+async fn seed_aged_session(pool: &PgPool, session: &str, updated_at: i64) {
+    upsert_client(pool, &mk(session)).await.expect("seed");
+    sqlx::query(r#"UPDATE client_entity SET "updatedAt" = $2 WHERE "sessionId" = $1"#)
+        .bind(session)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .expect("age row");
+}
+
+async fn drop_session(pool: &PgPool, session: &str) {
+    let _ = sqlx::query(r#"DELETE FROM client_entity WHERE "sessionId" = $1"#)
+        .bind(session)
+        .execute(pool)
+        .await;
+}
+
+async fn deleted_at_of(pool: &PgPool, session: &str) -> Option<i64> {
+    sqlx::query_scalar(r#"SELECT "deletedAt" FROM client_entity WHERE "sessionId" = $1"#)
+        .bind(session)
+        .fetch_one(pool)
+        .await
+        .expect("read deletedAt")
+}
+
 #[tokio::test]
 async fn stale_sessions_become_candidates_and_only_named_ones_die() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
-    let mut tx = pool.begin().await.expect("begin tx");
-
-    // Insert two clients; force one's updatedAt to be ancient by direct
-    // UPDATE in the tx (sqlx doesn't expose this on the upsert API).
-    upsert_client(&mut *tx, &mk("sessK001")).await.unwrap();
-    upsert_client(&mut *tx, &mk("sessK002")).await.unwrap();
-    sqlx::query(r#"UPDATE client_entity SET "updatedAt" = 1000 WHERE "sessionId" = $1"#)
-        .bind("sessK001")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
+    drop_session(&pool, "sessK001").await;
+    drop_session(&pool, "sessK002").await;
+    seed_aged_session(&pool, "sessK001", 1000).await;
+    seed_aged_session(&pool, "sessK002", i64::MAX / 2).await;
 
     // Cutoff at 2000 — only sessK001 is a candidate; the fresh session
     // must not even be OFFERED to the verdict step.
-    let candidates = find_stale_active_sessions(&mut *tx, 2000).await.unwrap();
+    let candidates = find_stale_active_sessions(&pool, 2000).await.unwrap();
     assert!(
         candidates.iter().any(|c| c.session_id == "sessK001"),
         "ancient session must be a candidate"
@@ -526,7 +548,7 @@ async fn stale_sessions_become_candidates_and_only_named_ones_die() {
 
     // Verdict: soft-delete exactly the named triple.
     let n = soft_delete_sessions(
-        &mut *tx,
+        &pool,
         &["test_client_addr".to_string()],
         &["wkr".to_string()],
         &["sessK001".to_string()],
@@ -534,22 +556,17 @@ async fn stale_sessions_become_candidates_and_only_named_ones_die() {
     .await
     .unwrap();
     assert_eq!(n, 1);
+    assert!(
+        deleted_at_of(&pool, "sessK001").await.is_some(),
+        "named session must be soft-deleted"
+    );
+    assert!(
+        deleted_at_of(&pool, "sessK002").await.is_none(),
+        "unnamed session must stay alive"
+    );
 
-    let dead: Option<i64> =
-        sqlx::query_scalar(r#"SELECT "deletedAt" FROM client_entity WHERE "sessionId" = $1"#)
-            .bind("sessK001")
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-    let alive: Option<i64> =
-        sqlx::query_scalar(r#"SELECT "deletedAt" FROM client_entity WHERE "sessionId" = $1"#)
-            .bind("sessK002")
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-    assert!(dead.is_some(), "named session must be soft-deleted");
-    assert!(alive.is_none(), "unnamed session must stay alive");
-    tx.rollback().await.expect("rollback");
+    drop_session(&pool, "sessK001").await;
+    drop_session(&pool, "sessK002").await;
 }
 
 #[tokio::test]
@@ -557,29 +574,19 @@ async fn sweep_primitives_skip_already_deleted_rows() {
     let Some(pool) = connect_or_skip().await else {
         return;
     };
-    let mut tx = pool.begin().await.expect("begin tx");
+    drop_session(&pool, "sessK003").await;
+    seed_aged_session(&pool, "sessK003", 1).await;
+    delete_client_for_session(&pool, "sessK003").await.unwrap();
 
-    upsert_client(&mut *tx, &mk("sessK003")).await.unwrap();
-    delete_client_for_session(&mut *tx, "sessK003")
-        .await
-        .unwrap();
-    // Force ancient updatedAt — still no candidate, because the
-    // deletedAt IS NULL filter excludes it.
-    sqlx::query(r#"UPDATE client_entity SET "updatedAt" = 1 WHERE "sessionId" = $1"#)
-        .bind("sessK003")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    let candidates = find_stale_active_sessions(&mut *tx, i64::MAX)
-        .await
-        .unwrap();
+    // Soft-deleted → not a candidate, however ancient it is.
+    let candidates = find_stale_active_sessions(&pool, i64::MAX).await.unwrap();
     assert!(
         !candidates.iter().any(|c| c.session_id == "sessK003"),
         "soft-deleted row must not be a candidate"
     );
-    // And a soft-delete aimed at it is a no-op (deletedAt preserved).
+    // And a soft-delete aimed at it is a no-op.
     let n = soft_delete_sessions(
-        &mut *tx,
+        &pool,
         &["test_client_addr".to_string()],
         &["wkr".to_string()],
         &["sessK003".to_string()],
@@ -587,7 +594,69 @@ async fn sweep_primitives_skip_already_deleted_rows() {
     .await
     .unwrap();
     assert_eq!(n, 0, "already-deleted row is skipped");
-    tx.rollback().await.expect("rollback");
+
+    drop_session(&pool, "sessK003").await;
+}
+
+/// The repair half's two primitives: a soft-deleted row shows up in the
+/// lookback window with its stamp, and reviving clears the flag. The
+/// negative control is the fresh row, which must be invisible to both.
+#[tokio::test]
+async fn recently_deleted_sessions_are_listed_and_revivable() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    drop_session(&pool, "sessR001").await;
+    drop_session(&pool, "sessR002").await;
+    seed_aged_session(&pool, "sessR001", 1000).await;
+    seed_aged_session(&pool, "sessR002", 1000).await;
+    delete_client_for_session(&pool, "sessR001").await.unwrap();
+
+    let since = 0;
+    let deleted = find_recently_deleted_sessions(&pool, since).await.unwrap();
+    let row = deleted
+        .iter()
+        .find(|d| d.session_id == "sessR001")
+        .expect("soft-deleted row is listed");
+    assert!(row.deleted_at > 0, "carries its soft-delete stamp");
+    assert!(
+        !deleted.iter().any(|d| d.session_id == "sessR002"),
+        "a live row must never appear in the repair input"
+    );
+
+    // Outside the lookback window it drops out again.
+    let future = row.deleted_at + 1;
+    let none = find_recently_deleted_sessions(&pool, future).await.unwrap();
+    assert!(!none.iter().any(|d| d.session_id == "sessR001"));
+
+    let n = revive_sessions(
+        &pool,
+        &["test_client_addr".to_string()],
+        &["wkr".to_string()],
+        &["sessR001".to_string()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 1);
+    assert!(
+        deleted_at_of(&pool, "sessR001").await.is_none(),
+        "revive clears deletedAt"
+    );
+    assert_eq!(
+        revive_sessions(
+            &pool,
+            &["test_client_addr".to_string()],
+            &["wkr".to_string()],
+            &["sessR001".to_string()],
+        )
+        .await
+        .unwrap(),
+        0,
+        "reviving a live row is a no-op"
+    );
+
+    drop_session(&pool, "sessR001").await;
+    drop_session(&pool, "sessR002").await;
 }
 
 // ── update_sv2_user_agent_by_address ────────────────────────────────

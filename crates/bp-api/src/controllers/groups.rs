@@ -948,12 +948,26 @@ where
                 } else {
                     &[][..]
                 };
-                let mut items = Vec::with_capacity(slice.len());
+                // Roster first, then ONE live-hashrate read for the whole
+                // page: each read is a cursor-complete SCAN of the Redis
+                // keyspace, so per-group calls would multiply a full walk
+                // by the page size (up to 100).
+                let mut rosters = Vec::with_capacity(slice.len());
                 for g in slice {
-                    let members = svc.list_members(g.id).await?;
-                    let addrs: Vec<AddressId> = members.iter().map(|m| m.address.clone()).collect();
-                    let total_hashrate =
-                        bp_client_live::hashrate_for_addresses(s.redis.as_ref(), &addrs).await?;
+                    rosters.push((g, svc.list_members(g.id).await?));
+                }
+                let everyone: Vec<AddressId> = rosters
+                    .iter()
+                    .flat_map(|(_, members)| members.iter().map(|m| m.address.clone()))
+                    .collect();
+                let by_address =
+                    bp_client_live::hashrate_by_address(s.redis.as_ref(), &everyone).await?;
+                let mut items = Vec::with_capacity(rosters.len());
+                for (g, members) in rosters {
+                    let total_hashrate: f64 = members
+                        .iter()
+                        .map(|m| by_address.get(m.address.as_str()).copied().unwrap_or(0.0))
+                        .sum();
                     let mut summary = GroupSummary::from(g.clone());
                     summary.creator_address = None; // never expose the creator publicly
                     items.push(PublicGroupEntry {
@@ -1242,6 +1256,29 @@ where
                 std::collections::HashSet::new()
             };
 
+            // Roster-wide session stats in two round trips instead of two
+            // per member: the loop below used to issue one PG query and
+            // one Redis pipeline each, awaited in sequence.
+            let sessions =
+                bp_db::find_active_sessions_for_addresses(&s.pool, &addr_strings).await?;
+            let live =
+                bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &sessions).await?;
+            let mut start_times: HashMap<&str, i64> = HashMap::new();
+            let mut last_seen_by_address: HashMap<&str, i64> = HashMap::new();
+            for (c, lf) in sessions.iter().zip(&live) {
+                let addr = c.address.as_str();
+                start_times
+                    .entry(addr)
+                    .and_modify(|t| *t = (*t).min(c.start_time))
+                    .or_insert(c.start_time);
+                if let Some(ts) = lf.as_ref().and_then(|lf| lf.updated_at_ms) {
+                    last_seen_by_address
+                        .entry(addr)
+                        .and_modify(|t| *t = (*t).max(ts))
+                        .or_insert(ts);
+                }
+            }
+
             let mut entries = Vec::with_capacity(members.len());
             for m in members {
                 let addr_str = m.address.as_str();
@@ -1274,28 +1311,8 @@ where
                 // Per-member worker stats folded in server-side (best-diff /
                 // uptime / last-seen) so the UI no longer fetches per-member
                 // client info by full address.
-                let clients = bp_db::find_clients_by_address(&s.pool, &m.address).await?;
-                let start_time = clients.iter().map(|c| c.start_time).min();
-                let triples: Vec<(&str, &str, &str)> = clients
-                    .iter()
-                    .map(|c| {
-                        (
-                            c.address.as_str(),
-                            c.client_name.as_str(),
-                            c.session_id.as_str(),
-                        )
-                    })
-                    .collect();
-                let live =
-                    bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &triples).await?;
-                // Freshest accepted share across the member's sessions;
-                // no live data → the youngest thing known is a start.
-                let last_seen = live
-                    .iter()
-                    .flatten()
-                    .filter_map(|lf| lf.updated_at_ms)
-                    .max()
-                    .or(start_time);
+                let start_time = start_times.get(addr_str).copied();
+                let last_seen = last_seen_by_address.get(addr_str).copied().or(start_time);
                 let best_difficulty = bp_db::find_address_settings(&s.pool, &m.address)
                     .await?
                     .map(|x| x.best_difficulty)

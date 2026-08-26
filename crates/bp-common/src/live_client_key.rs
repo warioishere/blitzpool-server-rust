@@ -49,6 +49,35 @@ pub const F_BEST_DIFFICULTY: &str = "best_difficulty";
 /// Hash field: epoch-ms timestamp of the freshest accepted share.
 pub const F_UPDATED_AT_MS: &str = "updated_at_ms";
 
+/// Anything that identifies one mining session. The live-hash key is
+/// this triple, and it was being rebuilt by hand at seven call sites
+/// across three crates — a fourth component or a normalisation step
+/// would have had to be found in all of them, which is the drift shape
+/// this codebase is most prone to. Implemented for `bp_db`'s row types
+/// and for a bare triple, so every reader passes what it already has.
+pub trait SessionKey {
+    fn address(&self) -> &str;
+    fn worker(&self) -> &str;
+    fn session_id(&self) -> &str;
+}
+
+impl SessionKey for (&str, &str, &str) {
+    fn address(&self) -> &str {
+        self.0
+    }
+    fn worker(&self) -> &str {
+        self.1
+    }
+    fn session_id(&self) -> &str {
+        self.2
+    }
+}
+
+/// The live-hash key of any [`SessionKey`].
+pub fn key_of(s: &impl SessionKey) -> String {
+    client_live_key(s.address(), s.worker(), s.session_id())
+}
+
 /// Key of one session's live hash.
 pub fn client_live_key(address: &str, worker: &str, session_id: &str) -> String {
     let mut key = String::with_capacity(

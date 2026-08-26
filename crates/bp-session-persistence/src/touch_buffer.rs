@@ -141,6 +141,15 @@ impl TouchBuffer {
         channel_count: i32,
         updated_at_ms: i64,
     ) {
+        // Keep non-finite values out of the buffer entirely — the same
+        // guard the hashrate sampler has. They would reach Redis as
+        // "inf"/"NaN", which the write script's `tonumber` rejects and a
+        // reader's `parse::<f64>()` happily turns into an infinity that
+        // poisons every sum it lands in.
+        if !share_diff.is_finite() {
+            return;
+        }
+        let current_diff = current_diff.filter(|d| d.is_finite());
         let mut guard = self.guard();
         if let Some(e) = guard.get_mut(&key) {
             if share_diff > e.share_diff {
@@ -359,6 +368,32 @@ mod tests {
         let snap = buf.drain();
         assert_eq!(snap.len(), 1);
         assert_eq!(buf.len(), 0);
+    }
+
+    /// Non-finite samples never enter the buffer: they would reach
+    /// Redis as "inf"/"NaN", which the write script cannot parse and a
+    /// reader's `parse::<f64>()` turns into an infinity that poisons
+    /// every sum it lands in.
+    #[test]
+    fn non_finite_samples_are_dropped_at_the_door() {
+        let b = TouchBuffer::default();
+        let k = TouchKey {
+            address: "addr".into(),
+            client_name: "wkr".into(),
+            session_id: "sess".into(),
+        };
+        b.record(kref(&k), f32::INFINITY, None, 1, 1);
+        b.record(kref(&k), f32::NAN, None, 1, 1);
+        assert_eq!(b.len(), 0, "an unusable share_diff creates no entry");
+
+        // A finite share with a non-finite vardiff target keeps the
+        // entry but drops the unusable field.
+        b.record(kref(&k), 5.0, Some(f32::INFINITY), 1, 1);
+        assert_eq!(b.len(), 1);
+        let snap = b.drain();
+        let e = snap.values().next().expect("entry");
+        assert_eq!(e.share_diff, 5.0);
+        assert_eq!(e.current_diff, None, "non-finite current_diff is dropped");
     }
 
     #[test]

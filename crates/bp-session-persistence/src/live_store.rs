@@ -54,6 +54,13 @@ local ttl = tonumber(ARGV[1])
 for i = 1, #KEYS do
     local base = 1 + (i - 1) * 4
     local key = KEYS[i]
+    -- No `or 0` fallback here on purpose: `tonumber` only yields nil
+    -- for a string that is not a number at all ("abc", ""), and every
+    -- argument is `f32::to_string()`, which always is one. Measured
+    -- against this Redis: tonumber("inf") = inf, tonumber("NaN") = nan
+    -- — neither is nil. Non-finite values are kept out one layer up, in
+    -- `TouchBuffer::record`, because they would poison a reader's sums,
+    -- not because they would break this script.
     local best = tonumber(ARGV[base + 1])
     local prev = tonumber(redis.call('HGET', key, 'best_difficulty'))
     if prev and prev > best then
@@ -168,28 +175,48 @@ impl LiveSessionStore {
         }
     }
 
-    /// Mirror one touch-flush snapshot into the live hashes. Stops at the
-    /// first failed chunk — the next flush rewrites every field anyway
-    /// (and `best_difficulty` is max-merged, so a rewrite can't regress).
+    /// Mirror one touch-flush snapshot into the live hashes.
+    ///
+    /// Every chunk is attempted even after one fails: a chunk carries an
+    /// arbitrary slice of the pool, and returning early would leave the
+    /// sessions behind the failure point without a TTL refresh until
+    /// their keys lapsed — and the dead-session sweep would then retire
+    /// miners that never stopped hashing. The first error is reported
+    /// once the pass is done, so the caller still rebuffers and retries.
     pub(crate) async fn write_touch_batch(
         &self,
         snapshot: &HashMap<TouchKey, TouchEntry>,
     ) -> Result<(), redis::RedisError> {
-        for batch in build_touch_batches(snapshot) {
-            self.invoke(&self.touch_script, &batch).await?;
-        }
-        Ok(())
+        self.invoke_all(&self.touch_script, build_touch_batches(snapshot))
+            .await
     }
 
-    /// Mirror one sampler pass into the live hashes.
+    /// Mirror one sampler pass into the live hashes. Same all-chunks
+    /// rule as [`Self::write_touch_batch`].
     pub(crate) async fn write_hashrate_batch(
         &self,
         writes: &[(TouchKey, f64)],
     ) -> Result<(), redis::RedisError> {
-        for batch in build_hashrate_batches(writes) {
-            self.invoke(&self.hashrate_script, &batch).await?;
+        self.invoke_all(&self.hashrate_script, build_hashrate_batches(writes))
+            .await
+    }
+
+    /// Run every batch, keep the first error, report it at the end.
+    async fn invoke_all(
+        &self,
+        script: &redis::Script,
+        batches: Vec<Batch>,
+    ) -> Result<(), redis::RedisError> {
+        let mut first_err = None;
+        for batch in batches {
+            if let Err(e) = self.invoke(script, &batch).await {
+                first_err.get_or_insert(e);
+            }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -199,6 +226,7 @@ mod tests {
     use bp_common::live_client_key::{
         F_BEST_DIFFICULTY, F_CHANNEL_COUNT, F_CURRENT_DIFFICULTY, F_HASH_RATE, F_UPDATED_AT_MS,
     };
+    use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
 
     fn key(n: usize) -> TouchKey {
         TouchKey {
@@ -261,6 +289,51 @@ mod tests {
         );
         let batches = build_touch_batches(&snap);
         assert_eq!(batches[0].args[1], "", "None sentinel is the empty string");
+    }
+
+    /// One failing chunk must not starve the sessions in the others: a
+    /// chunk carries an arbitrary slice of the pool, so an early return
+    /// would leave those keys without a TTL refresh — and the sweep
+    /// would retire miners that never stopped hashing. The test poisons
+    /// a key the FIRST chunk owns (asking the layout, so it is not
+    /// order-dependent) and asserts the second chunk still landed.
+    #[tokio::test]
+    async fn a_failing_chunk_does_not_stop_the_later_ones() {
+        let Some(mut conn) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 8).await
+        else {
+            return;
+        };
+        let mut snap = HashMap::new();
+        for n in 0..=CHUNK {
+            snap.insert(key(n), entry());
+        }
+        let batches = build_touch_batches(&snap);
+        assert_eq!(batches.len(), 2, "fixture must span two chunks");
+        // A string where the script wants a hash → WRONGTYPE, i.e. the
+        // whole EVAL for that chunk fails.
+        let poisoned = batches[0].keys[0].clone();
+        let _: () = redis::cmd("SET")
+            .arg(&poisoned)
+            .arg("not-a-hash")
+            .query_async(&mut conn)
+            .await
+            .expect("poison");
+
+        let store = LiveSessionStore::new(conn.clone(), Duration::from_secs(300));
+        let err = store.write_touch_batch(&snap).await;
+        assert!(err.is_err(), "the failure is still reported to the caller");
+
+        for k in &batches[1].keys {
+            let written: i64 = redis::cmd("EXISTS")
+                .arg(k)
+                .query_async(&mut conn)
+                .await
+                .expect("exists");
+            assert_eq!(
+                written, 1,
+                "second chunk must be written despite chunk 1 failing"
+            );
+        }
     }
 
     #[test]

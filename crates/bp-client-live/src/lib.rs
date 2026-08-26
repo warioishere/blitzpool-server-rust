@@ -26,7 +26,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use bp_common::live_client_key::{
-    self as live_key, CLIENT_LIVE_PREFIX, F_HASH_RATE, KEY_SEP, SCAN_PATTERN_ALL,
+    self as live_key, SessionKey, CLIENT_LIVE_PREFIX, F_HASH_RATE, KEY_SEP, SCAN_PATTERN_ALL,
 };
 use bp_common::AddressId;
 use redis::aio::ConnectionManager;
@@ -219,9 +219,9 @@ pub async fn delete_address_live_keys(
 /// a silently-dead session (stale birth row, no live hash) from an
 /// active one — which is why an error here must make the sweep SKIP,
 /// never sweep: "cannot ask Redis" and "no key" are different answers.
-pub async fn live_keys_exist(
+pub async fn live_keys_exist<S: SessionKey>(
     redis: Option<&ConnectionManager>,
-    sessions: &[(&str, &str, &str)],
+    sessions: &[S],
 ) -> Result<Vec<bool>, LiveReadError> {
     if sessions.is_empty() {
         return Ok(Vec::new());
@@ -230,9 +230,8 @@ pub async fn live_keys_exist(
     let mut out = Vec::with_capacity(sessions.len());
     for chunk in sessions.chunks(FETCH_CHUNK) {
         let mut pipe = redis::pipe();
-        for (address, worker, session_id) in chunk {
-            pipe.cmd("EXISTS")
-                .arg(live_key::client_live_key(address, worker, session_id));
+        for s in chunk {
+            pipe.cmd("EXISTS").arg(live_key::key_of(s));
         }
         let flags: Vec<bool> = bounded(pipe.query_async(&mut conn)).await?;
         out.extend(flags);
@@ -279,9 +278,9 @@ fn parse_live_fields(pairs: Vec<(String, String)>) -> Option<LiveFields> {
 /// session_id)` triples. Positional result aligned with the input;
 /// `None` = no live hash for that session. This is the ONE composition
 /// point every "PG birth row + Redis live fields" reader goes through.
-pub async fn live_fields_for_sessions(
+pub async fn live_fields_for_sessions<S: SessionKey>(
     redis: Option<&ConnectionManager>,
-    sessions: &[(&str, &str, &str)],
+    sessions: &[S],
 ) -> Result<Vec<Option<LiveFields>>, LiveReadError> {
     if sessions.is_empty() {
         return Ok(Vec::new());
@@ -290,9 +289,8 @@ pub async fn live_fields_for_sessions(
     let mut out = Vec::with_capacity(sessions.len());
     for chunk in sessions.chunks(FETCH_CHUNK) {
         let mut pipe = redis::pipe();
-        for (address, worker, session_id) in chunk {
-            pipe.cmd("HGETALL")
-                .arg(live_key::client_live_key(address, worker, session_id));
+        for s in chunk {
+            pipe.cmd("HGETALL").arg(live_key::key_of(s));
         }
         let hashes: Vec<Vec<(String, String)>> = bounded(pipe.query_async(&mut conn)).await?;
         out.extend(hashes.into_iter().map(parse_live_fields));
@@ -309,6 +307,18 @@ pub struct UserAgentSessionRow {
     pub address: String,
     pub worker: String,
     pub session_id: String,
+}
+
+impl SessionKey for UserAgentSessionRow {
+    fn address(&self) -> &str {
+        &self.address
+    }
+    fn worker(&self) -> &str {
+        &self.worker
+    }
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 /// One `GROUP BY userAgent` output row — the shape both `/api/info`'s
@@ -334,11 +344,7 @@ pub async fn aggregate_by_user_agent(
     redis: Option<&ConnectionManager>,
     rows: &[UserAgentSessionRow],
 ) -> Result<Vec<UserAgentAgg>, LiveReadError> {
-    let triples: Vec<(&str, &str, &str)> = rows
-        .iter()
-        .map(|r| (r.address.as_str(), r.worker.as_str(), r.session_id.as_str()))
-        .collect();
-    let live = live_fields_for_sessions(redis, &triples).await?;
+    let live = live_fields_for_sessions(redis, rows).await?;
     Ok(group_user_agents(rows, &live))
 }
 
@@ -367,7 +373,13 @@ fn group_user_agents(
         }
     }
     let mut out: Vec<UserAgentAgg> = groups.into_values().collect();
-    out.sort_by_key(|a| std::cmp::Reverse(a.count));
+    // Tie-break by name: hashbrown's iteration order is seeded per
+    // map, so equal counts would reshuffle between cache refreshes.
+    out.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.user_agent.cmp(&b.user_agent))
+    });
     out
 }
 

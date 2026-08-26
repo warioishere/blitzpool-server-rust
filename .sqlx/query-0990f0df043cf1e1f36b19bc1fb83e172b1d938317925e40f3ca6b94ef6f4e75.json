@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"deletedAt\" AS \"deleted_at!\"\n           FROM client_entity\n           WHERE \"deletedAt\" IS NOT NULL AND \"deletedAt\" >= $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address!: AddressId",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "client_name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "session_id!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "deleted_at!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "0990f0df043cf1e1f36b19bc1fb83e172b1d938317925e40f3ca6b94ef6f4e75"
+}

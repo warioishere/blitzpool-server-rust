@@ -360,17 +360,7 @@ where
             // Live half from Redis, positionally aligned with `clients`.
             // A session without a live hash renders as 0/None — it stays
             // listed while its PG row is active.
-            let triples: Vec<(&str, &str, &str)> = clients
-                .iter()
-                .map(|c| {
-                    (
-                        c.address.as_str(),
-                        c.client_name.as_str(),
-                        c.session_id.as_str(),
-                    )
-                })
-                .collect();
-            let live = bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &triples).await?;
+            let live = bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &clients).await?;
             let total_hashrate: f64 = live.iter().flatten().map(|lf| lf.hash_rate).sum();
             let settings = find_address_settings(&s.pool, &addr).await?;
             let best_difficulty = settings.as_ref().map(|x| x.best_difficulty.floor() as u64);
@@ -547,17 +537,8 @@ where
             }
             // Max over the worker's live per-session bests (a session
             // without a live hash contributes nothing, like a 0 column).
-            let triples: Vec<(&str, &str, &str)> = matching
-                .iter()
-                .map(|c| {
-                    (
-                        c.address.as_str(),
-                        c.client_name.as_str(),
-                        c.session_id.as_str(),
-                    )
-                })
-                .collect();
-            let live = bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &triples).await?;
+            let live =
+                bp_client_live::live_fields_for_sessions(s.redis.as_ref(), &matching).await?;
             let best_difficulty = live
                 .iter()
                 .flatten()

@@ -431,6 +431,7 @@ fn spawn_kill_dead_clients_loop(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = staggered_interval(KILL_DEAD_TICK, offsets::KILL_DEAD);
+        let mut strikes = StrikeSet::new();
         info!("crons.kill_dead_clients: loop started");
         loop {
             tokio::select! {
@@ -441,18 +442,24 @@ fn spawn_kill_dead_clients_loop(
                 _ = ticker.tick() => {
                     let cutoff_ms =
                         Utc::now().timestamp_millis() - STALE_CLIENT_TTL.as_millis() as i64;
-                    match sweep_dead_sessions_once(&pool, &redis, cutoff_ms).await {
-                        Ok(0) => {}
-                        Ok(n) => info!(
-                            count = n,
+                    match sweep_dead_sessions_once(&pool, &redis, cutoff_ms, &mut strikes).await {
+                        Ok(o) if o.is_quiet() => {}
+                        Ok(o) => info!(
+                            swept = o.swept,
+                            revived = o.revived,
                             cutoff_ms,
-                            "crons.kill_dead_clients: swept dead sessions"
+                            "crons.kill_dead_clients: reconciled sessions"
                         ),
-                        Err(err) => warn!(
-                            err,
-                            cutoff_ms,
-                            "crons.kill_dead_clients: sweep skipped (will retry on next tick)"
-                        ),
+                        Err(err) => {
+                            // Start the two-observation rule over: what we
+                            // learned before an outage is not evidence after it.
+                            strikes.clear();
+                            warn!(
+                                err,
+                                cutoff_ms,
+                                "crons.kill_dead_clients: sweep skipped (will retry on next tick)"
+                            );
+                        }
                     }
                 }
             }
@@ -461,49 +468,148 @@ fn spawn_kill_dead_clients_loop(
     })
 }
 
-/// One sweep pass — candidates from PG, verdict from Redis, soft-delete
-/// back into PG. Returns the number of sessions soft-deleted; any error
-/// (PG or Redis) aborts the pass without sweeping anything.
+/// Session triples whose live key was missing on the previous tick.
+/// Bounded by the candidate count, replaced wholesale every pass.
+type StrikeSet = std::collections::HashSet<(String, String, String)>;
+
+/// How far back the repair half looks for a session it should un-delete.
+/// Generous enough to survive several failed passes, bounded so the
+/// query stays small (the rows are hard-deleted after 2 h anyway).
+const REVIVE_LOOKBACK: Duration = Duration::from_secs(15 * 60);
+
+/// What one reconcile pass did.
+struct SweepOutcome {
+    swept: u64,
+    revived: u64,
+}
+
+impl SweepOutcome {
+    fn is_quiet(&self) -> bool {
+        self.swept == 0 && self.revived == 0
+    }
+}
+
+/// One reconcile pass between the birth rows and the live hashes.
+///
+/// **Kill half.** Candidates come from PG (past the birth grace), the
+/// verdict from the live key — but only a session whose key was missing
+/// on TWO consecutive passes is swept. One observation is not evidence:
+/// after a Redis restart the keyspace is legitimately empty (the live
+/// hashes are deliberately excluded from the backup allowlist) until the
+/// next touch flush repopulates it 30 s later, and a single-observation
+/// sweep landing in that window would retire the entire pool at once.
+///
+/// **Repair half.** A session soft-deleted within [`REVIVE_LOOKBACK`]
+/// whose live hash has been written SINCE the soft-delete kept mining
+/// through it, so the soft-delete was wrong and is undone. Only a live
+/// session can satisfy that: a cleanly disconnected one stops touching,
+/// so its `updated_at_ms` stays older than its `deletedAt` until the key
+/// expires. This restores the self-healing the touch UPDATE used to
+/// provide through `"deletedAt" = NULL`, which left with the hot writes.
+///
+/// Any error aborts the pass without sweeping anything — "cannot ask
+/// Redis" and "no key" must never collapse into the same answer.
 async fn sweep_dead_sessions_once(
     pool: &PgPool,
     redis: &redis::aio::ConnectionManager,
     cutoff_ms: i64,
+    strikes: &mut StrikeSet,
+) -> Result<SweepOutcome, String> {
+    let swept = sweep_kill_half(pool, redis, cutoff_ms, strikes).await?;
+    let revived = sweep_repair_half(pool, redis).await?;
+    Ok(SweepOutcome { swept, revived })
+}
+
+async fn sweep_kill_half(
+    pool: &PgPool,
+    redis: &redis::aio::ConnectionManager,
+    cutoff_ms: i64,
+    strikes: &mut StrikeSet,
 ) -> Result<u64, String> {
     let candidates = bp_db::find_stale_active_sessions(pool, cutoff_ms)
         .await
         .map_err(|e| format!("candidates: {e}"))?;
     if candidates.is_empty() {
+        strikes.clear();
         return Ok(0);
     }
-    let triples: Vec<(&str, &str, &str)> = candidates
-        .iter()
-        .map(|c| {
-            (
-                c.address.as_str(),
-                c.client_name.as_str(),
-                c.session_id.as_str(),
-            )
-        })
-        .collect();
-    let alive = bp_client_live::live_keys_exist(Some(redis), &triples)
+    let alive = bp_client_live::live_keys_exist(Some(redis), &candidates)
         .await
         .map_err(|e| format!("live-key check: {e}"))?;
+
+    let mut missing_now = StrikeSet::with_capacity(candidates.len());
     let mut addresses = Vec::new();
     let mut client_names = Vec::new();
     let mut session_ids = Vec::new();
     for (c, alive) in candidates.iter().zip(alive) {
-        if !alive {
-            addresses.push(c.address.as_str().to_string());
-            client_names.push(c.client_name.clone());
-            session_ids.push(c.session_id.clone());
+        if alive {
+            continue;
         }
+        let key = (
+            c.address.as_str().to_string(),
+            c.client_name.clone(),
+            c.session_id.clone(),
+        );
+        // Second strike: missing now AND missing on the previous pass.
+        if strikes.contains(&key) {
+            addresses.push(key.0.clone());
+            client_names.push(key.1.clone());
+            session_ids.push(key.2.clone());
+        }
+        missing_now.insert(key);
     }
+    *strikes = missing_now;
+
     if addresses.is_empty() {
         return Ok(0);
     }
     bp_db::soft_delete_sessions(pool, &addresses, &client_names, &session_ids)
         .await
         .map_err(|e| format!("soft-delete: {e}"))
+}
+
+async fn sweep_repair_half(
+    pool: &PgPool,
+    redis: &redis::aio::ConnectionManager,
+) -> Result<u64, String> {
+    let since_ms = Utc::now().timestamp_millis() - REVIVE_LOOKBACK.as_millis() as i64;
+    let deleted = bp_db::find_recently_deleted_sessions(pool, since_ms)
+        .await
+        .map_err(|e| format!("deleted rows: {e}"))?;
+    if deleted.is_empty() {
+        return Ok(0);
+    }
+    let live = bp_client_live::live_fields_for_sessions(Some(redis), &deleted)
+        .await
+        .map_err(|e| format!("live-field check: {e}"))?;
+
+    let mut addresses = Vec::new();
+    let mut client_names = Vec::new();
+    let mut session_ids = Vec::new();
+    for (d, lf) in deleted.iter().zip(live) {
+        // Touched after it was retired → it never stopped mining.
+        let touched_after = lf
+            .and_then(|lf| lf.updated_at_ms)
+            .is_some_and(|ts| ts > d.deleted_at);
+        if touched_after {
+            addresses.push(d.address.as_str().to_string());
+            client_names.push(d.client_name.clone());
+            session_ids.push(d.session_id.clone());
+        }
+    }
+    if addresses.is_empty() {
+        return Ok(0);
+    }
+    let n = bp_db::revive_sessions(pool, &addresses, &client_names, &session_ids)
+        .await
+        .map_err(|e| format!("revive: {e}"))?;
+    if n > 0 {
+        warn!(
+            count = n,
+            "crons.kill_dead_clients: revived sessions that were mining through their soft-delete"
+        );
+    }
+    Ok(n)
 }
 
 // ─── Cleanup cron tasks (hourly stats purge + daily block purge) ──
@@ -654,9 +760,24 @@ fn spawn_stale_push_cleanup(pool: PgPool, cancel: CancellationToken) -> JoinHand
 
 #[cfg(test)]
 mod sweep_tests {
-    use super::sweep_dead_sessions_once;
+    use super::{sweep_dead_sessions_once, sweep_repair_half, StrikeSet};
     use bp_common::live_client_key::client_live_key;
     use bp_test_support::{connect_pg_or_skip, connect_redis_in_range_or_skip, redis_db};
+
+    // ⚠️ Indices, not literals elsewhere in this binary: the
+    // block-confirmation regtests claim 17–23 through named `DB_*`
+    // constants, and `connect_redis_in_range_or_skip` FLUSHES the
+    // database it opens — taking one of theirs wipes a money-path
+    // regtest mid-run. Grep for `const DB_` as well as call sites
+    // before picking a number.
+    const DB_TWO_STRIKE: u8 = 24;
+    const DB_KEY_RETURNS: u8 = 25;
+    const DB_REVIVE: u8 = 26;
+
+    /// The kill half queries `client_entity` pool-wide, so two of these
+    /// running at once would sweep each other's fixtures — one would
+    /// then report the fail-open guard as broken when it is not.
+    static SWEEP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn upsert(session: &str, address: &str) -> bp_db::ClientUpsert {
         bp_db::ClientUpsert {
@@ -666,6 +787,17 @@ mod sweep_tests {
             user_agent: None,
             start_time_ms: 1_700_000_000_000,
         }
+    }
+
+    async fn seed_aged(pool: &sqlx::PgPool, address: &str, session: &str) {
+        bp_db::upsert_client(pool, &upsert(session, address))
+            .await
+            .expect("seed");
+        sqlx::query(r#"UPDATE client_entity SET "updatedAt" = 1000 WHERE "sessionId" = $1"#)
+            .bind(session)
+            .execute(pool)
+            .await
+            .expect("age row");
     }
 
     async fn active(pool: &sqlx::PgPool, session: &str) -> bool {
@@ -679,71 +811,176 @@ mod sweep_tests {
         .is_none()
     }
 
-    /// The two-step verdict: of two equally stale birth rows, only the
-    /// one WITHOUT a `client:live:*` key is swept — a live hash proves
-    /// the session is still flushing touches, however old `updatedAt` is.
-    #[tokio::test]
-    async fn sweep_kills_only_sessions_without_a_live_key() {
-        let Some(pool) = connect_pg_or_skip().await else {
-            return;
-        };
-        let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 17).await
-        else {
-            return;
-        };
-        let addr = "test_sweep_addr";
+    async fn cleanup(pool: &sqlx::PgPool, address: &str) {
         let _ = sqlx::query(r#"DELETE FROM client_entity WHERE address = $1"#)
-            .bind(addr)
-            .execute(&pool)
+            .bind(address)
+            .execute(pool)
             .await;
-        bp_db::upsert_client(&pool, &upsert("swpA0001", addr))
-            .await
-            .expect("seed A");
-        bp_db::upsert_client(&pool, &upsert("swpB0001", addr))
-            .await
-            .expect("seed B");
-        sqlx::query(r#"UPDATE client_entity SET "updatedAt" = 1000 WHERE address = $1"#)
-            .bind(addr)
-            .execute(&pool)
-            .await
-            .expect("age rows");
-        // Session A has a live hash; B has none.
-        let key = client_live_key(addr, "wkr", "swpA0001");
+    }
+
+    async fn put_live_key(
+        redis: &mut redis::aio::ConnectionManager,
+        address: &str,
+        session: &str,
+        updated_at_ms: i64,
+    ) {
+        let key = client_live_key(address, "wkr", session);
         let _: () = redis::cmd("HSET")
             .arg(&key)
             .arg("hash_rate")
             .arg("1.0")
-            .query_async(&mut redis)
+            .arg("updated_at_ms")
+            .arg(updated_at_ms)
+            .query_async(redis)
             .await
             .expect("seed live key");
         let _: () = redis::cmd("EXPIRE")
             .arg(&key)
             .arg(300i64)
-            .query_async(&mut redis)
+            .query_async(redis)
             .await
             .expect("ttl");
+    }
 
-        sweep_dead_sessions_once(&pool, &redis, 2_000)
+    /// The two-strike rule AND the verdict's selectivity in one pass
+    /// pair: a missing key is not evidence on its own (pass 1 sweeps
+    /// nothing), and on the second pass only the session that is still
+    /// keyless dies — the live-keyed one survives however old its birth
+    /// row is.
+    #[tokio::test]
+    async fn a_missing_key_sweeps_only_on_the_second_pass() {
+        let _guard = SWEEP_LOCK.lock().await;
+        let Some(pool) = connect_pg_or_skip().await else {
+            return;
+        };
+        let Some(mut redis) =
+            connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, DB_TWO_STRIKE).await
+        else {
+            return;
+        };
+        let addr = "test_sweep_addr";
+        cleanup(&pool, addr).await;
+        seed_aged(&pool, addr, "swpA0001").await;
+        seed_aged(&pool, addr, "swpB0001").await;
+        // A has a live hash, B has none.
+        put_live_key(&mut redis, addr, "swpA0001", 1_700_000_000_000).await;
+
+        let mut strikes = StrikeSet::new();
+        let first = sweep_dead_sessions_once(&pool, &redis, 2_000, &mut strikes)
             .await
-            .expect("sweep");
+            .expect("first pass");
+        assert_eq!(first.swept, 0, "one observation must not sweep anything");
+        assert!(
+            active(&pool, "swpB0001").await,
+            "keyless session survives pass 1"
+        );
 
+        let second = sweep_dead_sessions_once(&pool, &redis, 2_000, &mut strikes)
+            .await
+            .expect("second pass");
+        assert_eq!(second.swept, 1, "second consecutive miss sweeps");
         assert!(
             active(&pool, "swpA0001").await,
             "live-keyed session survives"
         );
         assert!(!active(&pool, "swpB0001").await, "keyless session is swept");
-        let _ = sqlx::query(r#"DELETE FROM client_entity WHERE address = $1"#)
-            .bind(addr)
-            .execute(&pool)
-            .await;
+
+        cleanup(&pool, addr).await;
+    }
+
+    /// A key that reappears between the two passes clears the strike —
+    /// this is the Redis-restart case, where the keyspace is briefly
+    /// empty before the touch flush repopulates it.
+    #[tokio::test]
+    async fn a_key_that_comes_back_between_passes_is_never_swept() {
+        let _guard = SWEEP_LOCK.lock().await;
+        let Some(pool) = connect_pg_or_skip().await else {
+            return;
+        };
+        let Some(mut redis) =
+            connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, DB_KEY_RETURNS).await
+        else {
+            return;
+        };
+        let addr = "test_sweep_back_addr";
+        cleanup(&pool, addr).await;
+        seed_aged(&pool, addr, "swpD0001").await;
+
+        let mut strikes = StrikeSet::new();
+        // Pass 1: keyspace empty (as after a restart) → strike, no sweep.
+        sweep_dead_sessions_once(&pool, &redis, 2_000, &mut strikes)
+            .await
+            .expect("first pass");
+        assert!(active(&pool, "swpD0001").await);
+        // The touch flush repopulates before the next tick.
+        put_live_key(&mut redis, addr, "swpD0001", 1_700_000_000_000).await;
+        sweep_dead_sessions_once(&pool, &redis, 2_000, &mut strikes)
+            .await
+            .expect("second pass");
+        assert!(
+            active(&pool, "swpD0001").await,
+            "a session whose key came back must never be swept"
+        );
+
+        cleanup(&pool, addr).await;
+    }
+
+    /// The repair half: a session that kept mining THROUGH its
+    /// soft-delete (its live hash was written after the stamp) is
+    /// revived. The negative control is a session whose hash predates
+    /// the stamp — a clean disconnect — which must stay retired.
+    #[tokio::test]
+    async fn a_session_that_mined_through_its_soft_delete_is_revived() {
+        let _guard = SWEEP_LOCK.lock().await;
+        let Some(pool) = connect_pg_or_skip().await else {
+            return;
+        };
+        let Some(mut redis) =
+            connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, DB_REVIVE).await
+        else {
+            return;
+        };
+        let addr = "test_revive_addr";
+        cleanup(&pool, addr).await;
+        seed_aged(&pool, addr, "rvvA0001").await;
+        seed_aged(&pool, addr, "rvvB0001").await;
+        bp_db::delete_client_for_session(&pool, "rvvA0001")
+            .await
+            .expect("retire A");
+        bp_db::delete_client_for_session(&pool, "rvvB0001")
+            .await
+            .expect("retire B");
+        let stamp: i64 =
+            sqlx::query_scalar(r#"SELECT "deletedAt" FROM client_entity WHERE "sessionId" = $1"#)
+                .bind("rvvA0001")
+                .fetch_one(&pool)
+                .await
+                .expect("stamp");
+
+        // A kept mining after the stamp; B's last share predates it.
+        put_live_key(&mut redis, addr, "rvvA0001", stamp + 1_000).await;
+        put_live_key(&mut redis, addr, "rvvB0001", stamp - 1_000).await;
+
+        let revived = sweep_repair_half(&pool, &redis).await.expect("repair");
+        assert!(revived >= 1, "the mining session must be revived");
+        assert!(
+            active(&pool, "rvvA0001").await,
+            "session that mined through its soft-delete is back"
+        );
+        assert!(
+            !active(&pool, "rvvB0001").await,
+            "a cleanly disconnected session must stay retired"
+        );
+
+        cleanup(&pool, addr).await;
     }
 
     /// Fail-open: when Redis cannot be asked, the sweep must SKIP —
     /// "cannot ask" and "no key" are different answers, and confusing
-    /// them sweeps actively-hashing miners (the exact bug the two-step
-    /// shape exists to prevent).
+    /// them sweeps actively-hashing miners.
     #[tokio::test]
     async fn sweep_skips_everything_when_redis_is_unreachable() {
+        let _guard = SWEEP_LOCK.lock().await;
         let Some(pool) = connect_pg_or_skip().await else {
             return;
         };
@@ -761,10 +998,9 @@ mod sweep_tests {
             Err(_) => return,
         };
         let port = listener.local_addr().expect("addr").port();
-        // Track the per-connection forwarders too: aborting only the
-        // accept loop leaves established connections ALIVE (the detached
-        // copy task keeps forwarding), and a healthy connection answers
-        // EXISTS — the exact opposite of the outage this test stages.
+        // Track the forwarders too: aborting only the accept loop leaves
+        // established connections ALIVE, and a healthy connection answers
+        // EXISTS — the opposite of the outage this test stages.
         let conns: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
             Default::default();
         let conns_in_loop = conns.clone();
@@ -793,40 +1029,32 @@ mod sweep_tests {
                 return;
             }
         };
-        // Kill the proxy: the accept loop AND every live forwarder.
         accept.abort();
         for handle in conns.lock().unwrap().drain(..) {
             handle.abort();
         }
 
         let addr = "test_sweep_down_addr";
-        let _ = sqlx::query(r#"DELETE FROM client_entity WHERE address = $1"#)
-            .bind(addr)
-            .execute(&pool)
-            .await;
-        bp_db::upsert_client(&pool, &upsert("swpC0001", addr))
-            .await
-            .expect("seed");
-        sqlx::query(r#"UPDATE client_entity SET "updatedAt" = 1000 WHERE address = $1"#)
-            .bind(addr)
-            .execute(&pool)
-            .await
-            .expect("age row");
+        cleanup(&pool, addr).await;
+        seed_aged(&pool, addr, "swpC0001").await;
 
-        let res = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            sweep_dead_sessions_once(&pool, &manager, 2_000),
-        )
-        .await
-        .expect("sweep must not hang");
-        assert!(res.is_err(), "unreachable Redis must abort the pass");
+        // Two passes: even the strike bookkeeping must not advance on a
+        // pass that could not observe anything.
+        let mut strikes = StrikeSet::new();
+        for _ in 0..2 {
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                sweep_dead_sessions_once(&pool, &manager, 2_000, &mut strikes),
+            )
+            .await
+            .expect("sweep must not hang");
+            assert!(res.is_err(), "unreachable Redis must abort the pass");
+        }
         assert!(
             active(&pool, "swpC0001").await,
             "no session may be swept on a failed pass"
         );
-        let _ = sqlx::query(r#"DELETE FROM client_entity WHERE address = $1"#)
-            .bind(addr)
-            .execute(&pool)
-            .await;
+
+        cleanup(&pool, addr).await;
     }
 }

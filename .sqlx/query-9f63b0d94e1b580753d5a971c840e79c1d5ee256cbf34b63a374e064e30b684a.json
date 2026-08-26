@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"userAgent\" AS \"user_agent?\",\n            \"startTime\" AS \"start_time!\"\n           FROM client_entity\n           WHERE address = ANY($1)",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"userAgent\" AS \"user_agent?\",\n            \"startTime\" AS \"start_time!\"\n           FROM client_entity\n           WHERE address = ANY($1) AND \"deletedAt\" IS NULL",
   "describe": {
     "columns": [
       {
@@ -42,5 +42,5 @@
       false
     ]
   },
-  "hash": "2625ae5f42a5b11f43190645ab6d5cbac9dae89fef39faeac602eb89bfcb78a3"
+  "hash": "9f63b0d94e1b580753d5a971c840e79c1d5ee256cbf34b63a374e064e30b684a"
 }

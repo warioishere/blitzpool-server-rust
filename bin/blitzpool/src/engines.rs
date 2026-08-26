@@ -392,8 +392,13 @@ async fn spawn_session_persistence(
     handles: &FoundationHandles,
 ) -> Result<SessionPersistenceEngineHandle, EngineError> {
     let cfg = SessionPersistenceConfig {
-        // Same clock as the kill_dead_clients sweep: a session's live
-        // hash expires exactly when its birth row becomes sweep-eligible.
+        // Same duration as the sweep's staleness cutoff, but NOT the
+        // same instant: the cutoff runs from the row's birth (updatedAt
+        // is only stamped at birth / re-register / soft-delete), while
+        // this TTL runs from the last touch flush and is refreshed every
+        // 30 s. For a session mining all day the two are hours apart —
+        // by design, since the age is only a birth grace and the key is
+        // the actual liveness signal. Tuning one does not move the other.
         live_ttl: crate::crons::STALE_CLIENT_TTL,
         ..SessionPersistenceConfig::default()
     };

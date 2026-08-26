@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE client_entity AS t\n           SET \"deletedAt\" = NULL,\n               \"updatedAt\" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint\n           FROM (\n               SELECT\n                   unnest($1::text[]) AS address,\n                   unnest($2::text[]) AS \"clientName\",\n                   unnest($3::text[]) AS \"sessionId\"\n           ) AS u\n           WHERE t.address      = u.address\n             AND t.\"clientName\" = u.\"clientName\"\n             AND t.\"sessionId\"  = u.\"sessionId\"\n             AND t.\"deletedAt\" IS NOT NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bbf2cea8d44749079fbb33aba8e52ff62510437dc366f8fdf003926f700834c5"
+}
