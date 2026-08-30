@@ -26,7 +26,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use bp_common::live_client_key::{
-    self as live_key, SessionKey, CLIENT_LIVE_PREFIX, F_HASH_RATE, KEY_SEP, SCAN_PATTERN_ALL,
+    self as live_key, SessionKey, CLIENT_LIVE_PREFIX, F_BEST_DIFFICULTY, F_HASH_RATE, KEY_SEP,
+    SCAN_PATTERN_ALL,
 };
 use bp_common::AddressId;
 use redis::aio::ConnectionManager;
@@ -213,6 +214,46 @@ pub async fn delete_address_live_keys(
         deleted += n;
     }
     Ok(deleted)
+}
+
+/// Clear the `best_difficulty` field of every live hash under `address`,
+/// leaving hashrate, current difficulty and channel count in place.
+/// Returns the number of fields removed.
+///
+/// This is the session half of a best-difficulty reset: without it, a
+/// miner who reset their best still saw the old value on every worker
+/// row, because the reset only ever touched the per-address total.
+///
+/// `HDEL` rather than `HSET .. 0` on purpose: the touch script reads the
+/// previous value with `tonumber(redis.call('HGET', ...))`, and a
+/// missing field yields nil there, which its `if prev and prev > best`
+/// guard already treats as "no sample yet". Writing a literal 0 would
+/// work too, but it would claim a miner has a best of zero rather than
+/// none, and that is what the readers would then render.
+///
+/// Best-effort, like [`delete_address_live_keys`]: a share landing
+/// mid-clear re-establishes the field at that share's difficulty, which
+/// is the correct post-reset value anyway.
+pub async fn clear_address_best_difficulty(
+    redis: Option<&ConnectionManager>,
+    address: &AddressId,
+) -> Result<u64, LiveReadError> {
+    let mut conn = redis.ok_or(LiveReadError::NotConfigured)?.clone();
+    let keys = scan_keys(
+        &mut conn,
+        &live_key::scan_pattern_for_address(address.as_str()),
+    )
+    .await?;
+    let mut cleared = 0u64;
+    for chunk in keys.chunks(FETCH_CHUNK) {
+        let mut pipe = redis::pipe();
+        for key in chunk {
+            pipe.cmd("HDEL").arg(key).arg(F_BEST_DIFFICULTY);
+        }
+        let removed: Vec<u64> = bounded(pipe.query_async(&mut conn)).await?;
+        cleared += removed.iter().sum::<u64>();
+    }
+    Ok(cleared)
 }
 
 /// Pipelined `EXISTS` for the given `(address, worker, session_id)`

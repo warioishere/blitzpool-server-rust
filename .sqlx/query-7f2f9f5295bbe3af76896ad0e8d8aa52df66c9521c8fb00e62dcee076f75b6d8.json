@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE address_settings_entity\n           SET shares = 0,\n               \"miscCoinbaseScriptData\" = NULL,\n               \"updatedAt\" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint\n           WHERE address = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7f2f9f5295bbe3af76896ad0e8d8aa52df66c9521c8fb00e62dcee076f75b6d8"
+}

@@ -718,6 +718,16 @@ impl CommandHandler {
                 .await;
             return;
         }
+        // Second half of the reset: the per-session bests in Redis. Same
+        // best-effort treatment as the API endpoint — the miner has been
+        // told the reset succeeded, and it did; a stale worker row clears
+        // itself on the next share.
+        if let Err(e) =
+            bp_client_live::clear_address_best_difficulty(self.redis.as_ref(), &pending.address)
+                .await
+        {
+            warn!(target: "bp_notifications::command", error = %e, address = %pending.address, "bestdiff confirm: live clear");
+        }
         let _ = adapter
             .answer_callback_query(
                 callback_id,

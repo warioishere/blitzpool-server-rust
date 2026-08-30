@@ -142,33 +142,42 @@ pub async fn upsert_best_difficulty_trackers(
 }
 
 /// One entry of the top-10 best-difficulty leaderboard surfaced by
-/// `/api/info` → `highScores`. Ordered by `bestDifficulty DESC` LIMIT 10,
-/// and `updatedAt` is rendered as an ISO string at the boundary.
+/// `/api/info` → `highScores`, rendered with its timestamp as an ISO
+/// string at the boundary.
 #[derive(Clone, Debug)]
 pub struct HighScoreRow {
-    /// ISO-8601 timestamp built from the epoch-ms `updatedAt` column.
+    /// ISO-8601 timestamp of when the record was set.
     pub updated_at: Option<String>,
     pub best_difficulty: f64,
     pub best_difficulty_user_agent: Option<String>,
 }
 
-/// Top-10 by `bestDifficulty DESC` from `address_settings_entity`.
-/// Boundary conversion of `updatedAt` (bigint epoch-ms) to ISO matches
-/// the shape consumed by the dashboard.
+/// Top-10 by `allTimeBestDifficulty DESC` from `address_settings_entity`.
+///
+/// Deliberately NOT `"bestDifficulty"`: that column is the miner's own,
+/// resettable value, and reading the public leaderboard off it meant a
+/// `/bestdiff_reset` silently deleted the miner's entry from the pool's
+/// hall of fame — permanently, since the flush's `GREATEST` only ever
+/// re-offers the current window's max. The all-time column is written by
+/// the same upsert (see [`crate::bulk_upsert_address_settings`]) and is
+/// never lowered by any reset or delete path.
 pub async fn find_high_scores(pool: &PgPool) -> Result<Vec<HighScoreRow>, DbError> {
     #[derive(FromRow)]
     struct Raw {
-        #[sqlx(rename = "updatedAt")]
-        updated_at: i64,
-        #[sqlx(rename = "bestDifficulty")]
+        // Nullable: pre-0014 rows that never set a best carry NULL here,
+        // and the backfill only stamps rows that had one.
+        #[sqlx(rename = "allTimeBestDifficultyAt")]
+        updated_at: Option<i64>,
+        #[sqlx(rename = "allTimeBestDifficulty")]
         best_difficulty: f64,
-        #[sqlx(rename = "bestDifficultyUserAgent")]
+        #[sqlx(rename = "allTimeBestDifficultyUserAgent")]
         best_difficulty_user_agent: Option<String>,
     }
     let rows = sqlx::query_as::<_, Raw>(
-        r#"SELECT "updatedAt", "bestDifficulty", "bestDifficultyUserAgent"
+        r#"SELECT "allTimeBestDifficultyAt", "allTimeBestDifficulty",
+                  "allTimeBestDifficultyUserAgent"
            FROM address_settings_entity
-           ORDER BY "bestDifficulty" DESC
+           ORDER BY "allTimeBestDifficulty" DESC
            LIMIT 10"#,
     )
     .fetch_all(pool)
@@ -177,7 +186,7 @@ pub async fn find_high_scores(pool: &PgPool) -> Result<Vec<HighScoreRow>, DbErro
     Ok(rows
         .into_iter()
         .map(|r| HighScoreRow {
-            updated_at: epoch_ms_to_iso(r.updated_at),
+            updated_at: r.updated_at.and_then(epoch_ms_to_iso),
             best_difficulty: r.best_difficulty,
             best_difficulty_user_agent: r.best_difficulty_user_agent,
         })
@@ -192,9 +201,23 @@ fn epoch_ms_to_iso(ms: i64) -> Option<String> {
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
-/// Reset `address_settings_entity.bestDifficulty` (and the user-agent
-/// hint) to zero — `/bestdiff_reset` bot command. Idempotent: missing
-/// row returns `affected = 0`.
+/// Reset a miner's own best difficulty to zero: the
+/// `address_settings_entity` value, its user-agent hint, and the
+/// notification dedup baseline in `best_difficulty_tracker_entity`.
+/// Idempotent: a missing row returns `affected = 0`, a missing tracker
+/// row deletes nothing.
+///
+/// `"allTimeBestDifficulty"` is deliberately NOT touched — that is the
+/// pool's public record (`/api/info` → `highScores`), and it survives
+/// every reset by design. See migration 0014.
+///
+/// The tracker delete lives HERE rather than at the call site because it
+/// did not, and the two callers drifted: the API endpoint deleted the
+/// tracker row, the `/bestdiff_reset` bot command did not, so the same
+/// user action left different state behind depending on which door it
+/// came through. Callers must also clear the live session bests
+/// (`bp_client_live::clear_address_best_difficulty`) — that one cannot
+/// move in here without giving this crate a Redis dependency.
 pub async fn reset_address_settings_best_difficulty(
     pool: &PgPool,
     address: &AddressId,
@@ -208,6 +231,13 @@ pub async fn reset_address_settings_best_difficulty(
            WHERE address = $1"#,
         address.as_str(),
         now_ms,
+    )
+    .execute(pool)
+    .await
+    .map_err(DbError::from)?;
+    sqlx::query!(
+        r#"DELETE FROM best_difficulty_tracker_entity WHERE address = $1"#,
+        address.as_str()
     )
     .execute(pool)
     .await

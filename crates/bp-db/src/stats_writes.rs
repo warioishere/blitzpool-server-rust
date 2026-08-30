@@ -385,10 +385,20 @@ pub struct AddressSettingsUpsert {
 ///   batch is a no-op, keeping partial/retried flushes idempotent.
 /// - `"bestDifficultyUserAgent"` + `"updatedAt"` move ONLY when the best
 ///   difficulty actually grows: a pure share-accumulation flush never
-///   bumps `"updatedAt"` (it tracks when a miner last set a new best,
-///   surfaced next to each entry on /api/info). Postgres evaluates every
-///   SET RHS against the pre-update row, so the CASE guards compare
-///   against the stored best regardless of clause order.
+///   bumps `"updatedAt"` (it tracks when a miner last set a new best).
+///   Postgres evaluates every SET RHS against the pre-update row, so the
+///   CASE guards compare against the stored best regardless of clause
+///   order — which is also why the two `GREATEST`s below can be assigned
+///   in the same statement that reads them.
+///
+/// The `"allTime*"` triple is the same fold against a SECOND high-water
+/// mark, and exists because the first one is resettable: `/bestdiff_reset`
+/// zeroes `"bestDifficulty"`, and the public leaderboard must survive
+/// that (see migration 0014). Both are folded HERE, in one statement, on
+/// purpose — a second writer for the all-time value is exactly the twin
+/// that would drift. The reset and the delete endpoints must never lower
+/// `"allTimeBestDifficulty"`; `GREATEST` cannot restore it, because a
+/// flush only ever offers the CURRENT window's max.
 pub async fn bulk_upsert_address_settings<'e, E>(
     executor: E,
     rows: &[AddressSettingsUpsert],
@@ -406,8 +416,11 @@ where
 
     let result = sqlx::query!(
         r#"INSERT INTO address_settings_entity
-             (address, shares, "bestDifficulty", "bestDifficultyUserAgent", "createdAt", "updatedAt")
-           SELECT u.address, u.dshares, u.bd, u.ua,
+             (address, shares, "bestDifficulty", "bestDifficultyUserAgent",
+              "allTimeBestDifficulty", "allTimeBestDifficultyUserAgent",
+              "allTimeBestDifficultyAt", "createdAt", "updatedAt")
+           SELECT u.address, u.dshares, u.bd, u.ua, u.bd, u.ua,
+                  (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
                   (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint,
                   (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
            FROM UNNEST($1::varchar[], $2::double precision[], $3::double precision[], $4::varchar[])
@@ -423,7 +436,17 @@ where
                  THEN EXCLUDED."updatedAt"
                  ELSE address_settings_entity."updatedAt" END,
              "bestDifficulty" = GREATEST(
-                 address_settings_entity."bestDifficulty", EXCLUDED."bestDifficulty")"#,
+                 address_settings_entity."bestDifficulty", EXCLUDED."bestDifficulty"),
+             "allTimeBestDifficultyUserAgent" = CASE
+                 WHEN EXCLUDED."bestDifficulty" > address_settings_entity."allTimeBestDifficulty"
+                 THEN EXCLUDED."bestDifficultyUserAgent"
+                 ELSE address_settings_entity."allTimeBestDifficultyUserAgent" END,
+             "allTimeBestDifficultyAt" = CASE
+                 WHEN EXCLUDED."bestDifficulty" > address_settings_entity."allTimeBestDifficulty"
+                 THEN EXCLUDED."updatedAt"
+                 ELSE address_settings_entity."allTimeBestDifficultyAt" END,
+             "allTimeBestDifficulty" = GREATEST(
+                 address_settings_entity."allTimeBestDifficulty", EXCLUDED."bestDifficulty")"#,
         &addresses,
         &deltas,
         &bests,
