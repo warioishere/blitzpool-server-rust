@@ -593,6 +593,96 @@ async fn read_best(
     )
 }
 
+/// The public leaderboard's source: `(allTimeBestDifficulty, userAgent)`.
+async fn read_all_time(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    address: &str,
+) -> (f64, Option<String>) {
+    let row = sqlx::query(
+        r#"SELECT "allTimeBestDifficulty", "allTimeBestDifficultyUserAgent"
+           FROM address_settings_entity WHERE address = $1"#,
+    )
+    .bind(address)
+    .fetch_one(&mut **tx)
+    .await
+    .expect("read all-time best");
+    (
+        row.get("allTimeBestDifficulty"),
+        row.get("allTimeBestDifficultyUserAgent"),
+    )
+}
+
+/// The whole point of migration 0014: `/bestdiff_reset` clears what the
+/// miner sees, and leaves the pool's public record standing.
+///
+/// Asserts BOTH directions in one test, so it cannot pass on a
+/// precondition that silently did not hold: the reset must actually
+/// zero the personal value (otherwise "the all-time survived" proves
+/// nothing), and the all-time value must not move.
+#[tokio::test]
+async fn a_reset_zeroes_the_personal_best_and_leaves_the_public_record() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("begin tx");
+    let addr = "test_bd_public_record_survives";
+
+    // A record share. Both high-water marks take it.
+    bulk_upsert_address_settings(&mut *tx, &[bd(addr, 8_225_062_000_000.0, Some("GMiner"))])
+        .await
+        .expect("record");
+    assert_eq!(
+        read_best(&mut tx, addr).await,
+        (8_225_062_000_000.0, Some("GMiner".into()))
+    );
+    assert_eq!(
+        read_all_time(&mut tx, addr).await,
+        (8_225_062_000_000.0, Some("GMiner".into())),
+        "the same flush must seed the public record — no second writer"
+    );
+
+    // Exactly what `reset_address_settings_best_difficulty` writes.
+    sqlx::query(
+        r#"UPDATE address_settings_entity
+           SET "bestDifficulty" = 0, "bestDifficultyUserAgent" = NULL WHERE address = $1"#,
+    )
+    .bind(addr)
+    .execute(&mut *tx)
+    .await
+    .expect("reset");
+
+    // Negative control: the reset really did clear the personal value.
+    assert_eq!(
+        read_best(&mut tx, addr).await,
+        (0.0, None),
+        "precondition: the reset must actually zero the personal best"
+    );
+    // The claim under test.
+    assert_eq!(
+        read_all_time(&mut tx, addr).await,
+        (8_225_062_000_000.0, Some("GMiner".into())),
+        "the public record must survive the miner's own reset"
+    );
+
+    // A later, much smaller share rebuilds the personal value from 0 —
+    // and must NOT drag the public record down to it.
+    bulk_upsert_address_settings(&mut *tx, &[bd(addr, 880_234_385.0, Some("bitaxe"))])
+        .await
+        .expect("rebuild");
+    assert_eq!(
+        read_best(&mut tx, addr).await,
+        (880_234_385.0, Some("bitaxe".into())),
+        "personal best climbs back from 0 via GREATEST"
+    );
+    assert_eq!(
+        read_all_time(&mut tx, addr).await,
+        (8_225_062_000_000.0, Some("GMiner".into())),
+        "a lower share never lowers the public record"
+    );
+
+    tx.rollback().await.expect("rollback");
+}
+
 /// Reads the full merged triple: `(shares, bestDifficulty, userAgent)`.
 async fn read_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

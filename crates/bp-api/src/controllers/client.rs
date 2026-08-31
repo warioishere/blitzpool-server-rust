@@ -722,14 +722,16 @@ where
     M: EmailHooks + 'static,
 {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
+    // Clears the per-address value and the notification baseline. The
+    // public `allTimeBestDifficulty` is untouched by design.
     reset_address_settings_best_difficulty(&state.pool, &addr).await?;
-    sqlx::query!(
-        r#"DELETE FROM best_difficulty_tracker_entity WHERE address = $1"#,
-        addr.as_str()
-    )
-    .execute(&state.pool)
-    .await
-    .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    // Best-effort second half: the per-session bests in Redis. A failure
+    // here leaves stale worker rows until their next share, which is a
+    // display lag, not a wrong total — so it must not fail the reset.
+    if let Err(e) = bp_client_live::clear_address_best_difficulty(state.redis.as_ref(), &addr).await
+    {
+        tracing::warn!(target: "bp_api", error = %e, address = %addr, "reset: live best-difficulty clear failed");
+    }
     invalidate_address_cache(&state, &addr).await;
     Ok(Json(StatusResponse {
         status: "reset",
@@ -769,13 +771,10 @@ async fn purge_address_stats(pool: &sqlx::PgPool, addr: &AddressId) -> Result<()
     .execute(pool)
     .await
     .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
-    sqlx::query!(
-        r#"DELETE FROM best_difficulty_tracker_entity WHERE address = $1"#,
-        addr.as_str()
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    // Zeroes the address-level best AND deletes the
+    // `best_difficulty_tracker_entity` baseline — the tracker delete used
+    // to be repeated here, and moved into the shared reset so this path
+    // and `/bestdiff_reset` cannot drift apart again.
     reset_address_settings_best_difficulty(pool, addr).await?;
     Ok(())
 }
@@ -807,7 +806,7 @@ where
 {
     let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
     purge_address_stats(&state.pool, &addr).await?;
-    // Hard-delete client rows + address-settings row.
+    // Hard-delete the client rows.
     sqlx::query!(
         r#"DELETE FROM client_entity WHERE address = $1"#,
         addr.as_str()
@@ -815,8 +814,19 @@ where
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
+    // The address-settings row is EMPTIED, not deleted: dropping it would
+    // take `allTimeBestDifficulty` with it, and that is the one value no
+    // path may lower (migration 0014). `purge_address_stats` already
+    // zeroed the resettable best above; this clears the remaining
+    // per-address state. What stays behind is the leaderboard record,
+    // which carries no address — only a difficulty, a firmware string and
+    // a timestamp.
     sqlx::query!(
-        r#"DELETE FROM address_settings_entity WHERE address = $1"#,
+        r#"UPDATE address_settings_entity
+           SET shares = 0,
+               "miscCoinbaseScriptData" = NULL,
+               "updatedAt" = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
+           WHERE address = $1"#,
         addr.as_str()
     )
     .execute(&state.pool)

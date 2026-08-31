@@ -172,6 +172,117 @@ async fn touch_flush_dual_writes_hash_and_ttl() {
     cleanup(&pool, prefix).await;
 }
 
+/// The session half of a best-difficulty reset. `/bestdiff_reset` used
+/// to clear only the per-address total, so every worker row kept
+/// rendering the old high — one miner's dashboard showed 8.23T next to
+/// an address total of 880M until the next share.
+///
+/// Pins the three properties that make the clear safe: it removes the
+/// one field and leaves the live telemetry beside it, it is scoped to a
+/// single address, and it really drops the high-water mark rather than
+/// masking it — the touch script's `tonumber(HGET ...)` must read the
+/// absent field as "no sample" so a LOWER later share becomes the new
+/// best instead of losing to a ghost.
+#[tokio::test]
+async fn clearing_the_live_best_takes_one_field_from_one_address() {
+    let Some(pool) = pg_or_skip().await else {
+        return;
+    };
+    let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 7).await
+    else {
+        return;
+    };
+    let prefix = "test_lv_clear_";
+    cleanup(&pool, prefix).await;
+
+    let handle = spawn_engine(&pool, redis.clone()).await;
+    let hook = handle.session_persistence_hook();
+    let sink = handle.client_row_touch_sink();
+    let mine = format!("{prefix}alice");
+    let other = format!("{prefix}bob");
+
+    hook.register_session("sessC001", &mine, "rig1", Some("GMiner"))
+        .await;
+    hook.register_session("sessC002", &other, "rig1", Some("bitaxe"))
+        .await;
+    handle.flush_births_now().await;
+    sink.record_accepted(share(&mine, "rig1", "sessC001", 100.5, 64.0, 2))
+        .await;
+    sink.record_accepted(share(&other, "rig1", "sessC002", 543.5, 32.0, 1))
+        .await;
+    handle.flush_touches_now().await;
+
+    let my_key = client_live_key(&mine, "rig1", "sessC001");
+    let other_key = client_live_key(&other, "rig1", "sessC002");
+
+    // Precondition: both sessions carry a best. Without this the
+    // "it is gone" assertion below would also pass on an empty hash.
+    assert_eq!(
+        hgetall(&mut redis, &my_key)
+            .await
+            .get(F_BEST_DIFFICULTY)
+            .map(String::as_str),
+        Some("100.5"),
+        "precondition: the session recorded a best to clear"
+    );
+
+    let cleared = bp_client_live::clear_address_best_difficulty(
+        Some(&redis),
+        &bp_common::AddressId::new(mine.clone()).expect("address"),
+    )
+    .await
+    .expect("clear");
+    assert_eq!(cleared, 1, "one field removed, from the one live session");
+
+    let hash = hgetall(&mut redis, &my_key).await;
+    assert_eq!(
+        hash.get(F_BEST_DIFFICULTY),
+        None,
+        "the best is gone from the session hash"
+    );
+    // The rest of the hash is live telemetry, not a record — untouched.
+    assert_eq!(
+        hash.get(F_CURRENT_DIFFICULTY).map(String::as_str),
+        Some("64")
+    );
+    assert_eq!(hash.get(F_CHANNEL_COUNT).map(String::as_str), Some("2"));
+    assert!(
+        hash.contains_key(F_UPDATED_AT_MS),
+        "liveness timestamp survives the clear"
+    );
+    assert!(
+        ttl(&mut redis, &my_key).await > 0,
+        "clearing a field must not strip the key's TTL"
+    );
+
+    // Negative control: another miner's record is not collateral.
+    assert_eq!(
+        hgetall(&mut redis, &other_key)
+            .await
+            .get(F_BEST_DIFFICULTY)
+            .map(String::as_str),
+        Some("543.5"),
+        "the clear is scoped to one address"
+    );
+
+    // A LOWER share now sets the best: the old high is really gone, not
+    // hiding behind a nil that the monotonicity guard would treat as 0.
+    sink.record_accepted(share(&mine, "rig1", "sessC001", 7.25, 64.0, 2))
+        .await;
+    handle.flush_touches_now().await;
+    assert_eq!(
+        hgetall(&mut redis, &my_key)
+            .await
+            .get(F_BEST_DIFFICULTY)
+            .map(String::as_str),
+        Some("7.25"),
+        "post-reset the best rebuilds from the next share, not from the old high"
+    );
+
+    handle.shutdown().await;
+    cleanup(&pool, prefix).await;
+}
+
 /// `best_difficulty` must be monotone ACROSS flushes. The touch buffer
 /// only maxes within one flush window, so a plain HSET would let a
 /// later window regress the stored best — the channel-count change in
