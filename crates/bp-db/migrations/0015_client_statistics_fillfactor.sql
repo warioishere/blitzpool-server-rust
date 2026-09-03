@@ -1,0 +1,40 @@
+-- Leave room on the page so the slot-row updates can be HOT.
+--
+-- Measured on prod 2026-09-02 (counters cumulative, `stats_reset` never
+-- ran), share of updates that reused their page:
+--
+--     address_settings_entity              74.4 M upd   99.2 % HOT
+--     pool_share_statistics_entity          0.16 M upd  99.2 % HOT
+--     client_difficulty_statistics_entity 159.7 M upd   88.6 % HOT
+--     client_entity                       248.7 M upd   78.6 % HOT
+--     client_statistics_entity            106.7 M upd   16.7 % HOT   <—
+--
+-- One table falls out, and it is the one carrying 794 MB of index on
+-- 274 MB of table. Of its 106 692 695 updates only 17 836 795 were HOT;
+-- the other ~89 M each wrote a new entry into all five indexes.
+--
+-- It is not an indexed column changing: the five indexes cover
+-- (address, clientName, sessionId, time) and id, while the ON CONFLICT
+-- arm only increments counters. It is page space. The row is ~20 counter
+-- columns wide, a slot row is updated ~10× (60 s stats flush into a
+-- 10 min slot), and fillfactor 100 leaves nothing to update into. The
+-- sibling tables get by because their rows are narrow.
+--
+-- Deliberately only this one table: the others measure 78–99 % HOT and
+-- have nothing to gain, and a change nobody can point a number at is a
+-- change nobody can explain later.
+--
+-- What this does NOT do:
+--   * It does not rewrite the table. Only newly written pages carry the
+--     reserve, so the effect arrives as the 14-day retention turns the
+--     table over — no VACUUM FULL, no exclusive lock.
+--   * It does not reclaim the existing index bloat. VACUUM marks dead
+--     entries reusable but the files do not shrink; that needs a
+--     REINDEX CONCURRENTLY, which cannot run inside a migration's
+--     transaction and is an operator step.
+--
+-- Cost is table size: ~20 % more for the same rows (274 MB → ~340 MB),
+-- against indexes that stop growing at the old rate. Reversible with
+-- `ALTER TABLE client_statistics_entity RESET (fillfactor);` — neither
+-- direction touches data.
+ALTER TABLE client_statistics_entity SET (fillfactor = 80);
