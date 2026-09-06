@@ -262,6 +262,28 @@ async fn info_chart_invalid_range_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// `14d` is a valid preset — the /stats page reads a 14-day average
+/// and used to pull the 30-day `1m` payload to get it. Before the
+/// preset existed this exact request answered 400, so the assertion
+/// pins the addition and not just "some range parses".
+#[tokio::test]
+async fn info_chart_accepts_fourteen_day_range() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let router = build_router(minimal_state(pool));
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/info/chart?range=14d")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn info_shares_returns_singleton_totals() {
     let Some(pool) = connect_or_skip().await else {

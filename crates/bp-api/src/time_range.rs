@@ -12,6 +12,7 @@
 //! | `1d`  | 24h     | 10 min    | 144         |
 //! | `3d`  | 72h     | 10 min    | 432         |
 //! | `7d`  | 168h    | 10 min    | 1008        |
+//! | `14d` | 336h    | 10 min    | 2016        |
 //! | `1m`  | 30 days | 10 min    | 4320        |
 //!
 //! Endpoints that don't take `range` (e.g. `/api/info/shares`) just
@@ -28,6 +29,7 @@ pub enum Range {
     Day,
     ThreeDays,
     SevenDays,
+    FourteenDays,
     Month,
 }
 
@@ -40,8 +42,9 @@ impl Range {
             "1d" => Ok(Self::Day),
             "3d" => Ok(Self::ThreeDays),
             "7d" => Ok(Self::SevenDays),
+            "14d" => Ok(Self::FourteenDays),
             "1m" | "30d" => Ok(Self::Month),
-            _ => Err(ApiError::InvalidQuery("range must be 1d|3d|7d|1m")),
+            _ => Err(ApiError::InvalidQuery("range must be 1d|3d|7d|14d|1m")),
         }
     }
 
@@ -52,6 +55,7 @@ impl Range {
             Self::Day => DAY,
             Self::ThreeDays => 3 * DAY,
             Self::SevenDays => 7 * DAY,
+            Self::FourteenDays => 14 * DAY,
             Self::Month => 30 * DAY,
         }
     }
@@ -68,12 +72,13 @@ impl Range {
     }
 
     /// Short string for cache keys / log lines (`1d`, `3d`, `7d`,
-    /// `1m`). Round-trips through `Range::parse`.
+    /// `14d`, `1m`). Round-trips through `Range::parse`.
     pub fn label(self) -> &'static str {
         match self {
             Self::Day => "1d",
             Self::ThreeDays => "3d",
             Self::SevenDays => "7d",
+            Self::FourteenDays => "14d",
             Self::Month => "1m",
         }
     }
@@ -303,6 +308,7 @@ mod tests {
         assert_eq!(Range::parse(Some("1d")).unwrap(), Range::Day);
         assert_eq!(Range::parse(Some("3d")).unwrap(), Range::ThreeDays);
         assert_eq!(Range::parse(Some("7d")).unwrap(), Range::SevenDays);
+        assert_eq!(Range::parse(Some("14d")).unwrap(), Range::FourteenDays);
         assert_eq!(Range::parse(Some("1m")).unwrap(), Range::Month);
         assert_eq!(Range::parse(Some("30d")).unwrap(), Range::Month);
     }
@@ -311,7 +317,13 @@ mod tests {
     /// per-range bucketing (keeps chart resolution + correct hashrate).
     #[test]
     fn slot_size_is_always_ten_minutes() {
-        for r in [Range::Day, Range::ThreeDays, Range::SevenDays, Range::Month] {
+        for r in [
+            Range::Day,
+            Range::ThreeDays,
+            Range::SevenDays,
+            Range::FourteenDays,
+            Range::Month,
+        ] {
             assert_eq!(
                 r.slot_size_ms(),
                 10 * 60 * 1000,
