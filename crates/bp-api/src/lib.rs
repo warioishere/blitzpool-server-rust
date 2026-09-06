@@ -47,6 +47,7 @@ pub use state::{AppState, SharedState};
 
 use axum::Router;
 use bp_group_mgmt_engine::{EmailHooks, GroupServiceHooks};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 
 /// Build the root router from a [`SharedState`]. The state is shared
@@ -71,4 +72,9 @@ where
         .merge(controllers::push::routes())
         .with_state(state)
         .layer(CorsLayer::permissive())
+        // gzip/br/deflate every response the client will accept. The big
+        // periodic chart/stats pulls are JSON that compresses ~5-10×, so the
+        // ~7MB egress burst that saturated the 100 Mbit uplink drops well under
+        // the bufferbloat threshold. No-op for clients that omit Accept-Encoding.
+        .layer(CompressionLayer::new())
 }

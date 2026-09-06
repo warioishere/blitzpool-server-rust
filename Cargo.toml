@@ -121,7 +121,7 @@ clap = { version = "4", features = ["derive"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-br", "compression-gzip", "compression-deflate"] }
 
 # Bitcoin
 bitcoin = "0.32"
