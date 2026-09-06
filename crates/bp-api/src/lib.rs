@@ -72,9 +72,6 @@ where
         .merge(controllers::push::routes())
         .with_state(state)
         .layer(CorsLayer::permissive())
-        // gzip/br/deflate every response the client will accept. The big
-        // periodic chart/stats pulls are JSON that compresses ~5-10×, so the
-        // ~7MB egress burst that saturated the 100 Mbit uplink drops well under
-        // the bufferbloat threshold. No-op for clients that omit Accept-Encoding.
+        // Compress responses (gzip/br/deflate) for clients that accept it.
         .layer(CompressionLayer::new())
 }
