@@ -105,7 +105,7 @@ async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> 
 
     let net_diff = NetworkDifficulty::new(1_000_000.0);
     let window = WindowStore::new(
-        conn, /*factor=*/ 4.0, /*bucket_shares=*/ 100, net_diff,
+        conn, /*factor=*/ 4.0, /*bucket_shares=*/ 100, net_diff, /*max_age_days=*/ 0,
     );
     // The weight model requires the pool-output recipient (pay_P is
     // structural) — mirror the production requirement in the harness.
@@ -610,7 +610,7 @@ async fn build_window(h: &Harness) -> WindowStore {
     let client = Client::open(url).expect("client");
     let conn = ConnectionManager::new(client).await.expect("conn");
     let nd = NetworkDifficulty::new(1_000_000.0);
-    WindowStore::new(conn, 4.0, 100, nd)
+    WindowStore::new(conn, 4.0, 100, nd, 0)
 }
 
 fn redis_db_for_prefix(prefix: &str) -> u8 {
@@ -714,7 +714,7 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
         .expect("read-only conn");
     let ro_builder = DistributionBuilder::new(
         h.pool.clone(),
-        WindowStore::new(ro_conn, 4.0, 100, NetworkDifficulty::new(1_000_000.0)),
+        WindowStore::new(ro_conn, 4.0, 100, NetworkDifficulty::new(1_000_000.0), 0),
         DistributionConfig::from_engine_config(&PplnsEngineConfig {
             fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
             ..PplnsEngineConfig::default()
