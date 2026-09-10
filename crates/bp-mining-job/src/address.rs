@@ -1,36 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! BTC address normalization and script derivation.
+//! BTC address → `scriptPubKey` derivation.
+//!
+//! The normalization rule that used to live here moved to
+//! `bp_common::normalize_btc_address` — it had been copied into both engines
+//! (which cannot depend on this crate: it is only a dev-dependency of theirs),
+//! and the "must agree byte-for-byte" invariant the copies documented was
+//! checked by nothing. `bp-common` is a dependency of all of them.
 
 use std::str::FromStr;
 
 use bitcoin::{Address, Network, ScriptBuf};
-
-/// Normalize a BTC address for storage / equality comparison.
-///
-/// Bech32 / bech32m (BIP-173 / BIP-350) are case-insensitive by spec —
-/// wallets may present them uppercase (QR-code optimization) but the
-/// canonical wire form is lowercase. Legacy P2PKH / P2SH (base58) IS
-/// case-sensitive — different cases are different addresses with
-/// different checksums — and is left untouched.
-///
-/// Whitespace is trimmed. Empty input maps to empty output.
-pub fn normalize_btc_address(address: &str) -> String {
-    let trimmed = address.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("bc1")
-        || lower.starts_with("tb1")
-        || lower.starts_with("bcrt1")
-        || lower.starts_with("sb1")
-    {
-        lower
-    } else {
-        trimmed.to_string()
-    }
-}
 
 /// Convert a BTC address to its `scriptPubKey` bytes for the given network.
 /// All address types supported by `rust-bitcoin` are handled (P2PKH, P2SH,
@@ -55,48 +35,6 @@ pub enum AddressError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bech32_normalized_to_lowercase() {
-        assert_eq!(
-            normalize_btc_address("BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4"),
-            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
-        );
-        assert_eq!(
-            normalize_btc_address("TB1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KXPJZSX"),
-            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
-        );
-        assert_eq!(
-            normalize_btc_address("BCRT1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KYGT080"),
-            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
-        );
-    }
-
-    #[test]
-    fn legacy_preserves_case() {
-        assert_eq!(
-            normalize_btc_address("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"),
-            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
-        );
-        assert_eq!(
-            normalize_btc_address("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"),
-            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"
-        );
-    }
-
-    #[test]
-    fn trims_whitespace() {
-        assert_eq!(
-            normalize_btc_address("  bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4  "),
-            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
-        );
-    }
-
-    #[test]
-    fn empty_input_returns_empty() {
-        assert_eq!(normalize_btc_address(""), "");
-        assert_eq!(normalize_btc_address("   "), "");
-    }
 
     #[test]
     fn address_to_script_p2wpkh_mainnet() {

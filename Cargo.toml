@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/bp-common",
     "crates/bp-client-live",
+    "crates/bp-payout-descriptor",
     "crates/bp-config",
     "crates/bp-db",
     "crates/bp-bitcoin",
@@ -125,6 +126,15 @@ tower-http = { version = "0.6", features = ["cors", "trace", "compression-br", "
 
 # Bitcoin
 bitcoin = "0.32"
+# Output-descriptor parsing for rotating (xpub) payout identities. Already in
+# the tree transitively via stratum-apps at this exact version, against the one
+# `bitcoin 0.32` the workspace resolves — so this is a promotion to a direct
+# dependency, not a new package and not a version negotiation.
+#
+# It is deliberately NOT a dependency of `bp-common`: nearly everything depends
+# on that crate and 11 of its 19 dependents take no `bitcoin` at all. Descriptor
+# handling lives in `bp-payout-descriptor` instead.
+miniscript = "13.1"
 secp256k1 = "0.29"
 # Base58Check round-trip for SV2 authority-key conversion in
 # `bin/blitzpool/src/stratum_v2.rs` (config holds the key as hex;
@@ -229,6 +239,7 @@ tempfile = "3"
 # without repeating the path.
 bp-common = { path = "crates/bp-common" }
 bp-client-live = { path = "crates/bp-client-live" }
+bp-payout-descriptor = { path = "crates/bp-payout-descriptor" }
 bp-config = { path = "crates/bp-config" }
 bp-db = { path = "crates/bp-db" }
 bp-bitcoin = { path = "crates/bp-bitcoin" }

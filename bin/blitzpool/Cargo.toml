@@ -32,6 +32,10 @@ bp-share-hook = { workspace = true }
 # Accepted-share Redis-stream transport (core producer / satellite consumer).
 bp-share-stream = { workspace = true }
 bp-mining-mode = { workspace = true }
+# The rotating-identity intake (`payout_identities.rs`). It is the only crate
+# here that owns `miniscript`, which is why the intake is built at this layer
+# and handed to the protocol crates as a trait object.
+bp-payout-descriptor = { workspace = true }
 bp-pplns = { workspace = true }
 hex = { workspace = true }
 bp-pplns-engine = { workspace = true }

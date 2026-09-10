@@ -209,10 +209,7 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
     // ── Convert §4 entries → bp-mining-job PayoutEntry ────────────
     let payouts: Vec<PayoutEntry> = entries
         .iter()
-        .map(|(a, s)| PayoutEntry {
-            address: a.as_str().to_string(),
-            sats: *s,
-        })
+        .map(|(a, s)| PayoutEntry::static_address(a.as_str().to_string(), *s))
         .collect();
 
     // ── Build the MiningJob + brute-force a regtest-target nonce ──
@@ -360,10 +357,7 @@ async fn pplns_block_with_real_txs_nonempty_merkle_path_accepted_by_core() {
         .payout_entries_at(reward_sats)
         .expect("§4 payout vector")
         .iter()
-        .map(|(a, s)| PayoutEntry {
-            address: a.as_str().to_string(),
-            sats: *s,
-        })
+        .map(|(a, s)| PayoutEntry::static_address(a.as_str().to_string(), *s))
         .collect();
 
     // ── Build coinbase, reconstruct the root over the NON-EMPTY branch ──
@@ -407,8 +401,10 @@ async fn cleanup_pplns_state(pool: &PgPool, payouts: &[PayoutEntry]) {
     // Delete only the balance rows for the addresses the test seeded;
     // leaves any other lingering rows alone.
     for p in payouts {
+        // `payout_id()`: `pplns_balance.address` is the ledger key, which is
+        // exactly what that accessor is defined to return.
         let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
-            .bind(&p.address)
+            .bind(p.payout_id())
             .execute(pool)
             .await;
     }
@@ -545,10 +541,7 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
         .payout_entries_at(reward_sats)
         .expect("§4 payout vector")
         .iter()
-        .map(|(a, s)| PayoutEntry {
-            address: a.as_str().to_string(),
-            sats: *s,
-        })
+        .map(|(a, s)| PayoutEntry::static_address(a.as_str().to_string(), *s))
         .collect();
 
     // The job carries the fingerprint the resolver handed it — the

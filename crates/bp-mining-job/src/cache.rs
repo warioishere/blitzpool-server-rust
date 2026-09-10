@@ -20,10 +20,12 @@
 //!    differ per finder (Solo / Group-Solo / Blockparty) get distinct
 //!    keys by construction — no per-mode special-casing.
 //! 2. **Payout-outputs level** — the parsed `(sats, script)` outputs,
-//!    keyed by (network, payouts, reward). A job-level miss with an
-//!    already-seen payout set (different slot size on SV2 Extended, or
-//!    a template refresh that left the reward unchanged) reuses the
-//!    parsed scripts and only re-serializes.
+//!    keyed by (network, payouts, reward, block height). A job-level
+//!    miss with an already-seen payout set at the same height
+//!    (different slot size on SV2 Extended, or a template refresh that
+//!    left the reward unchanged) reuses the parsed scripts and only
+//!    re-serializes. The height is in the key because
+//!    [`build_payout_outputs`] takes it — see [`OutputsKeyTuple`].
 //!
 //! ## Concurrency
 //!
@@ -69,8 +71,8 @@ use std::time::{Duration, Instant};
 use bitcoin::Network;
 
 use crate::coinbase::{
-    assemble_tdp_job, build_payout_outputs, checked_tdp_scriptsig, MiningJob, MiningJobError,
-    PayoutEntry, TdpCoinbaseTemplate,
+    assemble_tdp_job, build_payout_outputs, checked_tdp_scriptsig, payout_height, MiningJob,
+    MiningJobError, PayoutEntry, TdpCoinbaseTemplate,
 };
 
 /// Drop an entry after this long without a hit. Comfortably above the
@@ -130,8 +132,24 @@ fn job_key_tuple<'a>(
     )
 }
 
-/// THE outputs-level cache key: (network, reward, payouts).
-type OutputsKeyTuple<'a> = (Network, u64, &'a [PayoutEntry]);
+/// THE outputs-level cache key: (network, reward, payouts, block_height).
+///
+/// **`block_height` is in the key because `build_payout_outputs` takes it.**
+/// This entry memoizes address→script derivation, and a rotating identity's
+/// script is a function of the height — so without the height, two heights with
+/// the same payout list and the same reward would share one entry and the second
+/// would be paid the *first* height's scripts. That is a wrong coinbase, not a
+/// stale cache.
+///
+/// It costs nothing today: every identity is `Static`, so the derivation ignores
+/// the height, and in practice `reward_sats` already differs between heights
+/// (subsidy plus a different fee total), so this does not split entries that
+/// were previously shared.
+///
+/// The job-level key does not need the same treatment — it already carries
+/// `coinbase_prefix`, which *is* the BIP-34 height push (see
+/// `TdpCoinbaseTemplate::block_height`), so two heights can never collide there.
+type OutputsKeyTuple<'a> = (Network, u64, &'a [PayoutEntry], u32);
 
 fn hash_tuple<T: Hash>(tuple: &T) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -198,16 +216,21 @@ struct OutputsKey {
     network: Network,
     reward_sats: u64,
     payouts: Arc<Vec<PayoutEntry>>,
+    block_height: u32,
 }
 
 impl OutputsKey {
+    /// Exhaustive destructure — same reason as [`JobKey::as_tuple`]: adding a
+    /// field without adding it to the tuple fails to compile, so key equality
+    /// cannot silently go incomplete.
     fn as_tuple(&self) -> OutputsKeyTuple<'_> {
         let OutputsKey {
             network,
             reward_sats,
             payouts,
+            block_height,
         } = self;
-        (*network, *reward_sats, payouts.as_slice())
+        (*network, *reward_sats, payouts.as_slice(), *block_height)
     }
 }
 
@@ -491,6 +514,13 @@ impl MiningJobCache {
         );
         let job_hash = hash_tuple(&lookup);
         let reward = template.coinbase_tx_value_remaining;
+        // Resolved BEFORE the map is touched, and by the same
+        // `coinbase::payout_height` the direct builder uses — the outputs key
+        // includes the height, so an entry could otherwise be installed under a
+        // height this build would have refused. It also fixes the error
+        // precedence: `MissingBlockHeight` beats `ScriptSigTooLong`, which is
+        // why `build_mining_job_from_tdp` orders the two the same way.
+        let block_height = payout_height(template, payouts)?;
         let now = Instant::now();
 
         // Resolve the canonical payouts Arc from the outputs level FIRST.
@@ -500,7 +530,7 @@ impl MiningJobCache {
         // → allocate the payout vec once; the job key and the outputs
         // entry then share this one allocation.
         let payouts_arc = self
-            .touch_outputs(network, reward, payouts, now)
+            .touch_outputs(network, reward, payouts, block_height, now)
             .unwrap_or_else(|| Arc::new(payouts.to_vec()));
         let key_payouts = payouts_arc.clone();
 
@@ -531,8 +561,14 @@ impl MiningJobCache {
                     pool_identifier,
                     extranonce_slot_size,
                 )?;
-                let payout_outputs =
-                    self.get_or_parse_outputs(network, payouts, reward, payouts_arc, now)?;
+                let payout_outputs = self.get_or_parse_outputs(
+                    network,
+                    payouts,
+                    reward,
+                    block_height,
+                    payouts_arc,
+                    now,
+                )?;
                 Ok(Arc::new(assemble_tdp_job(
                     script_sig,
                     &payout_outputs,
@@ -563,10 +599,11 @@ impl MiningJobCache {
         network: Network,
         payouts: &[PayoutEntry],
         reward_sats: u64,
+        block_height: u32,
         payouts_arc: Arc<Vec<PayoutEntry>>,
         now: Instant,
     ) -> Result<Arc<PayoutOutputs>, MiningJobError> {
-        let lookup: OutputsKeyTuple<'_> = (network, reward_sats, payouts);
+        let lookup: OutputsKeyTuple<'_> = (network, reward_sats, payouts, block_height);
         let hash = hash_tuple(&lookup);
         let (outputs, outcome) = self.outputs.get_or_build(
             hash,
@@ -578,12 +615,14 @@ impl MiningJobCache {
                 network,
                 reward_sats,
                 payouts: payouts_arc,
+                block_height,
             },
             || -> Result<Arc<PayoutOutputs>, MiningJobError> {
                 Ok(Arc::new(build_payout_outputs(
                     network,
                     payouts,
                     reward_sats,
+                    block_height,
                 )?))
             },
         )?;
@@ -594,20 +633,25 @@ impl MiningJobCache {
     }
 
     /// Refresh the `last_used` of the outputs entry for
-    /// (network, reward, payouts) and return its shared payouts Arc, if
+    /// (network, reward, payouts, height) and return its shared payouts Arc, if
     /// one exists. Called on every `get_or_build` — including a pure
     /// job-hit — so the backing outputs entry can never age out from
     /// under a live job (which would waste the address-parse
     /// memoization it exists for), and so a new job entry reuses the one
     /// payouts allocation instead of cloning the vec again.
+    ///
+    /// Takes the same four key components as [`Self::get_or_parse_outputs`] and
+    /// builds the lookup the same way, so a touch cannot warm (or hand the
+    /// payouts Arc of) an entry the parse would consider a different key.
     fn touch_outputs(
         &self,
         network: Network,
         reward_sats: u64,
         payouts: &[PayoutEntry],
+        block_height: u32,
         now: Instant,
     ) -> Option<Arc<Vec<PayoutEntry>>> {
-        let lookup: OutputsKeyTuple<'_> = (network, reward_sats, payouts);
+        let lookup: OutputsKeyTuple<'_> = (network, reward_sats, payouts, block_height);
         let hash = hash_tuple(&lookup);
         self.outputs
             .touch(hash, now, |k| k.as_tuple() == lookup, |k| k.payouts.clone())
@@ -690,14 +734,8 @@ mod tests {
 
     fn payouts_two_way() -> Vec<PayoutEntry> {
         vec![
-            PayoutEntry {
-                address: MINER_A.to_string(),
-                sats: 3_000_000_000,
-            },
-            PayoutEntry {
-                address: MINER_B.to_string(),
-                sats: 2_000_000_000,
-            },
+            PayoutEntry::static_address(MINER_A.to_string(), 3_000_000_000),
+            PayoutEntry::static_address(MINER_B.to_string(), 2_000_000_000),
         ]
     }
 
@@ -793,14 +831,8 @@ mod tests {
                     let tmpl = template(&prefix, &outputs);
                     // Same addresses, distinct sats split per "finder".
                     let payouts = vec![
-                        PayoutEntry {
-                            address: MINER_A.to_string(),
-                            sats: 3_000_000_000 + i,
-                        },
-                        PayoutEntry {
-                            address: MINER_B.to_string(),
-                            sats: 2_000_000_000 - i,
-                        },
+                        PayoutEntry::static_address(MINER_A.to_string(), 3_000_000_000 + i),
+                        PayoutEntry::static_address(MINER_B.to_string(), 2_000_000_000 - i),
                     ];
                     cache
                         .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
@@ -827,14 +859,8 @@ mod tests {
         let tmpl = template(&prefix, &outputs);
         let cache = MiningJobCache::new();
 
-        let payouts_a = vec![PayoutEntry {
-            address: MINER_A.to_string(),
-            sats: REWARD,
-        }];
-        let payouts_b = vec![PayoutEntry {
-            address: MINER_B.to_string(),
-            sats: REWARD,
-        }];
+        let payouts_a = vec![PayoutEntry::static_address(MINER_A.to_string(), REWARD)];
+        let payouts_b = vec![PayoutEntry::static_address(MINER_B.to_string(), REWARD)];
 
         let job_a = cache
             .get_or_build(Network::Bitcoin, &payouts_a, &tmpl, "BP", 12, [0u8; 32])
@@ -906,14 +932,21 @@ mod tests {
         }
     }
 
+    /// A template refresh **at the same height** is a distinct job that reuses
+    /// the parsed outputs — the case the outputs level exists for.
+    ///
+    /// Same height, same payout set, same reward, different transaction set (so
+    /// a different witness commitment in `coinbase_tx_outputs`). Nothing about
+    /// the payout scripts changed, so nothing is re-parsed.
     #[test]
-    fn template_change_is_a_distinct_job_but_reuses_outputs() {
+    fn a_same_height_template_change_is_a_distinct_job_but_reuses_outputs() {
         let (prefix, outputs) = tdp_fixture();
         let tmpl_a = template(&prefix, &outputs);
-        // Same reward, different BIP-34 prefix (next height) — as in a
-        // template refresh where fees happened to cancel out.
-        let prefix_b = vec![0x03, 0x01, 0x35, 0x0c];
-        let tmpl_b = template(&prefix_b, &outputs);
+        // Same BIP-34 prefix, different witness commitment.
+        let mut outputs_b = outputs.clone();
+        let last = outputs_b.len() - 1;
+        outputs_b[last] ^= 0xFF;
+        let tmpl_b = template(&prefix, &outputs_b);
         let payouts = payouts_two_way();
         let cache = MiningJobCache::new();
 
@@ -925,12 +958,64 @@ mod tests {
             .unwrap();
 
         assert!(!Arc::ptr_eq(&job_a, &job_b));
-        assert_ne!(job_a.coinbase_prefix(), job_b.coinbase_prefix());
+        assert_ne!(job_a.coinbase_suffix(), job_b.coinbase_suffix());
         let stats = cache.stats();
         assert_eq!(stats.jobs_built, 2);
         assert_eq!(
             stats.outputs_built, 1,
-            "same payout set + reward → one parse"
+            "same height + payout set + reward → one parse"
+        );
+    }
+
+    /// **A DIFFERENT height re-parses, even when everything else matches.**
+    ///
+    /// `build_payout_outputs` takes the height, and a rotating identity's script
+    /// is a function of it. Sharing one entry across two heights would serve the
+    /// second height the *first* height's scripts — a coinbase paying the wrong
+    /// address, not a stale cache. So the height is part of
+    /// [`OutputsKeyTuple`], and this test is the control for it: delete
+    /// `block_height` from that tuple and `outputs_built` drops to 1 here.
+    ///
+    /// Verified by mutation, 2026-08-10: with `block_height` removed from
+    /// `OutputsKeyTuple` and `OutputsKey`, this test fails `left: 1, right: 2`
+    /// while every other test in this module still passes — the height is not
+    /// otherwise observable, which is exactly why the omission survived review
+    /// until a rotating identity would have made it a money bug.
+    ///
+    /// The cost today is nil. Two heights sharing a reward means fees cancelled
+    /// out exactly, and the broadcast storm the cache exists to collapse is N
+    /// connections on ONE template — one height by definition.
+    #[test]
+    fn a_different_height_reparses_the_outputs_even_when_nothing_else_changed() {
+        let (prefix, outputs) = tdp_fixture(); // BIP-34 height 800_000
+        let tmpl_a = template(&prefix, &outputs);
+        // Height 800_001, everything else identical — a refresh across a height
+        // boundary where the fees happened to cancel out.
+        let prefix_b = vec![0x03, 0x01, 0x35, 0x0c];
+        let tmpl_b = template(&prefix_b, &outputs);
+        assert_eq!(tmpl_a.block_height(), Some(800_000));
+        assert_eq!(tmpl_b.block_height(), Some(800_001));
+        assert_eq!(
+            tmpl_a.coinbase_tx_value_remaining, tmpl_b.coinbase_tx_value_remaining,
+            "precondition: the reward must NOT distinguish these, or the height \
+             is not what this test is measuring"
+        );
+        let payouts = payouts_two_way();
+        let cache = MiningJobCache::new();
+
+        cache
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl_a, "BP", 12, [0u8; 32])
+            .unwrap();
+        cache
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl_b, "BP", 12, [0u8; 32])
+            .unwrap();
+
+        let stats = cache.stats();
+        assert_eq!(stats.jobs_built, 2);
+        assert_eq!(
+            stats.outputs_built, 2,
+            "each height parses its own outputs — one entry per height, or the \
+             second height is paid the first height's scripts"
         );
     }
 
@@ -943,10 +1028,10 @@ mod tests {
         let long_prefix = vec![0x01; 95]; // 95 + 12-byte slot > 100
         let (_, outputs) = tdp_fixture();
         let tmpl = template(&long_prefix, &outputs);
-        let bad = vec![PayoutEntry {
-            address: "not-an-address".to_string(),
-            sats: REWARD,
-        }];
+        let bad = vec![PayoutEntry::static_address(
+            "not-an-address".to_string(),
+            REWARD,
+        )];
 
         assert!(matches!(
             build_mining_job_from_tdp(Network::Bitcoin, &bad, &tmpl, "BP", 12, [0u8; 32]),
@@ -977,10 +1062,10 @@ mod tests {
         let (prefix, outputs) = tdp_fixture();
         let tmpl = template(&prefix, &outputs);
         let cache = MiningJobCache::new();
-        let bad = vec![PayoutEntry {
-            address: "not-an-address".to_string(),
-            sats: REWARD,
-        }];
+        let bad = vec![PayoutEntry::static_address(
+            "not-an-address".to_string(),
+            REWARD,
+        )];
         for _ in 0..2 {
             assert!(matches!(
                 cache.get_or_build(Network::Bitcoin, &bad, &tmpl, "BP", 12, [0u8; 32]),
@@ -1000,10 +1085,7 @@ mod tests {
         let (prefix, outputs) = tdp_fixture();
         let tmpl = template(&prefix, &outputs);
         let cache = MiningJobCache::new();
-        let payouts = vec![PayoutEntry {
-            address: MINER_A.to_string(),
-            sats: REWARD,
-        }];
+        let payouts = vec![PayoutEntry::static_address(MINER_A.to_string(), REWARD)];
         let job = cache
             .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
@@ -1077,21 +1159,24 @@ mod tests {
 
     #[test]
     fn job_key_shares_payouts_arc_with_outputs_key() {
-        // The payout vec is stored once per distinct payout set: the
-        // second template's JobKey reuses the outputs entry's Arc
+        // The payout vec is stored once per distinct payout set at a
+        // height: the second job's JobKey reuses the outputs entry's Arc
         // instead of cloning the vec again.
+        //
+        // The two jobs differ in extranonce slot size, NOT in height —
+        // two heights are two outputs entries by design (see
+        // `a_different_height_reparses_the_outputs_even_when_nothing_else_changed`)
+        // and there would be no sharing left to measure.
         let (prefix, outputs) = tdp_fixture();
-        let tmpl_a = template(&prefix, &outputs);
-        let prefix_b = vec![0x03, 0x01, 0x35, 0x0c];
-        let tmpl_b = template(&prefix_b, &outputs);
+        let tmpl = template(&prefix, &outputs);
         let payouts = payouts_two_way();
         let cache = MiningJobCache::new();
 
         cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl_a, "BP", 12, [0u8; 32])
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 12, [0u8; 32])
             .unwrap();
         cache
-            .get_or_build(Network::Bitcoin, &payouts, &tmpl_b, "BP", 12, [0u8; 32])
+            .get_or_build(Network::Bitcoin, &payouts, &tmpl, "BP", 16, [0u8; 32])
             .unwrap();
 
         let job_arcs = cache.jobs.map_keys(|k| k.payouts.clone());

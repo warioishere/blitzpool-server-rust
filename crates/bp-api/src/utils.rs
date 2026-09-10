@@ -4,17 +4,14 @@
 //! share the same wire-shape transforms (email masking, etc.) without
 //! drifting per-file.
 
-use bp_common::{AddressId, InvalidAddressError};
-
-/// Normalize a user-supplied Bitcoin address and parse it into an [`AddressId`].
+/// The "normalize (trim + lowercase bech32) → validate shape" step every
+/// address-taking endpoint runs.
 ///
-/// The single source of truth for the "normalize (trim + lowercase bech32) →
-/// validate shape" step every address-taking endpoint runs, so the controllers
-/// don't each re-spell `AddressId::new(normalize_btc_address(x))` (and can't
-/// drift on whether they normalize first).
-pub fn normalized_address_id(raw: &str) -> Result<AddressId, InvalidAddressError> {
-    AddressId::new(bp_mining_job::normalize_btc_address(raw))
-}
+/// A re-export, not a wrapper: this was a fourth spelling of the composition
+/// (`AddressId::new(normalize_btc_address(x))`) beside the rule's
+/// three copies. Re-exporting keeps the `crate::utils::normalized_address_id`
+/// call sites while leaving exactly one implementation.
+pub use bp_common::normalized_address_id;
 
 /// Mask an email for over-the-wire exposure.
 ///

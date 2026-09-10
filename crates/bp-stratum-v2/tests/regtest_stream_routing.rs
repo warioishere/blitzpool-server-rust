@@ -136,9 +136,9 @@ fn split_reward(addresses: &[String], reward_sats: u64) -> Vec<PayoutEntry> {
     addresses
         .iter()
         .enumerate()
-        .map(|(i, address)| PayoutEntry {
-            address: address.clone(),
-            sats: if i == 0 { each + remainder } else { each },
+        .map(|(i, address)| {
+            let sats = if i == 0 { each + remainder } else { each };
+            PayoutEntry::static_address(address.clone(), sats)
         })
         .collect()
 }

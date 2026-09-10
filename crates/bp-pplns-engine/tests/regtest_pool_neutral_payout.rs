@@ -570,10 +570,7 @@ fn payout_entries(distribution: &WeightDistribution, reward: u64) -> Vec<PayoutE
         .payout_entries_at(reward)
         .expect("§4 payout vector")
         .iter()
-        .map(|(address, sats)| PayoutEntry {
-            address: address.as_str().to_string(),
-            sats: *sats,
-        })
+        .map(|(address, sats)| PayoutEntry::static_address(address.as_str().to_string(), *sats))
         .collect()
 }
 

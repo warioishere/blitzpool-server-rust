@@ -595,6 +595,11 @@ async fn run_mining_connection(
     // the session so the submit validators can gate their per-share
     // traces (`🎯 Extended share difficulty`) on it.
     state.share_logs = server_config.share_logs;
+    // The pool's rotating-identity intake, if this deployment wired one — the
+    // same `Arc` SV1 installs, off the same hook composite. Set here rather than
+    // passed to `MiningSessionState::new` for the `share_logs` reason above:
+    // `resolve_open_context` is a pure handler over `&mut MiningSessionState`.
+    state.rotating_intake = hooks.rotating_intake.clone();
     let mut current_template = initial_template;
     // `alt_streams` holds one receiver+snapshot per fixed-reservation stream;
     // at OpenChannel the connection `remove`s the entry for its resolved mode

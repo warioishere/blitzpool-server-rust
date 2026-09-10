@@ -64,10 +64,10 @@ impl PayoutResolver for SoloResolver {
         miner_address: &AddressId,
         reward_sats: u64,
     ) -> ResolvedPayouts {
-        ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-            address: miner_address.as_str().to_string(),
-            sats: reward_sats,
-        }])
+        ResolvedPayouts::unsnapshotted(vec![PayoutEntry::static_address(
+            miner_address.as_str(),
+            reward_sats,
+        )])
     }
     fn resolve_stream(&self, _miner_address: &AddressId) -> StreamKind {
         StreamKind::Solo

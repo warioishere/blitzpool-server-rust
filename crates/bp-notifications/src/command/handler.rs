@@ -1295,7 +1295,17 @@ mod tests {
     fn parse_address_rejects_blank_or_oversized() {
         assert!(parse_address("").is_none());
         assert!(parse_address("   ").is_none());
-        assert!(parse_address(&"a".repeat(70)).is_none());
+        // "Oversized" is whatever `AddressId` says it is, read from the cap
+        // rather than written as a literal. This line said `repeat(70)` until
+        // 2026-08-12, when `MAX_ADDRESS_LEN` moved from 62 to 90
+        // (`0015_widen_identity_columns.sql`) and 70 became a *valid* length —
+        // the test then failed, which is how it was found.
+        assert!(parse_address(&"a".repeat(bp_common::MAX_ADDRESS_LEN + 1)).is_none());
+        assert!(
+            parse_address(&"a".repeat(bp_common::MAX_ADDRESS_LEN)).is_some(),
+            "and the cap itself is admitted, so this rejects on width and not \
+             on the character"
+        );
         assert!(parse_address("with space").is_none());
     }
 

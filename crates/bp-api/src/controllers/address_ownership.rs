@@ -343,7 +343,7 @@ fn script_type_label(t: AddressType) -> &'static str {
 
 /// Parse + validate a mainnet BTC address into a **canonical** `AddressId`.
 /// Rejects testnet / malformed addresses at the API boundary, then normalises
-/// via the single source of truth [`bp_mining_job::normalize_btc_address`]
+/// via the single source of truth [`bp_common::normalize_btc_address`]
 /// (lowercase bech32, preserve case-sensitive Base58) so the ownership row is
 /// keyed identically to what every verification gate looks up — otherwise a
 /// mixed-case Base58 (or upper-case bech32) proof would never match.

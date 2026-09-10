@@ -1,0 +1,28 @@
+[package]
+name = "bp-payout-descriptor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# For `AddressId` (the `payout_id` shape) and `InvalidAddressError`. This crate
+# depends on `bp-common`, never the reverse — see the module docs for why
+# `miniscript` must not land there.
+bp-common = { workspace = true }
+bitcoin = { workspace = true }
+miniscript = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Tests only, and only to read `COINBASE_OUTPUT_WEIGHT` — the 172 WU worst case
+# that Group-Solo's member cap is sized from. Comparing against a literal `172`
+# here would be a second copy of that number, which is the exact drift
+# `CLAUDE.md` opens with. `bp-pplns` depends on `bp-common` alone, so this edge
+# adds no cycle, and being a dev-dependency it puts nothing in the built crate.
+bp-pplns = { workspace = true }

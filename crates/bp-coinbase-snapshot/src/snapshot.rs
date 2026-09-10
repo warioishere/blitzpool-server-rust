@@ -522,6 +522,8 @@ mod tests {
         let fee = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap();
         let shares = StdMap::from([(a1.clone(), 2.0)]);
         let balances = StdMap::from([(a1.clone(), Sats(-500))]);
+        // Literal addresses only: no rotating identity, so nothing is derived.
+        let no_derived = std::collections::HashSet::new();
         let d = bp_pplns::build_weight_distribution(bp_pplns::WeightDistributionInput {
             address_shares: &shares,
             balances: &balances,
@@ -533,6 +535,7 @@ mod tests {
             finder_address: None,
             reference_revenue_sats: 312_500_000,
             withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
+            derived_payout_keys: &no_derived,
         })
         .unwrap();
         let s = StoredWeightSnapshot::from_distribution(&d);
@@ -559,6 +562,8 @@ mod tests {
         let a2 = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
         let fee = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap();
         let shares = StdMap::from([(a1.clone(), 3.0), (a2.clone(), 1.0)]);
+        // Literal addresses only: no rotating identity, so nothing is derived.
+        let no_derived = std::collections::HashSet::new();
         // The bonus is a proportion now — plain score weight, nothing to
         // project — so what still has to reproduce is the LEDGER side:
         // credits, debts, and a promise larger than the block.
@@ -583,6 +588,7 @@ mod tests {
                 finder_address: Some(&a1),
                 reference_revenue_sats: 312_500_000,
                 withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
+                derived_payout_keys: &no_derived,
             })
             .unwrap();
             let s = StoredWeightSnapshot::from_distribution(&d);

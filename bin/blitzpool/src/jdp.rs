@@ -30,7 +30,6 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use bitcoin::Network as BitcoinNetwork;
 use bp_bitcoin::BitcoinRpc;
 use bp_common::AddressId;
 use bp_config::AppConfig;
@@ -139,13 +138,7 @@ pub(crate) async fn spawn(
     }
     let port = cfg.sv2.jdp_port.ok_or(JdpSpawnError::PortMissing)?;
     let noise = stratum_v2::build_noise_config(cfg)?;
-    let network = match cfg.network {
-        bp_config::Network::Mainnet => BitcoinNetwork::Bitcoin,
-        // testnet4 shares the `tb` HRP with testnet3 — rust-bitcoin
-        // 0.32's Testnet variant covers both.
-        bp_config::Network::Testnet | bp_config::Network::Testnet4 => BitcoinNetwork::Testnet,
-        bp_config::Network::Regtest => BitcoinNetwork::Regtest,
-    };
+    let network = crate::network::config_network_to_bitcoin(cfg.network);
     // ext 0x0003 payout-distribution source: same resolver + engines the
     // allocate path uses, so the published weight distribution and the
     // pool's own coinbase always agree. The fee address anchors tailored

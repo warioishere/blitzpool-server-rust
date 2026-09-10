@@ -593,6 +593,12 @@ async fn run_connection(
         &port_config,
         random_session_id_hex(),
     );
+    // The pool's rotating-identity intake, if this deployment wired one. Copied
+    // onto the session the same way `share_logs` is, and for the same reason:
+    // `handle_authorize` is a pure handler that takes `&mut SessionState`, so a
+    // capability it needs has to arrive on the state rather than as a new
+    // constructor parameter every test's `SessionState::new` would have to pass.
+    state.rotating_intake = hooks.rotating_intake.clone();
     // Assign a pool-wide collision-free extranonce1 from the shared
     // allocator, decoupled from the (still-random) session id — the
     // session id keeps its old identity role for the UI / DB / device
@@ -1298,10 +1304,10 @@ mod tests {
             coinbase_tx_outputs_count: 1,
             coinbase_tx_locktime: 0,
         };
-        let payouts = vec![PayoutEntry {
-            address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            sats: 5_000_000_000,
-        }];
+        let payouts = vec![PayoutEntry::static_address(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            5_000_000_000,
+        )];
         build_mining_job_from_tdp(
             Network::Regtest,
             &payouts,
@@ -1539,10 +1545,10 @@ mod tests {
             coinbase_tx_outputs_count: active.coinbase_tx_outputs_count,
             coinbase_tx_locktime: active.coinbase_tx_locktime,
         };
-        let payouts = vec![PayoutEntry {
-            address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            sats: 5_000_000_000,
-        }];
+        let payouts = vec![PayoutEntry::static_address(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            5_000_000_000,
+        )];
         let mining_job = build_mining_job_from_tdp(
             Network::Regtest,
             &payouts,

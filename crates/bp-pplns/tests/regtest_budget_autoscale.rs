@@ -175,10 +175,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
     );
     let payouts: Vec<PayoutEntry> = entries
         .iter()
-        .map(|(a, s)| PayoutEntry {
-            address: a.as_str().to_string(),
-            sats: *s,
-        })
+        .map(|(a, s)| PayoutEntry::static_address(a.as_str().to_string(), *s))
         .collect();
     eprintln!(
         "[autoscale] distribution published {} outputs (incl. pool output)",
@@ -295,6 +292,8 @@ fn build_distribution(
         finder_address: None,
         reference_revenue_sats: REGTEST_BLOCK_REWARD_SATS,
         withheld_value: WithheldValue::ToOtherMiners,
+        // Every miner here is a literal regtest address: nothing derived.
+        derived_payout_keys: &std::collections::HashSet::new(),
     })
     .expect("build_weight_distribution")
 }

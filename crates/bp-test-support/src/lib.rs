@@ -432,7 +432,31 @@ pub mod redis_db {
     /// store to answer at all. Don't claim it for a session-persistence
     /// test, and don't add a write to either borrower without moving
     /// them apart first.
+    ///
+    /// Occupied indices in this range: 0-6 and 8 (`live_store_integration`
+    /// plus `live_store.rs`'s own test), 20 ([`RT_ROTATING_PPLNS_BLOCK`]),
+    /// 31 (the two `bp-api` borrowers above).
     pub const SESSION_PERSISTENCE: u16 = 15 * RANGE;
+
+    /// `bp-pplns-engine`'s `regtest_rotating_pplns_block` — a rotating miner
+    /// through the whole PPLNS path, twice.
+    ///
+    /// **A lodger in [`SESSION_PERSISTENCE`]'s range, not a base of its own.**
+    /// 15 is the last usable base: `redis_db_in_range` is
+    /// `(base + test_db) % redis_database_count()`, so a sixteenth base would
+    /// be `16 * 32 = 512`, which folds straight back onto `BLITZPOOL_BIN = 0`
+    /// on the 512-database container — silently, and onto a range that
+    /// flushes.
+    ///
+    /// Sharing the base is safe because the two never share a *database*:
+    /// this binary owns index 20 alone, and `FLUSHDB` wipes only the database
+    /// it is issued against. That holds under `cargo-nextest`'s concurrent
+    /// binaries too, which is the runner the note above this block says the
+    /// serial-binary assumption does not survive.
+    ///
+    /// A binary that needs a whole 32-slice of its own is the one that has to
+    /// recreate `bp-test-redis` with `--databases` past 512.
+    pub const RT_ROTATING_PPLNS_BLOCK: u16 = SESSION_PERSISTENCE;
 }
 
 /// How many logical databases this Redis actually has.

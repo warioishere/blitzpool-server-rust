@@ -222,10 +222,7 @@ async fn group_solo_three_member_distribution_block_accepted_by_core() {
     // ── Build the block + brute-force a regtest-target nonce ────
     let payouts: Vec<PayoutEntry> = entries
         .iter()
-        .map(|(a, s)| PayoutEntry {
-            address: a.as_str().to_string(),
-            sats: *s,
-        })
+        .map(|(a, s)| PayoutEntry::static_address(a.as_str().to_string(), *s))
         .collect();
     // The job carries the distribution's settlement identity — the
     // fingerprint a block found on it books through.

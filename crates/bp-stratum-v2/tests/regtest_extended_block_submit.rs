@@ -246,10 +246,10 @@ async fn run_block_submit_case(
         coinbase_tx_outputs_count: template.coinbase_tx_outputs_count,
         coinbase_tx_locktime: template.coinbase_tx_locktime,
     };
-    let payouts = vec![PayoutEntry {
-        address: MINER_ADDR.to_string(),
-        sats: 5_000_000_000,
-    }];
+    let payouts = vec![PayoutEntry::static_address(
+        MINER_ADDR.to_string(),
+        5_000_000_000,
+    )];
     let mining_job = build_mining_job_from_tdp(
         Network::Regtest,
         &payouts,

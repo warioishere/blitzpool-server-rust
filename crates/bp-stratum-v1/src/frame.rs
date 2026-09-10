@@ -559,17 +559,28 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
                 });
             }
             let raw_username = arr[0].as_str().unwrap().to_string();
-            // A trailing dot ("addr.") gets the same default as no dot at
-            // all: an empty worker name is not a name. Letting "" through
-            // birthed the `client_entity` row under clientName "" while
-            // every share-path write targets a non-empty name — the touch
-            // UPDATE then matches 0 rows, `updatedAt` freezes, and
-            // `kill_dead_clients` sweeps an actively-hashing session.
-            let (address, worker) = match raw_username.split_once('.') {
-                Some((a, w)) if !w.is_empty() => (a.to_string(), w.to_string()),
-                Some((a, _)) => (a.to_string(), "worker".to_string()),
-                None => (raw_username.clone(), "worker".to_string()),
-            };
+            // The shared split — one implementation across the protocol paths
+            // that read a `user_identity` (see
+            // `bp_common::split_identity_and_worker`). SV1's own default stays
+            // here rather than in the shared function, which is why that one
+            // returns `Option` instead of a defaulted string.
+            //
+            // A trailing dot ("addr.") gets the same default as no dot at all:
+            // an empty worker name is not a name. Letting "" through birthed the
+            // `client_entity` row under clientName "" while every share-path
+            // write targets a non-empty name — the touch UPDATE then matches 0
+            // rows, `updatedAt` freezes, and `kill_dead_clients` sweeps an
+            // actively-hashing session. The shared split returns `Some("")` for
+            // a trailing dot, so the emptiness check has to live at this call
+            // site; the SV2 reader in `bp_stratum_v2::extensions` makes the same
+            // check for the same reason.
+            let (address, worker) = bp_common::split_identity_and_worker(&raw_username);
+            let (address, worker) = (
+                address.to_string(),
+                worker
+                    .filter(|w| !w.is_empty())
+                    .map_or_else(|| "worker".to_string(), str::to_string),
+            );
             let password = arr.get(1).and_then(|v| v.as_str()).map(String::from);
             Ok(SV1Request::Authorize(AuthorizeRequest {
                 id,

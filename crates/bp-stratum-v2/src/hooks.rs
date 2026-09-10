@@ -240,6 +240,18 @@ pub struct MiningServerHooks {
     /// Customer extranonce overrides. [`NoOpHooks`] returns `None` for every
     /// worker, so a deployment without the feature behaves exactly as before.
     pub custom_extranonce: Arc<dyn CustomExtranonceSource>,
+    /// The pool's rotating-identity intake, consulted once per
+    /// `OpenMiningChannel`. **The same `Arc` SV1's
+    /// `ServerHooks::rotating_intake` carries** — see that field for why an
+    /// injected capability rather than something this crate builds, and
+    /// [`crate::mining::client::MiningSessionState::rotating_intake`] for the
+    /// session-side copy the channel-open handler reads.
+    ///
+    /// One implementation across both protocols is the point: an xpub that SV1
+    /// admits and SV2 refuses (or vice versa) would be two answers to one
+    /// question, and the miner's ledger key would depend on which port it
+    /// connected to.
+    pub rotating_intake: Option<Arc<dyn bp_common::RotatingIntake>>,
 }
 
 impl MiningServerHooks {
@@ -256,6 +268,9 @@ impl MiningServerHooks {
             session_persistence: no_op.clone(),
             device_status_sink: no_op.clone(),
             custom_extranonce: no_op,
+            // See SV1's `no_op`: no intake means the static path, unchanged,
+            // and `NoOpHooks` gets no stub impl of the trait.
+            rotating_intake: None,
         }
     }
 }
@@ -275,10 +290,10 @@ impl PayoutResolver for NoOpHooks {
         miner_address: &AddressId,
         reward_sats: u64,
     ) -> ResolvedPayouts {
-        ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-            address: miner_address.as_str().to_string(),
-            sats: reward_sats,
-        }])
+        ResolvedPayouts::unsnapshotted(vec![PayoutEntry::static_address(
+            miner_address.as_str().to_string(),
+            reward_sats,
+        )])
     }
 }
 
@@ -414,6 +429,7 @@ pub mod test_support {
                 device_status_sink: arc,
                 // RecordingHooks doesn't record EN lookups — no override in tests.
                 custom_extranonce: Arc::new(NoOpHooks),
+                rotating_intake: None,
             }
         }
     }
@@ -428,10 +444,10 @@ pub mod test_support {
             if let Some(ref custom) = *self.payouts_override.lock().expect("poisoned") {
                 return ResolvedPayouts::unsnapshotted(custom.clone());
             }
-            ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-                address: miner_address.as_str().to_string(),
-                sats: reward_sats,
-            }])
+            ResolvedPayouts::unsnapshotted(vec![PayoutEntry::static_address(
+                miner_address.as_str().to_string(),
+                reward_sats,
+            )])
         }
     }
 
@@ -667,17 +683,11 @@ mod tests {
     #[tokio::test]
     async fn recording_hooks_payout_override_replaces_default() {
         let hooks = RecordingHooks::new().with_payouts(vec![
-            PayoutEntry {
-                address: "p1".to_string(),
-                sats: 1_500_000_000,
-            },
-            PayoutEntry {
-                address: "p2".to_string(),
-                sats: 3_500_000_000,
-            },
+            PayoutEntry::static_address("p1".to_string(), 1_500_000_000),
+            PayoutEntry::static_address("p2".to_string(), 3_500_000_000),
         ]);
         let payouts = hooks.resolve_payouts(&make_addr(), 5_000_000_000).await;
         assert_eq!(payouts.entries.len(), 2);
-        assert_eq!(payouts.entries[0].address, "p1");
+        assert_eq!(payouts.entries[0].payout_id(), "p1");
     }
 }

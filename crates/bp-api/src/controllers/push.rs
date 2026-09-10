@@ -83,7 +83,7 @@ async fn info() -> Json<Value> {
                 "path": "/api/push/register",
                 "description": "Register Unified Push endpoint (all notification types enabled by default). Requires address to have mined on this pool.",
                 "body": {
-                    "address": "bitcoin address (62 chars)",
+                    "address": "bitcoin address (max 90 chars)",
                     "endpoint": "https://your-endpoint-url",
                     "platform": "optional identifier (default: unknown)"
                 }
@@ -93,7 +93,7 @@ async fn info() -> Json<Value> {
                 "path": "/api/push/fcm/register",
                 "description": "Register FCM device token (all notification types enabled by default). Requires address to have mined on this pool.",
                 "body": {
-                    "address": "bitcoin address (62 chars)",
+                    "address": "bitcoin address (max 90 chars)",
                     "token": "FCM device token (100+ chars)",
                     "platform": "optional: android|ios|web"
                 }

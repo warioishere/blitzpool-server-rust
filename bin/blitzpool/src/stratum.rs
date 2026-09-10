@@ -159,9 +159,28 @@ pub(crate) async fn spawn(
             dev_fee_percent: cfg.solo.dev_fee_percent.unwrap_or(0.0),
         },
         engines.blockparty.clone(),
+        engines.payout_identities.clone(),
+        // The renderer's network, so the resolver can ask the renderer's own
+        // payability question before it hands a coinbase a key it cannot pay.
+        crate::network::config_network_to_bitcoin(cfg.network),
     ));
     let sv1_resolver: Arc<dyn bp_stratum_v1::PayoutResolver> = production_resolver.clone();
     let sv2_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver> = production_resolver;
+
+    // ONE rotating intake, fanned out to both protocols — built here for the
+    // same reason the resolver above is: this is the join point where the SV1 and
+    // SV2 hook builders both need it. Two instances would be two verdicts on
+    // "is this xpub admissible", and the miner's ledger key would depend on
+    // which protocol it spoke. Both write into `engines.payout_identities`, which
+    // is the same directory the resolver reads — and, through the pool below,
+    // into `miner_identity`, which is what settlement reads ~100 blocks later
+    // when this connection no longer exists.
+    let rotating_intake: Arc<dyn bp_common::RotatingIntake> =
+        Arc::new(crate::payout_identities::PoolRotatingIntake::new(
+            engines.payout_identities.clone(),
+            cfg.payout_identity.allow_rotating,
+            foundation.db.pool().clone(),
+        ));
 
     // ONE pool-wide MiningJob cache shared across every SV1 AND SV2
     // port server. All of them ride the same TDP streams, and the
@@ -188,6 +207,7 @@ pub(crate) async fn spawn(
         engines,
         group_service,
         sv1_resolver,
+        rotating_intake.clone(),
         dispatcher.clone(),
         gate.clone(),
         Arc::clone(&live_sessions),
@@ -208,6 +228,7 @@ pub(crate) async fn spawn(
         bridge,
         sv2_resolver,
         custom_extranonce,
+        rotating_intake,
         dispatcher,
         gate,
         Arc::clone(&live_sessions),

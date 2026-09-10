@@ -47,11 +47,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bp_blockparty_engine::BlockpartyApi;
-use bp_common::{AddressId, MiningMode, Sats};
+use bp_common::{AddressId, MiningMode, PayoutIdentity, Sats};
 use bp_group_solo_engine::engine::GroupSoloEngine;
 /// Re-exported so the wiring keeps one import path for the solo split.
 pub(crate) use bp_mining_job::SoloFeeConfig;
-use bp_mining_job::{solo_payouts, PayoutEntry, ResolvedPayouts};
+use bp_mining_job::{is_payable_identity, solo_payouts, PayoutEntry, ResolvedPayouts};
 use bp_pplns::CoinbaseDistributionEntry;
 use bp_pplns_engine::engine::PplnsEngine;
 use bp_stratum_v2::bridge::DistributionAccounting;
@@ -60,6 +60,7 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::engines::BlitzpoolModeGate;
+use crate::payout_identities::PayoutIdentityDirectory;
 
 /// The single production `PayoutResolver` impl. Holds clones of the
 /// engines + the mode gate; cheap to clone (each field is internally
@@ -75,15 +76,29 @@ pub(crate) struct ProductionPayoutResolver {
     /// payouts — i.e. a deployment without the Blockparty feature wired
     /// behaves exactly as before.
     blockparty: Option<Arc<dyn BlockpartyApi>>,
+    /// `payout_id → PayoutIdentity` for the rotating identities of currently
+    /// connected miners. See [`PayoutIdentityDirectory`] for why the descriptor
+    /// arrives this way and not down the connection.
+    identities: Arc<PayoutIdentityDirectory>,
+    /// The network the coinbase renders against — carried so
+    /// [`weight_entries_to_payouts`] can ask
+    /// [`bp_mining_job::is_payable_identity`], which is the renderer's own
+    /// question and therefore network-aware. Not `bp_config::Network`: the
+    /// mapping belongs at the wiring edge (`network::config_network_to_bitcoin`),
+    /// and one more copy of it in here is `CLAUDE.md`'s opening failure mode.
+    network: bitcoin::Network,
 }
 
 impl ProductionPayoutResolver {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         mode_gate: Arc<BlitzpoolModeGate>,
         pplns: Option<PplnsEngine>,
         group_solo: GroupSoloEngine,
         solo_fee: SoloFeeConfig,
         blockparty: Option<Arc<dyn BlockpartyApi>>,
+        identities: Arc<PayoutIdentityDirectory>,
+        network: bitcoin::Network,
     ) -> Self {
         Self {
             mode_gate,
@@ -91,7 +106,38 @@ impl ProductionPayoutResolver {
             group_solo,
             solo_fee,
             blockparty,
+            identities,
+            network,
         }
+    }
+
+    /// **How this pool pays a `payout_id`** — one lookup, one place.
+    ///
+    /// Every mode's payout builder goes through here for a miner-supplied
+    /// identity, so "rotating miners are paid a derived script" is a property of
+    /// one function rather than of four arms agreeing. Pool-side addresses (the
+    /// Solo dev fee, the Blockparty pending-fee route, a group's operator-entered
+    /// member addresses) deliberately do NOT: they are `Static` at their
+    /// construction site, which is what keeps the pool-fee address unrotatable.
+    fn identity_of(&self, payout_id: &str) -> PayoutIdentity {
+        self.identities.identity_for(payout_id)
+    }
+
+    /// Solo's payout list for `miner_address`.
+    ///
+    /// Exists because the Solo split is reached from six places — the Solo arm
+    /// and five Blockparty fallbacks — and every one of them has to resolve the
+    /// identity the same way. Five of them spelling
+    /// `solo_payouts(miner_address, …)` and one spelling
+    /// `solo_payouts(&self.identity_of(miner_address), …)` is precisely how a
+    /// rotating miner ends up paid a hash on the fallback path only, which is
+    /// the shape of `CLAUDE.md`'s 2026-08-03 entry.
+    fn solo_split(&self, miner_address: &str, reward_sats: u64) -> Vec<PayoutEntry> {
+        solo_payouts(
+            &self.identity_of(miner_address),
+            &self.solo_fee,
+            reward_sats,
+        )
     }
 
     /// Resolution core — used by both the SV1 + SV2 trait impls.
@@ -127,11 +173,7 @@ impl ProductionPayoutResolver {
                     return (ResolvedPayouts::unsnapshotted(route), vouchable);
                 }
                 (
-                    ResolvedPayouts::unsnapshotted(solo_payouts(
-                        miner_address,
-                        &self.solo_fee,
-                        reward_sats,
-                    )),
+                    ResolvedPayouts::unsnapshotted(self.solo_split(miner_address, reward_sats)),
                     vouchable,
                 )
             }
@@ -380,13 +422,11 @@ impl ProductionPayoutResolver {
                 match result.distribution.payout_entries_at(reward_sats) {
                     Ok(entries) => (
                         ResolvedPayouts {
-                            entries: entries
-                                .into_iter()
-                                .map(|(address, sats)| PayoutEntry {
-                                    address: address.into_inner(),
-                                    sats,
-                                })
-                                .collect(),
+                            entries: weight_entries_to_payouts(
+                                entries,
+                                &self.identities,
+                                self.network,
+                            ),
                             payouts_fingerprint: result.payouts_fingerprint(),
                         },
                         result.snapshot_written,
@@ -422,10 +462,10 @@ impl ProductionPayoutResolver {
         // exact sats. The coinbase builder's remainder guard tops up any
         // sub-1-sat floor loss on this sole output.
         let sats = ((route.percent as f64 / 100.0) * reward_sats as f64).floor() as u64;
-        Some(vec![PayoutEntry {
-            address: route.fee_address.into_inner(),
+        Some(vec![PayoutEntry::static_address(
+            route.fee_address.into_inner(),
             sats,
-        }])
+        )])
     }
 
     async fn blockparty_payouts(
@@ -439,31 +479,31 @@ impl ProductionPayoutResolver {
                 miner_address,
                 "Blockparty mode in gate but service handle not wired; falling back to solo"
             );
-            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
+            return self.solo_split(miner_address, reward_sats);
         };
         let Some(gid_str) = group_id_str else {
             warn!(
                 miner_address,
                 "Blockparty mode published WITHOUT a group_id; falling back to solo"
             );
-            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
+            return self.solo_split(miner_address, reward_sats);
         };
         let Ok(group_id) = Uuid::parse_str(gid_str) else {
             warn!(
                 miner_address,
                 gid_str, "Blockparty group_id failed to parse as UUID; falling back to solo"
             );
-            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
+            return self.solo_split(miner_address, reward_sats);
         };
         match svc.build_payouts(group_id, Sats(reward_sats as i64)).await {
-            Ok(Some(result)) => entries_to_payouts(&result.payouts),
+            Ok(Some(result)) => entries_to_payouts(&result.payouts, &self.identities),
             Ok(None) => {
                 warn!(
                     miner_address,
                     %group_id,
                     "Blockparty group not found; falling back to solo"
                 );
-                solo_payouts(miner_address, &self.solo_fee, reward_sats)
+                self.solo_split(miner_address, reward_sats)
             }
             Err(err) => {
                 warn!(
@@ -472,7 +512,7 @@ impl ProductionPayoutResolver {
                     %group_id,
                     "Blockparty distribution build failed; falling back to solo"
                 );
-                solo_payouts(miner_address, &self.solo_fee, reward_sats)
+                self.solo_split(miner_address, reward_sats)
             }
         }
     }
@@ -519,13 +559,11 @@ impl ProductionPayoutResolver {
                 match result.distribution.payout_entries_at(reward_sats) {
                     Ok(entries) => (
                         ResolvedPayouts {
-                            entries: entries
-                                .into_iter()
-                                .map(|(address, sats)| PayoutEntry {
-                                    address: address.into_inner(),
-                                    sats,
-                                })
-                                .collect(),
+                            entries: weight_entries_to_payouts(
+                                entries,
+                                &self.identities,
+                                self.network,
+                            ),
                             payouts_fingerprint: result.payouts_fingerprint(),
                         },
                         result.snapshot_written,
@@ -638,41 +676,6 @@ impl ProductionDistributionSource {
             .map(|s| s.to_bytes())
     }
 
-    /// Lower a weight-native engine distribution into the wire shape.
-    fn lower_weight_distribution(
-        &self,
-        d: &bp_pplns::WeightDistribution,
-        fingerprint: Option<[u8; 32]>,
-        bookable: bool,
-    ) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
-        let pool_script = self.script_of(d.fee_address.as_str())?;
-        let mut payouts = Vec::new();
-        let mut dust_limits = Vec::new();
-        for entry in d.published() {
-            // A published entry whose script fails to derive would shift every
-            // ext 0x0003/Payout Computation position — fail the whole build
-            // instead.
-            let script = self.script_of(entry.address.as_str())?;
-            payouts.push(bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
-                script_pubkey: script,
-                weight: entry.wire_weight,
-            });
-            dust_limits.push(entry.dust_limit);
-        }
-        Some(bp_stratum_v2::jdp_server::BuiltPayoutDistribution {
-            pool_payout: bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
-                script_pubkey: pool_script,
-                weight: d.weight_p,
-            },
-            payouts,
-            dust_limits,
-            additional_outputs: Vec::new(),
-            reference_reward_sats: d.reference_revenue_sats,
-            payouts_fingerprint: fingerprint,
-            bookable,
-        })
-    }
-
     /// Sats-at-reference as weights, for Solo — the one mode JDP serves that
     /// has its own exact allocator and settles by recompute rather than from a
     /// snapshot. `entries` in ext 0x0003/Payout Computation order WITHOUT a
@@ -713,6 +716,89 @@ impl ProductionDistributionSource {
     }
 }
 
+/// Lower a weight-native engine distribution into the wire shape.
+///
+/// **A rotating entry makes the whole distribution unpublishable**, and this is
+/// the same refusal the `TailoredMode::Solo` arm of
+/// `ProductionDistributionSource::build_for_miner` writes for a rotating miner —
+/// one reason, stated twice because the two reach it from different directions,
+/// and the alternative is a fall-through that publishes the wrong thing.
+///
+/// A published ext 0x0003 distribution is a list of FIXED `script_pubkey` bytes
+/// under a distribution id, which a JDC reuses across blocks. There is no height
+/// here, so lowering a rotating identity would pin that miner to whichever
+/// address this one build derived — for every block the JDC ever builds against
+/// this distribution id. Rotation in name only, and the miner who configured an
+/// xpub would never see its second address.
+///
+/// `None` costs the JDC its published distribution and pays every one of these
+/// miners correctly through the mining path instead, where `payout_script` has
+/// the height.
+///
+/// A free function taking the two things it reads, for the reason
+/// [`weight_entries_to_payouts`] is one: the refusal is then provable without a
+/// live `GroupSoloEngine` (hence a Postgres pool) behind `self.resolver`. As a
+/// method it had no test at all, and one rotating miner in the window silences
+/// ext 0x0003 for the entire pool — a regression in either direction was
+/// unobservable.
+fn lower_weight_distribution(
+    d: &bp_pplns::WeightDistribution,
+    identities: &PayoutIdentityDirectory,
+    network: bitcoin::Network,
+    fingerprint: Option<[u8; 32]>,
+    bookable: bool,
+) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
+    let script_of = |addr: &str| -> Option<Vec<u8>> {
+        bp_mining_job::address_to_script(network, addr)
+            .ok()
+            .map(|s| s.to_bytes())
+    };
+    let pool_script = script_of(d.fee_address.as_str())?;
+    let mut payouts = Vec::new();
+    let mut dust_limits = Vec::new();
+    for entry in d.published() {
+        // `match` and not `if identity.rotates()`: this arm chooses what to
+        // *do* with an identity, which is the exhaustive question. The key is
+        // a ledger key, so for a rotating miner `script_of` below would be
+        // handed a 47-char `payout_id` and answer `None` — the right answer,
+        // reached for the wrong reason and logged as if the miner had
+        // configured a broken address. Say it explicitly instead.
+        match identities.identity_for(entry.address.as_str()) {
+            PayoutIdentity::Rotating { payout_id, .. } => {
+                warn!(
+                    payout_id = payout_id.as_str(),
+                    entries = d.entries.len(),
+                    "jdp distribution source: a distribution member's payout identity rotates \
+                     per block, which a published distribution's fixed scripts cannot express \
+                     — no published distribution"
+                );
+                return None;
+            }
+            PayoutIdentity::Static { .. } => {}
+        }
+        // A published entry whose script fails to derive would shift
+        // every §4 position — fail the whole build instead.
+        let script = script_of(entry.address.as_str())?;
+        payouts.push(bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
+            script_pubkey: script,
+            weight: entry.wire_weight,
+        });
+        dust_limits.push(entry.dust_limit);
+    }
+    Some(bp_stratum_v2::jdp_server::BuiltPayoutDistribution {
+        pool_payout: bp_stratum_v2::jdp::payout_distribution::WeightedOutput {
+            script_pubkey: pool_script,
+            weight: d.weight_p,
+        },
+        payouts,
+        dust_limits,
+        additional_outputs: Vec::new(),
+        reference_reward_sats: d.reference_revenue_sats,
+        payouts_fingerprint: fingerprint,
+        bookable,
+    })
+}
+
 #[async_trait]
 impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistributionSource {
     async fn build_pool_wide(&self) -> Option<bp_stratum_v2::jdp_server::BuiltPayoutDistribution> {
@@ -725,8 +811,10 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                 return None;
             }
         };
-        self.lower_weight_distribution(
+        lower_weight_distribution(
             &result.distribution,
+            &self.resolver.identities,
+            self.network,
             Some(result.payouts_fingerprint()),
             result.snapshot_written,
         )
@@ -798,8 +886,10 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                     .build_distribution(group_id, t_ref, miner_address)
                     .await
                 {
-                    Ok(result) => self.lower_weight_distribution(
+                    Ok(result) => lower_weight_distribution(
                         &result.distribution,
+                        &self.resolver.identities,
+                        self.network,
                         Some(result.payouts_fingerprint()),
                         result.snapshot_written,
                     ),
@@ -811,10 +901,41 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                 }
             }
             TailoredMode::Solo => {
+                let identity = self.resolver.identity_of(miner_address.as_str());
+                // **A REFUSAL, not a fallback** — the idiom `jdp_distribution_for`
+                // established for Blockparty, and the same answer the
+                // base-protocol allocate path gives (`jdp_hooks.rs`).
+                //
+                // A published ext 0x0003 distribution is a list of FIXED
+                // `script_pubkey` bytes under a distribution id, and a JDC reuses
+                // it across blocks. There is no height here and no way to change
+                // it per block, so a rotating identity has no expressible form:
+                // lowering one would pin every future block to a script derived
+                // at whatever index this build happened to pick — rotation in
+                // name only, and a miner who configured an xpub would never see
+                // its second address.
+                //
+                // `Unavailable` costs this JDC its tailored distribution and pays
+                // it correctly through the mining path instead. `match` and not
+                // `if identity.rotates()`: this arm chooses what to *do* with an
+                // identity, which is the exhaustive question.
+                match &identity {
+                    PayoutIdentity::Rotating { payout_id, .. } => {
+                        warn!(
+                            miner = miner_address.as_str(),
+                            payout_id = payout_id.as_str(),
+                            "jdp distribution source: this miner's payout identity rotates per \
+                             block, which a published distribution's fixed scripts cannot \
+                             express — no tailored distribution"
+                        );
+                        return TailoredDistribution::Unavailable;
+                    }
+                    PayoutIdentity::Static { .. } => {}
+                }
                 let entries: Vec<(String, u64)> =
-                    solo_payouts(miner_address.as_str(), &self.resolver.solo_fee, t_ref)
+                    solo_payouts(&identity, &self.resolver.solo_fee, t_ref)
                         .into_iter()
-                        .map(|p| (p.address, p.sats))
+                        .map(|p| (p.payout_id().to_string(), p.sats))
                         .collect();
                 // The dev-fee output doubles as pool_payout when set;
                 // otherwise the configured pool fee address anchors `weight_P`
@@ -905,18 +1026,124 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
 /// Carries the EXACT per-output sats the distributor computed (largest-remainder
 /// residuum, fixed finder bonus, solvency cap) — the coinbase builder places
 /// them verbatim, never re-deriving from a percentage.
-fn entries_to_payouts(entries: &[CoinbaseDistributionEntry]) -> Vec<PayoutEntry> {
-    entries
-        .iter()
-        .map(|e| PayoutEntry {
-            address: e.address.as_str().to_string(),
-            // `Sats` is a signed i64; a coinbase output can only ever be a
-            // non-negative amount. Clamp defensively so a (should-be-impossible)
-            // negative distributor value can't wrap to ~1.8e19 via `as u64` and
-            // blow up the coinbase as bad-cb-amount.
-            sats: e.sats.0.max(0) as u64,
-        })
-        .collect()
+///
+/// **Blockparty only, and it REFUSES a rotating identity.** Not an omission — a
+/// decision, and the same one `jdp_distribution_for` writes as an explicit
+/// `Nothing` arm rather than a fall-through. A Blockparty group is a rental: its
+/// members are enrolled by an admin into `blockparty_member`, out of band, and
+/// the hashing device never presents an identity for them. There is no
+/// channel-open at which a member could supply a descriptor, so a `Rotating` here
+/// means a member address collided with a published `payout_id` — a bug, not a
+/// miner to pay.
+///
+/// The refusal is an empty list, which is `ResolvedPayouts::none()` — the pool's
+/// existing "serve no job" answer. Deliberately NOT a fall-through to
+/// `solo_split`: that pays this block's whole reward to the connecting miner and
+/// nothing to the group, which is the wrong money rather than no money. And
+/// deliberately not "skip that one entry": the remaining percentages would no
+/// longer sum to the group's split, so the coinbase would silently pay a
+/// distribution no admin ever configured.
+fn entries_to_payouts(
+    entries: &[CoinbaseDistributionEntry],
+    identities: &PayoutIdentityDirectory,
+) -> Vec<PayoutEntry> {
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        // `match`, not `is_some()` on a descriptor: the refusal has to be an arm
+        // the compiler can see, per `CLAUDE.md`.
+        match identities.identity_for(e.address.as_str()) {
+            PayoutIdentity::Static { .. } => out.push(PayoutEntry::static_address(
+                e.address.as_str(),
+                // `Sats` is a signed i64; a coinbase output can only ever be a
+                // non-negative amount. Clamp defensively so a
+                // (should-be-impossible) negative distributor value can't wrap
+                // to ~1.8e19 via `as u64` and blow up the coinbase as
+                // bad-cb-amount.
+                e.sats.0.max(0) as u64,
+            )),
+            PayoutIdentity::Rotating { .. } => {
+                error!(
+                    payout_id = e.address.as_str(),
+                    entries = entries.len(),
+                    "Blockparty distribution contains a ROTATING identity; Blockparty members are \
+                     operator-entered addresses and this mode does not derive scripts — refusing \
+                     the whole distribution and serving NO JOB"
+                );
+                return Vec::new();
+            }
+        }
+    }
+    out
+}
+
+/// Translate a §4 weight-model evaluation (`payout_entries_at`) into coinbase
+/// payout entries.
+///
+/// **PPLNS and Group-Solo both resolve through here**, which is the point: this
+/// was the same three-line closure written twice, once per mode, and
+/// `CLAUDE.md`'s opening line is about exactly that shape. It is also where the
+/// two modes stop paying a literal address once identities can rotate — one
+/// edit, both modes, instead of the "fixed twice in two PRs a day apart" entry.
+///
+/// The entry keys are **ledger keys**, not addresses — for a rotating miner the
+/// key is a 47-char `payout_id`, and the script it pays comes from the
+/// descriptor at this block's height. Hence the directory lookup: handing the
+/// key to `PayoutEntry::static_address` verbatim, which is what this did while
+/// every identity was `Static`, would put a hash where a script has to go.
+///
+/// # Why an unpayable entry refuses the WHOLE list
+///
+/// The distribution that produced these entries already filtered its rows
+/// through `is_payable_payout_key` against the *same* resolution
+/// (`bp_coinbase_snapshot::resolve_derived_keys`, Amendment 2) — the filter and
+/// this lowering are two reads of one answer, so an unpayable key arriving here
+/// means they disagreed. There is no safe way to absorb that disagreement one
+/// entry at a time:
+///
+/// - **Dropping the entry** hands its satoshis to the pool output, because the
+///   pool output is the §4 residual of whatever the payout entries do not claim.
+///   That is the pool taking more than its fee — the one thing `CLAUDE.md` says
+///   it must never do — and under PPLNS the miner would *also* be credited at
+///   settlement, since settlement books from the block's own coinbase.
+/// - **Paying the key as an address** is what Amendment 2's gap actually is:
+///   `address_to_script` refuses an `xpb…` hash, `build_payout_outputs`
+///   propagates it with `?`, and `MiningJobCache::get_or_build(…).ok()?` in the
+///   SV1 client turns that into no `mining.notify` for every connection sharing
+///   this payout set — with no log line at all.
+///
+/// An empty list is `ResolvedPayouts::none()`, the pool's existing "serve no
+/// job" answer: this template is lost for this payout set, loudly, and the next
+/// build (≤ the 30 s inputs cache) re-resolves and drops the key at the filter
+/// instead — where the weight model withholds its value correctly.
+///
+/// The exhaustive `match` lives inside `is_payable_identity`, which is the
+/// point: it is the renderer's own predicate, three lines from `payout_script`,
+/// and asking it here rather than re-deriving "can we pay this" is what stops a
+/// third answer to that question from existing.
+fn weight_entries_to_payouts(
+    entries: Vec<(AddressId, u64)>,
+    identities: &PayoutIdentityDirectory,
+    network: bitcoin::Network,
+) -> Vec<PayoutEntry> {
+    let mut out = Vec::with_capacity(entries.len());
+    let total = entries.len();
+    for (key, sats) in entries {
+        let identity = identities.identity_for(key.as_str());
+        if !is_payable_identity(network, &identity) {
+            error!(
+                payout_id = key.as_str(),
+                entries = total,
+                %network,
+                "a distribution entry's ledger key resolves to an identity this coinbase cannot \
+                 pay — the build-time payability filter and this lowering disagreed (a rotating \
+                 identity forgotten by the directory, or a wrong-network address); refusing the \
+                 whole distribution and serving NO JOB rather than paying its satoshis to the pool"
+            );
+            return Vec::new();
+        }
+        out.push(PayoutEntry { identity, sats });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -924,6 +1151,14 @@ mod tests {
     use super::*;
 
     const TEST_REWARD: u64 = 5_000_000_000;
+
+    /// The miner argument to [`solo_payouts`]. These cases are about the dev-fee
+    /// split, which is the same arithmetic for either identity variant; the
+    /// rotating side of the Solo path is covered where it is observable — the
+    /// derived-script regtest gate — not here, where nothing renders a script.
+    fn miner(address: &str) -> PayoutIdentity {
+        PayoutIdentity::static_address_verbatim(address)
+    }
 
     /// The promise this flag carries gates the whole block-found emission, not
     /// just a snapshot lookup: without it nothing is emitted, so the durable
@@ -1074,14 +1309,14 @@ mod tests {
 
     #[test]
     fn solo_payouts_empty_address_yields_empty() {
-        let r = solo_payouts("", &SoloFeeConfig::default(), TEST_REWARD);
+        let r = solo_payouts(&miner(""), &SoloFeeConfig::default(), TEST_REWARD);
         assert!(r.is_empty());
     }
 
     #[test]
     fn solo_payouts_no_dev_fee_yields_single_100_pct() {
         let r = solo_payouts(
-            "bc1qabc",
+            &miner("bc1qabc"),
             &SoloFeeConfig {
                 dev_fee_address: None,
                 dev_fee_percent: 0.0,
@@ -1089,14 +1324,14 @@ mod tests {
             TEST_REWARD,
         );
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].address, "bc1qabc");
+        assert_eq!(r[0].payout_id(), "bc1qabc");
         assert_eq!(r[0].sats, TEST_REWARD);
     }
 
     #[test]
     fn solo_payouts_with_dev_fee_splits() {
         let r = solo_payouts(
-            "bc1qminer",
+            &miner("bc1qminer"),
             &SoloFeeConfig {
                 dev_fee_address: Some("bc1qdev".into()),
                 dev_fee_percent: 1.5,
@@ -1104,9 +1339,9 @@ mod tests {
             TEST_REWARD,
         );
         assert_eq!(r.len(), 2);
-        assert_eq!(r[0].address, "bc1qdev");
+        assert_eq!(r[0].payout_id(), "bc1qdev");
         assert_eq!(r[0].sats, 75_000_000); // floor(1.5% × 5e9)
-        assert_eq!(r[1].address, "bc1qminer");
+        assert_eq!(r[1].payout_id(), "bc1qminer");
         assert_eq!(r[1].sats, TEST_REWARD - 75_000_000); // miner takes the remainder
                                                          // The two outputs sum to exactly the reward.
         assert_eq!(r[0].sats + r[1].sats, TEST_REWARD);
@@ -1116,7 +1351,7 @@ mod tests {
     fn solo_payouts_with_dev_fee_empty_address_is_ignored() {
         // Trim treats whitespace-only as empty.
         let r = solo_payouts(
-            "bc1qminer",
+            &miner("bc1qminer"),
             &SoloFeeConfig {
                 dev_fee_address: Some("   ".into()),
                 dev_fee_percent: 1.5,
@@ -1124,14 +1359,14 @@ mod tests {
             TEST_REWARD,
         );
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].address, "bc1qminer");
+        assert_eq!(r[0].payout_id(), "bc1qminer");
         assert_eq!(r[0].sats, TEST_REWARD);
     }
 
     #[test]
     fn solo_payouts_rejects_out_of_range_fee_percent() {
         let r = solo_payouts(
-            "bc1qminer",
+            &miner("bc1qminer"),
             &SoloFeeConfig {
                 dev_fee_address: Some("bc1qdev".into()),
                 dev_fee_percent: 150.0,
@@ -1139,7 +1374,7 @@ mod tests {
             TEST_REWARD,
         );
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].address, "bc1qminer");
+        assert_eq!(r[0].payout_id(), "bc1qminer");
         assert_eq!(r[0].sats, TEST_REWARD);
     }
 
@@ -1149,7 +1384,7 @@ mod tests {
         // (operator forgot `dev_fee_percent`). Must NOT emit a zero-value dev
         // output — collapse to a single 100 %-to-miner payout.
         let r = solo_payouts(
-            "bc1qminer",
+            &miner("bc1qminer"),
             &SoloFeeConfig {
                 dev_fee_address: Some("bc1qdev".into()),
                 dev_fee_percent: 0.0,
@@ -1157,16 +1392,20 @@ mod tests {
             TEST_REWARD,
         );
         assert_eq!(r.len(), 1, "no zero-value dev output");
-        assert_eq!(r[0].address, "bc1qminer");
+        assert_eq!(r[0].payout_id(), "bc1qminer");
         assert_eq!(r[0].sats, TEST_REWARD);
     }
 
-    #[test]
-    fn entries_to_payouts_carries_exact_sats() {
+    /// A BIP-32 test-vector xpub — a real key with a real checksum, because
+    /// `RotatingPayout::from_xpub_str` refuses anything else and the refusal test
+    /// below would then be asserting against an empty directory.
+    const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+
+    fn blockparty_entries(first: &str) -> Vec<CoinbaseDistributionEntry> {
         use bp_common::Sats;
-        let entries = vec![
+        vec![
             CoinbaseDistributionEntry {
-                address: AddressId::new("bc1qa".to_string()).unwrap(),
+                address: AddressId::new(first.to_string()).unwrap(),
                 percent: 60.0,
                 sats: Sats(60_000_000),
             },
@@ -1175,12 +1414,424 @@ mod tests {
                 percent: 40.0,
                 sats: Sats(40_000_000),
             },
-        ];
-        let payouts = entries_to_payouts(&entries);
+        ]
+    }
+
+    #[test]
+    fn entries_to_payouts_carries_exact_sats() {
+        let entries = blockparty_entries("bc1qa");
+        let payouts = entries_to_payouts(&entries, &PayoutIdentityDirectory::new());
         assert_eq!(payouts.len(), 2);
-        assert_eq!(payouts[0].address, "bc1qa");
+        assert_eq!(payouts[0].payout_id(), "bc1qa");
         assert_eq!(payouts[0].sats, 60_000_000);
-        assert_eq!(payouts[1].address, "bc1qb");
+        assert_eq!(payouts[1].payout_id(), "bc1qb");
         assert_eq!(payouts[1].sats, 40_000_000);
+    }
+
+    /// **Blockparty's refusal, and its shape.** A rotating identity among the
+    /// members is a bug — they are operator-entered addresses — so the whole
+    /// distribution is refused rather than the entry skipped: skipping leaves the
+    /// other members' percentages no longer summing to the group's split, which
+    /// pays out a distribution no admin configured.
+    ///
+    /// The test above is this one's negative control, on the same entries: with an
+    /// empty directory the identical list yields both outputs, so the emptiness
+    /// here is the refusal and not a broken fixture.
+    #[test]
+    fn entries_to_payouts_refuses_a_rotating_member_entirely() {
+        let identity = bp_payout_descriptor::RotatingPayout::from_xpub_str(XPUB)
+            .expect("a BIP-32 vector is a valid xpub")
+            .into_payout_identity();
+        let payout_id = identity.payout_id().to_string();
+        let directory = PayoutIdentityDirectory::new();
+        directory.publish_for_test(identity);
+
+        let entries = blockparty_entries(&payout_id);
+        assert_eq!(
+            entries.len(),
+            2,
+            "the precondition: one rotating member AND one static one"
+        );
+
+        let payouts = entries_to_payouts(&entries, &directory);
+        assert!(
+            payouts.is_empty(),
+            "the static member must go down with it — a partial Blockparty split \
+             is worse than no job: {payouts:?}"
+        );
+        assert!(
+            ResolvedPayouts::unsnapshotted(payouts).is_none(),
+            "and an empty list is exactly the pool's existing serve-no-job answer"
+        );
+    }
+
+    // ── The weight path: PPLNS and Group-Solo ──────────────────────────────
+
+    /// A real regtest address, because the payability question here is asked by
+    /// the renderer's own network-aware parser: a `bc1q…` literal is *not* payable
+    /// on regtest, so a fabricated one would make every test below pass for the
+    /// wrong reason.
+    const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+    fn weight_entries(first: &str) -> Vec<(AddressId, u64)> {
+        vec![
+            (AddressId::new(first.to_string()).unwrap(), 60_000_000),
+            (
+                AddressId::new(REGTEST_ADDR.to_string()).unwrap(),
+                40_000_000,
+            ),
+        ]
+    }
+
+    /// A rotating miner's ledger key must lower to a **rotating** payout entry —
+    /// not to a static one carrying the key as its address, which is the shape
+    /// that renders a 47-char `payout_id` into a coinbase and fails
+    /// `build_payout_outputs`.
+    #[test]
+    fn weight_entries_lower_a_rotating_ledger_key_to_a_rotating_payout() {
+        let identity = bp_payout_descriptor::RotatingPayout::from_xpub_str(XPUB)
+            .expect("a BIP-32 vector is a valid xpub")
+            .into_payout_identity();
+        let payout_id = identity.payout_id().to_string();
+        let directory = PayoutIdentityDirectory::new();
+        directory.publish_for_test(identity);
+
+        let payouts = weight_entries_to_payouts(
+            weight_entries(&payout_id),
+            &directory,
+            bitcoin::Network::Regtest,
+        );
+
+        assert_eq!(payouts.len(), 2, "both miners are payable: {payouts:?}");
+        assert!(
+            payouts[0].identity.rotates(),
+            "the rotating miner must arrive as a rotating identity, so the coinbase \
+             derives a fresh script instead of being handed a payout_id"
+        );
+        assert_eq!(
+            payouts[0].payout_id(),
+            payout_id,
+            "and the LEDGER key is unchanged by the lowering — settlement books \
+             against this, not against the derived address"
+        );
+        assert_eq!(payouts[0].sats, 60_000_000, "sats carry through untouched");
+        assert!(!payouts[1].identity.rotates());
+        assert_eq!(payouts[1].sats, 40_000_000);
+    }
+
+    /// **The refusal, with its control in the same test.** A rotating ledger key
+    /// the directory has forgotten resolves to `Static { address: payout_id }`,
+    /// which no parser accepts. Dropping that one entry would hand its 60 M sats
+    /// to the pool as the §4 residual *while settlement still credits the miner
+    /// from the block's own coinbase* — the pool taking more than its fee, and a
+    /// double credit. So the whole distribution goes.
+    ///
+    /// The control is the identical entry list against a directory that knows the
+    /// key: it lowers to two payouts. The emptiness is therefore the guard, not a
+    /// malformed fixture.
+    #[test]
+    fn a_forgotten_rotating_key_refuses_the_whole_weight_distribution() {
+        let identity = bp_payout_descriptor::RotatingPayout::from_xpub_str(XPUB)
+            .expect("a BIP-32 vector is a valid xpub")
+            .into_payout_identity();
+        let payout_id = identity.payout_id().to_string();
+
+        let forgotten = PayoutIdentityDirectory::new();
+        assert!(
+            !forgotten.identity_for(&payout_id).rotates(),
+            "the precondition: this directory has never heard of the key"
+        );
+        let refused = weight_entries_to_payouts(
+            weight_entries(&payout_id),
+            &forgotten,
+            bitcoin::Network::Regtest,
+        );
+        assert!(
+            refused.is_empty(),
+            "an unpayable ledger key must take the whole distribution with it, \
+             because the alternative is paying its share to the pool: {refused:?}"
+        );
+        assert!(
+            ResolvedPayouts::unsnapshotted(refused).is_none(),
+            "and that empties into the pool's existing serve-no-job answer, which \
+             self-heals on the next build"
+        );
+
+        let known = PayoutIdentityDirectory::new();
+        known.publish_for_test(identity);
+        assert_eq!(
+            weight_entries_to_payouts(
+                weight_entries(&payout_id),
+                &known,
+                bitcoin::Network::Regtest
+            )
+            .len(),
+            2,
+            "control: the same entries lower fine once the identity is resolvable"
+        );
+    }
+
+    /// The same refusal covers the other way a key becomes unrenderable, which has
+    /// nothing to do with rotation: a literal address from the wrong network. The
+    /// weight path's own filter parses against the pool's network, so a mainnet
+    /// address in a regtest window is exactly as unpayable as a forgotten xpub —
+    /// and `is_payable_identity` is asked the one question rather than each caller
+    /// re-deriving what "payable" means.
+    #[test]
+    fn a_wrong_network_literal_refuses_the_whole_weight_distribution() {
+        let directory = PayoutIdentityDirectory::new();
+        let mainnet = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let entries = vec![
+            (AddressId::new(mainnet.to_string()).unwrap(), 60_000_000),
+            (
+                AddressId::new(REGTEST_ADDR.to_string()).unwrap(),
+                40_000_000,
+            ),
+        ];
+
+        assert!(
+            weight_entries_to_payouts(entries, &directory, bitcoin::Network::Regtest).is_empty(),
+            "a mainnet address cannot be paid by a regtest coinbase"
+        );
+        assert_eq!(
+            weight_entries_to_payouts(
+                weight_entries(REGTEST_ADDR),
+                &directory,
+                bitcoin::Network::Regtest
+            )
+            .len(),
+            2,
+            "control: two regtest literals through the same call lower to two \
+             payouts, so the emptiness above is the network check"
+        );
+    }
+
+    // ── The ext 0x0003 lowering: PPLNS pool-wide and Group-Solo tailored ────
+
+    /// Reference revenue for the fixture below: a quarter-era block subsidy, so
+    /// both members' §4 amounts are ~150 M sats and `min_payout` withholds
+    /// neither.
+    const TEST_T_REF: u64 = 312_500_000;
+
+    /// A real regtest P2WPKH for the pool output. `pay_P` is structural (§4), so
+    /// [`bp_pplns::build_weight_distribution`] refuses outright on a fee address
+    /// it cannot parse — a `format!`-ed one would make the fixture below an
+    /// `Err`, not a distribution.
+    fn pool_fee_address() -> AddressId {
+        AddressId::new(bp_test_support::deterministic_p2wpkh_regtest([0x7f; 32]))
+            .expect("a derived p2wpkh is a valid payout address")
+    }
+
+    /// The two-member distribution the lowering is handed, built by the real
+    /// [`bp_pplns::build_weight_distribution`] rather than assembled field by
+    /// field: the build is what decides which entries are `published()`, and a
+    /// hand-written `WeightDistribution` could claim a published set the weight
+    /// model would never produce.
+    ///
+    /// `first_key` is the member under test — a literal regtest address for the
+    /// control, the rotating `payout_id` for the refusal. `derived` is how the
+    /// build is told a key it cannot parse is nonetheless payable
+    /// (`is_payable_payout_key`); without it the rotating row is dropped *above*
+    /// the score total, leaving a one-member distribution with nothing to refuse.
+    fn two_member_distribution(
+        first_key: &str,
+        derived: &std::collections::HashSet<String>,
+    ) -> bp_pplns::WeightDistribution {
+        let shares = std::collections::HashMap::from([
+            (
+                AddressId::new(first_key.to_string()).expect("payout key"),
+                60.0,
+            ),
+            (
+                AddressId::new(REGTEST_ADDR.to_string()).expect("regtest address"),
+                40.0,
+            ),
+        ]);
+        let balances = std::collections::HashMap::new();
+        let fee = pool_fee_address();
+        bp_pplns::build_weight_distribution(bp_pplns::WeightDistributionInput {
+            address_shares: &shares,
+            balances: &balances,
+            fee_percent: 1.5,
+            fee_address: &fee,
+            coinbase_weight_budget: 50_000,
+            min_payout_sats: Some(Sats(5_000)),
+            finder_bonus_ppm: 0,
+            finder_address: None,
+            reference_revenue_sats: TEST_T_REF,
+            withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
+            derived_payout_keys: derived,
+        })
+        .expect("two scored miners and a payable fee address")
+    }
+
+    /// **One rotating member costs the WHOLE pool its published distribution**,
+    /// and that is the intended trade: a published distribution is a list of
+    /// fixed `script_pubkey`s a JDC reuses across blocks, there is no height here
+    /// to derive a rotating script at, and the two alternatives are both wrong —
+    /// pinning the miner to one derived address forever, or dropping its entry
+    /// and handing its satoshis to the pool as the §4 residual.
+    ///
+    /// The control is the same fixture with two static members: it lowers to two
+    /// payouts. So the `None` below is the refusal and not a distribution that
+    /// was empty, unparseable or never built — which is what a lone `is_none()`
+    /// would have been worth here.
+    ///
+    /// **What the other modes do at this call.** This one function is the whole
+    /// weight-native lowering: PPLNS reaches it from `build_pool_wide` and
+    /// Group-Solo from the `TailoredMode::GroupSolo` arm of `build_for_miner`, so
+    /// the refusal is one implementation for both — the difference is only blast
+    /// radius (PPLNS: every JDC on the pool; Group-Solo: that group's JDC). Solo
+    /// does not come through here at all: it lowers exact sats
+    /// (`lower_exact_entries`) and refuses a rotating identity one level up, in
+    /// `build_for_miner`. Blockparty is never published over JDP at all
+    /// ([`JdpDistributionFor::Nothing`]).
+    #[test]
+    fn one_rotating_member_refuses_the_whole_published_distribution() {
+        // Distinct from REGTEST_ADDR, or the fixture's share map would collapse
+        // to a single member and the "whole distribution" would be one entry.
+        let static_first = bp_test_support::deterministic_p2wpkh_regtest([0x11; 32]);
+        let control = two_member_distribution(&static_first, &std::collections::HashSet::new());
+        assert_eq!(
+            control.published().count(),
+            2,
+            "the control's precondition: both members hold a §4 output, so the \
+             lowering below has two entries to walk"
+        );
+
+        let lowered = lower_weight_distribution(
+            &control,
+            &PayoutIdentityDirectory::new(),
+            bitcoin::Network::Regtest,
+            Some([7u8; 32]),
+            true,
+        )
+        .expect("two static regtest members are publishable");
+        assert_eq!(
+            lowered.payouts.len(),
+            2,
+            "control: every published member reaches the wire, in §4 order"
+        );
+        assert_eq!(
+            lowered.payouts.iter().map(|p| p.weight).collect::<Vec<_>>(),
+            control
+                .published()
+                .map(|e| e.wire_weight)
+                .collect::<Vec<_>>(),
+            "and carries the published wire weight untouched — §4 positions are \
+             what a JDC pays against"
+        );
+        // The weights alone are not the control. §4 pays *weight against script*,
+        // so a lowering that put the right weights beside the wrong scripts is
+        // the failure with money in it, and the assertion above cannot see it:
+        // building every `WeightedOutput` with `pool_script.clone()` sends the
+        // entire miners' cut to the pool address and keeps the weight list
+        // identical. Pairing them positionally is what closes that, and it also
+        // catches the two vectors drifting out of step, which is the specific
+        // hazard of building `payouts` and `dust_limits` in one loop.
+        assert_eq!(
+            lowered
+                .payouts
+                .iter()
+                .map(|p| p.script_pubkey.clone())
+                .collect::<Vec<_>>(),
+            control
+                .published()
+                .map(|e| {
+                    bp_mining_job::address_to_script(bitcoin::Network::Regtest, e.address.as_str())
+                        .expect("the fixture's members are real regtest addresses")
+                        .to_bytes()
+                })
+                .collect::<Vec<_>>(),
+            "each §4 weight must sit against ITS OWN member's script"
+        );
+        assert_eq!(
+            lowered.dust_limits,
+            control
+                .published()
+                .map(|e| e.dust_limit)
+                .collect::<Vec<_>>(),
+            "and the dust limits stay in step with the payouts they bound — the \
+             two vectors are filled in one loop, so nothing but position \
+             relates them"
+        );
+        assert_eq!(lowered.pool_payout.weight, control.weight_p);
+        assert_eq!(
+            lowered.pool_payout.script_pubkey,
+            bp_mining_job::address_to_script(
+                bitcoin::Network::Regtest,
+                control.fee_address.as_str()
+            )
+            .expect("the fixture's fee address is a real regtest address")
+            .to_bytes(),
+            "the pool's own output is the §4 residual's destination, so it is \
+             worth pinning that it is the fee address and not a member's"
+        );
+        assert_eq!(lowered.reference_reward_sats, TEST_T_REF);
+
+        // The same distribution with ONE member swapped to a rotating identity.
+        let identity = bp_payout_descriptor::RotatingPayout::from_xpub_str(XPUB)
+            .expect("a BIP-32 vector is a valid xpub")
+            .into_payout_identity();
+        let payout_id = identity.payout_id().to_string();
+        let derived = std::collections::HashSet::from([payout_id.clone()]);
+        let rotating = two_member_distribution(&payout_id, &derived);
+        assert!(
+            rotating
+                .published()
+                .any(|e| e.address.as_str() == payout_id),
+            "the refusal's precondition: the rotating key really is in the \
+             published set. Un-vouched it is dropped at the build's own filter, \
+             and then this test would assert `None` about a distribution that \
+             never contained a rotating miner"
+        );
+        assert_eq!(
+            rotating.published().count(),
+            2,
+            "and the static member is published beside it — so what is refused \
+             below is a distribution that would otherwise have paid somebody"
+        );
+
+        let directory = PayoutIdentityDirectory::new();
+        directory.publish_for_test(identity);
+        assert!(
+            directory.identity_for(&payout_id).rotates(),
+            "the directory must answer Rotating for this key, or the lowering is \
+             being asked a different question"
+        );
+
+        assert!(
+            lower_weight_distribution(
+                &rotating,
+                &directory,
+                bitcoin::Network::Regtest,
+                Some([7u8; 32]),
+                true,
+            )
+            .is_none(),
+            "a rotating member must take the whole published distribution with \
+             it — publishing the rest would pay this miner's share to the pool \
+             output as the §4 residual, and publishing a script derived here \
+             would pin every future block a JDC builds to that one address"
+        );
+
+        // What the assertion above pins is the *scope* of the refusal: turn the
+        // `Rotating` arm into a `continue` and the other member is published
+        // alone, which fails here. It does not pin the arm's existence —
+        // measured, not assumed: deleting the `return None` and falling through
+        // still answers `None`, because the ledger key handed to
+        // `address_to_script` is a hash. That is the second guard, and the
+        // function's own comment is about reaching the right answer for the right
+        // reason rather than by accident.
+        //
+        // Which makes this assertion the one that would notice the accident going
+        // away: a `payout_id` that ever parsed as an address would leave the
+        // `match` arm as the only thing refusing this distribution.
+        assert!(
+            bp_mining_job::address_to_script(bitcoin::Network::Regtest, &payout_id).is_err(),
+            "a payout_id must stay unparseable as an address — if that changes, \
+             the `None` above is no longer over-determined and the arm alone \
+             carries it"
+        );
     }
 }

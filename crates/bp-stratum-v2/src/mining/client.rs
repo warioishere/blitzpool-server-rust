@@ -46,10 +46,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bitcoin::Network;
-use bp_common::{AddressId, StreamKind};
+use bp_common::{parse_payout_identity_with, AddressId, PayoutIdentity, StreamKind};
 use bp_mining_job::{
-    address_to_script, merkle_root_from_coinbase, normalize_btc_address, MiningJob, MiningJobCache,
-    MiningJobError, PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
+    address_to_script, merkle_root_from_coinbase, MiningJob, MiningJobCache, MiningJobError,
+    PayoutEntry, TdpCoinbaseTemplate, EXTRANONCE_SLOT_LEN,
 };
 use bp_share::{
     clamp_difficulty_to_max_target, difficulty_to_target, hash_rate_to_difficulty, sha256d,
@@ -160,8 +160,9 @@ pub const ERR_PROTOCOL_VERSION_MISMATCH: &str = "protocol-version-mismatch";
 /// Used for `protocol = 2` (TDP-only) until that path is wired.
 pub const ERR_UNSUPPORTED_PROTOCOL: &str = "unsupported-protocol";
 
-/// `unknown-user` — the address parsed out of `user_identity` failed
-/// `bp_mining_job::normalize_btc_address` validation.
+/// `unknown-user` — the payout part of `user_identity` failed
+/// `bp_common::parse_payout_identity` or, for a literal address, did not parse
+/// on the configured network.
 pub const ERR_UNKNOWN_USER: &str = "unknown-user";
 
 /// `max-target-out-of-range` — miner's declared `max_target` is below
@@ -736,6 +737,21 @@ pub struct MiningSessionState<C: Clock> {
     /// bool test — no cache lookup, no lock, no behaviour change. See
     /// `crate::server::custom_extranonce_broadcast_frames`.
     pub uses_custom_extranonce: bool,
+    /// The pool's rotating-identity intake, or `None` when the deployment has
+    /// none wired. Set by the I/O layer after construction, exactly like
+    /// [`Self::share_logs`] above — this crate cannot build one, because it needs
+    /// `miniscript`.
+    ///
+    /// Read once, at channel open. `None` is not "the feature is off": the
+    /// operator flag lives inside the implementation, so with an intake
+    /// installed and the flag off an xpub is *refused with a reason* rather than
+    /// reported as an unknown user. `None` is the standalone-crate case.
+    ///
+    /// The SV1 field of the same name is the same field for the same reason, and
+    /// both read it through the one shared `parse_payout_identity_with`. Two
+    /// protocols asking one question once is the point — see
+    /// [`bp_common::RotatingIntake`].
+    pub rotating_intake: Option<Arc<dyn bp_common::RotatingIntake>>,
 }
 
 /// Per-port config slice passed at construction.
@@ -798,6 +814,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             last_difficulty_check_ms: 0,
             share_logs: false,
             uses_custom_extranonce: false,
+            rotating_intake: None,
         }
     }
 
@@ -1311,26 +1328,47 @@ fn resolve_open_context<C: Clock>(
         error_code: code.to_string(),
     };
 
-    // Parse `user_identity` → (address, worker). Format is
-    // `address.worker_name` (single dot split). Multiple dots: worker_name
-    // keeps the rest (split only on first dot).
-    let (address_part, worker_part) = match user_identity.find('.') {
-        Some(idx) => (&user_identity[..idx], &user_identity[idx + 1..]),
-        None => (user_identity, ""),
-    };
-    if address_part.is_empty() {
-        return Err(err(ERR_UNKNOWN_USER));
-    }
+    // Parse `user_identity` → (payout identity, worker). The split, the
+    // normalization, the shape check and the pool's rotating intake are one
+    // shared function (`bp_common::parse_payout_identity_with`) rather than this
+    // site's own steps — see its docs for the four places that each spelled the
+    // rule differently.
+    //
+    // A refused rotating identity lands in the same `ERR_UNKNOWN_USER` as a bad
+    // address, because that is the only error SV2 channel-open has to offer. The
+    // reason is logged inside the intake implementation, which is the only thing
+    // that knows it — `IdentityRefused` deliberately carries no detail.
+    let (identity, worker_part) =
+        parse_payout_identity_with(user_identity, state.rotating_intake.as_deref())
+            .map_err(|_| err(ERR_UNKNOWN_USER))?;
 
-    // `normalize_btc_address` is a whitespace/casing-only normalizer.
-    // We then call `address_to_script` to actually verify the address
-    // parses and matches the configured network.
-    let normalized = normalize_btc_address(address_part);
-    if normalized.is_empty() {
-        return Err(err(ERR_UNKNOWN_USER));
+    // Then the real check, which is stronger than the shape check and stays
+    // here: does the address actually parse, and on THIS network? The identity
+    // decides what is being validated.
+    //
+    // `match` and not `if`: a rotating identity has no single script to probe —
+    // its scripts are derived per height and there is no height at channel-open
+    // — so what it gets is a derivability probe, not an address parse.
+    match &identity {
+        PayoutIdentity::Static { address } => {
+            address_to_script(state.network, address).map_err(|_| err(ERR_UNKNOWN_USER))?;
+        }
+        // Refuse the channel now if this descriptor cannot produce a script,
+        // rather than at coinbase assembly for a block. `state.network` is not
+        // consulted and that is correct, not an omission: a derived
+        // `scriptPubKey` is network-agnostic, so there is no network to
+        // mismatch. (A miner who pastes a `tpub` at a mainnet pool is paid to a
+        // script derived from the same key material they hold, so it is
+        // spendable — the network prefix is a serialization detail of the xpub,
+        // not of the output.)
+        PayoutIdentity::Rotating { .. } => {
+            identity
+                .probe_payable()
+                .map_err(|_| err(ERR_UNKNOWN_USER))?;
+        }
     }
-    address_to_script(state.network, &normalized).map_err(|_| err(ERR_UNKNOWN_USER))?;
-    let address = AddressId::new(normalized).map_err(|_| err(ERR_UNKNOWN_USER))?;
+    let address =
+        AddressId::new(identity.payout_id().to_string()).map_err(|_| err(ERR_UNKNOWN_USER))?;
 
     // Multi-channel address-lock check: subsequent channels MUST resolve
     // to the same address as the first one ("address-locked").
@@ -1340,10 +1378,13 @@ fn resolve_open_context<C: Clock>(
         }
     }
 
-    let worker = if worker_part.is_empty() {
-        "default".to_string()
-    } else {
-        worker_part.to_string()
+    // SV2's own default, kept verbatim: no dot AND an empty worker after a dot
+    // both become `"default"` here. `parse_payout_identity` distinguishes the
+    // two (SV1 does not default them the same way) and this site collapses them,
+    // which is what it did before.
+    let worker = match worker_part {
+        Some(w) if !w.is_empty() => w.to_string(),
+        _ => "default".to_string(),
     };
 
     // Initial difficulty. A positive `nominal_hash_rate` is the miner
@@ -3418,7 +3459,7 @@ pub(crate) mod tests {
         }
     }
 
-    // Regtest bech32 address — passes bp_mining_job::normalize_btc_address.
+    // Regtest bech32 address — passes bp_common::normalize_btc_address.
     const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
     // ── SetupConnection ────────────────────────────────────────────
@@ -4914,10 +4955,10 @@ pub(crate) mod tests {
     use bp_mining_job::PayoutEntry;
 
     fn payouts() -> Vec<PayoutEntry> {
-        vec![PayoutEntry {
-            address: REGTEST_ADDR.to_string(),
-            sats: 5_000_000_000,
-        }]
+        vec![PayoutEntry::static_address(
+            REGTEST_ADDR.to_string(),
+            5_000_000_000,
+        )]
     }
 
     /// `MiningJobInputs` fixture for the SV2 apply_template_broadcast

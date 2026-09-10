@@ -50,8 +50,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bp_common::AddressId;
-use bp_mining_job::normalize_btc_address;
+use bp_common::{parse_payout_identity, AddressId};
 
 use crate::extensions::{RequestExtensions, SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS};
 use crate::protocol_version::{negotiate_version, MIN_PROTOCOL_VERSION};
@@ -169,7 +168,7 @@ pub struct SetupConnectionInput {
 pub struct AllocateMiningJobTokenInput {
     pub request_id: u32,
     /// JDC-supplied identifier. The handler tries
-    /// `normalize_btc_address` on it first; if that fails, the
+    /// [`parse_user_identifier_as_address`] on it first; if that fails, the
     /// caller's `fallback_miner_address` argument takes over.
     pub user_identifier: String,
 }
@@ -733,22 +732,24 @@ pub fn parse_user_identifier_as_address(user_identifier: &str) -> Option<Address
     if trimmed.is_empty() {
         return None;
     }
-    // Stratum `address.worker` convention (single-dot split; the worker
-    // name keeps any further dots). Strip the worker suffix so only the
-    // payout address is validated and carried downstream — otherwise the
-    // trailing `.worker` makes `address_to_script` reject the address at
-    // coinbase-output encode time, collapsing the pool payout to an empty
-    // output set (`coinbase_tx_outputs = 0x00`). Same split as the
-    // mining channel-open parse (`address.worker_name`, first dot).
-    let address_part = match trimmed.find('.') {
-        Some(idx) => &trimmed[..idx],
-        None => trimmed,
-    };
-    if address_part.is_empty() {
-        return None;
-    }
-    let normalised = normalize_btc_address(address_part);
-    AddressId::new(normalised).ok()
+    // Stratum `address.worker` convention (single-dot split; the worker name
+    // keeps any further dots) — now the shared
+    // `bp_common::parse_payout_identity`, which does the split, the
+    // normalization and the `AddressId` shape check in one place. Stripping the
+    // worker suffix is what makes the payout usable at all: the trailing
+    // `.worker` otherwise makes `address_to_script` reject the address at
+    // coinbase-output encode time, collapsing the pool payout to an empty output
+    // set (`coinbase_tx_outputs = 0x00`).
+    //
+    // The worker part is discarded here on purpose — JDP attributes to the JDC,
+    // not to a rig.
+    let (identity, _worker) = parse_payout_identity(trimmed).ok()?;
+    // This function's return type is the constraint: an `AddressId` is a
+    // height-invariant id, which is exactly `payout_id()`. What a base-protocol
+    // JDP allocate then DESIGNATES is a script, a different question, and
+    // `jdp_hooks` matches on the identity to answer it rather than deriving it
+    // from this string.
+    AddressId::new(identity.payout_id().to_string()).ok()
 }
 
 // ── Handler: DeclareMiningJob ───────────────────────────────────────

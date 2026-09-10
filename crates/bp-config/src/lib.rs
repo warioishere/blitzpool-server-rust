@@ -97,6 +97,40 @@ pub struct AppConfig {
     /// switches (frame dumps, per-share traces, Noise-handshake debug).
     #[serde(default)]
     pub debug: DebugConfig,
+
+    /// Optional `[payout_identity]` section — rotating (xpub) payout
+    /// identities. Absent ⇒ every field default ⇒ the feature is off, which is
+    /// the state every existing deployment is already in.
+    #[serde(default)]
+    pub payout_identity: PayoutIdentityConfig,
+}
+
+/// Rotating (xpub-derived) payout identities.
+///
+/// The pool wraps a miner's bare xpub in its own fixed descriptor
+/// (`bp_payout_descriptor::POOL_DESCRIPTOR_TEMPLATE`) and pays a script derived
+/// at each block's height. See that crate for the derivation path, the three
+/// intake assertions and the credential rule.
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PayoutIdentityConfig {
+    /// `true` ⇒ an xpub supplied on the wire is accepted and stored as a
+    /// rotating identity. `false` ⇒ intake refuses it and the miner is told to
+    /// supply an address.
+    ///
+    /// **Defaults to `false`, and the default is the feature.** A rotating
+    /// identity changes which script a block's coinbase pays, and this pool is
+    /// non-custodial — a wrong script is satoshis that cannot be recalled. So
+    /// the flag exists to make "off" the state an operator gets by doing
+    /// nothing, including after an upgrade that ships this code: regtest and
+    /// signet first, mainnet when the regtest gate has been run against a real
+    /// node.
+    ///
+    /// `#[serde(default)]` on a `bool` is `false`; the explicit `Default` derive
+    /// and `a_default_config_has_rotating_identities_off` pin it so a later
+    /// `#[serde(default = "...")]` cannot quietly flip it.
+    #[serde(default)]
+    pub allow_rotating: bool,
 }
 
 /// Protocol-level debug logging switches. Both default to `false`
@@ -145,6 +179,33 @@ pub enum Network {
     /// `bitcoin::Network::Testnet` byte set.
     Testnet4,
     Regtest,
+}
+
+impl Network {
+    /// Every variant, for tests that must visit all of them.
+    ///
+    /// **This list is not compiler-enforced, and the honest version of that is
+    /// worth writing down.** A four-element array keeps compiling when a fifth
+    /// variant appears above, and no `match` trick fixes it: forcing an arm
+    /// requires a value to match on, which requires the list. Short of a
+    /// derive, proximity is the only guard there is — so the list lives three
+    /// lines from the variants, where adding one without extending it is a
+    /// visible omission at the edit site.
+    ///
+    /// What *is* enforced lives at the consumer: `blitzpool`'s `network` module
+    /// states each variant's mapping in an exhaustive `match`, so a new variant
+    /// cannot compile there until someone writes down what it means. This array
+    /// only decides which of those mappings a test actually exercises. That
+    /// split is the lesson from the copy this replaced — `stratum_v1`'s was the
+    /// one mapping with a test, and the test pinned three of four variants,
+    /// leaving out `Testnet4`, the newest arm and the only one carrying a
+    /// judgement call.
+    pub const ALL: [Network; 4] = [
+        Network::Mainnet,
+        Network::Testnet,
+        Network::Testnet4,
+        Network::Regtest,
+    ];
 }
 
 /// Fine-grained deployment role. A process runs one or more roles; the set it
@@ -1567,6 +1628,12 @@ mod tests {
             cfg.sv2.jdp_orphan_submitblock,
             "pool-side block propagation must default to on"
         );
+        // A config that predates `[payout_identity]` — i.e. every config in
+        // production — leaves rotating identities off.
+        assert!(
+            !cfg.payout_identity.allow_rotating,
+            "a config that says nothing about payout identity must not rotate"
+        );
     }
 
     #[test]
@@ -1577,5 +1644,32 @@ mod tests {
         "#;
         let c: TdpConfig = toml::from_str(text).expect("parses");
         assert_eq!(c.staleness_threshold_secs, 45);
+    }
+
+    /// Rotating payout identities are OFF unless an operator says otherwise,
+    /// including for a config written before the section existed.
+    ///
+    /// The three cases are the three ways a deployment actually arrives here:
+    /// the struct default, an upgraded config that never heard of
+    /// `[payout_identity]`, and the section present but empty.
+    #[test]
+    fn a_default_config_has_rotating_identities_off() {
+        assert!(
+            !PayoutIdentityConfig::default().allow_rotating,
+            "a non-custodial payout change must not arrive by upgrade"
+        );
+
+        // Section absent entirely — every config in production today.
+        let absent: PayoutIdentityConfig = toml::from_str("").expect("an absent section parses");
+        assert!(!absent.allow_rotating);
+
+        // Present and explicitly enabled — the operator's opt-in works.
+        let on: PayoutIdentityConfig =
+            toml::from_str("allow_rotating = true").expect("the opt-in parses");
+        assert!(on.allow_rotating);
+
+        // A typo in the section fails loud rather than defaulting to off, which
+        // would read as "I enabled it and nothing happened".
+        assert!(toml::from_str::<PayoutIdentityConfig>("allow_rotate = true").is_err());
     }
 }

@@ -132,10 +132,7 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
     let payouts: Vec<PayoutEntry> = dist
         .payouts
         .iter()
-        .map(|p| PayoutEntry {
-            address: p.address.as_str().to_string(),
-            sats: p.sats.0 as u64,
-        })
+        .map(|p| PayoutEntry::static_address(p.address.as_str().to_string(), p.sats.0 as u64))
         .collect();
     let mined = mine_and_submit_payouts(
         &node,
@@ -233,12 +230,12 @@ async fn pending_party_admin_routes_block_to_pool_fee_accepted_by_core() {
 
     // ── Mine the fee-route coinbase and make core validate it ────
     let (node, tdp, template, prev_hash) = boot_node_and_template(regtest_cfg).await;
-    let payouts = vec![PayoutEntry {
-        address: route.fee_address.into_inner(),
+    let payouts = vec![PayoutEntry::static_address(
+        route.fee_address.into_inner(),
         // The guard sends the whole block, so pay the template's own value
         // rather than a hardcoded subsidy — anything else is `bad-cb-amount`.
-        sats: template.coinbase_tx_value_remaining,
-    }];
+        template.coinbase_tx_value_remaining,
+    )];
     let _ = mine_and_submit_payouts(
         &node,
         &tdp,

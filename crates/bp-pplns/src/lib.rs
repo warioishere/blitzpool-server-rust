@@ -17,11 +17,12 @@ mod weights;
 
 pub use distribution::{BudgetTelemetry, CoinbaseDistributionEntry};
 pub use weight::{
-    is_valid_payout_address, max_coinbase_outputs, output_weight_for_address,
-    resolve_min_payout_sats, validate_fee_payout_budget, FeePayoutBudgetError,
-    BUDGET_SAFETY_MARGIN_WU, COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT,
-    COINBASE_WITNESS_COMMITMENT_WEIGHT, DEFAULT_COINBASE_WEIGHT_BUDGET, DEFAULT_MIN_PAYOUT_SATS,
-    DUST_LIMIT_SATS, MAX_FINDER_BONUS_PPM, MIN_COINBASE_WEIGHT_BUDGET,
+    is_payable_payout_key, is_valid_payout_address, max_coinbase_outputs,
+    output_weight_for_address, output_weight_for_payout_key, resolve_min_payout_sats,
+    validate_fee_payout_budget, FeePayoutBudgetError, BUDGET_SAFETY_MARGIN_WU,
+    COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT, COINBASE_WITNESS_COMMITMENT_WEIGHT,
+    DEFAULT_COINBASE_WEIGHT_BUDGET, DEFAULT_MIN_PAYOUT_SATS, DUST_LIMIT_SATS, MAX_FINDER_BONUS_PPM,
+    MIN_COINBASE_WEIGHT_BUDGET, P2WPKH_OUTPUT_WEIGHT,
 };
 pub use weights::{
     build_weight_distribution, WeightBuildError, WeightDistribution, WeightDistributionInput,

@@ -10,31 +10,17 @@ use bp_db::PatchField;
 
 use crate::error::GroupServiceError;
 
-/// Normalise a Bitcoin address: trim whitespace, lowercase ONLY bech32 /
-/// bech32m (`bc1` / `tb1` / `bcrt1` / `sb1` prefixes — case-insensitive
-/// per BIP-173/350); legacy Base58 (P2PKH `1…` / `3…` / `m…` / `n…` /
-/// `2…`) is case-sensitive and is preserved verbatim. Then validate the
-/// shape via [`AddressId::new`].
+/// [`bp_common::normalized_address_id`] with the error mapped into this
+/// crate's type.
 ///
-/// Must agree byte-for-byte with the stratum-side normalizer
-/// (`bp_mining_job::normalize_btc_address`) — group lookups otherwise
-/// miss for miners whose address has mixed-case Base58.
+/// The rule itself is NOT here. It used to be — a hand copy of the stratum-side
+/// normalizer, carrying a doc comment that required byte-for-byte agreement
+/// with it and no check that enforced that. Both copies are now callers of the
+/// one implementation in `bp-common`, which every crate involved already
+/// depends on. The only thing left to say locally is which error a rejection
+/// becomes.
 pub(crate) fn normalize_address(raw: &str) -> Result<AddressId, GroupServiceError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(GroupServiceError::InvalidAddress);
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let normalized = if lower.starts_with("bc1")
-        || lower.starts_with("tb1")
-        || lower.starts_with("bcrt1")
-        || lower.starts_with("sb1")
-    {
-        lower
-    } else {
-        trimmed.to_string()
-    };
-    AddressId::new(normalized).map_err(|_| GroupServiceError::InvalidAddress)
+    bp_common::normalized_address_id(raw).map_err(|_| GroupServiceError::InvalidAddress)
 }
 
 /// Apply a closure to the `Set` variant of a [`PatchField`], leaving

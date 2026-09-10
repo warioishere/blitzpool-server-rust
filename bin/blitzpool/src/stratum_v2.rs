@@ -36,7 +36,6 @@
 
 use std::sync::{Arc, RwLock};
 
-use bitcoin::Network as BitcoinNetwork;
 use bp_common::{MiningMode, StreamKind};
 use bp_config::{AppConfig, Role};
 use bp_share::Difficulty;
@@ -66,6 +65,8 @@ use tracing::{info, warn};
 use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
 use crate::group_service::SharedGroupService;
+use crate::network::config_network_to_bitcoin;
+use crate::payout_identities::PayoutIdentityDirectory;
 use crate::stratum_v1::{
     self, BlockpartyAdminLookup, BlockpartyApiAdminLookup, GroupLookup,
     ModeGatePopulatingPersistence,
@@ -148,19 +149,6 @@ pub(crate) fn build_server_config(cfg: &AppConfig) -> Sv2ServerConfig {
     sc
 }
 
-pub(crate) fn config_network_to_bitcoin(n: bp_config::Network) -> BitcoinNetwork {
-    match n {
-        bp_config::Network::Mainnet => BitcoinNetwork::Bitcoin,
-        // testnet4 shares the `tb` HRP + address byte set with
-        // testnet3, so the bitcoin-crate's Testnet variant covers
-        // both for address parsing / script generation purposes.
-        // rust-bitcoin 0.32 doesn't have a dedicated Testnet4
-        // variant yet.
-        bp_config::Network::Testnet | bp_config::Network::Testnet4 => BitcoinNetwork::Testnet,
-        bp_config::Network::Regtest => BitcoinNetwork::Regtest,
-    }
-}
-
 /// Build one [`StratumV2MiningServer`] per SV1 port (so SV1 and SV2
 /// share the same TCP listener — the per-port unified accept-loop in
 /// [`crate::stratum`] dispatches based on the first byte). Returns an
@@ -177,6 +165,9 @@ pub(crate) fn build_per_port_servers(
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     payout_resolver: Arc<dyn PayoutResolver>,
     custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
+    // The pool's one rotating-identity intake — the same `Arc` SV1 gets, built
+    // in `crate::stratum`. See SV1's `build_per_port_servers`.
+    rotating_intake: Arc<dyn bp_common::RotatingIntake>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
     gate: Option<(
         Arc<crate::device_status_gate::Gate>,
@@ -249,10 +240,12 @@ pub(crate) fn build_per_port_servers(
         let hooks = build_port_hooks(
             sv1_port_config.payout_mode,
             payout_resolver.clone(),
+            rotating_intake.clone(),
             block_sink.clone(),
             engines,
             lookup.clone(),
             mode_gate.clone(),
+            engines.payout_identities.clone(),
             device_status_sink.clone(),
             Arc::clone(&live_sessions),
             custom_extranonce.clone(),
@@ -327,10 +320,12 @@ pub(crate) fn build_per_port_servers(
 fn build_port_hooks(
     port_payout_mode: MiningMode,
     payout_resolver: Arc<dyn PayoutResolver>,
+    rotating_intake: Arc<dyn bp_common::RotatingIntake>,
     block_sink: Arc<dyn Sv2BlockSink>,
     engines: &EngineHandles,
     group_lookup: Arc<dyn GroupLookup>,
     mode_gate: Arc<BlitzpoolModeGate>,
+    payout_identities: Arc<PayoutIdentityDirectory>,
     device_status_sink: Arc<dyn bp_stratum_v2::hooks::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
     custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
@@ -358,6 +353,7 @@ fn build_port_hooks(
         Arc::new(ModeGatePopulatingPersistence::new(
             port_payout_mode,
             mode_gate,
+            payout_identities,
             group_lookup,
             blockparty_lookup,
             live_sessions,
@@ -373,6 +369,7 @@ fn build_port_hooks(
         session_persistence: session,
         device_status_sink,
         custom_extranonce,
+        rotating_intake: Some(rotating_intake),
     }
 }
 
@@ -380,8 +377,8 @@ fn build_port_hooks(
 mod tests {
     use super::*;
     use bp_config::{
-        ApiConfig, BitcoinRpcConfig, DatabaseConfig, Network, PplnsConfig, RedisConfig,
-        StratumConfig, Sv2Config, TdpConfig as TomlTdpConfig,
+        ApiConfig, BitcoinRpcConfig, DatabaseConfig, Network, PayoutIdentityConfig, PplnsConfig,
+        RedisConfig, StratumConfig, Sv2Config, TdpConfig as TomlTdpConfig,
     };
     use std::path::PathBuf;
 
@@ -392,6 +389,9 @@ mod tests {
             pool_base_url: None,
             api_secure: false,
             roles: Vec::new(),
+            // Default: rotating identities off — these tests assert SV2's
+            // existing static-address behaviour.
+            payout_identity: PayoutIdentityConfig::default(),
             bitcoin_rpc: BitcoinRpcConfig {
                 url: "http://127.0.0.1".into(),
                 user: "u".into(),

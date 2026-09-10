@@ -1642,10 +1642,10 @@ mod tests {
     /// assert the `submit_block` path doesn't panic when the underlying
     /// handle is broken — the hook is best-effort, errors only log.
     fn synthetic_accept() -> Sv1ShareAccept {
-        let payouts = [PayoutEntry {
-            address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            sats: 5_000_000_000,
-        }];
+        let payouts = [PayoutEntry::static_address(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            5_000_000_000,
+        )];
         let cb = CoinbaseTemplate {
             block_height: 1,
             coinbase_value_sats: 5_000_000_000,

@@ -43,6 +43,7 @@ mod custom_extranonce;
 mod email;
 mod external;
 mod group;
+mod miner_identity;
 mod notification;
 mod pool;
 mod pool_stats;
@@ -142,6 +143,10 @@ pub use group::{
     update_pplns_group_round_reset_config, GroupPayoutHistoryInsert, PatchField,
     PplnsGroupBlockHistoryRow, PplnsGroupInvitationRow, PplnsGroupJoinRequestRow,
     PplnsGroupMemberRow, PplnsGroupRow, RoundResetConfigPatch,
+};
+pub use miner_identity::{
+    find_miner_identity, find_rotating_identities, upsert_rotating_identity,
+    upsert_static_identity, MinerIdentityRow, KIND_ROTATING, KIND_STATIC,
 };
 pub use notification::{
     delete_ntfy_subscription_by_address, delete_push_subscription_by_endpoint,

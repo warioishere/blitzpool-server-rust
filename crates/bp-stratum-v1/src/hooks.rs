@@ -194,8 +194,9 @@ pub trait DeviceStatusSink: Send + Sync {
 
 // ── ServerHooks ──────────────────────────────────────────────────────
 
-/// Composite of all six trait boundaries. Cheap to clone (each field is
-/// an `Arc`); the server task clones once per connection.
+/// Composite of all six trait boundaries plus the rotating-identity intake.
+/// Cheap to clone (each field is an `Arc`); the server task clones once per
+/// connection.
 #[derive(Clone)]
 pub struct ServerHooks {
     pub block_sink: Arc<dyn BlockSubmissionSink>,
@@ -204,6 +205,24 @@ pub struct ServerHooks {
     pub session_persistence: Arc<dyn SessionPersistence>,
     pub payout_resolver: Arc<dyn PayoutResolver>,
     pub device_status_sink: Arc<dyn DeviceStatusSink>,
+    /// The pool's rotating-identity intake, consulted once per
+    /// `mining.authorize`. `None` in every standalone / test wiring.
+    ///
+    /// It rides the hook composite for the same reason
+    /// [`PayoutResolver`] does: it is a capability this crate **needs but
+    /// cannot provide** — building one requires `miniscript` and the
+    /// operator's `[payout_identity]` config, neither of which belongs in a
+    /// protocol crate. The composite is already the place an injected
+    /// capability arrives; a second mechanism for the same job would be one
+    /// more thing to keep in step.
+    ///
+    /// The `Option` is "no intake wired", not "the feature is off" — the
+    /// operator flag lives inside the implementation, so with an intake
+    /// installed and the flag `false` an xpub is *refused with a reason*
+    /// rather than mistaken for a malformed address. See
+    /// [`crate::client::SessionState::rotating_intake`], which the IO layer
+    /// copies this onto.
+    pub rotating_intake: Option<Arc<dyn bp_common::RotatingIntake>>,
 }
 
 impl ServerHooks {
@@ -221,6 +240,12 @@ impl ServerHooks {
             session_persistence: n.clone(),
             payout_resolver: n.clone(),
             device_status_sink: n,
+            // No intake: every address on this wiring takes the static path,
+            // byte for byte as before. `NoOpHooks` deliberately does NOT get a
+            // `RotatingIntake` impl — a no-op one would have to answer
+            // "is this an xpub?", and a stub answering `Ok(None)` is a second
+            // opinion on that question.
+            rotating_intake: None,
         }
     }
 }
@@ -277,10 +302,10 @@ impl DeviceStatusSink for NoOpHooks {
 #[async_trait]
 impl PayoutResolver for NoOpHooks {
     async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
-        ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-            address: miner_address.to_string(),
-            sats: reward_sats,
-        }])
+        ResolvedPayouts::unsnapshotted(vec![PayoutEntry::static_address(
+            miner_address.to_string(),
+            reward_sats,
+        )])
     }
 }
 
@@ -327,6 +352,7 @@ pub(crate) mod test_support {
                 session_persistence: self.clone(),
                 payout_resolver: self.clone(),
                 device_status_sink: self.clone(),
+                rotating_intake: None,
             }
         }
     }
@@ -407,10 +433,10 @@ pub(crate) mod test_support {
     #[async_trait]
     impl PayoutResolver for RecordingHooks {
         async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
-            ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-                address: miner_address.to_string(),
-                sats: reward_sats,
-            }])
+            ResolvedPayouts::unsnapshotted(vec![PayoutEntry::static_address(
+                miner_address.to_string(),
+                reward_sats,
+            )])
         }
     }
 

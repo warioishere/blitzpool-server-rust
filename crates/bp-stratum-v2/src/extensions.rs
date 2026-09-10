@@ -33,6 +33,8 @@
 //! twice. Worker-ID has a 32-byte cap on `user_identity`
 //! (ext 0x0002/TLV Format for user_identity).
 
+use bp_common::split_identity_and_worker;
+
 // ── Spec constants ─────────────────────────────────────────────────
 
 /// Extension identifier for **Worker-Specific Hashrate Tracking** (0x0002).
@@ -490,17 +492,23 @@ pub fn resolve_share_worker_name_from_tlv(opts: &ResolveWorkerNameInput<'_>) -> 
         Some(s) => s,
         None => return opts.channel_worker.to_string(),
     };
-    match user_identity.find('.') {
-        None => {
-            if user_identity.is_empty() {
+    // The split is `bp_common::split_identity_and_worker` — the same one the
+    // three `user_identity`-reading protocol paths use. Only the split is
+    // shared: this site's payout part is compared, not paid, so it keeps its own
+    // full-string `to_lowercase()` (a case-insensitive match against the
+    // channel-locked address) rather than `normalize_btc_address`, which
+    // deliberately preserves Base58 case. Loosening the comparison would widen a
+    // security boundary; the one-line difference is the point.
+    match split_identity_and_worker(&user_identity) {
+        (bare, None) => {
+            if bare.is_empty() {
                 opts.channel_worker.to_string()
             } else {
-                user_identity
+                bare.to_string()
             }
         }
-        Some(dot) => {
-            let tlv_address = user_identity[..dot].to_lowercase();
-            let tlv_worker = &user_identity[dot + 1..];
+        (payout_part, Some(tlv_worker)) => {
+            let tlv_address = payout_part.to_lowercase();
             if let Some(channel_addr) = opts.channel_address {
                 if tlv_address != channel_addr.to_lowercase() {
                     // Cross-account attribution — silently drop.

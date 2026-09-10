@@ -11,6 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+bp-common = { workspace = true }
 bp-share = { workspace = true }
 tracing = { workspace = true }
 bitcoin = { workspace = true }
@@ -23,3 +24,11 @@ proptest = { workspace = true }
 tokio = { workspace = true }
 bp-regtest-harness = { workspace = true }
 bp-template-distribution = { workspace = true }
+# The rotating-payout regtest gate (`tests/regtest_rotating_payout.rs`) needs a
+# real rotating identity to build a coinbase from, and `bp-payout-descriptor` is
+# the only crate that can mint one. Dev-only: this crate must NOT take
+# `miniscript` into the built artifact — the trait-object split in `bp-common`
+# exists precisely so it does not have to.
+bp-payout-descriptor = { workspace = true }
+# `deriveaddresses` params for the independent cross-check against Core.
+serde_json = { workspace = true }

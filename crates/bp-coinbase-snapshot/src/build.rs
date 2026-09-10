@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use bp_common::{AddressId, Sats};
 use bp_pplns::{
-    build_weight_distribution, is_valid_payout_address, WeightBuildError, WeightDistribution,
+    build_weight_distribution, is_payable_payout_key, WeightBuildError, WeightDistribution,
     WeightDistributionInput, WithheldValue,
 };
 use redis::aio::ConnectionManager;
@@ -93,6 +93,21 @@ pub struct BuildRequest<'a> {
     pub bootstrap_claimant: Option<&'a AddressId>,
     /// Prefix for the log lines, e.g. `"pplns"` / `"group-solo"`.
     pub scope: &'static str,
+    /// Payout keys this build may pay by **deriving** a script, resolved by
+    /// the caller before the request was handed over
+    /// ([`crate::PayoutIdentityResolver::derived_payout_keys`]).
+    ///
+    /// Owned rather than borrowed because the caller resolves it *for* this
+    /// request and has nothing else to do with it, and because
+    /// [`sanitize_and_build`] must stay a pure function of the request —
+    /// a closure back into a live identity directory would make the same
+    /// request build differently depending on who happened to be connected.
+    ///
+    /// It gates the sanitize pass below as well as the weight model, and
+    /// those two must gate on the same set: a key dropped here and priced
+    /// there (or the reverse) is a distribution whose claims and outputs
+    /// disagree.
+    pub derived_payout_keys: std::collections::HashSet<String>,
 }
 
 /// A built distribution plus whether its snapshot actually landed.
@@ -154,19 +169,36 @@ pub async fn build_and_snapshot(
 pub fn sanitize_and_build(
     mut req: BuildRequest<'_>,
 ) -> Result<WeightDistribution, WeightBuildError> {
-    // Drop anything that isn't a parseable Bitcoin address before it
-    // reaches the coinbase builder. One unparseable row (junk, a
-    // migration artifact, seed-test data) would otherwise abort the
+    // Drop anything the coinbase cannot pay before it reaches the coinbase
+    // builder. One unpayable row (junk, a migration artifact, seed-test
+    // data, a ledger key nothing could resolve) would otherwise abort the
     // whole coinbase build in `bp-mining-job` — its `address_to_script`
     // fails the entire transaction — and block every miner's job.
     // Dropping the row is strictly safer: it is simply not paid this
     // block, and for PPLNS it stays in the ledger.
+    //
+    // "Cannot pay" is `is_payable_payout_key`, not `is_valid_payout_address`:
+    // a rotating miner's ledger key is a hash that no parser will accept, and
+    // deleting its row here does not leave its money alone. This retain runs
+    // ABOVE the score total every other claim is divided by, so a dropped row is
+    // not a withheld entry — it is not an entry at all, and the survivors divide
+    // by a smaller denominator. Under PPLNS that inflates their claims (the
+    // dropped miner keeps its ledger balance, so the pool then owes more than
+    // the block paid); under Group-Solo the other members are simply paid its
+    // share, and there is no ledger to reverse it with.
+    //
+    // `WithheldValue` has nothing to do with either case, and an earlier version
+    // of this comment said it did — measured in
+    // `bp_pplns::weights::tests::an_unvouched_group_solo_member_donates_its_half_to_the_other_member`,
+    // the pool takes exactly its fee on both sides of that drop. `ToPool`
+    // disposes of an entry that HAS a score weight and lost its output to
+    // `min_payout` or the blockspace cut, which is further down and unchanged.
     let shares_before = req.address_shares.len();
     let balances_before = req.balances.len();
     req.address_shares
-        .retain(|a, _| is_valid_payout_address(a.as_str()));
+        .retain(|a, _| is_payable_payout_key(a.as_str(), &req.derived_payout_keys));
     req.balances
-        .retain(|a, _| is_valid_payout_address(a.as_str()));
+        .retain(|a, _| is_payable_payout_key(a.as_str(), &req.derived_payout_keys));
     let shares_dropped = shares_before - req.address_shares.len();
     let balances_dropped = balances_before - req.balances.len();
     if shares_dropped + balances_dropped > 0 {
@@ -174,7 +206,7 @@ pub fn sanitize_and_build(
             scope = req.scope,
             shares_dropped,
             balances_dropped,
-            "distribution: dropped unparseable payout addresses before the coinbase build"
+            "distribution: dropped unpayable payout keys before the coinbase build"
         );
     }
 
@@ -194,6 +226,9 @@ pub fn sanitize_and_build(
             finder_address: req.finder_address,
             reference_revenue_sats: req.reference_revenue_sats,
             withheld_value: req.withheld_value,
+            // The same set the sanitize pass above gated on, by construction
+            // and not by convention.
+            derived_payout_keys: &req.derived_payout_keys,
         })
     };
 
@@ -312,6 +347,10 @@ mod bootstrap_tests {
             reference_revenue_sats: T,
             withheld_value: WithheldValue::ToOtherMiners,
             bootstrap_claimant: claimant,
+            // Every address in these tests is a literal one, so the derived set
+            // is empty — the pre-rotation behaviour, which is what these
+            // bootstrap assertions were written against.
+            derived_payout_keys: std::collections::HashSet::new(),
             scope: "test",
         }
     }

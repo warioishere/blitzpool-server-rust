@@ -61,7 +61,9 @@ use crate::ledger::{
 };
 use crate::sweep::{spawn_daily_task, DustSweepRunner, SweepError, SystemClock};
 use crate::window::{snapshot::StoredWeightSnapshot, NetworkDifficulty, WindowError, WindowStore};
-use bp_coinbase_snapshot::ActualCoinbase;
+use bp_coinbase_snapshot::{
+    ActualCoinbase, InstalledResolver, PaidAtHeight, PaidAtHeightError, PayoutIdentityResolver,
+};
 use bp_share::{block_subsidy_sats, claim_sats};
 
 /// Errors surfaced across the engine boundary.
@@ -108,6 +110,8 @@ pub enum EngineError {
     BlockFoundInProgress,
     #[error("invalid address in snapshot: {0}")]
     Address(#[from] InvalidAddressError),
+    #[error("payment attribution: {0}")]
+    PaymentAttribution(#[from] PaidAtHeightError),
 }
 
 impl EngineError {
@@ -139,6 +143,10 @@ impl EngineError {
             // owns that distinction so this engine and Group-Solo cannot
             // disagree about it.
             EngineError::Ledger(e) => e.is_terminal(),
+            // Same shape, same reason: the attribution errors own their own
+            // classification so PPLNS and Group-Solo cannot disagree about
+            // which of them is a verdict.
+            EngineError::PaymentAttribution(e) => e.is_terminal(),
             // Infrastructure, and the in-flight guard — all of these
             // clear on their own.
             EngineError::Redis(_)
@@ -166,6 +174,27 @@ struct Inner {
     config: PplnsEngineConfig,
     cancel_tx: watch::Sender<bool>,
     block_found_in_progress: AtomicBool,
+    /// Who is behind a ledger key — read twice per block, from the two ends of
+    /// the split, through **one** handle.
+    ///
+    /// The distribution builder above holds a clone of this same
+    /// [`InstalledResolver`] and asks it which keys are rotating before it filters
+    /// them into the coinbase; settlement asks it which address each key was paid
+    /// under ~100 blocks later. Sharing the handle rather than the rule is
+    /// load-bearing: a row paid by a resolver that knows it and then booked by one
+    /// that does not is the double credit
+    /// [`PaidAtHeightError::Unresolvable`] exists to refuse.
+    ///
+    /// Unset means [`bp_coinbase_snapshot::StaticPaidAddresses`] — correct for a pool with no rotating
+    /// identities, and a refusal for any key that is not a payable address, so
+    /// leaving it unset can never misbook a `payout_id`. `bin/blitzpool` installs
+    /// the descriptor-aware one at startup
+    /// ([`PplnsEngine::install_payout_identity_resolver`]).
+    ///
+    /// Installed rather than passed to the constructor because `Inner` lives
+    /// behind an `Arc` shared by every clone of the handle, and because the
+    /// resolver needs the identity directory, which is built after the engines.
+    identity_resolver: InstalledResolver,
 }
 
 impl PplnsEngine {
@@ -235,7 +264,11 @@ impl PplnsEngine {
         // it everywhere is one empty ZRANGEBYSCORE per boot.
         window.restamp_legacy_bucket_scores().await?;
         let dist_cfg = DistributionConfig::from_engine_config(&config);
-        let distribution_builder = DistributionBuilder::new(pool.clone(), window.clone(), dist_cfg);
+        // One handle, two readers — the builder's job-path filter and this
+        // engine's settlement. See `Inner::identity_resolver`.
+        let identity_resolver = InstalledResolver::default();
+        let distribution_builder = DistributionBuilder::new(pool.clone(), window.clone(), dist_cfg)
+            .with_identities(identity_resolver.clone());
         let touch_buffer = Arc::new(TouchBuffer::new());
         let clock = Arc::new(SystemClock);
         let sweep_runner = DustSweepRunner::new(pool.clone(), clock, config.abandoned_balance_days);
@@ -285,6 +318,7 @@ impl PplnsEngine {
                 config,
                 cancel_tx,
                 block_found_in_progress: AtomicBool::new(false),
+                identity_resolver,
             }),
         })
     }
@@ -408,6 +442,30 @@ impl PplnsEngine {
         .ok_or(EngineError::SnapshotMissingForPayouts)
     }
 
+    /// Install the descriptor-aware payout-identity resolver.
+    /// Idempotent-by-refusal: returns `false` if one was already installed, and
+    /// keeps the first.
+    ///
+    /// Only `bin/blitzpool` calls this, once, at startup — it is the only place
+    /// that has the identity directory and the Postgres pool together. Until it
+    /// does, settlement uses [`bp_coinbase_snapshot::StaticPaidAddresses`], which refuses any ledger key
+    /// that is not a payable address rather than settling one wrongly.
+    ///
+    /// This also reaches the **distribution builder**, which shares the handle:
+    /// installing here is what makes a rotating miner's row survive into the
+    /// coinbase in the first place. There is nothing to install twice.
+    pub fn install_payout_identity_resolver(
+        &self,
+        resolver: Arc<dyn PayoutIdentityResolver>,
+    ) -> bool {
+        self.inner.identity_resolver.install(resolver)
+    }
+
+    /// The installed resolver, or the static-only default.
+    fn identity_resolver(&self) -> Arc<dyn PayoutIdentityResolver> {
+        self.inner.identity_resolver.get()
+    }
+
     /// Apply a found block: settle `claim(T_actual) − paid` per address
     /// against the block's OWN coinbase, then write the payout history.
     ///
@@ -507,9 +565,24 @@ impl PplnsEngine {
         //    transaction: it only decides which addresses get a 0-sat
         //    late-arriver audit row, and a Redis stall must not hold a PG
         //    transaction open.
+        // Which address did the coinbase pay each ledger key? For a static
+        // miner the two are the same string and always were; for a rotating one
+        // the ledger key is a `payout_id` and the paid address is derived at
+        // THIS height. Resolved here, after the snapshot is in hand, because the
+        // fallback branch above is where the caller does not know the entries.
+        //
+        // A negative height is not a derivation index; `require_height` refuses
+        // it on the next line rather than letting it settle as height 0.
+        let derivation_height = u32::try_from(block_height).unwrap_or(0);
+        let paid_at = self
+            .identity_resolver()
+            .paid_at_height(&Self::ledger_keys(&snapshot), derivation_height)
+            .await?;
+        paid_at.require_height(block_height)?;
+
         let now_ms = chrono::Utc::now().timestamp_millis();
         let current_window = self.inner.window.read_window_by_address().await?;
-        let addresses = Self::addresses_to_settle(&snapshot, actual);
+        let addresses = Self::addresses_to_settle(&snapshot, actual, &paid_at);
 
         let mut tx = self.inner.pool.begin().await.map_err(LedgerError::from)?;
         let existing: HashMap<String, PplnsBalanceRow> =
@@ -518,8 +591,13 @@ impl PplnsEngine {
                 .into_iter()
                 .map(|r| (r.address.as_str().to_string(), r))
                 .collect();
-        let (audit_rows, balance_writes) =
-            Self::build_writes_from_weight_snapshot(&snapshot, &current_window, actual, &existing)?;
+        let (audit_rows, balance_writes) = Self::build_writes_from_weight_snapshot(
+            &snapshot,
+            &current_window,
+            actual,
+            &existing,
+            &paid_at,
+        )?;
         let outcome =
             apply_distribution(&mut tx, block_height, &audit_rows, &balance_writes, now_ms).await?;
         tx.commit().await.map_err(LedgerError::from)?;
@@ -550,17 +628,37 @@ impl PplnsEngine {
     fn addresses_to_settle(
         snapshot: &StoredWeightSnapshot,
         actual: &ActualCoinbase,
+        paid_at: &PaidAtHeight,
     ) -> Vec<String> {
         let mut set: std::collections::HashSet<String> =
             snapshot.entries.iter().map(|e| e.address.clone()).collect();
         // Paid addresses outside the snapshot are settled too (they can
         // only be 0-value script matches or operator surprises — logged
         // in the builder — but the lifetime totals must not miss them).
-        set.extend(actual.paid_by_address.keys().cloned());
+        //
+        // A paid address an entry CLAIMS is not one of those: a rotating
+        // miner's row lives under its `payout_id`, already in the set above, and
+        // locking the derived address as well would create a second ledger row
+        // for the same miner — a new one every block, since the address moves
+        // with the height. For a static entry the two strings are equal, so this
+        // filter drops nothing that the `HashSet` was not already deduplicating.
+        set.extend(
+            actual
+                .paid_by_address
+                .keys()
+                .filter(|addr| !paid_at.claims(addr))
+                .cloned(),
+        );
         set.remove(&snapshot.fee_address);
         let mut addresses: Vec<String> = set.into_iter().collect();
         addresses.sort();
         addresses
+    }
+
+    /// The ledger keys this snapshot settles, in entry order — what the
+    /// paid-address resolver is asked about.
+    fn ledger_keys(snapshot: &StoredWeightSnapshot) -> Vec<String> {
+        snapshot.entries.iter().map(|e| e.address.clone()).collect()
     }
 
     /// The weight-model settlement: per snapshot entry compute the
@@ -579,11 +677,19 @@ impl PplnsEngine {
     /// transaction. It used to do that read itself, from the pool and
     /// outside the writing transaction, which is precisely the window the
     /// dust sweep could commit into.
+    ///
+    /// `paid_at` is what makes "read what the coinbase actually paid the
+    /// address" work for a rotating identity: the ledger key is a `payout_id`,
+    /// which no coinbase output can ever render to, so the lookup goes through
+    /// the address that key was paid under at this height. Every other use of
+    /// the key — the balance row, the audit row, the `existing` lookup — stays on
+    /// the height-invariant key, which is the whole point of the split.
     fn build_writes_from_weight_snapshot(
         snapshot: &StoredWeightSnapshot,
         current_window: &HashMap<String, f64>,
         actual: &ActualCoinbase,
         existing: &HashMap<String, PplnsBalanceRow>,
+        paid_at: &PaidAtHeight,
     ) -> Result<(Vec<AuditRow>, Vec<BalanceWrite>), EngineError> {
         let t = actual.total_value_sats;
 
@@ -618,9 +724,18 @@ impl PplnsEngine {
                 t,
                 extras_total,
             );
+            // No fallback to `entry.address` here on purpose: a rotating key
+            // missing from the attribution would find nothing in
+            // `paid_by_address`, book `delta == claim`, and credit the miner its
+            // whole claim on top of the payment it already received.
+            let paid_address = paid_at.paid_address(&entry.address).ok_or_else(|| {
+                PaidAtHeightError::NotCoveringSnapshot {
+                    payout_id: entry.address.clone(),
+                }
+            })?;
             let paid = actual
                 .paid_by_address
-                .get(&entry.address)
+                .get(paid_address)
                 .copied()
                 .unwrap_or(0);
             let delta = claim - paid as i64;
@@ -668,7 +783,12 @@ impl PplnsEngine {
             if *paid == 0 || emitted.contains(addr_str) || *addr_str == snapshot.fee_address {
                 continue;
             }
-            if !snapshot.entries.iter().any(|e| &e.address == addr_str) {
+            // `claims` and not a scan of `snapshot.entries`: a rotating entry's
+            // key is a `payout_id` and can never equal the address the coinbase
+            // paid it, so the scan would call every rotating payout an outsider
+            // and mint a second, height-shaped row debiting the miner for its own
+            // payout. For a static entry the two questions have the same answer.
+            if !paid_at.claims(addr_str) {
                 warn!(
                     address = %addr_str,
                     paid,
@@ -794,5 +914,296 @@ mod tests {
         let e = EngineError::SnapshotMissing { block_height: 9001 };
         let s = format!("{e}");
         assert!(s.contains("9001"), "got: {s}");
+    }
+
+    // ── Rotating identities at settlement (plan Phase 4a) ──────────────
+    //
+    // These call the pure settlement function directly. The money question
+    // is decided entirely inside it, and the block-height/attribution pair
+    // it is handed is the only new input, so a DB-backed test would add a
+    // container dependency without adding evidence.
+
+    use bitcoin::{absolute::LockTime, transaction::Version, Address, Amount, Network, ScriptBuf};
+    use bp_coinbase_snapshot::PaidAtHeight;
+    use bp_payout_descriptor::RotatingPayout;
+
+    /// BIP-32 test-vector xpubs (published, no funds).
+    const XPUB_A: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+    const XPUB_B: &str = "xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB";
+    const NETWORK: Network = Network::Regtest;
+    const HEIGHT: i32 = 840_000;
+
+    /// A real regtest address, derived rather than invented — a `format!`-built
+    /// address is dropped by every parse in the payout path, which is how a
+    /// money test passes while paying nobody.
+    fn real_address(xpub: &str, index: u32) -> String {
+        RotatingPayout::from_xpub_str(xpub)
+            .expect("test vector xpub")
+            .address_at(NETWORK, index)
+            .expect("derives")
+            .to_string()
+    }
+
+    fn entry(address: &str, score_weight: u64) -> bp_coinbase_snapshot::WeightSnapshotEntry {
+        bp_coinbase_snapshot::WeightSnapshotEntry {
+            address: address.to_string(),
+            score_weight,
+            balance_sats: 0,
+            wire_weight: 1_000,
+            dust_limit: 546,
+        }
+    }
+
+    /// A coinbase paying `(script, sats)` after the pool output.
+    fn coinbase(pool: ScriptBuf, outputs: Vec<(ScriptBuf, u64)>) -> bitcoin::Transaction {
+        let mut output = vec![bitcoin::TxOut {
+            value: Amount::from_sat(0),
+            script_pubkey: pool,
+        }];
+        output.extend(
+            outputs
+                .into_iter()
+                .map(|(script_pubkey, sats)| bitcoin::TxOut {
+                    value: Amount::from_sat(sats),
+                    script_pubkey,
+                }),
+        );
+        bitcoin::Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output,
+        }
+    }
+
+    fn script_for(address: &str) -> ScriptBuf {
+        address
+            .parse::<Address<_>>()
+            .expect("a real address")
+            .assume_checked()
+            .script_pubkey()
+    }
+
+    /// **The Phase 4a money test.** A rotating miner is paid at the address its
+    /// descriptor derives for THIS block, and settles under its height-invariant
+    /// `payout_id` — one row, the right amount, and nothing minted under the
+    /// derived address.
+    ///
+    /// Without the attribution the same inputs produce two wrong rows in
+    /// opposite directions: a full-claim CREDIT under the `payout_id` (because
+    /// `paid_by_address` has no such key) and a DEBIT under a `bcrt1…` that
+    /// changes every block. Both are asserted absent.
+    #[test]
+    fn a_rotating_entry_settles_under_its_payout_id_and_mints_no_second_row() {
+        let payout = RotatingPayout::from_xpub_str(XPUB_A).expect("intake");
+        let payout_id = payout.payout_id().as_str().to_string();
+        let derived = payout
+            .address_at(NETWORK, HEIGHT as u32)
+            .expect("derives")
+            .to_string();
+        let static_miner = real_address(XPUB_B, 7);
+        let fee_address = real_address(XPUB_B, 8);
+
+        // Preconditions that pin the shape this test means to build. Without
+        // them the assertions below could all hold for a distribution that
+        // never paid anybody.
+        assert_ne!(payout_id, derived, "the ledger key is not the paid address");
+        assert!(
+            !payout_id.starts_with("bcrt1"),
+            "and cannot be mistaken for one"
+        );
+
+        let snapshot = StoredWeightSnapshot {
+            entries: vec![entry(&payout_id, 500_000), entry(&static_miner, 500_000)],
+            weight_p: 0,
+            fee_ppm: 0,
+            fee_address: fee_address.clone(),
+            reference_revenue_sats: 0,
+            score_total: 1_000_000,
+        };
+
+        // The block pays each miner half of a 100_000-sat coinbase: the
+        // rotating one at its derived address, the static one at its own.
+        let tx = coinbase(
+            script_for(&fee_address),
+            vec![
+                (script_for(&derived), 50_000),
+                (script_for(&static_miner), 50_000),
+            ],
+        );
+        let actual = ActualCoinbase::from_coinbase(&tx, NETWORK);
+        assert_eq!(
+            actual.paid_by_address.get(&derived).copied(),
+            Some(50_000),
+            "precondition: the coinbase really paid the derived address"
+        );
+        assert!(
+            !actual.paid_by_address.contains_key(&payout_id),
+            "precondition: and nothing is keyed on the payout_id"
+        );
+
+        let identities = [
+            payout.clone().into_payout_identity(),
+            bp_common::PayoutIdentity::static_address_verbatim(static_miner.clone()),
+        ];
+        let paid_at =
+            PaidAtHeight::resolve(identities.iter(), NETWORK, HEIGHT as u32).expect("resolve");
+
+        let (audit_rows, balance_writes) = PplnsEngine::build_writes_from_weight_snapshot(
+            &snapshot,
+            &HashMap::new(),
+            &actual,
+            &HashMap::new(),
+            &paid_at,
+        )
+        .expect("settles");
+
+        // Each miner claims half of 100_000 with no fee, and was paid exactly
+        // that: delta 0, booked as a Coinbase row for what it received.
+        let expected_claim = claim_sats(500_000, 1_000_000, 0, actual.total_value_sats, 0);
+        assert_eq!(
+            expected_claim, 50_000,
+            "precondition: the claim is the payment"
+        );
+
+        let rotating_row = audit_rows
+            .iter()
+            .find(|r| r.address.as_str() == payout_id)
+            .expect("a row under the payout_id");
+        assert_eq!(
+            rotating_row.paid_sats,
+            Sats(50_000),
+            "the rotating miner's payment must be attributed to its ledger key"
+        );
+        assert_eq!(rotating_row.row_type, PayoutRowType::Coinbase);
+        assert!(
+            !audit_rows.iter().any(|r| r.address.as_str() == derived),
+            "no row may be minted under the derived address: {:?}",
+            audit_rows
+                .iter()
+                .map(|r| r.address.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let rotating_write = balance_writes
+            .iter()
+            .find(|w| w.address.as_str() == payout_id)
+            .expect("a balance write under the payout_id");
+        assert_eq!(
+            rotating_write.balance_sats,
+            Sats(0),
+            "paid exactly its claim, so the balance does not move"
+        );
+        assert_eq!(rotating_write.total_paid_sats, Sats(50_000));
+        assert_eq!(balance_writes.len(), 2, "one row per miner, no extras");
+    }
+
+    /// The same distribution settled against a block that paid the address the
+    /// identity derives for a DIFFERENT height. The rotating miner was not paid
+    /// by this block, so it books its whole claim as credit — and the address
+    /// that WAS paid is an outsider.
+    ///
+    /// This is the control that shows the test above is measuring attribution
+    /// and not just "two entries produce two rows".
+    #[test]
+    fn a_payment_derived_for_another_height_is_not_this_blocks_payment() {
+        let payout = RotatingPayout::from_xpub_str(XPUB_A).expect("intake");
+        let payout_id = payout.payout_id().as_str().to_string();
+        let other_height = payout
+            .address_at(NETWORK, HEIGHT as u32 + 1)
+            .expect("derives")
+            .to_string();
+        let fee_address = real_address(XPUB_B, 8);
+
+        let snapshot = StoredWeightSnapshot {
+            entries: vec![entry(&payout_id, 1_000_000)],
+            weight_p: 0,
+            fee_ppm: 0,
+            fee_address: fee_address.clone(),
+            reference_revenue_sats: 0,
+            score_total: 1_000_000,
+        };
+        let tx = coinbase(
+            script_for(&fee_address),
+            vec![(script_for(&other_height), 100_000)],
+        );
+        let actual = ActualCoinbase::from_coinbase(&tx, NETWORK);
+
+        let identities = [payout.into_payout_identity()];
+        let paid_at =
+            PaidAtHeight::resolve(identities.iter(), NETWORK, HEIGHT as u32).expect("resolve");
+        let (audit_rows, _) = PplnsEngine::build_writes_from_weight_snapshot(
+            &snapshot,
+            &HashMap::new(),
+            &actual,
+            &HashMap::new(),
+            &paid_at,
+        )
+        .expect("settles");
+
+        let own = audit_rows
+            .iter()
+            .find(|r| r.address.as_str() == payout_id)
+            .expect("a row under the payout_id");
+        assert_eq!(
+            own.row_type,
+            PayoutRowType::Pending,
+            "unpaid by this block, so the claim is owed, not recorded as paid"
+        );
+        assert!(
+            audit_rows
+                .iter()
+                .any(|r| r.address.as_str() == other_height),
+            "and the address this block DID pay is booked as an outsider"
+        );
+    }
+
+    /// An entry the attribution does not cover is refused, not settled as
+    /// "paid nothing" — which would credit the miner its whole claim on top of
+    /// what the coinbase already paid it.
+    #[test]
+    fn an_unattributed_entry_refuses_the_block() {
+        let payout_id = RotatingPayout::from_xpub_str(XPUB_A)
+            .expect("intake")
+            .payout_id()
+            .as_str()
+            .to_string();
+        let fee_address = real_address(XPUB_B, 8);
+        let snapshot = StoredWeightSnapshot {
+            entries: vec![entry(&payout_id, 1_000_000)],
+            weight_p: 0,
+            fee_ppm: 0,
+            fee_address,
+            reference_revenue_sats: 0,
+            score_total: 1_000_000,
+        };
+        let actual = ActualCoinbase {
+            paid_by_address: HashMap::new(),
+            pool_paid_sats: 0,
+            total_value_sats: 100_000,
+        };
+
+        let err = PplnsEngine::build_writes_from_weight_snapshot(
+            &snapshot,
+            &HashMap::new(),
+            &actual,
+            &HashMap::new(),
+            // Empty: nothing resolved this entry.
+            &PaidAtHeight::static_only(HEIGHT as u32),
+        )
+        .expect_err("an unattributed entry must refuse the block");
+        assert!(
+            matches!(
+                err,
+                EngineError::PaymentAttribution(
+                    bp_coinbase_snapshot::PaidAtHeightError::NotCoveringSnapshot { .. }
+                )
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            err.is_terminal(),
+            "a map that misses its own snapshot is a bug"
+        );
     }
 }

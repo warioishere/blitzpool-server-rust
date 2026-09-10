@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bp_coinbase_snapshot::{
-    build_and_snapshot, share_map_from_redis_hash, BuildRequest, StoredWeightSnapshot,
+    build_and_snapshot, resolve_derived_keys, share_map_from_redis_hash, BuildRequest,
+    InstalledResolver, StoredWeightSnapshot,
 };
 use bp_common::{AddressId, Sats};
 use bp_db::{find_group, DbError};
@@ -121,6 +122,10 @@ pub struct DistributionBuilder {
     round: GroupRoundStore,
     config: DistributionConfig,
     cache: InflightResultCache<CacheKey, DistributionResult, DistributionError>,
+    /// Who is behind a ledger key — the **same** handle the engine settles
+    /// through. See `crate::engine::Inner::identity_resolver`; PPLNS shares its
+    /// handle with its builder for the same reason and through the same type.
+    identities: InstalledResolver,
 }
 
 impl DistributionBuilder {
@@ -139,7 +144,19 @@ impl DistributionBuilder {
             round,
             config,
             cache: InflightResultCache::new(cache_ttl),
+            identities: InstalledResolver::default(),
         }
+    }
+
+    /// Read identities through `identities` — the engine's handle, so an
+    /// `install` that happens after this builder was constructed is still seen.
+    ///
+    /// Chained rather than a constructor argument so no existing call site
+    /// changes: a builder that never gets one resolves nothing, which is the
+    /// static-only default and not a silent failure.
+    pub fn with_identities(mut self, identities: InstalledResolver) -> Self {
+        self.identities = identities;
+        self
     }
 
     /// Build the current Group-Solo distribution for a given
@@ -160,10 +177,19 @@ impl DistributionBuilder {
         let round = self.round.clone();
         let config = self.config.clone();
         let finder = finder_address.clone();
+        let identities = self.identities.clone();
         self.cache
             .get_or_compute(key, move || async move {
-                compute_distribution(&pool, &round, &config, group_id, block_reward_sats, &finder)
-                    .await
+                compute_distribution(
+                    &pool,
+                    &round,
+                    &config,
+                    group_id,
+                    block_reward_sats,
+                    &finder,
+                    &identities,
+                )
+                .await
             })
             .await
     }
@@ -192,6 +218,7 @@ async fn compute_distribution(
     group_id: Uuid,
     block_reward_sats: u64,
     finder_address: &AddressId,
+    identities: &InstalledResolver,
 ) -> Result<DistributionResult, DistributionError> {
     // 1. Per-group config: the finder bonus lives in the DB row, as a
     //    FRACTION of the miner cut (ppm) rather than a sats amount —
@@ -223,6 +250,20 @@ async fn compute_distribution(
         .fee_address
         .as_ref()
         .ok_or(DistributionError::NoFeeAddress)?;
+
+    // Who is behind these keys. The round's members **and the finder**: the
+    // finder is this mode's `bootstrap_claimant`, and `build.rs` inserts the
+    // claimant AFTER the payability retain and re-runs the build — so a rotating
+    // finder missing from this set is dropped by that retain, on an empty round,
+    // which is the one case where they are the only entry there is. An empty
+    // round is routine here, not exotic (every reset DELs the by-address hash).
+    let derived_payout_keys = resolve_derived_keys(
+        identities,
+        address_shares.keys().chain(std::iter::once(finder_address)),
+        "group-solo",
+    )
+    .await;
+
     let group_key = group_id.to_string();
     let mut conn_fp = round.connection_for_snapshot();
     let built = build_and_snapshot(
@@ -253,6 +294,7 @@ async fn compute_distribution(
             // overpaid, so nothing has to be remembered until the next
             // block — which is what lets this mode run without a ledger.
             withheld_value: WithheldValue::ToPool,
+            derived_payout_keys,
             scope: "group-solo",
         },
         &mut conn_fp,
@@ -327,6 +369,9 @@ mod tests {
             finder_address: Some(&finder),
             reference_revenue_sats: 312_500_000,
             withheld_value: WithheldValue::ToPool,
+            // A literal address: nothing derived, which is the pre-rotation shape
+            // this clone test was written against.
+            derived_payout_keys: &std::collections::HashSet::new(),
         })
         .unwrap();
         let r = DistributionResult {

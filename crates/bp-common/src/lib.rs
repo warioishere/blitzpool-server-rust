@@ -22,6 +22,12 @@ pub mod extranonce;
 pub use extranonce::{ExtranonceAllocator, ExtranonceError};
 
 pub mod live_client_key;
+pub mod payout_identity;
+pub use payout_identity::{
+    parse_payout_identity, parse_payout_identity_with, split_identity_and_worker,
+    IdentityParseError, IdentityRefused, PayoutIdentity, RotatingDescriptor, RotatingIntake,
+    RotatingScriptSource, RotationError,
+};
 
 #[cfg(feature = "sqlx")]
 mod sqlx_impls;
@@ -137,12 +143,12 @@ impl fmt::Display for Sats {
 // ---------------------------------------------------------------------------
 
 /// A miner's Bitcoin address as the pool uses it — round-trips between PG
-/// (`varchar(62)`), API JSON, and Stratum `authorize` frames as a string.
+/// (`varchar(90)`), API JSON, and Stratum `authorize` frames as a string.
 ///
-/// This type only enforces *shape*: non-empty, ASCII-graphic, ≤62 chars.
-/// Cryptographic validation (network check, witness version, bech32/base58
-/// checksum) belongs at the I/O boundary in `bp-share` (or wherever
-/// `bitcoin::Address::from_str` is called), not here.
+/// This type only enforces *shape*: non-empty, ASCII-graphic, at most
+/// [`MAX_ADDRESS_LEN`] chars. Cryptographic validation (network check, witness
+/// version, bech32/base58 checksum) belongs at the I/O boundary in `bp-share`
+/// (or wherever `bitcoin::Address::from_str` is called), not here.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AddressId(String);
@@ -165,11 +171,85 @@ impl AddressId {
     }
 }
 
+/// Normalize a BTC address for storage / equality comparison.
+///
+/// **The one implementation of this rule.** It lived in three places
+/// (`bp_mining_job::address`, and a hand copy in each of the group-mgmt and
+/// blockparty engines) because `bp-mining-job` is only a dev-dependency of the
+/// engines, so they could not import it. Two of the three carried a doc comment
+/// requiring byte-for-byte agreement with the first — an invariant nothing
+/// checked. The blockparty copy records what the last drift cost: an
+/// unconditional `to_ascii_lowercase` corrupted Base58 case, so a
+/// signature-verified legacy address never matched the case-preserved row the
+/// verify path wrote, and any Base58 coinbase output was built from a mangled
+/// address. It lives here because `bp-common` already owns [`AddressId`], every
+/// one of those crates already depends on it, and the rule is pure string
+/// manipulation — no `bitcoin` dependency needed.
+///
+/// Bech32 / bech32m (BIP-173 / BIP-350) are case-insensitive by spec — wallets
+/// may present them uppercase (QR-code optimization) but the canonical wire form
+/// is lowercase. Legacy P2PKH / P2SH (base58) IS case-sensitive — different
+/// cases are different addresses with different checksums — and is left
+/// untouched.
+///
+/// Whitespace is trimmed. Empty input maps to empty output; callers that need
+/// empty rejected get that from [`AddressId::new`], which returns
+/// [`InvalidAddressError::Empty`].
+pub fn normalize_btc_address(address: &str) -> String {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("bc1")
+        || lower.starts_with("tb1")
+        || lower.starts_with("bcrt1")
+        || lower.starts_with("sb1")
+    {
+        lower
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// [`normalize_btc_address`] followed by [`AddressId::new`] — normalize, then
+/// shape-validate.
+///
+/// The two-step composition the engines and the API layer all perform. Exposed
+/// so a caller cannot normalize and forget to validate, or validate a
+/// non-normalized string; the engines map the error into their own type.
+pub fn normalized_address_id(raw: &str) -> Result<AddressId, InvalidAddressError> {
+    AddressId::new(normalize_btc_address(raw))
+}
+
+/// The widest string an identity column holds, and the cap
+/// [`AddressId`] enforces — **90**, BIP-173's maximum length for a bech32
+/// string.
+///
+/// It was 62 until 2026-08-12, which was exactly a mainnet `bc1p…` taproot
+/// address with zero spare. A **regtest** taproot address (`bcrt1p…`) is 64, so
+/// the first attempt to pay one met `TooLong(64)` — a latent break with nothing
+/// to do with xpubs, fixed in its own commit with migration
+/// `0015_widen_identity_columns.sql`, which widens the 32 identity columns to
+/// match. The two numbers are one fact and must move together: this cap is what
+/// keeps an over-long value from reaching a column, and the column width is what
+/// makes the cap load-bearing rather than decorative.
+///
+/// 90 rather than 64 so the number does not have to move again. The widest
+/// address any witness version can produce is a 40-byte program on regtest —
+/// `bcrt` + `1` + 64 data + 6 checksum = 75 — and no base58 address exceeds 35.
+///
+/// This is a *shape* bound, not address validation, and it is still the guard
+/// that turns a pasted extended key (111 chars) or an output descriptor
+/// (~130) into [`InvalidAddressError::TooLong`] instead of a row in the
+/// database.
+pub const MAX_ADDRESS_LEN: usize = 90;
+
 fn validate_address_shape(s: &str) -> Result<(), InvalidAddressError> {
     if s.is_empty() {
         return Err(InvalidAddressError::Empty);
     }
-    if s.len() > 62 {
+    if s.len() > MAX_ADDRESS_LEN {
         return Err(InvalidAddressError::TooLong(s.len()));
     }
     for (i, c) in s.bytes().enumerate() {
@@ -465,6 +545,217 @@ pub use tracing;
 mod tests {
     use super::*;
 
+    // ---- normalize_btc_address ----
+
+    /// The shared vector table for the normalizer agreement test.
+    ///
+    /// Covers what the three pre-unification implementations disagreed about or
+    /// could have: mixed-case Base58 (the case a past unconditional lowercase
+    /// corrupted), uppercase bech32 across all four HRPs (`bc1`/`tb1`/`bcrt1`/
+    /// `sb1`), whitespace, and empty input.
+    fn normalizer_vectors() -> Vec<&'static str> {
+        vec![
+            // mixed-case Base58 — MUST be preserved verbatim
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+            "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn",
+            "2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc",
+            // uppercase bech32, all four HRPs — MUST be lowercased
+            "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
+            "TB1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KXPJZSX",
+            "BCRT1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KYGT080",
+            "SB1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
+            // already-lowercase bech32 — unchanged
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            // mixed-case bech32
+            "Bc1QW508d6qejxtdg4y5r3zarvary0c5XW7Kv8f3t4",
+            // taproot (mainnet 62 chars, regtest 64 — both inside MAX_ADDRESS_LEN)
+            "BC1PW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KW508D6QEJXTDG4Y5R3ZARVARY0C5XW7K0YLH7D",
+            // whitespace
+            "  bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4  ",
+            "  1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2  ",
+            "\t1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2\n",
+            // empty / whitespace-only
+            "",
+            "   ",
+            // prefix-adjacent strings that must NOT be treated as bech32
+            "bc2qsomething",
+            "BC2QSOMETHING",
+            "sb2qsomething",
+            "notanaddress",
+            "NOTANADDRESS",
+        ]
+    }
+
+    /// The rule as it stood at `crates/bp-mining-job/src/address.rs:18`
+    /// (`normalize_btc_address`), copied VERBATIM.
+    fn old_mining_job_impl(address: &str) -> String {
+        let trimmed = address.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("bc1")
+            || lower.starts_with("tb1")
+            || lower.starts_with("bcrt1")
+            || lower.starts_with("sb1")
+        {
+            lower
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    /// The rule as it stood in BOTH engine hand copies
+    /// (`bp-group-mgmt-engine/src/util.rs:22`,
+    /// `bp-blockparty-engine/src/util.rs:22`), copied VERBATIM. The two were
+    /// byte-identical apart from the error type they mapped into, so one copy
+    /// here represents both; `Err` stands for "rejected", which is what both
+    /// `InvalidAddress` variants meant.
+    fn old_engine_impl(raw: &str) -> Result<String, ()> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(());
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let normalized = if lower.starts_with("bc1")
+            || lower.starts_with("tb1")
+            || lower.starts_with("bcrt1")
+            || lower.starts_with("sb1")
+        {
+            lower
+        } else {
+            trimmed.to_string()
+        };
+        AddressId::new(normalized)
+            .map(|a| a.into_inner())
+            .map_err(|_| ())
+    }
+
+    /// **The Phase 0 gate.** The new single implementation must agree
+    /// byte-for-byte with all three it replaces, over the shared vector table.
+    ///
+    /// Run against the three old implementations while they still existed, so
+    /// the deletion that follows is evidenced rather than assumed. The old
+    /// bodies are inlined above rather than imported because two of the three
+    /// were `pub(crate)` in crates that (still) cannot depend on the third —
+    /// which is the whole reason the duplication existed.
+    #[test]
+    fn new_normalizer_agrees_byte_for_byte_with_all_three_it_replaced() {
+        for raw in normalizer_vectors() {
+            let new = normalize_btc_address(raw);
+
+            // 1. bp-mining-job's `normalize_btc_address` — same signature, so
+            //    the comparison is direct and total (empty in → empty out).
+            assert_eq!(
+                new,
+                old_mining_job_impl(raw),
+                "disagreed with the bp-mining-job normalizer on {raw:?}"
+            );
+
+            // 2/3. The engine copies additionally ran `AddressId::new`, so they
+            //      are compared through the same composition
+            //      (`normalized_address_id`). Both directions are asserted: an
+            //      input the old one rejected must still be rejected, and one it
+            //      accepted must normalize to the same bytes — otherwise this
+            //      test would pass on everything being rejected.
+            match old_engine_impl(raw) {
+                Ok(old) => {
+                    let got = normalized_address_id(raw)
+                        .unwrap_or_else(|e| panic!("{raw:?} was accepted before, now {e}"));
+                    assert_eq!(
+                        got.as_str(),
+                        old,
+                        "disagreed with the engine normalizer on {raw:?}"
+                    );
+                    // and it agrees with the bare string rule too
+                    assert_eq!(got.as_str(), new, "composition drifted from the rule");
+                }
+                Err(()) => assert!(
+                    normalized_address_id(raw).is_err(),
+                    "{raw:?} was rejected before but is accepted now"
+                ),
+            }
+        }
+    }
+
+    /// Negative control for the agreement test: the vector table must actually
+    /// contain inputs that distinguish the rule from the two ways of getting it
+    /// wrong. Without this, the test above would pass against an
+    /// unconditional-lowercase implementation (the money bug the blockparty
+    /// copy documents) or against a no-op one.
+    #[test]
+    fn the_vector_table_would_catch_both_historical_mistakes() {
+        let vectors = normalizer_vectors();
+
+        // A. unconditional lowercase — the Base58-corrupting bug.
+        assert!(
+            vectors.iter().any(|raw| {
+                let wrong = raw.trim().to_ascii_lowercase();
+                !raw.trim().is_empty() && wrong != normalize_btc_address(raw)
+            }),
+            "no vector distinguishes the rule from unconditional lowercase"
+        );
+
+        // B. no-op (never lowercase bech32).
+        assert!(
+            vectors.iter().any(|raw| {
+                let wrong = raw.trim().to_string();
+                !raw.trim().is_empty() && wrong != normalize_btc_address(raw)
+            }),
+            "no vector distinguishes the rule from a no-op"
+        );
+    }
+
+    #[test]
+    fn normalize_btc_address_lowercases_every_bech32_hrp() {
+        assert_eq!(
+            normalize_btc_address("BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4"),
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        );
+        assert_eq!(
+            normalize_btc_address("TB1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KXPJZSX"),
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
+        );
+        assert_eq!(
+            normalize_btc_address("BCRT1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KYGT080"),
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+        );
+        assert_eq!(normalize_btc_address("SB1QFOO"), "sb1qfoo");
+    }
+
+    #[test]
+    fn normalize_btc_address_preserves_base58_case() {
+        for a in [
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+        ] {
+            assert_eq!(normalize_btc_address(a), a);
+        }
+    }
+
+    #[test]
+    fn normalize_btc_address_trims_and_maps_empty_to_empty() {
+        assert_eq!(normalize_btc_address("  bc1qfoo  "), "bc1qfoo");
+        assert_eq!(normalize_btc_address(""), "");
+        assert_eq!(normalize_btc_address("   "), "");
+    }
+
+    #[test]
+    fn normalized_address_id_rejects_what_address_id_rejects() {
+        // empty → Empty, not an Ok("") — the engines relied on this rejection.
+        assert_eq!(
+            normalized_address_id("   "),
+            Err(InvalidAddressError::Empty)
+        );
+        // over MAX_ADDRESS_LEN → TooLong. A 111-char xpub lands here.
+        let xpub = "x".repeat(111);
+        assert_eq!(
+            normalized_address_id(&xpub),
+            Err(InvalidAddressError::TooLong(111))
+        );
+    }
+
     // ---- StreamKind ----
 
     #[test]
@@ -584,7 +875,7 @@ mod tests {
     fn address_accepts_real_examples() {
         // Bech32 P2WPKH
         AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
-        // Bech32m P2TR (62 chars)
+        // Bech32m P2TR (mainnet, 62 chars)
         AddressId::new("bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297").unwrap();
         // Legacy P2PKH
         AddressId::new("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2").unwrap();
@@ -611,11 +902,50 @@ mod tests {
 
     #[test]
     fn address_rejects_too_long() {
-        let too_long = "a".repeat(63);
+        let at_the_cap = "a".repeat(MAX_ADDRESS_LEN);
+        assert!(
+            AddressId::new(&at_the_cap).is_ok(),
+            "the cap is inclusive — off-by-one here would reject the widest \
+             address the columns hold"
+        );
+        let too_long = "a".repeat(MAX_ADDRESS_LEN + 1);
         assert_eq!(
             AddressId::new(&too_long),
-            Err(InvalidAddressError::TooLong(63))
+            Err(InvalidAddressError::TooLong(MAX_ADDRESS_LEN + 1))
         );
+    }
+
+    /// The cap and the columns are one fact, and this is where the number is
+    /// pinned to what a real address needs.
+    ///
+    /// It was 62 until 2026-08-12 — exactly a mainnet `bc1p…` — which made a
+    /// **regtest** taproot address (64) unpayable. See [`MAX_ADDRESS_LEN`] and
+    /// migration `0015_widen_identity_columns.sql`. Both assertions below fail
+    /// against the old cap: the first because 64 > 62, the second because the
+    /// arithmetic it states was false.
+    #[test]
+    fn the_cap_admits_every_address_bitcoin_can_spell() {
+        // A real bech32m P2TR on regtest — the address that moved the number.
+        let regtest_p2tr = "bcrt1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusgm2jyk";
+        assert_eq!(regtest_p2tr.len(), 64);
+        AddressId::new(regtest_p2tr).expect("a regtest taproot payout address must fit");
+
+        // The widest a bech32 address can be at all: the longest hrp the pool
+        // normalizes (`bcrt`) + separator + a 40-byte witness program (64 data
+        // chars, the BIP-141 maximum) + 6 checksum characters.
+        let widest_possible = "bcrt".len() + 1 + 64 + 6;
+        assert!(
+            widest_possible <= MAX_ADDRESS_LEN,
+            "{widest_possible} must fit in {MAX_ADDRESS_LEN}, or a future witness \
+             version rediscovers this migration"
+        );
+
+        // And it is still the guard that stops an extended key or a descriptor
+        // from being taken for an address: 111 and ~130 characters.
+        assert!(matches!(
+            AddressId::new("x".repeat(111)),
+            Err(InvalidAddressError::TooLong(111))
+        ));
     }
 
     #[test]
@@ -716,9 +1046,12 @@ mod tests {
         }
 
         #[test]
-        fn address_shape_round_trip(s in "[!-~]{1,62}") {
-            // Any 1..=62 ASCII-graphic string round-trips through the
-            // shape-only validator.
+        fn address_shape_round_trip(s in "[!-~]{1,90}") {
+            // Any 1..=MAX_ADDRESS_LEN ASCII-graphic string round-trips through
+            // the shape-only validator. The literal in the regex has to be the
+            // number itself — proptest's syntax takes no interpolation — so it
+            // is asserted against the constant below.
+            prop_assert_eq!(MAX_ADDRESS_LEN, 90, "the regex above says 90");
             let a = AddressId::new(s.clone()).unwrap();
             prop_assert_eq!(a.as_str(), s.as_str());
         }

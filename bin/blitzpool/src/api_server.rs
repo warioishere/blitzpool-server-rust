@@ -145,11 +145,7 @@ fn build_app_state(
         email_enabled: cfg.smtp.is_some(),
         push_hooks: production_hooks.push.clone(),
         start_time: chrono::Utc::now(),
-        network: match cfg.network {
-            bp_config::Network::Mainnet => bitcoin::Network::Bitcoin,
-            bp_config::Network::Testnet | bp_config::Network::Testnet4 => bitcoin::Network::Testnet,
-            bp_config::Network::Regtest => bitcoin::Network::Regtest,
-        },
+        network: crate::network::config_network_to_bitcoin(cfg.network),
         pool_identifier: cfg.pool_identifier.clone(),
         // Same values the payout resolver is built with, so the preview
         // and the real coinbase cannot disagree.

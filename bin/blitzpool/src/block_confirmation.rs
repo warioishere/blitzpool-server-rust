@@ -640,10 +640,7 @@ mod declared_block_booking_regtest {
                 .payout_entries_at(reward_sats)
                 .expect("§4 payout vector")
                 .iter()
-                .map(|(a, s)| PayoutEntry {
-                    address: a.as_str().to_string(),
-                    sats: *s,
-                })
+                .map(|(a, s)| PayoutEntry::static_address(a.as_str().to_string(), *s))
                 .collect();
 
             // Precondition against the trap in the repo's CLAUDE.md: an address
@@ -657,7 +654,7 @@ mod declared_block_booking_regtest {
             );
             for m in &miners {
                 assert!(
-                    intended.iter().any(|p| p.address == *m && p.sats > 0),
+                    intended.iter().any(|p| p.payout_id() == *m && p.sats > 0),
                     "miner {m} must hold a non-zero payout — otherwise this test \
                      books an empty distribution and asserts nothing"
                 );
@@ -716,21 +713,32 @@ mod declared_block_booking_regtest {
             })
         }
 
+        /// Move `SHIFT_SATS` from one payee to another, keeping every identity
+        /// and the total intact.
+        ///
+        /// Clones the entry and edits only `sats` rather than rebuilding it from
+        /// an address string: the identity is what decides the script, so
+        /// reconstructing it here would make this helper silently
+        /// static-ify a rotating payee and produce a coinbase that is not the
+        /// shifted version of the one under test.
         fn shift(from: &[PayoutEntry], minus: &str, plus: &str) -> Vec<PayoutEntry> {
             from.iter()
-                .map(|p| PayoutEntry {
-                    address: p.address.clone(),
-                    sats: if p.address == *minus {
+                .map(|p| {
+                    let sats = if p.payout_id() == minus {
                         assert!(
                             p.sats > SHIFT_SATS,
                             "the shift must not drive an output under the dust floor"
                         );
                         p.sats - SHIFT_SATS
-                    } else if p.address == *plus {
+                    } else if p.payout_id() == plus {
                         p.sats + SHIFT_SATS
                     } else {
                         p.sats
-                    },
+                    };
+                    PayoutEntry {
+                        identity: p.identity.clone(),
+                        sats,
+                    }
                 })
                 .collect()
         }
@@ -863,7 +871,7 @@ mod declared_block_booking_regtest {
         fn intended_of(&self, miner: &str) -> u64 {
             self.intended
                 .iter()
-                .find(|p| p.address == *miner)
+                .find(|p| p.payout_id() == miner)
                 .map(|p| p.sats)
                 .expect("miner in the distribution")
         }
@@ -1312,10 +1320,7 @@ mod declared_block_booking_regtest {
                 .payout_entries_at(reward_sats)
                 .expect("§4 payout vector")
                 .iter()
-                .map(|(a, s)| PayoutEntry {
-                    address: a.as_str().to_string(),
-                    sats: *s,
-                })
+                .map(|(a, s)| PayoutEntry::static_address(a.as_str().to_string(), *s))
                 .collect();
 
             // Same precondition as the PPLNS fixture, for the same reason: an
@@ -1327,7 +1332,7 @@ mod declared_block_booking_regtest {
             );
             for m in &members {
                 assert!(
-                    intended.iter().any(|p| p.address == *m && p.sats > 0),
+                    intended.iter().any(|p| p.payout_id() == *m && p.sats > 0),
                     "member {m} must hold a non-zero payout — otherwise this test \
                      books an empty distribution and asserts nothing"
                 );
@@ -1458,7 +1463,7 @@ mod declared_block_booking_regtest {
         fn intended_of(&self, member: &str) -> u64 {
             self.intended
                 .iter()
-                .find(|p| p.address == *member)
+                .find(|p| p.payout_id() == member)
                 .map(|p| p.sats)
                 .expect("member in the distribution")
         }

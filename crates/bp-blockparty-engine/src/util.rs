@@ -1,40 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Service-private helpers. Kept local rather than imported from
-//! `bp_group_mgmt_engine::util` so the address normalizer can return
-//! a typed `BlockpartyServiceError` directly without a `.map_err`
-//! roundtrip at every call site.
+//! Service-private helpers.
 
 use bp_common::AddressId;
 
 use crate::error::BlockpartyServiceError;
 
-/// Canonicalise a Bitcoin address and shape-validate: trim, lowercase ONLY
-/// bech32/bech32m (`bc1`/`tb1`/`bcrt1`/`sb1` — case-insensitive per BIP-173/350),
-/// and preserve case-sensitive legacy Base58 (`1…`/`3…`/…) verbatim.
+/// [`bp_common::normalized_address_id`] with the error mapped into this
+/// crate's type.
 ///
-/// Must agree byte-for-byte with `bp_mining_job::normalize_btc_address` and the
-/// group-solo normalizer (replicated here rather than imported — bp-mining-job is
-/// only a dev-dependency). The previous unconditional `to_ascii_lowercase`
-/// corrupted Base58 case, so a signature-/email-verified legacy address never
-/// matched the case-preserved row written by the verify path (and any Base58
-/// coinbase output was built from a mangled address).
+/// The rule itself is NOT here. It used to be — a hand copy, because
+/// `bp-mining-job` (where the rule lived) is only a dev-dependency of this
+/// crate, so it could not be imported. What that copy cost is on record in its
+/// own doc comment: an unconditional `to_ascii_lowercase` corrupted Base58 case,
+/// so a signature-/email-verified legacy address never matched the
+/// case-preserved row the verify path wrote, and any Base58 coinbase output was
+/// built from a mangled address. The rule now lives in `bp-common` — a real
+/// dependency of every crate that needs it — with a test that pinned all three
+/// old copies to it before they were deleted.
 pub(crate) fn normalize_address(raw: &str) -> Result<AddressId, BlockpartyServiceError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(BlockpartyServiceError::InvalidAddress);
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let normalized = if lower.starts_with("bc1")
-        || lower.starts_with("tb1")
-        || lower.starts_with("bcrt1")
-        || lower.starts_with("sb1")
-    {
-        lower
-    } else {
-        trimmed.to_string()
-    };
-    AddressId::new(normalized).map_err(|_| BlockpartyServiceError::InvalidAddress)
+    bp_common::normalized_address_id(raw).map_err(|_| BlockpartyServiceError::InvalidAddress)
 }
 
 #[cfg(test)]

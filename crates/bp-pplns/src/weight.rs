@@ -2,6 +2,7 @@
 
 //! Coinbase-output weight constants + per-address type detection.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use bitcoin::{Address, AddressType};
@@ -25,6 +26,16 @@ pub const COINBASE_BASE_WEIGHT: u32 = 328;
 /// P2TR / P2WSH upper-bound output weight — used as the worst-case
 /// fallback when an address's type cannot be detected.
 pub const COINBASE_OUTPUT_WEIGHT: u32 = 172;
+
+/// A P2WPKH output's weight: 8-byte value + 1-byte script length + a 22-byte
+/// `OP_0 <20-byte hash>` script, ×4.
+///
+/// Named because it is now load-bearing in two places rather than one: the
+/// address-type table below, and [`output_weight_for_payout_key`], which prices
+/// every payout the pool derives itself — `bp_payout_descriptor`'s template is
+/// `wpkh(...)`, and the ~39 % capacity difference against
+/// [`COINBASE_OUTPUT_WEIGHT`] is the reason it is (plan Decision 7).
+pub const P2WPKH_OUTPUT_WEIGHT: u32 = 124;
 
 /// Segwit-commitment OP_RETURN output weight (~38-byte script → ~47 bytes
 /// serialized → ~188 WU).
@@ -104,10 +115,78 @@ pub fn is_valid_payout_address(address: &str) -> bool {
     !address.is_empty() && Address::from_str(address).is_ok()
 }
 
+/// **Can this block's coinbase pay this payout key?** — the distribution
+/// build's filter, and the only form of that question it should be asked.
+///
+/// A payout key is either a literal address, which
+/// [`is_valid_payout_address`] recognises, or a key the pool pays by
+/// *deriving* a script for it, which nothing in this crate can recognise —
+/// a derived key is a hash, and no amount of parsing will make it look
+/// payable. Those keys arrive as `derived` on the build request, already
+/// resolved and already vouched for by the layer that owns identities
+/// (`bp_coinbase_snapshot::PayoutIdentityResolver::derived_payout_keys`).
+///
+/// This crate therefore learns nothing about xpubs or descriptors: it is
+/// handed a set of strings, and a key in that set means *"payable, and its
+/// output is a P2WPKH"* — see [`output_weight_for_payout_key`].
+///
+/// # Why the `||` and not just the set
+///
+/// Because the fallback direction matters. An empty set — a caller that
+/// forgot to fill it, a resolver that could not read its store — degrades to
+/// exactly the behaviour this pool had before rotating identities existed:
+/// literal addresses paid, everything else dropped. A set that had to be
+/// *total* would turn the same mistake into dropping **every** miner, which is
+/// not a smaller distribution but no distribution at all
+/// (`WeightBuildError::NoScoredMiners` — the retain runs above the score total,
+/// so an empty retain leaves nothing to divide) and therefore no job for any
+/// connection in the payout set.
+///
+/// Note what dropping a row does *not* do: it is not a `WithheldValue` case.
+/// The retain is above `score_total`, so the survivors divide by a smaller
+/// denominator and are paid the dropped miner's share, while the pool still
+/// takes exactly its fee — measured in
+/// `crate::weights::tests::an_unvouched_group_solo_member_donates_its_half_to_the_other_member`.
+/// Under PPLNS the dropped miner keeps its `pplns_balance`, so the pool then
+/// owes more than the block paid; under Group-Solo there is no ledger and the
+/// loss is permanent.
+pub fn is_payable_payout_key(key: &str, derived: &HashSet<String>) -> bool {
+    is_valid_payout_address(key) || derived.contains(key)
+}
+
+/// Per-output weight in WU for the given payout key, including the keys paid
+/// by derivation, which [`output_weight_for_address`] cannot recognise.
+///
+/// **This is the site of the ~39 % capacity loss** the plan (Decision 8 part
+/// 6) required to be fixed in the same commit as the filter: a derived key is
+/// a hash, so `output_weight_for_address` takes the unparseable fallback and
+/// charges [`COINBASE_OUTPUT_WEIGHT`] (172 WU, the P2TR/P2WSH upper bound) for
+/// an output that is `wpkh(...)` and costs exactly
+/// [`P2WPKH_OUTPUT_WEIGHT`]. Over-reserving is not a money bug — a trimmed
+/// PPLNS row keeps its balance — but it silently pays 39 % fewer miners per
+/// block than the budget allows, which is the whole reason the pool's
+/// descriptor template is P2WPKH (Decision 7) and not taproot.
+pub fn output_weight_for_payout_key(key: &str, derived: &HashSet<String>) -> u32 {
+    // Checked first, and deliberately: `output_weight_for_address` would answer
+    // 172 for one of these keys rather than fall through to here.
+    if derived.contains(key) {
+        // Every script `bp_payout_descriptor::POOL_DESCRIPTOR_TEMPLATE` derives
+        // is a P2WPKH. That is a pool-fixed constant, not a property of the
+        // miner's key, which is why this crate can price it without knowing
+        // anything about the identity behind the string.
+        return P2WPKH_OUTPUT_WEIGHT;
+    }
+    output_weight_for_address(key)
+}
+
 /// Per-output weight in WU for the given address.
 /// Falls back to `COINBASE_OUTPUT_WEIGHT` (P2TR upper bound) when the
 /// address is empty, unparseable, or of an unknown type — guarantees the
 /// trim never undercounts.
+///
+/// Callers on the distribution path want [`output_weight_for_payout_key`]:
+/// this one answers 172 for a derived payout key, because a hash is not a
+/// parseable address.
 pub fn output_weight_for_address(address: &str) -> u32 {
     if address.is_empty() {
         return 0;
@@ -119,7 +198,7 @@ pub fn output_weight_for_address(address: &str) -> u32 {
     // does not validate the network — it only flips the type-system marker
     // so we can read the script type without committing to a Network.
     match unchecked.assume_checked().address_type() {
-        Some(AddressType::P2wpkh) => 124,
+        Some(AddressType::P2wpkh) => P2WPKH_OUTPUT_WEIGHT,
         Some(AddressType::P2sh) => 128,
         Some(AddressType::P2pkh) => 136,
         Some(AddressType::P2wsh) => 172,

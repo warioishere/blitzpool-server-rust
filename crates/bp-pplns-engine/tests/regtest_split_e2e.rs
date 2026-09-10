@@ -219,10 +219,7 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
     // ── Build the coinbase + brute-force a regtest-target nonce ───
     let payouts: Vec<PayoutEntry> = entries
         .iter()
-        .map(|(a, s)| PayoutEntry {
-            address: a.as_str().to_string(),
-            sats: *s,
-        })
+        .map(|(a, s)| PayoutEntry::static_address(a.as_str().to_string(), *s))
         .collect();
     let accepted = mine_and_submit_payouts(
         &node,
@@ -270,12 +267,14 @@ async fn split_path_distribution_block_accepted_with_satellite_restart() {
 
 async fn cleanup_pplns_state(pool: &PgPool, payouts: &[PayoutEntry]) {
     for p in payouts {
+        // `payout_id()`: both columns are the ledger key, which is what that
+        // accessor is defined to return.
         let _ = sqlx::query("DELETE FROM pplns_payout_history WHERE address = $1")
-            .bind(&p.address)
+            .bind(p.payout_id())
             .execute(pool)
             .await;
         let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
-            .bind(&p.address)
+            .bind(p.payout_id())
             .execute(pool)
             .await;
     }

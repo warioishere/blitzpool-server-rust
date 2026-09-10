@@ -1357,10 +1357,10 @@ mod tests {
         use bitcoin::Network;
         use bp_mining_job::{build_mining_job, CoinbaseTemplate, PayoutEntry, EXTRANONCE_SLOT_LEN};
 
-        let payouts = [PayoutEntry {
-            address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            sats: 5_000_000_000,
-        }];
+        let payouts = [PayoutEntry::static_address(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            5_000_000_000,
+        )];
         let template = CoinbaseTemplate {
             block_height: 42,
             coinbase_value_sats: 5_000_000_000,
