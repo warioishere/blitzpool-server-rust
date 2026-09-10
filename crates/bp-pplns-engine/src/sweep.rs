@@ -15,8 +15,9 @@
 //!    absolute value desc).
 //! 3. Walk greedy: for each pair `amount = min(credit, |debit|)`.
 //!    Write 2 audit rows to `pplns_payout_history` (same `blockHeight`
-//!    so an operator can group them) + update-or-delete both balance
-//!    rows. All inside one PG transaction per pair — on failure, skip
+//!    so an operator can group them) + update both balance rows, down to
+//!    0 where a side cancels out. Rows are never deleted — see
+//!    `apply_pair_tx` for why. All inside one PG transaction per pair — on failure, skip
 //!    and let the next sweep retry.
 //! 4. Σ balances stays 0: each pair cancels `+X` ↔ `-X`. No silent
 //!    drift toward fee or other miners — the pool is non-custodial,
@@ -44,9 +45,8 @@ use std::time::Duration;
 use bp_common::{AddressId, Sats};
 use bp_cron_utils::BlockHeightGen;
 use bp_db::{
-    bulk_insert_pplns_payout_history, delete_pplns_balance_if_unchanged,
-    find_pplns_sweep_candidates, update_pplns_balance_sats_if_unchanged, DbError,
-    PayoutHistoryInsert, PplnsBalanceRow,
+    bulk_insert_pplns_payout_history, find_pplns_sweep_candidates,
+    update_pplns_balance_sats_if_unchanged, DbError, PayoutHistoryInsert, PplnsBalanceRow,
 };
 use chrono::DateTime;
 use chrono::Utc;
@@ -137,9 +137,25 @@ impl<C: Clock> DustSweepRunner<C> {
             .filter(|r| r.balance_sats.0 != 0)
             .partition(|r| r.balance_sats.0 > 0);
 
-        // credits desc by balance, debits asc by balance (most-negative first).
+        // Credits: largest first.
         credits.sort_by_key(|r| std::cmp::Reverse(r.balance_sats.0));
-        debits.sort_by_key(|r| r.balance_sats.0);
+        // Debits: ABANDONED ones first, then most-negative. Magnitude alone
+        // put a still-mining miner's large debit ahead of a genuinely
+        // abandoned smaller one, so the credit paired against the live row
+        // while the dead one stayed open forever — the opposite of what the
+        // sweep exists to close. Only reachable since debits of any age
+        // became candidates; before that every debit here was abandoned and
+        // the order could not matter.
+        //
+        // A live row is still touched when the dead ones cannot absorb the
+        // whole credit. That is correct: the debt is owed either way, and
+        // leaving the credit open would defeat the run.
+        let cutoff_ms = now_ms - (self.abandoned_days as i64) * 86_400_000;
+        let is_abandoned = |r: &PplnsBalanceRow| {
+            r.last_accepted_share_at
+                .is_some_and(|last| last < cutoff_ms)
+        };
+        debits.sort_by_key(|r| (!is_abandoned(r), r.balance_sats.0));
 
         if credits.is_empty() || debits.is_empty() {
             return Ok(SweepStats {
@@ -299,12 +315,25 @@ impl<C: Clock> DustSweepRunner<C> {
         ];
         sides.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         for (addr, expected, new_balance) in sides {
-            let applied = if new_balance.0 == 0 {
-                delete_pplns_balance_if_unchanged(&mut *tx, addr, expected).await?
-            } else {
+            // Always an UPDATE, including down to 0. A fully cancelled row
+            // used to be DELETEd, which was tidiness with a cost: the row is
+            // the only home of `totalPaidSats` (and `lastAcceptedShareAt`),
+            // so removing it wipes that address's lifetime on-chain payout —
+            // `find_pplns_balance` then reports 0, the pool-wide
+            // `SUM("totalPaidSats")` drops by the lost amount, and the next
+            // settlement's `prev_total_paid` restarts the counter from zero.
+            // Nothing restores it: the balance upsert writes only balance,
+            // total and timestamp.
+            //
+            // Harmless while the DELETE could only reach rows silent for
+            // `abandoned_balance_days`; routine once debits of any age became
+            // candidates. A zero row is inert everywhere that matters — the
+            // candidate query filters `balanceSats <> 0` and the distribution
+            // build skips a zero balance — so keeping it costs one row per
+            // address that ever settled.
+            let applied =
                 update_pplns_balance_sats_if_unchanged(&mut *tx, addr, expected, new_balance)
-                    .await?
-            };
+                    .await?;
             if !applied {
                 // Someone settled this row since the run started. Roll the
                 // pair back whole — including its two audit rows, which

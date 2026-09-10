@@ -107,33 +107,6 @@ where
     Ok(result.rows_affected() > 0)
 }
 
-/// Guarded DELETE — same contract as
-/// [`update_pplns_balance_sats_if_unchanged`], for the case where the
-/// swept balance lands on exactly 0 and the row goes away.
-pub async fn delete_pplns_balance_if_unchanged<'e, E>(
-    executor: E,
-    address: &AddressId,
-    expected: Sats,
-) -> Result<bool, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let result = sqlx::query!(
-        r#"DELETE FROM pplns_balance WHERE address = $1 AND "balanceSats" = $2"#,
-        address.as_str(),
-        expected.0,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected() > 0)
-}
-
-/// All `pplns_balance` rows with a non-zero `balanceSats` (open
-/// claim — credit or debit). Consumed by
-/// `bp-pplns-engine::distribution::DistributionBuilder` so it can
-/// factor open claims in either direction into the next block's
-/// distribution.
 pub async fn find_pplns_balances_with_open_balance(
     pool: &PgPool,
 ) -> Result<Vec<PplnsBalanceRow>, DbError> {
@@ -253,7 +226,17 @@ pub struct PplnsBalanceAggregate {
     pub debit_sats: i64,
     pub credit_row_count: i64,
     pub debit_row_count: i64,
+    /// Credit whose owner has been silent past the cutoff — what the next
+    /// sweep tries to close.
     pub abandoned_credit_sats: i64,
+    /// Debit whose owner has been silent past the cutoff.
+    ///
+    /// ⚠️ **Not** the sweep's counterparty pool — that is
+    /// [`Self::debit_sats`], every open debit regardless of age. Keeping the
+    /// cutoff on this side is deliberate: the figure answers "how much of the
+    /// debt is itself abandoned", which is worth seeing, but it must not be
+    /// read as "how much the sweep can pair". See
+    /// [`find_pplns_sweep_candidates`] for why the two differ.
     pub abandoned_debit_sats: i64,
     pub lifetime_paid_sats: i64,
 }

@@ -209,11 +209,20 @@ pub struct LedgerSummary {
     pub credit_row_count: u32,
     /// Number of rows with negative balance.
     pub debit_row_count: u32,
-    /// Σ of positive balances whose owner has been inactive longer
-    /// than `abandoned_balance_days` — the next dust sweep will
-    /// pair-cancel these against the matching abandoned debits.
+    /// Σ of positive balances whose owner has been inactive longer than
+    /// `abandoned_balance_days`. This is what the next dust sweep will try
+    /// to close, and its counterparty pool is [`Self::total_debit_sats`] —
+    /// **every** open debit, not the abandoned slice below.
     pub abandoned_credit_sats: i64,
     /// Σ of |negative balances| in the abandoned bucket.
+    ///
+    /// ⚠️ Informational only, and easy to misread: the sweep does **not**
+    /// pair against this figure. It once did, which is exactly why it never
+    /// fired — a credit's counterparty is by construction someone who was
+    /// mining when the credit was withheld, so demanding the same inactivity
+    /// from both sides excluded every plausible partner. What this number
+    /// says is how much of the outstanding debt belongs to miners who are
+    /// themselves gone; a 0 here does not mean the sweep will pair nothing.
     pub abandoned_debit_sats: i64,
     /// `abandoned_balance_days` configured for this engine — exposed
     /// so dashboards can render the cutoff age.

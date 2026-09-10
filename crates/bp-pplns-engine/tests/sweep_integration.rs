@@ -71,6 +71,39 @@ async fn seed_balance(
     .expect("seed balance");
 }
 
+/// `seed_balance` with a lifetime payout on the row. The plain helper pins
+/// `totalPaidSats` to 0, which is exactly the value that cannot show a row
+/// being destroyed — every assertion about it holds trivially at 0.
+async fn seed_balance_with_paid(
+    pool: &PgPool,
+    address: &str,
+    balance_sats: i64,
+    total_paid_sats: i64,
+    last_accepted_share_at_ms: Option<i64>,
+) {
+    sqlx::query(
+        r#"INSERT INTO pplns_balance (address, "balanceSats", "totalPaidSats",
+                                      "updatedAt", "lastAcceptedShareAt")
+           VALUES ($1, $2, $3, 0, $4)"#,
+    )
+    .bind(address)
+    .bind(balance_sats)
+    .bind(total_paid_sats)
+    .bind(last_accepted_share_at_ms)
+    .execute(pool)
+    .await
+    .expect("seed balance with paid");
+}
+
+async fn total_paid_of(pool: &PgPool, address: &str) -> Option<i64> {
+    sqlx::query_as::<_, (i64,)>(r#"SELECT "totalPaidSats" FROM pplns_balance WHERE address = $1"#)
+        .bind(address)
+        .fetch_optional(pool)
+        .await
+        .expect("total paid read")
+        .map(|r| r.0)
+}
+
 async fn cleanup(pool: &PgPool, prefix: &str) {
     let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE address LIKE $1"#)
         .bind(format!("{prefix}%"))
@@ -107,7 +140,7 @@ fn clock_at(year: i32, month: u32, day: u32) -> Arc<TestClock> {
 // ── Test 1 — exact pair cancellation deletes both rows ─────────────
 
 #[tokio::test]
-async fn sweep_exact_pair_deletes_both_balance_rows() {
+async fn sweep_exact_pair_zeroes_both_balance_rows() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
     let pool = match connect_or_skip().await {
         Some(p) => p,
@@ -132,14 +165,18 @@ async fn sweep_exact_pair_deletes_both_balance_rows() {
     assert_eq!(stats.pairs_closed, 2);
     assert_eq!(stats.sats_paired, 5_000);
 
-    // Both balance rows deleted.
+    // Both balance rows survive at 0. They used to be DELETEd here; the row
+    // carries `totalPaidSats`, so removing it destroys the address's lifetime
+    // payout — see `apply_pair_tx`.
     let count: (i64,) =
         sqlx::query_as(r#"SELECT count(*) FROM pplns_balance WHERE address LIKE $1"#)
             .bind(format!("{prefix}%"))
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(count.0, 0);
+    assert_eq!(count.0, 2, "a cancelled row is zeroed, not removed");
+    assert_eq!(balance_of(&pool, &format!("{prefix}credit")).await, Some(0));
+    assert_eq!(balance_of(&pool, &format!("{prefix}debit")).await, Some(0));
 
     // 2 audit rows written with rowType='dust-sweep' and matching blockHeight.
     let audit: Vec<(String, i64, String, i32)> = sqlx::query_as(
@@ -197,9 +234,17 @@ async fn sweep_unequal_amounts_keeps_remainder_side() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(rows.len(), 1);
+    // Both rows are here: the debit cancelled out and is zeroed rather than
+    // removed, so its `totalPaidSats` survives. The subject of this test is
+    // the remainder on the credit side, and that is unchanged.
+    assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].0, format!("{prefix}credit"));
     assert_eq!(rows[0].1, 5_000, "credit reduced by paired amount");
+    assert_eq!(rows[1].0, format!("{prefix}debit"));
+    assert_eq!(
+        rows[1].1, 0,
+        "the fully paired debit is zeroed, not deleted"
+    );
 
     cleanup(&pool, prefix).await;
 }
@@ -297,15 +342,10 @@ async fn an_abandoned_credit_pairs_against_an_active_debit() {
     assert_eq!(stats.unpaired_credits, 0);
     assert_eq!(stats.unpaired_debits, 0);
 
-    // Exact pair → both rows gone, and the active miner keeps the sats
-    // it was already paid: its debt is forgiven, not collected.
-    let count: (i64,) =
-        sqlx::query_as(r#"SELECT count(*) FROM pplns_balance WHERE address LIKE $1"#)
-            .bind(format!("{prefix}%"))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(count.0, 0, "an exact pair deletes both balance rows");
+    // The active miner keeps the sats it was already paid: its debt is
+    // forgiven, not collected. Both rows stay, at 0.
+    assert_eq!(balance_of(&pool, &format!("{prefix}credit")).await, Some(0));
+    assert_eq!(balance_of(&pool, &format!("{prefix}active")).await, Some(0));
 
     cleanup(&pool, prefix).await;
 }
@@ -618,4 +658,156 @@ async fn balance_of(pool: &PgPool, address: &str) -> Option<i64> {
         .await
         .expect("balance read")
         .map(|r| r.0)
+}
+
+/// The safeguard behind not deleting a fully-cancelled row: `pplns_balance`
+/// is the only home of `totalPaidSats`, an address's lifetime on-chain
+/// payout. A DELETE takes it with the row and nothing puts it back — the
+/// reader then answers 0, the pool-wide `SUM("totalPaidSats")` drops by that
+/// amount, and the next settlement's `prev_total_paid` restarts the counter.
+///
+/// This only became routine when debits of any age turned into sweep
+/// candidates: before that the DELETE could reach nothing but rows already
+/// silent for `abandoned_balance_days`.
+///
+/// Fails against the delete-on-zero code: both rows are gone, so both
+/// lookups answer `None` instead of the seeded totals.
+#[tokio::test]
+async fn a_cancelled_pair_keeps_each_sides_lifetime_payout() {
+    let _guard = SWEEP_TEST_LOCK.lock().await;
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    wipe_all_test_state(&pool).await;
+    let prefix = "test_sweep_lifetime_";
+    cleanup(&pool, prefix).await;
+
+    let stale_ts = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    let active_ts = Utc
+        .with_ymd_and_hms(2026, 5, 15, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+
+    // The abandoned credit, and an ACTIVE miner holding the matching debit —
+    // the pairing this PR made possible, and the row that must not be lost.
+    seed_balance_with_paid(
+        &pool,
+        &format!("{prefix}credit"),
+        5_000,
+        111_000,
+        Some(stale_ts),
+    )
+    .await;
+    seed_balance_with_paid(
+        &pool,
+        &format!("{prefix}active"),
+        -5_000,
+        2_000_000,
+        Some(active_ts),
+    )
+    .await;
+
+    let clock = clock_at(2026, 5, 16);
+    let runner = DustSweepRunner::new(pool.clone(), clock, 90);
+    let stats = runner.sweep().await.expect("sweep ok");
+    assert_eq!(stats.pairs_closed, 2, "precondition: the pair must close");
+
+    assert_eq!(
+        total_paid_of(&pool, &format!("{prefix}active")).await,
+        Some(2_000_000),
+        "the active miner's lifetime payout must survive its debt being cancelled"
+    );
+    assert_eq!(
+        total_paid_of(&pool, &format!("{prefix}credit")).await,
+        Some(111_000),
+        "and so must the abandoned side's"
+    );
+
+    // The pool-wide lifetime figure is a SUM over exactly these rows.
+    let lifetime: (i64,) = sqlx::query_as(
+        r#"SELECT COALESCE(SUM("totalPaidSats"), 0)::bigint FROM pplns_balance
+           WHERE address LIKE $1"#,
+    )
+    .bind(format!("{prefix}%"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        lifetime.0, 2_111_000,
+        "pool-wide lifetime payout must not drop"
+    );
+
+    cleanup(&pool, prefix).await;
+}
+
+/// Dead debits are settled before live ones.
+///
+/// Sorting debits by magnitude alone put a still-mining miner's larger debt
+/// ahead of a genuinely abandoned smaller one, so the credit paired against
+/// the live row and the dead one stayed open — forever, since nothing else
+/// ever comes to claim it. Only reachable since debits of any age became
+/// candidates.
+///
+/// Fails against magnitude-only ordering: the abandoned debit is left at
+/// -4000 while the active one absorbs the whole credit.
+#[tokio::test]
+async fn an_abandoned_debit_is_settled_before_an_active_one() {
+    let _guard = SWEEP_TEST_LOCK.lock().await;
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    wipe_all_test_state(&pool).await;
+    let prefix = "test_sweep_order_";
+    cleanup(&pool, prefix).await;
+
+    let stale_ts = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    let active_ts = Utc
+        .with_ymd_and_hms(2026, 5, 15, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+
+    // The active debit is the LARGER one, so magnitude alone would take it
+    // first. That is the whole fixture.
+    seed_balance(&pool, &format!("{prefix}credit"), 5_000, Some(stale_ts)).await;
+    seed_balance(&pool, &format!("{prefix}deaddebit"), -4_000, Some(stale_ts)).await;
+    seed_balance(
+        &pool,
+        &format!("{prefix}livedebit"),
+        -9_000,
+        Some(active_ts),
+    )
+    .await;
+
+    let clock = clock_at(2026, 5, 16);
+    let runner = DustSweepRunner::new(pool.clone(), clock, 90);
+    let stats = runner.sweep().await.expect("sweep ok");
+    assert_eq!(stats.sats_paired, 5_000, "the whole credit is absorbed");
+
+    assert_eq!(
+        balance_of(&pool, &format!("{prefix}deaddebit")).await,
+        Some(0),
+        "the abandoned debit must be settled first and in full"
+    );
+    // The remaining 1000 has nowhere else to go, so the live row takes it —
+    // correct, the debt is owed either way.
+    assert_eq!(
+        balance_of(&pool, &format!("{prefix}livedebit")).await,
+        Some(-8_000),
+        "the live row absorbs only what the dead one could not"
+    );
+    assert_eq!(
+        balance_of(&pool, &format!("{prefix}credit")).await,
+        Some(0),
+        "and the credit is fully closed"
+    );
+
+    cleanup(&pool, prefix).await;
 }

@@ -49,7 +49,7 @@ pub const KEY_WINDOW_REBUILD: &str = "pplns:window:by-address:rebuild";
 /// **Score = epoch-ms of the bucket's most recent share**, not the id it
 /// used to be. Only the newest bucket ever receives shares, so a full
 /// bucket's score freezes at the moment it stopped filling — which is
-/// exactly the age [`TRIM_BATCH_LUA`] measures. FIFO order is unchanged by
+/// exactly the age the trim measures. FIFO order is unchanged by
 /// the switch: bucket ids and wall-clock both only ever increase, so the
 /// same member comes back as "oldest" either way.
 ///
