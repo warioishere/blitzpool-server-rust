@@ -171,8 +171,7 @@ pub use pool_stats::{
 };
 pub use pplns::{
     aggregate_pplns_balances, bulk_insert_pplns_payout_history,
-    bulk_update_pplns_last_accepted_share_at, bulk_upsert_pplns_balances,
-    delete_pplns_balance_if_unchanged, find_pplns_balance, find_pplns_balances_abandoned,
+    bulk_update_pplns_last_accepted_share_at, bulk_upsert_pplns_balances, find_pplns_balance,
     find_pplns_balances_for_addresses, find_pplns_balances_for_addresses_locked,
     find_pplns_balances_with_open_balance, find_pplns_payout_history,
     pplns_booked_value_rows_at_height, update_pplns_balance_sats_if_unchanged, BalanceUpsert,

@@ -197,6 +197,18 @@ async fn drop_harness(h: EngineHarness) {
 
 // ── Test 1 — record_share appears in window_stats ──────────────────
 
+/// Share timestamp anchored near now.
+///
+/// `record_share` used to ignore this argument, so these tests passed a
+/// hardcoded `ts(0)` (Nov 2023). It is now the bucket's index
+/// score, and the window ages buckets out past `abandoned_balance_days` — so
+/// the constant would mean "every bucket is three years old" and the trim
+/// would empty the window mid-test. The offset keeps the relative order these
+/// tests rely on.
+fn ts(offset: u64) -> u64 {
+    (bp_common::now_ms() as u64) - 1_000_000 + offset
+}
+
 #[tokio::test]
 async fn record_share_then_reader_sees_window_state() {
     let h = match spawn_or_skip(14, "test_engine_record_").await {
@@ -206,7 +218,7 @@ async fn record_share_then_reader_sees_window_state() {
 
     let addr = format!("{}foo", h.prefix);
     h.engine
-        .record_share(None, &addr, 100.0, 1_700_000_000_000)
+        .record_share(None, &addr, 100.0, ts(0))
         .await
         .expect("record_share ok");
 
@@ -229,11 +241,11 @@ async fn build_distribution_returns_payouts_after_shares() {
     const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
     h.engine
-        .record_share(None, ADDR_A, 60.0, 1_700_000_000_001)
+        .record_share(None, ADDR_A, 60.0, ts(1))
         .await
         .unwrap();
     h.engine
-        .record_share(None, ADDR_B, 40.0, 1_700_000_000_002)
+        .record_share(None, ADDR_B, 40.0, ts(2))
         .await
         .unwrap();
 
@@ -267,7 +279,7 @@ async fn on_block_found_applies_distribution_from_snapshot() {
     // names.
     const ADDR: &str = "bc1qvzf0p407umrsaxmsnq62yudwf27lmsxd8sshzl";
     h.engine
-        .record_share(None, ADDR, 100.0, 1_700_000_000_001)
+        .record_share(None, ADDR, 100.0, ts(1))
         .await
         .unwrap();
     let result = h.engine.build_distribution(312_500_000).await.expect("ok");
@@ -378,13 +390,10 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
     // settles as credit instead. That credit is precisely the money a lost
     // snapshot destroys, so it is what the assertions key on.
     h.engine
-        .record_share(None, BIG, 1_000_000.0, 1_700_000_000_001)
+        .record_share(None, BIG, 1_000_000.0, ts(1))
         .await
         .unwrap();
-    h.engine
-        .record_share(None, TINY, 1.0, 1_700_000_000_002)
-        .await
-        .unwrap();
+    h.engine.record_share(None, TINY, 1.0, ts(2)).await.unwrap();
 
     let result = h.engine.build_distribution(REWARD).await.expect("built");
     let fp = result.payouts_fingerprint();
@@ -493,13 +502,10 @@ async fn a_second_apply_of_the_same_block_moves_no_money() {
     // CREDIT — a non-zero delta, which is what a double-apply doubles. A
     // fully-paid miner books ~0 and would hide the bug.
     h.engine
-        .record_share(None, BIG, 1_000_000.0, 1_700_000_000_001)
+        .record_share(None, BIG, 1_000_000.0, ts(1))
         .await
         .unwrap();
-    h.engine
-        .record_share(None, TINY, 1.0, 1_700_000_000_002)
-        .await
-        .unwrap();
+    h.engine.record_share(None, TINY, 1.0, ts(2)).await.unwrap();
 
     let result = h.engine.build_distribution(REWARD).await.expect("built");
     let fp = result.payouts_fingerprint();
@@ -523,7 +529,7 @@ async fn a_second_apply_of_the_same_block_moves_no_money() {
     // The trigger: a miner absent from the snapshot starts mining before
     // the replay runs, so the apply's row set GROWS by one late-arriver row.
     h.engine
-        .record_share(None, LATECOMER, 50.0, 1_700_000_000_003)
+        .record_share(None, LATECOMER, 50.0, ts(3))
         .await
         .unwrap();
     let window = h
@@ -599,13 +605,10 @@ async fn a_different_block_at_the_same_height_is_refused_not_swallowed() {
     // TINY is withheld and settles as a CREDIT — a non-zero delta, so a
     // second apply would visibly double it.
     h.engine
-        .record_share(None, BIG, 1_000_000.0, 1_700_000_000_001)
+        .record_share(None, BIG, 1_000_000.0, ts(1))
         .await
         .unwrap();
-    h.engine
-        .record_share(None, TINY, 1.0, 1_700_000_000_002)
-        .await
-        .unwrap();
+    h.engine.record_share(None, TINY, 1.0, ts(2)).await.unwrap();
 
     let result = h.engine.build_distribution(REWARD).await.expect("built");
     let fp = result.payouts_fingerprint();
@@ -701,11 +704,11 @@ async fn later_build_does_not_cost_the_found_block_its_distribution() {
     const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
     h.engine
-        .record_share(None, ADDR_A, 70.0, 1_700_000_000_001)
+        .record_share(None, ADDR_A, 70.0, ts(1))
         .await
         .unwrap();
     h.engine
-        .record_share(None, ADDR_B, 30.0, 1_700_000_000_002)
+        .record_share(None, ADDR_B, 30.0, ts(2))
         .await
         .unwrap();
 
@@ -788,7 +791,7 @@ async fn reader_address_status_combines_window_and_balance() {
     };
     let addr = format!("{}miner", h.prefix);
     h.engine
-        .record_share(None, &addr, 80.0, 1_700_000_000_001)
+        .record_share(None, &addr, 80.0, ts(1))
         .await
         .unwrap();
     sqlx::query(
@@ -973,13 +976,10 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
 
     // ── Block 1: tiny miner accrues a sub-threshold pending credit ──
     h.engine
-        .record_share(None, BIG, 1_000_000.0, 1_700_000_000_001)
+        .record_share(None, BIG, 1_000_000.0, ts(1))
         .await
         .unwrap();
-    h.engine
-        .record_share(None, TINY, 1.0, 1_700_000_000_002)
-        .await
-        .unwrap();
+    h.engine.record_share(None, TINY, 1.0, ts(2)).await.unwrap();
     let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
     let entries1 = d1
         .distribution
@@ -1010,11 +1010,11 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
     //    payout, pending clears. Same window proportions (re-recording
     //    keeps the ratio identical, so rawFair per block is unchanged). ──
     h.engine
-        .record_share(None, BIG, 1_000_000.0, 1_700_000_060_001)
+        .record_share(None, BIG, 1_000_000.0, ts(60_001))
         .await
         .unwrap();
     h.engine
-        .record_share(None, TINY, 1.0, 1_700_000_060_002)
+        .record_share(None, TINY, 1.0, ts(60_002))
         .await
         .unwrap();
     let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
@@ -1073,7 +1073,7 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
 
     // Block 1: freeze → APPLY.
     h.engine
-        .record_share(None, MINER, 100.0, 1_700_000_000_001)
+        .record_share(None, MINER, 100.0, ts(1))
         .await
         .unwrap();
     let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
@@ -1093,7 +1093,7 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
 
     // Block 2: fresh snapshot, prepared AGAINST the post-block-1 ledger.
     h.engine
-        .record_share(None, MINER, 100.0, 1_700_000_060_001)
+        .record_share(None, MINER, 100.0, ts(60_001))
         .await
         .unwrap();
     let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
@@ -1144,7 +1144,7 @@ async fn two_blocks_in_sequence_both_accumulate() {
 
     // Freeze block 1 (NOT applied).
     h.engine
-        .record_share(None, MINER, 100.0, 1_700_000_000_001)
+        .record_share(None, MINER, 100.0, ts(1))
         .await
         .unwrap();
     let d1 = h.engine.build_distribution(REWARD).await.expect("build 1");
@@ -1162,7 +1162,7 @@ async fn two_blocks_in_sequence_both_accumulate() {
 
     // Block 2, against the ledger block 1 just moved.
     h.engine
-        .record_share(None, MINER, 100.0, 1_700_000_060_001)
+        .record_share(None, MINER, 100.0, ts(60_001))
         .await
         .unwrap();
     let d2 = h.engine.build_distribution(REWARD).await.expect("build 2");
@@ -1227,7 +1227,7 @@ async fn spawn_core_skips_crons_but_build_distribution_works() {
     // Valid address so it survives the payout-address filter in build_distribution.
     const ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     engine
-        .record_share(None, ADDR, 100.0, 1_700_000_000_000)
+        .record_share(None, ADDR, 100.0, ts(0))
         .await
         .expect("record_share ok");
 
@@ -1278,7 +1278,7 @@ async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
     };
     const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     h.engine
-        .record_share(None, ADDR_A, 100.0, 1_700_000_000_001)
+        .record_share(None, ADDR_A, 100.0, ts(1))
         .await
         .unwrap();
 
@@ -1325,11 +1325,11 @@ async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() 
     const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     const ADDR_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
     h.engine
-        .record_share(None, ADDR_A, 60.0, 1_700_000_000_001)
+        .record_share(None, ADDR_A, 60.0, ts(1))
         .await
         .unwrap();
     h.engine
-        .record_share(None, ADDR_B, 40.0, 1_700_000_000_002)
+        .record_share(None, ADDR_B, 40.0, ts(2))
         .await
         .unwrap();
 
@@ -1414,13 +1414,10 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
     cleanup_addr(&h.pool, TINY, &[h1, h2]).await;
 
     h.engine
-        .record_share(None, BIG, 1_000_000.0, 1_700_000_000_001)
+        .record_share(None, BIG, 1_000_000.0, ts(1))
         .await
         .unwrap();
-    h.engine
-        .record_share(None, TINY, 1.0, 1_700_000_000_002)
-        .await
-        .unwrap();
+    h.engine.record_share(None, TINY, 1.0, ts(2)).await.unwrap();
 
     // Two blocks in flight, BOTH frozen against the same (empty) ledger
     // — and under the weight model from the SAME distribution snapshot.
@@ -1528,13 +1525,10 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
 
     // Block 1 pays exactly, leaving TINY a sub-threshold credit.
     h.engine
-        .record_share(None, BIG, 1_000_000.0, 1_700_000_000_001)
+        .record_share(None, BIG, 1_000_000.0, ts(1))
         .await
         .unwrap();
-    h.engine
-        .record_share(None, TINY, 1.0, 1_700_000_000_002)
-        .await
-        .unwrap();
+    h.engine.record_share(None, TINY, 1.0, ts(2)).await.unwrap();
     let d1 = h.engine.build_distribution(T_REF).await.expect("build 1");
     h.engine
         .on_block_found(
@@ -1554,11 +1548,11 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
     // Block 2 is built against T_REF but paid at T_ACTUAL — the case a
     // job-declaring client's own template produces.
     h.engine
-        .record_share(None, BIG, 1_000_000.0, 1_700_000_060_001)
+        .record_share(None, BIG, 1_000_000.0, ts(60_001))
         .await
         .unwrap();
     h.engine
-        .record_share(None, TINY, 1.0, 1_700_000_060_002)
+        .record_share(None, TINY, 1.0, ts(60_002))
         .await
         .unwrap();
     let d2 = h.engine.build_distribution(T_REF).await.expect("build 2");
@@ -1632,7 +1626,7 @@ async fn a_coinbase_below_the_block_subsidy_is_refused() {
     cleanup_addr(&h.pool, MINER, &[height]).await;
 
     h.engine
-        .record_share(None, MINER, 1_000.0, 1_700_000_000_001)
+        .record_share(None, MINER, 1_000.0, ts(1))
         .await
         .unwrap();
     let d = h.engine.build_distribution(T_REF).await.expect("build");
@@ -1706,7 +1700,7 @@ async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
     cleanup_addr(&h.pool, DORMANT, &[height]).await;
 
     h.engine
-        .record_share(None, MINER, 1_000.0, 1_700_000_000_001)
+        .record_share(None, MINER, 1_000.0, ts(1))
         .await
         .unwrap();
     // A credit with no shares behind it — exactly what the sweep hunts.
@@ -1756,7 +1750,7 @@ async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
     cleanup_addr(&h.pool, DORMANT, &[height]).await;
 
     h.engine
-        .record_share(None, MINER, 1_000.0, 1_700_000_000_001)
+        .record_share(None, MINER, 1_000.0, ts(1))
         .await
         .unwrap();
     // A credit with no shares behind it — exactly what the sweep hunts.

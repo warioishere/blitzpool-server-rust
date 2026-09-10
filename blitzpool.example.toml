@@ -275,11 +275,26 @@ submit_latency = false
 # per share; bigger = less Redis memory + coarser trim, smaller = more memory
 # + finer. Do NOT raise this on a running pool: the bucket id comes from a
 # Redis counter that never resets, so a bigger divisor sends new shares to an
-# id below the live window and the trim throws them away again. Raise it only
-# against an empty window (lowering it is harmless).
+# id that is already in use, they merge into that older bucket, and they are
+# aged out with it. Raise it only against an empty window (lowering it is
+# harmless).
 # bucket_shares = 10000
 # Daily 03:00 UTC abandoned-pair sweep on pplns_balance.
 # dust_sweep_enabled = true
+#
+# How long a miner may be silent before it counts as gone. ONE knob, TWO
+# effects — check both before changing it:
+#
+#   1. Ledger. A credit whose owner has been silent this long is written off
+#      against an open debit by the nightly sweep.
+#   2. PAYOUT WINDOW. Share buckets older than this are dropped, so a miner
+#      silent this long stops earning a share of the next block.
+#
+# The second one is a payout change, not housekeeping. Setting this to 14
+# does not just clear dust faster, it truncates every miner's PPLNS window to
+# a fortnight. The window's own size rule (window_factor x network difficulty)
+# is a separate, much larger bound; on a pool far below it this value is the
+# only thing that ever drops a bucket.
 # abandoned_balance_days = 90
 
 # Coinbase-budget autoscaler (optional). Leave the sub-table out and the

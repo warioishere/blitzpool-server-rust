@@ -208,13 +208,32 @@ impl PplnsEngine {
         background_tasks: bool,
     ) -> Result<Self, EngineError> {
         let config = config.try_new()?;
-        let window = WindowStore::new(redis, config.window_factor, config.bucket_shares, net_diff);
+        let window = WindowStore::new(
+            redis,
+            config.window_factor,
+            config.bucket_shares,
+            net_diff,
+            config.abandoned_balance_days,
+        );
         // Cold-start safety: if the by-address aggregate is empty but buckets
         // exist (fresh deploy / lost key), rebuild it once from the buckets.
         // No-op at a normal cutover, where the previous pool version already
         // maintains the hash. After this the hash
         // is kept current incrementally; there is no periodic full recalc.
         window.bootstrap_window_if_needed().await?;
+        // Convert a bucket index written before the scores were timestamps.
+        // Must run before the first trim, or the age rule reads ids as 1970
+        // and drops the whole window. Idempotent, so it stays as a permanent
+        // guard rather than a one-release migration.
+        //
+        // Deliberately NOT gated on `background_tasks`, so it runs in every
+        // role, Core included. The trim runs wherever the share stream is
+        // consumed, and that is a role question this constructor does not
+        // see: `background_tasks` is the Payout role alone, while a Stats
+        // satellite without Front consumes the stream too. A gate here could
+        // leave exactly the trimming process unconverted. The cost of running
+        // it everywhere is one empty ZRANGEBYSCORE per boot.
+        window.restamp_legacy_bucket_scores().await?;
         let dist_cfg = DistributionConfig::from_engine_config(&config);
         let distribution_builder = DistributionBuilder::new(pool.clone(), window.clone(), dist_cfg);
         let touch_buffer = Arc::new(TouchBuffer::new());
@@ -251,6 +270,7 @@ impl PplnsEngine {
             min_payout_sats = config.min_payout_sats.0,
             fee_percent = config.fee_percent,
             dust_sweep_enabled = config.dust_sweep_enabled,
+            // One field, not two: the window's age rule reads the same knob.
             abandoned_balance_days = config.abandoned_balance_days,
             background_tasks,
             "pplns-engine spawned"

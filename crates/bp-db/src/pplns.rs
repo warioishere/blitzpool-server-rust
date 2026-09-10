@@ -23,38 +23,6 @@ pub struct PplnsBalanceRow {
     pub last_accepted_share_at: Option<i64>,
 }
 
-/// Abandoned-balance candidate rows for the dust-sweep cron.
-///
-/// Selects rows where:
-/// - `balanceSats != 0` (open claim, credit or debit)
-/// - `lastAcceptedShareAt IS NOT NULL` (NULL means pre-migration row
-///   with no signal — treated as "active until proven otherwise")
-/// - `lastAcceptedShareAt < cutoff_ms` (older than abandoned-days)
-///
-/// Consumer: `bp-pplns-engine::sweep::DustSweepRunner`.
-pub async fn find_pplns_balances_abandoned(
-    pool: &PgPool,
-    cutoff_ms: i64,
-) -> Result<Vec<PplnsBalanceRow>, DbError> {
-    sqlx::query_as!(
-        PplnsBalanceRow,
-        r#"SELECT
-            address AS "address!: AddressId",
-            "balanceSats" AS "balance_sats!: Sats",
-            "totalPaidSats" AS "total_paid_sats!: Sats",
-            "updatedAt" AS "updated_at!",
-            "lastAcceptedShareAt" AS "last_accepted_share_at?"
-           FROM pplns_balance
-           WHERE "balanceSats" <> 0
-             AND "lastAcceptedShareAt" IS NOT NULL
-             AND "lastAcceptedShareAt" < $1"#,
-        cutoff_ms,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::from)
-}
-
 /// Guarded single-column UPDATE of `balanceSats`: writes `new_balance`
 /// **only if** the row still holds `expected`. Returns `false` when it
 /// does not — the row moved since the caller read it, and the absolute
@@ -89,33 +57,24 @@ where
     Ok(result.rows_affected() > 0)
 }
 
-/// Guarded DELETE — same contract as
-/// [`update_pplns_balance_sats_if_unchanged`], for the case where the
-/// swept balance lands on exactly 0 and the row goes away.
-pub async fn delete_pplns_balance_if_unchanged<'e, E>(
-    executor: E,
-    address: &AddressId,
-    expected: Sats,
-) -> Result<bool, DbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let result = sqlx::query!(
-        r#"DELETE FROM pplns_balance WHERE address = $1 AND "balanceSats" = $2"#,
-        address.as_str(),
-        expected.0,
-    )
-    .execute(executor)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected() > 0)
-}
-
-/// All `pplns_balance` rows with a non-zero `balanceSats` (open
-/// claim — credit or debit). Consumed by
-/// `bp-pplns-engine::distribution::DistributionBuilder` so it can
-/// factor open claims in either direction into the next block's
-/// distribution.
+/// All `pplns_balance` rows with a non-zero `balanceSats` — an open claim in
+/// either direction, credit or debit.
+///
+/// Two consumers, deliberately one read:
+///
+/// - `bp-pplns-engine::distribution::DistributionBuilder` folds an open claim
+///   into the next block's distribution: a credit raises the address's wire
+///   weight, a debit is paid down out of its score share.
+/// - `bp-pplns-engine::sweep::DustSweepRunner` pair-cancels abandoned credits
+///   against open debits. Which credits count as abandoned is decided there,
+///   in Rust, and nowhere else — this query does not pre-filter by
+///   `lastAcceptedShareAt`, so that test has exactly one implementation.
+///
+/// A row the dust sweep cancelled to zero is therefore inert here — it is
+/// excluded by the predicate, and the builder would skip a zero balance
+/// anyway. That matters since the sweep stopped deleting such rows: they stay
+/// behind to keep `totalPaidSats`, and this is the read that must not trip
+/// over them.
 pub async fn find_pplns_balances_with_open_balance(
     pool: &PgPool,
 ) -> Result<Vec<PplnsBalanceRow>, DbError> {
@@ -235,7 +194,18 @@ pub struct PplnsBalanceAggregate {
     pub debit_sats: i64,
     pub credit_row_count: i64,
     pub debit_row_count: i64,
+    /// Credit whose owner has been silent past the cutoff — what the next
+    /// sweep tries to close.
     pub abandoned_credit_sats: i64,
+    /// Debit whose owner has been silent past the cutoff.
+    ///
+    /// ⚠️ **Not** the sweep's counterparty pool — that is
+    /// [`Self::debit_sats`], every open debit regardless of age. Keeping the
+    /// cutoff on this side is deliberate: the figure answers "how much of the
+    /// debt is itself abandoned", which is worth seeing, but it must not be
+    /// read as "how much the sweep can pair" — the sweep
+    /// (`bp-pplns-engine::sweep`) reads every open row and judges only the
+    /// credit side; see there for why.
     pub abandoned_debit_sats: i64,
     pub lifetime_paid_sats: i64,
 }
