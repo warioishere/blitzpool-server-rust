@@ -23,16 +23,33 @@ pub struct PplnsBalanceRow {
     pub last_accepted_share_at: Option<i64>,
 }
 
-/// Abandoned-balance candidate rows for the dust-sweep cron.
+/// Candidate rows for the dust-sweep cron: abandoned credits, plus
+/// every debit as a possible counterparty.
 ///
-/// Selects rows where:
-/// - `balanceSats != 0` (open claim, credit or debit)
-/// - `lastAcceptedShareAt IS NOT NULL` (NULL means pre-migration row
-///   with no signal — treated as "active until proven otherwise")
-/// - `lastAcceptedShareAt < cutoff_ms` (older than abandoned-days)
+/// **The cutoff is a property of the CREDIT side only.** A debit is not
+/// judged for abandonment — it is the other half of a pair-cancel, and
+/// requiring it to be silent too is what kept the sweep from ever
+/// firing. A credit exists because a miner was withheld (below
+/// `min_payout`, or folded by the blockspace cut); §4 hands that value
+/// to the miners who ARE published in the same block, and they carry
+/// the matching debit. The counterparty is therefore, by construction,
+/// someone who was mining at the time — and usually still is. Filtering
+/// both sides by the same inactivity window excluded exactly the rows
+/// that owe the credit.
+///
+/// Selects rows where `balanceSats != 0` and either:
+/// - `balanceSats < 0` — any debit, any age, `lastAcceptedShareAt` may
+///   be NULL (it is not a claim about the debit's owner), or
+/// - `lastAcceptedShareAt IS NOT NULL AND < cutoff_ms` — a credit whose
+///   owner has been silent past the abandoned-days window. NULL stays
+///   excluded on this side: no signal means "active until proven
+///   otherwise", and writing off a claim needs proof.
+///
+/// Pairing keeps `Σ balanceSats` at 0 whichever rows meet, so widening
+/// the counterparty set cannot make the ledger drift.
 ///
 /// Consumer: `bp-pplns-engine::sweep::DustSweepRunner`.
-pub async fn find_pplns_balances_abandoned(
+pub async fn find_pplns_sweep_candidates(
     pool: &PgPool,
     cutoff_ms: i64,
 ) -> Result<Vec<PplnsBalanceRow>, DbError> {
@@ -46,8 +63,9 @@ pub async fn find_pplns_balances_abandoned(
             "lastAcceptedShareAt" AS "last_accepted_share_at?"
            FROM pplns_balance
            WHERE "balanceSats" <> 0
-             AND "lastAcceptedShareAt" IS NOT NULL
-             AND "lastAcceptedShareAt" < $1"#,
+             AND ("balanceSats" < 0
+                  OR ("lastAcceptedShareAt" IS NOT NULL
+                      AND "lastAcceptedShareAt" < $1))"#,
         cutoff_ms,
     )
     .fetch_all(pool)

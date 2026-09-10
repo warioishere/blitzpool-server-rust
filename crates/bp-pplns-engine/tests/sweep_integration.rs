@@ -252,8 +252,21 @@ async fn sweep_multi_pair_preserves_ledger_symmetry() {
 
 // ── Test 4 — active row (within cutoff) is not swept ───────────────
 
+/// An abandoned credit pairs against a debit that is still ACTIVE.
+///
+/// This asserts the opposite of what it used to: the test previously
+/// seeded exactly this pair and required `pairs_closed == 0`, because
+/// the candidate query filtered both sides by the inactivity window.
+/// That is what kept the sweep from ever firing on the real pool — a
+/// credit exists because a miner was withheld and §4 handed the value
+/// to the miners published in that same block, so the debit belongs by
+/// construction to someone who was mining then, and usually still is.
+/// Demanding 90 days of silence from them excluded every plausible
+/// counterparty.
+///
+/// Fails against the pre-change query, which returns only the credit.
 #[tokio::test]
-async fn sweep_skips_active_rows_within_cutoff() {
+async fn an_abandoned_credit_pairs_against_an_active_debit() {
     let _guard = SWEEP_TEST_LOCK.lock().await;
     let pool = match connect_or_skip().await {
         Some(p) => p,
@@ -279,10 +292,66 @@ async fn sweep_skips_active_rows_within_cutoff() {
     let runner = DustSweepRunner::new(pool.clone(), clock, 90);
     let stats = runner.sweep().await.expect("sweep ok");
 
-    // Active row not in candidates → credit has no counterparty.
-    assert_eq!(stats.pairs_closed, 0);
-    assert_eq!(stats.unpaired_credits, 1);
+    assert_eq!(stats.pairs_closed, 2, "one pair, one row per side");
+    assert_eq!(stats.sats_paired, 5_000);
+    assert_eq!(stats.unpaired_credits, 0);
     assert_eq!(stats.unpaired_debits, 0);
+
+    // Exact pair → both rows gone, and the active miner keeps the sats
+    // it was already paid: its debt is forgiven, not collected.
+    let count: (i64,) =
+        sqlx::query_as(r#"SELECT count(*) FROM pplns_balance WHERE address LIKE $1"#)
+            .bind(format!("{prefix}%"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count.0, 0, "an exact pair deletes both balance rows");
+
+    cleanup(&pool, prefix).await;
+}
+
+/// Negative control for the change above: the cutoff must still bite on
+/// the CREDIT side. Without this, widening the query to "every debit"
+/// would look identical in the suite to dropping the window entirely.
+///
+/// Passes both before and after the change — that is the point.
+#[tokio::test]
+async fn an_active_credit_is_not_swept_even_with_an_abandoned_debit() {
+    let _guard = SWEEP_TEST_LOCK.lock().await;
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    wipe_all_test_state(&pool).await;
+    let prefix = "test_sweep_activecredit_";
+    cleanup(&pool, prefix).await;
+
+    let stale_ts = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    let active_ts = Utc
+        .with_ymd_and_hms(2026, 5, 15, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+
+    // Roles swapped vs the test above: the CREDIT is the active one.
+    seed_balance(&pool, &format!("{prefix}credit"), 5_000, Some(active_ts)).await;
+    seed_balance(&pool, &format!("{prefix}debit"), -5_000, Some(stale_ts)).await;
+
+    let clock = clock_at(2026, 5, 16);
+    let runner = DustSweepRunner::new(pool.clone(), clock, 90);
+    let stats = runner.sweep().await.expect("sweep ok");
+
+    assert_eq!(
+        stats.pairs_closed, 0,
+        "a still-mining miner's claim is never written off"
+    );
+    assert_eq!(
+        stats.unpaired_credits, 0,
+        "the active credit is no candidate"
+    );
+    assert_eq!(stats.unpaired_debits, 1, "the debit is, and waits");
 
     let count: (i64,) =
         sqlx::query_as(r#"SELECT count(*) FROM pplns_balance WHERE address LIKE $1"#)
@@ -290,10 +359,7 @@ async fn sweep_skips_active_rows_within_cutoff() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(
-        count.0, 2,
-        "neither row swept — credit waits for counterparty"
-    );
+    assert_eq!(count.0, 2, "both rows survive");
 
     cleanup(&pool, prefix).await;
 }
@@ -311,14 +377,27 @@ async fn sweep_skips_null_last_accepted_share() {
     let prefix = "test_sweep_null_";
     cleanup(&pool, prefix).await;
 
-    // NULL timestamp = "no signal" — treated as active, not stale.
+    // NULL timestamp = "no signal". On the CREDIT side that still means
+    // "active until proven otherwise" — writing off a claim needs proof,
+    // so a NULL credit is no candidate. On the DEBIT side the timestamp
+    // says nothing about eligibility (a debit is a counterparty, not a
+    // claim being written off), so a NULL debit does enter the set.
     seed_balance(&pool, &format!("{prefix}credit_null"), 5_000, None).await;
     seed_balance(&pool, &format!("{prefix}debit_null"), -5_000, None).await;
 
     let clock = clock_at(2026, 5, 16);
     let runner = DustSweepRunner::new(pool.clone(), clock, 90);
     let stats = runner.sweep().await.expect("sweep ok");
-    assert_eq!(stats, SweepStats::default());
+    assert_eq!(
+        stats,
+        SweepStats {
+            pairs_closed: 0,
+            sats_paired: 0,
+            unpaired_credits: 0,
+            unpaired_debits: 1,
+        },
+        "the NULL credit is excluded, so nothing can pair"
+    );
 
     let count: (i64,) =
         sqlx::query_as(r#"SELECT count(*) FROM pplns_balance WHERE address LIKE $1"#)
@@ -517,7 +596,7 @@ async fn sweep_pairs_with_stale_credit(
     now: chrono::DateTime<Utc>,
 ) -> SweepStats {
     let candidates =
-        bp_db::find_pplns_balances_abandoned(pool, now.timestamp_millis() - 90 * 86_400_000)
+        bp_db::find_pplns_sweep_candidates(pool, now.timestamp_millis() - 90 * 86_400_000)
             .await
             .expect("candidates");
     // The settlement commits here — between the read and the write.

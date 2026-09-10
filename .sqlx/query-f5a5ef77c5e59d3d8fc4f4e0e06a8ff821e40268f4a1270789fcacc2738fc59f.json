@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"balanceSats\" AS \"balance_sats!: Sats\",\n            \"totalPaidSats\" AS \"total_paid_sats!: Sats\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"lastAcceptedShareAt\" AS \"last_accepted_share_at?\"\n           FROM pplns_balance\n           WHERE \"balanceSats\" <> 0\n             AND \"lastAcceptedShareAt\" IS NOT NULL\n             AND \"lastAcceptedShareAt\" < $1",
+  "query": "SELECT\n            address AS \"address!: AddressId\",\n            \"balanceSats\" AS \"balance_sats!: Sats\",\n            \"totalPaidSats\" AS \"total_paid_sats!: Sats\",\n            \"updatedAt\" AS \"updated_at!\",\n            \"lastAcceptedShareAt\" AS \"last_accepted_share_at?\"\n           FROM pplns_balance\n           WHERE \"balanceSats\" <> 0\n             AND (\"balanceSats\" < 0\n                  OR (\"lastAcceptedShareAt\" IS NOT NULL\n                      AND \"lastAcceptedShareAt\" < $1))",
   "describe": {
     "columns": [
       {
@@ -42,5 +42,5 @@
       true
     ]
   },
-  "hash": "b4f2743e622c53a69aa336caf867db4907bf582a2e1517a10021caa9bef25f29"
+  "hash": "f5a5ef77c5e59d3d8fc4f4e0e06a8ff821e40268f4a1270789fcacc2738fc59f"
 }

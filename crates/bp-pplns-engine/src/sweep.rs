@@ -5,8 +5,12 @@
 //!
 //! Algorithm:
 //!
-//! 1. Load all `pplns_balance` rows whose `balanceSats != 0` and
-//!    whose `lastAcceptedShareAt < now - abandoned_days × 86400s`.
+//! 1. Load the candidate rows (`bp_db::find_pplns_sweep_candidates`):
+//!    every `balanceSats != 0` row that is either an abandoned CREDIT
+//!    (`lastAcceptedShareAt` older than `abandoned_days`) or a DEBIT of
+//!    any age. The inactivity window judges the credit side only — the
+//!    debit is the counterparty, and it belongs by construction to
+//!    someone who was mining when the credit was withheld.
 //! 2. Split: credits (balance > 0, desc) ↔ debits (balance < 0, by
 //!    absolute value desc).
 //! 3. Walk greedy: for each pair `amount = min(credit, |debit|)`.
@@ -41,7 +45,7 @@ use bp_common::{AddressId, Sats};
 use bp_cron_utils::BlockHeightGen;
 use bp_db::{
     bulk_insert_pplns_payout_history, delete_pplns_balance_if_unchanged,
-    find_pplns_balances_abandoned, update_pplns_balance_sats_if_unchanged, DbError,
+    find_pplns_sweep_candidates, update_pplns_balance_sats_if_unchanged, DbError,
     PayoutHistoryInsert, PplnsBalanceRow,
 };
 use chrono::DateTime;
@@ -112,7 +116,7 @@ impl<C: Clock> DustSweepRunner<C> {
         let now_ms = now.timestamp_millis();
         let cutoff_ms = now_ms - (self.abandoned_days as i64) * 86_400_000;
 
-        let candidates = find_pplns_balances_abandoned(&self.pool, cutoff_ms).await?;
+        let candidates = find_pplns_sweep_candidates(&self.pool, cutoff_ms).await?;
         self.sweep_pairs(candidates, now_ms, now).await
     }
 
