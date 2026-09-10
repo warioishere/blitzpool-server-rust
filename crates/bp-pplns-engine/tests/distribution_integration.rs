@@ -105,7 +105,11 @@ async fn connect_or_skip(redis_db: u8, address_prefix: &str) -> Option<Harness> 
 
     let net_diff = NetworkDifficulty::new(1_000_000.0);
     let window = WindowStore::new(
-        conn, /*factor=*/ 4.0, /*bucket_shares=*/ 100, net_diff, /*max_age_days=*/ 0,
+        conn,
+        /*factor=*/ 4.0,
+        /*bucket_shares=*/ 100,
+        net_diff,
+        AGE_RULE_OFF,
     );
     // The weight model requires the pool-output recipient (pay_P is
     // structural) — mirror the production requirement in the harness.
@@ -167,6 +171,14 @@ async fn cleanup_addresses(pool: &PgPool, addresses: &[&str]) {
 }
 
 // ── Test 1 — end-to-end build returns payouts + writes snapshot ────
+
+/// `max_age_days` for tests that are not about ageing.
+///
+/// Explicitly a very long window rather than `0`. The constructor floors the
+/// value at one day, so a literal `0` reads as "rule off" and quietly means
+/// "24 hours" — which these tests survive only because their shares are
+/// stamped near now. Writing the intent out removes the trap.
+const AGE_RULE_OFF: u32 = 3650;
 
 #[tokio::test]
 async fn build_with_shares_only_returns_payouts_and_writes_snapshot() {
@@ -610,7 +622,7 @@ async fn build_window(h: &Harness) -> WindowStore {
     let client = Client::open(url).expect("client");
     let conn = ConnectionManager::new(client).await.expect("conn");
     let nd = NetworkDifficulty::new(1_000_000.0);
-    WindowStore::new(conn, 4.0, 100, nd, 0)
+    WindowStore::new(conn, 4.0, 100, nd, AGE_RULE_OFF)
 }
 
 fn redis_db_for_prefix(prefix: &str) -> u8 {
@@ -714,7 +726,13 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
         .expect("read-only conn");
     let ro_builder = DistributionBuilder::new(
         h.pool.clone(),
-        WindowStore::new(ro_conn, 4.0, 100, NetworkDifficulty::new(1_000_000.0), 0),
+        WindowStore::new(
+            ro_conn,
+            4.0,
+            100,
+            NetworkDifficulty::new(1_000_000.0),
+            AGE_RULE_OFF,
+        ),
         DistributionConfig::from_engine_config(&PplnsEngineConfig {
             fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
             ..PplnsEngineConfig::default()

@@ -811,3 +811,74 @@ async fn an_abandoned_debit_is_settled_before_an_active_one() {
 
     cleanup(&pool, prefix).await;
 }
+
+/// The abandoned-credit test lives in `sweep_pairs`, not only in the query
+/// that feeds it.
+///
+/// `sweep_pairs` is `pub` and takes its candidates as an argument, so the SQL
+/// predicate is not a guarantee — a future admin endpoint or a widened read
+/// could hand it anything. Feed it an ACTIVE credit directly and it must
+/// still refuse to write the claim off.
+///
+/// Fails without the `retain`: the pair closes and a still-mining miner's
+/// credit is cancelled.
+#[tokio::test]
+async fn sweep_pairs_refuses_an_active_credit_handed_to_it_directly() {
+    let _guard = SWEEP_TEST_LOCK.lock().await;
+    let pool = match connect_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    wipe_all_test_state(&pool).await;
+    let prefix = "test_sweep_direct_";
+    cleanup(&pool, prefix).await;
+
+    let stale_ts = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    let active_ts = Utc
+        .with_ymd_and_hms(2026, 5, 15, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+
+    seed_balance(&pool, &format!("{prefix}credit"), 5_000, Some(active_ts)).await;
+    seed_balance(&pool, &format!("{prefix}debit"), -5_000, Some(stale_ts)).await;
+
+    let clock = clock_at(2026, 5, 16);
+    let runner = DustSweepRunner::new(pool.clone(), clock, 90);
+
+    // Bypass the query: hand it every row, exactly as a careless caller would.
+    let candidates: Vec<bp_db::PplnsBalanceRow> = sqlx::query_as::<_, bp_db::PplnsBalanceRow>(
+        r#"SELECT address, "balanceSats", "totalPaidSats", "updatedAt", "lastAcceptedShareAt"
+           FROM pplns_balance WHERE address LIKE $1 ORDER BY address"#,
+    )
+    .bind(format!("{prefix}%"))
+    .fetch_all(&pool)
+    .await
+    .expect("read candidates");
+    assert_eq!(candidates.len(), 2, "precondition: both rows handed over");
+
+    let now = Utc.with_ymd_and_hms(2026, 5, 16, 12, 0, 0).unwrap();
+    let stats = runner
+        .sweep_pairs(candidates, now.timestamp_millis(), now)
+        .await
+        .expect("sweep run");
+
+    assert_eq!(
+        stats.pairs_closed, 0,
+        "an active miner's claim is never written off, whoever supplied the list"
+    );
+    assert_eq!(
+        balance_of(&pool, &format!("{prefix}credit")).await,
+        Some(5_000),
+        "the active credit is untouched"
+    );
+    assert_eq!(
+        balance_of(&pool, &format!("{prefix}debit")).await,
+        Some(-5_000),
+        "and so is the debit that had nothing to pair with"
+    );
+
+    cleanup(&pool, prefix).await;
+}

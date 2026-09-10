@@ -110,12 +110,20 @@ impl<C: Clock> DustSweepRunner<C> {
         }
     }
 
+    /// Epoch-ms before which a balance row's owner counts as abandoned. The
+    /// one place that turns `abandoned_days` into a boundary — the SQL
+    /// predicate and the pairing both take it from here, so they cannot drift
+    /// apart on `<` versus `<=`.
+    fn cutoff_ms(&self, now_ms: i64) -> i64 {
+        now_ms - (self.abandoned_days as i64) * 86_400_000
+    }
+
     /// Run one sweep. Public so tests + admin endpoints can trigger
     /// without waiting for the daily cron.
     pub async fn sweep(&self) -> Result<SweepStats, SweepError> {
         let now = self.clock.now();
         let now_ms = now.timestamp_millis();
-        let cutoff_ms = now_ms - (self.abandoned_days as i64) * 86_400_000;
+        let cutoff_ms = self.cutoff_ms(now_ms);
 
         let candidates = find_pplns_sweep_candidates(&self.pool, cutoff_ms).await?;
         self.sweep_pairs(candidates, now_ms, now).await
@@ -138,7 +146,7 @@ impl<C: Clock> DustSweepRunner<C> {
             .filter(|r| r.balance_sats.0 != 0)
             .partition(|r| r.balance_sats.0 > 0);
 
-        // Credits: largest first.
+        // Credits: largest first. Filtered below, before anything is written.
         credits.sort_by_key(|r| std::cmp::Reverse(r.balance_sats.0));
         // Debits: ABANDONED ones first, then most-negative. Magnitude alone
         // put a still-mining miner's large debit ahead of a genuinely
@@ -151,12 +159,21 @@ impl<C: Clock> DustSweepRunner<C> {
         // A live row is still touched when the dead ones cannot absorb the
         // whole credit. That is correct: the debt is owed either way, and
         // leaving the credit open would defeat the run.
-        let cutoff_ms = now_ms - (self.abandoned_days as i64) * 86_400_000;
+        let cutoff_ms = self.cutoff_ms(now_ms);
         let is_abandoned = |r: &PplnsBalanceRow| {
             r.last_accepted_share_at
                 .is_some_and(|last| last < cutoff_ms)
         };
         debits.sort_by_key(|r| (!is_abandoned(r), r.balance_sats.0));
+
+        // Writing off a claim needs the owner to be gone, and this is where
+        // the write happens — so this is where it is checked. The SQL
+        // predicate one call up says the same thing, but this method is `pub`
+        // and takes its candidates as an argument: hand it a list from
+        // anywhere else and, without this, it would cancel a still-mining
+        // miner's credit without a word. A debit needs no such test — it is
+        // the counterparty, not the claim being written off.
+        credits.retain(is_abandoned);
 
         if credits.is_empty() || debits.is_empty() {
             return Ok(SweepStats {

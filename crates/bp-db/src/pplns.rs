@@ -48,12 +48,12 @@ pub struct PplnsBalanceRow {
 /// Pairing keeps `Σ balanceSats` at 0 whichever rows meet, so widening
 /// the counterparty set cannot make the ledger drift.
 ///
-/// Deliberately unbounded on the debit side. It reads as an unbounded scan,
-/// but the set cannot outgrow the addresses that ever held a balance — 1 484
-/// rows on the live pool as of 2026-09-10 — and the sweep stops as soon as the
-/// credits are absorbed. A `LIMIT` here would need a number nothing justifies,
-/// and picking one too small silently leaves credits unpaired. Revisit if the
-/// address count ever reaches a scale where one nightly read of it matters.
+/// Deliberately unbounded on the debit side: the sweep stops as soon as the
+/// credits are absorbed, and a `LIMIT` small enough to matter would silently
+/// leave credits unpaired. The bound is structural — one row per address that
+/// has ever held a non-zero balance, which is at most the number of addresses
+/// that have ever been paid. Revisit if a nightly read of that ever costs
+/// anything measurable.
 ///
 /// Consumer: `bp-pplns-engine::sweep::DustSweepRunner`.
 pub async fn find_pplns_sweep_candidates(
@@ -114,6 +114,18 @@ where
     Ok(result.rows_affected() > 0)
 }
 
+/// All `pplns_balance` rows with a non-zero `balanceSats` — an open claim in
+/// either direction, credit or debit.
+///
+/// Consumed by `bp-pplns-engine::distribution::DistributionBuilder`, which
+/// folds an open claim into the next block's distribution: a credit raises the
+/// address's wire weight, a debit is paid down out of its score share.
+///
+/// A row the dust sweep cancelled to zero is therefore inert here — it is
+/// excluded by the predicate, and the builder would skip a zero balance
+/// anyway. That matters since the sweep stopped deleting such rows: they stay
+/// behind to keep `totalPaidSats`, and this is the read that must not trip
+/// over them.
 pub async fn find_pplns_balances_with_open_balance(
     pool: &PgPool,
 ) -> Result<Vec<PplnsBalanceRow>, DbError> {

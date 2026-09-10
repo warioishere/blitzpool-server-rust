@@ -81,6 +81,14 @@ async fn connect_or_skip(test_db: u8) -> Option<ConnectionManager> {
     Some(conn)
 }
 
+/// `max_age_days` for tests that are not about ageing.
+///
+/// Explicitly a very long window rather than `0`. The constructor floors the
+/// value at one day, so a literal `0` reads as "rule off" and quietly means
+/// "24 hours" — which these tests survive only because [`ts`] stamps their
+/// shares near now. Writing the intent out removes the trap.
+const AGE_RULE_OFF: u32 = 3650;
+
 /// Build a `WindowStore` with a given bucket size. `bucket_shares = 1` makes
 /// each share its own bucket (finest trim, == per-share trim).
 fn make_store(
@@ -94,7 +102,7 @@ fn make_store(
         /*window_factor=*/ 4.0,
         bucket_shares,
         nd.clone(),
-        0,
+        AGE_RULE_OFF,
     );
     (store, nd)
 }
@@ -1070,7 +1078,7 @@ async fn restamping_legacy_scores_keeps_the_window_and_its_order() {
     assert_eq!(scored.len(), 11, "conversion must not drop a bucket");
     for (member, score) in &scored {
         assert!(
-            *score >= LEGACY_SCORE_CEILING,
+            *score >= LEGACY_SCORE_CEILING as f64,
             "bucket {member} still carries a legacy score {score}"
         );
     }
@@ -1099,39 +1107,109 @@ async fn restamping_legacy_scores_keeps_the_window_and_its_order() {
     assert_eq!(store.restamp_legacy_bucket_scores().await.unwrap(), 0);
 }
 
-/// An index entry whose score is not a timestamp is inert, whenever it shows
-/// up. The boot conversion cannot cover an entry written after it ran — an old
-/// binary still draining shares, a `RESTORE` into a live pool — so the floor
-/// lives in the trim itself.
+/// An entry that can never be dropped must not block the ones behind it.
+///
+/// This is the half the previous version of this test missed. It asserted the
+/// inert entry survived — which it does either way — and stopped there, so it
+/// passed just as happily when that entry wedged the whole rule. An entry
+/// below the score floor carries the lowest possible score, so it sits at rank
+/// 0 forever; while the age rule inspected only the head it answered "not too
+/// old", returned {0,0} on every append, and nothing behind it could ever age
+/// out. Selecting by score range steps over it instead.
+///
+/// Fails against head-only inspection: the 100-day-old bucket survives.
 #[tokio::test]
-async fn an_unconverted_score_is_never_aged_out() {
+async fn an_inert_entry_does_not_block_the_buckets_behind_it() {
     let Some(mut conn) = connect_or_skip(20).await else {
         return;
     };
     let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 1, 90);
 
-    for i in 1..=3 {
+    // The inert entry goes in FIRST. Order matters, and getting it wrong is
+    // how the first draft of this test came to pass against the very code it
+    // was written to reject: every `record_share` runs a trim, so an aged
+    // bucket created beforehand is already gone by the time the entry that is
+    // supposed to shield it arrives.
+    //
+    // An id-scored entry appears AFTER startup, so no conversion pass follows
+    // it — a `RESTORE` into a live pool, or an old binary still draining. Its
+    // score is the lowest possible, so it is the head from here on.
+    let _: () = conn.zadd(KEY_BUCKETS, "9999", 1.0).await.unwrap();
+
+    // Opened 100 days ago. While it is the only bucket it is also the active
+    // one and therefore protected, so a fresh share has to move the counter
+    // past it before the age rule can reach it.
+    store
+        .record_share(None, "addr_old", 10.0, ms_ago(100))
+        .await
+        .unwrap();
+    let head: Vec<String> = conn.zrange(KEY_BUCKETS, 0, 0).await.unwrap();
+    assert_eq!(
+        head,
+        vec!["9999"],
+        "precondition: the inert entry is the head"
+    );
+
+    for addr in ["addr_b", "addr_c", "addr_trigger"] {
         store
-            .record_share(None, &format!("addr_{i}"), 10.0, ms_ago(0))
+            .record_share(None, addr, 10.0, ms_ago(0))
             .await
             .unwrap();
     }
-    // An id-scored entry appears AFTER startup — no conversion pass follows.
-    let _: () = conn.zadd(KEY_BUCKETS, "1", 1.0).await.unwrap();
 
-    store
-        .record_share(None, "addr_trigger", 10.0, ms_ago(0))
-        .await
-        .unwrap();
-
-    let after: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    let index: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
     assert!(
-        after.contains(&"1".to_string()),
-        "a score below the floor reads as no timestamp, not as 1970, got {after:?}"
+        index.contains(&"9999".to_string()),
+        "a score below the floor reads as no timestamp, not as 1970 — it stays put"
     );
     let by_addr: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await.unwrap();
     assert!(
-        by_addr.contains_key("addr_1"),
-        "and its contribution stays in the aggregate"
+        !by_addr.contains_key("addr_old"),
+        "and the aged bucket behind it must still be dropped, got {by_addr:?}"
     );
+    for still_here in ["addr_b", "addr_c", "addr_trigger"] {
+        assert!(by_addr.contains_key(still_here), "{still_here} must stay");
+    }
+}
+
+/// The bucket currently taking shares is never dropped, however old its
+/// opening time is.
+///
+/// `NX` scoring means the index holds when a bucket OPENED. A pool slow enough
+/// that one bucket takes longer than the cutoff to fill would otherwise have
+/// the trim remove it while shares are still going into it. The active bucket
+/// is identified from the counter rather than by "stop at the last entry".
+#[tokio::test]
+async fn the_currently_filling_bucket_is_never_dropped() {
+    let Some(mut conn) = connect_or_skip(21).await else {
+        return;
+    };
+    // bucket_shares = 100 so everything below lands in bucket 0 and it stays
+    // the active one throughout.
+    let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 100, 90);
+
+    // Opened 100 days ago, still filling.
+    store
+        .record_share(None, "addr_a", 10.0, ms_ago(100))
+        .await
+        .unwrap();
+    store
+        .record_share(None, "addr_b", 10.0, ms_ago(0))
+        .await
+        .unwrap();
+
+    let index: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    assert_eq!(
+        index,
+        vec!["0"],
+        "precondition: one bucket, and it is active"
+    );
+
+    let by_addr: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await.unwrap();
+    assert!(
+        by_addr.contains_key("addr_a") && by_addr.contains_key("addr_b"),
+        "the open bucket keeps both shares, got {by_addr:?}"
+    );
+    let total: String = conn.get(KEY_WINDOW_TOTAL).await.unwrap();
+    assert!((total.parse::<f64>().unwrap() - 20.0).abs() < 1e-9);
 }
