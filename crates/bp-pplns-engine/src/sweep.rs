@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Daily 03:00 UTC dust-sweep — pair-cancel abandoned credits against
-//! abandoned debits in the PPLNS signed ledger.
+//! Daily 03:00 UTC dust-sweep — pair-cancel abandoned credits against open
+//! debits in the PPLNS signed ledger. The inactivity window judges the credit
+//! side only; step 1 below says why.
 //!
 //! Algorithm:
 //!

@@ -99,6 +99,17 @@ fn make_store(
     (store, nd)
 }
 
+/// Share timestamp for tests that are NOT about ageing, anchored near now.
+///
+/// These used to pass a hardcoded `ts(0)` (Nov 2023) as a value
+/// `record_share` ignored. It does not ignore it any more — it is the bucket's
+/// index score — so the constant would now mean "every bucket is three years
+/// old" and the age rule would empty the window out from under tests that are
+/// about weight trimming. The offset keeps their relative order.
+fn ts(offset: u64) -> u64 {
+    (bp_common::now_ms() as u64) - 1_000_000 + offset
+}
+
 /// Sum every live bucket into per-address totals — the bucketed source of
 /// truth the by-address aggregate must track.
 async fn sum_buckets(conn: &mut ConnectionManager) -> HashMap<String, f64> {
@@ -126,7 +137,7 @@ async fn record_share_writes_bucket_total_and_aggregate() {
     let (store, _) = make_store(conn.clone(), 1_000_000.0, 10_000);
 
     store
-        .record_share(None, "bc1qfoo", 100.0, 1_700_000_000_000)
+        .record_share(None, "bc1qfoo", 100.0, ts(0))
         .await
         .expect("record_share ok");
 
@@ -159,9 +170,9 @@ async fn multiple_shares_same_address_accumulate() {
     };
     let (store, _) = make_store(conn.clone(), 1_000_000.0, 10_000);
 
-    for ts in 1..=5 {
+    for i in 1..=5 {
         store
-            .record_share(None, "bc1qfoo", 50.0, 1_700_000_000_000 + ts)
+            .record_share(None, "bc1qfoo", 50.0, ts(i))
             .await
             .expect("record_share ok");
     }
@@ -195,17 +206,14 @@ async fn multiple_miners_get_separate_aggregate_entries() {
     let (store, _) = make_store(conn.clone(), 1_000_000.0, 10_000);
 
     store
-        .record_share(None, "bc1qa", 10.0, 1_700_000_000_001)
+        .record_share(None, "bc1qa", 10.0, ts(1))
         .await
         .unwrap();
     store
-        .record_share(None, "bc1qb", 20.0, 1_700_000_000_002)
+        .record_share(None, "bc1qb", 20.0, ts(2))
         .await
         .unwrap();
-    store
-        .record_share(None, "bc1qa", 5.0, 1_700_000_000_003)
-        .await
-        .unwrap();
+    store.record_share(None, "bc1qa", 5.0, ts(3)).await.unwrap();
 
     let by_addr = store.read_window_by_address().await.unwrap();
     assert_eq!(by_addr.len(), 2);
@@ -227,7 +235,7 @@ async fn trim_window_drops_oldest_over_window_size() {
 
     for i in 1..=5 {
         store
-            .record_share(None, &format!("bc1q{i}"), 1.0, 1_700_000_000_000 + i)
+            .record_share(None, &format!("bc1q{i}"), 1.0, ts(i))
             .await
             .unwrap();
     }
@@ -355,7 +363,7 @@ async fn a_bucket_ahead_of_the_aggregate_does_not_strand_a_negative_entry() {
 
     for i in 1..=4 {
         store
-            .record_share(None, &format!("bc1q{i}"), 1.0, 1_700_000_000_000 + i)
+            .record_share(None, &format!("bc1q{i}"), 1.0, ts(i))
             .await
             .unwrap();
     }
@@ -373,10 +381,7 @@ async fn a_bucket_ahead_of_the_aggregate_does_not_strand_a_negative_entry() {
 
     // A fifth share pushes the window over and trims bc1q1's bucket, whose
     // 1.0 exceeds the 0.25 the aggregate holds.
-    store
-        .record_share(None, "bc1q5", 1.0, 1_700_000_000_005)
-        .await
-        .unwrap();
+    store.record_share(None, "bc1q5", 1.0, ts(5)).await.unwrap();
 
     // The field must be GONE, not sitting at -0.75.
     let raw: Option<String> = conn.hget(KEY_WINDOW_BY_ADDRESS, "bc1q1").await.unwrap();
@@ -440,7 +445,7 @@ async fn record_share_with_zero_network_difficulty_does_not_trim() {
 
     for i in 1..=10 {
         store
-            .record_share(None, "bc1qfoo", 1.0, 1_700_000_000_000 + i)
+            .record_share(None, "bc1qfoo", 1.0, ts(i))
             .await
             .unwrap();
     }
@@ -468,7 +473,7 @@ async fn incremental_aggregate_matches_buckets_under_trim() {
 
     for i in 1..=10 {
         store
-            .record_share(None, &format!("bc1q{}", i % 3), 1.0, 1_700_000_000_000 + i)
+            .record_share(None, &format!("bc1q{}", i % 3), 1.0, ts(i))
             .await
             .expect("record_share ok");
     }
@@ -565,7 +570,7 @@ async fn concurrent_shares_keep_total_consistent_with_buckets() {
         handles.push(tokio::spawn(async move {
             for i in 0..50u64 {
                 let addr = format!("bc1q{}", t % 4);
-                s.record_share(None, &addr, 1.0, 1_700_000_000_000 + t * 100 + i)
+                s.record_share(None, &addr, 1.0, ts(t * 100 + i))
                     .await
                     .unwrap();
             }
@@ -601,19 +606,19 @@ async fn record_share_is_idempotent_per_share_id() {
     let (store, _) = make_store(conn.clone(), 1_000_000.0, 10_000); // big window, no trim
 
     let applied = store
-        .record_share(Some("ep1:0"), "bc1qfoo", 100.0, 1_700_000_000_000)
+        .record_share(Some("ep1:0"), "bc1qfoo", 100.0, ts(0))
         .await
         .expect("record_share ok");
     assert!(applied, "first apply must append");
 
     let replay = store
-        .record_share(Some("ep1:0"), "bc1qfoo", 100.0, 1_700_000_000_000)
+        .record_share(Some("ep1:0"), "bc1qfoo", 100.0, ts(0))
         .await
         .expect("record_share ok");
     assert!(!replay, "redelivered share_id must be a deduped no-op");
 
     let applied2 = store
-        .record_share(Some("ep1:1"), "bc1qfoo", 100.0, 1_700_000_000_001)
+        .record_share(Some("ep1:1"), "bc1qfoo", 100.0, ts(1))
         .await
         .expect("record_share ok");
     assert!(applied2, "a fresh share_id must append");
@@ -680,7 +685,7 @@ async fn bucketed_window_matches_exact_per_share_window() {
 
     for (i, (addr, diff)) in shares.iter().enumerate() {
         store
-            .record_share(None, addr, *diff, 1_700_000_000_000 + i as u64)
+            .record_share(None, addr, *diff, ts(i as u64))
             .await
             .unwrap();
     }
@@ -743,7 +748,7 @@ async fn fill_until_trimming(
 ) -> Vec<i64> {
     for i in 0..shares {
         store
-            .record_share(None, "bc1qfiller", 100.0, 1_700_000_000_000 + i as u64)
+            .record_share(None, "bc1qfiller", 100.0, ts(i as u64))
             .await
             .unwrap();
     }
@@ -782,7 +787,7 @@ async fn raising_bucket_shares_no_longer_strands_new_work() {
     // with an edited config would do.
     let (raised, raised_nd) = make_store(conn.clone(), 1250.0, 20);
     let appended = raised
-        .record_share(None, "bc1qvictim", 100.0, 1_700_000_999_000)
+        .record_share(None, "bc1qvictim", 100.0, ts(999_000))
         .await
         .unwrap();
     assert!(appended, "must be a real append, not a dedup no-op");
@@ -806,7 +811,7 @@ async fn raising_bucket_shares_no_longer_strands_new_work() {
     // Shrink the window hard so trims fire, and check they eat the old end.
     raised_nd.set(100.0);
     raised
-        .record_share(None, "bc1qvictim", 100.0, 1_700_000_999_001)
+        .record_share(None, "bc1qvictim", 100.0, ts(999_001))
         .await
         .unwrap();
 
@@ -845,7 +850,7 @@ async fn lowering_bucket_shares_keeps_new_work_above_the_live_window() {
 
     let (lowered, lowered_nd) = make_store(conn.clone(), 1250.0, 5);
     let appended = lowered
-        .record_share(None, "bc1qsurvivor", 100.0, 1_700_000_999_000)
+        .record_share(None, "bc1qsurvivor", 100.0, ts(999_000))
         .await
         .unwrap();
     assert!(appended, "must be a real append, not a dedup no-op");
@@ -866,7 +871,7 @@ async fn lowering_bucket_shares_keeps_new_work_above_the_live_window() {
 
     lowered_nd.set(100.0);
     lowered
-        .record_share(None, "bc1qsurvivor", 100.0, 1_700_000_999_001)
+        .record_share(None, "bc1qsurvivor", 100.0, ts(999_001))
         .await
         .unwrap();
 
@@ -891,13 +896,14 @@ async fn lowering_bucket_shares_keeps_new_work_above_the_live_window() {
 //
 // The size rule (`total > window_factor × difficulty`) cannot fire on a pool
 // whose window sits far below its cap — measured on prod at 0.15 % of it — so
-// a miner that stops mining keeps its weight indefinitely. These three cover
-// the age rule that fixes it, the switch that turns it off, and the one-shot
-// score conversion that must not eat the live window.
+// a miner that stops mining keeps its weight indefinitely. These cover the age
+// rule that fixes it, the control that it does not fire early, and the score
+// conversion that starts the clock on a pre-existing window.
 
 /// `net_diff` high enough that `4 × net_diff` is unreachable, so only the age
 /// rule can drop anything — the prod situation, in miniature.
 const UNREACHABLE_SIZE_DIFF: f64 = 1e12;
+const DAY_MS: u64 = 86_400_000;
 
 fn make_aged_store(
     conn: ConnectionManager,
@@ -909,12 +915,8 @@ fn make_aged_store(
     (store, nd)
 }
 
-/// Backdate a bucket's index score, standing in for one that filled months
-/// ago. Nothing else can produce that state in a test: `record_share` always
-/// stamps the current clock.
-async fn backdate_bucket(conn: &mut ConnectionManager, bucket_id: &str, age_ms: i64) {
-    let score = (bp_common::now_ms() - age_ms) as f64;
-    let _: () = conn.zadd(KEY_BUCKETS, bucket_id, score).await.unwrap();
+fn ms_ago(days: u64) -> u64 {
+    (bp_common::now_ms() as u64) - days * DAY_MS
 }
 
 #[tokio::test]
@@ -924,16 +926,25 @@ async fn an_old_bucket_is_dropped_by_age_even_far_below_the_size_cap() {
     };
     let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 1, 90);
 
-    // One share per bucket: A→1, B→2, C→3.
-    store.record_share(None, "addr_a", 100.0, 0).await.unwrap();
-    store.record_share(None, "addr_b", 200.0, 0).await.unwrap();
-    store.record_share(None, "addr_c", 300.0, 0).await.unwrap();
-
-    // A's bucket filled 100 days ago; the others are fresh.
-    backdate_bucket(&mut conn, "1", 100 * 86_400_000).await;
+    // One share per bucket. A's carries a 100-day-old accept time, which is
+    // what the index scores it with — no test backdoor needed, this is the
+    // ordinary path.
+    store
+        .record_share(None, "addr_a", 100.0, ms_ago(100))
+        .await
+        .unwrap();
+    for (addr, diff) in [("addr_b", 200.0), ("addr_c", 300.0)] {
+        store
+            .record_share(None, addr, diff, ms_ago(0))
+            .await
+            .unwrap();
+    }
 
     // Any further share runs the trim.
-    store.record_share(None, "addr_d", 400.0, 0).await.unwrap();
+    store
+        .record_share(None, "addr_d", 400.0, ms_ago(0))
+        .await
+        .unwrap();
 
     let by_addr: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await.unwrap();
     assert!(
@@ -953,41 +964,79 @@ async fn an_old_bucket_is_dropped_by_age_even_far_below_the_size_cap() {
         (total.parse::<f64>().unwrap() - 900.0).abs() < 1e-9,
         "total must drop by exactly the removed bucket, got {total}"
     );
-    // And the buckets agree with the aggregate.
     let summed = sum_buckets(&mut conn).await;
     assert!(!summed.contains_key("addr_a"));
 }
 
-/// Negative control. Same fixture, age rule switched off — without it, a
-/// change that dropped buckets for some unrelated reason would look identical
-/// to the test above.
+/// Control: a bucket inside the window is not touched. Same fixture, same
+/// rule, only the age differs — so a change that dropped buckets for some
+/// unrelated reason cannot pass both this and the test above.
 #[tokio::test]
-async fn a_zero_max_age_leaves_the_old_bucket_alone() {
+async fn a_bucket_inside_the_age_window_is_left_alone() {
     let Some(mut conn) = connect_or_skip(17).await else {
         return;
     };
-    let (store, _nd) = make_aged_store(
-        conn.clone(),
-        /*bucket_shares=*/ 1,
-        /*max_age_days=*/ 0,
-    );
+    let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 1, 90);
 
-    store.record_share(None, "addr_a", 100.0, 0).await.unwrap();
-    store.record_share(None, "addr_b", 200.0, 0).await.unwrap();
-    store.record_share(None, "addr_c", 300.0, 0).await.unwrap();
-    backdate_bucket(&mut conn, "1", 100 * 86_400_000).await;
-    store.record_share(None, "addr_d", 400.0, 0).await.unwrap();
+    // One day old against a 90-day rule.
+    store
+        .record_share(None, "addr_a", 100.0, ms_ago(1))
+        .await
+        .unwrap();
+    for (addr, diff) in [("addr_b", 200.0), ("addr_c", 300.0), ("addr_d", 400.0)] {
+        store
+            .record_share(None, addr, diff, ms_ago(0))
+            .await
+            .unwrap();
+    }
 
     let by_addr: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await.unwrap();
     assert!(
         by_addr.contains_key("addr_a"),
-        "with the age rule off nothing may age out, got {by_addr:?}"
+        "a one-day-old bucket is inside a 90-day window, got {by_addr:?}"
     );
     let total: String = conn.get(KEY_WINDOW_TOTAL).await.unwrap();
     assert!((total.parse::<f64>().unwrap() - 1000.0).abs() < 1e-9);
 }
 
-/// The conversion must keep the live window intact AND keep FIFO order.
+/// The score is written once, when the bucket opens, and a later share into
+/// the same id must not move it. Without `NX` a re-used id — a raised
+/// `bucket_shares`, or a counter rewound by a Redis state restore — would
+/// hand a months-old bucket a fresh 90-day lease.
+#[tokio::test]
+async fn a_second_share_does_not_refresh_its_buckets_age() {
+    let Some(mut conn) = connect_or_skip(19).await else {
+        return;
+    };
+    // bucket_shares = 10 so both shares land in the same bucket.
+    let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 10, 90);
+
+    store
+        .record_share(None, "addr_old", 100.0, ms_ago(100))
+        .await
+        .unwrap();
+    let opened: Vec<(String, f64)> = conn.zrange_withscores(KEY_BUCKETS, 0, -1).await.unwrap();
+    assert_eq!(opened.len(), 1, "precondition: one bucket so far");
+    let opened_score = opened[0].1;
+
+    // A fresh share into the SAME bucket.
+    store
+        .record_share(None, "addr_new", 100.0, ms_ago(0))
+        .await
+        .unwrap();
+
+    let after: Vec<(String, f64)> = conn.zrange_withscores(KEY_BUCKETS, 0, -1).await.unwrap();
+    assert_eq!(after.len(), 1, "still the same single bucket");
+    assert!(
+        (after[0].1 - opened_score).abs() < 1e-9,
+        "the bucket kept its opening time: {} vs {}",
+        after[0].1,
+        opened_score
+    );
+}
+
+/// The conversion must keep the live window intact AND keep FIFO order, and a
+/// trim right after it must not eat what it just stamped.
 ///
 /// Order is the subtle half. Ids are zset members as text, so a shared
 /// timestamp would order them lexicographically — `"10"` ahead of `"2"` —
@@ -1002,7 +1051,7 @@ async fn restamping_legacy_scores_keeps_the_window_and_its_order() {
 
     for i in 1..=11 {
         store
-            .record_share(None, &format!("addr_{i}"), 10.0, 0)
+            .record_share(None, &format!("addr_{i}"), 10.0, ms_ago(0))
             .await
             .unwrap();
     }
@@ -1032,10 +1081,57 @@ async fn restamping_legacy_scores_keeps_the_window_and_its_order() {
         "FIFO order must survive — lexicographic order would put 10 before 2"
     );
 
-    // Nothing was evicted: the window still holds all eleven contributions.
-    let total: String = conn.get(KEY_WINDOW_TOTAL).await.unwrap();
-    assert!((total.parse::<f64>().unwrap() - 110.0).abs() < 1e-9);
+    // Now actually run the rule against the converted index. Asserting the
+    // zset alone proved nothing about the trim; this is the claim that
+    // matters — freshly stamped buckets are young and must all survive.
+    store
+        .record_share(None, "addr_trigger", 10.0, ms_ago(0))
+        .await
+        .unwrap();
+    let after: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    assert_eq!(
+        after.len(),
+        12,
+        "the converted buckets are young; the trim must leave every one, got {after:?}"
+    );
 
     // Idempotent: a second run finds nothing left to convert.
     assert_eq!(store.restamp_legacy_bucket_scores().await.unwrap(), 0);
+}
+
+/// An index entry whose score is not a timestamp is inert, whenever it shows
+/// up. The boot conversion cannot cover an entry written after it ran — an old
+/// binary still draining shares, a `RESTORE` into a live pool — so the floor
+/// lives in the trim itself.
+#[tokio::test]
+async fn an_unconverted_score_is_never_aged_out() {
+    let Some(mut conn) = connect_or_skip(20).await else {
+        return;
+    };
+    let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 1, 90);
+
+    for i in 1..=3 {
+        store
+            .record_share(None, &format!("addr_{i}"), 10.0, ms_ago(0))
+            .await
+            .unwrap();
+    }
+    // An id-scored entry appears AFTER startup — no conversion pass follows.
+    let _: () = conn.zadd(KEY_BUCKETS, "1", 1.0).await.unwrap();
+
+    store
+        .record_share(None, "addr_trigger", 10.0, ms_ago(0))
+        .await
+        .unwrap();
+
+    let after: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    assert!(
+        after.contains(&"1".to_string()),
+        "a score below the floor reads as no timestamp, not as 1970, got {after:?}"
+    );
+    let by_addr: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await.unwrap();
+    assert!(
+        by_addr.contains_key("addr_1"),
+        "and its contribution stays in the aggregate"
+    );
 }

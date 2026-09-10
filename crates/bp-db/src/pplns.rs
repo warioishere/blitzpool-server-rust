@@ -48,6 +48,13 @@ pub struct PplnsBalanceRow {
 /// Pairing keeps `Σ balanceSats` at 0 whichever rows meet, so widening
 /// the counterparty set cannot make the ledger drift.
 ///
+/// Deliberately unbounded on the debit side. It reads as an unbounded scan,
+/// but the set cannot outgrow the addresses that ever held a balance — 1 484
+/// rows on the live pool as of 2026-09-10 — and the sweep stops as soon as the
+/// credits are absorbed. A `LIMIT` here would need a number nothing justifies,
+/// and picking one too small silently leaves credits unpaired. Revisit if the
+/// address count ever reaches a scale where one nightly read of it matters.
+///
 /// Consumer: `bp-pplns-engine::sweep::DustSweepRunner`.
 pub async fn find_pplns_sweep_candidates(
     pool: &PgPool,

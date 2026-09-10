@@ -262,8 +262,8 @@ impl PplnsEngine {
             min_payout_sats = config.min_payout_sats.0,
             fee_percent = config.fee_percent,
             dust_sweep_enabled = config.dust_sweep_enabled,
+            // One field, not two: the window's age rule reads the same knob.
             abandoned_balance_days = config.abandoned_balance_days,
-            window_max_age_days = config.abandoned_balance_days,
             background_tasks,
             "pplns-engine spawned"
         );
