@@ -41,10 +41,15 @@ const FETCH_CHUNK: usize = 500;
 /// reader must fail fast instead — "no answer" is already a handled
 /// state everywhere this crate is consumed, and a minutes-long hang on
 /// `/api/pool` or the liveness sweep is strictly worse than an error.
-const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Public because the front's live-session reader in the binary reads
+/// under the same bound, for the same cron.
+pub const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Run one Redis round-trip under [`ROUND_TRIP_TIMEOUT`].
-async fn bounded<T>(
+/// Run one Redis round-trip under [`ROUND_TRIP_TIMEOUT`]. The one
+/// implementation of "fail fast on a dead connection" for every live
+/// read — this crate's and the binary's live-session reader alike.
+pub async fn bounded<T>(
     fut: impl Future<Output = Result<T, redis::RedisError>>,
 ) -> Result<T, LiveReadError> {
     match tokio::time::timeout(ROUND_TRIP_TIMEOUT, fut).await {

@@ -7,11 +7,16 @@
 //! `boot.rs` / `engines.rs` / `hooks.rs`:
 //!
 //! 1. **`kill_dead_clients`** (every 60 s) — soft-deletes `client_entity`
-//!    rows past the 5-minute birth grace whose `client:live:*` hash is
-//!    gone. Catches sessions whose disconnect path didn't fire cleanly
-//!    (network drop without a clean FIN). Candidates from
-//!    `bp_db::find_stale_active_sessions`, verdict from Redis key
-//!    existence, soft-delete via `bp_db::soft_delete_sessions`.
+//!    rows past the 5-minute birth grace whose session no front holds any
+//!    more. Catches sessions whose disconnect path didn't fire cleanly
+//!    (network drop without a clean FIN, a front that restarted). The
+//!    verdict comes first-hand from the fronts' published live set
+//!    (`crate::live_sessions`): a session a front still holds is alive
+//!    whatever its share flow says. Only where no front publishes
+//!    sessions does the older rule decide — `client:live:*` hash gone on
+//!    two consecutive passes. Candidates from
+//!    `bp_db::find_stale_active_sessions`, soft-delete via
+//!    `bp_db::soft_delete_sessions`.
 //! 2. **`invitation_expiry`** (hourly) — flips
 //!    `pplns_group_invitation` rows from `pending → expired` past their
 //!    `expiresAt`. Lives in `bp_group_mgmt_engine::cron`.
@@ -75,6 +80,7 @@ use tracing::{info, warn};
 use crate::boot::FoundationHandles;
 use crate::hooks::ProductionHooks;
 use crate::listeners::ListenerHandles;
+use crate::live_sessions::RedisLiveSessions;
 
 /// Tick of the `kill_dead_clients` poller.
 const KILL_DEAD_TICK: Duration = Duration::from_secs(60);
@@ -417,13 +423,13 @@ pub(crate) async fn spawn(
 /// never immediately, so we don't race a just-spawned session that
 /// hasn't had its first `updatedAt` write yet.
 ///
-/// Two-step verdict since the live fields moved to Redis: `updatedAt`
-/// is only stamped at birth/re-register/soft-delete, so age alone means
-/// "past the birth grace", not "silent". A candidate is dead only when
-/// its `client:live:*` hash is ALSO gone (no touch flush refreshed the
-/// TTL for 5 minutes). ⚠️ Fail-open on Redis trouble: "cannot ask" must
-/// skip the tick, never sweep — sweeping actively-hashing miners is the
-/// exact bug the two-step shape exists to prevent.
+/// `updatedAt` is only stamped at birth/re-register/soft-delete, so age
+/// alone means "past the birth grace", not "dead". The verdict on a
+/// candidate is the fronts' published live set first (a held session is
+/// alive, full stop) and the `client:live:*` hash second, where no front
+/// publishes sessions — see [`sweep_dead_sessions_once`]. ⚠️ Fail-open on
+/// Redis trouble: "cannot ask" must skip the tick, never sweep — sweeping
+/// connected miners is the exact bug this shape exists to prevent.
 fn spawn_kill_dead_clients_loop(
     pool: PgPool,
     redis: redis::aio::ConnectionManager,
@@ -472,10 +478,16 @@ fn spawn_kill_dead_clients_loop(
 /// Bounded by the candidate count, replaced wholesale every pass.
 type StrikeSet = std::collections::HashSet<(String, String, String)>;
 
-/// How far back the repair half looks for a session it should un-delete.
-/// Generous enough to survive several failed passes, bounded so the
-/// query stays small (the rows are hard-deleted after 2 h anyway).
-const REVIVE_LOOKBACK: Duration = Duration::from_secs(15 * 60);
+/// How far back the repair half looks for a session it should un-delete:
+/// the whole life of a soft-deleted row. Past
+/// [`CLIENT_HARD_DELETE_RETENTION`] the row is gone and there is nothing
+/// left to un-delete; anything shorter is a window in which a wrong
+/// soft-delete turns permanent. It was 15 minutes — measured 2026-09-10
+/// on prod, a miner that paused ~70 min with its socket open was retired
+/// and never revived. The query stays small either way — measured the
+/// same day on prod: 120 rows soft-deleted in the last 20 minutes, 898
+/// in the last two hours, against 712 active rows.
+const REVIVE_LOOKBACK: Duration = CLIENT_HARD_DELETE_RETENTION;
 
 /// What one reconcile pass did.
 struct SweepOutcome {
@@ -491,13 +503,19 @@ impl SweepOutcome {
 
 /// One reconcile pass between the birth rows and the live hashes.
 ///
-/// **Kill half.** Candidates come from PG (past the birth grace), the
-/// verdict from the live key — but only a session whose key was missing
-/// on TWO consecutive passes is swept. One observation is not evidence:
-/// after a Redis restart the keyspace is legitimately empty (the live
-/// hashes are deliberately excluded from the backup allowlist) until the
-/// next touch flush repopulates it 30 s later, and a single-observation
-/// sweep landing in that window would retire the entire pool at once.
+/// **Kill half.** Candidates come from PG (past the birth grace). The
+/// verdict is first-hand where it can be: a session that a front still
+/// holds — published by the process with the socket, see
+/// `crate::live_sessions` — is alive, whatever its share flow says. That
+/// is what keeps a miner that pauses with its connection open (standby
+/// overnight, a slow rig) from being retired. Where no front publishes
+/// sessions, the live key decides — and only a session whose key was
+/// missing on TWO consecutive passes is swept. One observation is not
+/// evidence: after a Redis restart the keyspace is legitimately empty
+/// (the live hashes are deliberately excluded from the backup allowlist)
+/// until the next touch flush repopulates it 30 s later, and a
+/// single-observation sweep landing in that window would retire the
+/// entire pool at once.
 ///
 /// **Repair half.** A session soft-deleted within [`REVIVE_LOOKBACK`]
 /// whose live hash has been written SINCE the soft-delete kept mining
@@ -533,6 +551,14 @@ async fn sweep_kill_half(
         strikes.clear();
         return Ok(0);
     }
+    // `Err` is "cannot ask" and aborts the pass like any other Redis
+    // failure; `None` is "no front publishes sessions" (a front on the
+    // previous binary, a Redis just restarted) and leaves the key verdict
+    // below in charge, which is all this cron had before.
+    let held = RedisLiveSessions::new(redis.clone())
+        .sessions()
+        .await
+        .map_err(|e| format!("front live set: {e}"))?;
     let alive = bp_client_live::live_keys_exist(Some(redis), &candidates)
         .await
         .map_err(|e| format!("live-key check: {e}"))?;
@@ -542,7 +568,16 @@ async fn sweep_kill_half(
     let mut client_names = Vec::new();
     let mut session_ids = Vec::new();
     for (c, alive) in candidates.iter().zip(alive) {
-        if alive {
+        // A front holding this session under this very device needs no
+        // second observation: the socket is open. The device has to
+        // match, not only the id — an SV1 connection may re-authorize
+        // under another worker name, and the row of the name it left
+        // must still go.
+        let held_by_a_front = held.as_ref().is_some_and(|h| {
+            h.get(c.session_id.as_str())
+                .is_some_and(|(a, w)| a == c.address.as_str() && *w == c.client_name)
+        });
+        if alive || held_by_a_front {
             continue;
         }
         let key = (
@@ -773,6 +808,33 @@ mod sweep_tests {
     const DB_TWO_STRIKE: u8 = 24;
     const DB_KEY_RETURNS: u8 = 25;
     const DB_REVIVE: u8 = 26;
+    const DB_FRONT_HOLDS: u8 = 27;
+    const DB_FRONT_OTHER_WORKER: u8 = 28;
+
+    /// A front that holds `session` under `(address, worker)`, written
+    /// through the real registry so the test exercises the same
+    /// incremental path a connect takes.
+    async fn front_holding(
+        redis: &redis::aio::ConnectionManager,
+        front_id: &str,
+        session: &str,
+        address: &str,
+        worker: &str,
+    ) {
+        use bp_share_hook::SharedSessionPersistence;
+        struct Noop;
+        #[async_trait::async_trait]
+        impl SharedSessionPersistence for Noop {
+            async fn register_session(&self, _: &str, _: &str, _: &str, _: Option<&str>) {}
+            async fn deregister_session(&self, _: &str) {}
+        }
+        let reg = crate::live_sessions::LiveSessionRegistry::new(
+            std::sync::Arc::new(Noop),
+            redis.clone(),
+            front_id,
+        );
+        reg.register_session(session, address, worker, None).await;
+    }
 
     /// The kill half queries `client_entity` pool-wide, so two of these
     /// running at once would sweep each other's fixtures — one would
@@ -970,6 +1032,93 @@ mod sweep_tests {
         assert!(
             !active(&pool, "rvvB0001").await,
             "a cleanly disconnected session must stay retired"
+        );
+
+        cleanup(&pool, addr).await;
+    }
+
+    /// The front's word outranks the key. Three sessions past their
+    /// birth grace, none of them touched: the one a front still holds
+    /// survives both passes with no live key at all — that is a miner
+    /// paused with its socket open — while the one nobody holds is
+    /// swept on the second pass, and the one with a live key survives
+    /// on the key alone, so the older verdict still stands behind the
+    /// new one.
+    ///
+    /// Fails against the key-only verdict: the held session is swept.
+    #[tokio::test]
+    async fn a_session_a_front_still_holds_is_never_swept() {
+        let _guard = SWEEP_LOCK.lock().await;
+        let Some(pool) = connect_pg_or_skip().await else {
+            return;
+        };
+        let Some(mut redis) =
+            connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, DB_FRONT_HOLDS).await
+        else {
+            return;
+        };
+        let addr = "test_front_holds_addr";
+        cleanup(&pool, addr).await;
+        seed_aged(&pool, addr, "frtA0001").await; // held, no key
+        seed_aged(&pool, addr, "frtB0001").await; // nobody holds it, no key
+        seed_aged(&pool, addr, "frtC0001").await; // nobody holds it, live key
+        front_holding(&redis, "front-holds", "frtA0001", addr, "wkr").await;
+        put_live_key(&mut redis, addr, "frtC0001", 1_700_000_000_000).await;
+
+        let mut strikes = StrikeSet::new();
+        for pass in 1..=2 {
+            sweep_dead_sessions_once(&pool, &redis, 2_000, &mut strikes)
+                .await
+                .expect("pass");
+            assert!(
+                active(&pool, "frtA0001").await,
+                "pass {pass}: a session the front holds must not be swept, \
+                 whatever its share flow"
+            );
+        }
+        assert!(
+            !active(&pool, "frtB0001").await,
+            "the session no front holds is swept on the second pass"
+        );
+        assert!(
+            active(&pool, "frtC0001").await,
+            "a live key still counts where the front says nothing"
+        );
+
+        cleanup(&pool, addr).await;
+    }
+
+    /// Held is not enough: the front has to hold the session under the
+    /// row's own device. An SV1 connection can re-authorize under a new
+    /// worker name, and the row of the name it left is dead even though
+    /// its session id is very much alive.
+    ///
+    /// Fails against a match on the session id alone.
+    #[tokio::test]
+    async fn a_session_held_under_another_worker_is_swept() {
+        let _guard = SWEEP_LOCK.lock().await;
+        let Some(pool) = connect_pg_or_skip().await else {
+            return;
+        };
+        let Some(redis) =
+            connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, DB_FRONT_OTHER_WORKER).await
+        else {
+            return;
+        };
+        let addr = "test_front_other_addr";
+        cleanup(&pool, addr).await;
+        seed_aged(&pool, addr, "frtD0001").await; // row says worker "wkr"
+        front_holding(&redis, "front-other", "frtD0001", addr, "renamed").await;
+
+        let mut strikes = StrikeSet::new();
+        for _ in 1..=2 {
+            sweep_dead_sessions_once(&pool, &redis, 2_000, &mut strikes)
+                .await
+                .expect("pass");
+        }
+        assert!(
+            !active(&pool, "frtD0001").await,
+            "the row of the worker name the session left must be swept"
         );
 
         cleanup(&pool, addr).await;
