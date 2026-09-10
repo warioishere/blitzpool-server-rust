@@ -1173,43 +1173,73 @@ async fn an_inert_entry_does_not_block_the_buckets_behind_it() {
 }
 
 /// The bucket currently taking shares is never dropped, however old its
-/// opening time is.
+/// opening time is and wherever it sits in the index.
 ///
 /// `NX` scoring means the index holds when a bucket OPENED. A pool slow enough
 /// that one bucket takes longer than the cutoff to fill would otherwise have
-/// the trim remove it while shares are still going into it. The active bucket
-/// is identified from the counter rather than by "stop at the last entry".
+/// the trim remove it while shares are still going into it.
+///
+/// The active bucket is identified from the counter, not by "spare the last
+/// entry" — and the fixture is built so only the counter gives the right
+/// answer. The active bucket is opened by a REPLAYED share whose accept time
+/// is older than the completed bucket before it, so it sorts FIRST. A rule
+/// that spares the last entry spares the wrong bucket here and drops the one
+/// still filling. An earlier version of this test put the active bucket last,
+/// where both rules agree, and so proved nothing about which one was in force.
+///
+/// Fails against the "stop at the last bucket" guard: `addr_b` is gone and
+/// `addr_a` survives.
 #[tokio::test]
 async fn the_currently_filling_bucket_is_never_dropped() {
     let Some(mut conn) = connect_or_skip(21).await else {
         return;
     };
-    // bucket_shares = 100 so everything below lands in bucket 0 and it stays
-    // the active one throughout.
-    let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 100, 90);
+    // One share per bucket, so the second share opens the active bucket.
+    let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 1, 90);
 
-    // Opened 100 days ago, still filling.
+    // Bucket 1: opened 100 days ago, past the cutoff. Active while it is the
+    // only bucket, so its own append must not drop it.
     store
         .record_share(None, "addr_a", 10.0, ms_ago(100))
         .await
         .unwrap();
+    let index: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
+    assert_eq!(
+        index,
+        vec!["1"],
+        "precondition: the aged bucket is active and stays"
+    );
+
+    // Bucket 2: the active one from here on, opened by a replayed share from
+    // 101 days ago — older by score than bucket 1, so it is the index HEAD.
+    // Bucket 1 is now complete and aged; it is the one that has to go.
     store
-        .record_share(None, "addr_b", 10.0, ms_ago(0))
+        .record_share(None, "addr_b", 10.0, ms_ago(101))
         .await
         .unwrap();
 
     let index: Vec<String> = conn.zrange(KEY_BUCKETS, 0, -1).await.unwrap();
     assert_eq!(
         index,
-        vec!["0"],
-        "precondition: one bucket, and it is active"
+        vec!["2"],
+        "the completed, aged bucket 1 is dropped and the active bucket 2 stays \
+         although it sorts first and is older — got {index:?}"
+    );
+    let score: f64 = conn.zscore(KEY_BUCKETS, "2").await.unwrap();
+    assert!(
+        score < ms_ago(100) as f64,
+        "the survivor is the one that sorted FIRST, score {score}"
     );
 
     let by_addr: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await.unwrap();
     assert!(
-        by_addr.contains_key("addr_a") && by_addr.contains_key("addr_b"),
-        "the open bucket keeps both shares, got {by_addr:?}"
+        !by_addr.contains_key("addr_a"),
+        "the aged bucket's share must be gone, got {by_addr:?}"
+    );
+    assert!(
+        by_addr.contains_key("addr_b"),
+        "the open bucket keeps its share, got {by_addr:?}"
     );
     let total: String = conn.get(KEY_WINDOW_TOTAL).await.unwrap();
-    assert!((total.parse::<f64>().unwrap() - 20.0).abs() < 1e-9);
+    assert!((total.parse::<f64>().unwrap() - 10.0).abs() < 1e-9);
 }

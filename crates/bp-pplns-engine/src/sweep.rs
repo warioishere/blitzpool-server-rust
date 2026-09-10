@@ -6,12 +6,13 @@
 //!
 //! Algorithm:
 //!
-//! 1. Load the candidate rows (`bp_db::find_pplns_sweep_candidates`):
-//!    every `balanceSats != 0` row that is either an abandoned CREDIT
-//!    (`lastAcceptedShareAt` older than `abandoned_days`) or a DEBIT of
-//!    any age. The inactivity window judges the credit side only — the
-//!    debit is the counterparty, and it belongs by construction to
-//!    someone who was mining when the credit was withheld.
+//! 1. Load every open row (`bp_db::find_pplns_balances_with_open_balance`,
+//!    the same read the distribution builder uses) and keep, on the
+//!    credit side, only rows whose `lastAcceptedShareAt` is older than
+//!    `abandoned_days`. Debits stay whatever their age: a debit is the
+//!    counterparty, and it belongs by construction to someone who was
+//!    mining when the credit was withheld. That filter lives in
+//!    `sweep_pairs` and nowhere else — the query does not repeat it.
 //! 2. Split: credits (balance > 0, desc) ↔ debits (balance < 0, by
 //!    absolute value desc).
 //! 3. Walk greedy: for each pair `amount = min(credit, |debit|)`.
@@ -46,7 +47,7 @@ use std::time::Duration;
 use bp_common::{AddressId, Sats};
 use bp_cron_utils::BlockHeightGen;
 use bp_db::{
-    bulk_insert_pplns_payout_history, find_pplns_sweep_candidates,
+    bulk_insert_pplns_payout_history, find_pplns_balances_with_open_balance,
     update_pplns_balance_sats_if_unchanged, DbError, PayoutHistoryInsert, PplnsBalanceRow,
 };
 use chrono::DateTime;
@@ -111,9 +112,7 @@ impl<C: Clock> DustSweepRunner<C> {
     }
 
     /// Epoch-ms before which a balance row's owner counts as abandoned. The
-    /// one place that turns `abandoned_days` into a boundary — the SQL
-    /// predicate and the pairing both take it from here, so they cannot drift
-    /// apart on `<` versus `<=`.
+    /// one place that turns `abandoned_days` into a boundary.
     fn cutoff_ms(&self, now_ms: i64) -> i64 {
         now_ms - (self.abandoned_days as i64) * 86_400_000
     }
@@ -123,9 +122,8 @@ impl<C: Clock> DustSweepRunner<C> {
     pub async fn sweep(&self) -> Result<SweepStats, SweepError> {
         let now = self.clock.now();
         let now_ms = now.timestamp_millis();
-        let cutoff_ms = self.cutoff_ms(now_ms);
 
-        let candidates = find_pplns_sweep_candidates(&self.pool, cutoff_ms).await?;
+        let candidates = find_pplns_balances_with_open_balance(&self.pool).await?;
         self.sweep_pairs(candidates, now_ms, now).await
     }
 
@@ -166,13 +164,12 @@ impl<C: Clock> DustSweepRunner<C> {
         };
         debits.sort_by_key(|r| (!is_abandoned(r), r.balance_sats.0));
 
-        // Writing off a claim needs the owner to be gone, and this is where
-        // the write happens — so this is where it is checked. The SQL
-        // predicate one call up says the same thing, but this method is `pub`
-        // and takes its candidates as an argument: hand it a list from
-        // anywhere else and, without this, it would cancel a still-mining
-        // miner's credit without a word. A debit needs no such test — it is
-        // the counterparty, not the claim being written off.
+        // Writing off a claim needs the owner to be gone, and this is the
+        // ONE place that is checked: the read hands over every open row,
+        // live credits included, so without this line a still-mining
+        // miner's credit would be cancelled without a word. A debit needs
+        // no such test — it is the counterparty, not the claim being
+        // written off.
         credits.retain(is_abandoned);
 
         if credits.is_empty() || debits.is_empty() {

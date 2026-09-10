@@ -469,9 +469,9 @@ impl WindowStore {
     /// not an epoch-ms. Idempotent — a converted window has no legacy score
     /// left and the call is a no-op.
     ///
-    /// This is NOT what keeps the age rule off those entries; the floor inside
-    /// the score floor inside the trim script does that, and it holds whether
-    /// or not this ever ran. What the conversion buys is the opposite: an unconverted entry is
+    /// This is NOT what keeps the age rule off those entries; the score floor
+    /// inside the trim script does that, and it holds whether or not this ever
+    /// ran. What the conversion buys is the opposite: an unconverted entry is
     /// inert **forever**, so without this the pre-existing window could never
     /// age out at all. The two split the work — the floor is the safety net,
     /// this is what starts the clock.

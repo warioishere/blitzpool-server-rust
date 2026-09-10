@@ -225,6 +225,14 @@ impl PplnsEngine {
         // Must run before the first trim, or the age rule reads ids as 1970
         // and drops the whole window. Idempotent, so it stays as a permanent
         // guard rather than a one-release migration.
+        //
+        // Deliberately NOT gated on `background_tasks`, so it runs in every
+        // role, Core included. The trim runs wherever the share stream is
+        // consumed, and that is a role question this constructor does not
+        // see: `background_tasks` is the Payout role alone, while a Stats
+        // satellite without Front consumes the stream too. A gate here could
+        // leave exactly the trimming process unconverted. The cost of running
+        // it everywhere is one empty ZRANGEBYSCORE per boot.
         window.restamp_legacy_bucket_scores().await?;
         let dist_cfg = DistributionConfig::from_engine_config(&config);
         let distribution_builder = DistributionBuilder::new(pool.clone(), window.clone(), dist_cfg);

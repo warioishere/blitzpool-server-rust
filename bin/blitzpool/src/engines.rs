@@ -232,6 +232,9 @@ async fn spawn_pplns(
     let pool = handles.db.pool().clone();
     // Core runs read-only (no touch-flush / dust-sweep crons) — it only
     // reads the window for the PayoutResolver's coinbase distributions.
+    // Read-only after boot, that is: the constructor's one-shot window
+    // passes (aggregate bootstrap, bucket-score conversion) run in every
+    // role, and `PplnsEngine::spawn_inner` says why they are not gated.
     let engine = if core {
         PplnsEngine::spawn_core(engine_cfg, redis, pool, net_diff).await?
     } else {
