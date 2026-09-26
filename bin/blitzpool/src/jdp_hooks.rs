@@ -81,7 +81,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::pow::CompactTarget;
 use bitcoin::{BlockHash, Network as BitcoinNetwork, TxMerkleNode};
 use bp_bitcoin::BitcoinRpc;
-use bp_common::{AddressId, StreamKind};
+use bp_common::{AddressId, PayoutIdentity, StreamKind};
 use bp_mining_job::assemble_witness_coinbase;
 use bp_stratum_v2::jdp::client::{
     parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, SolutionHeader,
@@ -388,7 +388,42 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
             // template revenue into the designated output, so the pool's only
             // enforcement is "some sats went to that script" — which is enough
             // precisely because shorting it shorts the miner itself.
-            [only] if only.address == miner_address.as_str() => only.address.clone(),
+            //
+            // `payout_id()` for the "is this me?" test — that is an identity
+            // comparison against what the JDC authenticated as, and it is
+            // height-invariant. What gets DESIGNATED is a different question and
+            // is answered by the `match` below, not by this string.
+            [only] if only.payout_id() == miner_address.as_str() => match &only.identity {
+                PayoutIdentity::Static { address } => address.clone(),
+                // SV2 JDP/AllocateMiningJobToken.Success designates ONE locking
+                // script, once, at allocate time — before any template exists, so
+                // there is no height to derive at and no way to change it per
+                // block. A rotating identity therefore cannot be served on the
+                // base protocol.
+                //
+                // **A REFUSAL, not a fallback**, in the sense `jdp_distribution_for`
+                // established for Blockparty. The two answers available here are
+                // both wrong: designating a script derived at some chosen index
+                // pins every future block to that one index — rotation in name
+                // only, and a miner who configured an xpub would never see the
+                // second address — while designating the `payout_id`'s script is
+                // not a script at all (a `payout_id` is a hash, not an address).
+                // Refusing the token costs this JDC its custom job selection and
+                // pays it correctly through ext 0x0003 or the mining path
+                // instead; guessing costs it the rotation it asked for, silently.
+                PayoutIdentity::Rotating { .. } => {
+                    warn!(
+                        user_identifier,
+                        payout_id = only.payout_id(),
+                        "JDP allocate: this miner's payout identity rotates per block, which \
+                         SV2 JDP/AllocateMiningJobToken.Success's single designated output \
+                         cannot express — refusing the token; use ext 0x0003"
+                    );
+                    return AllocateOutcome::Refused {
+                        reason: "base-protocol JDP cannot express a rotating payout identity",
+                    };
+                }
+            },
             // A single payee who is SOMEBODY ELSE. The resolver routing the
             // block away from the miner is a guard — today the pending
             // Blockparty route, which sends 100 % to the pool fee address so
@@ -403,7 +438,7 @@ impl JdpAllocateResolver for ProductionJdpAllocateResolver {
             [only] => {
                 warn!(
                     user_identifier,
-                    routed_to = %only.address,
+                    routed_to = only.payout_id(),
                     "JDP allocate: this miner's block is routed to another payee, which the base \
                      protocol cannot enforce (the JDC would satisfy the designated output with \
                      1 sat) — refusing the token; use ext 0x0003"
@@ -1592,10 +1627,7 @@ mod base_allocate_tests {
         let payouts = Arc::new(FixedPayouts {
             entries: entries
                 .iter()
-                .map(|(a, s)| PayoutEntry {
-                    address: a.to_string(),
-                    sats: *s,
-                })
+                .map(|(a, s)| PayoutEntry::static_address(a.to_string(), *s))
                 .collect(),
             asked_at: StdMutex::new(Vec::new()),
             stream,

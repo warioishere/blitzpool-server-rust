@@ -31,6 +31,8 @@ pub enum BlockpartyServiceError {
     InvalidName,
     #[error("address is invalid or missing")]
     InvalidAddress,
+    #[error("an xpub identity cannot be in a blockparty: it pays fixed addresses only")]
+    RotatingIdentity,
     #[error("email is invalid or missing")]
     InvalidEmail,
     #[error("percentBp out of range (must be 100..=10000)")]
@@ -85,6 +87,7 @@ impl BlockpartyServiceError {
             Self::NotMember => "not-member",
             Self::InvalidName => "invalid-name",
             Self::InvalidAddress => "invalid-address",
+            Self::RotatingIdentity => "rotating-identity-not-supported",
             Self::InvalidEmail => "invalid-email",
             Self::InvalidPercent => "invalid-percent",
             Self::InvalidSplitsSum => "invalid-splits-sum",

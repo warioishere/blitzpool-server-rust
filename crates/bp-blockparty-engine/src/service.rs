@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::cache::BlockpartyCache;
 use crate::error::BlockpartyServiceError;
 use crate::hooks::BlockpartyHooks;
-use crate::util::normalize_address;
+use crate::util::{normalize_address, normalize_enrolled_address};
 use bp_common::now_ms;
 
 // ─── Config + result types ─────────────────────────────────────────
@@ -353,7 +353,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
     ) -> Result<BlockpartyCreateResult, BlockpartyServiceError> {
         validate_name(name)?;
         validate_percent_bp(admin_percent_bp)?;
-        let admin_addr = normalize_address(admin_address)?;
+        let admin_addr = normalize_enrolled_address(admin_address)?;
 
         // Unified onboarding gate: the admin address must be verified by a
         // confirmed email OR a signature ownership proof. The verified email
@@ -452,7 +452,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         assert_editable(&group)?;
         validate_percent_bp(percent_bp)?;
 
-        let address = normalize_address(member_address)?;
+        let address = normalize_enrolled_address(member_address)?;
         if address == group.admin_address {
             return Err(BlockpartyServiceError::AdminCannotRejoin);
         }
@@ -600,7 +600,7 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             .ok_or(BlockpartyServiceError::NotFound)?;
         assert_editable(&group)?;
 
-        let address = normalize_address(member_address)?;
+        let address = normalize_enrolled_address(member_address)?;
         if address == group.admin_address {
             return Err(BlockpartyServiceError::AdminCannotRejoin);
         }

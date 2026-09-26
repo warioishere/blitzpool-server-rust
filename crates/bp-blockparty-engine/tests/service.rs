@@ -999,3 +999,109 @@ async fn update_rental_hint_sets_cleans_and_clears() {
 
     cleanup(&pool, name, admin).await;
 }
+
+// ── Rotating (xpub) identities are refused at every enrolment door ─────────
+//
+// The payout resolver refuses a Blockparty distribution holding a rotating
+// identity and serves the WHOLE party no job while that miner is connected.
+// So the id must never become a member: not as the admin at creation, not by
+// the admin's add, not by the self-join link. Each door is driven with a real
+// payout id (minted by intake from a published BIP-32 test vector) AND, on the
+// same door, a plain address that goes through — so a refusal cannot come from
+// a precondition that did not hold.
+
+/// BIP-32 test vector 1 master public key (published, no funds).
+const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+
+fn rotating_payout_id() -> String {
+    bp_payout_descriptor::RotatingPayout::from_xpub_str(XPUB)
+        .expect("test vector xpub")
+        .payout_id()
+        .as_str()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_rotating_identity_is_refused_at_every_enrolment_door() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let rotating = rotating_payout_id();
+    let name = "bp-test-rotating-refused";
+    let admin = "bc1qadminrotating1";
+    let dave = "bc1qdaverotating1";
+    let erin = "bc1qerinrotating1";
+    let refused_name = "bp-test-rotating-admin";
+    cleanup(&pool, name, admin).await;
+    // A run against code without the check creates this one; clear it so the
+    // next run measures the check, not the leftovers.
+    cleanup(&pool, refused_name, &rotating).await;
+    for a in [dave, erin, rotating.as_str()] {
+        let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+            .bind(a)
+            .execute(&pool)
+            .await;
+    }
+    let svc = svc(&pool);
+
+    // Door 1: creation, with the rotating id as the admin.
+    let err = svc
+        .create_group(refused_name, &rotating, 5_000)
+        .await
+        .expect_err("a rotating admin must be refused");
+    assert_eq!(err.code(), "rotating-identity-not-supported");
+    assert!(
+        bp_db::find_blockparty_group_by_name(&pool, refused_name)
+            .await
+            .unwrap()
+            .is_none(),
+        "no party was created"
+    );
+    // Control on the same door: a plain admin address creates the party.
+    let create = svc.create_group(name, admin, 5_000).await.expect("create");
+
+    // Door 2: the admin's add.
+    let err = svc
+        .add_member(create.group.id, &rotating, 2_000, Some(&create.admin_token))
+        .await
+        .expect_err("a rotating member must be refused");
+    assert_eq!(err.code(), "rotating-identity-not-supported");
+    svc.add_member(create.group.id, dave, 2_000, Some(&create.admin_token))
+        .await
+        .expect("a plain address is added");
+
+    // Door 3: the self-join link.
+    let link = svc
+        .create_join_link(
+            create.group.id,
+            OpenInviteTtl::SevenDays,
+            Some(&create.admin_token),
+        )
+        .await
+        .expect("create_join_link");
+    let err = svc
+        .join_via_link(&link, &rotating)
+        .await
+        .expect_err("a rotating id must not join");
+    assert_eq!(err.code(), "rotating-identity-not-supported");
+    svc.join_via_link(&link, erin)
+        .await
+        .expect("a plain address joins");
+
+    // Nothing of the rotating id reached the roster.
+    let members = svc.list_members(create.group.id).await.unwrap();
+    assert!(members.iter().all(|m| m.address.as_str() != rotating));
+    assert_eq!(members.len(), 3, "admin + dave + erin");
+
+    cleanup(&pool, name, admin).await;
+    for a in [dave, erin] {
+        let _ = sqlx::query("DELETE FROM blockparty_member WHERE address = $1")
+            .bind(a)
+            .execute(&pool)
+            .await;
+    }
+    let _ = sqlx::query("DELETE FROM blockparty_join_link WHERE token = $1")
+        .bind(&link)
+        .execute(&pool)
+        .await;
+}

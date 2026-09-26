@@ -24,10 +24,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bp_coinbase_snapshot::{
-    build_and_snapshot, share_map_from_redis_hash, BuildRequest, StoredWeightSnapshot,
+    build_and_snapshot, resolve_derived_keys, share_map_from_redis_hash, BuildRequest,
+    InstalledResolver, StoredWeightSnapshot,
 };
 use bp_common::{AddressId, Sats};
-use bp_db::{find_group, DbError};
+use bp_db::{find_group, list_active_pplns_groups, DbError, PplnsGroupRow};
 use bp_inflight_cache::InflightResultCache;
 use bp_pplns::{WeightBuildError, WeightDistribution, WithheldValue};
 use sqlx::PgPool;
@@ -121,6 +122,10 @@ pub struct DistributionBuilder {
     round: GroupRoundStore,
     config: DistributionConfig,
     cache: InflightResultCache<CacheKey, DistributionResult, DistributionError>,
+    /// Who is behind a ledger key — the **same** handle the engine settles
+    /// through. See `crate::engine::Inner::identity_resolver`; PPLNS shares its
+    /// handle with its builder for the same reason and through the same type.
+    identities: InstalledResolver,
 }
 
 impl DistributionBuilder {
@@ -139,7 +144,19 @@ impl DistributionBuilder {
             round,
             config,
             cache: InflightResultCache::new(cache_ttl),
+            identities: InstalledResolver::default(),
         }
+    }
+
+    /// Read identities through `identities` — the engine's handle, so an
+    /// `install` that happens after this builder was constructed is still seen.
+    ///
+    /// Chained rather than a constructor argument so no existing call site
+    /// changes: a builder that never gets one resolves nothing, which is the
+    /// static-only default and not a silent failure.
+    pub fn with_identities(mut self, identities: InstalledResolver) -> Self {
+        self.identities = identities;
+        self
     }
 
     /// Build the current Group-Solo distribution for a given
@@ -160,10 +177,19 @@ impl DistributionBuilder {
         let round = self.round.clone();
         let config = self.config.clone();
         let finder = finder_address.clone();
+        let identities = self.identities.clone();
         self.cache
             .get_or_compute(key, move || async move {
-                compute_distribution(&pool, &round, &config, group_id, block_reward_sats, &finder)
-                    .await
+                compute_distribution(
+                    &pool,
+                    &round,
+                    &config,
+                    group_id,
+                    block_reward_sats,
+                    &finder,
+                    &identities,
+                )
+                .await
             })
             .await
     }
@@ -185,6 +211,44 @@ impl DistributionBuilder {
 
 // ── Internals ────────────────────────────────────────────────────────
 
+/// A group's current payout shares, sanitized to `AddressId`s. Mode-aware: a
+/// PROP group reads its per-round aggregate; a Window group trims to the
+/// sliding window first, so the result is always fenster-current (even for an
+/// idle group).
+///
+/// Read here for a build and for the boot-time identity preload
+/// ([`payout_keys_in_play`]) alike, so the preload cannot come to ask about a
+/// different set of keys than a build does.
+async fn read_round_shares(
+    round: &GroupRoundStore,
+    group_row: &PplnsGroupRow,
+) -> Result<HashMap<AddressId, f64>, DistributionError> {
+    let (mode, window_ms) = crate::engine::group_mode_from_row(group_row);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let round_raw = round
+        .read_payout_shares(&group_row.id.to_string(), mode, now_ms, window_ms)
+        .await?;
+    Ok(share_map_from_redis_hash(
+        &round_raw,
+        "group-solo distribution: skipping invalid address in round state",
+    ))
+}
+
+/// Every member key a build of any non-dissolved group will ask the identity
+/// resolver about, for the boot-time preload of rotating identities. The
+/// finder is not among them: a build's finder is the miner the job is built
+/// for, which is connected, and the resolver holds a connected miner already.
+pub async fn payout_keys_in_play(
+    pool: &PgPool,
+    round: &GroupRoundStore,
+) -> Result<Vec<AddressId>, DistributionError> {
+    let mut keys = std::collections::HashSet::new();
+    for group_row in list_active_pplns_groups(pool).await? {
+        keys.extend(read_round_shares(round, &group_row).await?.into_keys());
+    }
+    Ok(keys.into_iter().collect())
+}
+
 async fn compute_distribution(
     pool: &PgPool,
     round: &GroupRoundStore,
@@ -192,6 +256,7 @@ async fn compute_distribution(
     group_id: Uuid,
     block_reward_sats: u64,
     finder_address: &AddressId,
+    identities: &InstalledResolver,
 ) -> Result<DistributionResult, DistributionError> {
     // 1. Per-group config: the finder bonus lives in the DB row, as a
     //    FRACTION of the miner cut (ppm) rather than a sats amount —
@@ -201,18 +266,8 @@ async fn compute_distribution(
         .ok_or(DistributionError::GroupNotFound { group_id })?;
     let finder_bonus_ppm = group_row.finder_bonus_ppm.unwrap_or(0).max(0) as u32;
 
-    // 2. Round state from Redis. Mode-aware: a PROP group reads its per-round
-    //    aggregate; a Window group trims to the sliding window first, so the
-    //    built distribution is always fenster-current (even for an idle group).
-    let (mode, window_ms) = crate::engine::group_mode_from_row(&group_row);
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let round_raw = round
-        .read_payout_shares(&group_id.to_string(), mode, now_ms, window_ms)
-        .await?;
-    let address_shares = share_map_from_redis_hash(
-        &round_raw,
-        "group-solo distribution: skipping invalid address in round state",
-    );
+    // 2. Round state from Redis.
+    let address_shares = read_round_shares(round, &group_row).await?;
 
     // 3-5. No ledger to read: Group-Solo carries no balances (see the
     //      crate docs), so the empty map is what the shared builder
@@ -223,6 +278,20 @@ async fn compute_distribution(
         .fee_address
         .as_ref()
         .ok_or(DistributionError::NoFeeAddress)?;
+
+    // Who is behind these keys. The round's members **and the finder**: the
+    // finder is this mode's `bootstrap_claimant`, and `build.rs` inserts the
+    // claimant AFTER the payability retain and re-runs the build — so a rotating
+    // finder missing from this set is dropped by that retain, on an empty round,
+    // which is the one case where they are the only entry there is. An empty
+    // round is routine here, not exotic (every reset DELs the by-address hash).
+    let derived_payout_keys = resolve_derived_keys(
+        identities,
+        address_shares.keys().chain(std::iter::once(finder_address)),
+        "group-solo",
+    )
+    .await;
+
     let group_key = group_id.to_string();
     let mut conn_fp = round.connection_for_snapshot();
     let built = build_and_snapshot(
@@ -253,6 +322,7 @@ async fn compute_distribution(
             // overpaid, so nothing has to be remembered until the next
             // block — which is what lets this mode run without a ledger.
             withheld_value: WithheldValue::ToPool,
+            derived_payout_keys,
             scope: "group-solo",
         },
         &mut conn_fp,
@@ -327,6 +397,9 @@ mod tests {
             finder_address: Some(&finder),
             reference_revenue_sats: 312_500_000,
             withheld_value: WithheldValue::ToPool,
+            // A literal address: nothing derived, which is the pre-rotation shape
+            // this clone test was written against.
+            derived_payout_keys: &std::collections::HashSet::new(),
         })
         .unwrap();
         let r = DistributionResult {

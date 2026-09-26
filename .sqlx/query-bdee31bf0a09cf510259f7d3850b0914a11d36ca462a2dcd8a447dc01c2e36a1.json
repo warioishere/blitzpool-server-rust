@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO miner_identity (\"payoutId\", kind, descriptor, \"createdAt\", \"updatedAt\")\n           VALUES ($1, 'rotating', $2, $3, $3)\n           ON CONFLICT (\"payoutId\") DO UPDATE SET\n             kind = 'rotating',\n             descriptor = EXCLUDED.descriptor,\n             address = NULL,\n             \"updatedAt\" = EXCLUDED.\"updatedAt\"",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bdee31bf0a09cf510259f7d3850b0914a11d36ca462a2dcd8a447dc01c2e36a1"
+}

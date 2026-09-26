@@ -13,6 +13,9 @@ workspace = true
 [dependencies]
 # Internal — pure domain types + token primitives.
 bp-common = { workspace = true }
+# `is_payout_id` only: enrolment refuses a rotating identity, and the
+# spelling of one is that crate's to define.
+bp-payout-descriptor = { workspace = true }
 bp-blockparty = { workspace = true }
 # Reuse: token gen/hash + base64url helpers + Error model shape.
 bp-group-mgmt = { workspace = true }

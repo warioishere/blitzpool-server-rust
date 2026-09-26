@@ -41,15 +41,16 @@
 //! pool-neutral. The wire `dust_limit` is therefore the consensus
 //! floor ([`DUST_LIMIT_SATS`]), not the pool's operational threshold.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bp_common::{AddressId, Sats};
 use bp_share::weights_fingerprint_from_parts;
 
 use crate::weight::{
-    is_valid_payout_address, output_weight_for_address, BUDGET_SAFETY_MARGIN_WU,
-    COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT, COINBASE_WITNESS_COMMITMENT_WEIGHT,
-    DEFAULT_COINBASE_WEIGHT_BUDGET, DUST_LIMIT_SATS, MAX_FINDER_BONUS_PPM,
+    is_payable_payout_key, is_valid_payout_address, output_weight_for_payout_key,
+    BUDGET_SAFETY_MARGIN_WU, COINBASE_BASE_WEIGHT, COINBASE_OUTPUT_WEIGHT,
+    COINBASE_WITNESS_COMMITMENT_WEIGHT, DEFAULT_COINBASE_WEIGHT_BUDGET, DUST_LIMIT_SATS,
+    MAX_FINDER_BONUS_PPM,
 };
 use crate::BudgetTelemetry;
 
@@ -233,6 +234,35 @@ pub struct WeightDistributionInput<'a> {
     /// See [`WithheldValue`] — this is the one knob that decides whether
     /// the mode needs a ledger.
     pub withheld_value: WithheldValue,
+    /// **Payout keys the coinbase pays by deriving a script, not by parsing
+    /// the key as an address.**
+    ///
+    /// Without this the build's own sanity filter deletes them: a derived
+    /// key is a hash, `bitcoin::Address` cannot parse it, and the row goes
+    /// — above the score total every other miner's claim is divided by. So
+    /// the money does not stay put: the survivors divide by a smaller
+    /// denominator and are paid the dropped miner's share. Under PPLNS the
+    /// dropped miner still holds its ledger balance, so the pool then owes
+    /// more than the block paid; under Group-Solo there is no ledger at all
+    /// and the loss is permanent.
+    ///
+    /// Note this is **not** a [`WithheldValue`] case, which is a decision
+    /// about an entry that has a score weight and lost its output further
+    /// down (`min_payout`, the blockspace cut). A dropped row never reaches
+    /// it. Measured, because an earlier version of this doc had it wrong:
+    /// `tests::an_unvouched_group_solo_member_donates_its_half_to_the_other_member`.
+    ///
+    /// It is **data on the request** and not a callback on purpose (plan
+    /// Decision 8 part 2): [`build_weight_distribution`] is a pure function
+    /// of its input, the caller resolves these keys once for the build, and
+    /// the same set feeds this filter, the weight estimate
+    /// ([`output_weight_for_payout_key`]) and the coinbase lowering — three
+    /// readers that cannot disagree because there is one answer.
+    ///
+    /// Empty is the correct value for a pool with no rotating identities,
+    /// and it is also the safe degradation if the resolver cannot answer:
+    /// see [`is_payable_payout_key`].
+    pub derived_payout_keys: &'a HashSet<String>,
 }
 
 /// Why a weight distribution could not be built.
@@ -359,12 +389,21 @@ pub fn build_weight_distribution(
     // on every single block, forever.
     let is_fee = |a: &AddressId| a.as_str() == input.fee_address.as_str();
 
+    // "Payable" has two forms — a literal address, and a key the pool pays by
+    // deriving a script for it. One closure, read by all three filters below and
+    // spelled once, because the three of them dropping *different* rows is a
+    // distribution whose claims and outputs disagree.
+    //
+    // The fee address above is deliberately NOT this: the pool output is the
+    // operator's own configured address, it is never derived, and accepting a
+    // derived key there would mean the pool's residual `pay_P` went to a script
+    // the operator cannot spend.
+    let is_payable = |a: &AddressId| is_payable_payout_key(a.as_str(), input.derived_payout_keys);
+
     let mut scored: Vec<(&AddressId, f64)> = input
         .address_shares
         .iter()
-        .filter(|(a, s)| {
-            s.is_finite() && **s > 0.0 && is_valid_payout_address(a.as_str()) && !is_fee(a)
-        })
+        .filter(|(a, s)| s.is_finite() && **s > 0.0 && is_payable(a) && !is_fee(a))
         .map(|(a, s)| (a, *s))
         .collect();
     scored.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
@@ -394,7 +433,7 @@ pub fn build_weight_distribution(
         );
     }
     for (address, balance) in input.balances {
-        if balance.0 == 0 || !is_valid_payout_address(address.as_str()) || is_fee(address) {
+        if balance.0 == 0 || !is_payable(address) || is_fee(address) {
             continue;
         }
         candidates
@@ -451,7 +490,7 @@ pub fn build_weight_distribution(
     let bonus_ppm = input.finder_bonus_ppm.min(MAX_FINDER_BONUS_PPM);
     if bonus_ppm > 0 && score_total > 0 {
         if let Some(finder) = input.finder_address {
-            if is_valid_payout_address(finder.as_str()) && !is_fee(finder) {
+            if is_payable(finder) && !is_fee(finder) {
                 let boost = ((score_total as u128 * bonus_ppm as u128)
                     / (1_000_000 - bonus_ppm) as u128)
                     .min(u64::MAX as u128) as u64;
@@ -585,7 +624,11 @@ pub fn build_weight_distribution(
         if c.wire_weight == 0 {
             continue;
         }
-        let ow = output_weight_for_address(c.address.as_str());
+        // Not `output_weight_for_address`: a derived payout key is a hash, so
+        // that one prices it at the 172 WU unparseable fallback instead of the
+        // 124 a `wpkh(...)` output actually costs, and this greedy loop then
+        // trims ~39 % more miners out of the block than the budget requires.
+        let ow = output_weight_for_payout_key(c.address.as_str(), input.derived_payout_keys);
         desired_weight = desired_weight.saturating_add(ow);
         if used_weight.saturating_add(ow) <= effective_budget {
             used_weight += ow;
@@ -694,6 +737,15 @@ mod tests {
         AddressId::new(s.to_string()).expect("valid test address")
     }
 
+    /// The pre-rotation shape: every ledger key below is a literal address, so
+    /// nothing here is payable by derivation. `'static` rather than a per-call
+    /// temporary because [`base_input`] hands out a borrow that outlives the
+    /// call. Tests that mean to exercise a derived key build their own set.
+    fn no_derived() -> &'static HashSet<String> {
+        static EMPTY: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(HashSet::new)
+    }
+
     const A1: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     const A2: &str = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
     const A3: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
@@ -715,6 +767,7 @@ mod tests {
             finder_address: None,
             reference_revenue_sats: 312_500_000,
             withheld_value: WithheldValue::ToOtherMiners,
+            derived_payout_keys: no_derived(),
         }
     }
 
@@ -1967,7 +2020,9 @@ mod tests {
     /// `base + margin` = 528, half of what the cut reserves.
     #[test]
     fn the_smallest_accepted_budget_still_publishes_a_worst_case_output() {
-        use crate::weight::{validate_fee_payout_budget, MIN_COINBASE_WEIGHT_BUDGET};
+        use crate::weight::{
+            output_weight_for_address, validate_fee_payout_budget, MIN_COINBASE_WEIGHT_BUDGET,
+        };
         const P2TR: &str = "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297";
         assert_eq!(
             output_weight_for_address(P2TR),
@@ -2211,5 +2266,421 @@ mod tests {
             a.fingerprint, b.fingerprint,
             "the coinbase order is not the settlement identity"
         );
+    }
+
+    // ── Keys paid by derivation (plan Phase 4b) ─────────────────────────
+    //
+    // This crate learns nothing about xpubs: a derived payout key is a
+    // string in `derived_payout_keys` and nothing else. So the fixtures below
+    // are literal `payout_id`-shaped strings — 47 chars, `xpb` + base58, which
+    // is `bp_payout_descriptor`'s real format and, more to the point, is a
+    // string `bitcoin::Address::from_str` refuses. That refusal is the whole
+    // reason the filter had to change.
+
+    /// `payout_id`-shaped: `xpb` + 44 base58 characters, which is
+    /// `bp_payout_descriptor`'s real format. Not derived from any particular
+    /// xpub, and it does not need to be — this crate is handed strings, and the
+    /// only property of one that matters here is
+    /// `assert_the_fixture_is_unparseable_as_an_address` below. Hardcoded rather
+    /// than computed because `bp-pplns` must not depend on
+    /// `bp-payout-descriptor`: that dependency direction is the feature staying
+    /// out of the weight model.
+    const ROTATING_KEY: &str = "xpbGde6AcmBoPFVk7mbMgRXUshU81Q7vkEb95vk51jQu1vc";
+    /// A second one, for the cap and capacity tests.
+    const ROTATING_KEY_2: &str = "xpb6EJcH4wJv6zHYA6PgRSN4hE2wPd4jXqCkLnMbYzKt3qB";
+
+    fn derived_set<const N: usize>(keys: [&str; N]) -> HashSet<String> {
+        keys.iter().map(|k| (*k).to_string()).collect()
+    }
+
+    /// The precondition every test in this section rests on: these keys are
+    /// exactly the class of string the old filter deleted, so a build that keeps
+    /// them is keeping them because it was told to and not because they happen
+    /// to parse. A fixture that parsed would make the whole section vacuous —
+    /// `CLAUDE.md`'s "real addresses" rule pointing the other way.
+    #[test]
+    fn the_derived_key_fixtures_are_unparseable_as_addresses() {
+        for key in [ROTATING_KEY, ROTATING_KEY_2] {
+            assert_eq!(key.len(), 47, "{key} is not payout_id-shaped");
+            assert!(
+                !is_valid_payout_address(key),
+                "{key} must be the class of string bitcoin::Address refuses"
+            );
+            assert!(
+                is_payable_payout_key(key, &derived_set([key])),
+                "and payable only because the resolver vouched for it"
+            );
+            assert!(
+                !is_payable_payout_key(key, no_derived()),
+                "and not payable otherwise"
+            );
+        }
+    }
+
+    /// **The money test.** Three miners with equal shares, one of them paid by
+    /// derivation. Two assertions, and the second is the one that catches the
+    /// bug Amendment 1 found:
+    ///
+    /// 1. the derived key is published — the precondition that pins the shape,
+    ///    because a distribution that dropped it would still be a valid
+    ///    distribution and every arithmetic assertion below would hold;
+    /// 2. the two literal miners are paid **one third each**, not one half.
+    ///
+    /// The dropped-row bug is not "a miner is missing": the deletion happens
+    /// three lines above the denominator every other claim is divided by, so
+    /// the third miner's money does not stay put — it inflates the other two.
+    /// The negative control is in this test rather than in a sibling: the same
+    /// input with an empty `derived_payout_keys` is exactly the pre-Phase-4b
+    /// behaviour, and it must fail both assertions.
+    #[test]
+    fn a_derived_key_is_paid_and_does_not_inflate_the_literal_miners_claims() {
+        const T: u64 = 312_500_000;
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0), (addr(ROTATING_KEY), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+        let derived = derived_set([ROTATING_KEY]);
+
+        let d = build_weight_distribution(WeightDistributionInput {
+            derived_payout_keys: &derived,
+            ..base_input(&shares, &balances, &fee)
+        })
+        .expect("a derived key is payable");
+
+        // (1) The precondition. Without it every assertion below is about a
+        // two-miner distribution that happens to satisfy them.
+        assert!(
+            d.entries.iter().any(|e| e.address.as_str() == ROTATING_KEY),
+            "the derived key must be IN the distribution, not filtered out of it"
+        );
+        let paid = paid_map(&d, T);
+        assert!(
+            paid.contains_key(ROTATING_KEY),
+            "and it must have a coinbase output; the script for it is derived at \
+             render time, which is not this crate's business"
+        );
+
+        // (2) The denominator. Equal shares, so the miner cut splits in three.
+        let miner_cut = T as i64 - (T as i64 * d.fee_ppm as i64) / 1_000_000;
+        let third = miner_cut / 3;
+        let half = miner_cut / 2;
+        for a in [A1, A2] {
+            let got = paid[a] as i64;
+            assert!(
+                (got - third).abs() <= 2,
+                "{a} must be paid its third of the full denominator ({third}), got {got}"
+            );
+            assert!(
+                (got - half).abs() > 2,
+                "{a} is being paid a half ({half}): the third miner's share was \
+                 deleted from the denominator instead of paid"
+            );
+        }
+
+        // The control, in the same test: this is what the filter did before
+        // Phase 4b, and it must fail both assertions above.
+        let without = build_weight_distribution(base_input(&shares, &balances, &fee))
+            .expect("the literal miners still build");
+        assert!(
+            !without
+                .entries
+                .iter()
+                .any(|e| e.address.as_str() == ROTATING_KEY),
+            "control: with nothing vouched, an unparseable key IS dropped"
+        );
+        let paid_without = paid_map(&without, T);
+        for a in [A1, A2] {
+            assert!(
+                (paid_without[a] as i64 - half).abs() <= 2,
+                "control: the dropped share inflates the survivors to a half — \
+                 which is what assertion (2) above refuses"
+            );
+        }
+    }
+
+    /// **Group-Solo's money invariant, directly.** One found block, one member,
+    /// paid by derivation, `WithheldValue::ToPool`: the pool output must be
+    /// **exactly its fee**. Under `ToPool` a dropped member's share falls into
+    /// the §4 residual, i.e. into the pool output, and Group-Solo keeps no
+    /// ledger to remember it with — so the filter dropping this member is the
+    /// pool taking the block, which `CLAUDE.md` names as the one thing it must
+    /// never do.
+    ///
+    /// The control is the same build with nothing vouched, and it shows the pool
+    /// taking essentially all of `T`.
+    #[test]
+    fn a_derived_group_solo_member_leaves_the_pool_exactly_its_fee() {
+        const T: u64 = 312_500_000;
+        let shares = HashMap::from([(addr(ROTATING_KEY), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+        let derived = derived_set([ROTATING_KEY]);
+
+        let d = build_weight_distribution(WeightDistributionInput {
+            derived_payout_keys: &derived,
+            ..pool_keeps_overflow(&shares, &balances, &fee)
+        })
+        .expect("a derived member is payable");
+        assert_eq!(
+            d.published().count(),
+            1,
+            "the precondition: the member is published, so there is a payout to \
+             compare the pool's cut against"
+        );
+
+        let entries = d.payout_entries_at(T).expect("§4 vector");
+        assert_eq!(entries[0].0, fee, "pool output first");
+        let pool_pay = entries[0].1 as i64;
+        let fee_only = (T as i64 * d.fee_ppm as i64) / 1_000_000;
+        assert!(
+            (pool_pay - fee_only).abs() <= 2,
+            "the pool must take its fee ({fee_only}) and nothing more, took {pool_pay}"
+        );
+
+        let control = build_weight_distribution(pool_keeps_overflow(&shares, &balances, &fee))
+            .expect_err("with nothing vouched and one member, there is nobody to pay");
+        assert!(
+            matches!(control, WeightBuildError::NoScoredMiners),
+            "control: dropping the only member leaves no distribution at all — \
+             which for a group with a second, literal member would instead have \
+             folded this member's whole share into the pool output"
+        );
+    }
+
+    /// The same invariant with a survivor, so the control can be **measured**
+    /// rather than inferred: two Group-Solo members, one literal and one paid by
+    /// derivation.
+    ///
+    /// # What the control actually does, against what the plan predicted
+    ///
+    /// The plan (Amendment 1, and the comment this test corrected in
+    /// `bp_coinbase_snapshot::sanitize_and_build`) said a filter-dropped
+    /// Group-Solo member's share *"becomes pool revenue"* under
+    /// [`WithheldValue::ToPool`]. Measured here, it does not: the pool takes
+    /// exactly its fee in **both** builds, and the dropped member's half is paid
+    /// to the other member.
+    ///
+    /// Two different mechanisms were being conflated, and only one of them is
+    /// [`WithheldValue`]'s:
+    ///
+    /// - the payability **retain** runs before `score_total` exists, so a
+    ///   dropped row is not a withheld entry — it is not an entry at all, and
+    ///   the survivors simply divide by a smaller denominator;
+    /// - [`WithheldValue::ToPool`] disposes of an entry that *has* a
+    ///   `score_weight` and lost its output to `min_payout` or the blockspace
+    ///   cut. That path does pay the pool, deliberately, and is unchanged by
+    ///   this feature.
+    ///
+    /// The harm is therefore a transfer **between members** that Group-Solo, by
+    /// design, keeps no ledger to reverse — the member mined and is paid nothing,
+    /// permanently. Still a money bug, still fixed by opening the filter, but not
+    /// the one the plan named. The pool's own invariant was never the one at risk
+    /// here; [`a_derived_group_solo_member_leaves_the_pool_exactly_its_fee`] is
+    /// what pins it.
+    #[test]
+    fn an_unvouched_group_solo_member_donates_its_half_to_the_other_member() {
+        const T: u64 = 312_500_000;
+        let shares = HashMap::from([(addr(A1), 1.0), (addr(ROTATING_KEY), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+        let derived = derived_set([ROTATING_KEY]);
+        let fee_only = |d: &WeightDistribution| (T as i64 * d.fee_ppm as i64) / 1_000_000;
+
+        let vouched = build_weight_distribution(WeightDistributionInput {
+            derived_payout_keys: &derived,
+            ..pool_keeps_overflow(&shares, &balances, &fee)
+        })
+        .unwrap();
+        assert_eq!(vouched.published().count(), 2, "both members published");
+        let vouched_pool = vouched.payout_entries_at(T).unwrap()[0].1 as i64;
+        assert!(
+            (vouched_pool - fee_only(&vouched)).abs() <= 2,
+            "pool takes its fee only, got {vouched_pool}"
+        );
+        let miner_cut = T as i64 - fee_only(&vouched);
+        let vouched_paid = paid_map(&vouched, T);
+        for member in [A1, ROTATING_KEY] {
+            let got = vouched_paid[member] as i64;
+            assert!(
+                (got - miner_cut / 2).abs() <= 2,
+                "{member} must be paid its half of the round ({}), got {got}",
+                miner_cut / 2
+            );
+        }
+
+        let dropped =
+            build_weight_distribution(pool_keeps_overflow(&shares, &balances, &fee)).unwrap();
+        assert_eq!(
+            dropped.published().count(),
+            1,
+            "control: one member dropped"
+        );
+        let dropped_pool = dropped.payout_entries_at(T).unwrap()[0].1 as i64;
+        assert!(
+            (dropped_pool - fee_only(&dropped)).abs() <= 2,
+            "control: the pool still takes exactly its fee — the retain runs \
+             above the score total, so WithheldValue never sees this row \
+             (pool took {dropped_pool}, fee is {})",
+            fee_only(&dropped)
+        );
+        let survivor = paid_map(&dropped, T)[A1] as i64;
+        assert!(
+            (survivor - miner_cut).abs() <= 2,
+            "control: the surviving member takes the WHOLE round ({miner_cut}), \
+             got {survivor} — the dropped member's work is donated to them and \
+             Group-Solo has no ledger to reverse it"
+        );
+    }
+
+    /// **The ~39 % capacity gate** (Decision 8 part 6). A derived key's output is
+    /// a `wpkh(...)`, so it costs [`P2WPKH_OUTPUT_WEIGHT`] — not the 172 WU
+    /// unparseable fallback the old estimator would charge a hash. Measured
+    /// end-to-end: a budget sized to fit exactly N literal P2WPKH miners fits N
+    /// derived ones.
+    ///
+    /// Both halves of the control are here. `output_weight_for_address` on the
+    /// same key still answers 172 (it has no set to consult), and a budget that
+    /// fits N at 124 WU fits fewer at 172 — so if the estimator kept taking the
+    /// string alone, the published count would drop.
+    #[test]
+    fn a_derived_key_is_costed_as_a_p2wpkh_and_not_the_unparseable_fallback() {
+        use crate::weight::{output_weight_for_address, P2WPKH_OUTPUT_WEIGHT};
+        let derived = derived_set([ROTATING_KEY]);
+        assert_eq!(
+            output_weight_for_payout_key(ROTATING_KEY, &derived),
+            P2WPKH_OUTPUT_WEIGHT,
+            "a vouched key is a wpkh output"
+        );
+        assert_eq!(
+            output_weight_for_address(ROTATING_KEY),
+            COINBASE_OUTPUT_WEIGHT,
+            "control: without the set the same string is priced as the \
+             worst-case unparseable fallback — the 39 % Decision 7 chose \
+             P2WPKH to buy"
+        );
+
+        // A budget that fits exactly N P2WPKH outputs. `worst_case_addr` is
+        // P2WSH; these have to be P2WPKH for the comparison to be about the
+        // derived key rather than about the address type.
+        const N: usize = 12;
+        let literal: Vec<String> = (0..N as u32).map(p2wpkh_addr).collect();
+        let fee = addr(FEE);
+        let balances = HashMap::new();
+        let budget = COINBASE_BASE_WEIGHT
+            + COINBASE_WITNESS_COMMITMENT_WEIGHT
+            + BUDGET_SAFETY_MARGIN_WU
+            + COINBASE_OUTPUT_WEIGHT // the pool output, priced at the fee address
+            + P2WPKH_OUTPUT_WEIGHT * N as u32;
+
+        let all_literal: HashMap<AddressId, f64> = literal.iter().map(|a| (addr(a), 1.0)).collect();
+        let literal_build = build_weight_distribution(WeightDistributionInput {
+            coinbase_weight_budget: budget,
+            min_payout_sats: None,
+            ..base_input(&all_literal, &balances, &fee)
+        })
+        .unwrap();
+        let literal_count = literal_build.published().count();
+        assert_eq!(
+            literal_count, N,
+            "the budget must fit all {N} literal P2WPKH miners, or the \
+             comparison below is against a budget that was already too small"
+        );
+
+        // The same population with one member replaced by a derived key.
+        let mut mixed: HashMap<AddressId, f64> = all_literal.clone();
+        mixed.remove(&addr(&literal[0]));
+        mixed.insert(addr(ROTATING_KEY), 1.0);
+        let mixed_build = build_weight_distribution(WeightDistributionInput {
+            coinbase_weight_budget: budget,
+            min_payout_sats: None,
+            derived_payout_keys: &derived,
+            ..base_input(&mixed, &balances, &fee)
+        })
+        .unwrap();
+        assert_eq!(
+            mixed_build.published().count(),
+            literal_count,
+            "a derived miner must cost what a P2WPKH miner costs; a 172 WU \
+             estimate here trims somebody who fits"
+        );
+        assert!(
+            mixed_build
+                .published()
+                .any(|e| e.address.as_str() == ROTATING_KEY),
+            "and the derived miner is one of the published ones"
+        );
+    }
+
+    /// A distinct, valid P2WPKH address per index — 124 WU, the weight class the
+    /// pool's descriptor template derives, so a mixed population's arithmetic is
+    /// about the identity and not about the script type. Built the same way
+    /// [`worst_case_addr`] builds its P2WSH: any 20 bytes is a valid witness
+    /// program, and these are never spent from.
+    fn p2wpkh_addr(i: u32) -> String {
+        use bitcoin::hashes::Hash as _;
+        let mut h = [0u8; 20];
+        h[..4].copy_from_slice(&i.to_le_bytes());
+        let script = bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(h));
+        bitcoin::Address::from_script(&script, bitcoin::Network::Bitcoin)
+            .expect("p2wpkh script is addressable")
+            .to_string()
+    }
+
+    /// **Group-Solo's member cap is untouched by rotation**, which the plan
+    /// asked for as a test rather than as a claim.
+    ///
+    /// Two independent reasons, and this asserts both:
+    ///
+    /// 1. [`max_coinbase_outputs`] takes a budget and no address, so there is
+    ///    nothing about an identity it could read. The signature is the proof;
+    ///    the assertion is that the answer is the same value the pre-rotation
+    ///    code got for the same budget.
+    /// 2. The cap assumes every output is [`COINBASE_OUTPUT_WEIGHT`] (172 WU)
+    ///    and a derived output is 124, so a population of derived members at
+    ///    the cap has strictly more headroom than the cap promises — never
+    ///    less. `GroupService` refusing a join past the cap therefore still
+    ///    guarantees every member fits in the coinbase, which is the invariant
+    ///    that lets Group-Solo run without a ledger.
+    #[test]
+    fn the_group_solo_member_cap_is_unchanged_by_rotating_members() {
+        use crate::weight::{max_coinbase_outputs, P2WPKH_OUTPUT_WEIGHT};
+        const BUDGET: u32 = 20_000;
+        let cap = max_coinbase_outputs(BUDGET) as usize;
+        assert!(cap > 2, "fixture sanity: {cap}");
+
+        // A whole round of derived members, one over the cap's worst case, all
+        // published: the headroom the 172-vs-124 margin buys.
+        let derived = derived_set([ROTATING_KEY, ROTATING_KEY_2]);
+        let shares = HashMap::from([(addr(ROTATING_KEY), 1.0), (addr(ROTATING_KEY_2), 1.0)]);
+        let balances = HashMap::new();
+        let fee = addr(FEE);
+        let d = build_weight_distribution(WeightDistributionInput {
+            coinbase_weight_budget: BUDGET,
+            derived_payout_keys: &derived,
+            ..pool_keeps_overflow(&shares, &balances, &fee)
+        })
+        .unwrap();
+        assert_eq!(
+            d.published().count(),
+            2,
+            "both derived members fit well inside a cap sized for {cap} \
+             worst-case outputs"
+        );
+        assert_eq!(
+            max_coinbase_outputs(BUDGET) as usize,
+            cap,
+            "the cap is a function of the budget alone — building a \
+             distribution full of rotating members cannot have moved it"
+        );
+        // A `const` block, because both sides are constants: this way the claim is
+        // checked when the crate compiles rather than when this test runs, and
+        // clippy's `assertions_on_constants` (CI runs `-D warnings`) is satisfied
+        // by the thing it asks for instead of by an `allow`.
+        const {
+            assert!(
+                P2WPKH_OUTPUT_WEIGHT < COINBASE_OUTPUT_WEIGHT,
+                "the cap's own assumption is the pessimistic one, so a derived \
+                 member can only ever be cheaper than the reservation"
+            )
+        };
     }
 }

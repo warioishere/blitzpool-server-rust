@@ -26,6 +26,14 @@ pub enum ApiError {
     InvalidAddress,
     #[error("invalid query param: {0}")]
     InvalidQuery(&'static str),
+    /// `POST /api/identity/resolve` was handed something that is not an
+    /// extended public key this pool can rotate. The intake error's own text
+    /// is not forwarded: no parser text leaves `bp-payout-descriptor`.
+    #[error("not an extended public key this pool can pay to")]
+    InvalidXpub,
+    /// `[payout_identity] allow_rotating` is off, which is the default.
+    #[error("rotating payout identities are not enabled on this pool")]
+    RotatingIdentitiesDisabled,
     #[error("group-service: {code}")]
     GroupService {
         code: &'static str,
@@ -70,6 +78,8 @@ impl ApiError {
             Self::BadRequest(_) => "bad-request",
             Self::InvalidAddress => "invalid-address",
             Self::InvalidQuery(_) => "invalid-query",
+            Self::InvalidXpub => "invalid-xpub",
+            Self::RotatingIdentitiesDisabled => "rotating-identities-disabled",
             Self::GroupService { code, .. }
             | Self::Invitation { code, .. }
             | Self::JoinRequest { code, .. }
@@ -86,9 +96,11 @@ impl ApiError {
     pub(crate) fn status(&self) -> StatusCode {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::BadRequest(_) | Self::InvalidAddress | Self::InvalidQuery(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::BadRequest(_)
+            | Self::InvalidAddress
+            | Self::InvalidQuery(_)
+            | Self::InvalidXpub => StatusCode::BAD_REQUEST,
+            Self::RotatingIdentitiesDisabled => StatusCode::FORBIDDEN,
             Self::GroupService { status, .. }
             | Self::Invitation { status, .. }
             | Self::JoinRequest { status, .. }
@@ -229,6 +241,7 @@ impl From<bp_blockparty_engine::BlockpartyServiceError> for ApiError {
             "not-member" => "not-member",
             "invalid-name" => "invalid-name",
             "invalid-address" => "invalid-address",
+            "rotating-identity-not-supported" => "rotating-identity-not-supported",
             "invalid-email" => "invalid-email",
             "invalid-percent" => "invalid-percent",
             "invalid-splits-sum" => "invalid-splits-sum",
@@ -262,6 +275,7 @@ impl From<bp_blockparty_engine::BlockpartyServiceError> for ApiError {
             B::EmailNotVerified => StatusCode::FAILED_DEPENDENCY,
             B::InvalidName
             | B::InvalidAddress
+            | B::RotatingIdentity
             | B::InvalidEmail
             | B::InvalidPercent
             | B::InvalidSplitsSum

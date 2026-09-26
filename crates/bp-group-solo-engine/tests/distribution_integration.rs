@@ -567,3 +567,105 @@ async fn distinct_rewards_for_same_group_finder_run_independently() {
 
     cleanup_group(&h.pool, h.group_id).await;
 }
+
+// ── The boot-time preload asks about the keys a build asks about ────
+
+/// Records every key a build asks the identity resolver about, and answers
+/// that each one is derived, so the build keeps them all.
+#[derive(Debug, Default)]
+struct RecordingResolver {
+    asked: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+#[async_trait::async_trait]
+impl bp_coinbase_snapshot::PayoutIdentityResolver for RecordingResolver {
+    async fn paid_at_height(
+        &self,
+        _ledger_keys: &[String],
+        height: u32,
+    ) -> Result<bp_coinbase_snapshot::PaidAtHeight, bp_coinbase_snapshot::PaidAtHeightError> {
+        Ok(bp_coinbase_snapshot::PaidAtHeight::static_only(height))
+    }
+
+    async fn derived_payout_keys(
+        &self,
+        ledger_keys: &[String],
+    ) -> std::collections::HashSet<String> {
+        self.asked
+            .lock()
+            .expect("recorder mutex")
+            .extend(ledger_keys.iter().cloned());
+        ledger_keys.iter().cloned().collect()
+    }
+}
+
+/// **The boot-time preload covers the keys a Group-Solo build resolves.** A
+/// rotating member with shares in the group's round is in play, and a build of
+/// that group asks the resolver about exactly that key, not the plain address.
+///
+/// Compared on this test's own keys: the preload walks every non-dissolved
+/// group in the shared Postgres, other tests' included.
+#[tokio::test]
+async fn the_keys_in_play_are_the_keys_a_build_resolves() {
+    let h = match spawn_or_skip(8, None).await {
+        Some(h) => h,
+        None => return,
+    };
+    const ROTATING: &str = "xpbGroupKeysInPlayCoverageTest01";
+    let finder = AddressId::new(FINDER_A).unwrap();
+    let group = h.group_id.to_string();
+    h.round
+        .record_share(None, &group, finder.as_str(), 60.0, 1)
+        .await
+        .unwrap();
+    h.round
+        .record_share(None, &group, ROTATING, 40.0, 2)
+        .await
+        .unwrap();
+    let mine = [FINDER_A, ROTATING];
+
+    let in_play: std::collections::HashSet<String> =
+        bp_group_solo_engine::distribution::payout_keys_in_play(&h.pool, &h.round)
+            .await
+            .expect("groups and rounds are readable")
+            .into_iter()
+            .map(|key| key.as_str().to_string())
+            .filter(|key| mine.contains(&key.as_str()))
+            .collect();
+    assert_eq!(
+        in_play,
+        mine.iter().map(|k| k.to_string()).collect(),
+        "both members of this group's round are in play"
+    );
+
+    let recorder = Arc::new(RecordingResolver::default());
+    let identities = bp_coinbase_snapshot::InstalledResolver::default();
+    assert!(
+        identities.install(recorder.clone()),
+        "a fresh handle takes it"
+    );
+    let dist_cfg = DistributionConfig::from_engine_config(&GroupSoloEngineConfig {
+        fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
+        ..GroupSoloEngineConfig::default()
+    });
+    DistributionBuilder::new(h.pool.clone(), h.round.clone(), dist_cfg)
+        .with_identities(identities)
+        .build(h.group_id, 312_500_000, &finder)
+        .await
+        .expect("build ok");
+    let asked: std::collections::HashSet<String> = recorder
+        .asked
+        .lock()
+        .expect("recorder mutex")
+        .iter()
+        .filter(|key| mine.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(
+        asked,
+        std::iter::once(ROTATING.to_string()).collect(),
+        "a build resolves the rotating member the preload loads, and not the address"
+    );
+
+    cleanup_group(&h.pool, h.group_id).await;
+}

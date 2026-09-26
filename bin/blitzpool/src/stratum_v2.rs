@@ -148,6 +148,9 @@ pub(crate) fn build_per_port_servers(
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
     payout_resolver: Arc<dyn PayoutResolver>,
     custom_extranonce: Arc<dyn bp_stratum_v2::hooks::CustomExtranonceSource>,
+    // The pool's one rotating-identity intake — the same `Arc` SV1 gets, built
+    // in `crate::stratum`. See SV1's `build_per_port_servers`.
+    rotating_intake: Arc<dyn bp_common::RotatingIntake>,
     dispatcher: Option<Arc<bp_notifications::dispatcher::NotificationDispatcher>>,
     device_status_sink: Arc<dyn bp_share_hook::DeviceStatusSink>,
     live_sessions: Arc<crate::live_sessions::LiveSessionRegistry>,
@@ -191,6 +194,7 @@ pub(crate) fn build_per_port_servers(
         let hooks = build_port_hooks(
             sv1_port_config.payout_mode,
             payout_resolver.clone(),
+            rotating_intake.clone(),
             block_sink.clone(),
             engines,
             lookup.clone(),
@@ -260,6 +264,7 @@ pub(crate) fn build_per_port_servers(
 fn build_port_hooks(
     port_payout_mode: MiningMode,
     payout_resolver: Arc<dyn PayoutResolver>,
+    rotating_intake: Arc<dyn bp_common::RotatingIntake>,
     block_sink: Arc<dyn Sv2BlockSink>,
     engines: &EngineHandles,
     group_lookup: Arc<dyn GroupLookup>,
@@ -288,6 +293,7 @@ fn build_port_hooks(
         ),
         device_status_sink,
         custom_extranonce,
+        rotating_intake: Some(rotating_intake),
     }
 }
 
@@ -295,8 +301,8 @@ fn build_port_hooks(
 mod tests {
     use super::*;
     use bp_config::{
-        ApiConfig, BitcoinRpcConfig, DatabaseConfig, Network, PplnsConfig, RedisConfig,
-        StratumConfig, Sv2Config, TdpConfig as TomlTdpConfig,
+        ApiConfig, BitcoinRpcConfig, DatabaseConfig, Network, PayoutIdentityConfig, PplnsConfig,
+        RedisConfig, StratumConfig, Sv2Config, TdpConfig as TomlTdpConfig,
     };
     use std::path::PathBuf;
 
@@ -306,6 +312,9 @@ mod tests {
             pool_identifier: "Blitzpool-Test".into(),
             pool_base_url: None,
             roles: Vec::new(),
+            // Default: rotating identities off — these tests assert SV2's
+            // existing static-address behaviour.
+            payout_identity: PayoutIdentityConfig::default(),
             bitcoin_rpc: BitcoinRpcConfig {
                 url: "http://127.0.0.1".into(),
                 user: "u".into(),

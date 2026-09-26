@@ -59,10 +59,10 @@ const MERKLE_DEPTH_MAINNET: usize = 12;
 fn make_job() -> MiningJob {
     build_mining_job(
         Network::Regtest,
-        &[PayoutEntry {
-            address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            sats: 5_000_000_000,
-        }],
+        &[PayoutEntry::static_address(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            5_000_000_000,
+        )],
         &CoinbaseTemplate {
             block_height: 800_000,
             coinbase_value_sats: 5_000_000_000,

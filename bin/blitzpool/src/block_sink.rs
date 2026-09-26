@@ -1715,10 +1715,7 @@ mod tests {
         let miner = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
         let job = build_mining_job(
             Network::Regtest,
-            &[PayoutEntry {
-                address: miner.to_string(),
-                sats: 5_000_000_000,
-            }],
+            &[PayoutEntry::static_address(miner, 5_000_000_000)],
             &CoinbaseTemplate {
                 block_height: 42,
                 coinbase_value_sats: 5_000_000_000,

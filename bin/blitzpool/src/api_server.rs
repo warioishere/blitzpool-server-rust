@@ -155,6 +155,7 @@ fn build_app_state(
             dev_fee_address: cfg.solo.dev_fee_address.clone(),
             dev_fee_percent: cfg.solo.dev_fee_percent.unwrap_or(0.0),
         },
+        allow_rotating_identities: cfg.payout_identity.allow_rotating,
         cache: ResponseCache::new(cfg.api.cache.clone()),
     };
     Arc::new(state)

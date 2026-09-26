@@ -14,6 +14,24 @@ pub(crate) fn normalize_address(raw: &str) -> Result<AddressId, BlockpartyServic
     AddressId::normalized(raw).map_err(|_| BlockpartyServiceError::InvalidAddress)
 }
 
+/// [`normalize_address`] for every path that puts an address INTO a party:
+/// creation (the admin row), the admin's add, and the self-join link.
+///
+/// A Blockparty pays fixed addresses only. The payout resolver refuses a
+/// distribution holding a rotating identity and serves the whole party no job
+/// while that miner is connected, so admitting one here would stall every
+/// member's mining on one enrolment. Refused at the door instead.
+///
+/// Not used by `remove_member`: an id enrolled before this check existed has
+/// to stay removable.
+pub(crate) fn normalize_enrolled_address(raw: &str) -> Result<AddressId, BlockpartyServiceError> {
+    let address = normalize_address(raw)?;
+    if bp_payout_descriptor::is_payout_id(address.as_str()) {
+        return Err(BlockpartyServiceError::RotatingIdentity);
+    }
+    Ok(address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::normalize_address;

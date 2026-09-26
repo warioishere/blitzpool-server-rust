@@ -82,6 +82,10 @@ pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     /// which is a different pool of money: a solo miner was shown a fee
     /// output its real `mining.notify` never carried.
     pub solo_fee: bp_mining_job::SoloFeeConfig,
+    /// `[payout_identity] allow_rotating`, the same flag stratum intake is
+    /// built with. `/api/identity/resolve` answers from it, so the UI cannot
+    /// send a miner to a dashboard for an identity the pool would refuse.
+    pub allow_rotating_identities: bool,
     /// Per-endpoint response cache. Handlers that opt in use
     /// `cache.get_or_fetch(...)` to skip DB / RPC work on repeat
     /// reads inside the configured TTL window.
@@ -114,6 +118,7 @@ impl<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> AppState<H, M> {
             network: bitcoin::Network::Bitcoin,
             pool_identifier: String::new(),
             solo_fee: bp_mining_job::SoloFeeConfig::default(),
+            allow_rotating_identities: false,
             cache: ResponseCache::new(bp_config::ApiCacheConfig::default()),
         }
     }

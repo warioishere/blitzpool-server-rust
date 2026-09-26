@@ -64,10 +64,10 @@ async fn single_output_coinbase_no_fee_accepted_by_core() {
         return;
     }
 
-    let payouts = vec![PayoutEntry {
-        address: MINER_ADDR.to_string(),
-        sats: 5_000_000_000,
-    }];
+    let payouts = vec![PayoutEntry::static_address(
+        MINER_ADDR.to_string(),
+        5_000_000_000,
+    )];
     run_block_acceptance_case(payouts, "v1-solo-nofee").await;
 }
 
@@ -322,26 +322,11 @@ async fn coinbase_with_all_5_address_types_accepted_by_core() {
 
     // ── 5 outputs × 20% ──────────────────────────────────────────────
     let payouts = vec![
-        PayoutEntry {
-            address: p2pkh.clone(),
-            sats: 1_000_000_000,
-        },
-        PayoutEntry {
-            address: p2sh.clone(),
-            sats: 1_000_000_000,
-        },
-        PayoutEntry {
-            address: p2wpkh.clone(),
-            sats: 1_000_000_000,
-        },
-        PayoutEntry {
-            address: p2wsh.clone(),
-            sats: 1_000_000_000,
-        },
-        PayoutEntry {
-            address: p2tr.clone(),
-            sats: 1_000_000_000,
-        },
+        PayoutEntry::static_address(p2pkh.clone(), 1_000_000_000),
+        PayoutEntry::static_address(p2sh.clone(), 1_000_000_000),
+        PayoutEntry::static_address(p2wpkh.clone(), 1_000_000_000),
+        PayoutEntry::static_address(p2wsh.clone(), 1_000_000_000),
+        PayoutEntry::static_address(p2tr.clone(), 1_000_000_000),
     ];
 
     let coinbase_template = TdpCoinbaseTemplate {

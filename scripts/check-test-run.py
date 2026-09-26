@@ -46,7 +46,12 @@ def main() -> int:
     ap.add_argument(
         "--expect-regtest-binaries",
         type=int,
-        default=24,
+        # 24 upstream + the two rotating-payout regtests (bp-mining-job's
+        # regtest_rotating_payout, bp-pplns-engine's regtest_rotating_pplns_block).
+        # A property of the tree, which is why it lives here rather than in a flag
+        # someone has to remember: the check exists to catch a regtest binary
+        # silently stopping being built, and a wrong default trains that away.
+        default=26,
         help="how many regtest_* binaries must appear (0 disables the check)",
     )
     args = ap.parse_args()

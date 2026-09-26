@@ -61,6 +61,7 @@ mod listeners;
 mod live_mode_marker;
 mod live_sessions;
 mod network_difficulty;
+mod payout_identities;
 mod payout_resolver;
 mod pending_blocks;
 mod redis_backup;
@@ -971,6 +972,13 @@ async fn main() -> ExitCode {
                             dev_fee_percent: cfg.solo.dev_fee_percent.unwrap_or(0.0),
                         },
                         engines.blockparty.clone(),
+                        // The SAME directory the Stratum resolver reads, not a
+                        // fresh one: a JDC's declared job pays the identities
+                        // Stratum's authorize published, so a second directory
+                        // here would resolve every rotating miner to its
+                        // `payout_id` as an address and fail the coinbase.
+                        engines.payout_identities.clone(),
+                        crate::boot::bitcoin_network(cfg.network),
                     ));
                 // Spawn the JDP template-tx cache when the pool needs the txs
                 // (`jdp_orphan_submitblock` → reconstruct the full block +
@@ -1536,6 +1544,18 @@ fn print_engine_error_help(err: &EngineError) {
                 "hint: failed to fetch the share-id epoch (`INCR core:epoch`) \
                  from Redis at engine spawn. Redis must be reachable here — \
                  check the `[redis]` URL and that the server is up."
+            );
+        }
+        EngineError::PplnsPayoutKeys(_)
+        | EngineError::GroupSoloPayoutKeys(_)
+        | EngineError::IdentityPreload(_) => {
+            eprintln!(
+                "hint: the front loads every rotating payout identity in play \
+                 before its first distribution build, and needs Redis (the \
+                 window and rounds) and Postgres (balances, groups, \
+                 miner_identity) for it. Starting without them would drop \
+                 those miners from the coinbase, so it stops instead. Check \
+                 both are reachable and restart."
             );
         }
     }

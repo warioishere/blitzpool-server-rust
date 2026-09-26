@@ -799,3 +799,76 @@ async fn best_difficulty_today_rejects_missing_or_out_of_window_since() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
     assert_eq!(json["code"], "invalid-address");
 }
+
+/// `POST /api/identity/resolve` records the identity it resolves, so the pool
+/// can admit a miner who connects with the payout id (rented hashrate does)
+/// without ever having mined with the xpub. Both directions: with the flag off
+/// it answers 403 and writes nothing.
+#[tokio::test]
+async fn identity_resolve_records_the_identity_it_resolves() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    // BIP-32 test vector 3, master public key (published, no funds).
+    let xpub = "xpub661MyMwAqRbcEZVB4dScxMAdx6d4nFc9nvyvH3v4gJL378CSRZiYmhRoP7mBy6gSPSCYk6SzXPTf3ND1cZAceL7SfJ1Z3GC8vBgp2epUt13";
+    let expected = bp_payout_descriptor::RotatingPayout::from_xpub_str(xpub)
+        .expect("a BIP-32 vector is a valid xpub");
+    let id = expected.payout_id().as_str().to_string();
+    sqlx::query(r#"DELETE FROM miner_identity WHERE "payoutId" = $1"#)
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .expect("clear any earlier run's row");
+
+    let post = |state: Arc<AppState<NoopHooks, NoopEmailHooks>>| {
+        let body = format!(r#"{{"xpub":"{xpub}"}}"#);
+        async move {
+            let resp = build_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/identity/resolve")
+                        .header("x-forwarded-for", "127.0.0.1")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .expect("oneshot");
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), 1 << 16).await.expect("body");
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            (status, json)
+        }
+    };
+
+    let (status, _) = post(minimal_state(pool.clone())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the flag defaults to off");
+    assert!(
+        bp_db::find_miner_identity(&pool, &id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused resolve writes nothing"
+    );
+
+    let mut state = AppState::<NoopHooks, NoopEmailHooks>::new(pool.clone(), "0.0.0");
+    state.allow_rotating_identities = true;
+    let (status, json) = post(Arc::new(state)).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["payoutId"], id.as_str());
+    let row = bp_db::find_miner_identity(&pool, &id)
+        .await
+        .unwrap()
+        .expect("a resolved identity is recorded");
+    assert_eq!(row.kind, bp_db::KIND_ROTATING);
+    assert_eq!(
+        row.descriptor.as_deref(),
+        Some(expected.canonical_descriptor())
+    );
+
+    let _ = sqlx::query(r#"DELETE FROM miner_identity WHERE "payoutId" = $1"#)
+        .bind(&id)
+        .execute(&pool)
+        .await;
+}

@@ -72,3 +72,7 @@ bp-template-distribution = { workspace = true }
 bp-mining-job = { workspace = true }
 bp-share = { workspace = true }
 bitcoin = { workspace = true }
+# Real rotating identities for the history-attribution test. DEV only: the
+# engine resolves a ledger key through the injected resolver and never parses
+# a descriptor itself.
+bp-payout-descriptor = { workspace = true }

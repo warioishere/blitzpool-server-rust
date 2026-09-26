@@ -533,6 +533,7 @@ dependencies = [
  "bp-mining-job",
  "bp-mining-mode",
  "bp-notifications",
+ "bp-payout-descriptor",
  "bp-pplns",
  "bp-pplns-engine",
  "bp-regtest-harness",
@@ -607,6 +608,7 @@ dependencies = [
  "bp-group-mgmt-engine",
  "bp-group-solo-engine",
  "bp-mining-job",
+ "bp-payout-descriptor",
  "bp-pplns-engine",
  "bp-share",
  "bp-stats",
@@ -666,6 +668,7 @@ dependencies = [
  "bp-group-mgmt",
  "bp-group-mgmt-engine",
  "bp-mining-job",
+ "bp-payout-descriptor",
  "bp-regtest-harness",
  "bp-share",
  "bp-template-distribution",
@@ -694,9 +697,11 @@ dependencies = [
 name = "bp-coinbase-snapshot"
 version = "2.3.6"
 dependencies = [
+ "async-trait",
  "bitcoin",
  "bp-common",
  "bp-db",
+ "bp-payout-descriptor",
  "bp-pplns",
  "bp-share",
  "redis",
@@ -804,6 +809,7 @@ dependencies = [
  "bp-group-mgmt",
  "bp-inflight-cache",
  "bp-mining-job",
+ "bp-payout-descriptor",
  "bp-pplns",
  "bp-regtest-harness",
  "bp-share",
@@ -853,12 +859,15 @@ name = "bp-mining-job"
 version = "2.3.6"
 dependencies = [
  "bitcoin",
+ "bp-common",
+ "bp-payout-descriptor",
  "bp-regtest-harness",
  "bp-share",
  "bp-template-distribution",
  "bp-test-support",
  "hex",
  "proptest",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -901,6 +910,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bp-payout-descriptor"
+version = "2.3.6"
+dependencies = [
+ "bitcoin",
+ "bp-common",
+ "bp-pplns",
+ "miniscript",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "bp-pplns"
 version = "2.3.6"
 dependencies = [
@@ -930,6 +950,7 @@ dependencies = [
  "bp-db",
  "bp-inflight-cache",
  "bp-mining-job",
+ "bp-payout-descriptor",
  "bp-pplns",
  "bp-regtest-harness",
  "bp-share",

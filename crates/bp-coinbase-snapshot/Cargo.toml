@@ -32,6 +32,10 @@ sqlx = { workspace = true }
 # Backoff between snapshot-write retries.
 tokio = { workspace = true, features = ["time"] }
 
+# The injected paid-address resolver is async (its production implementation
+# reads `miner_identity` from Postgres).
+async-trait = { workspace = true }
+
 # Observability + errors
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -39,6 +43,11 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # Async test runtime for the Redis-backed budget persistence tests.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# Real rotating identities for the `paid_at_height` tests. A DEV dependency on
+# purpose: this crate renders a derived script to the address key it already
+# builds, and never parses or stores a descriptor — the intake crate is needed
+# to construct a `PayoutIdentity::Rotating` in a test, not to attribute one.
+bp-payout-descriptor = { workspace = true }
 # Round-trips the pending-block JSON blob, to pin that a snapshot still
 # carrying the retired finder bonus is refused rather than silently
 # stripped of it.

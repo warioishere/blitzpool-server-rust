@@ -43,10 +43,10 @@ struct SoloResolver;
 #[async_trait]
 impl PayoutResolver for SoloResolver {
     async fn resolve_payouts(&self, miner_address: &str, reward_sats: u64) -> ResolvedPayouts {
-        ResolvedPayouts::unsnapshotted(vec![PayoutEntry {
-            address: miner_address.to_string(),
-            sats: reward_sats,
-        }])
+        ResolvedPayouts::unsnapshotted(vec![PayoutEntry::static_address(
+            miner_address.to_string(),
+            reward_sats,
+        )])
     }
 
     fn resolve_stream(&self, _miner_address: &str) -> StreamKind {

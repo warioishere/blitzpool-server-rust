@@ -60,6 +60,7 @@ where
         .merge(controllers::info::routes())
         .merge(controllers::pplns::routes())
         .merge(controllers::groups::routes(state.clone()))
+        .merge(controllers::identity::routes())
         .merge(controllers::address_ownership::routes())
         .merge(controllers::custom_extranonce::routes())
         .merge(controllers::blockparty::routes())

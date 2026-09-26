@@ -642,6 +642,7 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
         "test_dist_nopg_" => 5,
         "test_dist_nowin_" => 7,
         "test_dist_boot_" => 4,
+        "test_dist_keys_" => 3,
         other => panic!("unknown test prefix: {other}"),
     }
 }
@@ -961,4 +962,110 @@ async fn raw_conn(h: &Harness) -> ConnectionManager {
         bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, db).await;
     let client = Client::open(format!("{redis_base}/{db}")).expect("client");
     ConnectionManager::new(client).await.expect("conn")
+}
+
+// ── The boot-time preload asks about the keys a build asks about ────
+
+/// Records every key a build asks the identity resolver about, and answers
+/// that each one is derived, so the build keeps them all.
+#[derive(Debug, Default)]
+struct RecordingResolver {
+    asked: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+#[async_trait::async_trait]
+impl bp_coinbase_snapshot::PayoutIdentityResolver for RecordingResolver {
+    async fn paid_at_height(
+        &self,
+        _ledger_keys: &[String],
+        height: u32,
+    ) -> Result<bp_coinbase_snapshot::PaidAtHeight, bp_coinbase_snapshot::PaidAtHeightError> {
+        Ok(bp_coinbase_snapshot::PaidAtHeight::static_only(height))
+    }
+
+    async fn derived_payout_keys(
+        &self,
+        ledger_keys: &[String],
+    ) -> std::collections::HashSet<String> {
+        self.asked
+            .lock()
+            .expect("recorder mutex")
+            .extend(ledger_keys.iter().cloned());
+        ledger_keys.iter().cloned().collect()
+    }
+}
+
+/// **The boot-time preload covers the keys a build resolves, from both of a
+/// build's sources.** A rotating key with a share in the window and one that
+/// only holds an open balance are both in play, and a build asks the resolver
+/// about exactly those two, not the plain address. Without the balance half the
+/// preload would miss a rotating miner with a standing balance and no share
+/// this epoch.
+///
+/// Compared on this test's own keys only: `pplns_balance` is shared with the
+/// other tests in this binary, which seed and delete balances concurrently.
+#[tokio::test]
+async fn the_keys_in_play_are_the_keys_a_build_resolves() {
+    let h = match connect_or_skip(3, "test_dist_keys_").await {
+        Some(h) => h,
+        None => return,
+    };
+    const ADDR: &str = "bc1qvzf0p407umrsaxmsnq62yudwf27lmsxd8sshzl";
+    const ROT_SHARES: &str = "xpbKeysInPlayWindowCoverageTest01";
+    const ROT_BALANCE: &str = "xpbKeysInPlayBalanceCoverageTest01";
+    let mine = [ADDR, ROT_SHARES, ROT_BALANCE];
+    cleanup_addresses(&h.pool, &mine).await;
+
+    let window = build_window(&h).await;
+    seed_share(&window, ADDR, 100.0, 1_700_000_000_001).await;
+    seed_share(&window, ROT_SHARES, 50.0, 1_700_000_000_002).await;
+    seed_open_balance(&h.pool, ROT_BALANCE, 10_000, 0).await;
+
+    let in_play: std::collections::HashSet<String> =
+        bp_pplns_engine::distribution::payout_keys_in_play(&h.pool, &window)
+            .await
+            .expect("window and ledger are readable")
+            .into_iter()
+            .map(|key| key.as_str().to_string())
+            .filter(|key| mine.contains(&key.as_str()))
+            .collect();
+    assert_eq!(
+        in_play,
+        mine.iter().map(|k| k.to_string()).collect(),
+        "the window's keys and the open balance's key are all in play"
+    );
+
+    let recorder = Arc::new(RecordingResolver::default());
+    let identities = bp_coinbase_snapshot::InstalledResolver::default();
+    assert!(
+        identities.install(recorder.clone()),
+        "a fresh handle takes it"
+    );
+    let cfg = DistributionConfig::from_engine_config(&PplnsEngineConfig {
+        fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
+        ..PplnsEngineConfig::default()
+    });
+    DistributionBuilder::new(h.pool.clone(), window, cfg)
+        .with_identities(identities)
+        .build(312_500_000)
+        .await
+        .expect("build ok");
+    let asked: std::collections::HashSet<String> = recorder
+        .asked
+        .lock()
+        .expect("recorder mutex")
+        .iter()
+        .filter(|key| mine.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(
+        asked,
+        [ROT_SHARES, ROT_BALANCE]
+            .iter()
+            .map(|k| k.to_string())
+            .collect(),
+        "a build resolves the two rotating keys the preload loads, and not the address"
+    );
+
+    cleanup_addresses(&h.pool, &mine).await;
 }

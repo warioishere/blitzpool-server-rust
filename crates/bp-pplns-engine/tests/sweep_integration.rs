@@ -519,7 +519,7 @@ async fn sweep_running_twice_is_safe() {
 #[tokio::test]
 async fn sweep_works_with_typed_address_id() {
     // Defensive: ensures the AddressId-based call chain in the runner
-    // accepts addresses up to the 62-char column limit.
+    // accepts addresses up to the column limit (`bp_common::MAX_ADDRESS_LEN`).
     let _guard = SWEEP_TEST_LOCK.lock().await;
     let pool = match connect_or_skip().await {
         Some(p) => p,

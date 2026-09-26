@@ -25,14 +25,16 @@
 //! keys and, without the inputs layer, N window reads plus N ledger
 //! queries in the same few milliseconds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bp_coinbase_snapshot::{build_and_snapshot, BuildRequest};
+use bp_coinbase_snapshot::{
+    build_and_snapshot, resolve_derived_keys, BuildRequest, InstalledResolver,
+};
 use bp_common::{AddressId, Sats};
-use bp_db::{find_pplns_balances_with_open_balance, PplnsBalanceRow};
+use bp_db::{find_pplns_balances_with_open_balance, DbError, PplnsBalanceRow};
 use bp_pplns::{WeightBuildError, WeightDistribution};
 use sqlx::PgPool;
 use thiserror::Error;
@@ -90,6 +92,21 @@ pub enum DistributionError {
 pub struct DistributionInputs {
     pub address_shares: HashMap<AddressId, f64>,
     pub balances: HashMap<AddressId, Sats>,
+    /// Which of those ledger keys are a rotating identity — paid by a script
+    /// derived at the block's height rather than by being an address.
+    ///
+    /// Loaded here, with the window and the ledger, because it is a property of
+    /// the same key set and not of the reward: one resolution per inputs-cache
+    /// epoch, shared by every concurrent build, instead of one per template.
+    ///
+    /// **Why it belongs in the inputs and not the build.** The weight model
+    /// drops any key it cannot pay, so a rotating miner missing from this set is
+    /// silently unpaid for the whole epoch; and `output_weight_for_payout_key`
+    /// charges the 172 WU unparseable fallback for a key it does not recognize,
+    /// against the 124 WU a derived P2WPKH actually costs — a ~39 % capacity loss
+    /// on a full coinbase. Both the filter and the weight estimate must read the
+    /// same set, which is why there is one.
+    pub derived_payout_keys: HashSet<String>,
 }
 
 /// Result of one distribution build. Cheap to clone-via-Arc because
@@ -167,6 +184,16 @@ pub struct DistributionBuilder {
     /// How often the window+ledger load actually ran. Observability, and
     /// the assertion hook for the dedup tests.
     inputs_loads: Arc<AtomicU64>,
+    /// Who is behind a ledger key — the **same** handle the engine settles
+    /// through, not a second one.
+    ///
+    /// Shared rather than copied on purpose: this builder decides whether a
+    /// rotating miner's row survives into the coinbase, and the engine later
+    /// books what that coinbase paid. Two resolvers could disagree, and the
+    /// disagreement is a double credit ([`bp_coinbase_snapshot::PaidAtHeightError::Unresolvable`]).
+    /// Unset it degrades to static-only, which is this pool's pre-rotation
+    /// behaviour — see [`InstalledResolver::get`].
+    identities: InstalledResolver,
 }
 
 impl DistributionBuilder {
@@ -187,7 +214,19 @@ impl DistributionBuilder {
             cache: InflightResultCache::new(cache_ttl),
             inputs_cache: InflightResultCache::new(cache_ttl),
             inputs_loads: Arc::new(AtomicU64::new(0)),
+            identities: InstalledResolver::default(),
         }
+    }
+
+    /// Read identities through `identities` — the engine's handle, so an
+    /// `install` that happens after this builder was constructed is still seen.
+    ///
+    /// Chained rather than a constructor argument so no existing call site
+    /// changes: a builder that never gets one resolves nothing, which is the
+    /// static-only default and not a silent failure.
+    pub fn with_identities(mut self, identities: InstalledResolver) -> Self {
+        self.identities = identities;
+        self
     }
 
     /// Number of window+ledger loads performed so far. Under a burst of
@@ -214,12 +253,14 @@ impl DistributionBuilder {
         let config = self.config.clone();
         let inputs_cache = self.inputs_cache.clone();
         let inputs_loads = self.inputs_loads.clone();
+        let identities = self.identities.clone();
+        let identities_for_inputs = self.identities.clone();
         self.cache
             .get_or_compute(reference_revenue_sats, || async move {
                 let inputs = inputs_cache
                     .get_or_compute((), || async move {
                         inputs_loads.fetch_add(1, Ordering::Relaxed);
-                        load_inputs(&pool, &window_for_inputs).await
+                        load_inputs(&pool, &window_for_inputs, &identities_for_inputs).await
                     })
                     .await
                     .map_err(|e| DistributionError::Inputs(e.to_string()))?;
@@ -228,7 +269,15 @@ impl DistributionBuilder {
                 // there is no single miner it could name. An empty window
                 // therefore surfaces as `NoScoredMiners` — see
                 // [`Self::build_bootstrap`] for who resolves that.
-                build_from_inputs(&inputs, &window, &config, reference_revenue_sats, None).await
+                build_from_inputs(
+                    &inputs,
+                    &window,
+                    &config,
+                    reference_revenue_sats,
+                    None,
+                    &identities,
+                )
+                .await
             })
             .await
     }
@@ -258,11 +307,12 @@ impl DistributionBuilder {
         let pool = self.pool.clone();
         let window_for_inputs = self.window.clone();
         let inputs_loads = self.inputs_loads.clone();
+        let identities_for_inputs = self.identities.clone();
         let inputs = self
             .inputs_cache
             .get_or_compute((), || async move {
                 inputs_loads.fetch_add(1, Ordering::Relaxed);
-                load_inputs(&pool, &window_for_inputs).await
+                load_inputs(&pool, &window_for_inputs, &identities_for_inputs).await
             })
             .await
             .map_err(|e| Arc::new(DistributionError::Inputs(e.to_string())))?;
@@ -272,6 +322,7 @@ impl DistributionBuilder {
             &self.config,
             reference_revenue_sats,
             Some(claimant),
+            &self.identities,
         )
         .await
         .map(Arc::new)
@@ -308,6 +359,61 @@ impl DistributionBuilder {
 
 // ── Internals ────────────────────────────────────────────────────────
 
+/// The two places every PPLNS build takes its ledger keys from: the window
+/// (Redis) and the open-balance ledger (Postgres), sanitized to `AddressId`s.
+///
+/// Read here for a build ([`load_inputs`]) and for the boot-time identity
+/// preload ([`payout_keys_in_play`]) alike, so the preload cannot come to ask
+/// about a different set of keys than a build does. A window error is `Err`;
+/// the ledger result is handed back as it is, because the two callers treat a
+/// failed ledger read differently.
+async fn read_key_sources(
+    pool: &PgPool,
+    window: &WindowStore,
+) -> Result<
+    (
+        HashMap<AddressId, f64>,
+        Result<HashMap<AddressId, Sats>, DbError>,
+    ),
+    DistributionError,
+> {
+    // Window aggregate from Redis (HashMap<String, f64>).
+    let window_raw = window.read_window_by_address().await?;
+
+    // Open-balance ledger rows from PG.
+    let ledger = find_pplns_balances_with_open_balance(pool)
+        .await
+        .map(|rows| open_balance_rows_to_balance_map(&rows));
+
+    // Window addresses are raw strings. Ones that fail `AddressId` validation
+    // are skipped with a warn (an upstream bug could have pushed an invalid
+    // address into Redis; better to skip its share than fail the
+    // distribution). Dropping addresses that parse but are not usable payout
+    // scripts happens in the shared build.
+    let address_shares = share_map_from_redis_hash(
+        &window_raw,
+        "pplns distribution: skipping invalid address in window — likely from a buggy upstream",
+    );
+    Ok((address_shares, ledger))
+}
+
+/// Every ledger key the next build will ask the identity resolver about: the
+/// window's and the open balances'. For the boot-time preload of rotating
+/// identities, which reads the ledger **hard**, unlike a build: a preload that
+/// skipped the balances would leave exactly the keys it exists for unloaded.
+pub async fn payout_keys_in_play(
+    pool: &PgPool,
+    window: &WindowStore,
+) -> Result<Vec<AddressId>, DistributionError> {
+    let (address_shares, ledger) = read_key_sources(pool, window).await?;
+    let balances = ledger.map_err(|err| DistributionError::Inputs(err.to_string()))?;
+    let keys: HashSet<AddressId> = address_shares
+        .into_keys()
+        .chain(balances.into_keys())
+        .collect();
+    Ok(keys.into_iter().collect())
+}
+
 /// Steps 1-3: the reward-independent half of a build — read the window
 /// and the ledger, sanitize both. Shared by every concurrent build via
 /// [`DistributionBuilder::inputs_cache`].
@@ -338,13 +444,12 @@ impl DistributionBuilder {
 async fn load_inputs(
     pool: &PgPool,
     window: &WindowStore,
+    identities: &InstalledResolver,
 ) -> Result<DistributionInputs, DistributionError> {
-    // 1. Read window aggregate from Redis (HashMap<String, f64>). Hard.
-    let window_raw = window.read_window_by_address().await?;
-
-    // 2. Read open-balance ledger rows from PG. Soft — see the docs above.
-    let balances = match find_pplns_balances_with_open_balance(pool).await {
-        Ok(rows) => open_balance_rows_to_balance_map(&rows),
+    // 1-3. The window (hard) and the ledger (soft, see the docs above).
+    let (address_shares, ledger) = read_key_sources(pool, window).await?;
+    let balances = match ledger {
+        Ok(balances) => balances,
         Err(err) => {
             error!(
                 %err,
@@ -356,18 +461,21 @@ async fn load_inputs(
         }
     };
 
-    // 3. Convert to bp_pplns inputs. Window addresses are raw strings —
-    //    ones that fail `AddressId` validation are skipped with a warn
-    //    (an upstream bug could have pushed an invalid address into
-    //    Redis; better to skip its share than fail the distribution).
-    //    Dropping addresses that parse but are not usable payout scripts
-    //    happens in the shared build.
+    // 4. Ask who is behind the keys that are not addresses. Both maps, because
+    //    the window and the ledger are filtered by the same predicate and a
+    //    rotating miner with a standing balance but no share this epoch is still
+    //    an entry the coinbase has to be able to pay.
+    let derived_payout_keys = resolve_derived_keys(
+        identities,
+        address_shares.keys().chain(balances.keys()),
+        "pplns",
+    )
+    .await;
+
     Ok(DistributionInputs {
-        address_shares: share_map_from_redis_hash(
-            &window_raw,
-            "pplns distribution: skipping invalid address in window — likely from a buggy upstream",
-        ),
+        address_shares,
         balances,
+        derived_payout_keys,
     })
 }
 
@@ -379,6 +487,7 @@ async fn build_from_inputs(
     config: &DistributionConfig,
     reference_revenue_sats: u64,
     bootstrap_claimant: Option<&AddressId>,
+    identities: &InstalledResolver,
 ) -> Result<DistributionResult, DistributionError> {
     // 4-5. Sanitize, project onto weights, persist the snapshot — the
     //      one path both payout engines share. The *live* budget is read
@@ -388,6 +497,19 @@ async fn build_from_inputs(
         .fee_address
         .as_ref()
         .ok_or(DistributionError::NoFeeAddress)?;
+
+    // The bootstrap claimant is, by definition, the one key the window does NOT
+    // hold — so `load_inputs` never asked about it. Resolve it here or the
+    // build whose entire purpose is to pay this one miner drops the only row it
+    // has: `build.rs` inserts the claimant AFTER the payability retain and
+    // re-runs the build, and the retain is what would drop it.
+    let mut derived_payout_keys = inputs.derived_payout_keys.clone();
+    if let Some(claimant) = bootstrap_claimant {
+        derived_payout_keys.extend(
+            resolve_derived_keys(identities, std::iter::once(claimant), "pplns-bootstrap").await,
+        );
+    }
+
     let mut conn = window.connection_for_snapshot();
     let built = build_and_snapshot(
         BuildRequest {
@@ -406,6 +528,7 @@ async fn build_from_inputs(
             // blocks until they clear `min_payout` instead of forfeiting.
             withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
             bootstrap_claimant,
+            derived_payout_keys,
             scope: "pplns",
         },
         &mut conn,
@@ -503,6 +626,9 @@ mod tests {
             finder_address: None,
             reference_revenue_sats: 312_500_000,
             withheld_value: bp_pplns::WithheldValue::ToOtherMiners,
+            // A literal address: nothing derived, which is the pre-rotation shape
+            // this clone test was written against.
+            derived_payout_keys: &HashSet::new(),
         })
         .unwrap();
         let result = DistributionResult {
