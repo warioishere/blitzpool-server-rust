@@ -20,10 +20,8 @@ the same host port numbers.
 
 ## What's in the stack
 
-- **postgres** — `postgres:18-alpine`. Single shared instance. The
-  baseline schema (`../db/schema.sql`) is auto-applied to the empty data
-  volume on first boot; the pool then brings it up to date with its own
-  sqlx migrations — see *Schema sync* below.
+- **postgres** — `postgres:18-alpine`. Single shared instance. The pool
+  builds the schema itself at boot — see *Schema sync* below.
 - **redis** — `valkey/valkey:8-alpine` with AOF + `everysec` fsync,
   `volatile-lru` eviction.
 - **bitcoin-{mainnet,testnet4,regtest}** — Bitcoin Core 31's
@@ -152,14 +150,8 @@ image is assembled.
 
 ## Schema sync
 
-Two halves. `db/schema.sql` is the baseline snapshot — it carries the base
-tables and seeds a fresh data volume on first boot. Everything since is a
-sqlx migration in `crates/bp-db/migrations/`, applied at boot by
-`Db::run_migrations()` under an advisory lock, so the deploy needs no
-separate migration step.
-
-Note that the baseline has no generator in this repo: its tables predate the
-Rust pool and `db/README.md`'s recipe for regenerating one from scratch
-still points at the (retired) TS pool. Refreshing it from a running prod DB
-works — see `../db/README.md`, and never commit data dumps (only
-`--schema-only` output).
+The whole schema lives in `crates/bp-db/migrations/` and is applied at boot
+by `Db::run_migrations()` under an advisory lock, so the deploy needs no
+separate migration step. On an empty data volume `0000_baseline.sql` creates
+the base tables first; on a database that already has them (one carried over
+from the TS pool, or prod) it changes nothing.

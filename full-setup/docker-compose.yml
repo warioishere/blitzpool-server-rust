@@ -122,10 +122,6 @@ services:
       # production PG data in (data/.../pg/18/docker/), enabling a
       # 1:1 cp -a copy without flattening.
       - "./data/postgres:/var/lib/postgresql"
-      # Auto-apply the TS-pool schema on first init. postgres:18-alpine
-      # runs anything in /docker-entrypoint-initdb.d/ once when the
-      # data dir is empty.
-      - "../db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro"
 
   redis:
     container_name: blitzpool-redis

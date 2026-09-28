@@ -117,11 +117,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto libcapnp-dev postgresql-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Load DB schema + migrations
+      # 0000_baseline.sql builds the base tables on the empty service DB.
+      - name: Apply DB migrations
         env:
           PGPASSWORD: postgres
         run: |
-          psql -h localhost -p 15433 -U postgres -d public_pool -v ON_ERROR_STOP=1 -f db/schema.sql
           for f in crates/bp-db/migrations/*.sql; do
             psql -h localhost -p 15433 -U postgres -d public_pool -v ON_ERROR_STOP=1 -f "$f"
           done

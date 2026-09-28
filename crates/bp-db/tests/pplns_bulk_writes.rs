@@ -25,7 +25,8 @@
 //!     -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
 //!     postgres:18
 //! ```
-//! and load `db/schema.sql` into it.
+//! and build the schema with
+//! `cargo sqlx migrate run --source crates/bp-db/migrations`.
 
 use bp_db::{
     bulk_insert_pplns_payout_history, bulk_update_pplns_last_accepted_share_at,

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `sqlx`-based data layer against the existing Blitzpool Postgres schema
-//! (see `db/schema.sql` for the canonical DDL).
+//! `sqlx`-based data layer against the Blitzpool Postgres schema, which
+//! `crates/bp-db/migrations/` builds from an empty database (the base tables
+//! are `0000_baseline.sql`).
 //!
 //! # Scope
 //!

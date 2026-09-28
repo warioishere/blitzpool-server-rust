@@ -1397,11 +1397,7 @@ mod session_id_for_blocks_entity {
     /// `blocks_entity."sessionId"` is `character varying(8)` and Postgres
     /// refuses a longer value on INSERT rather than truncating it. This is
     /// eight BY CONSTRUCTION — `{:08x}` of a `u32` cannot be anything else —
-    /// which is why the width is asserted here and not read out of a schema
-    /// file: `db/schema.sql` is not kept in step with
-    /// `crates/bp-db/migrations/` (migration 0011's `rejectedStale*` columns
-    /// are missing from it), so a test that consulted it would promise a
-    /// guard it cannot give.
+    /// so the width is asserted here rather than read out of the schema.
     #[test]
     fn a_session_id_is_always_eight_characters() {
         for id in [0u32, 1, 0xFFFF, u32::MAX, 0x1234_5678] {

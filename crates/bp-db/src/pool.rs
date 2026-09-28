@@ -36,9 +36,9 @@ impl Db {
     /// sqlx tracks applied migrations in `_sqlx_migrations` and takes a
     /// Postgres advisory lock for the duration, so every process in the
     /// Core/Satellite split can call this at boot: the first to win the lock
-    /// applies the pending set, the rest see them already done. Migrations
-    /// are written idempotent (`ADD COLUMN IF NOT EXISTS`) so they also
-    /// no-op against a fresh DB bootstrapped from `db/schema.sql`.
+    /// applies the pending set, the rest see them already done. On an empty
+    /// database `0000_baseline.sql` builds the base tables first; on one
+    /// that already has them it changes nothing.
     pub async fn run_migrations(&self) -> Result<(), DbError> {
         with_boot_policy(sqlx::migrate!()).run(&self.pool).await?;
         Ok(())
