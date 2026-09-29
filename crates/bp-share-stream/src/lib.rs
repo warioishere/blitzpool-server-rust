@@ -120,11 +120,16 @@ pub enum StreamError {
     MissingField { id: String },
 }
 
-/// Off-loop publish buffer. An `XADD` is sub-millisecond at realistic
-/// share rates, so this only fills if Redis publishing stalls. On overflow
-/// we drop (best-effort — the miner already got its accept) rather than
-/// block the stratum read loop. ~32 s of headroom at 250 shares/s.
+/// Off-loop publish buffer. It only fills if Redis publishing stalls or
+/// falls behind the share rate. On overflow we drop (best-effort — the miner
+/// already got its accept) rather than block the stratum read loop.
 const PUBLISH_BUFFER: usize = 8192;
+
+/// Most values one drain round trip carries. The drain takes whatever is
+/// queued, up to this, and writes it as one pipeline: one `XADD` round trip
+/// per share capped the drain at the Redis latency (measured ~64 µs a share,
+/// ~14k shares/s against a local Redis).
+const PUBLISH_BATCH: usize = 256;
 
 /// Off-loop publish core shared by the producing sinks: a bounded channel + a
 /// drain task that owns the `XADD` round-trip, so the latency-sensitive stratum
@@ -141,14 +146,17 @@ impl<T: Serialize + Send + Sync + 'static> BufferedPublisher<T> {
     fn new(producer: StreamProducer<T>, what: &'static str) -> Self {
         let (tx, mut rx) = mpsc::channel::<T>(PUBLISH_BUFFER);
         tokio::spawn(async move {
-            while let Some(item) = rx.recv().await {
-                if let Err(e) = producer.publish(&item).await {
+            let mut batch = Vec::with_capacity(PUBLISH_BATCH);
+            while rx.recv_many(&mut batch, PUBLISH_BATCH).await > 0 {
+                if let Err(e) = producer.publish_batch(&batch).await {
                     tracing::warn!(
                         error = %e,
                         what,
+                        count = batch.len(),
                         "share-stream: stream publish failed (accounting deferred)"
                     );
                 }
+                batch.clear();
             }
         });
         Self {
@@ -300,6 +308,25 @@ impl<T: Serialize> StreamProducer<T> {
             )
             .await?;
         Ok(id)
+    }
+
+    /// [`Self::publish`] for several values in one round trip: one pipeline
+    /// of `XADD`s, applied in order.
+    pub async fn publish_batch(&self, values: &[T]) -> Result<(), StreamError> {
+        let mut pipe = redis::pipe();
+        for value in values {
+            let json = serde_json::to_string(value)?;
+            pipe.xadd_maxlen(
+                &self.stream_key,
+                StreamMaxlen::Approx(self.maxlen),
+                "*",
+                &[(FIELD, json.as_str())],
+            )
+            .ignore();
+        }
+        let mut conn = self.conn.clone();
+        pipe.query_async::<()>(&mut conn).await?;
+        Ok(())
     }
 }
 
@@ -990,6 +1017,41 @@ mod tests {
         // Reconstructed records are identical, in produce order.
         assert_eq!(got[0].value, s1, "the produced record round-trips intact");
         assert_eq!(got[1].value, s2, "mode + group_id round-trip intact");
+    }
+
+    /// A burst larger than one drain batch arrives complete and in order:
+    /// the money consumer's window order is the stream order.
+    #[tokio::test]
+    async fn producing_sink_keeps_order_across_batches() {
+        let Some(consumer_conn) = connect_or_skip(13).await else {
+            return;
+        };
+        let Some(producer_conn) = connect_peer(13).await else {
+            return;
+        };
+        let key = "bp:test:shares:accepted-batched";
+        let consumer = StreamConsumer::accepted(consumer_conn, key, "money", "c1");
+        consumer.ensure_group().await.expect("ensure_group");
+
+        let sink = ProducingSink::new(StreamProducer::new(producer_conn, key));
+        let n = PUBLISH_BATCH * 3 + 7;
+        // Offered without yielding, so the drain finds more than one batch
+        // queued.
+        for i in 0..n {
+            sink.record_accepted(sample(&format!("ep1:{i}"), MiningMode::Pplns, None).as_view())
+                .await;
+        }
+
+        let mut got = Vec::new();
+        for _ in 0..50 {
+            got.extend(consumer.read_new(1000, 1000).await.expect("read_new"));
+            if got.len() >= n {
+                break;
+            }
+        }
+        let ids: Vec<String> = got.into_iter().map(|c| c.value.share_id).collect();
+        let want: Vec<String> = (0..n).map(|i| format!("ep1:{i}")).collect();
+        assert_eq!(ids, want);
     }
 
     /// The rejected producing sink publishes a (group_id-stamped) rejected
