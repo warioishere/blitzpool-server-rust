@@ -43,14 +43,13 @@ pub(crate) fn shared_accepted<'a>(
     }
 }
 
-/// Maps SV1's 4-variant `RejectReason` (Duplicate / JobNotFound / Stale /
-/// LowDifficulty) into the canonical 3-variant `bp_stats::RejectedReason`.
-/// `Stale` collapses into `JobNotFound` because both share the same reject
-/// accumulator bucket (see `bp_share_stats_sink::hooks::map_reject_reason`
-/// for the same mapping at the sink-side — centralized here).
+/// Maps SV1's `RejectReason` onto the canonical `bp_stats::RejectedReason`,
+/// one to one: a stale share (for a job the pool has retired) is kept apart
+/// from one for a job the pool never had or already dropped.
 fn map_sv1_reject(reason: RejectReason) -> RejectedReason {
     match reason {
-        RejectReason::JobNotFound | RejectReason::Stale => RejectedReason::JobNotFound,
+        RejectReason::JobNotFound => RejectedReason::JobNotFound,
+        RejectReason::Stale => RejectedReason::Stale,
         RejectReason::DuplicateShare => RejectedReason::DuplicateShare,
         RejectReason::LowDifficulty => RejectedReason::LowDifficulty,
         RejectReason::VersionRollingNotAllowed => RejectedReason::VersionRollingNotAllowed,
@@ -179,11 +178,14 @@ mod tests {
         );
     }
 
-    /// Stale and job-not-found share one reject bucket.
+    /// A stale share keeps its own reason; it used to be counted as
+    /// job-not-found, so the stale column stayed empty.
     #[test]
-    fn a_stale_reject_lands_in_the_job_not_found_bucket() {
+    fn a_stale_reject_keeps_its_own_reason() {
         let share = shared_rejected(Some("a"), Some("w"), "s", RejectReason::Stale, 8.0);
-        assert_eq!(share.reason, RejectedReason::JobNotFound);
+        assert_eq!(share.reason, RejectedReason::Stale);
         assert_eq!(share.difficulty, 8.0);
+        let share = shared_rejected(Some("a"), Some("w"), "s", RejectReason::JobNotFound, 8.0);
+        assert_eq!(share.reason, RejectedReason::JobNotFound);
     }
 }

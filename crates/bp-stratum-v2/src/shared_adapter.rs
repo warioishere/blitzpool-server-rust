@@ -42,17 +42,17 @@ pub(crate) fn shared_accepted<'a>(
     }
 }
 
-/// Maps SV2's per-protocol reject reasons into the canonical 3-variant
+/// Maps SV2's per-protocol reject reasons onto the canonical
 /// `bp_stats::RejectedReason`. `None` for the protocol-validity rejects
 /// that do not count toward the per-address rejected-stats. `BadExtranonceSize`
 /// never reaches this (it's a pre-share-validation reject — see
 /// `feedback-sv2-bad-extranonce-size-hard-reject`).
 fn map_sv2_reject(reason: RejectReason) -> Option<RejectedReason> {
     match reason {
-        // Retired-past-grace + unknown-job-id both bucket as JobNotFound
-        // — these are "the job isn't valid for crediting" failures, the
-        // shared rejected-stats only has three buckets.
-        RejectReason::StaleShare | RejectReason::InvalidJobId => Some(RejectedReason::JobNotFound),
+        // A share for a retired job is stale; one for a job the channel
+        // never had is job-not-found.
+        RejectReason::StaleShare => Some(RejectedReason::Stale),
+        RejectReason::InvalidJobId => Some(RejectedReason::JobNotFound),
         RejectReason::DuplicateShare => Some(RejectedReason::DuplicateShare),
         RejectReason::DifficultyTooLow => Some(RejectedReason::LowDifficulty),
         // Channel-id rejects + bad-extranonce-size are protocol-validity
@@ -172,7 +172,7 @@ mod tests {
         );
         assert_eq!(
             map_sv2_reject(RejectReason::StaleShare),
-            Some(RejectedReason::JobNotFound)
+            Some(RejectedReason::Stale)
         );
         assert_eq!(
             map_sv2_reject(RejectReason::InvalidJobId),

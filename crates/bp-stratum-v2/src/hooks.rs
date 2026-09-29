@@ -499,10 +499,7 @@ mod tests {
         server_hooks.rejected_sink.record_rejected(share).await;
         let records = hooks.rejected.lock().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0].reason,
-            bp_share_hook::RejectedReason::JobNotFound
-        );
+        assert_eq!(records[0].reason, bp_share_hook::RejectedReason::Stale);
     }
 
     #[tokio::test]

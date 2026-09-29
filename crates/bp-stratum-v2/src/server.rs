@@ -2439,10 +2439,7 @@ mod tests {
         apply_session_events_generic(events, "sess-1", &state, &hooks).await;
         let records = recording.rejected.lock().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0].reason,
-            bp_share_hook::RejectedReason::JobNotFound
-        );
+        assert_eq!(records[0].reason, bp_share_hook::RejectedReason::Stale);
         assert_eq!(records[0].address.as_deref(), Some(ADDR));
     }
 
