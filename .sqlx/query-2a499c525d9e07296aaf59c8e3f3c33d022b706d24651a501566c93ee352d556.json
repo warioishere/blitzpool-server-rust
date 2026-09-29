@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            \"time\" AS \"time!\",\n            accepted AS \"accepted!\",\n            rejected AS \"rejected!\"\n           FROM pool_share_statistics_entity\n           WHERE \"deletedAt\" IS NULL AND \"time\" >= $1\n           ORDER BY \"time\" ASC",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            \"time\" AS \"time!\",\n            accepted AS \"accepted!\",\n            rejected AS \"rejected!\",\n            \"maxDifficulty\" AS \"max_difficulty!\"\n           FROM pool_share_statistics_entity WHERE id = $1 LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -37,11 +37,16 @@
         "ordinal": 6,
         "name": "rejected!",
         "type_info": "Float4"
+      },
+      {
+        "ordinal": 7,
+        "name": "max_difficulty!",
+        "type_info": "Float4"
       }
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Int4"
       ]
     },
     "nullable": [
@@ -51,8 +56,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "86dea9a9fe29151d13a579976a1c65eab4abc39997c922e097bc73cd4902ed70"
+  "hash": "2a499c525d9e07296aaf59c8e3f3c33d022b706d24651a501566c93ee352d556"
 }

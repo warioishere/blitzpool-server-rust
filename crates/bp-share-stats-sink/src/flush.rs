@@ -109,6 +109,7 @@ async fn flush_pool_shares(
             time_ms: slot.as_millis(),
             accepted: rec.accepted as f32,
             rejected: rec.rejected as f32,
+            max_difficulty: rec.max_difficulty as f32,
         })
         .collect();
     match bulk_upsert_pool_share_statistics(pool, &rows).await {
@@ -233,6 +234,7 @@ async fn flush_client_statistics(
             rejected_version_rolling_diff1: rec.rejected_version_rolling_diff1 as f32,
             rejected_stale_count: rec.rejected_stale_count as i32,
             rejected_stale_diff1: rec.rejected_stale_diff1 as f32,
+            max_difficulty: rec.max_difficulty as f32,
         })
         .collect();
 

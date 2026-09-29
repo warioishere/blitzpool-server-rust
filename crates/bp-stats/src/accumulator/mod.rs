@@ -29,6 +29,27 @@ pub use share_totals::{
     AddressTotalsSnapshot, ShareTotalsAccumulator, WorkerKey, WorkerTotalsSnapshot,
 };
 
+/// A share's contribution to a slot maximum: the difficulty it solved, or
+/// nothing for a non-finite or non-positive value.
+pub fn share_max(submission_difficulty: f64) -> f64 {
+    if submission_difficulty.is_finite() && submission_difficulty > 0.0 {
+        submission_difficulty
+    } else {
+        0.0
+    }
+}
+
+/// A slot maximum after a flush of `flushed` succeeded. The database merges
+/// maxima with `GREATEST`, so a buffered value no higher than the one written
+/// is done; a higher one arrived during the flush and is still owed.
+pub(crate) fn flushed_max(buffered: f64, flushed: f64) -> f64 {
+    if buffered <= flushed {
+        0.0
+    } else {
+        buffered
+    }
+}
+
 /// Categorisation of a rejected share. The string forms are written
 /// verbatim to the `reason` column on `pool_rejected_statistics_entity`
 /// and `client_rejected_statistics_entity` — they match the values the

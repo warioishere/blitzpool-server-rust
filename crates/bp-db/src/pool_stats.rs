@@ -35,7 +35,8 @@ pub async fn find_pool_share_statistics_since(
             id AS "id!",
             "time" AS "time!",
             accepted AS "accepted!",
-            rejected AS "rejected!"
+            rejected AS "rejected!",
+            "maxDifficulty" AS "max_difficulty!"
            FROM pool_share_statistics_entity
            WHERE "deletedAt" IS NULL AND "time" >= $1
            ORDER BY "time" ASC"#,
@@ -113,6 +114,9 @@ pub struct PoolShareStatisticsRow {
     pub time: i64,
     pub accepted: f32,
     pub rejected: f32,
+    /// Highest single share difficulty of the slot.
+    #[sqlx(rename = "maxDifficulty")]
+    pub max_difficulty: f32,
 }
 
 pub async fn find_pool_share_statistics(
@@ -128,7 +132,8 @@ pub async fn find_pool_share_statistics(
             id AS "id!",
             "time" AS "time!",
             accepted AS "accepted!",
-            rejected AS "rejected!"
+            rejected AS "rejected!",
+            "maxDifficulty" AS "max_difficulty!"
            FROM pool_share_statistics_entity WHERE id = $1 LIMIT 1"#,
         id
     )

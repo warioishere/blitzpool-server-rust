@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use bp_common::AddressId;
 
+use super::flushed_max;
 use crate::buffer::{BufferRecord, RecordDeltaBuffer};
 use crate::slot::TimeSlot;
 
@@ -46,6 +47,9 @@ pub struct ClientStatisticsRecord {
     /// never had.
     pub rejected_stale_count: f64,
     pub rejected_stale_diff1: f64,
+    /// Highest single accepted share difficulty of the slot. A maximum, not
+    /// a sum: merged with `max`, and with `GREATEST` in the database.
+    pub max_difficulty: f64,
 }
 
 impl ClientStatisticsRecord {
@@ -78,6 +82,7 @@ impl BufferRecord for ClientStatisticsRecord {
             && self.rejected_version_rolling_diff1 == 0.0
             && self.rejected_stale_count == 0.0
             && self.rejected_stale_diff1 == 0.0
+            && self.max_difficulty == 0.0
     }
 
     fn add_assign(&mut self, rhs: &Self) {
@@ -94,6 +99,7 @@ impl BufferRecord for ClientStatisticsRecord {
         self.rejected_version_rolling_diff1 += rhs.rejected_version_rolling_diff1;
         self.rejected_stale_count += rhs.rejected_stale_count;
         self.rejected_stale_diff1 += rhs.rejected_stale_diff1;
+        self.max_difficulty = self.max_difficulty.max(rhs.max_difficulty);
     }
 
     fn sub_assign_clamped(&mut self, rhs: &Self) -> bool {
@@ -110,6 +116,7 @@ impl BufferRecord for ClientStatisticsRecord {
         self.rejected_version_rolling_diff1 -= rhs.rejected_version_rolling_diff1;
         self.rejected_stale_count -= rhs.rejected_stale_count;
         self.rejected_stale_diff1 -= rhs.rejected_stale_diff1;
+        self.max_difficulty = flushed_max(self.max_difficulty, rhs.max_difficulty);
         self.shares <= 0.0
             && self.accepted_count <= 0.0
             && self.rejected_count <= 0.0
@@ -123,6 +130,7 @@ impl BufferRecord for ClientStatisticsRecord {
             && self.rejected_version_rolling_diff1 <= 0.0
             && self.rejected_stale_count <= 0.0
             && self.rejected_stale_diff1 <= 0.0
+            && self.max_difficulty <= 0.0
     }
 }
 
@@ -197,6 +205,25 @@ mod tests {
             rejected_job_not_found_diff1: diff,
             ..Default::default()
         }
+    }
+
+    /// Two shares in one row: the sums add, the maximum keeps the higher.
+    #[test]
+    fn slot_max_is_a_maximum_not_a_sum() {
+        let acc = ClientStatisticsAccumulator::new();
+        let k = key("bc1qalice", "w1", "s1", 1_000);
+        for (credited, solved) in [(10.0, 500.0), (10.0, 300.0)] {
+            acc.add(
+                k.clone(),
+                &ClientStatisticsRecord {
+                    max_difficulty: solved,
+                    ..accepted_record(credited)
+                },
+            );
+        }
+        let snap = acc.drain();
+        let rec = snap.get(&k).expect("row");
+        assert_eq!((rec.shares, rec.max_difficulty), (20.0, 500.0));
     }
 
     #[test]

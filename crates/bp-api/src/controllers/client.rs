@@ -35,6 +35,10 @@ where
         )
         .route("/api/client/:address/chart", get(chart::<H, M>))
         .route("/api/client/:address/accepted", get(accepted::<H, M>))
+        .route(
+            "/api/client/:address/max-difficulty",
+            get(max_difficulty::<H, M>),
+        )
         .route("/api/client/:address/workers", get(workers::<H, M>))
         .route("/api/client/:address/rejected", get(rejected::<H, M>))
         .route("/api/client/:address/diff-scores", get(diff_scores::<H, M>))
@@ -62,8 +66,8 @@ where
 
 use crate::controllers::info::{rejected_by_reason_slots, RejectSlotsResponse};
 use crate::time_range::{
-    accepted_slot_data, chart_slot_boundaries, fold_into_slots, sum_into_slots, ChartPoint, Range,
-    SlotDataResponse,
+    accepted_slot_data, chart_slot_boundaries, fold_into_slots, max_difficulty_slot_data,
+    sum_into_slots, ChartPoint, Range, SlotDataResponse,
 };
 use axum::extract::Query;
 use serde::Deserialize;
@@ -150,6 +154,36 @@ where
             Ok(accepted_slot_data(
                 &chart_slot_boundaries(since),
                 rows.iter().map(|r| (r.time, r.shares as f64)),
+            ))
+        })
+        .await?;
+    Ok(JsonBytes(bytes))
+}
+
+/// The highest single share difficulty of the address in each 10-minute
+/// slot, over all its workers.
+async fn max_difficulty<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(address): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> Result<JsonBytes, ApiError>
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    let addr = AddressId::new(address).map_err(|_| ApiError::InvalidAddress)?;
+    let range = Range::parse(q.range.as_deref())?;
+    let key = format!("CLIENT_MAX_DIFFICULTY_{}_{}", addr.as_str(), range.label());
+    let s = state.clone();
+    let bytes = state
+        .cache
+        .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::ClientAccepted, async move {
+            let since = bp_common::now_ms() - range.window_ms();
+            let rows =
+                bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
+            Ok(max_difficulty_slot_data(
+                &chart_slot_boundaries(since),
+                rows.iter().map(|r| (r.time, r.max_difficulty as f64)),
             ))
         })
         .await?;

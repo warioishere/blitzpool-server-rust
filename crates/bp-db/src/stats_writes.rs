@@ -31,17 +31,20 @@ use crate::pool::DbError;
 
 /// One row in a `pool_share_statistics_entity` bulk-upsert. `accepted`
 /// and `rejected` are diff sums (NOT share counts) for the 10-minute
-/// slot whose end aligns with `time_ms`.
+/// slot whose end aligns with `time_ms`; `max_difficulty` is the highest
+/// single share difficulty in it.
 #[derive(Clone, Debug)]
 pub struct PoolShareStatsUpsert {
     pub time_ms: i64,
     pub accepted: f32,
     pub rejected: f32,
+    pub max_difficulty: f32,
 }
 
 /// Bulk-upsert pool-wide share statistics. `ON CONFLICT ("time") DO
-/// UPDATE` adds `EXCLUDED` to the current values so two flushes with
-/// the same slot sum cleanly. Updates `updatedAt` to current epoch ms.
+/// UPDATE` adds `EXCLUDED` to the current sums so two flushes with the
+/// same slot sum cleanly, and keeps the greater `maxDifficulty`. Updates
+/// `updatedAt` to current epoch ms.
 pub async fn bulk_upsert_pool_share_statistics<'e, E>(
     executor: E,
     rows: &[PoolShareStatsUpsert],
@@ -55,18 +58,21 @@ where
     let times: Vec<i64> = rows.iter().map(|r| r.time_ms).collect();
     let accepted: Vec<f32> = rows.iter().map(|r| r.accepted).collect();
     let rejected: Vec<f32> = rows.iter().map(|r| r.rejected).collect();
+    let max_difficulty: Vec<f32> = rows.iter().map(|r| r.max_difficulty).collect();
 
     let result = sqlx::query!(
-        r#"INSERT INTO pool_share_statistics_entity ("time", accepted, rejected, "updatedAt")
-           SELECT u.t, u.a, u.r, (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
-           FROM UNNEST($1::bigint[], $2::real[], $3::real[]) AS u(t, a, r)
+        r#"INSERT INTO pool_share_statistics_entity ("time", accepted, rejected, "maxDifficulty", "updatedAt")
+           SELECT u.t, u.a, u.r, u.m, (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
+           FROM UNNEST($1::bigint[], $2::real[], $3::real[], $4::real[]) AS u(t, a, r, m)
            ON CONFLICT ("time") DO UPDATE
-           SET accepted   = pool_share_statistics_entity.accepted  + EXCLUDED.accepted,
-               rejected   = pool_share_statistics_entity.rejected  + EXCLUDED.rejected,
-               "updatedAt" = EXCLUDED."updatedAt""#,
+           SET accepted        = pool_share_statistics_entity.accepted  + EXCLUDED.accepted,
+               rejected        = pool_share_statistics_entity.rejected  + EXCLUDED.rejected,
+               "maxDifficulty" = GREATEST(pool_share_statistics_entity."maxDifficulty", EXCLUDED."maxDifficulty"),
+               "updatedAt"     = EXCLUDED."updatedAt""#,
         &times,
         &accepted,
         &rejected,
+        &max_difficulty,
     )
     .execute(executor)
     .await
@@ -175,6 +181,7 @@ pub struct ClientStatsUpsert {
     pub rejected_version_rolling_diff1: f32,
     pub rejected_stale_count: i32,
     pub rejected_stale_diff1: f32,
+    pub max_difficulty: f32,
 }
 
 /// Bulk-upsert client-statistics rows. UNIQUE (address, clientName,
@@ -236,6 +243,7 @@ where
         .collect();
     let r_stale_count: Vec<i32> = rows.iter().map(|r| r.rejected_stale_count).collect();
     let r_stale_diff: Vec<f32> = rows.iter().map(|r| r.rejected_stale_diff1).collect();
+    let max_difficulty: Vec<f32> = rows.iter().map(|r| r.max_difficulty).collect();
 
     let result = sqlx::query!(
         r#"INSERT INTO client_statistics_entity
@@ -246,6 +254,7 @@ where
               "rejectedLowDifficultyShareCount","rejectedLowDifficultyShareDiff1",
               "rejectedVersionRollingCount",   "rejectedVersionRollingDiff1",
               "rejectedStaleCount",            "rejectedStaleDiff1",
+              "maxDifficulty",
               "updatedAt")
            SELECT
              u.addr, u.cname, u.sid, u.t, u.sh,
@@ -255,6 +264,7 @@ where
              u.rlc, u.rld,
              u.rvc, u.rvd,
              u.rsc, u.rsd,
+             u.mx,
              (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
            FROM UNNEST(
              $1::varchar[], $2::varchar[], $3::varchar[], $4::bigint[], $5::real[],
@@ -263,8 +273,9 @@ where
              $10::int[], $11::real[],
              $12::int[], $13::real[],
              $14::int[], $15::real[],
-             $16::int[], $17::real[]
-           ) AS u(addr, cname, sid, t, sh, ac, rc, rjc, rjd, rdc, rdd, rlc, rld, rvc, rvd, rsc, rsd)
+             $16::int[], $17::real[],
+             $18::real[]
+           ) AS u(addr, cname, sid, t, sh, ac, rc, rjc, rjd, rdc, rdd, rlc, rld, rvc, rvd, rsc, rsd, mx)
            ON CONFLICT (address, "clientName", "sessionId", "time") DO UPDATE
            SET shares                              = client_statistics_entity.shares                              + EXCLUDED.shares,
                "acceptedCount"                     = client_statistics_entity."acceptedCount"                     + EXCLUDED."acceptedCount",
@@ -279,6 +290,7 @@ where
                "rejectedVersionRollingDiff1"       = client_statistics_entity."rejectedVersionRollingDiff1"       + EXCLUDED."rejectedVersionRollingDiff1",
                "rejectedStaleCount"                = client_statistics_entity."rejectedStaleCount"                + EXCLUDED."rejectedStaleCount",
                "rejectedStaleDiff1"                = client_statistics_entity."rejectedStaleDiff1"                + EXCLUDED."rejectedStaleDiff1",
+               "maxDifficulty"                     = GREATEST(client_statistics_entity."maxDifficulty", EXCLUDED."maxDifficulty"),
                "updatedAt"                         = EXCLUDED."updatedAt""#,
         &addresses,
         &client_names,
@@ -297,6 +309,7 @@ where
         &r_vr_diff,
         &r_stale_count,
         &r_stale_diff,
+        &max_difficulty,
     )
     .execute(executor)
     .await

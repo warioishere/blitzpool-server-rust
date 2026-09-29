@@ -111,9 +111,11 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
     .await
     .expect("seed addr row");
 
-    // Drive accumulators: pretend one accepted + one rejected share.
+    // Drive accumulators: pretend one accepted + one rejected share. The
+    // accepted one is credited at 10 but solved 4096, which only the slot
+    // maximum records.
     let accs = Arc::new(Accumulators::default());
-    accs.pool_shares.add_accepted(slot, 10.0);
+    accs.pool_shares.add_accepted(slot, 10.0, 4096.0);
     accs.pool_shares.add_rejected(slot, 1.0);
     accs.pool_mode_hashrate.add(slot, MiningMode::Pplns, 10.0);
     accs.pool_rejected
@@ -128,6 +130,7 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
         &ClientStatisticsRecord {
             shares: 10.0,
             accepted_count: 1.0,
+            max_difficulty: 4096.0,
             ..Default::default()
         },
     );
@@ -148,7 +151,7 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
 
     // Pool-shares row exists with the right values.
     let row = sqlx::query(
-        r#"SELECT accepted, rejected FROM pool_share_statistics_entity WHERE "time" = $1"#,
+        r#"SELECT accepted, rejected, "maxDifficulty" FROM pool_share_statistics_entity WHERE "time" = $1"#,
     )
     .bind(slot.as_millis())
     .fetch_one(&pool)
@@ -156,8 +159,21 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
     .expect("pool_share row");
     let accepted: f32 = row.get("accepted");
     let rejected: f32 = row.get("rejected");
+    let pool_max: f32 = row.get("maxDifficulty");
     assert!((accepted - 10.0).abs() < 0.01);
     assert!((rejected - 1.0).abs() < 0.01);
+    assert_eq!(pool_max, 4096.0);
+
+    let client_max: f32 = sqlx::query_scalar(
+        r#"SELECT "maxDifficulty" FROM client_statistics_entity
+           WHERE address = $1 AND "time" = $2"#,
+    )
+    .bind(format!("{prefix}alice"))
+    .bind(slot.as_millis())
+    .fetch_one(&pool)
+    .await
+    .expect("client_statistics row");
+    assert_eq!(client_max, 4096.0);
 
     // Pool-mode hashrate.
     let diff: f32 = sqlx::query_scalar(
@@ -347,12 +363,12 @@ async fn replay_idempotency_double_flush_doubles_counts() {
     // accumulator never confirmed, and a new tick re-includes the
     // same snapshot.
     let accs1 = Arc::new(Accumulators::default());
-    accs1.pool_shares.add_accepted(slot, 5.0);
+    accs1.pool_shares.add_accepted(slot, 5.0, 5.0);
     let health1 = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
     flush_once(&pool, &accs1, &health1, 1000).await;
 
     let accs2 = Arc::new(Accumulators::default());
-    accs2.pool_shares.add_accepted(slot, 5.0);
+    accs2.pool_shares.add_accepted(slot, 5.0, 5.0);
     let health2 = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
     flush_once(&pool, &accs2, &health2, 1000).await;
 
@@ -384,7 +400,7 @@ async fn health_monitor_tracks_success_after_single_clean_flush() {
     cleanup(&pool, slot.as_millis(), prefix).await;
 
     let accs = Arc::new(Accumulators::default());
-    accs.pool_shares.add_accepted(slot, 1.0);
+    accs.pool_shares.add_accepted(slot, 1.0, 1.0);
     let health = Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default()));
     flush_once(&pool, &accs, &health, 1000).await;
 

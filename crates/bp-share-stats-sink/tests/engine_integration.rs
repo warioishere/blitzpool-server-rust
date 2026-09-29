@@ -129,7 +129,7 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
     // Push data via the shared accumulators handle — same path SV1 hooks
     // would take when a real Stratum server is wired up.
     let accs = handle.accumulators();
-    accs.pool_shares.add_accepted(slot, 50.0);
+    accs.pool_shares.add_accepted(slot, 50.0, 50.0);
     accs.pool_rejected
         .add(slot, RejectedReason::DuplicateShare, 1.0);
     accs.client_statistics.add(
@@ -166,7 +166,7 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
     );
 
     // Drop more data, then signal shutdown — final-drain should commit it.
-    accs.pool_shares.add_accepted(slot, 10.0);
+    accs.pool_shares.add_accepted(slot, 10.0, 10.0);
     handle.shutdown().await;
 
     let accepted_after: f32 = sqlx::query_scalar(
@@ -206,7 +206,7 @@ async fn engine_reader_exposes_pending_residuals_before_flush() {
 
     assert_eq!(reader.pending_pool_shares(), 0);
     accs.pool_shares
-        .add_accepted(TimeSlot::from_millis(32_503_680_011_001), 25.0);
+        .add_accepted(TimeSlot::from_millis(32_503_680_011_001), 25.0, 25.0);
     assert_eq!(reader.pending_pool_shares(), 1);
     // Cheap clone semantics: clones see the same backing state.
     let reader_clone = reader.clone();

@@ -57,7 +57,9 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
         // Producer-stamped mode — no per-share gate query.
         let mode = share.mode;
         // Per-share accumulator fan-out.
-        self.accumulators.pool_shares.add_accepted(slot, diff);
+        self.accumulators
+            .pool_shares
+            .add_accepted(slot, diff, share.submission_difficulty);
         self.accumulators.pool_mode_hashrate.add(slot, mode, diff);
         let address_id = match AddressId::new(share.address.to_string()) {
             Ok(a) => a,
@@ -74,6 +76,7 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
             &ClientStatisticsRecord {
                 shares: diff,
                 accepted_count: 1.0,
+                max_difficulty: bp_stats::share_max(share.submission_difficulty),
                 ..Default::default()
             },
         );
@@ -187,5 +190,44 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
             }
         }
         self.accumulators.client_statistics.add(key, &delta);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bp_common::MiningMode;
+
+    /// The slot maximum is the difficulty the share solved, the sums are what
+    /// it was credited at. Handing the credited value to the maximum would
+    /// leave it at 10 here.
+    #[tokio::test]
+    async fn an_accepted_share_feeds_the_solved_difficulty_into_both_slot_maxima() {
+        let accs = Arc::new(Accumulators::default());
+        let sink = ShareStatsAcceptedSink::new(accs.clone());
+        sink.record_accepted(SharedAcceptedShare {
+            address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            worker: "rig1",
+            session_id: "sess0001",
+            effective_difficulty: 10.0,
+            submission_difficulty: 4096.0,
+            user_agent: None,
+            is_block_candidate: false,
+            hash_rate: 0.0,
+            channel_count: 1,
+            ts_ms: 0,
+            share_id: "",
+            mode: MiningMode::Solo,
+            group_id: None,
+        })
+        .await;
+
+        let pool = accs.pool_shares.drain();
+        let pool = pool.values().next().expect("one pool slot");
+        assert_eq!((pool.accepted, pool.max_difficulty), (10.0, 4096.0));
+
+        let clients = accs.client_statistics.drain();
+        let client = clients.values().next().expect("one client row");
+        assert_eq!((client.shares, client.max_difficulty), (10.0, 4096.0));
     }
 }

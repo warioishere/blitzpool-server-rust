@@ -75,22 +75,23 @@ async fn pool_share_stats_insert_then_increment() {
     let mut tx = pool.begin().await.expect("begin tx");
     let slot = unique_slot(1);
 
-    let rows = vec![PoolShareStatsUpsert {
+    let row_with = |max_difficulty: f32| PoolShareStatsUpsert {
         time_ms: slot,
         accepted: 100.5,
         rejected: 3.0,
-    }];
-    bulk_upsert_pool_share_statistics(&mut *tx, &rows)
+        max_difficulty,
+    };
+    bulk_upsert_pool_share_statistics(&mut *tx, &[row_with(500.0)])
         .await
         .expect("first upsert");
 
-    // Second call increments.
-    bulk_upsert_pool_share_statistics(&mut *tx, &rows)
+    // Second call increments the sums and keeps the higher maximum.
+    bulk_upsert_pool_share_statistics(&mut *tx, &[row_with(300.0)])
         .await
         .expect("second upsert");
 
     let row = sqlx::query(
-        r#"SELECT accepted, rejected FROM pool_share_statistics_entity WHERE "time" = $1"#,
+        r#"SELECT accepted, rejected, "maxDifficulty" FROM pool_share_statistics_entity WHERE "time" = $1"#,
     )
     .bind(slot)
     .fetch_one(&mut *tx)
@@ -106,6 +107,9 @@ async fn pool_share_stats_insert_then_increment() {
         (rejected - 6.0).abs() < 0.01,
         "rejected should accumulate: got {rejected}"
     );
+    // Neither the sum (800) nor the last write (300).
+    let max: f32 = row.get("maxDifficulty");
+    assert_eq!(max, 500.0);
 
     tx.rollback().await.expect("rollback");
 }
@@ -274,6 +278,7 @@ async fn client_stats_insert_then_increment_every_field() {
             rejected_version_rolling_diff1: vr as f32 * 0.75,
             rejected_stale_count: stale,
             rejected_stale_diff1: stale as f32 * 0.2,
+            max_difficulty: shares * 7.0,
         }
     };
 
@@ -290,7 +295,7 @@ async fn client_stats_insert_then_increment_every_field() {
                   "rejectedJobNotFoundCount", "rejectedDuplicateShareCount",
                   "rejectedLowDifficultyShareCount",
                   "rejectedVersionRollingCount", "rejectedVersionRollingDiff1",
-                  "rejectedStaleCount", "rejectedStaleDiff1"
+                  "rejectedStaleCount", "rejectedStaleDiff1", "maxDifficulty"
            FROM client_statistics_entity
            WHERE address = $1 AND "clientName" = $2 AND "sessionId" = $3 AND "time" = $4"#,
     )
@@ -327,6 +332,9 @@ async fn client_stats_insert_then_increment_every_field() {
     // `jnf` moving instead of this staying put.
     assert_eq!(stale, 10);
     assert!((stale_diff - 2.0_f32).abs() < 0.001, "got {stale_diff}");
+    // The maximum of 700 and 350: neither their sum nor the last write.
+    let max: f32 = row.get("maxDifficulty");
+    assert_eq!(max, 700.0);
 
     tx.rollback().await.expect("rollback");
 }
@@ -357,6 +365,7 @@ async fn client_stats_distinct_keys_stay_independent() {
         rejected_version_rolling_diff1: 0.0,
         rejected_stale_count: 0,
         rejected_stale_diff1: 0.0,
+        max_difficulty: 0.0,
     };
     // Two sessions for the same address+worker → 2 distinct PK rows.
     let mut variant = base.clone();
@@ -891,6 +900,7 @@ async fn seed_aggregates_client_statistics_into_worker_shares() {
             rejected_version_rolling_diff1: 0.0,
             rejected_stale_count: 0,
             rejected_stale_diff1: 0.0,
+            max_difficulty: 0.0,
         },
         ClientStatsUpsert {
             address: "test_seed_alice".to_string(),
@@ -910,6 +920,7 @@ async fn seed_aggregates_client_statistics_into_worker_shares() {
             rejected_version_rolling_diff1: 0.0,
             rejected_stale_count: 0,
             rejected_stale_diff1: 0.0,
+            max_difficulty: 0.0,
         },
     ];
     bulk_upsert_client_statistics_entity(&mut *tx, &stats)

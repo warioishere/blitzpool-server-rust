@@ -33,8 +33,8 @@ pub mod health;
 pub mod slot;
 
 pub use accumulator::{
-    AddressTotalsSnapshot, BestDifficultyAccumulator, BestDifficultyEntry, BestDifficultySnapshot,
-    ClientRejectedAccumulator, ClientRejectedKey, ClientRejectedSnapshot,
+    share_max, AddressTotalsSnapshot, BestDifficultyAccumulator, BestDifficultyEntry,
+    BestDifficultySnapshot, ClientRejectedAccumulator, ClientRejectedKey, ClientRejectedSnapshot,
     ClientStatisticsAccumulator, ClientStatisticsKey, ClientStatisticsRecord,
     ClientStatisticsSnapshot, PoolModeHashrateAccumulator, PoolModeHashrateSnapshot,
     PoolRejectedAccumulator, PoolRejectedSnapshot, PoolSharesAccumulator, PoolSharesRecord,

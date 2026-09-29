@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"time\" AS \"time!\",\n            shares AS \"shares!\",\n            \"acceptedCount\" AS \"accepted_count!\",\n            \"rejectedCount\" AS \"rejected_count!\",\n            \"rejectedJobNotFoundCount\" AS \"rejected_job_not_found_count!\",\n            \"rejectedJobNotFoundDiff1\" AS \"rejected_job_not_found_diff1!\",\n            \"rejectedDuplicateShareCount\" AS \"rejected_duplicate_share_count!\",\n            \"rejectedDuplicateShareDiff1\" AS \"rejected_duplicate_share_diff1!\",\n            \"rejectedLowDifficultyShareCount\" AS \"rejected_low_difficulty_share_count!\",\n            \"rejectedLowDifficultyShareDiff1\" AS \"rejected_low_difficulty_share_diff1!\",\n            \"rejectedVersionRollingCount\" AS \"rejected_version_rolling_count!\",\n            \"rejectedVersionRollingDiff1\" AS \"rejected_version_rolling_diff1!\",\n            \"rejectedStaleCount\" AS \"rejected_stale_count!\",\n            \"rejectedStaleDiff1\" AS \"rejected_stale_diff1!\"\n           FROM client_statistics_entity\n           WHERE \"deletedAt\" IS NULL AND address = $1 AND \"time\" >= $2\n           ORDER BY \"time\" ASC",
+  "query": "SELECT\n            \"deletedAt\" AS \"deleted_at?\",\n            \"createdAt\" AS \"created_at!\",\n            \"updatedAt\" AS \"updated_at!\",\n            id AS \"id!\",\n            address AS \"address!: AddressId\",\n            \"clientName\" AS \"client_name!\",\n            \"sessionId\" AS \"session_id!\",\n            \"time\" AS \"time!\",\n            shares AS \"shares!\",\n            \"acceptedCount\" AS \"accepted_count!\",\n            \"rejectedCount\" AS \"rejected_count!\",\n            \"rejectedJobNotFoundCount\" AS \"rejected_job_not_found_count!\",\n            \"rejectedJobNotFoundDiff1\" AS \"rejected_job_not_found_diff1!\",\n            \"rejectedDuplicateShareCount\" AS \"rejected_duplicate_share_count!\",\n            \"rejectedDuplicateShareDiff1\" AS \"rejected_duplicate_share_diff1!\",\n            \"rejectedLowDifficultyShareCount\" AS \"rejected_low_difficulty_share_count!\",\n            \"rejectedLowDifficultyShareDiff1\" AS \"rejected_low_difficulty_share_diff1!\",\n            \"rejectedVersionRollingCount\" AS \"rejected_version_rolling_count!\",\n            \"rejectedVersionRollingDiff1\" AS \"rejected_version_rolling_diff1!\",\n            \"rejectedStaleCount\" AS \"rejected_stale_count!\",\n            \"rejectedStaleDiff1\" AS \"rejected_stale_diff1!\",\n            \"maxDifficulty\" AS \"max_difficulty!\"\n           FROM client_statistics_entity\n           WHERE \"deletedAt\" IS NULL AND \"time\" >= $1\n           ORDER BY \"time\" ASC",
   "describe": {
     "columns": [
       {
@@ -107,11 +107,15 @@
         "ordinal": 20,
         "name": "rejected_stale_diff1!",
         "type_info": "Float4"
+      },
+      {
+        "ordinal": 21,
+        "name": "max_difficulty!",
+        "type_info": "Float4"
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
         "Int8"
       ]
     },
@@ -136,8 +140,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "45f658b7ac4c69e7c79eaf63fc7a6b08a276b83dd244724be224706f14ed4f42"
+  "hash": "daf1b5a9ad31a906f9c01955a8cee5d539302899acd8372349d7ad40eca7a766"
 }

@@ -157,6 +157,21 @@ pub fn accepted_slot_data(
     })
 }
 
+/// The `/max-difficulty` shape: one `{"maxDifficulty": max}` bucket per
+/// slot, the highest single share difficulty of the slot's rows; an empty
+/// slot is `0`.
+pub fn max_difficulty_slot_data(
+    boundaries: &[i64],
+    samples: impl IntoIterator<Item = (i64, f64)>,
+) -> SlotDataResponse {
+    let slots = fold_into_slots(boundaries, samples, |max: &mut f64, v: f64| {
+        *max = max.max(v)
+    });
+    SlotDataResponse::from_slots(slots, |max| {
+        BTreeMap::from([("maxDifficulty".to_string(), max)])
+    })
+}
+
 /// Render an epoch-ms timestamp as an ISO-8601 string with
 /// millisecond precision and a trailing `Z`
 /// (`"YYYY-MM-DDTHH:MM:SS.mmmZ"`).

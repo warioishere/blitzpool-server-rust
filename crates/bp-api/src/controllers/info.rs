@@ -45,6 +45,7 @@ where
         )
         .route("/api/info/chart", get(chart::<H, M>))
         .route("/api/info/accepted", get(accepted::<H, M>))
+        .route("/api/info/max-difficulty", get(max_difficulty::<H, M>))
         .route("/api/info/workers", get(workers::<H, M>))
         .route("/api/info/rejected", get(rejected::<H, M>))
         .route("/api/info/shares", get(shares::<H, M>))
@@ -975,7 +976,8 @@ fn format_uptime(ms: u64) -> String {
 // shows a half-filled bucket.
 
 use crate::time_range::{
-    accepted_slot_data, chart_slot_boundaries, fold_into_slots, ChartPoint, Range, SlotDataResponse,
+    accepted_slot_data, chart_slot_boundaries, fold_into_slots, max_difficulty_slot_data,
+    ChartPoint, Range, SlotDataResponse,
 };
 use axum::extract::Query;
 use serde::Deserialize;
@@ -1044,6 +1046,35 @@ where
             Ok(accepted_slot_data(
                 &chart_slot_boundaries(since),
                 rows.iter().map(|r| (r.time, r.accepted as f64)),
+            ))
+        })
+        .await?;
+    Ok(JsonBytes(bytes))
+}
+
+// ─── /api/info/max-difficulty ─────────────────────────────────────
+//
+// The highest single share difficulty the pool saw in each 10-minute slot.
+
+async fn max_difficulty<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Query(q): Query<RangeQuery>,
+) -> Result<JsonBytes, ApiError>
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    let range = Range::parse(q.range.as_deref())?;
+    let key = format!("POOL_MAX_DIFFICULTY_{}", range.label());
+    let s = state.clone();
+    let bytes = state
+        .cache
+        .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Accepted, async move {
+            let since = bp_common::now_ms() - range.window_ms();
+            let rows = bp_db::find_pool_share_statistics_since(&s.pool, since).await?;
+            Ok(max_difficulty_slot_data(
+                &chart_slot_boundaries(since),
+                rows.iter().map(|r| (r.time, r.max_difficulty as f64)),
             ))
         })
         .await?;
@@ -1542,6 +1573,24 @@ mod slot_json_tests {
         assert_eq!(
             json(&accepted_slot_data(&BOUNDARIES, samples)),
             r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"accepted":1.6000000014901161}},{"time":"2023-11-14T22:30:00.000Z","counts":{"accepted":2}},{"time":"2023-11-14T22:40:00.000Z","counts":{"accepted":0}}]}"#
+        );
+    }
+
+    /// `/api/info/max-difficulty` and `/api/client/:address/max-difficulty` —
+    /// the highest share per slot: not the sum (800) and not the last row
+    /// (300); an empty slot is 0 and a row off the grid is dropped.
+    #[test]
+    fn max_difficulty_json_keeps_the_highest_share_per_slot() {
+        let samples = vec![
+            (T0, 500.0),
+            (T0, 300.0),
+            (T0 + S + 5, 7.0),
+            (T0 - S, 9e9),
+            (T0 + 3 * S, 1e9),
+        ];
+        assert_eq!(
+            json(&max_difficulty_slot_data(&BOUNDARIES, samples)),
+            r#"{"slotData":[{"time":"2023-11-14T22:20:00.000Z","counts":{"maxDifficulty":500}},{"time":"2023-11-14T22:30:00.000Z","counts":{"maxDifficulty":7}},{"time":"2023-11-14T22:40:00.000Z","counts":{"maxDifficulty":0}}]}"#
         );
     }
 

@@ -186,7 +186,8 @@ pub async fn find_client_statistics_since(
             "rejectedVersionRollingCount" AS "rejected_version_rolling_count!",
             "rejectedVersionRollingDiff1" AS "rejected_version_rolling_diff1!",
             "rejectedStaleCount" AS "rejected_stale_count!",
-            "rejectedStaleDiff1" AS "rejected_stale_diff1!"
+            "rejectedStaleDiff1" AS "rejected_stale_diff1!",
+            "maxDifficulty" AS "max_difficulty!"
            FROM client_statistics_entity
            WHERE "deletedAt" IS NULL AND "time" >= $1
            ORDER BY "time" ASC"#,
@@ -260,7 +261,8 @@ pub async fn find_client_statistics_since_for_address(
             "rejectedVersionRollingCount" AS "rejected_version_rolling_count!",
             "rejectedVersionRollingDiff1" AS "rejected_version_rolling_diff1!",
             "rejectedStaleCount" AS "rejected_stale_count!",
-            "rejectedStaleDiff1" AS "rejected_stale_diff1!"
+            "rejectedStaleDiff1" AS "rejected_stale_diff1!",
+            "maxDifficulty" AS "max_difficulty!"
            FROM client_statistics_entity
            WHERE "deletedAt" IS NULL AND address = $1 AND "time" >= $2
            ORDER BY "time" ASC"#,
@@ -343,6 +345,9 @@ pub struct ClientStatisticsRow {
     pub rejected_stale_count: i32,
     #[sqlx(rename = "rejectedStaleDiff1")]
     pub rejected_stale_diff1: f32,
+    /// Highest single share difficulty of the slot.
+    #[sqlx(rename = "maxDifficulty")]
+    pub max_difficulty: f32,
 }
 
 /// N per-slot maxima in one `INSERT … SELECT unnest(...) … ON CONFLICT DO
