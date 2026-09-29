@@ -712,6 +712,17 @@ async fn run_mining_connection(
                 }
                 let is_submit =
                     matches!(inbound, InboundMiningFrame::SubmitSharesExtended(_));
+                // The dispatch consumes the frame; the identity is kept for the
+                // refusal log below.
+                let open_identity = match &inbound {
+                    InboundMiningFrame::OpenStandardMiningChannel(input, _) => {
+                        Some(input.user_identity.clone())
+                    }
+                    InboundMiningFrame::OpenExtendedMiningChannel(input, _) => {
+                        Some(input.user_identity.clone())
+                    }
+                    _ => None,
+                };
                 // The pool-wide extranonce allocator is locked INSIDE the
                 // Open/Close dispatch arms only — the hot submit path never
                 // touches it, so share validation across connections does
@@ -732,6 +743,16 @@ async fn run_mining_connection(
                     SessionEvent::Disconnect { reason } => Some(reason.clone()),
                     _ => None,
                 });
+                if let (Some(user_identity), Some(error_code)) =
+                    (&open_identity, open_channel_refusal(&outcome.outbound))
+                {
+                    warn!(
+                        session_id_hex = %session_id_hex,
+                        user_identity = %user_identity,
+                        error_code,
+                        "sv2 channel open refused"
+                    );
+                }
                 let newly_opened_channel = outcome.events.iter().find_map(|e| match e {
                     SessionEvent::ChannelOpened {
                         channel_id, kind, ..
@@ -1069,6 +1090,15 @@ async fn run_mining_connection(
         .await;
     let _ = writer.shutdown().await;
     Ok(())
+}
+
+/// The error code of the `OpenMiningChannel.Error` in `outbound`, if the
+/// dispatch refused a channel open.
+fn open_channel_refusal(outbound: &[OutboundFrame]) -> Option<&str> {
+    outbound.iter().find_map(|frame| match frame {
+        OutboundFrame::OpenMiningChannelError { error_code, .. } => Some(error_code.as_str()),
+        _ => None,
+    })
 }
 
 /// `"{vendor}/sv2"`: the user agent a connection's SetupConnection `vendor`
@@ -2752,6 +2782,57 @@ mod tests {
             before - 1,
             "close releases the channel's prefix"
         );
+    }
+
+    /// A refused open is what the connection loop logs, with the handler's
+    /// reason; an accepted one is not.
+    #[test]
+    fn open_channel_refusal_reports_the_reason_of_a_refused_open_only() {
+        let mut s = fresh_test_session();
+        let alloc = ConnectionExtranonce::new(fresh_allocator());
+        let bridge = fresh_bridge();
+        let setup = InboundMiningFrame::SetupConnection(SetupConnectionInput {
+            protocol: PROTOCOL_MINING,
+            min_version: 2,
+            max_version: 2,
+            flags: FLAG_REQUIRES_VERSION_ROLLING,
+            vendor: "t".to_string(),
+            firmware: "0.1".to_string(),
+            hardware_version: "r".to_string(),
+            device_id: "d".to_string(),
+        });
+        let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
+        let open = |request_id, user_identity: String| {
+            InboundMiningFrame::OpenStandardMiningChannel(
+                crate::mining::client::OpenStandardMiningChannelInput {
+                    request_id,
+                    user_identity,
+                    nominal_hash_rate: 1_000.0,
+                    max_target: [0xFF; 32],
+                },
+                Vec::new(),
+            )
+        };
+
+        let refused = dispatch_inbound_frame(
+            &mut s,
+            open(1, "not-an-address.w".to_string()),
+            &alloc,
+            &bridge,
+            0,
+        );
+        assert_eq!(
+            open_channel_refusal(&refused.outbound),
+            Some(crate::mining::client::ERR_UNKNOWN_USER)
+        );
+
+        let accepted =
+            dispatch_inbound_frame(&mut s, open(2, format!("{ADDR}.w")), &alloc, &bridge, 0);
+        assert!(
+            s.primary_channel.is_some(),
+            "precondition: the open succeeded"
+        );
+        assert_eq!(open_channel_refusal(&accepted.outbound), None);
     }
 
     /// A `CloseChannel` addressed to a group_channel_id releases the

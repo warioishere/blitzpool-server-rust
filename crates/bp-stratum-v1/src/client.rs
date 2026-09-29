@@ -481,6 +481,12 @@ pub(crate) fn handle_authorize<C: Clock>(
     // We validate via the parse-
     // step here.
     if request.address.is_empty() {
+        tracing::warn!(
+            session_id_hex = %state.session_id_hex,
+            username = %request.raw_username,
+            reason = VALIDATION_INVALID_AUTHORIZE,
+            "sv1 authorize refused"
+        );
         out.push_frame(write_error(
             &id,
             ERR_OTHER_UNKNOWN,
@@ -498,6 +504,12 @@ pub(crate) fn handle_authorize<C: Clock>(
     // bitcoin-address-validation; our `Address::from_str` +
     // `require_network` covers the same shape.
     if address_to_script(state.network, &request.address).is_err() {
+        tracing::warn!(
+            session_id_hex = %state.session_id_hex,
+            username = %request.raw_username,
+            reason = REJECT_INVALID_ADDR,
+            "sv1 authorize refused"
+        );
         out.push_frame(write_error(&id, ERR_OTHER_UNKNOWN, REJECT_INVALID_ADDR));
         out.push_event(SessionEvent::Disconnect);
         return out;
