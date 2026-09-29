@@ -779,14 +779,13 @@ async fn run_mining_connection(
                         // there.)
                         let address = addr.clone();
                         let worker = state.worker_name.clone();
-                        let user_agent = session_user_agent(&state.vendor);
                         hooks
                             .session_persistence
                             .register_session(
                                 &session_id_hex,
                                 address.as_str(),
                                 &worker,
-                                Some(user_agent.as_str()),
+                                Some(session_user_agent(state.user_agent.as_deref())),
                             )
                             .await;
                         if state.stream.is_pplns() {
@@ -1101,19 +1100,10 @@ fn open_channel_refusal(outbound: &[OutboundFrame]) -> Option<&str> {
     })
 }
 
-/// `"{vendor}/sv2"`: the user agent a connection's SetupConnection `vendor`
-/// is recorded under (`bitaxe/sv2`, `NerdQAxe++/sv2`), with the vendor
-/// normalised the way SV1 normalises its user agent
-/// ([`bp_common::normalize_user_agent`]); `None` when that leaves nothing.
-fn vendor_user_agent(vendor: &str) -> Option<String> {
-    let normalized = bp_common::normalize_user_agent(vendor);
-    (!normalized.is_empty()).then(|| format!("{normalized}/sv2"))
-}
-
-/// [`vendor_user_agent`], with an empty vendor recorded as the
+/// The session's user agent, with an empty vendor recorded as the
 /// `jd-client/sv2` placeholder the downstream report later refines.
-fn session_user_agent(vendor: &str) -> String {
-    vendor_user_agent(vendor).unwrap_or_else(|| "jd-client/sv2".to_string())
+fn session_user_agent(user_agent: Option<&str>) -> &str {
+    user_agent.unwrap_or("jd-client/sv2")
 }
 
 // ── Dispatch + Outbound write helpers ───────────────────────────────
@@ -1663,14 +1653,13 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                 // pending row for the /api/info histogram (`bitaxe/sv2`,
                 // etc.); it reaches client_entity.userAgent when the row is
                 // born.
-                let user_agent_owned = session_user_agent(&state.vendor);
                 hooks
                     .device_status_sink
                     .on_device_event(
                         address.as_str(),
                         &worker,
                         session_id_hex,
-                        Some(user_agent_owned.as_str()),
+                        Some(session_user_agent(state.user_agent.as_deref())),
                         true,
                     )
                     .await;
@@ -1678,14 +1667,13 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
             SessionEvent::ChannelClosed { .. } => {
                 if !address_str.is_empty() {
                     // Same vendor-derived UA the online/register path uses.
-                    let user_agent = session_user_agent(&state.vendor);
                     hooks
                         .device_status_sink
                         .on_device_event(
                             address_str,
                             worker_str,
                             session_id_hex,
-                            Some(user_agent.as_str()),
+                            Some(session_user_agent(state.user_agent.as_deref())),
                             false,
                         )
                         .await;
@@ -1744,16 +1732,15 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                         accept.submission_difficulty.as_f64()
                     );
                 }
-                // Same vendor-derived UA the register / device-status
-                // path uses (empty vendor ⇒ no UA).
-                let user_agent = vendor_user_agent(&state.vendor);
                 hooks
                     .accepted_sink
                     .record_accepted(crate::shared_adapter::shared_accepted(
                         address_str,
                         effective_worker,
                         session_id_hex,
-                        user_agent.as_deref(),
+                        // Same vendor-derived UA the register / device-status
+                        // path uses (empty vendor ⇒ no UA).
+                        state.user_agent.as_deref(),
                         &accept,
                         // Sum every channel's vardiff hash-rate so the per-session
                         // client row reports the whole connection's rate. For a 1:1
@@ -2633,21 +2620,45 @@ mod tests {
     /// `jd-client/sv2` placeholder; the accepted-share path records none.
     #[test]
     fn user_agent_from_vendor() {
+        use crate::mining::client::vendor_user_agent;
         assert_eq!(vendor_user_agent("bitaxe").as_deref(), Some("bitaxe/sv2"));
         assert_eq!(vendor_user_agent(""), None);
-        assert_eq!(session_user_agent("bitaxe"), "bitaxe/sv2");
-        assert_eq!(session_user_agent(""), "jd-client/sv2");
+        assert_eq!(session_user_agent(Some("bitaxe/sv2")), "bitaxe/sv2");
+        assert_eq!(session_user_agent(None), "jd-client/sv2");
     }
 
     /// The vendor is normalised like an SV1 user agent before `/sv2` is
     /// appended: version stripped, Braiins firmware collapsed.
     #[test]
     fn user_agent_normalises_vendor_like_sv1() {
-        assert_eq!(session_user_agent("cgminer/4.11.1"), "cgminer/sv2");
+        use crate::mining::client::vendor_user_agent;
         assert_eq!(
-            session_user_agent("bosminer-plus-tuner x"),
-            "Braiins OS/sv2"
+            vendor_user_agent("cgminer/4.11.1").as_deref(),
+            Some("cgminer/sv2")
         );
+        assert_eq!(
+            vendor_user_agent("bosminer-plus-tuner x").as_deref(),
+            Some("Braiins OS/sv2")
+        );
+    }
+
+    /// SetupConnection derives the session's user agent once, from its
+    /// vendor; nothing on the share path rebuilds it.
+    #[test]
+    fn setup_connection_records_the_vendor_user_agent() {
+        let mut s = fresh_test_session();
+        let setup = InboundMiningFrame::SetupConnection(SetupConnectionInput {
+            protocol: PROTOCOL_MINING,
+            min_version: 2,
+            max_version: 2,
+            flags: FLAG_REQUIRES_VERSION_ROLLING,
+            vendor: "cgminer/4.11.1".to_string(),
+            firmware: "0.1".to_string(),
+            hardware_version: "r".to_string(),
+            device_id: "d".to_string(),
+        });
+        let _ = dispatch_inbound_frame(&mut s, setup, &fresh_extranonce(), &fresh_bridge(), 0);
+        assert_eq!(s.user_agent.as_deref(), Some("cgminer/sv2"));
     }
 
     // ── ServerConfig defaults ─────────────────────────────────────

@@ -608,7 +608,10 @@ pub struct MiningSessionState<C: Clock> {
     pub network: Network,
     pub address: Option<AddressId>,
     pub worker_name: String,
-    pub vendor: String,
+    /// The user agent this connection is recorded under, derived once from
+    /// its SetupConnection `vendor` (`vendor_user_agent`). `None` when the
+    /// vendor normalises to nothing.
+    pub user_agent: Option<String>,
     /// TDP **template** stream this connection mines on. Resolved once from
     /// the OpenChannel address (`StreamKind::for_mode`) and then fixed, so the
     /// block-submit handle always matches the template the job was built on.
@@ -757,7 +760,7 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             network: port.network,
             address: None,
             worker_name: String::new(),
-            vendor: String::new(),
+            user_agent: None,
             stream: StreamKind::Pplns,
             accounting_stream: StreamKind::Pplns,
             setup_complete: false,
@@ -874,6 +877,15 @@ fn setup_rejected(error_code: &str, reason: String) -> HandlerOutcome {
     outcome
 }
 
+/// `"{vendor}/sv2"`: the user agent a connection's SetupConnection `vendor`
+/// is recorded under (`bitaxe/sv2`, `NerdQAxe++/sv2`), with the vendor
+/// normalised the way SV1 normalises its user agent
+/// ([`bp_common::normalize_user_agent`]); `None` when that leaves nothing.
+pub(crate) fn vendor_user_agent(vendor: &str) -> Option<String> {
+    let normalized = bp_common::normalize_user_agent(vendor);
+    (!normalized.is_empty()).then(|| format!("{normalized}/sv2"))
+}
+
 pub fn handle_setup_connection<C: Clock>(
     state: &mut MiningSessionState<C>,
     input: &SetupConnectionInput,
@@ -909,7 +921,7 @@ pub fn handle_setup_connection<C: Clock>(
 
     state.setup_complete = true;
     state.used_version = used_version;
-    state.vendor = input.vendor.clone();
+    state.user_agent = vendor_user_agent(&input.vendor);
     state.requires_standard_jobs = (input.flags & FLAG_REQUIRES_STANDARD_JOBS) != 0;
     state.work_selection = (input.flags & FLAG_REQUIRES_WORK_SELECTION) != 0;
 
