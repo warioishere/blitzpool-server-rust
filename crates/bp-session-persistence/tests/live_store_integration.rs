@@ -91,7 +91,7 @@ fn share<'a>(
         is_block_candidate: false,
         hash_rate: 0.0,
         channel_count,
-        ts_ms: 0,
+        ts_ms: bp_common::now_ms(),
         share_id: "",
         mode: bp_share_hook::MiningMode::Solo,
         group_id: None,
@@ -167,6 +167,49 @@ async fn touch_flush_dual_writes_hash_and_ttl() {
         t > 0 && t <= 300,
         "touch write must set the liveness TTL, got {t}"
     );
+
+    handle.shutdown().await;
+    cleanup(&pool, prefix).await;
+}
+
+/// `updated_at_ms` is when the front accepted the share, not when this
+/// process consumed it. The satellite can reach a session's last shares
+/// after the front has already soft-deleted its row on disconnect; stamped
+/// with the consume time, those shares look like mining after the
+/// soft-delete, and `kill_dead_clients` revives a session that is gone.
+#[tokio::test]
+async fn a_late_consumed_share_keeps_its_acceptance_time() {
+    let Some(pool) = pg_or_skip().await else {
+        return;
+    };
+    let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::SESSION_PERSISTENCE, 9).await
+    else {
+        return;
+    };
+    let prefix = "test_lv_late_";
+    cleanup(&pool, prefix).await;
+
+    let handle = spawn_engine(&pool, redis.clone()).await;
+    let sink = handle.client_row_touch_sink();
+    let address = format!("{prefix}alice");
+
+    // Accepted a minute ago, consumed now.
+    let accepted_at = bp_common::now_ms() - 60_000;
+    sink.record_accepted(SharedAcceptedShare {
+        ts_ms: accepted_at,
+        ..share(&address, "rig1", "sessL009", 100.0, 64.0, 1)
+    })
+    .await;
+    handle.flush_touches_now().await;
+
+    let key = client_live_key(&address, "rig1", "sessL009");
+    let updated: i64 = hgetall(&mut redis, &key)
+        .await
+        .get(F_UPDATED_AT_MS)
+        .expect("updated_at_ms present")
+        .parse()
+        .expect("updated_at_ms numeric");
+    assert_eq!(updated, accepted_at);
 
     handle.shutdown().await;
     cleanup(&pool, prefix).await;

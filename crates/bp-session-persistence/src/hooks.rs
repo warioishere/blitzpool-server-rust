@@ -119,7 +119,6 @@ impl ClientRowTouchSink {
 #[async_trait]
 impl SharedAcceptedShareSink for ClientRowTouchSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        let now_ms = now_ms();
         // Worker can be empty in some SV2 paths (no `.<name>` suffix in
         // user_identity); the SV2 session row was registered under the
         // same "default", so the fallback preserves the PK match. SV1
@@ -149,7 +148,11 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
             share.submission_difficulty as f32,
             Some(share.effective_difficulty as f32),
             share.channel_count as i32,
-            now_ms,
+            // When the front accepted the share, not when this satellite got
+            // to it: a session's last shares can arrive after its disconnect
+            // soft-deleted the row, and a later stamp there makes
+            // `kill_dead_clients` revive a session that has already gone.
+            share.ts_ms,
         );
         // Live hashrate: accumulate the same credited difficulty into the
         // sampler's current window. It owns the live hash's `hash_rate` and
@@ -195,8 +198,8 @@ impl SharedAcceptedShareSink for ClientDifficultyStatisticsSink {
         if !candidate.is_finite() || candidate <= 0.0 {
             return;
         }
-        let now_ms = now_ms();
-        let slot = (now_ms / DIFF_STAT_SLOT_MS) * DIFF_STAT_SLOT_MS;
+        // The hour the share was accepted in, not the hour it was consumed in.
+        let slot = (share.ts_ms / DIFF_STAT_SLOT_MS) * DIFF_STAT_SLOT_MS;
         // Empty worker → "default", matching the PK convention the
         // client-row touch sink uses for the session row.
         let worker = if share.worker.is_empty() {
@@ -214,7 +217,7 @@ impl SharedAcceptedShareSink for ClientDifficultyStatisticsSink {
                 slot_ms: slot,
             },
             candidate as f32,
-            now_ms,
+            share.ts_ms,
         );
     }
 }

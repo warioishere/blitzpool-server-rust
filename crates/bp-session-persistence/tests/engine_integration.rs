@@ -420,6 +420,9 @@ async fn diff_stats_sink_keeps_per_slot_maximum() {
     .await
     .expect("spawn engine");
     let sink = handle.client_difficulty_statistics_sink();
+    // Two hours back: the row must land in the hour the share was
+    // accepted in, not the hour the sink ran in.
+    let accepted_at = bp_common::now_ms() - 2 * 3_600_000;
     let share = |submission_difficulty: f64| SharedAcceptedShare {
         address,
         worker: "rig1",
@@ -430,7 +433,7 @@ async fn diff_stats_sink_keeps_per_slot_maximum() {
         is_block_candidate: false,
         hash_rate: 0.0,
         channel_count: 1,
-        ts_ms: 0,
+        ts_ms: accepted_at,
         share_id: "",
         mode: bp_share_hook::MiningMode::Solo,
         group_id: None,
@@ -457,7 +460,7 @@ async fn diff_stats_sink_keeps_per_slot_maximum() {
     handle.shutdown().await;
 
     let row = sqlx::query(
-        r#"SELECT MAX("maxDifficulty")::float8 AS m
+        r#"SELECT MAX("maxDifficulty")::float8 AS m, MIN("slotTime") AS lo, MAX("slotTime") AS hi
                FROM client_difficulty_statistics_entity WHERE address = $1"#,
     )
     .bind(address)
@@ -465,6 +468,15 @@ async fn diff_stats_sink_keeps_per_slot_maximum() {
     .await
     .expect("query max");
     let max: f64 = row.try_get("m").expect("max column");
+    let hour = accepted_at / 3_600_000 * 3_600_000;
+    assert_eq!(
+        (
+            row.try_get::<i64, _>("lo").unwrap(),
+            row.try_get::<i64, _>("hi").unwrap()
+        ),
+        (hour, hour),
+        "one row, in the hour the shares were accepted"
+    );
     assert!(
         (max - 50_000.0).abs() < 1.0,
         "expected per-slot max 50000, got {max}"
