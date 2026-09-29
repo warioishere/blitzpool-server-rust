@@ -121,6 +121,10 @@ where
             get(group_rejected::<H, M>),
         )
         .route(
+            "/api/pplns/groups/:id/max-difficulty",
+            get(group_max_difficulty::<H, M>),
+        )
+        .route(
             "/api/pplns/groups/:id/distribution",
             get(distribution::<H, M>),
         )
@@ -2017,7 +2021,8 @@ fn jr_to_api_error(e: bp_group_mgmt_engine::JoinRequestServiceError) -> ApiError
 
 use crate::controllers::info::{rejected_by_reason_slots, RejectSlotsResponse};
 use crate::time_range::{
-    accepted_slot_data, chart_slot_boundaries, ChartPoint, Range, SlotDataResponse,
+    accepted_slot_data, chart_slot_boundaries, max_difficulty_slot_data, ChartPoint, Range,
+    SlotDataResponse,
 };
 
 use crate::time_range::SLOT_SECONDS;
@@ -2115,6 +2120,36 @@ where
             Ok(accepted_slot_data(
                 &chart_slot_boundaries(since),
                 rows.iter().map(|r| (r.time, r.shares as f64)),
+            ))
+        })
+        .await?;
+    Ok(JsonBytes(bytes))
+}
+
+/// The highest share difficulty any member of the group reached in each
+/// 10-minute slot.
+async fn group_max_difficulty<H, M>(
+    State(state): State<SharedState<H, M>>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<GroupRangeQuery>,
+) -> Result<JsonBytes, ApiError>
+where
+    H: GroupServiceHooks + 'static,
+    M: EmailHooks + 'static,
+{
+    let range = Range::parse(q.range.as_deref())?;
+    let key = format!("GROUP_MAX_DIFFICULTY_{id}_{}", range.label());
+    let s = state.clone();
+    let bytes = state
+        .cache
+        .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::GroupAccepted, async move {
+            let since = bp_common::now_ms() - range.window_ms();
+            let addrs = collect_group_member_addresses(&s, id).await?;
+            let rows =
+                bp_db::find_max_difficulty_since_for_addresses(&s.pool, &addrs, since).await?;
+            Ok(max_difficulty_slot_data(
+                &chart_slot_boundaries(since),
+                rows.into_iter().map(|(t, max)| (t, max as f64)),
             ))
         })
         .await?;

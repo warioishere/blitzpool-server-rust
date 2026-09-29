@@ -274,6 +274,36 @@ pub async fn find_client_statistics_since_for_address(
     .map_err(DbError::from)
 }
 
+/// The highest share difficulty per slot over `addresses`, from `since_ms`
+/// on: one `(time, max)` pair per slot any of them has a row in. Drives
+/// `/api/pplns/groups/:id/max-difficulty` — one query for every member
+/// instead of one per member.
+pub async fn find_max_difficulty_since_for_addresses<'e, E>(
+    executor: E,
+    addresses: &[AddressId],
+    since_ms: i64,
+) -> Result<Vec<(i64, f32)>, DbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let addresses: Vec<String> = addresses.iter().map(|a| a.as_str().to_string()).collect();
+    let rows = sqlx::query!(
+        r#"SELECT "time" AS "time!", MAX("maxDifficulty") AS "max_difficulty!"
+           FROM client_statistics_entity
+           WHERE "deletedAt" IS NULL AND address = ANY($1) AND "time" >= $2
+           GROUP BY "time""#,
+        &addresses,
+        since_ms,
+    )
+    .fetch_all(executor)
+    .await
+    .map_err(DbError::from)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.time, r.max_difficulty))
+        .collect())
+}
+
 /// `client_rejected_statistics_entity` rows for one address from
 /// `since_ms` onward. Drives `/api/client/:address/rejected` (per-
 /// reason aggregation done in bp-api).

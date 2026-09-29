@@ -24,7 +24,7 @@ use bp_db::{
     bulk_upsert_address_settings, bulk_upsert_client_rejected_statistics_entity,
     bulk_upsert_client_statistics_entity, bulk_upsert_pool_mode_hashrate,
     bulk_upsert_pool_rejected_statistics, bulk_upsert_pool_share_statistics,
-    bulk_upsert_worker_shares_entity, count_worker_shares,
+    bulk_upsert_worker_shares_entity, count_worker_shares, find_max_difficulty_since_for_addresses,
     seed_worker_shares_from_client_statistics, AddressSettingsUpsert, ClientRejectedStatsUpsert,
     ClientStatsUpsert, PoolModeHashrateUpsert, PoolRejectedStatsUpsert, PoolShareStatsUpsert,
     WorkerSharesUpsert,
@@ -335,6 +335,63 @@ async fn client_stats_insert_then_increment_every_field() {
     // The maximum of 700 and 350: neither their sum nor the last write.
     let max: f32 = row.get("maxDifficulty");
     assert_eq!(max, 700.0);
+
+    tx.rollback().await.expect("rollback");
+}
+
+/// The group reader takes the maximum over the listed members per slot and
+/// ignores everyone else, including a higher share by a non-member in the
+/// same slot.
+#[tokio::test]
+async fn max_difficulty_for_addresses_is_the_members_maximum_per_slot() {
+    let Some(pool) = connect_or_skip().await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("begin tx");
+    let slot = unique_slot(40);
+    let next = slot + 600_000;
+
+    let row = |address: &str, time_ms: i64, max_difficulty: f32| ClientStatsUpsert {
+        address: address.to_string(),
+        client_name: "w1".to_string(),
+        session_id: "sess0001".to_string(),
+        time_ms,
+        shares: 1.0,
+        accepted_count: 1,
+        rejected_count: 0,
+        rejected_job_not_found_count: 0,
+        rejected_job_not_found_diff1: 0.0,
+        rejected_duplicate_share_count: 0,
+        rejected_duplicate_share_diff1: 0.0,
+        rejected_low_difficulty_share_count: 0,
+        rejected_low_difficulty_share_diff1: 0.0,
+        rejected_version_rolling_count: 0,
+        rejected_version_rolling_diff1: 0.0,
+        rejected_stale_count: 0,
+        rejected_stale_diff1: 0.0,
+        max_difficulty,
+    };
+    bulk_upsert_client_statistics_entity(
+        &mut *tx,
+        &[
+            row("test_grp_max_alice", slot, 500.0),
+            row("test_grp_max_bob", slot, 700.0),
+            row("test_grp_max_carol", slot, 9000.0),
+            row("test_grp_max_alice", next, 300.0),
+        ],
+    )
+    .await
+    .expect("seed rows");
+
+    let members = [
+        bp_common::AddressId::new("test_grp_max_alice").unwrap(),
+        bp_common::AddressId::new("test_grp_max_bob").unwrap(),
+    ];
+    let mut got = find_max_difficulty_since_for_addresses(&mut *tx, &members, slot)
+        .await
+        .expect("read");
+    got.sort_by_key(|(t, _)| *t);
+    assert_eq!(got, vec![(slot, 700.0), (next, 300.0)]);
 
     tx.rollback().await.expect("rollback");
 }
