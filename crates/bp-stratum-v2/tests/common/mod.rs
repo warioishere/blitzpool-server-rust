@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Wire helpers shared by the SV2 regtests: one frame out, one frame in,
-//! and the polling wait. They used to be copied into every regtest file,
-//! and the sv2-apps v0.8.0 bump had to be applied five times for it.
+//! and the polling wait, in one place so a dependency bump lands once.
 //!
 //! Cargo compiles this module into every test binary that declares it, so
 //! a helper one binary does not use is dead code there; the allow is for

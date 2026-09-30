@@ -2,12 +2,8 @@
 
 #![allow(clippy::print_stderr)]
 
-//! T4 — Core/Satellite split, gold-standard end-to-end against a real
-//! regtest `bitcoin-node`.
-//!
-//! The other regtest block-submit tests record shares directly in-process
-//! and prove a coinbase built from the engine's distribution is accepted by
-//! bitcoin-core. This one proves the **split** path does the same:
+//! T4 — Core/Satellite split, end-to-end against a real regtest
+//! `bitcoin-node`: the **split** path yields a coinbase bitcoin-core accepts.
 //!
 //! 1. The three miners' shares flow through the real Core→Satellite
 //!    transport: Core producer `XADD`s → the Satellite consumer drains into

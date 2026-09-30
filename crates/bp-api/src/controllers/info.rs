@@ -132,12 +132,9 @@ where
                     .bitcoin_rpc
                     .as_ref()
                     .ok_or(ApiError::Unavailable("bitcoin-rpc not wired"))?;
-                // Read the raw JSON rather than a typed `Vec<PeerInfo>` — bitcoin-core
-                // keeps adding fields to `getpeerinfo` (v31: `last_inv_sequence`,
-                // `inv_to_send`, `bip152_hb_to/from`, `presynced_headers`,
-                // `last_transaction`, `last_block`). A strict struct deserialise
-                // would fail the whole endpoint on every new field; the raw
-                // projection only reads the keys the UI actually renders.
+                // Raw JSON rather than a typed struct: bitcoin-core keeps adding
+                // `getpeerinfo` fields, and this projection reads only the keys
+                // the UI renders, so a new field cannot fail the endpoint.
                 let raw: serde_json::Value = rpc.call("getpeerinfo", serde_json::json!([])).await?;
                 let peers = raw.as_array().cloned().unwrap_or_default();
                 let mut out = Vec::with_capacity(peers.len());
@@ -253,9 +250,8 @@ fn format_location(loc: &bp_geoip::GeoLocation) -> String {
 
 // ─── /api/info/difficulty ────────────────────────────────────────
 //
-// Returns the singleton tracker row maintained by
-// bp-notifications::cron::network_difficulty. UI uses it to render
-// the current network-difficulty + previous value for the delta arrow.
+// The singleton network-difficulty tracker row: current value plus the
+// previous one for the UI's delta arrow.
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -285,9 +281,6 @@ where
 }
 
 // ─── /api/info/block-template ────────────────────────────────────
-//
-// Exposes TDP-snapshot fields the UI can use to render "current
-// template" without round-tripping bitcoin-core.
 
 async fn block_template<H, M>(
     State(state): State<SharedState<H, M>>,
@@ -296,11 +289,8 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    // Raw bitcoind `getblocktemplate` passthrough — the UI's
-    // block-template preview consumes the full RPC response
-    // (transactions, coinbasevalue, target, height, etc.). The
-    // TDP-snapshot projection used previously only carries the
-    // SV2-spec subset; the UI needs the whole document.
+    // Raw `getblocktemplate` passthrough: the UI's template preview needs
+    // the whole document, not the SV2 subset a TDP snapshot carries.
     let rpc = state
         .bitcoin_rpc
         .as_ref()
@@ -317,8 +307,7 @@ where
 /// Next-block reward, computed server-side from the current `getblocktemplate`.
 /// `coinbasevalue` is the authoritative subsidy + real mempool fees the pool
 /// would mine (the same value the live coinbase payout is built from), split
-/// into subsidy + fees via the shared halving helper. Lets the UI drop its
-/// hard-coded subsidy and per-client mempool.space fetch.
+/// into subsidy + fees via the shared halving helper.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NextBlockReward {
@@ -533,10 +522,8 @@ where
                         None => Vec::new(),
                     },
                     MiningMode::Solo => {
-                        // Solo: exactly what the payout resolver would build.
-                        // This used to be a second implementation reading the
-                        // PPLNS fee config, so a solo miner saw a fee output
-                        // that its real coinbase never carried.
+                        // Exactly what the payout resolver builds, solo fee
+                        // included, so the preview matches the real coinbase.
                         bp_mining_job::solo_payouts(addr.as_str(), &s.solo_fee, reward_sats)
                             .into_iter()
                             .map(|p| PayoutInfoEntry {
@@ -552,10 +539,9 @@ where
                     }
                 };
 
-                // Build the per-address coinbase + full block preview when we have
-                // enough payout info. An empty distribution (e.g. PPLNS window
-                // empty at startup) skips block assembly so the panel still
-                // renders the template + mode tile.
+                // An empty distribution (e.g. an empty PPLNS window at startup)
+                // skips block assembly; the panel still renders the template
+                // and mode tile.
                 let (coinbase_tx_hex, block_hex) = if payouts.is_empty() {
                     (String::new(), String::new())
                 } else {
@@ -577,22 +563,13 @@ where
     Ok(JsonBytes(bytes))
 }
 
-/// Construct a preview coinbase + full block from the payout list +
-/// bitcoind's `getblocktemplate` response. The coinbase uses zero
-/// extranonces (the miner fills them in at submit time) so the preview
-/// is byte-stable across renders. The block carries every tx the
-/// template proposed plus the just-built coinbase, with a zero nonce
-/// in the header (preview, never submitted).
 /// Who the Group-Solo preview names as the block's finder.
 ///
-/// A member's miner mines a job that names that member as finder, so for an
-/// address with shares in the current window the preview is its own job.
-/// An address with no shares there cannot find the block; naming it would
-/// pay it a finder bonus no real coinbase will pay. The preview then shows
-/// the most likely block instead: the member with the largest window share
-/// as finder. With no shares in the window at all, the asking address
-/// stays the finder (that is how the first block of an empty window is
-/// built).
+/// A member's job names that member as finder, so an address with shares in
+/// the current window previews its own job. An address without shares cannot
+/// find the block, so the preview names the member with the largest window
+/// share instead. With an empty window the asking address stays the finder,
+/// as the first block of an empty window is built that way.
 fn preview_finder(
     requester: &bp_common::AddressId,
     window: &std::collections::HashMap<String, f64>,
@@ -612,6 +589,9 @@ fn preview_finder(
         .unwrap_or_else(|| requester.clone())
 }
 
+/// Preview coinbase + full block from the payout list and a
+/// `getblocktemplate` response. Zero extranonces and a zero nonce keep the
+/// preview byte-stable across renders; it is never submitted.
 fn assemble_block_preview(
     template: &serde_json::Value,
     payouts: &[PayoutInfoEntry],
@@ -741,10 +721,9 @@ fn assemble_block_preview(
 
 // ─── /api/pool ────────────────────────────────────────────────────
 
-/// Pool-wide summary card. `blocksFound` is the full found-block
-/// log (same projection `/api/info` returns under the `blockData`
-/// key); the UI renders it as a tile list. `fee` is reported as `0`
-/// for compatibility with the existing dashboard tile.
+/// Pool-wide summary card. `blocksFound` is the full found-block log (the
+/// same projection `/api/info` returns as `blockData`). `fee` is always `0`;
+/// the dashboard tile still reads the key.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PoolResponse {
@@ -844,13 +823,11 @@ struct HealthChecks {
     /// availability-first and survives a Redis blip). `None` when no
     /// Redis handle is wired into the API state.
     cache: Option<&'static str>,
-    /// TDP (bitcoin-core template feed) freshness. `"connected"` when
-    /// the last NewTemplate/SetNewPrevHash is within the configured
-    /// staleness window, `"stale"` when bitcoin-core has stopped
-    /// feeding fresh work for longer than that (auto-reconnect failed
-    /// to recover, or core is wedged). `None` when no TDP handle is
-    /// wired. Unlike `cache`, a stale feed DOES flip `status` to
-    /// "degraded" — the pool can't hand out valid work without it.
+    /// TDP template-feed freshness: `"connected"` when the last
+    /// NewTemplate/SetNewPrevHash is within the staleness window, `"stale"`
+    /// otherwise, `None` when no TDP handle is wired. Unlike `cache`, a
+    /// stale feed flips `status` to "degraded": without fresh templates the
+    /// pool cannot hand out valid work.
     tdp: Option<&'static str>,
 }
 
@@ -872,19 +849,11 @@ where
     } else {
         None
     };
-    // Cache (Redis) round-trip: SET a 1s-TTL probe key, read it back.
-    // Confirms Redis round-trips, not just TCP-accepts. Informational
-    // only — a Redis outage doesn't make the pool "degraded".
     let cache_ok = if let Some(conn) = state.redis.as_ref() {
         Some(redis_health_roundtrip(conn.clone()).await)
     } else {
         None
     };
-    // TDP feed freshness. `last_update_at` is the wall-clock of the last
-    // template/prev-hash; when the feed has never produced one (boot,
-    // or core never attached) we measure age from process start so a
-    // core that never comes up still trips the staleness threshold
-    // instead of staying silently "fresh" forever.
     let tdp_fresh = state.tdp.as_ref().map(|handle| {
         let last_update_at = handle.current_snapshot().last_update_at;
         tdp_is_fresh(
@@ -894,10 +863,8 @@ where
             state.tdp_staleness_threshold_ms,
         )
     });
-    // `status` gates on database + bitcoin RPC + TDP freshness. Redis is
-    // availability-first (surfaced in `checks.cache` but never degrading);
-    // a stale TDP feed DOES degrade because the pool can't produce valid
-    // work without fresh templates from bitcoin-core.
+    // `status` gates on database + bitcoin RPC + TDP freshness; Redis is
+    // reported in `checks.cache` but never degrades it.
     let status = if database && bitcoin_ok.unwrap_or(true) && tdp_fresh.unwrap_or(true) {
         "healthy"
     } else {
@@ -924,9 +891,9 @@ where
 
 /// Decide whether the TDP feed counts as fresh. `last_update_at` is the
 /// wall-clock of the last template/prev-hash (None until the first one
-/// arrives); when absent we measure age from `start_ms` so a core that
-/// never attaches still trips the threshold instead of reading fresh
-/// forever. Returns `true` when the age is within `threshold_ms`.
+/// arrives); when absent, age counts from `start_ms` so a core that never
+/// attaches still trips the threshold. `true` when the age is within
+/// `threshold_ms`.
 fn tdp_is_fresh(
     last_update_at: Option<i64>,
     start_ms: i64,
@@ -968,12 +935,9 @@ fn format_uptime(ms: u64) -> String {
 
 // ─── /api/info/chart ──────────────────────────────────────────────
 //
-// Pool-wide hashrate timeseries. Reads `pool_share_statistics_entity`,
-// converts per-slot accepted-share weight into hashrate (H/s) via
-// `accepted * 2^32 / 600` (10-min slot = 600 s), and emits one point
-// per fixed slot boundary. Slots beyond the chart-visibility cutoff
-// (the in-progress slot) are excluded so the tail of the chart never
-// shows a half-filled bucket.
+// Pool-wide hashrate timeseries: per-slot accepted weight to H/s via
+// `accepted * 2^32 / 600`. The in-progress slot (past the visibility
+// cutoff) is excluded so the chart never ends in a half-filled bucket.
 
 use crate::time_range::{
     accepted_slot_data, chart_slot_boundaries, fold_into_slots, max_difficulty_slot_data,
@@ -1104,9 +1068,8 @@ where
         .cache
         .get_or_fetch::<SlotDataResponse, _, ApiError>(key, TtlKind::Workers, async move {
             let since = bp_common::now_ms() - range.window_ms();
-            // Skinny projection (slot time + address + worker only) — the
-            // distinct counting stays in-process; we just avoid shipping the
-            // full 17-column stats row for every session in the window.
+            // Only slot time + address + worker are fetched; distinct
+            // counting happens in-process.
             let rows = bp_db::find_pool_worker_rows_since(&s.pool, since).await?;
             Ok(worker_slots(
                 &chart_slot_boundaries(since),
@@ -1161,12 +1124,10 @@ pub(crate) const REJECT_REASON_KEYS: &[&str] = &[
 ];
 
 /// Normalise the reason string stored on `pool_rejected_statistics_entity`
-/// to the camel-case key the UI expects. Old rows stored kebab-case
-/// (`job-not-found`, `duplicate-share`, `low-difficulty`), new rows
-/// write the camel-case form directly — this map covers both forms.
+/// to the camel-case key the UI expects. Stored rows carry either the
+/// camel-case or the kebab-case form; both map here.
 pub(crate) fn normalise_reject_reason(raw: &str) -> &'static str {
     match raw {
-        // Camel-case (new writer + legacy rows).
         "OtherUnknown" => "OtherUnknown",
         "JobNotFound" => "JobNotFound",
         "DuplicateShare" => "DuplicateShare",
@@ -1175,7 +1136,7 @@ pub(crate) fn normalise_reject_reason(raw: &str) -> &'static str {
         "UnauthorizedWorker" => "UnauthorizedWorker",
         "NotSubscribed" => "NotSubscribed",
         "Stale" => "Stale",
-        // Legacy kebab-case from earlier Rust writer.
+        // Kebab-case rows.
         "job-not-found" => "JobNotFound",
         "duplicate-share" => "DuplicateShare",
         "low-difficulty" | "low-difficulty-share" => "LowDifficultyShare",
@@ -1349,11 +1310,8 @@ where
                 let accepted_30d = month_rows.iter().map(|r| r.accepted as f64).sum::<f64>();
                 let rejected_30d = month_rows.iter().map(|r| r.rejected as f64).sum::<f64>();
 
-                // Slice since the most-recent confirmed block; fall back to 0
-                // (epoch → all-time total) when no block has ever been found.
-                // Matches TS `sinceBlock = latestBlock?.createdAt ?? 0`: a pool
-                // that hasn't found a block shows its cumulative share total,
-                // not just the last day.
+                // Slice since the most-recent confirmed block; with no block
+                // ever found, 0 (epoch) yields the cumulative share total.
                 let last_block_at: Option<i64> = sqlx::query_scalar(
                     r#"SELECT MAX("createdAt") FROM blocks_entity WHERE "deletedAt" IS NULL"#,
                 )
@@ -1632,7 +1590,7 @@ mod slot_json_tests {
 #[cfg(test)]
 mod tests {
     /// `previewFinder` is present for Group-Solo only; every other mode's
-    /// JSON stays exactly as it was (no null, no key).
+    /// JSON omits the key entirely (no null).
     #[test]
     fn preview_finder_field_is_absent_unless_set() {
         let response = |finder: Option<&str>| ClientBlockTemplateResponse {

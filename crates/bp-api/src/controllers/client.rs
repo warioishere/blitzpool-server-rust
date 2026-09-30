@@ -145,12 +145,10 @@ where
             let since = now - range.window_ms();
             let rows =
                 bp_db::find_client_statistics_since_for_address(&s.pool, &addr, since).await?;
-            // Diff-1-weighted accepted shares (sum of share difficulty),
-            // NOT the raw share count: this tracks actual work, so the
-            // chart stays flat when vardiff trades share size for share
-            // rate at constant hashrate. The raw count (`accepted_count`)
-            // would drift up as per-share difficulty drops. (The rejected
-            // endpoint intentionally still reports raw full-share counts.)
+            // Diff-1-weighted accepted shares (sum of share difficulty), not
+            // the raw count: it tracks work, so the chart stays flat when
+            // vardiff trades share size for share rate. (The rejected
+            // endpoint intentionally reports raw counts.)
             Ok(accepted_slot_data(
                 &chart_slot_boundaries(since),
                 rows.iter().map(|r| (r.time, r.shares as f64)),
@@ -441,12 +439,10 @@ where
 /// (`data`), the raw accepted-share weight, and the per-reason
 /// rejection breakdowns (count + diff-1) the worker tile renders.
 ///
-/// **One field pair per `bp_stats::RejectedReason`, and that is a
-/// contract, not tidiness.** The tile shows these against
-/// `rejectedCount`, so a reason with no pair here is a reject the
-/// operator sees in the total and cannot find in the breakdown — which
-/// is exactly what happened to version rolling between migration 0010
-/// (which gave it a column) and this struct learning to emit it.
+/// **One field pair per `bp_stats::RejectedReason` is a contract.** The
+/// tile shows these against `rejectedCount`, so a reason with no pair here
+/// is a reject the operator sees in the total and cannot find in the
+/// breakdown.
 #[derive(Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 struct WorkerChartEntry {
@@ -748,9 +744,8 @@ async fn purge_address_stats(pool: &sqlx::PgPool, addr: &AddressId) -> Result<()
     .await
     .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
     // Zeroes the address-level best AND deletes the
-    // `best_difficulty_tracker_entity` baseline — the tracker delete used
-    // to be repeated here, and moved into the shared reset so this path
-    // and `/bestdiff_reset` cannot drift apart again.
+    // `best_difficulty_tracker_entity` baseline; the reset is shared with
+    // `/bestdiff_reset` so the two paths cannot drift apart.
     reset_address_settings_best_difficulty(pool, addr).await?;
     Ok(())
 }
@@ -792,7 +787,7 @@ where
     .map_err(|e| ApiError::Db(bp_db::DbError::Sqlx(e)))?;
     // The address-settings row is EMPTIED, not deleted: dropping it would
     // take `allTimeBestDifficulty` with it, and that is the one value no
-    // path may lower (migration 0014). `purge_address_stats` already
+    // path may lower. `purge_address_stats` already
     // zeroed the resettable best above; this clears the remaining
     // per-address state. What stays behind is the leaderboard record,
     // which carries no address — only a difficulty, a firmware string and

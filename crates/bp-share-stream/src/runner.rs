@@ -211,8 +211,8 @@ impl<T: DeserializeOwned + Send + 'static> StreamConsumer<T> {
 /// Live consumer task(s) + their shared cancel token. One shape for both the
 /// single-task consumers ([`StreamConsumer::spawn`]) and the accepted-share
 /// consumer's two durability-class groups (built via [`Self::new`] with two
-/// tasks, each driving [`StreamConsumer::run`]). [`Self::shutdown`] cancels and joins them as part of graceful
-/// shutdown.
+/// tasks, each driving [`StreamConsumer::run`]). [`Self::shutdown`] cancels
+/// and joins them as part of graceful shutdown.
 pub struct StreamConsumerHandle {
     tasks: Vec<JoinHandle<()>>,
     cancel: CancellationToken,
@@ -247,8 +247,8 @@ mod tests {
     //! Integration tests against a local docker-Redis at
     //! `redis://127.0.0.1:16379` (override with `BP_REDIS_URL`). Each test uses
     //! a distinct logical DB + stream key and skips cleanly if Redis isn't
-    //! reachable. These secure the extracted consume-loop skeleton itself
-    //! (ordering, pending-backlog replay, tail-start, clean cancel).
+    //! reachable. They pin the consume loop itself (ordering, pending-backlog
+    //! replay, tail-start, clean cancel).
     #![allow(clippy::print_stderr)]
 
     use std::sync::Arc;

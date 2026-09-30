@@ -24,10 +24,7 @@ pub const MAX_RESET_INTERVAL_DAYS: u32 = 365;
 /// `bp_pplns::MAX_FINDER_BONUS_PPM`, which is what the build clamps to.
 ///
 /// Half the pot to one member already makes the proportional split
-/// nearly meaningless, so anything past this is a typo. Deliberately
-/// ABOVE the 32 % that the previous 1-BTC sats cap worked out to
-/// against a 3.125-BTC block, so migration 0009 never clamps an
-/// existing configuration down.
+/// nearly meaningless, so anything past this is a typo.
 pub const MAX_FINDER_BONUS_PPM: i32 = 500_000;
 
 /// How long a directed invitation stays valid before auto-expiring.

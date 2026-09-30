@@ -23,7 +23,7 @@
 //!    `worker_shares_entity` (composite-PK INSERT … ON CONFLICT DO UPDATE).
 //! 3. **Seed bootstrap** (2 funcs): `count_worker_shares` +
 //!    `seed_worker_shares_from_client_statistics` for the one-shot boot
-//!    one-shot boot migration that seeds worker-share rows from accumulated client statistics.
+//!    step that seeds worker-share rows from accumulated client statistics.
 
 use crate::pool::DbError;
 
@@ -387,31 +387,25 @@ pub struct AddressSettingsUpsert {
 
 /// Bulk-upsert the per-address lifetime row: increment `shares` by the
 /// window delta AND fold the window-max best difficulty in via `GREATEST`
-/// — one write to `address_settings_entity` per address per flush, in
-/// place of a separate shares-UPDATE and best-difficulty-upsert.
+/// — one write to `address_settings_entity` per address per flush.
 ///
-/// Semantics preserved from the two writes it replaces:
 /// - `shares` is increment-semantic (`shares + EXCLUDED.shares`); a
 ///   missing row is INSERTed with the delta as its initial value, so a
-///   brand-new address no longer loses its first flush window of shares.
+///   brand-new address keeps its first flush window of shares.
 /// - `"bestDifficulty"` only grows (`GREATEST`) — re-applying the same
 ///   batch is a no-op, keeping partial/retried flushes idempotent.
 /// - `"bestDifficultyUserAgent"` + `"updatedAt"` move ONLY when the best
-///   difficulty actually grows: a pure share-accumulation flush never
-///   bumps `"updatedAt"` (it tracks when a miner last set a new best).
-///   Postgres evaluates every SET RHS against the pre-update row, so the
-///   CASE guards compare against the stored best regardless of clause
-///   order — which is also why the two `GREATEST`s below can be assigned
-///   in the same statement that reads them.
+///   difficulty actually grows (`"updatedAt"` tracks when a miner last set
+///   a new best). Postgres evaluates every SET RHS against the pre-update
+///   row, so the CASE guards compare against the stored best regardless of
+///   clause order.
 ///
-/// The `"allTime*"` triple is the same fold against a SECOND high-water
-/// mark, and exists because the first one is resettable: `/bestdiff_reset`
-/// zeroes `"bestDifficulty"`, and the public leaderboard must survive
-/// that (see migration 0014). Both are folded HERE, in one statement, on
-/// purpose — a second writer for the all-time value is exactly the twin
-/// that would drift. The reset and the delete endpoints must never lower
-/// `"allTimeBestDifficulty"`; `GREATEST` cannot restore it, because a
-/// flush only ever offers the CURRENT window's max.
+/// The `"allTime*"` triple is the same fold against a second high-water
+/// mark that survives `/bestdiff_reset`, for the public leaderboard. Both
+/// are folded here in one statement so there is a single writer. The reset
+/// and delete endpoints must never lower `"allTimeBestDifficulty"`:
+/// `GREATEST` cannot restore it, since a flush only offers the current
+/// window's max.
 pub async fn bulk_upsert_address_settings<'e, E>(
     executor: E,
     rows: &[AddressSettingsUpsert],

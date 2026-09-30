@@ -45,11 +45,11 @@ use tokio::sync::mpsc;
 /// Field name carrying the JSON-encoded share in each stream entry.
 const FIELD: &str = "d";
 
-/// Default cap on a stream's length (approximate `MAXLEN ~`). Generous —
-/// at pool share-rates this is hours of buffer for a Satellite outage — and
-/// the producer trims oldest beyond it rather than letting Redis grow
-/// unbounded. A breach is a fairness delle (the coinbase already paid the
-/// window), not fund loss; the consumer-lag monitor alerts before then.
+/// Default cap on a stream's length (approximate `MAXLEN ~`): hours of buffer
+/// for a Satellite outage at pool share-rates; beyond it the producer trims the
+/// oldest instead of letting Redis grow unbounded. A breach costs fairness (the
+/// coinbase already paid the window), not funds; the consumer-lag monitor
+/// alerts before then.
 pub const DEFAULT_STREAM_MAXLEN: usize = 1_000_000;
 
 /// Redis key of the accepted-share stream. Shared by the Core's producer
@@ -98,10 +98,11 @@ pub mod cache_kind {
     pub const GROUP: &str = "group";
     pub const BLOCKPARTY: &str = "blockparty";
     /// A block was booked, so every published SV2 ext-0x0003 payout
-    /// distribution is stale (§10). Unlike the two above this asks the
-    /// Front to INVALIDATE, not to rebuild from the DB — the published
-    /// weights encode pre-settlement ledger balances, and a job-declaring
-    /// client still mining them would pay those balances a second time.
+    /// distribution is stale (ext 0x0003/Implementation Notes). Unlike the
+    /// two above this asks the Front to INVALIDATE, not to rebuild from the
+    /// DB — the published weights encode pre-settlement ledger balances,
+    /// and a job-declaring client still mining them would pay those
+    /// balances a second time.
     ///
     /// It rides this stream because the settling process and the process
     /// holding the JDP registry are different ones under the role split
@@ -121,19 +122,18 @@ pub enum StreamError {
 }
 
 /// Off-loop publish buffer. It only fills if Redis publishing stalls or
-/// falls behind the share rate. On overflow we drop (best-effort — the miner
-/// already got its accept) rather than block the stratum read loop.
+/// falls behind the share rate. On overflow the share is dropped (best-effort,
+/// the miner already got its accept) rather than blocking the stratum read loop.
 const PUBLISH_BUFFER: usize = 8192;
 
 /// Most values one drain round trip carries. The drain takes whatever is
-/// queued, up to this, and writes it as one pipeline: one `XADD` round trip
-/// per share capped the drain at the Redis latency (measured ~64 µs a share,
-/// ~14k shares/s against a local Redis).
+/// queued, up to this, and writes it as one pipeline, so throughput is not
+/// capped at one Redis round trip per share.
 const PUBLISH_BATCH: usize = 256;
 
 /// Off-loop publish core shared by the producing sinks: a bounded channel + a
 /// drain task that owns the `XADD` round-trip, so the latency-sensitive stratum
-/// read loop never blocks on Redis (the loop already acked the share in ~40µs).
+/// read loop never blocks on Redis.
 /// On buffer overflow it drops best-effort and logs on power-of-two crossings
 /// to surface a sustained stall without flooding.
 struct BufferedPublisher<T> {
@@ -186,7 +186,7 @@ impl<T: Serialize + Send + Sync + 'static> BufferedPublisher<T> {
 /// A [`SharedAcceptedShareSink`] that publishes each accepted share onto the
 /// Redis stream — the Core's fan-out target in `core` mode.
 ///
-/// Because it *is* a sink, the Core reuses the unchanged in-process composite
+/// Because it *is* a sink, the Core reuses the in-process composite
 /// (which stamps `share_id` + `mode` + `group_id`) and simply fans out to
 /// this one sink instead of the engine sinks. The share it receives is
 /// already stamped, so the published owned record carries everything the
@@ -486,14 +486,11 @@ impl<T: DeserializeOwned> StreamConsumer<T> {
     }
 
     /// Split a reply into decodable entries; entries that can't be
-    /// reconstructed (missing `d` field / malformed JSON) can never reach a
-    /// handler, so they're **dead-lettered** — logged and `XACK`ed here
-    /// so a single poison entry can't fail its whole batch (dropping the good
-    /// entries with it) or linger un-acked in the PEL (which would also mask the
-    /// consumer-lag monitor). A decode failure is deterministic — same bytes +
-    /// same code → same failure — so retrying is futile and dropping with a
-    /// log is correct. Genuine version-skew is prevented upstream by
-    /// `#[serde(default)]` on newly-added fields.
+    /// reconstructed (missing `d` field / malformed JSON) are **dead-lettered**
+    /// (logged and `XACK`ed here) so one bad entry neither fails its whole
+    /// batch nor lingers un-acked in the PEL, masking the consumer-lag monitor.
+    /// A decode failure is deterministic, so retrying is futile. Additive
+    /// schema changes are absorbed by `#[serde(default)]` on new fields.
     ///
     /// A drop is a `warn`, except on the accepted-share (money) stream, where
     /// it is an `error` + counter (see [`StreamConsumer::accepted`]).
@@ -909,11 +906,9 @@ mod tests {
         );
     }
 
-    /// Regression: the resume loop must drain good pending shares even when an
-    /// all-poison batch sits at the FRONT of the PEL. With a batch of 1 the
-    /// first pending entry (poison) is dead-lettered and yields zero good
-    /// shares; the loop must key on the RAW count (keep going) not the good
-    /// count (which would break here and strand the good share behind it).
+    /// The resume loop drains good pending shares even when an all-poison
+    /// batch sits at the FRONT of the PEL: it keys on the RAW count, so a
+    /// batch that yields zero good shares does not end the drain.
     #[tokio::test]
     async fn resume_loop_drains_good_share_stranded_behind_front_poison() {
         let Some(conn) = connect_or_skip(2).await else {
@@ -933,9 +928,9 @@ mod tests {
             .await
             .expect("publish good");
 
-        // Simulate a crash AFTER delivery, BEFORE ack: deliver both to the PEL
-        // via a raw XREADGROUP `>` (marks pending; does NOT run partition, so
-        // the poison is not yet dead-lettered — exactly the post-crash state).
+        // Post-crash state (delivered, not acked): a raw XREADGROUP `>` puts
+        // both in the PEL without running `partition`, so the poison is not
+        // yet dead-lettered.
         let _: redis::Value = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg(group)
@@ -949,9 +944,9 @@ mod tests {
             .await
             .expect("raw deliver to PEL");
 
-        // The production loop, batch 1 to force the all-poison first batch.
-        // Keyed on the good count it would stop there and go live, and `>`
-        // never hands the pending good share out again.
+        // The production loop, batch 1 to force an all-poison first batch;
+        // `>` never hands a pending entry out again, so only the resume drain
+        // can reach the good share.
         let (fan_out, recorded) = recording_fan_out();
         let cancel = tokio_util::sync::CancellationToken::new();
         let task = tokio::spawn(consumer.clone().run(
@@ -1155,8 +1150,8 @@ mod tests {
     /// block / event. Contrasted against the `0`-started group, which does.
     #[tokio::test]
     async fn ensure_group_at_tail_skips_history() {
-        // Own DB (1): `connect_or_skip` FLUSHDBs, so sharing a DB with another
-        // FLUSHDB-ing test makes both flaky when the suite runs in parallel.
+        // Own DB (1): `connect_or_skip` FLUSHDBs, so a shared DB would let
+        // parallel tests wipe each other.
         let Some(conn) = connect_or_skip(1).await else {
             return;
         };
@@ -1208,8 +1203,8 @@ mod tests {
 
     /// The producer caps stream length (`MAXLEN ~`) so a stuck consumer can't
     /// grow Redis without bound. Approximate trimming keeps at least the cap
-    /// but may keep up to a macro-node more — so we assert it trimmed well
-    /// below the produced count, not an exact length.
+    /// but may keep up to a macro-node more, so the assertion is "well below
+    /// the produced count", not an exact length.
     #[tokio::test]
     async fn producer_caps_stream_length() {
         let Some(conn) = connect_or_skip(8).await else {

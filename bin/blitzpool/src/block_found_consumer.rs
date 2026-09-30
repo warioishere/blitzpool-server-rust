@@ -34,9 +34,8 @@ const BATCH: usize = 64;
 const CONSUMER: &str = "c1";
 
 /// What a block-found consumer does with each event, and on which consumer
-/// group. The two run independently off the same stream: `payout` applies the
-/// per-mode engine ledger, `notify` fans out the dispatcher notification. Split
-/// so a notification change redeploys `notify` without touching `payout`.
+/// group. Both run independently off the same stream, so a notification
+/// change redeploys `notify` without touching `payout`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum BlockFoundAction {
     /// Engine ledger-write (PPLNS / Group-Solo / Blockparty). The `payout` role.
@@ -186,11 +185,9 @@ mod tests {
         got
     }
 
-    /// End-to-end over real Redis + PG: one block-found event, two independent
-    /// consumer groups — `notify` fires the dispatcher fan-out, `satellite`
-    /// runs the ledger apply (Solo → no-op) — each drains + acks the same event
-    /// on its own group. Proves the split routing the `payout`/`notify` roles
-    /// rely on.
+    /// Over real Redis + PG: one block-found event is delivered to and acked
+    /// on both groups independently, `notify` running the dispatcher fan-out
+    /// and `satellite` the ledger apply (Solo → no-op).
     #[tokio::test]
     async fn block_found_dual_group_routes_ledger_and_notify() {
         let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 10).await else {

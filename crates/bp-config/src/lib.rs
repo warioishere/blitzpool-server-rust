@@ -2,17 +2,14 @@
 
 //! Typed application configuration for `bin/blitzpool`.
 //!
-//! The Rust pool reads a single TOML file at startup (`--config <PATH>`
-//! on the binary). The schema covers the full operator-facing
-//! configuration surface so a production deployment maps one-to-one.
-//! Field names use `snake_case`; grouping uses TOML tables.
+//! The pool reads a single TOML file at startup (`--config <PATH>`
+//! on the binary). Field names use `snake_case`; grouping uses TOML tables.
 //!
 //! ## Design choices
 //!
-//! - **TOML-only, no env-var override layer**. We ship a
-//!   `blitzpool.example.toml` committed in the repo + an
-//!   operator-managed `.local/blitzpool.toml` (or wherever the
-//!   operator wants it). One source of truth.
+//! - **TOML-only, no env-var override layer** (apart from `--roles` /
+//!   `BLITZPOOL_ROLES`). `blitzpool.example.toml` in the repo is the
+//!   template; the operator's copy is the one source of truth.
 //! - **`deny_unknown_fields` everywhere**. A typo in a key name is a
 //!   load error, not a silent default. Operators see "unknown field
 //!   `pplsn_fee_percent`" up-front.
@@ -71,7 +68,7 @@ pub struct AppConfig {
     pub solo: SoloConfig,
     /// Shared fee config for Group-Solo + Blockparty. Independent
     /// from the PPLNS lane; falls back to `[pplns].fee_*` when
-    /// fields are absent so existing deployments keep working.
+    /// fields are absent.
     #[serde(default)]
     pub group_fees: GroupFeesConfig,
     #[serde(default)]
@@ -211,10 +208,9 @@ pub struct BitcoinRpcConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TdpConfig {
-    /// Path to the bitcoin-core IPC Unix-domain socket. The Rust port
-    /// uses TDP-direkt (see memory `project-tdp-direct-architecture`)
-    /// instead of ZMQ + RPC `getblocktemplate`; this socket is what
-    /// `bp-template-distribution::TdpHandle::spawn` connects to.
+    /// Path to the bitcoin-core IPC Unix-domain socket. Templates arrive
+    /// over this socket (TDP), not via ZMQ + RPC `getblocktemplate`;
+    /// `bp-template-distribution::TdpHandle::spawn` connects to it.
     pub socket_path: PathBuf,
     /// Minimum block-reward fee (sats) before a refreshed template
     /// supersedes the previous one. Lower → more template churn.
@@ -493,17 +489,12 @@ pub struct Sv2Config {
     #[serde(default)]
     pub jdp_port: Option<u16>,
     /// Pool-side block resubmit over JSON-RPC — the ONLY way the pool can
-    /// meet §6.4.9 ("When receiving `PushSolution`, JDS MUST attempt to
-    /// reconstruct and propagate the block") on Bitcoin Core v31.
+    /// meet SV2 JDP/PushSolution ("When receiving `PushSolution`, JDS MUST
+    /// attempt to reconstruct and propagate the block") on Bitcoin Core v31.
     ///
-    /// Routing it through Core's job-declaration IPC instead would be the
-    /// natural home for it — that interface already holds the declaration it
-    /// validated. It cannot be done yet: v31's JDP interface has no
-    /// `submitSolution`, and its `handle_push_solution` is an explicit stub
-    /// ("Not yet implemented — deliberately left as a stub for future work").
-    /// Verified against bitcoin_core_sv2 v0.5.0 (sv2-apps v0.7.0) on
-    /// 2026-08-03. It arrives with Core v32 via sv2-apps#593; do not wire it
-    /// before then, the call would silently do nothing.
+    /// ⚠️ Core v31's job-declaration IPC has no working solution submit
+    /// (its push-solution handler is a stub); do not route this through it
+    /// before Core v32, the call would silently do nothing.
     ///
     /// `true` (default): reconstruct the block and submit it via `bitcoind
     /// submitblock`. Costs one RPC per found block — the node answers
@@ -514,16 +505,17 @@ pub struct Sv2Config {
     /// second path that shrinks the orphan window.
     #[serde(default = "default_true")]
     pub jdp_orphan_submitblock: bool,
-    /// bitcoin-core IPC socket for declared-job validation (SV2 §6.1). Same
-    /// shape as `[tdp] socket_path`, and normally the SAME socket — validation
-    /// is a second interface on the one node, not a second node.
+    /// bitcoin-core IPC socket for declared-job validation
+    /// (SV2 JDP/Job Declarator Server). Same shape as `[tdp] socket_path`, and
+    /// normally the SAME socket — validation is a second interface on the one
+    /// node, not a second node.
     ///
     /// When set, every declared Custom Job goes to bitcoin-core's
     /// `job_declaration_protocol` interface for a real `checkBlock` verdict
     /// instead of being accepted on the JDC's word. Unset (default) keeps
     /// declarations trusted.
     ///
-    /// Upstream's engine takes a data DIRECTORY and derives
+    /// The validation engine takes a data DIRECTORY and derives
     /// `<dir>/<network>/node.sock` itself (no subdirectory on mainnet), so the
     /// path given here must be one that derivation can produce. Boot checks it
     /// and refuses to start on a mismatch — the alternative is connecting
@@ -545,7 +537,7 @@ impl Default for Sv2Config {
     /// per-field defaults only run while deserializing a table that exists, so
     /// every `default = "…"` field would silently fall back to the type's own
     /// zero. `jdp_orphan_submitblock` is the one where that matters — off means
-    /// the pool stops doing what §6.4.9 asks of a JDS.
+    /// the pool stops doing what SV2 JDP/PushSolution asks of a JDS.
     fn default() -> Self {
         // Deserialize an empty table rather than list fields: "no section" is
         // then the same answer as "empty section" BY CONSTRUCTION, including
@@ -616,7 +608,7 @@ pub struct PplnsConfig {
     #[serde(default = "default_bucket_shares")]
     pub bucket_shares: u64,
     /// Coinbase-budget autoscaler. **Absent** ⇒ the budget stays fixed at
-    /// `coinbase_weight_budget` (legacy behaviour, fully back-compatible).
+    /// `coinbase_weight_budget`.
     /// **Present** ⇒ the budget self-adjusts at runtime within
     /// `[coinbase_weight_budget` (floor)`, max_weight_budget]` — no restart
     /// needed as the pool grows.
@@ -774,8 +766,7 @@ impl Default for SoloConfig {
 ///
 /// **Fee config** is NOT in this section. Group-Solo + Blockparty
 /// share a single `[group_fees]` lane (`group_fees.address` /
-/// `group_fees.percent`) with fallback to `[pplns]` — that's the
-/// production model.
+/// `group_fees.percent`) with fallback to `[pplns]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockpartyConfig {
@@ -819,8 +810,7 @@ fn default_blockparty_coinbase_weight_budget() -> u32 {
 /// Shared `[group_fees]` lane used by both Group-Solo and Blockparty
 /// (`group_fees.address` / `group_fees.percent`). Both fields are
 /// optional — when absent the boot layer falls
-/// back to the corresponding `[pplns]` values so existing PPLNS-only
-/// deployments keep working without a config change.
+/// back to the corresponding `[pplns]` values.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupFeesConfig {
@@ -1157,9 +1147,8 @@ mod tests {
         difficulty_check_interval_ms = 60000
     "#;
 
-    /// The debounce must arrive on every existing deployment without a
-    /// config edit — a `[notifications]` block that predates it (or no
-    /// block at all) has to yield the documented defaults.
+    /// A missing `[notifications]` block, or one without
+    /// `device_status` keys, yields the documented debounce defaults.
     #[test]
     fn device_status_debounce_defaults_without_a_config_block() {
         let cfg: AppConfig = toml::from_str(&format!("roles = [\"notify\"]\n{MINIMAL_CFG}"))
@@ -1220,9 +1209,8 @@ mod tests {
 
     #[test]
     fn stray_mode_field_is_rejected() {
-        // `mode` was removed — roles are the only topology input. A leftover
-        // `mode = "..."` must surface as a load error (deny_unknown_fields)
-        // rather than be silently ignored.
+        // Roles are the only topology input: a `mode = "..."` key is a load
+        // error (deny_unknown_fields), not silently ignored.
         let parsed = AppConfig::from_toml_str(&format!(
             "roles = [\"front\"]\nmode = \"core\"\n{MINIMAL_CFG}"
         ));
@@ -1259,11 +1247,8 @@ mod tests {
 
     #[test]
     fn solo_rejects_unknown_dust_sweep_keys() {
-        // The dust_sweep_* keys used to live on [solo] but were always
-        // semantic-misnomers — abandoned_balance_days only sweeps PPLNS,
-        // dormant_balance_days only sweeps Group-Solo. They moved to
-        // [pplns] and [group_fees] respectively. Stale configs MUST fail
-        // loud rather than silently use defaults.
+        // Sweep keys belong to [pplns]; on [solo] they MUST fail loud rather
+        // than be silently ignored.
         assert!(toml::from_str::<SoloConfig>("dust_sweep_enabled = true").is_err());
         assert!(toml::from_str::<SoloConfig>("abandoned_balance_days = 90").is_err());
         assert!(toml::from_str::<SoloConfig>("dust_sweep_dormant_days = 30").is_err());
@@ -1307,9 +1292,8 @@ mod tests {
     }
 
     /// Group-Solo has no ledger and therefore no dust sweep. `[group_fees]`
-    /// is `deny_unknown_fields`, so a config still carrying the retired keys
-    /// fails the boot instead of quietly ignoring them — same rule as the
-    /// `[solo]` keys above.
+    /// is `deny_unknown_fields`, so a config carrying sweep keys fails the
+    /// boot instead of quietly ignoring them.
     #[test]
     fn group_fees_rejects_the_retired_sweep_keys() {
         assert!(toml::from_str::<GroupFeesConfig>("dust_sweep_enabled = false").is_err());
@@ -1469,11 +1453,9 @@ mod tests {
         assert_eq!(cfg.stratum.job_retention_ms, 600_000);
         // [tdp] staleness threshold defaults to 120s when unset.
         assert_eq!(cfg.tdp.staleness_threshold_secs, 120);
-        // §6.4.9 makes propagating a pushed solution a MUST for the JDS, and
-        // JSON-RPC is the only route Core v31 offers. A config that says
-        // nothing must therefore leave it ON — flipping this default back to
-        // false silently stops the pool contributing its half of the
-        // anti-orphan redundancy.
+        // SV2 JDP/PushSolution makes propagating a pushed solution a MUST for
+        // the JDS, and JSON-RPC is the only route Core v31 offers, so a
+        // config that says nothing must leave it ON.
         assert!(
             cfg.sv2.jdp_orphan_submitblock,
             "pool-side block propagation must default to on"

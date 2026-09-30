@@ -6,17 +6,15 @@
 //!
 //! - [`parse_request`] consumes one line of JSON and returns a typed
 //!   [`SV1Request`] or a typed [`FrameParseError`] (the latter carries the
-//!   exact wire reason the caller should emit). Validation rules
-//!   implement SV1 validation rules (`mining.subscribe` accepts empty `params`
-//!   for Braiins probers, `mining.submit` requires the first five params to be
-//!   strings, etc).
+//!   exact wire reason the caller should emit). `mining.subscribe` accepts
+//!   empty `params` for Braiins probers, `mining.submit` requires the first
+//!   five params to be strings, etc.
 //!
 //! - [`write_subscribe_response`] / [`write_configure_response`] /
 //!   [`write_authorize_response`] / [`write_submit_success`] /
 //!   [`write_set_difficulty`] / [`write_error`] emit the corresponding
-//!   wire frame, terminated with `\n`. Field-order is pinned via
-//!   `Serialize`-derived structs (no `BTreeMap` reorder) to ensure
-//!   consistent byte-for-byte JSON output for each message shape.
+//!   wire frame, terminated with `\n`. Field order is pinned via
+//!   `Serialize`-derived structs so the JSON is byte-stable per shape.
 //!
 //! `mining.notify` emission lives in `notify.rs` because it depends on
 //! per-template state the frame layer doesn't see.
@@ -48,7 +46,7 @@ pub(crate) const REJECT_STALE: &str = "stale";
 pub(crate) const REJECT_UNAUTHORIZED: &str = "Unauthorized worker";
 pub(crate) const REJECT_NOT_SUBSCRIBED: &str = "Not subscribed";
 /// Emitted when a miner changes version bits outside the mask it negotiated
-/// (BIP-310). New string — no historical tooling parses it yet.
+/// (BIP-310).
 pub(crate) const REJECT_VERSION_ROLLING: &str = "Version rolling not allowed";
 pub(crate) const REJECT_SUGGEST_DISABLED: &str =
     "Suggest difficulty is disabled for this connection";
@@ -81,7 +79,7 @@ impl RpcId {
             serde_json::Value::Number(n) => RpcId::Num(n),
             serde_json::Value::String(s) => RpcId::Str(s),
             // Objects / arrays in the id field are spec-illegal but some
-            // sloppy probers send them. We coerce to Null rather than reject
+            // sloppy probers send them; coerce to Null rather than reject
             // the whole frame.
             _ => RpcId::Null,
         }
@@ -159,11 +157,10 @@ impl ConfigureRequest {
     /// this case a default full mask is used" — so an absent field means
     /// *everything*, never *nothing*.
     ///
-    /// `Malformed` is kept apart from it on purpose. The BIP's default is
-    /// defined for a field that is not there; a field that IS there and
-    /// unreadable (`"1fffe0000"`, `"zzzz"`, a non-string) says the miner
-    /// meant something the pool could not read, and silently upgrading that
-    /// to "grant everything" hands it bits it never asked for.
+    /// `Malformed` is kept apart on purpose: the BIP's default covers a
+    /// missing field, while an unreadable one (`"1fffe0000"`, `"zzzz"`, a
+    /// non-string) must not be upgraded to "grant everything", which would
+    /// hand the miner bits it never asked for.
     pub fn requested_version_rolling_mask(&self) -> RequestedMask {
         let Some(field) = self
             .params
@@ -219,11 +216,9 @@ pub struct SuggestDifficultyRequest {
 /// string carried an escape (worker names are plain in practice, so this
 /// is borrow-only). No DOM, no per-field `String` — see [`parse_request`].
 ///
-/// The borrow-only claim holds because `worker` is deserialized through
+/// The borrow only holds because `worker` is deserialized through
 /// `CowStr`, **not** the blanket `Deserialize for Cow` (which always
-/// allocates). Pinned by `parse_submit_plain_worker_is_borrowed_not_allocated`;
-/// swapping the deserializer back would silently reintroduce a per-share
-/// allocation while leaving this comment looking correct.
+/// allocates). Pinned by `parse_submit_plain_worker_is_borrowed_not_allocated`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubmitRequest<'a> {
     pub id: RpcId,
@@ -291,15 +286,13 @@ pub enum FrameParseError {
 /// serde's blanket `Deserialize for Cow<'a, T>` **always** yields
 /// `Cow::Owned` — it deserializes a `String` and wraps it — so a field
 /// merely *typed* `Cow<'a, str>` allocates on every parse even when the
-/// input needed no unescaping. `#[serde(borrow)]` does not rescue it
-/// through an `Option<…>` either (measured: both `worker` and `method`
-/// came out `Owned` for a plain line).
+/// input needed no unescaping, and `#[serde(borrow)]` does not reach
+/// through an `Option<…>` either.
 ///
 /// This wrapper implements the borrowing visitor directly:
-/// `visit_borrowed_str` — the parser could point straight into the input
-/// buffer — yields `Cow::Borrowed`, and only `visit_str` / `visit_string`
-/// (serde had to unescape into a scratch buffer) allocates. That is the
-/// behaviour the `mining.submit` doc comment always claimed.
+/// `visit_borrowed_str` (a span of the input) yields `Cow::Borrowed`, and
+/// only `visit_str` / `visit_string` (serde had to unescape into a scratch
+/// buffer) allocates.
 struct CowStr<'a>(Cow<'a, str>);
 
 impl<'de> Deserialize<'de> for CowStr<'de> {
@@ -392,7 +385,7 @@ impl<'de> Deserialize<'de> for SubmitParams<'de> {
                     .ok_or_else(|| de::Error::invalid_length(4, &self))?;
                 // Sixth param is optional. Read it as a raw span so a null /
                 // numeric / bool value degrades to "no mask" rather than
-                // failing the whole submit (the historical lenient rule).
+                // failing the whole submit.
                 let version_mask = match seq.next_element::<&RawValue>()? {
                     Some(raw) if raw.get().starts_with('"') => {
                         serde_json::from_str::<&str>(raw.get()).ok()
@@ -433,10 +426,9 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
         Ok(env) => env,
         Err(_) => {
             // Distinguish "not JSON at all" (connection-fatal) from "valid
-            // JSON but not a request object / non-string method" — the
-            // latter is a broken frame we tolerate as `Other` (matching the
-            // lenient DOM parser this replaced). A bare `RawValue` parse
-            // validates the JSON without building a DOM.
+            // JSON but not a request object / non-string method"; the
+            // latter is a broken frame tolerated as `Other`. A bare
+            // `RawValue` parse validates the JSON without building a DOM.
             return match serde_json::from_str::<&RawValue>(trimmed) {
                 Ok(_) => Ok(SV1Request::Other {
                     id: RpcId::Null,
@@ -449,7 +441,7 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
 
     // Resolve the id once. `id_present` is "present and not literal null":
     // an object/array id is spec-illegal but counts as present (and then
-    // coerces to `Null`), preserving the historical behaviour.
+    // coerces to `Null`).
     let (id, id_present) = match envelope.id {
         Some(raw) => {
             let token = raw.get().trim();
@@ -561,11 +553,9 @@ pub fn parse_request(line: &str) -> Result<SV1Request<'_>, FrameParseError> {
             }
             let raw_username = arr[0].as_str().unwrap().to_string();
             // A trailing dot ("addr.") gets the same default as no dot at
-            // all: an empty worker name is not a name. Letting "" through
-            // birthed the `client_entity` row under clientName "" while
-            // every share-path write targets a non-empty name — the touch
-            // UPDATE then matches 0 rows, `updatedAt` freezes, and
-            // `kill_dead_clients` sweeps an actively-hashing session.
+            // all. The share path writes under a non-empty name, so a ""
+            // client row would never be touched and `kill_dead_clients`
+            // would sweep an actively-hashing session.
             let (address, worker) = match bp_common::split_user_identity(&raw_username) {
                 (a, Some(w)) if !w.is_empty() => (a.to_string(), w.to_string()),
                 (a, _) => (a.to_string(), "worker".to_string()),
@@ -709,10 +699,8 @@ pub(crate) fn write_submit_success(id: &RpcId) -> Vec<u8> {
 
 /// Emit a server-initiated `mining.set_difficulty` notification (no id).
 ///
-/// Integer-valued `difficulty` (`d.fract() == 0`) gets serialized as an integer:
-/// emits as a bare integer (`[1024]`), whereas a fractional value emits
-/// as a float (`[0.1]`). JavaScript has no separate integer type, so
-/// `JSON.stringify` already does this — we replicate it explicitly.
+/// An integer-valued `difficulty` emits as a bare integer (`[1024]`), a
+/// fractional one as a float (`[0.1]`).
 pub(crate) fn write_set_difficulty(difficulty: f64) -> Vec<u8> {
     let frame = NotificationFrame {
         id: (),
@@ -739,9 +727,8 @@ pub(crate) fn write_extranonce_subscribe_response(id: &RpcId) -> Vec<u8> {
 /// Emit a Stratum error frame.
 ///
 /// Wire shape: `{"id":<id>,"result":null,"error":[<code>,"<msg>",""]}`.
-/// The third element is the empty string — validation errors are concatenated
-/// over an empty array, and we never collect validation details
-/// (`StratumV1Client::isValid*` returns bool, not details).
+/// The third element is always the empty string: no validation details
+/// are collected.
 pub(crate) fn write_error(id: &RpcId, code: i64, message: &str) -> Vec<u8> {
     let frame = ErrorFrame {
         id,
@@ -758,17 +745,13 @@ fn finalize<F: Serialize>(frame: &F) -> Vec<u8> {
     bytes
 }
 
-/// Number serialization: integer-valued finite `f64` → JSON
-/// integer; otherwise → JSON float. Mirrors `JSON.stringify`'s behavior
-/// for the JS `Number` type.
+/// Integer-valued finite `f64` → JSON integer; otherwise → JSON float.
 fn difficulty_to_json_number(d: f64) -> serde_json::Number {
     if d.is_finite() && d.fract() == 0.0 && d.abs() <= (i64::MAX as f64) {
         serde_json::Number::from(d as i64)
     } else {
-        // `from_f64` returns `None` only for NaN / ±Infinity; we filtered
-        // those above, so this is safe in steady state. If it ever fires
-        // it indicates a bug upstream (a non-finite diff slipped past
-        // vardiff validation).
+        // `from_f64` returns `None` only for NaN / ±Infinity, which vardiff
+        // validation keeps out; firing here means a bug upstream.
         serde_json::Number::from_f64(d).expect("difficulty must be finite for wire emission")
     }
 }
@@ -789,7 +772,7 @@ mod tests {
             SV1Request::Subscribe(s) => {
                 assert_eq!(s.id, RpcId::from(1));
                 assert_eq!(s.raw_user_agent.as_deref(), Some("cgminer/4.11.1"));
-                // refineUserAgent: split('/')[0] → "cgminer"
+                // Normalised to the part before the first '/'.
                 assert_eq!(s.user_agent, "cgminer");
             }
             other => panic!("expected Subscribe, got {:?}", other),
@@ -798,8 +781,7 @@ mod tests {
 
     #[test]
     fn parse_subscribe_with_empty_params() {
-        // Braiins Hashpower marketplace minimal probe — params: [].
-        // Some clients send empty params: [].
+        // Braiins Hashpower marketplace minimal probe: params: [].
         let req = parse_request(r#"{"id":1,"method":"mining.subscribe","params":[]}"#).expect("ok");
         match req {
             SV1Request::Subscribe(s) => {
@@ -911,10 +893,9 @@ mod tests {
         }
     }
 
-    /// A trailing dot must never yield an empty worker name: the session
-    /// would register under clientName "" while every share-path write
-    /// targets a non-empty name, so its touches match 0 rows and
-    /// `kill_dead_clients` sweeps the live session after 5 minutes.
+    /// A trailing dot must never yield an empty worker name: the share path
+    /// writes under a non-empty name, so a "" client row would never be
+    /// touched and `kill_dead_clients` would sweep the live session.
     #[test]
     fn parse_authorize_with_trailing_dot_gets_the_default_worker_name() {
         let req = parse_request(
@@ -1093,14 +1074,9 @@ mod tests {
         }
     }
 
-    /// The other half of the `Cow` contract, and the regression guard for
-    /// the borrow fix: a PLAIN worker name (the overwhelmingly common case)
-    /// must be **borrowed** from the input line, not copied.
-    ///
-    /// Before the `CowStr` deserializer this asserted `Owned` in practice —
-    /// serde's blanket `Deserialize for Cow` never borrows — so the hot
-    /// submit path allocated ~50 bytes for the worker on every single share
-    /// while the doc comment claimed it was borrow-only.
+    /// The other half of the `Cow` contract: a PLAIN worker name (the
+    /// common case) must be **borrowed** from the input line, not copied,
+    /// so the hot submit path does not allocate per share.
     #[test]
     fn parse_submit_plain_worker_is_borrowed_not_allocated() {
         let line = r#"{"id":5,"method":"mining.submit","params":["bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.worker1","000a","1122","ntime","nonce"]}"#;
@@ -1120,9 +1096,8 @@ mod tests {
         }
     }
 
-    /// Same contract for the envelope's `method`, which had the identical
-    /// bug: `#[serde(borrow)]` does not reach through `Option<Cow<_>>`, so
-    /// every frame allocated for `"mining.submit"` too.
+    /// Same contract for the envelope's `method`: `#[serde(borrow)]` alone
+    /// does not reach through `Option<Cow<_>>`.
     #[test]
     fn envelope_plain_method_is_borrowed_not_allocated() {
         let line = r#"{"id":1,"method":"mining.submit","params":[]}"#;
@@ -1236,7 +1211,6 @@ mod tests {
     #[test]
     fn write_subscribe_response_byte_exact() {
         let bytes = write_subscribe_response(&RpcId::from(1), "abcd1234", "abcd1234", 8);
-        // Subscription message response shape.
         assert_eq!(
             s(&bytes),
             r#"{"id":1,"error":null,"result":[[["mining.notify","abcd1234"]],"abcd1234",8]}"#
@@ -1248,8 +1222,7 @@ mod tests {
     #[test]
     fn write_configure_response_byte_exact() {
         let bytes = write_configure_response(&RpcId::from(2), 0x1fffe000);
-        // format!"{:08x}" produces lowercase, 8-padded hex.
-        // produces the same.
+        // Lowercase, 8-padded hex.
         assert_eq!(
             s(&bytes),
             r#"{"id":2,"error":null,"result":{"version-rolling":true,"version-rolling.mask":"1fffe000"}}"#
@@ -1310,8 +1283,7 @@ mod tests {
 
     #[test]
     fn write_error_byte_exact_with_empty_validation_detail() {
-        // Concatenate validation errors with comma separator.
-        // — over an empty array yields the empty string.
+        // The third element (validation detail) is always empty.
         let bytes = write_error(
             &RpcId::from(1),
             ERR_OTHER_UNKNOWN,

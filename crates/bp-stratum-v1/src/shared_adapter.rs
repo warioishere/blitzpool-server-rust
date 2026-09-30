@@ -178,8 +178,8 @@ mod tests {
         );
     }
 
-    /// A stale share keeps its own reason; it used to be counted as
-    /// job-not-found, so the stale column stayed empty.
+    /// A stale share keeps its own reason and is not folded into
+    /// job-not-found, so the stale column counts it.
     #[test]
     fn a_stale_reject_keeps_its_own_reason() {
         let share = shared_rejected(Some("a"), Some("w"), "s", RejectReason::Stale, 8.0);

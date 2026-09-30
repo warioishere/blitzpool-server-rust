@@ -23,12 +23,11 @@ pub const CHART_VISIBILITY_BUFFER: Duration = Duration::from_millis(60_000);
 /// so a single ingested diff above ~1e15 is implausible for real miners
 /// and almost certainly a corrupted SV2 frame or a misconfigured probe.
 /// Shares above this limit are silently discarded by the accumulator —
-/// see `PoolSharesAccumulator::add_accepted_share`.
+/// see `PoolSharesAccumulator::add_accepted`.
 pub const MAX_REASONABLE_DIFFICULTY: f64 = 1.0e15;
 
 /// Once a flusher reports this many consecutive failures, the health
 /// monitor flips to "warning" so the caller can emit a single
-/// `tracing::warn!`. Three minutes of sustained PG outage = enough slack
-/// that one slow query doesn't spam the log, quick enough that a real
-/// outage is visible before OOM.
+/// `tracing::warn!`: enough slack that one slow query does not spam the
+/// log, quick enough that a real outage is visible before memory grows.
 pub const FLUSH_FAILURE_WARN_THRESHOLD: u32 = 3;

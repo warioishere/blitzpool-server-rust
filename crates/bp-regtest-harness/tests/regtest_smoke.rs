@@ -35,7 +35,7 @@ async fn spawn_mine_shutdown() {
         .get_network_info()
         .await
         .expect("getnetworkinfo should succeed");
-    // The node we were handed must be the one `is_available` vouched for.
+    // The spawned node must be the one `is_available` vouched for.
     // That gate reads the `-version` banner; this reads `getnetworkinfo` off
     // the running process, so agreement between them is what rules out
     // "discovery found a v31 and then something else got spawned".

@@ -5,8 +5,7 @@
 
 //! End-to-end tests for `SessionPersistenceEngine`: the
 //! session-register/deregister hook + the per-hour difficulty-stats sink,
-//! verified against PG. (Best difficulty is no longer a per-share
-//! write-through here — it's folded into the batched stats-sink flush.)
+//! verified against PG.
 
 use std::time::Duration;
 
@@ -54,11 +53,9 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
     }
 }
 
-/// The full debounced life of a mining session: register writes NOTHING
-/// (the anti-write half — under the old synchronous hook the row existed
-/// here, so this assertion fails against that behaviour), the birth
-/// flush writes the row with the values register captured, deregister
-/// soft-deletes it.
+/// The full debounced life of a mining session: register writes NOTHING,
+/// the birth flush writes the row with the values register captured,
+/// deregister soft-deletes it.
 #[tokio::test]
 async fn engine_session_persistence_hook_debounces_then_soft_deletes() {
     let _guard = ENGINE_LOCK.lock().await;
@@ -141,9 +138,8 @@ async fn engine_session_persistence_hook_debounces_then_soft_deletes() {
 
 /// The probe path and its negative control in one test: a session that
 /// deregisters before its birth leaves NO row, while the surviving
-/// control session from the same batch does get one — so a regression
-/// that writes at authorize again fails the first half, and a filter
-/// that drops everything fails the second.
+/// control session from the same batch does get one, so a filter that
+/// drops everything cannot pass.
 #[tokio::test]
 async fn a_probe_session_leaves_no_row_while_a_survivor_gets_one() {
     let _guard = ENGINE_LOCK.lock().await;
@@ -160,7 +156,7 @@ async fn a_probe_session_leaves_no_row_while_a_survivor_gets_one() {
     let hook = handle.session_persistence_hook();
     let address = format!("{prefix}carol");
 
-    // The probe: authorize + hang up, the measured 95 % case.
+    // The probe: authorize + hang up, the common case.
     hook.register_session("sessPRB1", &address, "probe", None)
         .await;
     hook.deregister_session("sessPRB1").await;
@@ -244,9 +240,8 @@ async fn two_workers_on_one_session_both_get_rows_and_one_teardown_retires_both(
 
 /// One poisoned entry (a `clientName` past the column's varchar(64),
 /// which the SV1 path does not length-check) must not starve the healthy
-/// rows in its batch, and must be dropped after its bounded retries —
-/// the unbounded-retry version of this is exactly how the abandoned
-/// upsert-touch design took the whole flush down.
+/// rows in its batch, and is dropped after its bounded retries so it
+/// cannot stall every later flush.
 #[tokio::test]
 async fn a_poisoned_birth_row_is_isolated_and_dropped_after_bounded_retries() {
     let _guard = ENGINE_LOCK.lock().await;
@@ -330,7 +325,7 @@ async fn engine_re_register_under_same_session_id_clears_soft_delete() {
     handle.flush_births_now().await;
     hook.deregister_session("sessY002").await;
     // Same composite PK re-register: the birth's ON CONFLICT arm clears
-    // deletedAt, exactly as the synchronous upsert did.
+    // deletedAt.
     hook.register_session("sessY002", &address, "wkr", None)
         .await;
     handle.flush_births_now().await;
@@ -385,11 +380,10 @@ async fn engine_shutdown_is_a_drop_no_op() {
 /// hour-slot) MAX submission difficulty; a lower follow-up share leaves
 /// the stored max untouched, and a higher one raises it.
 ///
-/// Goes through the ENGINE since the sink was batched (2026-08-05): the sink
-/// only merges into the buffer, and the row appears when the flush loop — or
-/// the shutdown drain — writes it. So this now covers the whole chain
-/// (record → coalesce → bulk upsert → row), including that `shutdown()`
-/// does not discard the current window.
+/// Goes through the ENGINE: the sink only merges into the buffer, and the
+/// row appears when the flush loop or the shutdown drain writes it. Covers
+/// the whole chain (record → coalesce → bulk upsert → row), including that
+/// `shutdown()` does not discard the current window.
 #[tokio::test]
 async fn diff_stats_sink_keeps_per_slot_maximum() {
     let _guard = ENGINE_LOCK.lock().await;
@@ -443,8 +437,7 @@ async fn diff_stats_sink_keeps_per_slot_maximum() {
     sink.record_accepted(share(50_000.0)).await; // new max
     sink.record_accepted(share(2_000.0)).await; // below max → no change
 
-    // Nothing may be in the DB yet — the whole point of batching is that the
-    // share path does not write. If this fires, the sink went inline again.
+    // Nothing may be in the DB yet: the share path does not write.
     let pending: i64 = sqlx::query_scalar(
         r#"SELECT count(*) FROM client_difficulty_statistics_entity WHERE address = $1"#,
     )

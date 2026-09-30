@@ -25,7 +25,7 @@ const DEFAULT_WALLET_NAME: &str = "bp_regtest";
 /// Not `Clone` — there is exactly one underlying process per instance. Pass
 /// `&RegtestNode` around if multiple tasks need access.
 pub struct RegtestNode {
-    /// The bitcoin-node child. Wrapped in `Option` so we can take it out in
+    /// The bitcoin-node child. Wrapped in `Option` so it can be taken out in
     /// [`RegtestNode::shutdown`] without leaving an invalid `Child` behind
     /// for `Drop`.
     child: Option<Child>,
@@ -185,13 +185,8 @@ impl RegtestNode {
     /// Peek for process death without blocking. `child` is always `Some`
     /// between construction and shutdown.
     ///
-    /// This used to `stat /proc/<pid>` because `try_wait` needs `&mut self`
-    /// and the caller only had `&self`. **`/proc` does not exist on macOS**,
-    /// so the probe failed for every healthy node and `wait_for_ready`
-    /// aborted a node that was still starting normally — the whole regtest
-    /// suite errored out instead of running. Taking `&mut self` up through
-    /// `wait_for_ready` (its one caller owns the node outright) costs
-    /// nothing and buys the portable answer plus the real exit status.
+    /// Uses `try_wait` (hence `&mut self`) rather than probing `/proc`,
+    /// which does not exist on macOS; it also yields the real exit status.
     fn check_alive(&mut self) -> Result<(), RegtestError> {
         let Some(child) = self.child.as_mut() else {
             return Ok(());
@@ -267,7 +262,7 @@ impl RegtestNode {
             // Wallet exists on disk but is NOT loaded — the common case
             // after a node restart at the same datadir (createwallet
             // reports "Database already exists"). createwallet does NOT
-            // load it, so we must `loadwallet` explicitly; otherwise the
+            // load it, so `loadwallet` runs explicitly; otherwise the
             // first wallet RPC fails with -18 "wallet not loaded".
             Err(RegtestError::Rpc { detail, .. }) if detail.contains("already exists") => {
                 match self
@@ -324,8 +319,8 @@ impl RegtestNode {
 
     async fn wallet_rpc(&self, method: &'static str, params: Value) -> Result<Value, RegtestError> {
         // Bitcoin-core wallet RPCs require the URL to include the wallet
-        // name as a path component. We construct a per-wallet RpcCaller on
-        // the fly rather than maintain a separate field — call rate is low.
+        // name as a path component. A per-wallet RpcCaller is built on the
+        // fly rather than kept in a field; the call rate is low.
         let wallet_url = format!(
             "http://127.0.0.1:{}/wallet/{}",
             self.rpc_port, DEFAULT_WALLET_NAME
@@ -498,7 +493,7 @@ impl RegtestNode {
 impl Drop for RegtestNode {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            // Fast path on Drop: SIGKILL the process. We don't have an async
+            // Fast path on Drop: SIGKILL the process. There is no async
             // context here, so a graceful `stop` RPC isn't viable. Tempdir
             // cleanup happens automatically when `self.datadir_guard` drops
             // (owned tempdir only; external datadirs are left for the caller).

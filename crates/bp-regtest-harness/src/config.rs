@@ -24,11 +24,9 @@ pub const BITCOIN_NODE_PATH_ENV: &str = "BITCOIN_NODE_PATH";
 /// that binary, and it should win over an older tarball left in a home
 /// directory.
 ///
-/// This list is the whole macOS story. Homebrew's `bitcoin` formula
-/// installs `bitcoind`, NOT the multiprocess `bitcoin-node`, so there is
-/// no Homebrew path worth probing — on macOS this binary comes from an
-/// upstream tarball or a local build, which is why `~/.local` and
-/// `/usr/local` are here and `/opt/homebrew/bin` is not.
+/// No Homebrew path: the `bitcoin` formula installs `bitcoind`, not the
+/// multiprocess `bitcoin-node`, so on macOS the binary comes from a
+/// tarball or a local build.
 const CANDIDATE_SUFFIXES: &[&str] = &[
     // Tarball layouts, relative to a prefix.
     "libexec/bitcoin-node",
@@ -41,25 +39,18 @@ const CANDIDATE_PREFIXES: &[&str] = &[
     "~/.local",
     "/usr/local",
     "/opt/bitcoin",
-    // Where the Linux dev box has it — kept so that machine keeps working
-    // without an env var now that the default is no longer its path.
+    // Extracted-tarball directories in a home directory.
     "~/bitcoin-31.0",
     "~/bitcoin-30.0",
 ];
 
 /// Lowest bitcoin-core major version this harness can actually drive.
 ///
-/// Not cosmetic, and not a "please upgrade": `bp-template-distribution`
-/// links `bitcoin_core_sv2::unix_capnp::v31x`, whose schema declares
-/// `Init.makeMining @3` (v30 had it at `@2`, and upstream kept the ordinal
-/// busy with a `makeMiningOld2` placeholder). A v30 node therefore has no
-/// method 3 to call. Measured on v30.2 (2026-08-09): it spawns, writes its
-/// cookie, serves JSON-RPC and creates `node.sock`, and then answers TDP
-/// startup with
-/// `Unimplemented … interfaceName = capnp/init.capnp:Init; methodId = 3`.
-/// So a v30 node passes every check except the one that matters, which is
-/// why the version is checked up front rather than discovered as an opaque
-/// capnp error 29 tests deep.
+/// `bp-template-distribution` links `bitcoin_core_sv2::unix_capnp::v31x`,
+/// whose schema declares `Init.makeMining @3` (`@2` in v30), so a v30 node
+/// has no method 3 to call. It spawns, serves JSON-RPC and creates
+/// `node.sock`, then fails TDP startup with a capnp `Unimplemented`. The
+/// version is checked up front so that shows up as a clear skip instead.
 pub const MIN_BITCOIN_NODE_MAJOR: u32 = 31;
 
 /// Find an IPC-enabled `bitcoin-node` new enough to drive, or return the
@@ -70,12 +61,10 @@ pub const MIN_BITCOIN_NODE_MAJOR: u32 = 31;
 /// otherwise the first path searched — which exists only to make the skip
 /// message concrete. `is_available()` is what callers actually branch on.
 ///
-/// Deliberately NOT cached in a `OnceLock`: it runs once per
-/// `RegtestConfig::default()`, a handful of times per test binary, and a
-/// few `stat` calls plus at most one or two `-version` spawns are nothing
-/// against the ~1-2 s the node itself takes to come up. Caching would also
-/// make the env var un-overridable within a process, which is exactly the
-/// knob a developer reaches for first.
+/// Deliberately NOT cached in a `OnceLock`: a few `stat` calls and
+/// `-version` spawns per `RegtestConfig::default()` are cheap next to node
+/// startup, and caching would make the env var un-overridable within a
+/// process.
 pub fn discover_bitcoin_node() -> (PathBuf, bool) {
     // An explicit env var is a decision, not a hint: honour it verbatim,
     // including when it points at nothing. Silently searching elsewhere
@@ -83,13 +72,9 @@ pub fn discover_bitcoin_node() -> (PathBuf, bool) {
     // and a regtest that passes on the wrong node proves nothing.
     //
     // The version floor is deliberately NOT applied here. The banner cannot
-    // settle it for a development build: master carries minor `.99`, and
-    // `v30.99` exists both before and after the `makeMining` renumbering —
-    // measured on this machine, where a Jan-2026 master checkout reports
-    // v30.99 with `@2` while v31.1 reports `@3`. Refusing every `.99` would
-    // lock out contributors building from master; accepting them all would
-    // reinstate the confusing failure. So a named binary is simply used, and
-    // a mismatch surfaces as the capnp error rather than as a wrong guess.
+    // settle it for a development build: master reports `v30.99` both
+    // before and after the `makeMining` renumbering. So a named binary is
+    // simply used, and a mismatch surfaces as the capnp error.
     if let Ok(from_env) = std::env::var(BITCOIN_NODE_PATH_ENV) {
         let p = named_node_path(&from_env, std::env::var("HOME").ok().as_deref());
         let ok = p.exists() && is_executable(&p);
@@ -122,13 +107,9 @@ pub fn discover_bitcoin_node() -> (PathBuf, bool) {
 /// `unsafe_code` and Rust 1.85 made `set_var` unsafe, so a test cannot
 /// mutate the environment to reach it.
 ///
-/// A leading `~` is expanded — a tilde only survives into a child process
-/// when it was quoted (`BITCOIN_NODE_PATH='~/b/bitcoin-node'`, or fish's
-/// `set -x` with the value in quotes), and left literal it names a path
-/// that cannot exist, so every regtest skips while reporting "not found"
-/// against a path the operator can see is right. `candidates()` already
-/// expands `~` for the search list; the override was the one place a
-/// correct-looking path silently meant nothing.
+/// A leading `~` is expanded: a tilde only survives into a child process
+/// when it was quoted (`BITCOIN_NODE_PATH='~/b/bitcoin-node'`), and left
+/// literal it names a path that cannot exist, so every regtest would skip.
 ///
 /// Without `$HOME` the literal is kept rather than mangled, so the skip
 /// message still shows what was asked for.
@@ -142,10 +123,8 @@ fn named_node_path(value: &str, home: Option<&str>) -> PathBuf {
 /// [`RegtestConfig::is_available`] so the two cannot disagree.
 ///
 /// An unreadable or unparseable `-version` banner counts as **usable**: a
-/// local build may print something we don't recognise, and skipping it
-/// silently is the worse error. Failing loudly against a node we could not
-/// classify leaves a diagnosable message; skipping leaves a green suite
-/// that proved nothing.
+/// local build may print anything, and failing loudly leaves a diagnosable
+/// message while skipping leaves a green suite that proved nothing.
 ///
 /// Same reasoning, one step further, for a path the operator named in
 /// [`BITCOIN_NODE_PATH_ENV`]: the floor is not applied at all. See
@@ -198,12 +177,9 @@ fn candidates() -> Vec<PathBuf> {
     let home = std::env::var("HOME").ok();
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            // `$PATH` entries get the same tilde expansion as our own
-            // prefixes. A shell exports `PATH` verbatim, so an unexpanded
-            // `~/...` written in a shell profile arrives here literally —
-            // measured on this machine, where `$PATH` carries
-            // `~/.dotnet/tools`. `Path::join` would then probe a directory
-            // named `~`, which cannot exist.
+            // `$PATH` entries get the same tilde expansion as the fixed
+            // prefixes: a shell exports `PATH` verbatim, so an unexpanded
+            // `~/...` from a shell profile arrives here literally.
             if let Some(expanded) = expand_home(&dir, home.as_deref()) {
                 out.push(expanded.join("bitcoin-node"));
             }
@@ -297,7 +273,7 @@ impl RegtestConfig {
     /// The version is part of "available" on purpose. A v30 node satisfies
     /// every other check and then fails TDP startup with an opaque capnp
     /// `Unimplemented`; treating it as available would turn a clean skip
-    /// into ~29 confusing failures.
+    /// into a wall of confusing failures.
     pub fn is_available(&self) -> bool {
         is_usable(&self.bitcoin_node_path)
     }
@@ -331,11 +307,7 @@ impl RegtestConfig {
     }
 }
 
-/// The "too old" half of [`RegtestConfig::unavailable_reason`], split out so a
-/// test can assert the wording against a known-old version without needing a
-/// v30 binary on the machine — which is what lets the "`/bin/sh` is not called
-/// too old" control compare against a string it has actually seen produced,
-/// rather than a phrase that may no longer appear anywhere.
+/// The "too old" half of [`RegtestConfig::unavailable_reason`].
 fn too_old_reason(path: &Path, major: u32) -> String {
     let path = path.display();
     format!(
@@ -384,30 +356,20 @@ mod tests {
         assert!(!cfg.is_available());
     }
 
-    /// No one developer's home directory may be baked into discovery.
-    ///
-    /// This is the regression: the default used to be an absolute
-    /// `/home/<a-specific-user>/bitcoin-31.0/libexec/bitcoin-node`, so ~29
-    /// regtests skipped on every other machine — and a skipped test PASSES,
-    /// so the suite went green while proving nothing. Discovery has to come
-    /// from the environment, never from a literal.
+    /// No one developer's home directory may be baked into discovery: on
+    /// every other machine the regtests would skip, and a skipped test
+    /// passes.
     ///
     /// Asserted against `CANDIDATE_PREFIXES`, the only place a literal can
-    /// live. Testing the *expanded* `candidates()` for a username cannot
-    /// work: `~/.local` is supposed to expand to `/home/<you>/.local`, and a
-    /// `$PATH` full of `$HOME` entries expands the same way, so the check
-    /// fires on correct behaviour — and only ever on the one machine whose
-    /// name it hard-codes, staying inert everywhere else. Measured
-    /// 2026-08-10 on the Linux box, where a `$PATH` entry under `$HOME`
-    /// (`~/.bun/bin`) failed it while nothing was wrong; without
-    /// `--no-fail-fast` it aborted the run at 12 binaries of 28, which reads
-    /// exactly like a discovery regression and was not one.
+    /// live. The *expanded* `candidates()` legitimately contain the current
+    /// user's home (`~/.local`, `$PATH` entries), so a username check there
+    /// would fire on correct behaviour.
     #[test]
     fn candidates_are_derived_from_the_environment_not_hard_coded() {
         for prefix in CANDIDATE_PREFIXES {
             // `~` is the portable way to name "this user's home". An
             // absolute path into a per-user root names somebody in
-            // particular, which is the bug.
+            // particular.
             assert!(
                 !prefix.starts_with("/home/") && !prefix.starts_with("/Users/"),
                 "{prefix} hard-codes one user's home directory — use a `~` prefix, \
@@ -417,14 +379,9 @@ mod tests {
         // Positive direction, so this cannot pass by the prefix list being
         // empty: `$PATH` must really contribute candidates.
         //
-        // Counting is not enough — every prefix yields
-        // `CANDIDATE_SUFFIXES.len()` entries, so the total already exceeds the
-        // prefix count with `$PATH` ignored entirely. Nor is "some `$PATH`
-        // entry is in the list": `/usr/local` is a prefix AND `/usr/local/bin`
-        // is on most `$PATH`s, and `~/.local` likewise, so that assert matches
-        // a prefix-derived path and survives deleting the `$PATH` loop —
-        // measured, it did. Only a directory no prefix can produce
-        // distinguishes them.
+        // Only a directory no prefix can produce proves it: `/usr/local/bin`
+        // and `~/.local/bin` are both on most `$PATH`s AND prefix-derived,
+        // so matching one of those would survive deleting the `$PATH` loop.
         let home = std::env::var("HOME").ok();
         let prefix_derived: Vec<PathBuf> = CANDIDATE_PREFIXES
             .iter()
@@ -479,11 +436,9 @@ mod tests {
     /// A `~`-prefixed entry must be expanded, not probed literally —
     /// wherever it came from.
     ///
-    /// Both our own `CANDIDATE_PREFIXES` and `$PATH` are subject to this: a
-    /// shell exports `PATH` verbatim, so a profile line written as
-    /// `~/.dotnet/tools` arrives unexpanded. That is not hypothetical — it
-    /// is what this machine's `$PATH` contains, and it is what made the
-    /// first version of this test fail.
+    /// Both `CANDIDATE_PREFIXES` and `$PATH` are subject to this: a shell
+    /// exports `PATH` verbatim, so a profile line written as
+    /// `~/.dotnet/tools` arrives unexpanded.
     #[test]
     fn home_relative_paths_are_expanded_from_every_source() {
         let Ok(home) = std::env::var("HOME") else {
@@ -510,12 +465,9 @@ mod tests {
         );
     }
 
-    /// The version gate has to read a real banner, and reject v30.
-    ///
-    /// Measured 2026-08-09: v30.2 spawns, writes its cookie, serves JSON-RPC
-    /// and creates `node.sock` — it passes every check the harness had — and
-    /// then fails TDP startup with `Unimplemented … capnp/init.capnp:Init`.
-    /// So the banner is the only cheap place to catch it.
+    /// The version gate has to read a real banner, and reject v30. A v30
+    /// node passes every other check and only fails at TDP startup, so the
+    /// banner is the only cheap place to catch it.
     #[test]
     fn version_banner_is_parsed_and_v30_is_rejected() {
         let v30 = "Bitcoin Core daemon version v30.2 bitcoin-node\n\
@@ -539,10 +491,9 @@ mod tests {
 
     /// An unrecognised banner must NOT skip.
     ///
-    /// A local build can print anything, and per this repo's testing notes a
-    /// skipped test is indistinguishable from a passing one. Failing loudly
-    /// against an unclassifiable node is recoverable; silently skipping is
-    /// the failure mode that hid a whole suite.
+    /// A local build can print anything, and a skipped test is
+    /// indistinguishable from a passing one. Failing loudly against an
+    /// unclassifiable node is recoverable; silently skipping is not.
     #[test]
     fn an_unparseable_banner_is_treated_as_usable() {
         assert_eq!(
@@ -550,12 +501,8 @@ mod tests {
             None
         );
         // Pinned through `is_usable` itself, not through an `Option`
-        // identity. `None::<u32>.is_none_or(..)` was the original assertion
-        // here, and it is true for every predicate you could write, so it
-        // held even when `is_usable` was mutated to reject unparseable
-        // banners outright — the one behaviour this test names. `/bin/sh` is
-        // executable and prints no `v`-numeric token, so it is a real
-        // unclassifiable binary rather than a stand-in.
+        // identity. `/bin/sh` is executable and prints no `v`-numeric token,
+        // so it is a real unclassifiable binary rather than a stand-in.
         let sh = Path::new("/bin/sh");
         assert_eq!(
             node_major_version(sh),
@@ -571,12 +518,9 @@ mod tests {
 
     /// A binary the operator named must be used even if the banner is old.
     ///
-    /// Not a nicety. `v30.99` is what a master build reports, and that
-    /// banner exists on BOTH sides of the `makeMining` renumbering —
-    /// measured on this machine, where a Jan-2026 master checkout is v30.99
-    /// with `@2` and v31.1 is `@3`. So the floor cannot classify a
-    /// development build, and the env var has to be the way out. Without
-    /// this, a contributor's own master build is unusable with no override.
+    /// `v30.99` is what a master build reports, on BOTH sides of the
+    /// `makeMining` renumbering, so the floor cannot classify a development
+    /// build and the env var has to be the way out.
     #[test]
     fn an_explicitly_named_binary_bypasses_the_version_floor() {
         let Some(named) = std::env::var_os(BITCOIN_NODE_PATH_ENV) else {
@@ -620,11 +564,8 @@ mod tests {
             "a missing binary should name the override env var: {reason}"
         );
         // Positive control, driven through `unavailable_reason` against a
-        // binary that really answers `-version` with a v30 banner. Calling
-        // `too_old_reason` directly (an earlier version of this test) proved
-        // only that the string exists: the `major < MIN` arm was never
-        // reached, so weakening its guard — or deleting the arm — left every
-        // test green while a rejected v30 reported "looks usable".
+        // binary that really answers `-version` with a v30 banner, so the
+        // `major < MIN` arm is actually reached.
         let hallmark = "the SV2 IPC bindings call";
         let stub = v30_banner_stub();
         let old = RegtestConfig::default().with_bitcoin_node_path(&stub);
@@ -653,10 +594,8 @@ mod tests {
     /// An executable that answers `-version` with a real v30 banner.
     ///
     /// The floor exists to reject a node that passes every other check, so
-    /// the only honest way to test it is to run something that answers like
-    /// one. Cheaper and more portable than requiring a v30 install: the
-    /// machine that has one is exactly the machine this needs to work
-    /// without.
+    /// the test runs something that answers like one, without requiring a
+    /// v30 install.
     fn v30_banner_stub() -> PathBuf {
         let path = std::env::temp_dir().join(format!("bp-v30-stub-{}", stub_suffix()));
         std::fs::write(
@@ -709,10 +648,8 @@ mod tests {
     /// A quoted `~` in the override must reach `$HOME`, not a directory
     /// literally named `~`.
     ///
-    /// Driven through `named_node_path` rather than `expand_home`, because
-    /// the bug was not in expansion — that always worked — but in the
-    /// override never calling it. A test on `expand_home` alone passed
-    /// throughout.
+    /// Driven through `named_node_path` rather than `expand_home`, so it
+    /// pins that the override path actually calls the expansion.
     #[test]
     fn a_quoted_tilde_in_the_override_is_expanded() {
         assert_eq!(

@@ -101,10 +101,10 @@ pub enum KickEligibility {
 
 /// Decide whether `address` may be removed from the group.
 ///
-/// Pure function of three values:
+/// Pure function of these values:
 ///
-/// - `role`: creators can never be kicked (must `transferCreator` or
-///   `dissolveGroup` first).
+/// - `role`: creators can never be kicked (the creator role must be
+///   transferred or the group dissolved first).
 /// - `last_active_ms`: timestamp of the address's most recent accepted
 ///   share (or `joined_at` if it never mined).
 /// - `now_ms`: current wall-clock time.
@@ -199,7 +199,7 @@ impl PayoutMode {
 
     /// Parse the stored varchar. Returns `None` for an unrecognized value so
     /// the caller can decide the fallback (callers default to `Prop`, the
-    /// safe legacy behavior).
+    /// safe default).
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "prop" => Self::Prop,
@@ -209,7 +209,7 @@ impl PayoutMode {
     }
 
     /// Lenient parse used on the read side: an unknown / absent value resolves
-    /// to `Prop` (legacy default) rather than erroring.
+    /// to `Prop` (the default) rather than erroring.
     pub fn parse_or_default(s: &str) -> Self {
         Self::parse(s).unwrap_or_default()
     }
@@ -257,7 +257,7 @@ pub struct RoundResetConfig {
     pub interval_days: Option<u32>,
     /// IANA timezone name (e.g. `Europe/Berlin`). Required when `preset`
     /// is set. Validation of the actual IANA shape is the service layer's
-    /// job (depends on OS / chrono-tz); here we only enforce non-empty.
+    /// job (depends on OS / chrono-tz); this crate only enforces non-empty.
     pub timezone: Option<String>,
     /// Finder bonus as a fraction of the miner cut, in parts-per-million
     /// (1 % = 10 000 ppm). 0 = disabled, capped at
@@ -281,10 +281,9 @@ pub enum RoundResetError {
 
 /// Validate a `RoundResetConfig`. Pure — does not consult the DB.
 ///
-/// The finder bonus no longer needs a `min_payout` cross-check: it is a
-/// PROPORTION of the miner cut, not a satoshi amount, so it cannot fall
-/// below a satoshi floor at build time and be silently cleared. It is
-/// simply part of the finder's own output.
+/// The finder bonus has no `min_payout` cross-check: it is a PROPORTION of
+/// the miner cut, not a satoshi amount, and is part of the finder's own
+/// output.
 pub fn validate_round_reset(config: &RoundResetConfig) -> Result<(), RoundResetError> {
     // intervalDays only meaningful with Custom preset.
     if let Some(d) = config.interval_days {
@@ -296,7 +295,7 @@ pub fn validate_round_reset(config: &RoundResetConfig) -> Result<(), RoundResetE
         }
     }
 
-    // If a preset is set, we need timezone + (for Custom) intervalDays.
+    // A preset requires a timezone + (for Custom) intervalDays.
     if let Some(preset) = config.preset {
         match &config.timezone {
             Some(tz) if !tz.is_empty() => {}
@@ -307,23 +306,12 @@ pub fn validate_round_reset(config: &RoundResetConfig) -> Result<(), RoundResetE
         }
     }
 
-    // Finder bonus bounds — a range check and nothing else.
-    //
-    // The old `min_payout` cross-check is gone because it is no longer
-    // COMPUTABLE, not because small bonuses became harmless. It could
-    // only ever be applied to a satoshi amount; what a percentage comes
-    // to depends on the block's revenue and on how the round's shares
-    // fell, neither of which exists at configuration time. There is no
-    // ppm value that guarantees the finder clears `min_payout`, so
-    // there is nothing here to reject.
-    //
-    // What still happens downstream: `build_weight_distribution` runs a
-    // withholding pass, and a finder whose entire weight is a small
-    // bonus can be pruned from the coinbase by it. On-chain that is
-    // correct — the §4 split hands the withheld value to the published
-    // miners. The ledger booking that follows is the known open
-    // question about Group-Solo carry-forward; it predates the switch to
-    // a proportional bonus and is not decided here.
+    // Finder bonus bounds — a range check and nothing else. What a ppm
+    // bonus comes to depends on block revenue and on how the round's
+    // shares fell, neither known at configuration time, so it cannot be
+    // checked against `min_payout` here. Small bonuses are not harmless:
+    // `build_weight_distribution`'s withholding pass can still prune a
+    // finder whose entire weight is a small bonus from the coinbase.
     let bonus = config.finder_bonus_ppm;
     if !(0..=MAX_FINDER_BONUS_PPM).contains(&bonus) {
         return Err(RoundResetError::FinderBonusOutOfRange(bonus));
@@ -552,11 +540,9 @@ mod tests {
         );
     }
 
-    /// A tiny bonus is now perfectly valid. As a proportion it cannot be
-    /// "below the payout floor" — it scales with the block and is simply
-    /// part of the finder's own output. The old sats form had to be
-    /// rejected here, because a bonus under `min_payout` was silently
-    /// dropped at coinbase-build time.
+    /// A tiny bonus is valid: as a proportion it scales with the block and
+    /// is part of the finder's own output, so there is no payout floor to
+    /// check it against.
     #[test]
     fn round_reset_a_tiny_finder_bonus_is_accepted() {
         let mut cfg = ok_cfg();

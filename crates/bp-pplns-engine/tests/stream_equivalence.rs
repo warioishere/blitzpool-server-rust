@@ -10,8 +10,7 @@
 //!   (b) through produce → Redis stream → drain into a *fresh*
 //!       `PplnsAcceptedShareSink`
 //! must leave **identical** PPLNS window state (per-address aggregate +
-//! total). That proves the stream transport is accounting-neutral — the
-//! core of the Core/Satellite correctness story.
+//! total), i.e. the stream transport is accounting-neutral.
 //!
 //! Two Redis DBs: engine A on one, engine B + the stream on another (the
 //! stream's `t1:*` keys don't collide with the engine's `pplns:*` keys).
@@ -56,17 +55,14 @@ fn share_seq() -> Vec<SharedAcceptedShareOwned> {
 }
 
 async fn spawn_engine(conn: ConnectionManager, pool: PgPool) -> PplnsEngine {
-    // Huge net-diff so the window never trims — all N shares retained,
-    // exact comparison. Long touch-flush so neither engine writes PG
-    // during the test (we compare only Redis window state).
+    // Huge net-diff so the window never trims and the comparison is exact.
+    // Long touch-flush so neither engine writes PG during the test; only
+    // Redis window state is compared.
     let net_diff = NetworkDifficulty::new(1_000_000.0);
     let config = PplnsEngineConfig {
         touch_flush_interval_secs: 3600,
         dust_sweep_enabled: false,
-        // Structural under §4 — the engine refuses to construct without a
-        // usable pool-output recipient, because a pool that starts without
-        // one pays every block to a single miner. Unused here (this test
-        // compares window state, not payouts).
+        // Required by construction (structural under §4); unused here.
         fee_address: Some(
             bp_common::AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").expect("valid"),
         ),

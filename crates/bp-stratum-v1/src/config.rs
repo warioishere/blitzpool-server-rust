@@ -10,9 +10,7 @@
 //!   mode, vardiff floor). One per TCP port the operator
 //!   exposes.
 //!
-//! Default values are tuned for production deployments and require no
-//! behavioral retuning on cut-over. Configuration sources and environment-
-//! variable equivalents are documented inline.
+//! Default values are the production values.
 
 use bitcoin::Network;
 use bp_common::MiningMode;
@@ -128,7 +126,6 @@ impl ServerConfig {
 }
 
 /// Per-listener configuration: one instance per TCP port.
-/// Stratum port-listener settings.
 #[derive(Clone, Debug)]
 pub struct PortConfig {
     pub port: u16,
@@ -170,8 +167,7 @@ impl PortConfig {
         }
     }
 
-    /// Apply the `rawInitial`-style clamping semantics:
-    /// constructor does: if `initial_difficulty` is non-finite or
+    /// Clamp the configured start: if `initial_difficulty` is non-finite or
     /// non-positive, fall back to `DEFAULT_INITIAL_DIFFICULTY`; if the
     /// minimum-difficulty floor is set, raise the initial to meet it.
     ///
@@ -196,8 +192,8 @@ impl PortConfig {
             return Err(StratumV1Error::InvalidConfig("port must be > 0".into()));
         }
         // initial_difficulty may be NaN/0 in the raw struct — the
-        // effective value clamps that, but we still reject negatives
-        // (caller-provided garbage).
+        // effective value clamps that, but negatives are still rejected
+        // as a configuration error.
         if self.initial_difficulty.is_finite() && self.initial_difficulty < 0.0 {
             return Err(StratumV1Error::InvalidConfig(format!(
                 "initial_difficulty {} must be ≥ 0 (use 0 / NaN to opt into the fallback)",

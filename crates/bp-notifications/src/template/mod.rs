@@ -3,7 +3,7 @@
 //! Email-template rendering — pure functions producing
 //! [`EmailContent`] triples (`subject`, `html`, `text`).
 //!
-//! Five template families for outbound email:
+//! Template families for outbound email:
 //!
 //! - [`render_verification`] — email-binding confirmation
 //! - [`render_invitation`] — payout-group invitation

@@ -390,7 +390,7 @@ mod tests {
         let mut a = Autoscaler::new(p, 100_000);
         let mut changes = 0;
         // Simulate a closed loop: demand is fixed; utilization = demand/budget.
-        // Pick demand so we START just over the up-threshold.
+        // Demand is picked to START just over the up-threshold.
         let demand = 0.86 * 100_000.0;
         for now in 0..1000u64 {
             let util = demand / a.current_budget() as f64;

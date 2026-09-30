@@ -29,8 +29,8 @@ pub async fn write_coinbase_budget(
 }
 
 /// Read the persisted live budget. `Ok(None)` when the key is missing (first
-/// boot) or holds a non-`u32` payload (legacy / corrupt — logged, treated as
-/// missing so the caller seeds from config rather than crashing).
+/// boot) or holds a non-`u32` payload (logged, treated as missing so the
+/// caller seeds from config rather than failing).
 pub async fn read_coinbase_budget(
     conn: &mut ConnectionManager,
     key: &str,
@@ -78,10 +78,9 @@ mod tests {
         // PG tests' `:15433` convention. Override via `REDIS_URL`.
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:16379".into());
         let client = redis::Client::open(url).ok()?;
-        // `ConnectionManager::new` retries internally and HANGS when the host
-        // is unreachable (e.g. Redis on a non-default port) rather than
-        // erroring — which would wedge the whole `cargo test` run. Bound it so
-        // the test skips cleanly when Redis isn't reachable.
+        // `ConnectionManager::new` retries internally and hangs on an
+        // unreachable host instead of erroring; the timeout lets the test
+        // skip cleanly.
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             ConnectionManager::new(client),

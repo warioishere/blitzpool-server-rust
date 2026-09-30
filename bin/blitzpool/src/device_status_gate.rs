@@ -6,19 +6,16 @@
 //! storage-agnostic; this module supplies the concrete pieces it needs
 //! and the task that drives it:
 //!
-//! - [`FrontLiveness`] — the liveness answer. "Is it connected?" comes
-//!   from the union of what the Stratum fronts publish (see
-//!   [`crate::live_sessions`]); only "when did the pool first see this
-//!   worker?", a historical fact, still comes from `client_entity`.
+//! - [`FrontLiveness`] — "is it connected?" from the union of what the
+//!   Stratum fronts publish ([`crate::live_sessions`]); "when did the pool
+//!   first see this worker?" from `client_entity`.
 //! - [`RedisReportedState`] — what each subscriber was last told,
 //!   persisted so a restart neither repeats an offline message nor
 //!   swallows the matching return.
 //! - [`SubscribedAddresses`] — which addresses have a device-status
-//!   subscriber at all, so the state machine and the sweep scale with
-//!   the number of *subscribers* rather than the number of miners. It
-//!   fails **open**: until the set has been loaded successfully once,
-//!   nothing is filtered, because a filter that has never seen its data
-//!   would silently disable every notification on the pool.
+//!   subscriber, so the work scales with subscribers, not miners. Fails
+//!   **open** until loaded once, so a never-loaded filter cannot silence
+//!   every notification.
 //! - [`spawn`] — restores the reported state, seeds the watch list, then
 //!   ticks: resolve what is due, dispatch what the gate releases.
 //!
@@ -61,20 +58,18 @@ const SUBSCRIBER_REFRESH: Duration = Duration::from_secs(60);
 /// devices.
 const SEED_LOOKBACK: Duration = Duration::from_secs(60 * 60);
 
-/// Concurrency for dispatching released messages. Bounded so a large
-/// batch cannot open an unbounded number of HTTP requests, but not
-/// serial — a serial loop would block the next sweep behind a full
-/// transport fan-out per address.
+/// Concurrency for dispatching released messages: bounded HTTP fan-out,
+/// but not serial, which would block the next sweep behind every
+/// transport call.
 const DISPATCH_CONCURRENCY: usize = 8;
 
 /// Redis key prefix for the persisted reported state.
 const REPORTED_PREFIX: &str = "device:status:reported:";
 
 /// How long a persisted reported state survives without being rewritten.
-/// Comfortably longer than the 2 h `client_entity` hard-delete: this
-/// state — not the table's `firstSeen`, which never outlives the
-/// retention window — is what actually carries "the subscriber already
-/// knows this device" across restarts.
+/// Far longer than the 2 h `client_entity` hard-delete: this state, not
+/// the table's `firstSeen`, carries "the subscriber already knows this
+/// device" across restarts.
 const REPORTED_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// The concrete gate the binary uses.
@@ -82,11 +77,9 @@ pub(crate) type Gate = DeviceStatusGate<SystemClock, FrontLiveness, RedisReporte
 
 /// Liveness from the fronts, first-seen from the database.
 ///
-/// The split is deliberate. Whether a device is connected **right now**
-/// is only known first-hand by the process holding its socket, and every
-/// database-derived answer conflates it with share activity. When the
-/// pool first saw the worker is the opposite: a historical fact no live
-/// process can reconstruct.
+/// Whether a device is connected **right now** is known first-hand only
+/// by the process holding its socket; a database answer conflates it with
+/// share activity. First-seen is a historical fact no live process holds.
 pub(crate) struct FrontLiveness {
     pool: PgPool,
     live: RedisLiveSessions,
@@ -95,9 +88,9 @@ pub(crate) struct FrontLiveness {
 #[async_trait]
 impl DeviceLivenessLookup for FrontLiveness {
     async fn liveness(&self, keys: &[DeviceKey]) -> Option<HashMap<DeviceKey, DeviceLiveness>> {
-        // `None` here means no front is publishing, which is NOT the
-        // same as "nothing is connected" — concluding the latter would
-        // report the whole pool offline during a front deploy.
+        // `None` means no front is publishing, NOT "nothing is connected";
+        // the latter would report the whole pool offline during a front
+        // deploy.
         let live = self.live.union().await?;
 
         let addresses: Vec<String> = keys.iter().map(|(a, _)| a.clone()).collect();
@@ -137,9 +130,8 @@ impl DeviceLivenessLookup for FrontLiveness {
 
 /// Reported state persisted in Redis, one key per device with a TTL.
 ///
-/// One key rather than a hash field so expiry prunes the space by itself
-/// — a pool whose worker names churn would otherwise grow a hash that
-/// nothing ever cleans.
+/// One key rather than a hash field so expiry prunes churned worker names
+/// by itself.
 pub(crate) struct RedisReportedState {
     redis: ConnectionManager,
 }
@@ -172,9 +164,8 @@ impl ReportedStateStore for RedisReportedState {
             let (next, keys) = match scan {
                 Ok(v) => v,
                 Err(err) => {
-                    // Empty rather than fatal: the gate then behaves as
-                    // it did before persistence existed, which costs one
-                    // restart's worth of imprecision, not an outage.
+                    // Empty rather than fatal: costs one restart's worth
+                    // of imprecision, not an outage.
                     warn!(%err, "device-status gate: reported-state scan failed — starting without it");
                     return out;
                 }
@@ -185,9 +176,9 @@ impl ReportedStateStore for RedisReportedState {
                 };
                 match conn.get::<_, Option<String>>(&raw).await {
                     Ok(Some(v)) => {
-                        // Plain counts now; "online"/"offline" are what a
-                        // process from before the count rule wrote, and a
-                        // rolling upgrade still has to read them.
+                        // Values are session counts; "online"/"offline"
+                        // are the legacy form, still read so persisted
+                        // keys stay valid.
                         let sessions = match v.as_str() {
                             "online" => 1,
                             "offline" => 0,
@@ -214,11 +205,9 @@ impl ReportedStateStore for RedisReportedState {
             return;
         }
         let mut conn = self.redis.clone();
-        // Pipelined, not one call per device: a front restart resolves
-        // every supervised device at once, and nothing is released until
-        // this returns. Deliberately NOT a MULTI — these writes are
-        // independent and best-effort, so all-or-nothing would buy
-        // nothing and only widen the failure.
+        // Pipelined: a front restart resolves every supervised device at
+        // once, and nothing is released until this returns. Not a MULTI:
+        // the writes are independent and best-effort.
         let mut pipe = redis::pipe();
         for (key, sessions) in updates {
             pipe.set_ex(redis_key(key), *sessions, REPORTED_TTL_SECS)
@@ -238,10 +227,9 @@ impl ReportedStateStore for RedisReportedState {
 
 /// Addresses with at least one device-status subscriber.
 ///
-/// Fails **open**: `contains` answers `true` for everything until the
-/// set has been loaded successfully at least once. The alternative — an
-/// empty set that reads as "nobody is subscribed" — turns a single
-/// failing query into a silent, pool-wide notification outage.
+/// Fails **open**: `contains` answers `true` until the set has loaded
+/// once, so a failing query cannot read as "nobody is subscribed" and
+/// silence the whole pool.
 #[derive(Clone)]
 pub(crate) struct SubscribedAddresses {
     inner: Arc<RwLock<HashSet<String>>>,
@@ -345,18 +333,13 @@ pub(crate) fn spawn(
 
 /// Await `fut` unless shutdown starts first; `None` means stop.
 ///
-/// Every await the sweeper performs goes through this. [`dispatch`] was
-/// already cancellable, but the Redis + Postgres round-trips in front of
-/// it were not — so an unreachable dependency still parked the whole
-/// deploy behind `task.await` with no timeout, and a process that gets
-/// SIGKILLed for taking too long cannot run its own cleanup either. That
-/// is exactly what making the drain cancellable was meant to avoid, so
-/// the rest of the tick has to hold the same property.
+/// Every await in the sweeper goes through this, so an unreachable Redis
+/// or Postgres cannot hold shutdown (joined without a timeout) until the
+/// process is killed without cleanup.
 ///
-/// Dropping a lookup or a store mid-flight is safe here: no lock is held
-/// across an await, and the in-memory schedule dies with the process
-/// anyway — it is rebuilt from the seed, and the reported state that
-/// makes a transition a transition is persisted.
+/// Dropping a lookup or store mid-flight is safe: no lock is held across
+/// an await, the in-memory schedule is rebuilt from the seed, and the
+/// reported state is persisted.
 async fn until_cancelled<T>(cancel: &CancellationToken, fut: impl Future<Output = T>) -> Option<T> {
     tokio::select! {
         biased;
@@ -372,18 +355,16 @@ async fn run_sweeper(
     pool: PgPool,
     cancel: CancellationToken,
 ) {
-    // Startup is cancellable too: a process told to stop while a slow
-    // restore is still in flight must not hold the deploy either.
+    // Startup is cancellable too.
     if until_cancelled(&cancel, gate.restore_reported_state())
         .await
         .is_none()
     {
         return;
     }
-    // Seeding waits for a subscriber set that actually loaded, and any
-    // address that gains its first subscriber later is seeded then —
-    // otherwise its devices would only ever be learned from a future
-    // Stratum event.
+    // Seeding waits for a loaded subscriber set; an address that gains its
+    // first subscriber later is seeded then, or its devices would only be
+    // learned from a future Stratum event.
     match until_cancelled(&cancel, subscribers.refresh(&pool)).await {
         None => return,
         Some(Some(added)) => {
@@ -441,13 +422,9 @@ async fn run_sweeper(
 
 /// Fan out released notices with bounded concurrency.
 ///
-/// Cancellation-aware on purpose: each notice is a subscription lookup
-/// plus HTTP calls to Telegram / FCM / UnifiedPush with double-digit
-/// second timeouts, so an unreachable push endpoint can stretch a big
-/// batch into minutes. Without the check, shutdown would wait behind all
-/// of it and the deploy would be SIGKILLed instead of stopping cleanly —
-/// which is strictly worse, since a killed process cannot run its own
-/// cleanup either.
+/// Cancellation-aware: each notice is a subscription lookup plus HTTP calls
+/// with double-digit-second timeouts, so an unreachable push endpoint can
+/// stretch a batch into minutes, and shutdown must not wait behind it.
 async fn dispatch(
     dispatcher: &Arc<NotificationDispatcher>,
     notices: Vec<DeviceNotice>,
@@ -487,9 +464,8 @@ async fn dispatch(
 /// Seed the watch list for `addresses` — every device under them that is
 /// connected now, or was disconnected within [`SEED_LOOKBACK`].
 ///
-/// This is what makes a restart survivable for a miner that died during
-/// the deploy: it will not send another Stratum event, so without the
-/// seed nothing would ever evaluate it again.
+/// A miner that died during a restart sends no further Stratum event; the
+/// seed is what gets it evaluated again.
 async fn seed_addresses(gate: &Gate, pool: &PgPool, addresses: &[String]) {
     if addresses.is_empty() {
         return;
@@ -528,12 +504,8 @@ mod tests {
 
     const ADDR: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
 
-    /// The filter must not answer "nobody is subscribed" before it has
-    /// ever seen its data. A single failing query at boot would
-    /// otherwise drop every device event on the pool and disable the
-    /// whole feature behind one WARN line — the dispatcher's own
-    /// per-event subscription lookup, which this filter is an
-    /// optimisation over, could never miss a subscriber.
+    /// The filter passes everything until it has loaded once; after that,
+    /// even an empty set filters.
     #[test]
     fn the_subscriber_filter_passes_everything_until_it_has_loaded() {
         let subs = SubscribedAddresses::new();
@@ -553,16 +525,10 @@ mod tests {
         assert!(!subs.contains("some-other-address"));
     }
 
-    /// Shutdown must not wait on a dependency that never answers. The
-    /// sweep is a Redis SCAN plus a Postgres query before the (already
-    /// cancellable) dispatch, and `shutdown` joins the task with no
-    /// timeout — so a hung Redis parked the deploy until the supervisor
-    /// SIGKILLed it, and a killed process cannot run its own cleanup.
-    ///
-    /// This covers the primitive every await in the sweeper now goes
-    /// through, not the wiring: that each call site uses it is verified by
-    /// reading `run_sweeper`, because making the loop drivable from a test
-    /// would mean threading a fake dispatcher through production types.
+    /// Cancellation wins over a dependency that never answers, and a live
+    /// token passes the result through. Covers the primitive, not the
+    /// wiring: that every await in `run_sweeper` uses it is checked by
+    /// reading it.
     #[tokio::test]
     async fn a_hung_dependency_does_not_hold_shutdown() {
         let cancel = CancellationToken::new();

@@ -3,8 +3,8 @@
 //! ntfy SSE listener.
 //!
 //! Subscribes to `GET {server}/{topics}/sse` (Server-Sent Events).
-//! Each message-event JSON carries `topic` + `message` + `tags`. We
-//! ignore our own echo by checking `tags` for `"bot"` (the
+//! Each message-event JSON carries `topic` + `message` + `tags`. The
+//! pool's own echo is ignored by checking `tags` for `"bot"` (the
 //! [`crate::adapter::NtfyAdapter`] sets `Tags: bot` on every outbound).
 //!
 //! The topic IS the user's mining address (after stripping the
@@ -127,15 +127,12 @@ pub fn spawn_ntfy_listener(
     shutdown_tx
 }
 
-/// Longest comma-joined topic path we will put in one SSE URL.
+/// Longest comma-joined topic path put in one SSE URL.
 ///
-/// ntfy answers **HTTP 400** once the path gets long enough, and the pool
-/// speaks HTTP/1.1 so it sees the 400 rather than a stream that never opens.
-/// Measured against the production server on 2026-08-06: a 14 830-character
-/// path returned 200, a 15 980-character one returned 400. The exact ceiling
-/// sits between those, so this budget is set at roughly half the last known
-/// good value — the topic list grows with the miner count, and a limit that
-/// only just fits is the situation this constant exists to end.
+/// ntfy answers **HTTP 400** once the path gets long enough: the server
+/// accepts a 14 830-character path and rejects a 15 980-character one. The
+/// budget sits at roughly half the known-good value, since the topic list
+/// grows with the miner count.
 ///
 /// It bounds the PATH, not the topic count, because addresses differ in length
 /// (42 characters for a bech32 v0, 62 for the longest seen) and a count-based
@@ -145,10 +142,9 @@ const MAX_TOPIC_PATH_LEN: usize = 8_000;
 /// Split `topics` so each chunk's comma-joined path stays within
 /// `max_path_len`. Order is preserved; no topic is dropped or duplicated.
 ///
-/// A single topic longer than the budget still gets its own chunk — dropping
-/// it would silently stop serving that miner, and one oversized path is a
-/// visible failure rather than an invisible omission. ntfy's own topic grammar
-/// (`[-_A-Za-z0-9]{1,64}`) makes it unreachable in practice.
+/// A single topic longer than the budget still gets its own chunk: an
+/// oversized path fails visibly, a dropped topic would not. ntfy's own topic
+/// grammar (`[-_A-Za-z0-9]{1,64}`) makes it unreachable in practice.
 fn chunk_topics(topics: &[String], max_path_len: usize) -> Vec<Vec<String>> {
     let mut chunks: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
@@ -179,11 +175,9 @@ fn chunk_topics(topics: &[String], max_path_len: usize) -> Vec<Vec<String>> {
 
 /// Hold one SSE connection per chunk and return as soon as ANY of them ends.
 ///
-/// Returning on the first break — rather than restarting only that chunk —
-/// keeps the caller's state machine exactly as it was with a single stream: a
-/// break re-reads the topic list and rebuilds everything. With a handful of
-/// chunks that is cheap, and it means there is still only one place that
-/// decides when the topic set is refreshed.
+/// Any break re-reads the topic list and rebuilds every chunk, so there is
+/// one place that decides when the topic set is refreshed. With a handful of
+/// chunks that is cheap.
 async fn stream_all_chunks(
     client: &Client,
     config: &NtfyListenerConfig,
@@ -237,9 +231,8 @@ async fn stream_until_break(
         // ntfy's `/sse` endpoint is Server-Sent Events: each event is a
         // `data: {json}` line, framed by `event:` / `id:` / comment (`:`) /
         // blank separator lines. Only the `data:` field carries the ntfy
-        // message JSON — the raw-line parser must skip the rest (the
-        // EventSource client the reference impl uses does this framing for us;
-        // here we do it explicitly). We accumulate partial chunks until `\n`.
+        // message JSON; the rest is skipped. Partial chunks accumulate
+        // until `\n`.
         if let Ok(text) = std::str::from_utf8(&bytes) {
             buffer.push_str(text);
             while let Some(idx) = buffer.find('\n') {
@@ -313,8 +306,7 @@ mod tests {
 
     /// Only `data:` lines carry the ntfy message JSON; the SSE framing
     /// (`event:` / `id:` / comments / blanks) must be skipped, and the one
-    /// optional space after `data:` stripped. This is the regression that made
-    /// every line fail to JSON-parse (the raw line still had the `data:` prefix).
+    /// optional space after `data:` stripped.
     #[test]
     fn sse_data_field_extracts_only_data_lines() {
         assert_eq!(
@@ -336,14 +328,10 @@ mod tests {
 
     // ── Topic chunking ───────────────────────────────────────────────
     //
-    // The bug this guards: every topic went into ONE comma-joined path, and
-    // ntfy answers 400 once that path is long enough. Measured against the
-    // production server 2026-08-06 — 14 830 characters returned 200, 15 980
-    // returned 400 — and on 2026-08-10 prod stood at 358 topics / 15 193
-    // characters with 5 804 SSE failures in 24 h. The return channel
-    // (user → pool commands) was down roughly two thirds of the time.
+    // ntfy answers 400 once one comma-joined path is long enough: 14 830
+    // characters are accepted, 15 980 are not.
 
-    /// A realistic topic: the longest address shape seen on prod is 62 chars.
+    /// A realistic topic: the longest address shape seen is 62 chars.
     fn topic(i: usize, len: usize) -> String {
         let seed = format!("bc1q{i:0>8}");
         let mut t = seed.clone();
@@ -358,10 +346,8 @@ mod tests {
         chunk.iter().map(|t| t.len()).sum::<usize>() + chunk.len().saturating_sub(1)
     }
 
-    /// ⚠️ 372 and not 349: the memory of this bug records that a test at 349
-    /// topics passes by ACCIDENT — that count sits just under the server's
-    /// threshold, so it would hold with the chunking removed and prove
-    /// nothing. Every count here is above the observed failure point.
+    /// ⚠️ Every count here is above the server's failure point; a count just
+    /// under it would pass with the chunking removed and prove nothing.
     #[test]
     fn every_chunk_stays_within_the_path_budget() {
         for count in [372usize, 500, 1_000] {
@@ -386,8 +372,7 @@ mod tests {
     }
 
     /// Splitting must not lose or duplicate a topic: a dropped one is a miner
-    /// whose commands silently stop arriving, which is the failure this whole
-    /// change exists to end — just quieter.
+    /// whose commands silently stop arriving.
     #[test]
     fn chunking_preserves_every_topic_exactly_once() {
         let topics: Vec<String> = (0..500).map(|i| topic(i, 62)).collect();
@@ -399,7 +384,7 @@ mod tests {
     }
 
     /// Mixed lengths, because a count-based split would drift with the address
-    /// mix: bech32 v0 is 42 characters, the longest seen on prod is 62.
+    /// mix: bech32 v0 is 42 characters, the longest seen is 62.
     #[test]
     fn a_mixed_address_length_list_still_respects_the_budget() {
         let topics: Vec<String> = (0..600)
@@ -410,9 +395,8 @@ mod tests {
         }
     }
 
-    /// Below the budget nothing changes — one chunk, one connection, exactly
-    /// as before. A fix that split a small pool into several streams would be
-    /// paying connection overhead for nothing.
+    /// Below the budget a list stays one chunk, one connection; splitting a
+    /// small pool would pay connection overhead for nothing.
     #[test]
     fn a_short_list_is_left_as_one_chunk() {
         let topics: Vec<String> = (0..50).map(|i| topic(i, 62)).collect();
@@ -430,9 +414,8 @@ mod tests {
         assert_eq!(chunks, vec![vec![huge]]);
     }
 
-    /// The production numbers, as a regression pin: 358 topics of the longest
-    /// observed shape exceed what the server accepted, and must come out as
-    /// more than one chunk.
+    /// 358 topics of the longest observed shape exceed what the server
+    /// accepts and must come out as more than one chunk.
     #[test]
     fn the_measured_production_list_gets_split() {
         let topics: Vec<String> = (0..358).map(|i| topic(i, 62)).collect();

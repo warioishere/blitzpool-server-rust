@@ -61,7 +61,7 @@ async fn insert_persists_all_columns() {
     .await
     .expect("insert_found_block");
 
-    // Read back via the public find_found_blocks helper and locate our row.
+    // Read back via the public find_found_blocks helper and locate the test row.
     let rows = find_found_blocks(&pool).await.expect("find_found_blocks");
     let row = rows
         .iter()
@@ -142,11 +142,10 @@ async fn drop_history(pool: &PgPool, heights: &[i32]) {
 ///
 /// The PPLNS apply writes a 0-sat `pending` row for every address live in
 /// the window but absent from the block's distribution ("late arrivers").
-/// A distribution that paid nobody — measured shape: a coinbase paying
-/// 100 % to the pool output — therefore still leaves rows behind. Under a
-/// plain `EXISTS(SELECT 1 …)` that block reads as booked, and
-/// `block_reconcile`, the one check whose whole job is to find blocks the
-/// ledger missed, stays silent about it.
+/// A distribution that paid nobody (a coinbase paying 100 % to the pool
+/// output) therefore still leaves rows behind. Under a plain
+/// `EXISTS(SELECT 1 …)` that block would read as booked and `block_reconcile`
+/// would never report it.
 #[tokio::test]
 async fn zero_sat_rows_alone_do_not_count_as_a_recorded_payout() {
     let Some(pool) = connect_or_skip().await else {
@@ -154,10 +153,10 @@ async fn zero_sat_rows_alone_do_not_count_as_a_recorded_payout() {
     };
     drop_history(&pool, &[H_ZERO_ROWS_ONLY, H_REAL_PAYOUT]).await;
 
-    // The Befund-1 shape: late-arriver rows, every one of them 0 sats.
+    // Late-arriver rows only, every one of them 0 sats.
     seed_history(&pool, H_ZERO_ROWS_ONLY, "bc1qlate1", 0, "pending").await;
     seed_history(&pool, H_ZERO_ROWS_ONLY, "bc1qlate2", 0, "pending").await;
-    // Precondition: rows DO exist, which is exactly why `EXISTS` was blind.
+    // Precondition: rows DO exist, so a plain `EXISTS` would see them.
     let row_count: i64 =
         sqlx::query_scalar(r#"SELECT count(*) FROM pplns_payout_history WHERE "blockHeight" = $1"#)
             .bind(H_ZERO_ROWS_ONLY)

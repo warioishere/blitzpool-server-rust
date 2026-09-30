@@ -6,23 +6,22 @@
 //! ## Why this is a test and not a refactor
 //!
 //! `stratum_core` re-exports canonical `ERROR_CODE_*` constants from
-//! `common_messages_sv2`, `job_declaration_sv2` and `mining_sv2`. Aliasing our
-//! constants onto them would look tidier and would be the wrong trade: a
-//! dependency bump could then change what the pool writes on the wire with
-//! nothing in the diff to see. `stale-chain-tip` is the one declaration error
-//! a reference JD-client retries instead of leaving the pool over, so that
-//! string is not something a `cargo update` gets to decide.
+//! `common_messages_sv2`, `job_declaration_sv2` and `mining_sv2`. Aliasing the
+//! pool's constants onto them would let a dependency bump change what the
+//! pool writes on the wire with nothing in the diff to see. `stale-chain-tip`
+//! is the one declaration error a JD client retries instead of leaving the
+//! pool over, so that string is not something a `cargo update` gets to decide.
 //!
-//! So the strings stay ours, and this asserts they still agree. A bump that
-//! moves a code fails here, loudly, instead of shifting a wire meaning
+//! So the pool keeps its own strings, and this asserts they still agree. A
+//! bump that moves a code fails here instead of shifting a wire meaning
 //! quietly.
 //!
 //! ## Why the same string appears more than once
 //!
 //! Upstream's model is one constant per **(message, code)** pair, not per
 //! string: `mining_sv2` ships `"invalid-channel-id"` three times, once each
-//! for `UpdateChannel`, `SubmitShares` and `SetCustomMiningJob`. Ours follow
-//! the same shape — `ERR_STALE_CHAIN_TIP` exists on the JDP side for
+//! for `UpdateChannel`, `SubmitShares` and `SetCustomMiningJob`. The pool
+//! follows the same shape — `ERR_STALE_CHAIN_TIP` exists on the JDP side for
 //! `DeclareMiningJob.Error` and on the mining side for
 //! `SetCustomMiningJob.Error`, and those are two upstream constants that
 //! happen to share a value. Collapsing them by string would merge message
@@ -36,8 +35,8 @@ use bp_stratum_v2::jdp::client as jdp_client;
 use bp_stratum_v2::mining::client as mining_client;
 use bp_stratum_v2::mining::submit as mining_submit;
 
-/// Every code we send that the SV2 message crates also name, paired with the
-/// upstream constant for the SAME message. `(ours, upstream, label)`.
+/// Every code the pool sends that the SV2 message crates also name, paired
+/// with the upstream constant for the SAME message. `(ours, upstream, label)`.
 const PAIRS: &[(&str, &str, &str)] = &[
     // ── SetupConnection (common) ────────────────────────────────────
     (
@@ -64,10 +63,9 @@ const PAIRS: &[(&str, &str, &str)] = &[
     // whoever reads the log — SV2 JDP/DeclareMiningJob.Error asks for a
     // "human-readable error code", and names no list to choose from.
     //
-    // Still pinned here rather than dropped: the pairing is what stops a
-    // dependency bump from changing the STRING under us without anyone
-    // looking. Compare `mining_client::ERR_INVALID_JOB_ID` further down, which
-    // is absent because upstream ships nothing to pair it with at all.
+    // Still pinned: the pairing stops a dependency bump from changing the
+    // STRING unnoticed. `mining_client::ERR_INVALID_JOB_ID` further down is
+    // absent because upstream ships nothing to pair it with at all.
     (
         jdp_client::ERR_UNSUPPORTED_FEATURE_FLAGS,
         common::ERROR_CODE_SETUP_CONNECTION_UNSUPPORTED_FEATURE_FLAGS,
@@ -192,11 +190,10 @@ fn every_shared_error_code_still_matches_the_sv2_message_crates() {
 
 /// Where the pool knowingly says something else.
 ///
-/// Pinned so the divergence is a decision on the record rather than an
-/// accident, and so a later bump cannot quietly close the gap without anyone
-/// looking at it. Changing any of these is a wire-behaviour change: an
-/// SRI JD-client treats every `DeclareMiningJob.Error` except
-/// `stale-chain-tip` as a reason to leave the pool.
+/// Pinned so the divergence stays a decision rather than an accident.
+/// Changing any of these is a wire-behaviour change: a JD client treats
+/// every `DeclareMiningJob.Error` except `stale-chain-tip` as a reason to
+/// leave the pool.
 #[test]
 fn the_codes_we_diverge_on_are_still_the_ones_we_chose() {
     // A coinbase that violates its referenced payout set. Upstream names

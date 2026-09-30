@@ -13,20 +13,19 @@
 //!    counterparty, and it belongs by construction to someone who was
 //!    mining when the credit was withheld. That filter lives in
 //!    `sweep_pairs` and nowhere else — the query does not repeat it.
-//! 2. Split: credits (balance > 0, desc) ↔ debits (balance < 0, by
-//!    absolute value desc).
+//! 2. Split: credits (balance > 0, desc) ↔ debits (balance < 0,
+//!    abandoned first, then by absolute value desc).
 //! 3. Walk greedy: for each pair `amount = min(credit, |debit|)`.
 //!    Write 2 audit rows to `pplns_payout_history` (same `blockHeight`
 //!    so an operator can group them) + update both balance rows, down to
 //!    0 where a side cancels out. Rows are never deleted — see
-//!    `apply_pair_tx` for why. All inside one PG transaction per pair — on failure, skip
-//!    and let the next sweep retry.
+//!    `apply_pair_tx` for why. One PG transaction per pair; on failure,
+//!    skip and let the next sweep retry.
 //! 4. Σ balances stays 0: each pair cancels `+X` ↔ `-X`. No silent
 //!    drift toward fee or other miners — the pool is non-custodial,
 //!    the physical sats already live on-chain.
 //!
-//! `blockHeight` slot: synthetic `-Math.floor(now_unix_seconds)`. Two
-//! reasons:
+//! `blockHeight` slot: synthetic `-now_unix_seconds`. Two reasons:
 //! - audit rows aren't associated with a real block; a negative value
 //!   can't be confused with a real block height
 //! - the `UNIQUE(blockHeight, address)` index would otherwise reject
@@ -34,9 +33,7 @@
 //!   against two smaller credits across iterations). Sweep keeps a
 //!   monotonic counter so sub-second re-triggers stay unique too.
 //!
-//! Group-Solo dust absorption lives in the future `bp-group-solo-engine`
-//! crate — the architecture-decision splits them by crate so the
-//! engines stay independent.
+//! PPLNS only: Group-Solo keeps no ledger, so it has nothing to sweep.
 //!
 //! Clock abstraction lets `TestClock` step time deterministically in
 //! unit tests, same pattern as `bp-vardiff::Clock`.
@@ -58,8 +55,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-// Re-export the cron primitives so existing call sites that imported
-// from `bp_pplns_engine::sweep::*` keep working.
+// Re-exported so callers can take the cron primitives from
+// `bp_pplns_engine::sweep`.
 pub use bp_cron_utils::{next_3am_utc, Clock, SystemClock, TestClock};
 
 /// Wire string for the `rowType` column on sweep-emitted history rows.
@@ -126,12 +123,10 @@ impl<C: Clock> DustSweepRunner<C> {
         self.sweep_pairs(candidates, now_ms, now).await
     }
 
-    /// Algorithm split out so tests can feed synthetic candidates
-    /// without seeding PG (the integration tests still exercise the
-    /// full PG path). Public for exactly that: an integration test lives
-    /// in its own binary and cannot reach a private item, and the case
-    /// worth testing here — a candidate list that is already stale when
-    /// the pairing runs — is only reachable by supplying the list.
+    /// Algorithm split out so tests can feed synthetic candidates. Public
+    /// because an integration test cannot reach a private item, and a
+    /// candidate list that is already stale when the pairing runs is only
+    /// reachable by supplying the list.
     pub async fn sweep_pairs(
         &self,
         candidates: Vec<PplnsBalanceRow>,
@@ -145,13 +140,8 @@ impl<C: Clock> DustSweepRunner<C> {
 
         // Credits: largest first. Filtered below, before anything is written.
         credits.sort_by_key(|r| std::cmp::Reverse(r.balance_sats.0));
-        // Debits: ABANDONED ones first, then most-negative. Magnitude alone
-        // put a still-mining miner's large debit ahead of a genuinely
-        // abandoned smaller one, so the credit paired against the live row
-        // while the dead one stayed open forever — the opposite of what the
-        // sweep exists to close. Only reachable since debits of any age
-        // became candidates; before that every debit here was abandoned and
-        // the order could not matter.
+        // Debits: ABANDONED ones first, then most-negative, so a credit
+        // closes a dead debit before a still-mining miner's larger one.
         //
         // A live row is still touched when the dead ones cannot absorb the
         // whole credit. That is correct: the debt is owed either way, and
@@ -165,10 +155,8 @@ impl<C: Clock> DustSweepRunner<C> {
 
         // Writing off a claim needs the owner to be gone, and this is the
         // ONE place that is checked: the read hands over every open row,
-        // live credits included, so without this line a still-mining
-        // miner's credit would be cancelled without a word. A debit needs
-        // no such test — it is the counterparty, not the claim being
-        // written off.
+        // live credits included. A debit needs no such test — it is the
+        // counterparty, not the claim being written off.
         credits.retain(is_abandoned);
 
         if credits.is_empty() || debits.is_empty() {
@@ -263,27 +251,22 @@ impl<C: Clock> DustSweepRunner<C> {
         Ok(stats)
     }
 
-    /// One pair-cancel TX: insert 2 audit rows + update-or-delete both
-    /// balance rows. Both writes commit or both roll back.
+    /// One pair-cancel TX: insert 2 audit rows + update both balance rows.
+    /// Both writes commit or both roll back.
     ///
     /// Returns `Ok(false)` when a row no longer holds the value this pair
     /// was computed from — the whole transaction rolls back and the caller
     /// leaves the pair alone.
     ///
-    /// **Why the guard.** `sweep_pairs` reads its candidate set ONCE per
-    /// run and then commits pair by pair, updating only its in-memory
-    /// copy, so its view of every not-yet-processed row is stale from the
-    /// start of the run. Writing the computed absolute anyway would
-    /// silently undo whatever moved the row — and the other writer is the
-    /// block-found settlement, whose balance-only entries ARE this sweep's
-    /// target set (open balance, no recent shares). `amount` also comes
-    /// from that stale read, so a shrunken credit would be driven negative:
-    /// a credit row turned into a debit, which is worse than a lost update.
+    /// **Why the guard.** `sweep_pairs` reads its candidates ONCE per run,
+    /// so its view of every not-yet-processed row can be stale. Writing the
+    /// computed absolute anyway would undo whatever moved the row (the
+    /// block-found settlement targets the same balance-only rows), and a
+    /// stale `amount` could drive a shrunken credit negative.
     ///
     /// **Lock order.** Both rows are touched smallest-address-first, the
     /// same order `bp_db::find_pplns_balances_for_addresses_locked` takes
-    /// them in. Two transactions grabbing the same two rows from opposite
-    /// ends deadlock, and Postgres resolves that by aborting one.
+    /// them in, so two transactions on the same two rows cannot deadlock.
     #[allow(clippy::too_many_arguments)] // scalar args are tightly coupled; grouping struct adds boilerplate
     async fn apply_pair_tx(
         &self,
@@ -329,22 +312,11 @@ impl<C: Clock> DustSweepRunner<C> {
         ];
         sides.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         for (addr, expected, new_balance) in sides {
-            // Always an UPDATE, including down to 0. A fully cancelled row
-            // used to be DELETEd, which was tidiness with a cost: the row is
-            // the only home of `totalPaidSats` (and `lastAcceptedShareAt`),
-            // so removing it wipes that address's lifetime on-chain payout —
-            // `find_pplns_balance` then reports 0, the pool-wide
-            // `SUM("totalPaidSats")` drops by the lost amount, and the next
-            // settlement's `prev_total_paid` restarts the counter from zero.
-            // Nothing restores it: the balance upsert writes only balance,
-            // total and timestamp.
-            //
-            // Harmless while the DELETE could only reach rows silent for
-            // `abandoned_balance_days`; routine once debits of any age became
-            // candidates. A zero row is inert everywhere that matters — the
-            // candidate query filters `balanceSats <> 0` and the distribution
-            // build skips a zero balance — so keeping it costs one row per
-            // address that ever settled.
+            // Always an UPDATE, including down to 0, never a DELETE: the row
+            // is the only home of `totalPaidSats` (and `lastAcceptedShareAt`),
+            // and nothing would restore that lifetime payout. A zero row is
+            // inert — the candidate query filters `balanceSats <> 0` and the
+            // distribution build skips a zero balance.
             let applied =
                 update_pplns_balance_sats_if_unchanged(&mut *tx, addr, expected, new_balance)
                     .await?;
@@ -420,8 +392,5 @@ pub fn spawn_daily_task<C: Clock>(
     })
 }
 
-// Clock / TestClock / next_3am_utc / BlockHeightGen tests live with
-// their extracted crate `bp-cron-utils`; the re-exports above keep
-// existing call sites working. Sweep-specific behaviour is exercised
-// via the runner's own unit + integration tests further up in this
-// module.
+// Clock / TestClock / next_3am_utc / BlockHeightGen are tested in
+// `bp-cron-utils`.

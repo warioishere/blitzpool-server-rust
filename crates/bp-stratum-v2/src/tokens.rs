@@ -1,57 +1,36 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Per-connection JDP-token store. Tokens are opaque 16-byte identifiers the
-//! JDS hands to a JDC on `AllocateMiningJobToken`. The JDC then references
-//! them in `DeclareMiningJob` and `SetCustomMiningJob`. Each token has a 1 h
-//! TTL — OUR policy, the spec sets no lifetime — and the pool rate-limits
-//! allocations to one per 1 s per connection, with a burst of
-//! [`ALLOCATE_BURST`], which is the spec's only constraint here
-//! (SV2 JDP/AllocateMiningJobToken — "rate limited to a rather slow rate", no
-//! number given).
+//! JDS hands to a JDC on `AllocateMiningJobToken`; the JDC references them in
+//! `DeclareMiningJob` and `SetCustomMiningJob`. The 1 h TTL is pool policy
+//! (the spec sets no lifetime). Allocations are rate-limited to one per 1 s
+//! per connection with a burst of [`ALLOCATE_BURST`]
+//! (SV2 JDP/AllocateMiningJobToken — "rate limited to a rather slow rate").
 //!
 //! ## Format
 //!
-//! 16 bytes laid out as:
-//! - **bytes 0..4** — per-connection counter, **big-endian**. The
-//!   counter is incremented BEFORE encoding, so the first token allocated
-//!   on a connection has `counter = 1` → bytes `00 00 00 01`. Zero is
-//!   reserved.
-//! - **bytes 4..16** — 12 CSPRNG bytes from `getrandom`. Makes the
-//!   token unguessable so a misbehaving JDC can't forge tokens for a
+//! - **bytes 0..4** — per-connection counter, big-endian, starting at 1
+//!   (zero is reserved).
+//! - **bytes 4..16** — 12 CSPRNG bytes, so a JDC cannot forge tokens for a
 //!   different connection.
 //!
 //! ## Lifecycle
 //!
-//! - `allocate` enforces the rate limit, generates a fresh token,
-//!   stamps `expires_at_ms = now + TTL`, stores the `(token →
-//!   AllocatedToken)` mapping, and sweeps expired entries on the way in.
-//! - `mint_for_declaration` generates the pool's own
-//!   `new_mining_job_token`. Same shape, NO rate limit and NO storage —
-//!   nothing ever looks a declaration token up here, and an unbounded
-//!   write-only map is what it would otherwise be.
-//! - `take_active` CONSUMES the token a `DeclareMiningJob` presents —
-//!   one allocate authorises one declaration attempt, and the pool answers
-//!   the declared-job side with a separate token of its own. For a session
-//!   that declares, this is what keeps the map small: one entry in, one
-//!   entry out. `allocate`'s sweep covers the rest — tokens allocated and
-//!   never presented, which nothing else would ever touch.
-//! - `cleanup_expired` is the sweep itself, also exposed for a
-//!   periodic tick.
+//! - `allocate` enforces the rate limit, stores the token with its expiry
+//!   and sweeps expired entries.
+//! - `mint_for_declaration` makes the pool's own `new_mining_job_token`:
+//!   same shape, no rate limit, not stored (nothing looks it up here).
+//! - `take_active` consumes the token a `DeclareMiningJob` presents: one
+//!   allocate authorises one declaration attempt.
+//! - `cleanup_expired` is the sweep, also usable from a periodic tick.
 
 use std::collections::HashMap;
 
 use bp_common::AddressId;
 
-/// Boxed RNG closure type used by [`TokenStore::set_rng`].
-///
-/// The store holds an `Option<Box<…>>` of this so production code uses
-/// `getrandom::getrandom` while tests inject a deterministic byte-stream.
-/// The `String` error matches what `getrandom::Error::to_string` produces.
-///
-/// Public so callers wrapping `TokenStore` (e.g.
-/// `jdp::client::JdpSessionState`) can expose a deterministic-RNG hook
-/// without re-declaring the `dyn FnMut` shape and tripping
-/// `clippy::type_complexity`.
+/// Boxed RNG closure type used by [`TokenStore::set_rng`]: production uses
+/// `getrandom`, tests inject a deterministic byte stream. Public so wrappers
+/// (e.g. `jdp::client::JdpSessionState`) can expose the same hook.
 pub type RngFn = dyn FnMut(&mut [u8]) -> Result<(), String> + Send + 'static;
 
 /// Token length in bytes. SV2 spec doesn't pin a specific length;
@@ -71,12 +50,9 @@ pub const DEFAULT_TOKEN_TTL_MS: u64 = 3_600_000;
 pub const DEFAULT_RATE_LIMIT_MS: u64 = 1_000;
 
 /// How many allocations a connection may make at once before the rate limit
-/// applies. Two, because that is what the reference jd-client asks for when it
-/// connects (`allocate_tokens(2)`, sv2-apps `jdc_runtime.rs`) — back to back,
-/// never re-requesting one that goes unanswered. With a strict one-per-second
-/// limit its second token was dropped and it ran on a queue of one for the
-/// whole session. The sustained rate stays one per `rate_limit_ms`, so the
-/// store stays as bounded as before.
+/// applies. A JDC requests two tokens back to back on connect and does not
+/// re-request an unanswered one. The sustained rate stays one per
+/// `rate_limit_ms`, so the store stays bounded.
 pub const ALLOCATE_BURST: u64 = 2;
 
 // ── Token ────────────────────────────────────────────────────────────
@@ -89,8 +65,7 @@ pub struct Token(pub [u8; TOKEN_LEN]);
 
 impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Show only the first 4 bytes (8 hex chars) — full bytes are
-        // secret-ish (anyone who sees them can act as the JDC).
+        // Full bytes let anyone who sees them act as the JDC.
         write!(
             f,
             "Token({:02x}{:02x}{:02x}{:02x}…)",
@@ -101,11 +76,10 @@ impl std::fmt::Debug for Token {
 
 // ── AllocatedToken ───────────────────────────────────────────────────
 
-/// One issued token's bookkeeping. `coinbase_outputs` is the
-/// SV2 JDP/AllocateMiningJobToken.Success fallback single-output payload
-/// returned in `AllocateMiningJobTokenSuccess.coinbase_outputs`. Used later by
-/// `jdp::dynamic_outputs` as the fallback when a 0x0003-unaware JDC skips the
-/// dynamic step.
+/// One issued token's bookkeeping. `coinbase_outputs` is the single-output
+/// payload returned in `AllocateMiningJobTokenSuccess.coinbase_outputs`;
+/// `jdp::dynamic_outputs` falls back to it when a 0x0003-unaware JDC skips
+/// the dynamic step.
 #[derive(Clone, Debug)]
 pub struct AllocatedToken {
     pub token: Token,
@@ -126,20 +100,16 @@ impl AllocatedToken {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TokenAllocError {
-    /// Caller breached the per-connection allocation rate limit: the
-    /// [`ALLOCATE_BURST`] is spent and not yet refilled. The caller should
-    /// silently drop the request — SV2 JDP/AllocateMiningJobToken says
-    /// nothing about a wire response for rate limiting.
+    /// The [`ALLOCATE_BURST`] is spent and not yet refilled. The caller drops
+    /// the request silently: SV2 JDP/AllocateMiningJobToken defines no wire
+    /// response for rate limiting.
     #[error("allocation rate limited: next allocation possible in {retry_in_ms} ms")]
     RateLimited { retry_in_ms: u64 },
-    /// `getrandom` returned an error. The OS RNG only fails in
-    /// pathological cases (closed FDs in a hardened seccomp sandbox).
-    /// On failure the caller should drop the request — never proceed
-    /// with a predictable token suffix.
+    /// `getrandom` failed. The caller drops the request rather than issue a
+    /// token with a predictable suffix.
     #[error("token entropy: {0}")]
     EntropyFailed(String),
-    /// The 32-bit counter saturated. Would require ~4 billion
-    /// allocations on a single connection — defensive only.
+    /// The 32-bit counter saturated (~4 billion tokens on one connection).
     #[error("token counter saturated")]
     CounterSaturated,
 }
@@ -158,9 +128,7 @@ pub struct TokenStore {
     allocated: HashMap<Token, AllocatedToken>,
     rate_limit_ms: u64,
     ttl_ms: u64,
-    /// Optional override for the random-suffix source — exposes a
-    /// hook for deterministic tests. Production calls use
-    /// `getrandom::getrandom`.
+    /// Test override for the random-suffix source; `None` uses `getrandom`.
     rng: Option<Box<RngFn>>,
 }
 
@@ -213,55 +181,30 @@ impl TokenStore {
         self.allocated.is_empty()
     }
 
-    /// Mint a token for a message the POOL originates — today only the
+    /// Mint a token for a message the POOL originates: the
     /// `new_mining_job_token` of a `DeclareMiningJobSuccess`.
     ///
-    /// Deliberately not rate-limited, and that is the whole point of it
-    /// existing separately. SV2 JDP/AllocateMiningJobToken asks for the limit
-    /// on `AllocateMiningJobToken`, the message a client sends; minting
-    /// through [`Self::allocate`] made the pool's own answer draw from the
-    /// client's budget. A JDC that allocates and then declares inside the
-    /// same second — which the reference client does on every block change,
-    /// since it refills its token queue fire-and-forget from four call sites
-    /// — had its `DeclareMiningJob` silently dropped, no frame at all, and
-    /// waited for an answer that never came.
+    /// Not rate-limited: SV2 JDP/AllocateMiningJobToken limits the client's
+    /// `AllocateMiningJobToken`, and the pool's own answer must not draw from
+    /// that budget (a JDC that allocates and declares within one second would
+    /// otherwise get no answer at all).
     ///
-    /// It is also **not stored**, and that is not an optimisation. Nothing
-    /// ever looks a declaration token up here: the declare path's only
-    /// resolution ([`Self::take_active`]) consumes the ALLOCATE token a
-    /// `DeclareMiningJob` presents, the mining side resolves the declaration
-    /// through the bridge, and `PushSolution` through
-    /// [`crate::jdp::declarations::DeclaredJobStore`]. So the entry was
-    /// write-only — and, being unbounded once the rate limit came off, the
-    /// one thing on this connection that could grow without end.
-    ///
-    /// Not storing it also closes what storing it opened: a JDC could present
-    /// a `new_mining_job_token` as the `mining_job_token` of the NEXT
-    /// `DeclareMiningJob` and chain declarations off declaration tokens, each
-    /// one minting another. The reference JDS rejects that — `is_allocated`
-    /// consults the allocated set only, and activation moves a token OUT of
-    /// it (`token_management::TokenManager`, sv2-apps v0.7.0) — so this
-    /// matches it rather than diverging.
+    /// Not stored: nothing looks a declaration token up here (the mining side
+    /// resolves it through the bridge, `PushSolution` through
+    /// [`crate::jdp::declarations::DeclaredJobStore`]). Keeping it out of the
+    /// allocated set also means a `new_mining_job_token` is never accepted as
+    /// the `mining_job_token` of a later `DeclareMiningJob`.
     pub fn mint_for_declaration(&mut self) -> Result<Token, TokenAllocError> {
         self.next_token()
     }
 
-    /// Allocate a new token + record it under `(miner_address,
+    /// Allocate a new token and record it under `(miner_address,
     /// coinbase_outputs)`. Enforces the SV2 JDP/AllocateMiningJobToken rate
-    /// limit — see [`Self::mint_for_declaration`] for the path that must
-    /// not. Bumps the per-connection counter (BE-encoded into the token
-    /// prefix).
+    /// limit (see [`Self::mint_for_declaration`] for the path that must not).
     ///
-    /// Sweeps expired entries on the way in. A session that declares empties
-    /// the map as it fills it — [`Self::take_active`] removes the entry it
-    /// resolves — so what this sweep is for is the tokens NOBODY presents: a
-    /// connection that allocates and never declares left every entry behind
-    /// for as long as it stayed open, and nothing else would have touched
-    /// them. The rate limit caps inserts at one per second (plus the
-    /// [`ALLOCATE_BURST`]) and the TTL caps their lifetime, so the two together cap the map, but only once
-    /// something actually drops the expired ones. One sweep per insert is
-    /// affordable for exactly the reason the map is bounded at all: inserts
-    /// are rate-limited.
+    /// Sweeps expired entries on the way in, which is what removes tokens
+    /// that are allocated but never presented. Rate limit plus TTL bound the
+    /// map, and the rate limit also keeps one sweep per insert cheap.
     pub fn allocate(
         &mut self,
         now_ms: u64,
@@ -286,22 +229,13 @@ impl TokenStore {
             expires_at_ms: now_ms.saturating_add(self.ttl_ms),
         };
         self.allocated.insert(token, entry);
-        // Returning &AllocatedToken from the insert path requires
-        // a re-lookup since `insert` returns `Option<V>` (the previous
-        // value). Tokens are unique so the lookup always succeeds.
         Ok(self.allocated.get(&token).expect("token was just inserted"))
     }
 
-    /// The token SHAPE — counter prefix + entropy suffix — in one place, so
-    /// it cannot drift between the client-facing allocate and the pool's own
-    /// minting. Storage, TTL and the rate limit all live in the callers,
-    /// because those are the three things that legitimately differ.
-    ///
-    /// The allocation budget (`budget_refilled_at_ms`) is deliberately NOT
-    /// charged here: it is the SV2 JDP/AllocateMiningJobToken budget of the
-    /// CLIENT's allocate message, and `allocate` charges it before calling in.
-    /// Charging here would make a pool-minted declaration token eat into the
-    /// miner's next allocates — the same interop bug mirrored.
+    /// The token shape (counter prefix + entropy suffix), shared by
+    /// `allocate` and `mint_for_declaration`. Storage, TTL and the rate limit
+    /// live in the callers because that is where the two differ; the
+    /// allocation budget is the client's and is charged only by `allocate`.
     fn next_token(&mut self) -> Result<Token, TokenAllocError> {
         self.counter = self
             .counter
@@ -309,7 +243,6 @@ impl TokenStore {
             .ok_or(TokenAllocError::CounterSaturated)?;
         let mut bytes = [0u8; TOKEN_LEN];
         bytes[..TOKEN_COUNTER_LEN].copy_from_slice(&self.counter.to_be_bytes());
-        // Fill bytes[4..16] from RNG.
         if let Some(ref mut rng) = self.rng {
             rng(&mut bytes[TOKEN_COUNTER_LEN..]).map_err(TokenAllocError::EntropyFailed)?;
         } else {
@@ -319,18 +252,11 @@ impl TokenStore {
         Ok(Token(bytes))
     }
 
-    /// Look up a token without expiry-check. Returns the entry
-    /// regardless of `expires_at_ms`.
+    /// Look up a token without expiry check or consuming it.
     ///
-    /// No production caller, and none is wanted: every path that resolves a
-    /// token a JDC presented must honour expiry AND consume it, which is
-    /// [`Self::take_active`]. What needs this is the TESTS — it is the only
-    /// non-consuming window into the map, so it is what tells "the entry is
-    /// still there" apart from "it was taken", and "it was pruned" apart from
-    /// "it is there but expired". `take_active` answers `None` to the last
-    /// two alike, which is exactly the distinction
-    /// `taking_a_token_removes_it` and the `cleanup_expired` tests are
-    /// making.
+    /// For tests only: production paths must honour expiry AND consume the
+    /// token, which is [`Self::take_active`]. This is the non-consuming view
+    /// that tells "taken" or "pruned" apart from "still there".
     pub fn lookup(&self, token: &Token) -> Option<&AllocatedToken> {
         self.allocated.get(token)
     }
@@ -338,35 +264,20 @@ impl TokenStore {
     /// TAKE the token a declaration presents: remove it from the map and
     /// hand back its entry, unless it had already expired.
     ///
-    /// Consuming rather than reading IS the rule. An allocate token
-    /// authorises exactly ONE declaration attempt: SV2 JDP/Full-Template Mode
-    /// describes it as "a token (allocated by JDS), so it can use it to
-    /// identify some unique work", and a token that identifies one piece of
-    /// work cannot answer for the next one. It is spent whichever way that
-    /// declaration ends, accepted or refused. A read-only lookup let a single
-    /// token carry declarations for its whole 1 h TTL, which is not what a
-    /// `mining_job_token` identifies.
+    /// An allocate token authorises exactly ONE declaration attempt
+    /// (SV2 JDP/Full-Template Mode: a token "to identify some unique work"),
+    /// spent whether the declaration is accepted or refused. Removing before
+    /// the expiry check also drops an expired entry.
     ///
-    /// Removing before judging expiry subsumes what the old read-only lookup
-    /// did on the side: an expired entry is dropped either way.
-    ///
-    /// ⚠️ The mining side looks like the same rule and is not. A token there
-    /// likewise authorises exactly one `SetCustomMiningJob`, but it SURVIVES
-    /// a rejection: `stale-chain-tip` on that side means the JDC retries the
-    /// SAME custom job on the SAME token, so consuming it would turn a benign
-    /// tip race into the fatal fallback every declaration error but that one
-    /// triggers. Here `stale-chain-tip` means the JDC rebuilds against its
-    /// new template and declares with the next token it holds, so there is
-    /// nothing to keep the spent one for.
+    /// ⚠️ The mining side differs: its token survives a rejection, because on
+    /// `stale-chain-tip` the JDC retries the SAME custom job on the SAME
+    /// token. Here the JDC re-declares with the next token it holds.
     pub fn take_active(&mut self, token: &Token, now_ms: u64) -> Option<AllocatedToken> {
         let entry = self.allocated.remove(token)?;
         (!entry.is_expired(now_ms)).then_some(entry)
     }
 
-    /// Sweep expired entries. Returns the count removed. Use as a
-    /// periodic tick if `take_active` isn't enough on its own —
-    /// e.g. when the connection is being inspected without a fresh
-    /// request.
+    /// Sweep expired entries and return how many were removed.
     pub fn cleanup_expired(&mut self, now_ms: u64) -> usize {
         let before = self.allocated.len();
         self.allocated.retain(|_, entry| !entry.is_expired(now_ms));
@@ -519,9 +430,8 @@ mod tests {
         assert_eq!(entry.coinbase_outputs, vec![1, 2, 3]);
     }
 
-    /// `take_active` hands the entry back ONCE. The second attempt on the
-    /// same token finds nothing — that is the whole rule an allocate token
-    /// carries: it identifies one piece of work, not a session's worth.
+    /// `take_active` hands the entry back once; a second attempt on the same
+    /// token finds nothing.
     #[test]
     fn taking_a_token_removes_it() {
         let mut s = fresh_store_with_rng(0x00);
@@ -539,7 +449,7 @@ mod tests {
         assert_eq!(s.len(), 0);
     }
 
-    /// An expired token is dropped rather than handed out — and the boundary
+    /// An expired token is dropped rather than handed out; the boundary
     /// timestamp is still active, same rule as `AllocatedToken::is_expired`.
     #[test]
     fn take_active_refuses_and_prunes_an_expired_token() {

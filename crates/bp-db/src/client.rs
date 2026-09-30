@@ -119,12 +119,9 @@ pub async fn find_active_session_keys(pool: &PgPool) -> Result<Vec<ClientRow>, D
 /// `/api/pplns`'s `userAgents` aggregation and of the group roster's
 /// per-member session stats.
 ///
-/// The inline SQL this replaced had no `deletedAt` filter, and while it
-/// summed and counted the same rows that was merely generous. It is not
-/// any more: the numbers come from the live hashes, which a retired
-/// session no longer has, so counting its ghost row would report
-/// `count: 31` next to one session's hashrate. Count and sums have to
-/// describe the same population.
+/// Filtered on `deletedAt IS NULL`: the numbers come from the live hashes,
+/// which a retired session no longer has, so counting its row would put a
+/// session count next to hashrate from a different population.
 pub async fn find_active_sessions_for_addresses(
     pool: &PgPool,
     addresses: &[String],
@@ -200,9 +197,8 @@ pub async fn find_client_statistics_since(
 
 /// Minimal projection for `/api/info/workers`: only the slot time + identity
 /// columns needed to count DISTINCT addresses / (address, worker) per slot.
-/// Selecting three columns instead of the full 19-column stats row cuts the
-/// transferred payload ~4× for the same row set, and there's no `ORDER BY`
-/// (the caller buckets into a map, order is irrelevant) so PG skips a sort.
+/// Three columns instead of the full stats row keep the payload small, and
+/// there's no `ORDER BY` (the caller buckets into a map) so PG skips a sort.
 #[derive(Clone, Debug, FromRow)]
 pub struct PoolWorkerRow {
     pub time: i64,
@@ -381,8 +377,7 @@ pub struct ClientStatisticsRow {
 }
 
 /// N per-slot maxima in one `INSERT … SELECT unnest(...) … ON CONFLICT DO
-/// UPDATE`. Sole writer of the table's upsert path — the per-row variant it
-/// replaced went with the inline sink.
+/// UPDATE`. Sole writer of the table's upsert path.
 ///
 /// `maxDifficulty` takes `GREATEST` against what is already stored (a lower
 /// share in the same batch must not lower the slot's max), `updatedAt`
@@ -391,17 +386,12 @@ pub struct ClientStatisticsRow {
 ///
 /// ⚠️ **The caller MUST collapse duplicates per `(address, clientName,
 /// slotTime)`.** Postgres rejects a multi-row `ON CONFLICT DO UPDATE` that
-/// would touch the same row twice with "cannot affect row a second time" —
-/// which is a hard error, not a merge. The buffer that feeds this is keyed by
-/// exactly that triple, so duplicates are impossible by construction; anything
-/// else calling it has to guarantee the same.
+/// would touch the same row twice with a hard error, not a merge. The buffer
+/// that feeds this is keyed by exactly that triple.
 ///
-/// No advisory lock here, unlike the `client_entity` pair: that one exists
-/// because TWO loops write the same rows concurrently, a deadlock that was
-/// actually measured. Here a single flush loop is the only writer, so there is
-/// nothing to serialise against. ⚠️ Splitting `payout` and `stats` into two
-/// processes would create a second writer — then this needs its own lock, on
-/// its own key.
+/// No advisory lock here, unlike `client_entity`: a single flush loop is the
+/// only writer. ⚠️ Splitting `payout` and `stats` into two processes would
+/// create a second writer, which then needs its own lock on its own key.
 pub async fn bulk_upsert_client_difficulty_statistics(
     pool: &PgPool,
     addresses: &[String],
@@ -606,23 +596,14 @@ where
 /// Postgres takes row locks in processing order, and each of these
 /// builds its arrays from an unordered source (a `HashMap` for the
 /// births, a query result for the sweep), so two of them running
-/// concurrently over shared rows can deadlock. That is measured, not
-/// theoretical: 46 deadlocks in ~90 minutes on the prod accounting
-/// process (2026-08-05), back when the touch flush and the hashrate
-/// sampler collided every 60 s.
+/// concurrently over shared rows can deadlock.
 ///
-/// Sorting the inputs would NOT fix it — the planner may reorder the
+/// Sorting the inputs does NOT fix it — the planner may reorder the
 /// join, so input order does not determine lock order. Serialising the
-/// writers does. A process-local mutex would not do either: births run
-/// on the Front, the sweep on the accounting role, i.e. two processes.
+/// writers does, and it has to be this PG advisory lock: births run on the
+/// Front, the sweep on the accounting role, i.e. two processes.
 ///
-/// ⚠️ Any future multi-row writer of `client_entity` MUST take this
-/// lock too.
-///
-/// The hot writers this lock was born for are gone (the live fields
-/// live in Redis now), so it no longer sits between two 30 s/60 s
-/// statements over the same 700 rows — it now serialises ~9 births per
-/// minute against a once-per-minute sweep that usually touches nothing.
+/// ⚠️ Any multi-row writer of `client_entity` MUST take this lock.
 const CLIENT_ENTITY_BULK_WRITE_LOCK: i64 = 0x636c_6e74_6277; // "clntbw"
 
 /// Take [`CLIENT_ENTITY_BULK_WRITE_LOCK`] for the rest of `tx`. The
@@ -675,12 +656,12 @@ where
 
 /// Active sessions whose `updatedAt` is older than `cutoff_ms` — the
 /// CANDIDATES of the dead-session sweep, not its verdict. `updatedAt`
-/// is only stamped at birth, re-register, and soft-delete now, so age
-/// alone no longer means "silent": the cron in `bin/blitzpool` checks
-/// each candidate's `client:live:*` key and soft-deletes (via
+/// is only stamped at birth, re-register, and soft-delete, so age alone
+/// does not mean "silent": the cron in `bin/blitzpool` checks each
+/// candidate's `client:live:*` key and soft-deletes (via
 /// [`soft_delete_sessions`]) only those whose live hash is gone. The
-/// age predicate survives purely as the birth grace period — a session
-/// younger than the cutoff may not have flushed its first touch yet.
+/// age predicate is the birth grace period — a session younger than the
+/// cutoff may not have flushed its first touch yet.
 pub async fn find_stale_active_sessions<'e, E>(
     executor: E,
     cutoff_ms: i64,
@@ -768,12 +749,10 @@ impl bp_common::live_client_key::SessionKey for DeletedSessionRow {
 /// Sessions soft-deleted at or after `since_ms` — the input to the
 /// sweep's REPAIR half ([`revive_sessions`]).
 ///
-/// The live fields left Postgres, and with them the touch UPDATE that
-/// used to carry `"deletedAt" = NULL` and undo a wrong sweep on its next
-/// 30 s pass. Nothing else ever cleared the flag, so a session
-/// soft-deleted by mistake — Redis restarted empty, its key was evicted
-/// — stayed invisible for the rest of its TCP connection, i.e. days.
-/// The sweep now reconciles in both directions instead.
+/// Nothing on the share path clears `deletedAt`, so a session
+/// soft-deleted by mistake (Redis restarted empty, its key was evicted)
+/// would stay invisible for the rest of its TCP connection. The sweep
+/// therefore reconciles in both directions.
 pub async fn find_recently_deleted_sessions(
     pool: &PgPool,
     since_ms: i64,
@@ -1018,11 +997,10 @@ pub async fn device_first_seen(
 /// a Stratum event, so a miner that died just before the restart — and
 /// will therefore never emit another event — could never be reported.
 ///
-/// ⚠️ Since the live fields moved to Redis, `updatedAt` is no longer
-/// touched per share — the `ORDER BY "updatedAt"` inside the aggregate
-/// now picks the user agent of the most recently born or soft-deleted
-/// session rather than the most recently *touched* one. Accepted drift:
-/// this only seasons the seed's user-agent string, never liveness.
+/// ⚠️ `updatedAt` is not touched per share, so the `ORDER BY "updatedAt"`
+/// inside the aggregate picks the user agent of the most recently born
+/// or soft-deleted session, not the most recently active one. It only
+/// affects the seed's user-agent string, never liveness.
 pub async fn device_watch_seed(
     pool: &PgPool,
     addresses: &[String],

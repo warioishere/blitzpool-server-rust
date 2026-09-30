@@ -30,10 +30,8 @@
 //!   The answer to "is THIS session still connected", which is what the
 //!   dead-session cron in `crons` has to know before it retires a row.
 //!   Without it the cron infers death from share silence, and a miner
-//!   that pauses with its socket open — standby overnight, a slow rig —
-//!   is retired while it is still connected. Measured 2026-09-10 on
-//!   prod: 46 of 635 connected devices had no visible row — an upper
-//!   bound, it also counts sessions younger than the birth debounce.
+//!   that pauses with its socket open (standby overnight, a slow rig)
+//!   would be retired while it is still connected.
 //!
 //! Two properties make it safe to trust:
 //!
@@ -467,10 +465,9 @@ impl RedisLiveSessions {
     /// - `Err`: Redis could not be asked. The dead-session cron skips
     ///   its tick on this, exactly as it does when the `client:live:*`
     ///   hashes cannot be read — "cannot ask" is not "not held".
-    /// - `Ok(None)`: no front is publishing sessions. Also what a front
-    ///   on the previous binary looks like, which publishes the device
-    ///   counts but not this; the caller falls back to what it did
-    ///   before the fronts published sessions at all.
+    /// - `Ok(None)`: no front is publishing sessions (also a front that
+    ///   publishes device counts but not sessions); the caller falls back
+    ///   to its live-key verdict.
     /// - `Ok(Some(map))`: first-hand knowledge. A session absent from it
     ///   is held by no front.
     pub(crate) async fn sessions(
@@ -602,23 +599,15 @@ mod tests {
 
     /// Every route that can CREATE this front's key has to leave a TTL on
     /// it. "A dead front disappears by itself" is the property the whole
-    /// design rests on, and it is unrecoverable if it ever fails: the
-    /// front id is a fresh UUID per process, so no later process writes
-    /// that key again and nothing else ever cleans it — it would claim
-    /// its miners are online forever.
+    /// design rests on: the front id is a fresh UUID per process, so no
+    /// later process writes that key again and nothing else cleans it.
     ///
-    /// This pins the invariant, not the atomicity. That the SADD and the
-    /// EXPIRE cannot be separated is argued from their being one
-    /// MULTI/EXEC; a process dying between two awaits is not something a
-    /// unit test can stage.
+    /// This pins the invariant, not the atomicity; that the write and the
+    /// EXPIRE cannot be separated follows from their being one MULTI/EXEC.
     #[tokio::test]
     async fn a_key_the_incremental_path_creates_always_expires() {
-        // Its own database, not a shared one. This test used to sit on a
-        // non-flushing connection to DB 1 on the argument that it "only
-        // reads the TTL of its own key" — but `cache_sync`'s tests are in
-        // this same binary, take DB 1 too, and DO flush. The flush landed
-        // between the register below and the TTL read, the key was gone,
-        // and TTL answered -2.
+        // Its own database: a sibling test in this binary flushing a shared
+        // one between the register and the TTL read would remove the key.
         let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 9).await
         else {
             eprintln!("redis unreachable — skipping");
@@ -627,8 +616,7 @@ mod tests {
         // No publish() first: this is the narrow case where a session
         // registers before the publisher's first tick, so the register is
         // what brings the key into existence. The connect above flushed the
-        // database, so a key left by a previous run cannot make that
-        // vacuously true.
+        // database, so a leftover key cannot make that vacuously true.
         let reg = registry(redis.clone(), "front-fresh");
         reg.register_session("s1", ADDR, "rig-a", None).await;
 
@@ -648,8 +636,8 @@ mod tests {
     }
 
     /// The per-session projection: unknown until a front publishes it,
-    /// still unknown while only the previous binary's device counts are
-    /// there, and first-hand once a front holds anything — including the
+    /// still unknown while only device counts are there, and first-hand
+    /// once a front holds anything, including the
     /// incremental path, so a fresh connect is visible before the first
     /// republish. Re-authorizing moves the session to its new device,
     /// and a front that holds nothing is an empty answer, not no answer.
@@ -666,8 +654,8 @@ mod tests {
             "nothing published yet"
         );
 
-        // A front on the previous binary: device counts, no sessions.
-        // Written the way that binary wrote them — tombstone and TTL.
+        // A front that publishes device counts (tombstone and TTL) but no
+        // sessions.
         let _: () = redis::pipe()
             .atomic()
             .hset("device:live:front-old", PRESENT, 0)
@@ -790,9 +778,9 @@ mod tests {
     /// and one front going away must not take the other's miners with it.
     #[tokio::test]
     async fn the_union_spans_fronts_and_survives_one_disappearing() {
-        // DB 2, not 12: every test target in this binary runs as a thread
-        // in one process and FLUSHDBs its index on entry, so two sharing
-        // an index wipe each other. `cache_sync` already owns 12.
+        // DB 2: every test in this binary runs as a thread in one process
+        // and FLUSHDBs its index on entry, so two sharing an index wipe
+        // each other.
         let Some(mut redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 2).await
         else {
             eprintln!("redis unreachable — skipping");
@@ -827,16 +815,15 @@ mod tests {
         );
     }
 
-    /// A key can expire between the SCAN that finds it and the SMEMBERS
-    /// that reads it. `SMEMBERS` on a missing key answers with an empty
-    /// set rather than an error, so counting that as a real answer drops
-    /// everything the front was carrying — and with a single front, the
-    /// whole pool reads as offline and every subscriber is paged.
+    /// A key can expire between the SCAN that finds it and the HGETALL
+    /// that reads it, and a missing key reads as empty rather than an
+    /// error. Counting that as a real answer would drop everything the
+    /// front was carrying; with a single front, the whole pool would read
+    /// as offline.
     ///
     /// Driven concurrently because that window is one round-trip wide.
-    /// The invariant is absolute rather than statistical: this front
-    /// holds exactly one device the entire time, so an empty union is
-    /// never a correct answer, no matter when the read lands.
+    /// This front holds exactly one device the entire time, so an empty
+    /// union is never a correct answer, no matter when the read lands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_key_that_vanishes_mid_read_is_unknown_not_empty() {
         let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 3).await else {
@@ -904,9 +891,8 @@ mod tests {
 
     /// SV2 fires one `register_session` per channel opened, all carrying
     /// the SAME session id and the connection's locked worker. Re-recording
-    /// an unchanged device must release nothing: a rental source opening
-    /// its second channel would otherwise take its own worker offline —
-    /// which is the exact spam this feature exists to stop.
+    /// an unchanged device must release nothing, or a rental source opening
+    /// its second channel would report its own worker offline.
     #[test]
     fn re_registering_the_same_device_releases_nothing() {
         let mut state = RegistryState::default();
@@ -926,12 +912,10 @@ mod tests {
     /// One SV1 connection may authorize more than once — `handle_authorize`
     /// is unconditional, so a proxy that switches worker names re-registers
     /// the SAME session id under a different device. The device it left
-    /// must not keep a phantom holder: nothing will ever remove it, so the
-    /// worker would be reported connected for the life of the process and
-    /// could never go offline again.
+    /// must not keep a phantom holder, which nothing would ever remove.
     ///
     /// Asserted after a full republish, so this is about the registry's
-    /// own state and not about a missed incremental SREM.
+    /// own state and not about a missed incremental write.
     #[tokio::test]
     async fn re_authorizing_under_a_new_worker_leaves_nothing_behind() {
         let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 4).await else {
@@ -1099,10 +1083,9 @@ mod tests {
 
     /// A miner that vanishes without closing cleanly — power cut, NAT
     /// timeout, a yanked cable — resets the connection instead of sending
-    /// a FIN. That is the most common way an unstable miner disconnects
-    /// and precisely the case the offline notification exists for, so it
-    /// has to reach the live set too. A session left behind here is
-    /// permanent: nothing else can ever remove it.
+    /// a FIN. That is the case the offline notification exists for, so it
+    /// has to reach the live set too; a session left behind here is
+    /// permanent, since nothing else removes it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_reset_connection_still_leaves_the_live_set() {
         assert!(

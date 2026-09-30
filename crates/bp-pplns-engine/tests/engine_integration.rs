@@ -6,11 +6,11 @@
 //! End-to-end integration tests for `PplnsEngine` + `hooks` + `reader`.
 //!
 //! Covers the full lifecycle: spawn → record_share → build_distribution
-//! → on_block_found → reader views. Plus hook gating + re-entrancy
-//! guard.
+//! → on_block_found → reader views.
 //!
-//! Each test uses a distinct Redis logical DB (0–15) and a distinct
-//! PG address-prefix; tests cleanup their own state before + after.
+//! Each test uses a distinct Redis logical DB (inside this binary's
+//! `bp_test_support::redis_db` range) and a distinct PG address prefix,
+//! and cleans up its own state before and after.
 
 use bp_common::AddressId;
 use bp_pplns_engine::config::PplnsEngineConfig;
@@ -26,8 +26,8 @@ const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
 /// addresses and assert exact ledger totals. `build_distribution` reads
 /// EVERY open balance in the table (`find_pplns_balances_with_open_balance`),
 /// so a concurrent test holding an open balance would perturb another's
-/// distribution math. (Tests that seed prefix/invalid addresses are
-/// unaffected — those get filtered out of the distribution input.)
+/// distribution math. Invalid (prefix) addresses are filtered out of the
+/// distribution input and need no lock.
 fn balance_table_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -47,9 +47,8 @@ struct EngineHarness {
 async fn connect_or_skip(redis_db: u8, prefix: &str) -> Option<(ConnectionManager, PgPool)> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    // Fold this binary's local number into its own DB range — see
-    // `bp_test_support::redis_db`. Without it every binary's 0..15
-    // land on the same 16 databases and FLUSHDB each other mid-run.
+    // Map into this binary's own DB range (`bp_test_support::redis_db`) so
+    // binaries do not FLUSHDB each other's databases.
     let redis_db =
         bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_ENGINE, redis_db).await;
     let redis_url = format!("{redis_base}/{redis_db}");
@@ -105,15 +104,13 @@ async fn connect_or_skip(redis_db: u8, prefix: &str) -> Option<(ConnectionManage
     Some((conn, pool))
 }
 
-/// Test config: tight flush cadence + no daily sweep so background
-/// tasks don't loiter / interfere during a test.
+/// Test config: tight flush cadence and no daily sweep, so background tasks
+/// do not interfere with a test.
 ///
-/// A fee address is structural in the weight model — the pool output
-/// anchors the §4 residual (`pay_P` is never pruned), so a build
-/// without one refuses (`NoFeeAddress`). `fee_percent` stays 0.0: the
-/// pool output then only absorbs integer-rounding residue and the
-/// miners keep effectively the whole reward, which is what the payout
-/// assertions in this file are written against.
+/// A fee address is required: the pool output anchors the §4 residual, so a
+/// build without one refuses (`NoFeeAddress`). `fee_percent` stays 0.0, so
+/// the pool output only absorbs rounding residue and the payout assertions
+/// can treat the whole reward as the miners'.
 fn test_config() -> PplnsEngineConfig {
     PplnsEngineConfig {
         touch_flush_interval_secs: 1,
@@ -157,11 +154,9 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
         .await;
 }
 
-/// A coinbase that pays EXACTLY the distribution's §4 vector at
-/// revenue `t` — the pool output first, then the kept miner outputs.
-/// What every honestly-built job produces; settlement then books
-/// `claim − paid` per address (small integer-rounding deltas between
-/// the claim formula and the §4 weight path are expected and correct).
+/// A coinbase that pays EXACTLY the distribution's §4 vector at revenue `t`,
+/// pool output first. Settlement books `claim − paid` per address; small
+/// rounding deltas between the claim formula and the §4 path are expected.
 fn actual_paying_exactly(
     dist: &bp_pplns_engine::distribution::DistributionResult,
     t: u64,
@@ -188,23 +183,16 @@ async fn drop_harness(h: EngineHarness) {
     cleanup(&h.pool, &h.prefix).await;
 }
 
-// Hook-impls themselves are covered by `crate::hooks::tests` (ModeGate
-// gating logic) + the engine's own `record_share` path. Building a
-// real `ShareAccept` for an integration test pulls in `bp-mining-job`'s
-// coinbase-construction setup which is heavier than the value adds —
-// the gating logic is decoupled from `accept` content, so unit-level
-// coverage suffices.
+// Hook gating is covered by `crate::hooks::tests`; it does not depend on
+// the `ShareAccept` content, so no integration test builds one here.
 
 // ── Test 1 — record_share appears in window_stats ──────────────────
 
 /// Share timestamp anchored near now.
 ///
-/// `record_share` used to ignore this argument, so these tests passed a
-/// hardcoded `ts(0)` (Nov 2023). It is now the bucket's index
-/// score, and the window ages buckets out past `abandoned_balance_days` — so
-/// the constant would mean "every bucket is three years old" and the trim
-/// would empty the window mid-test. The offset keeps the relative order these
-/// tests rely on.
+/// The timestamp becomes the bucket's index score and the window ages
+/// buckets out past `abandoned_balance_days`, so a fixed old timestamp would
+/// empty the window mid-test. The offset keeps the relative order.
 fn ts(offset: u64) -> u64 {
     (bp_common::now_ms() as u64) - 1_000_000 + offset
 }
@@ -271,21 +259,17 @@ async fn on_block_found_applies_distribution_from_snapshot() {
         Some(h) => h,
         None => return,
     };
-    // A REAL address. This used to be `format!("{}aaa", h.prefix)`, which
-    // `AddressId` accepts and the distribution build then DROPS — so the
-    // distribution was empty, the miner surfaced only as a 0-sat
-    // "late arriver" row, and `history_inserted >= 1` held without a
-    // payout ever being exercised. Exactly the trap the repo's CLAUDE.md
-    // names.
+    // A real address: the distribution build drops anything
+    // `bitcoin::Address` cannot parse, which would leave only a 0-sat
+    // late-arriver row and never exercise a payout.
     const ADDR: &str = "bc1qvzf0p407umrsaxmsnq62yudwf27lmsxd8sshzl";
     h.engine
         .record_share(None, ADDR, 100.0, ts(1))
         .await
         .unwrap();
     let result = h.engine.build_distribution(312_500_000).await.expect("ok");
-    // Precondition pinning the SHAPE this test means to build: the miner
-    // must really be a published payout, or the assertions below pass on
-    // an empty distribution again.
+    // Precondition: the miner must be a published payout, or the assertions
+    // below would pass on an empty distribution.
     assert!(
         result
             .distribution
@@ -294,11 +278,9 @@ async fn on_block_found_applies_distribution_from_snapshot() {
         "the miner must be a published coinbase output, not a late-arriver row"
     );
     let block_height = 9_997_001;
-    // Clean this height FIRST. `apply_distribution`'s replay guard asks
-    // "does this blockHeight have history?", so a row left by an earlier
-    // run makes the apply a silent no-op — and `cleanup` only deletes by
-    // ADDRESS prefix, which a real Bitcoin address does not match. The
-    // sibling tests below already clean by height for the same reason.
+    // Clean this height first: the replay guard treats existing history at
+    // this height as "already booked", and `cleanup` only deletes by address
+    // prefix, which a real address does not match.
     let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = $1"#)
         .bind(block_height)
         .execute(&h.pool)
@@ -353,17 +335,11 @@ async fn on_block_found_applies_distribution_from_snapshot() {
 // ── The settlement inputs must outlive the snapshot TTL ────────────
 //
 // A confirmation-gated block applies `confirmation_depth` blocks after it
-// was found — about 20 minutes at the default depth of 3, against a
-// `snapshot_ttl_secs` of 1200 whose clock started when the WINNING JOB was
-// built. Reading the key only at apply time loses that race roughly half
-// the time, and losing it is not a delay: per-job snapshot keys are
-// excluded from the Redis→Postgres backup, so the inputs are then gone
-// from every store. The block's own coinbase still says who WAS paid — it
-// cannot say what the miners it did NOT pay were owed.
-//
-// So the Core resolves them at the block-found instant and the parked blob
-// carries them. This test deletes the key outright, which is the strongest
-// form of "the TTL expired", and pins both directions.
+// was found, which can outlast `snapshot_ttl_secs` (counted from when the
+// winning job was built). Per-job snapshot keys are not backed up, and the
+// coinbase cannot say what the miners it did not pay were owed, so the Core
+// resolves the inputs at block-found time and the parked blob carries them.
+// This test deletes the key outright and pins both directions.
 
 #[tokio::test]
 async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
@@ -387,8 +363,8 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
 
     // TINY's 1-in-1_000_001 share of 30 BTC ≈ 2_999 sat, under the
     // 5_000-sat `min_payout`, so it is WITHHELD from the coinbase and
-    // settles as credit instead. That credit is precisely the money a lost
-    // snapshot destroys, so it is what the assertions key on.
+    // settles as credit instead. That credit exists only in the snapshot,
+    // so it is what the assertions key on.
     h.engine
         .record_share(None, BIG, 1_000_000.0, ts(1))
         .await
@@ -409,7 +385,7 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
     );
 
     // What the Core stamps into the block-found event, resolved while the
-    // key is still alive — through the same seam the build wrote it under.
+    // key is still alive.
     let blob = h
         .engine
         .weight_snapshot_for_block_found(&fp)
@@ -421,10 +397,9 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
     let key = bp_pplns_engine::window::snapshot_key_for(&fp);
     let _: () = conn.del(&key).await.expect("drop the snapshot key");
 
-    // Negative control FIRST, so the positive case below cannot pass on a
-    // key that was never actually gone. Without the blob there is nothing
-    // left to settle from — this is the failure the fix exists to remove,
-    // and it must still be reachable.
+    // Negative control first, so the positive case below cannot pass on a
+    // key that was never actually gone: without the blob there is nothing
+    // left to settle from.
     let without_blob = h
         .engine
         .on_block_found(h_without, &actual, None, Some(fp))
@@ -461,29 +436,19 @@ async fn a_block_settles_from_its_parked_blob_after_the_snapshot_key_is_gone() {
 
 // ── A booked block stays booked, whatever the row set does ─────────
 //
-// `apply_distribution` used to infer "already booked" from a side effect:
-// it ran the balance upsert only when the history insert had reported rows
-// inserted, on the reasoning that the `(blockHeight, address)` UNIQUE
-// swallows a replay. That holds only if the row set is the SAME on both
-// attempts, and it is not — the audit rows include one per "late arriver",
-// an address live in the PPLNS window at APPLY time but absent from the
-// snapshot. The window moves between attempts, so one new miner is enough
-// to make the insert report progress on a block that is already booked,
-// and the balance write is ABSOLUTE (`current + delta`) against a `current`
-// re-read after the first commit — i.e. `current + 2·delta`.
-//
-// Reaching a second attempt takes an interrupted first one: the
-// confirmation watcher removes the parked entry only after the apply
-// commits, and ignores the removal's own error (`let _ =`), so a Redis blip
-// or a process kill in that window replays the block.
+// "Already booked" cannot be inferred from the history insert reporting new
+// rows: the audit rows include one per late arriver (in the window at apply
+// time, absent from the snapshot), so the row set can grow between two
+// attempts while the balances must not move again. A second attempt happens
+// when the confirmation watcher is interrupted between the apply commit and
+// removing the parked entry.
 
 #[tokio::test]
 async fn a_second_apply_of_the_same_block_moves_no_money() {
-    // This test is one of the few that DEPENDS on Redis state surviving
-    // between two steps (the latecomer below must still be in the window),
-    // so it needs a logical DB no sibling flushes — see
-    // `bp_test_support::redis_db`. The precondition assert stays as the
-    // backstop if that ever stops holding.
+    // Depends on Redis state surviving between two steps (the latecomer
+    // must still be in the window), so it needs a logical DB no sibling
+    // flushes — see `bp_test_support::redis_db`. The precondition assert
+    // below is the backstop.
     let _serial = balance_table_lock().lock().await;
     let h = match spawn_or_skip(13, "test_reapply_").await {
         Some(h) => h,
@@ -500,7 +465,7 @@ async fn a_second_apply_of_the_same_block_moves_no_money() {
 
     // TINY is withheld (sub-`min_payout`) and therefore settles as a
     // CREDIT — a non-zero delta, which is what a double-apply doubles. A
-    // fully-paid miner books ~0 and would hide the bug.
+    // fully-paid miner books ~0 and would not show it.
     h.engine
         .record_share(None, BIG, 1_000_000.0, ts(1))
         .await
@@ -526,8 +491,8 @@ async fn a_second_apply_of_the_same_block_moves_no_money() {
         "precondition: the withheld miner carries a credit to double"
     );
 
-    // The trigger: a miner absent from the snapshot starts mining before
-    // the replay runs, so the apply's row set GROWS by one late-arriver row.
+    // A miner absent from the snapshot starts mining before the replay
+    // runs, so the apply's row set GROWS by one late-arriver row.
     h.engine
         .record_share(None, LATECOMER, 50.0, ts(3))
         .await
@@ -573,19 +538,13 @@ async fn a_second_apply_of_the_same_block_moves_no_money() {
 //
 // MONEY. `pplns_payout_history` has no `blockHash` column and is UNIQUE on
 // `(blockHeight, address)`, so the ledger identifies a booked block by its
-// HEIGHT alone. When a reorg replaces a booked block with another one at the
-// same height, the guard used to answer "this height has history" and return
-// `Ok` with zero counts — which the confirmation watcher reads as success: it
-// fires the settlement, logs "payout history applied" and drops the parked
-// block. A block whose coinbase paid miners on-chain disappeared, and the
-// log line was indistinguishable from a harmless redelivery.
+// HEIGHT alone. A different block at a booked height (reorg) must be a
+// terminal error, not an `Ok` no-op: the watcher then parks it in the
+// unbookable store for a reprocess and `pool_blocks_unbookable` counts it,
+// instead of treating it as a redelivery and dropping it.
 //
-// It is now a terminal error, so the watcher parks it in the unbookable
-// store where the frozen distribution survives for a reprocess — and
-// `pool_blocks_unbookable` makes it a number rather than a lost line.
-//
-// The false-alarm half is guarded by `a_second_apply_of_the_same_block_moves_
-// no_money`, which grows the row set between two applies and demands a no-op.
+// The same-block replay case is pinned by
+// `a_second_apply_of_the_same_block_moves_no_money`.
 
 #[tokio::test]
 async fn a_different_block_at_the_same_height_is_refused_not_swallowed() {
@@ -682,15 +641,10 @@ async fn credit_of(pool: &PgPool, address: &str) -> i64 {
 
 // ── A later build must not cost the found block its distribution ───
 //
-// The bug this guards: the pool builds the job a block is later mined on,
-// then some other build — an ext-0x0003 payout request from a JD client with
-// its own payout value, or just a template refresh — overwrites the shared
-// `pplns:snapshot` key. `prepare_block_found` then reads a snapshot whose
-// reward disagrees with the coinbase, refuses, deletes it, and the block's
-// PPLNS distribution is never applied (WARN only, manual reprocessing).
-//
-// Looked up under the job's payout fingerprint it still resolves, because
-// nothing else writes that key.
+// After the job a block is mined on is built, other builds (an ext 0x0003
+// payout request with its own value, a template refresh) overwrite the
+// shared `pplns:snapshot` key. The block's distribution is therefore looked
+// up under the job's payout fingerprint, which nothing else writes.
 
 #[tokio::test]
 async fn later_build_does_not_cost_the_found_block_its_distribution() {
@@ -844,9 +798,8 @@ async fn reader_ledger_summary_aggregates_open_balances() {
     .unwrap();
 
     let summary = h.engine.reader().ledger_summary().await.expect("ok");
-    // Note: ledger summary aggregates ALL open-balance rows in the
-    // table, not just our prefix. Assert *at least* our pair shows up
-    // rather than exact totals.
+    // The summary aggregates ALL open-balance rows in the table, not just
+    // this prefix, so assert at least this pair shows up, not exact totals.
     assert!(summary.credit_row_count >= 1);
     assert!(summary.debit_row_count >= 1);
     assert!(summary.abandoned_credit_sats >= 1);
@@ -903,16 +856,9 @@ async fn reader_current_distribution_sorts_descending() {
 
 // ── Two blocks in sequence must both land ───────────────────────────
 //
-// This comment used to describe a `prepare_block_found` / `apply_prepared`
-// pair that froze ABSOLUTE balances at found-time, and a
-// flush-before-prepare rule that kept at most one block pending so the
-// second absolute write could not clobber the first. None of that exists:
-// the gated path parks a block's INPUTS and computes the balances at apply
-// time, which is what removed the hazard — and with it the flush rule and
-// the re-base baseline that went with it.
-//
-// What the tests below still pin is the outcome that mattered: two blocks
-// applied in sequence both accumulate, whatever order they mature in.
+// The gated path parks a block's INPUTS and computes the balances at apply
+// time, as deltas onto the ledger as it stands. The tests below pin that two
+// blocks applied in sequence both accumulate.
 
 async fn cleanup_addr(pool: &PgPool, address: &str, heights: &[i32]) {
     let _ = sqlx::query(r#"DELETE FROM pplns_payout_history WHERE "blockHeight" = ANY($1)"#)
@@ -944,13 +890,10 @@ async fn miner_balance_and_paid(pool: &PgPool, address: &str) -> (i64, i64) {
         .expect("balance row present")
 }
 
-/// Sub-min-payout pending-credit carry-forward (end-to-end through PG).
-/// A miner whose per-block share is below `min_payout_sats` (default
-/// 5_000, clamped ≥ the 546-sat dust floor) accrues a pending balance
-/// instead of an on-chain output; once the accrued credit plus a later
-/// block's share crosses the threshold it pays out on-chain and the
-/// pending balance clears. The single-block halves are unit-tested in
-/// `bp-pplns`; this pins the multi-block ledger round-trip.
+/// Sub-min-payout credit carry-forward, end-to-end through PG: a miner below
+/// `min_payout_sats` accrues a pending balance instead of an output; once
+/// the credit plus a later block's share crosses the threshold it pays out
+/// on-chain and the balance clears. Pins the multi-block ledger round-trip.
 #[tokio::test]
 async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
     let _serial = balance_table_lock().lock().await;
@@ -959,12 +902,9 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
         None => return,
     };
     // Dominant miner soaks the reward; the tiny miner's 1-in-1_000_001
-    // share of 3 BTC ≈ 2_999 sat < 5_000 min-payout → accrues. Uses
-    // addresses unique to this test (distinct from the other balance
-    // tests + the cross-binary `build_folds` test, which use bc1qw508 /
-    // bc1qar0) so no test writes another's rows. The assertions touch
-    // only TINY's own ledger, so a foreign open balance the whole-table
-    // read folds in can't perturb them.
+    // share of 3 BTC ≈ 2_999 sat < 5_000 min-payout → accrues. Addresses
+    // are unique to this test so no test writes another's rows, and the
+    // assertions touch only TINY's own ledger.
     const BIG: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
     const TINY: &str = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
     const REWARD: u64 = 3_000_000_000;
@@ -1007,8 +947,8 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
     assert_eq!(paid1, 0, "tiny not paid on-chain yet (got {paid1})");
 
     // ── Block 2: rawFair + accrued credit crosses min_payout → on-chain
-    //    payout, pending clears. Same window proportions (re-recording
-    //    keeps the ratio identical, so rawFair per block is unchanged). ──
+    //    payout, pending clears. Re-recording keeps the ratio, so rawFair
+    //    per block is unchanged. ──
     h.engine
         .record_share(None, BIG, 1_000_000.0, ts(60_001))
         .await
@@ -1052,9 +992,8 @@ async fn pplns_sub_payout_credit_carries_forward_until_it_pays_out() {
     drop_harness(h).await;
 }
 
-/// Flush-before-prepare ordering (what `gate_or_apply_pplns` enforces):
-/// applying block 1 before preparing block 2 lets `totalPaidSats`
-/// accumulate across blocks.
+/// Applying block 1 before building block 2 accumulates `totalPaidSats`
+/// across blocks.
 #[tokio::test]
 async fn gated_apply_before_next_prepare_accumulates_total_paid() {
     let _serial = balance_table_lock().lock().await;
@@ -1071,7 +1010,7 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
     let h2: i32 = 9_996_102;
     cleanup_addr(&h.pool, MINER, &[h1, h2]).await;
 
-    // Block 1: freeze → APPLY.
+    // Block 1.
     h.engine
         .record_share(None, MINER, 100.0, ts(1))
         .await
@@ -1087,11 +1026,10 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         )
         .await
         .expect("prepare 1");
-    // (apply happens inside on_block_found now)
     let t1 = miner_total_paid(&h.pool, MINER).await;
     assert!(t1 > 0, "block 1 must credit the miner, got {t1}");
 
-    // Block 2: fresh snapshot, prepared AGAINST the post-block-1 ledger.
+    // Block 2: fresh snapshot, built against the post-block-1 ledger.
     h.engine
         .record_share(None, MINER, 100.0, ts(60_001))
         .await
@@ -1107,7 +1045,6 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
         )
         .await
         .expect("block 2");
-    // (apply happens inside on_block_found now)
     let t2 = miner_total_paid(&h.pool, MINER).await;
 
     assert_eq!(
@@ -1121,14 +1058,8 @@ async fn gated_apply_before_next_prepare_accumulates_total_paid() {
 }
 
 /// Two blocks applied back-to-back must both land — the second must not
-/// clobber the first.
-///
-/// This used to be a characterization test for the opposite: the apply
-/// re-based `balanceSats` onto the current row but wrote `totalPaidSats`
-/// as an absolute frozen at found-time, so block 2 reverted block 1's
-/// increment and a miner's lifetime-paid figure silently lost a block.
-/// The whole class is gone with the freeze — every write is a delta onto
-/// the row as it stands at apply time — and this pins that it stays gone.
+/// clobber the first. Every write, `totalPaidSats` included, is a delta onto
+/// the row as it stands at apply time.
 #[tokio::test]
 async fn two_blocks_in_sequence_both_accumulate() {
     let _serial = balance_table_lock().lock().await;
@@ -1142,7 +1073,7 @@ async fn two_blocks_in_sequence_both_accumulate() {
     let h2: i32 = 9_996_202;
     cleanup_addr(&h.pool, MINER, &[h1, h2]).await;
 
-    // Freeze block 1 (NOT applied).
+    // Block 1.
     h.engine
         .record_share(None, MINER, 100.0, ts(1))
         .await
@@ -1201,13 +1132,11 @@ async fn two_blocks_in_sequence_both_accumulate() {
 
 // ── Core-mode spawn — no background crons, read path intact ────────
 //
-// Contract B slice 1: a Core-mode engine (`spawn_core`) wires the same
-// window + distribution builder but skips the touch-flush + dust-sweep
-// crons (those mutate the ledger, which is the Satellite's job). We
-// prove the absence of the flush cron *observably*: record a share
-// (which marks the touch buffer), wait past the 1s flush cadence, and
-// assert the buffer never drained — a full engine would have flushed it
-// to empty. `build_distribution` (the Core's actual job) still works.
+// A Core-mode engine (`spawn_core`) wires the same window + distribution
+// builder but skips the touch-flush + dust-sweep crons, which mutate the
+// ledger and belong to the Satellite. The missing flush cron shows as a
+// touch buffer that does not drain past the 1s cadence;
+// `build_distribution` (the Core's job) still works.
 #[tokio::test]
 async fn spawn_core_skips_crons_but_build_distribution_works() {
     let prefix = "test_engine_core_";
@@ -1263,11 +1192,9 @@ fn _force_use(_: AddressId) {}
 
 // ── An unresolvable fingerprint must refuse, never fall back ────────
 //
-// The fingerprint asserts WHICH distribution the coinbase pays. If it
-// resolves to nothing that assertion cannot be honoured, and reading the
-// shared last-writer-wins key instead would book a distribution the coinbase
-// demonstrably did not pay — silently, since the shared copy carries the
-// right reward and passes the reward check.
+// The fingerprint names WHICH distribution the coinbase pays. Falling back
+// to the shared last-writer-wins key would book a distribution the coinbase
+// did not pay, and it would pass the reward check unnoticed.
 
 #[tokio::test]
 async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
@@ -1307,13 +1234,11 @@ async fn unknown_fingerprint_refuses_instead_of_booking_the_shared_key() {
     drop_harness(h).await;
 }
 
-// ── Apply consumes the snapshot the block was frozen from ───────────
+// ── A redelivered block-found writes nothing ─────────────────────────
 //
-// The block-found stream is at-least-once. If the fingerprinted snapshot
-// outlives its own block, a redelivered event re-prepares against the ledger
-// it already credited and double-credits `totalPaidSats`. Deleting on apply
-// is what makes the redelivery fail closed, exactly as it did before the
-// fingerprint key existed.
+// The block-found stream is at-least-once. The weight snapshot outlives the
+// apply (it serves every block of its distribution), so the payout-history
+// guard is what turns a redelivery into a no-op.
 
 #[tokio::test]
 async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() {
@@ -1344,11 +1269,9 @@ async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() 
         .on_block_found(height, &actual, None, Some(fp))
         .await
         .expect("prepare ok");
-    // (apply happens inside on_block_found now)
 
-    // The weight snapshot SURVIVES (it serves every block of this
-    // distribution) — redelivery is refused by the payout-history
-    // guard, not by consuming the snapshot.
+    // The weight snapshot survives; redelivery is refused by the
+    // payout-history guard.
     assert!(
         h.engine
             .window()
@@ -1386,12 +1309,10 @@ async fn apply_consumes_the_fingerprinted_snapshot_so_redelivery_fails_closed() 
 
 // ── A block frozen before another was applied still books correctly ──
 //
-// Two blocks can be in flight inside the confirmation window. The later one's
-// snapshot was written when its job was built — necessarily before the
-// earlier one was applied. Booking it must not undo the pay-down the earlier
-// coinbase just made: the snapshot's balances are applied as a DELTA against
-// the ledger as it stands at prepare time, not as the absolute it computed
-// against a ledger that has since moved.
+// Two blocks can be in flight inside the confirmation window, and the later
+// one's snapshot predates the earlier one's apply. Booking it must not undo
+// the earlier block: settlement is a DELTA against the ledger as it stands
+// at apply time, not an absolute computed against an older ledger.
 
 #[tokio::test]
 async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
@@ -1419,8 +1340,8 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
         .unwrap();
     h.engine.record_share(None, TINY, 1.0, ts(2)).await.unwrap();
 
-    // Two blocks in flight, BOTH frozen against the same (empty) ledger
-    // — and under the weight model from the SAME distribution snapshot.
+    // Two blocks in flight, both built against the same (empty) ledger and
+    // from the SAME distribution snapshot.
     let dist_first = h.engine.build_distribution(REWARD_FIRST).await.expect("ok");
     let dist_second = h
         .engine
@@ -1444,7 +1365,6 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
         )
         .await
         .expect("prepare first");
-    // (apply happens inside on_block_found now)
     let (accrued_once, _) = miner_balance_and_paid(&h.pool, TINY).await;
     assert!(
         accrued_once > 0,
@@ -1473,10 +1393,8 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
         )
         .await
         .expect("a block frozen before the apply must still be bookable");
-    // (apply happens inside on_block_found now)
 
-    // Writing the snapshot's ABSOLUTE would leave the credit at one block's
-    // worth — the second block's accrual silently lost.
+    // Two blocks' worth of accrual, not one.
     let (accrued_twice, _) = miner_balance_and_paid(&h.pool, TINY).await;
     assert!(
         accrued_twice > accrued_once,
@@ -1493,18 +1411,14 @@ async fn a_block_frozen_before_an_earlier_apply_still_books_correctly() {
 //
 // The distribution's `reference_revenue_sats` is only the base the
 // wire weights were projected against. Settlement books `claim − paid`
-// from the block's OWN coinbase, so it is right at any revenue.
-// Refusing to book on a wide reference drift used to leave the
-// balances the block had already paid standing in the ledger — and the
-// next block paid them out a second time, out of the other miners'
-// cut. Heights here sit in the current subsidy epoch (4 halvings →
-// 312 500 000 sats) so the gate is genuinely exercised rather than
-// passing on a synthetic height where the subsidy has decayed to 0.
+// from the block's OWN coinbase, so it is right at any revenue; not booking
+// would leave already-paid balances in the ledger to be paid again. Heights
+// here sit in subsidy epoch 4 (312 500 000 sats) so the subsidy gate is
+// really exercised, not passed on a height whose subsidy has decayed to 0.
 
-/// A block whose coinbase pays far outside the ±25 % band around the
-/// distribution's reference revenue MUST still be booked: the claims
-/// come from that coinbase, and dropping the block is what left the
-/// paid-out credits standing to be paid again.
+/// A block whose coinbase pays far off the distribution's reference revenue
+/// MUST still be booked: the claims come from that coinbase, and skipping it
+/// would leave the paid-out credits standing to be paid again.
 #[tokio::test]
 async fn a_block_far_off_the_reference_revenue_is_still_booked() {
     let _serial = balance_table_lock().lock().await;
@@ -1556,9 +1470,8 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
         .await
         .unwrap();
     let d2 = h.engine.build_distribution(T_REF).await.expect("build 2");
-    // The fixture's own statement, now that no production constant defines
-    // a band: T_ACTUAL must be FAR off the projection base, or the test
-    // would pass on a block that never exercised the drift.
+    // T_ACTUAL must be FAR off the projection base, or the test would pass
+    // on a block that never exercised the drift.
     const _: () = assert!(
         T_ACTUAL > T_REF + T_REF / 4,
         "the fixture must pay far off the revenue it was built against"
@@ -1572,7 +1485,6 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
         "the credit must buy TINY a real coinbase output, or this proves nothing"
     );
 
-    // THE REGRESSION: this returned `RewardOutOfBand` and booked nothing.
     h.engine
         .on_block_found(h2, &actual2, None, Some(d2.payouts_fingerprint()))
         .await
@@ -1607,9 +1519,9 @@ async fn a_block_far_off_the_reference_revenue_is_still_booked() {
     drop_harness(h).await;
 }
 
-/// The one thing settlement still refuses: a coinbase paying less than
-/// the block's own subsidy destroyed money it was entitled to. No
-/// mempool drift and no stale projection base can produce that.
+/// Settlement refuses a coinbase paying less than the block's own subsidy:
+/// it destroyed money it was entitled to, which no mempool drift or stale
+/// projection base can produce.
 #[tokio::test]
 async fn a_coinbase_below_the_block_subsidy_is_refused() {
     let _serial = balance_table_lock().lock().await;
@@ -1669,21 +1581,12 @@ async fn a_coinbase_below_the_block_subsidy_is_refused() {
 
 // ── The gated apply must not undo what moved underneath it ─────────
 //
-// A confirmation-gated block freezes ABSOLUTE post-block balances at
-// found-time and writes them ~3 blocks later, and the upsert sets
-// `balanceSats = EXCLUDED`. `gate_or_apply_pplns` already flushes an
-// earlier pending block before the next one freezes — that was the one
-// interleaving writer it knew about. The daily 03:00-UTC dust sweep is
-// the other, and it was not guarded.
+// A confirmation-gated block applies several blocks after it was found, and
+// the daily dust sweep can change the ledger in between.
 
-/// The sweep pair-cancels an abandoned credit against an abandoned
-/// debit and deletes both rows. If that lands between freeze and apply,
-/// writing the frozen absolute puts the credit back while the debit
-/// stays swept — the ledger then owes satoshis nobody owes it, and the
-/// next block pays them out of the other miners' cut.
-///
-/// Re-basing books what actually happened instead: the credit was
-/// cancelled AND the coinbase paid it out, so the holder owes it back.
+/// If the sweep cancels an abandoned credit between build and apply (here
+/// simulated by removing the row), the apply must not restore it: the credit
+/// was cancelled AND the coinbase paid it out, so the holder owes it back.
 #[tokio::test]
 async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
     let _serial = balance_table_lock().lock().await;
@@ -1721,9 +1624,7 @@ async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
         "the credit must buy a real coinbase output, or this proves nothing"
     );
 
-    // …the 03:00 sweep pair-cancels the credit and deletes the row
-    // BEFORE the block is applied. Under confirmation gating that gap is
-    // hours wide.
+    // The credit is swept away BEFORE the block is applied.
     sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
         .bind(DORMANT)
         .execute(&h.pool)
@@ -1735,10 +1636,8 @@ async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
         .await
         .expect("apply");
 
-    // The settlement reads the row as it stands NOW and books a delta
-    // onto it, so the swept row is not restored. Freezing an absolute
-    // post-block balance at found-time and writing it verbatim later was
-    // exactly the bug this guards: it would have put the credit back.
+    // Settlement reads the row as it stands at apply time and books a
+    // delta onto it, so the swept credit is not restored.
     let (after, _) = miner_balance_and_paid(&h.pool, DORMANT).await;
     assert!(
         after < 0,
@@ -1771,9 +1670,7 @@ async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
         "the credit must buy a real coinbase output, or this proves nothing"
     );
 
-    // …the 03:00 sweep pair-cancels the credit and deletes the row
-    // BEFORE the block is applied. Under confirmation gating that gap is
-    // hours wide.
+    // The credit is swept away BEFORE the block is applied.
     sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
         .bind(DORMANT)
         .execute(&h.pool)
@@ -1785,10 +1682,8 @@ async fn a_row_swept_between_freeze_and_apply_is_not_restored() {
         .await
         .expect("apply");
 
-    // The settlement reads the row as it stands NOW and books a delta
-    // onto it, so the swept row is not restored. Freezing an absolute
-    // post-block balance at found-time and writing it verbatim later was
-    // exactly the bug this guards: it would have put the credit back.
+    // Settlement reads the row as it stands at apply time and books a
+    // delta onto it, so the swept credit is not restored.
     let (after, _) = miner_balance_and_paid(&h.pool, DORMANT).await;
     assert!(
         after < 0,

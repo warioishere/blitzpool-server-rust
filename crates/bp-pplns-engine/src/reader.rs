@@ -4,9 +4,8 @@
 //!
 //! Each `ReaderView::*` method composes a Redis-window read with a
 //! Postgres ledger read into a typed response struct. `bp-api`
-//! serializes the struct to JSON; field names match the wire API so
-//! the existing UI keeps working across the cut-over without
-//! response-shape changes.
+//! serializes the struct to JSON; field names match the wire API the UI
+//! consumes.
 //!
 //! Endpoints served:
 //!
@@ -16,8 +15,7 @@
 //! - `/api/pplns/ledger` ⇒ [`ReaderView::ledger_summary`]
 //! - `/api/pplns/:address` ⇒ [`ReaderView::address_status`]
 //!
-//! `/api/pplns/:address/history` is deferred to a future
-//! consumer-driven bp-db read (per-address payout-history query).
+//! `/api/pplns/:address/history` is not served here.
 
 use bp_common::{AddressId, Sats};
 use bp_db::find_pplns_balance;
@@ -156,10 +154,8 @@ impl ReaderView<'_> {
         // input from the API just returns `Ok(None)` rather than 4xx —
         // permissive get-or-default behaviour.
         let Ok(addr_id) = AddressId::new(address.to_string()) else {
-            // Malformed → no balance row + no window contribution (we
-            // wouldn't have a HashMap entry for an invalid address
-            // either). Surface as Some with zeros if window had it,
-            // None otherwise.
+            // Malformed: no balance row can exist. Surface as Some with
+            // zeros if the window has it, None otherwise.
             return Ok(if current_window_shares > 0.0 {
                 Some(AddressStatus {
                     address: address.to_string(),
@@ -216,13 +212,11 @@ pub struct LedgerSummary {
     pub abandoned_credit_sats: i64,
     /// Σ of |negative balances| in the abandoned bucket.
     ///
-    /// ⚠️ Informational only, and easy to misread: the sweep does **not**
-    /// pair against this figure. It once did, which is exactly why it never
-    /// fired — a credit's counterparty is by construction someone who was
-    /// mining when the credit was withheld, so demanding the same inactivity
-    /// from both sides excluded every plausible partner. What this number
-    /// says is how much of the outstanding debt belongs to miners who are
-    /// themselves gone; a 0 here does not mean the sweep will pair nothing.
+    /// ⚠️ Informational only: the sweep does **not** pair against this
+    /// figure. A credit's counterparty is by construction someone who was
+    /// mining when the credit was withheld, so debits of any age qualify.
+    /// This says how much outstanding debt belongs to miners who are gone;
+    /// a 0 here does not mean the sweep will pair nothing.
     pub abandoned_debit_sats: i64,
     /// `abandoned_balance_days` configured for this engine — exposed
     /// so dashboards can render the cutoff age.
@@ -238,11 +232,9 @@ impl ReaderView<'_> {
         let now_ms = Utc::now().timestamp_millis();
         let cutoff_ms = crate::config::abandoned_cutoff_ms(now_ms, cfg.abandoned_balance_days);
 
-        // One PG round-trip — credit/debit sums, row counts, abandoned
-        // buckets and lifetime payout are all computed in SQL. The
-        // previous implementation fetched every non-zero balance row
-        // into Rust and looped, which scaled poorly as historical
-        // miner balances accumulated.
+        // One PG round-trip: sums, row counts, abandoned buckets and
+        // lifetime payout are computed in SQL, so no balance rows are
+        // fetched into Rust however many accumulate.
         let agg = bp_db::aggregate_pplns_balances(self.engine.pool(), cutoff_ms).await?;
 
         Ok(LedgerSummary {

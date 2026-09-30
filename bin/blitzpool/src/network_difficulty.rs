@@ -3,27 +3,19 @@
 //! Keep the PPLNS window's network-difficulty view current.
 //!
 //! The window is capped at `window_factor × networkDifficulty`
-//! ([`bp_pplns_engine::window::WindowStore::window_size`]). That value used
-//! to be read once, from `getmininginfo` at process start, and then never
-//! written again — `NetworkDifficulty::set` had no caller anywhere in the
-//! tree. `window_factor` therefore meant "x times the difficulty at the
-//! last restart", so a long-running payout process trimmed to a window
-//! spanning steadily fewer blocks than configured (difficulty trends up, so
-//! the frozen value is the smaller one and the window comes out short).
+//! ([`bp_pplns_engine::window::WindowStore::window_size`]), so the value
+//! is refreshed periodically; a value read only at boot would make the
+//! window mean "x times the difficulty at the last restart".
 //!
-//! **Why an RPC and not the TDP template stream**, which the old doc
-//! claimed: the value is read only by the trim, the trim runs only inside
-//! `record_share`, and `record_share` runs on the process that consumes the
-//! accepted-share stream — the `payout` role, which has no TDP feed. The
-//! Bitcoin RPC is the source that process actually has.
+//! **Why an RPC and not the TDP template stream:** the value is read only
+//! by the trim inside `record_share`, which runs on the `payout` role, and
+//! that process has no TDP feed.
 //!
 //! **Why the guard matters.** `window_size` returns `0.0` for a
-//! non-positive difficulty, and a zero window size disables trimming
-//! outright (deliberately — it is the "no difficulty seeded yet" state).
-//! So writing a bad reading does not merely mis-size the window, it stops
-//! the window from shedding anything at all and lets it grow without
-//! bound. A failed or nonsensical reading must leave the last good value
-//! in place.
+//! non-positive difficulty, and a zero window size disables trimming (the
+//! "no difficulty seeded yet" state). A bad reading would therefore let the
+//! window grow without bound, so a failed or nonsensical reading leaves the
+//! last good value in place.
 
 use std::time::Duration;
 
@@ -35,19 +27,15 @@ use tracing::{info, warn};
 
 /// How often the difficulty is re-read.
 ///
-/// Bitcoin retargets every 2016 blocks (~2 weeks), so this could be far
-/// slower and still be correct; `getmininginfo` is a local, cheap call and
-/// ten minutes keeps the window honest within one block of a retarget
-/// without being chatty.
+/// Bitcoin retargets every 2016 blocks; `getmininginfo` is a cheap local
+/// call, and ten minutes tracks a retarget within about one block.
 pub(crate) const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Is this reading usable as the live window difficulty?
 ///
-/// `None` ⇒ leave the previous value alone. Anything non-finite or
-/// non-positive is rejected because it would zero `window_size` and switch
-/// trimming off; a genuine difficulty is always positive, and a legitimate
-/// one can move by any factor (a retarget can halve it), so magnitude is
-/// deliberately NOT second-guessed here.
+/// `None` ⇒ leave the previous value alone. Non-finite or non-positive
+/// values would zero `window_size` and switch trimming off. Magnitude is
+/// deliberately not checked: a retarget can move difficulty by a large factor.
 fn usable_difficulty(raw: f64) -> Option<f64> {
     (raw.is_finite() && raw > 0.0).then_some(raw)
 }
@@ -113,12 +101,9 @@ pub(crate) fn spawn_refresh_task(
 mod tests {
     use super::*;
 
-    /// MONEY-adjacent: a bad reading must never be written.
-    ///
-    /// `window_size()` returns 0 for a non-positive difficulty, and a zero
-    /// window size disables the trim completely — so writing a 0 would not
-    /// mis-size the window, it would let it grow without bound and pay a
-    /// block over an ever-widening set of shares.
+    /// A bad reading is never written: a zero window size disables the trim,
+    /// so the window would grow without bound and pay a block over an
+    /// ever-widening set of shares.
     #[test]
     fn an_unusable_reading_is_rejected_rather_than_written() {
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -130,9 +115,8 @@ mod tests {
         }
     }
 
-    /// And a real reading IS accepted, at any magnitude — a retarget can
-    /// legitimately halve the difficulty, so nothing here may second-guess
-    /// how far it moved.
+    /// A real reading is accepted at any magnitude, since a retarget can
+    /// move the difficulty by a large factor.
     #[test]
     fn any_positive_finite_reading_is_accepted() {
         for good in [1.0, 0.06, 1e-8, 1.2e14, f64::MAX] {
@@ -140,9 +124,8 @@ mod tests {
         }
     }
 
-    /// The handle really is shared: a refresh must be observable through the
-    /// clone the `WindowStore` holds, or the task would update a private
-    /// copy and change nothing.
+    /// The handle is shared: a refresh is observable through the clone the
+    /// `WindowStore` holds.
     #[test]
     fn setting_the_handle_is_observed_by_its_clone() {
         let live = NetworkDifficulty::new(1_000.0);

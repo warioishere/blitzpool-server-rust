@@ -6,8 +6,7 @@
 //! hashrate sampler); the key/field schema both sides share is
 //! [`bp_common::live_client_key`]. This crate is the ONE
 //! implementation of "sum the live hashrate" — `bp-api` and
-//! `bp-notifications` both call it, so the two can't drift apart the
-//! way twin SQL aggregates could.
+//! `bp-notifications` both call it, so the two can't drift apart.
 //!
 //! Reading rules (the schema module explains why):
 //!
@@ -19,7 +18,7 @@
 //!   expired key with just that field.
 //! - `NotConfigured` (no Redis handle) is an error, not a silent 0 —
 //!   the caller decides whether its surface degrades to 0, an error
-//!   text, or a 500, exactly as it did for a failed SQL query.
+//!   text, or a 500.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -37,7 +36,7 @@ const FETCH_CHUNK: usize = 500;
 
 /// Upper bound for ONE Redis round-trip. A `ConnectionManager` whose
 /// connection is mid-reconnect makes every caller await its full retry
-/// ladder (minutes on redis-rs 0.27's defaults) before erroring. A
+/// ladder (minutes on redis-rs defaults) before erroring. A
 /// reader must fail fast instead — "no answer" is already a handled
 /// state everywhere this crate is consumed, and a minutes-long hang on
 /// `/api/pool` or the liveness sweep is strictly worse than an error.
@@ -144,10 +143,9 @@ async fn accumulate_rates(
     Ok(())
 }
 
-/// Sum of the live hashrate across every session in the pool — the
-/// replacement for the `SUM("hashRate") WHERE deletedAt IS NULL` SQL
-/// aggregate ("active" is now key-liveness: the TTL rides the same
-/// 5-minute clock the `kill_dead_clients` sweep used).
+/// Sum of the live hashrate across every session in the pool. "Active"
+/// means the live key exists: its TTL is the pool's 5-minute liveness
+/// clock.
 pub async fn pool_hashrate(redis: Option<&ConnectionManager>) -> Result<f64, LiveReadError> {
     let mut conn = redis.ok_or(LiveReadError::NotConfigured)?.clone();
     let keys = scan_live_keys(&mut conn).await?;
@@ -182,8 +180,7 @@ pub async fn hashrate_by_address(
 }
 
 /// Sum of the live hashrate across the supplied addresses. Empty input
-/// returns `0.0` without touching Redis (parity with the SQL reader it
-/// replaces).
+/// returns `0.0` without touching Redis.
 pub async fn hashrate_for_addresses(
     redis: Option<&ConnectionManager>,
     addresses: &[AddressId],
@@ -225,16 +222,12 @@ pub async fn delete_address_live_keys(
 /// leaving hashrate, current difficulty and channel count in place.
 /// Returns the number of fields removed.
 ///
-/// This is the session half of a best-difficulty reset: without it, a
-/// miner who reset their best still saw the old value on every worker
-/// row, because the reset only ever touched the per-address total.
+/// This is the session half of a best-difficulty reset: the per-address
+/// total alone would leave the old value on every worker row.
 ///
-/// `HDEL` rather than `HSET .. 0` on purpose: the touch script reads the
-/// previous value with `tonumber(redis.call('HGET', ...))`, and a
-/// missing field yields nil there, which its `if prev and prev > best`
-/// guard already treats as "no sample yet". Writing a literal 0 would
-/// work too, but it would claim a miner has a best of zero rather than
-/// none, and that is what the readers would then render.
+/// `HDEL` rather than `HSET .. 0`: the touch script treats a missing field
+/// as "no sample yet", while a literal 0 would render as a best of zero
+/// rather than none.
 ///
 /// Best-effort, like [`delete_address_live_keys`]: a share landing
 /// mid-clear re-establishes the field at that share's difficulty, which
@@ -288,9 +281,9 @@ pub async fn live_keys_exist<S: SessionKey>(
 
 /// The live half of one session, composed next to its PG birth row.
 ///
-/// Absence semantics: `hash_rate` / `best_difficulty` default to 0 (the
-/// same default the PG columns carried), the optionals to `None`. A
-/// session whose whole hash is missing comes back as `None` from
+/// Absence semantics: `hash_rate` / `best_difficulty` default to 0, the
+/// optionals to `None`. A session whose whole hash is missing comes back
+/// as `None` from
 /// [`live_fields_for_sessions`] — no shares inside the TTL, or evicted.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LiveFields {
@@ -378,15 +371,13 @@ pub struct UserAgentAgg {
     pub total_hash_rate: f64,
 }
 
-/// Group sessions by user agent and aggregate their live numbers —
-/// the ONE implementation replacing the two twin SQL aggregations
-/// (`find_user_agents` and the `/api/pplns` inline variant). Ordered by
-/// `count` descending, like the SQL `ORDER BY count DESC`.
+/// Group sessions by user agent and aggregate their live numbers — the
+/// ONE implementation behind `/api/info` and `/api/pplns`. Ordered by
+/// `count` descending.
 ///
-/// SQL parity quirk kept on purpose: `COUNT("userAgent")` counted
-/// non-NULL values, so the NULL-user-agent group reported `count = 0`
-/// while still carrying its sums. Consumers render that today; changing
-/// it is a display decision, not a refactor side effect.
+/// The NULL-user-agent group reports `count = 0` while still carrying its
+/// sums (`COUNT("userAgent")` semantics). Consumers render that; changing
+/// it is a display decision.
 pub async fn aggregate_by_user_agent(
     redis: Option<&ConnectionManager>,
     rows: &[UserAgentSessionRow],
@@ -540,8 +531,7 @@ mod tests {
             hashrate_for_addresses(None, std::slice::from_ref(&addr)).await,
             Err(LiveReadError::NotConfigured)
         ));
-        // The empty-input fast path never needs Redis — parity with the
-        // SQL reader's early return.
+        // The empty-input fast path never needs Redis.
         assert_eq!(hashrate_for_addresses(None, &[]).await.unwrap(), 0.0);
     }
 }

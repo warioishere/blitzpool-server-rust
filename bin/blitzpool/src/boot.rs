@@ -1,31 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Foundation-handle spawning — Phase 7.1.
+//! Foundation handles: [`boot`] builds every long-lived dependency the
+//! engines need, in dependency order.
 //!
-//! [`boot`] builds every long-lived dependency the Phase-7.2+ engines
-//! need, in dependency order:
-//!
-//! 1. **Postgres pool** — `sqlx::PgPool` via `bp_db::Db::connect_with`.
-//!    Essential. Connect failure → fatal.
-//! 2. **Redis** — `redis::aio::ConnectionManager`. Essential (PPLNS
-//!    window + group-solo round state both live there). Connect
-//!    failure → fatal.
-//! 3. **Bitcoin RPC** — `BitcoinRpc::new` + a single ping via
-//!    `getnetworkinfo`. Connect failure → fatal.
-//! 4. **TDP** — `TdpHandle::spawn` against the bitcoin-core IPC
-//!    socket. Spawn failure → fatal (no templates ⇒ no jobs ⇒ no
-//!    point in running).
-//! 5. **GeoIP** — optional. Lookup-cache only; if `ip-api.com` is
-//!    unreachable at boot the resolver still serves Stratum, just
-//!    without country/city labels on peer-info responses.
-//! 6. **Metrics** — optional. `/metrics` endpoint installation is a
-//!    process-global recorder install; if the bind port is in use we
-//!    warn-and-continue (the pool itself doesn't depend on the
-//!    exporter).
-//!
-//! Returns a [`FoundationHandles`] aggregate cloned + threaded into
-//! Phase 7.2's `run` function. Everything in `FoundationHandles` is
-//! cheaply cloneable (single `Arc` under the hood).
+//! 1. **Postgres**, **Redis** (PPLNS window and Group-Solo round state live
+//!    there) and **Bitcoin RPC** (with a `getnetworkinfo` ping): essential,
+//!    a failure is fatal.
+//! 2. **TDP** against the bitcoin-core IPC socket, front role only: fatal on
+//!    failure, since no templates means no jobs.
+//! 3. **GeoIP** and **Metrics**: optional; a failure is logged and the pool
+//!    runs without them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,14 +26,10 @@ use redis::aio::ConnectionManager;
 use thiserror::Error;
 use tracing::{info, warn};
 
-/// Long-lived runtime dependencies the engine wiring (Phase 7.2+)
-/// consumes. Clone-on-share; the underlying handles all share an
-/// `Arc` so duplicating this struct is cheap.
-// Phase 7.2+ wires every field into the engine layer + bp-api
-// AppState; consumers borrow the aggregate (`&FoundationHandles`)
-// and clone individual handles internally. `FoundationHandles`
-// itself is NOT `Clone` because `GeoIpServiceHandle` owns an
-// exclusive shutdown `oneshot` and can't satisfy the bound.
+/// Long-lived runtime dependencies the engine wiring consumes.
+// Consumers borrow the aggregate and clone individual handles. The struct
+// itself is not `Clone`: `GeoIpServiceHandle` owns an exclusive shutdown
+// `oneshot`.
 pub(crate) struct FoundationHandles {
     pub(crate) db: Db,
     pub(crate) redis: ConnectionManager,
@@ -104,29 +84,22 @@ pub(crate) enum BootError {
     BitcoinRpc(#[from] bp_bitcoin::RpcError),
     #[error("tdp spawn failed: {0}")]
     Tdp(#[from] bp_template_distribution::TdpError),
-    /// Construction succeeded but the initial liveness ping failed.
-    /// Surfaces a hint to the operator that the bitcoin-core process
-    /// likely isn't reachable / RPC creds are wrong / port is closed.
+    /// Construction succeeded but the initial liveness ping failed:
+    /// bitcoin-core unreachable, wrong RPC credentials or a closed port.
     #[error("bitcoin rpc liveness ping failed: {0}")]
     BitcoinRpcLiveness(bp_bitcoin::RpcError),
 }
 
-/// Boot-time flags that override the strict defaults. Currently
-/// only one knob (`skip_bitcoin_rpc_liveness`) — kept as a struct
-/// so additions in later sub-phases don't churn the call signature.
+/// Boot-time flags that override the strict defaults (staging only).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct BootOptions {
-    /// Skip the bitcoin-rpc `getnetworkinfo` liveness ping. The RPC
-    /// client itself still gets built; only the proof-of-reachability
-    /// is bypassed. Useful in staging where bitcoind isn't reachable
-    /// from the operator's workstation but the rest of the pool
-    /// stack (PG, Redis, HTTP) should still come up.
+    /// Skip the `getnetworkinfo` liveness ping; the RPC client is still
+    /// built. For staging where bitcoind is unreachable but PG, Redis and
+    /// HTTP should come up.
     pub(crate) skip_bitcoin_rpc_liveness: bool,
-    /// Skip TDP spawn entirely — leaves `FoundationHandles.tdp` as
-    /// an unused stub. The PPLNS network-difficulty bootstrap will
-    /// warn-and-default-to-1.0; bp-api `/info/block-template` will
-    /// return 503. Same staging affordance as the RPC liveness skip
-    /// — production should never set this.
+    /// Skip TDP spawn entirely: the PPLNS network-difficulty bootstrap
+    /// defaults to 1.0 and `/info/block-template` returns 503. Never in
+    /// production.
     pub(crate) skip_tdp: bool,
 }
 
@@ -139,11 +112,9 @@ pub(crate) async fn boot(
     let db = spawn_pg(&cfg.database).await?;
     let redis = spawn_redis(&cfg.redis).await?;
     let bitcoin_rpc = spawn_bitcoin_rpc(&cfg.bitcoin_rpc, opts.skip_bitcoin_rpc_liveness).await?;
-    // TDP is the template source for the share path + block submit — a
-    // front-only concern. Any process that doesn't run the `front` role
-    // (api / payout / stats) holds no Stratum listeners and never builds
-    // jobs, so it skips the TDP spawn entirely (and doesn't need the
-    // bitcoin-core IPC socket).
+    // TDP feeds the share path and block submit, a front-only concern; a
+    // process without the `front` role builds no jobs and needs no IPC
+    // socket.
     let (tdp, alt_tdp) = if opts.skip_tdp || !cfg.has_role(Role::Front) {
         if opts.skip_tdp {
             warn!(
@@ -159,10 +130,8 @@ pub(crate) async fn boot(
         let default_constraints = coinbase_constraints_from_pplns_budget(cfg.pplns.as_ref());
         let tdp = spawn_tdp_stream(&cfg.tdp, default_constraints, StreamKind::Pplns.as_label())?;
         // Alt streams: small FIXED reservations against the same socket, one
-        // per non-PPLNS mode. Each is sized so its mode's coinbase never
-        // overflows the reservation. Blockparty is only included when the
-        // feature is configured — an absent `[blockparty]` table means no
-        // Blockparty connections, so no stream.
+        // per non-PPLNS mode, each sized so its mode's coinbase never
+        // overflows it. Blockparty only when `[blockparty]` is configured.
         let mut alt_specs: Vec<(StreamKind, u32)> = vec![
             (StreamKind::Solo, cfg.solo.coinbase_weight_budget),
             (StreamKind::GroupSolo, cfg.group_fees.coinbase_weight_budget),
@@ -211,19 +180,17 @@ pub(crate) async fn spawn_pg(cfg: &DatabaseConfig) -> Result<Db, BootError> {
     );
     let db = Db::connect_with(&url, pool_cfg).await?;
     info!("postgres: connected");
-    // Apply pending schema migrations before serving. Advisory-locked +
-    // idempotent, so every process in the split can run it at boot — the
-    // first wins the lock and applies, the rest see them done.
+    // Apply pending migrations before serving. Advisory-locked and
+    // idempotent, so every process can run it at boot; the first applies.
     info!("postgres: applying migrations");
     db.run_migrations().await?;
     info!("postgres: migrations applied");
     Ok(db)
 }
 
-/// Build a libpq-style URL from the typed config. We URL-encode the
-/// password naively (`%`/`@`/`/` would break the URL otherwise); the
-/// `urlencoding` crate isn't worth a dep just for this so we do it
-/// inline. SSL is signalled via the `?sslmode=...` query parameter.
+/// Build a libpq-style URL from the typed config. User and password are
+/// percent-encoded (`@`, `:`, `/` would break the URL); SSL is signalled via
+/// `?sslmode=require`.
 fn build_pg_url(cfg: &DatabaseConfig) -> String {
     let user = encode_pg_url_component(&cfg.user);
     let password = encode_pg_url_component(&cfg.password);
@@ -314,10 +281,8 @@ async fn spawn_bitcoin_rpc(
         warn!("bitcoin rpc: liveness ping skipped via --skip-bitcoin-rpc-liveness");
         return Ok(rpc);
     }
-    // Single liveness ping. If bitcoind isn't reachable / creds wrong
-    // we surface a separate error variant so the operator sees a
-    // pointed hint rather than a generic `BitcoinRpc` failure later
-    // when the first share comes in.
+    // Liveness ping with its own error variant, so an unreachable node or
+    // wrong credentials fail at boot with a pointed message.
     rpc.get_network_info()
         .await
         .map_err(BootError::BitcoinRpcLiveness)?;
@@ -327,24 +292,12 @@ async fn spawn_bitcoin_rpc(
 
 // ─── TDP ──────────────────────────────────────────────────────────
 
-/// Headroom over the strict byte-equivalent of `coinbase_weight_budget`.
-/// `coinbase_weight_budget` is in BIP-141 weight units (witness-discount
-/// applied). For a coinbase whose extra outputs are all non-witness data,
-/// `bytes ≈ weight / 4`. We round up + add a small constant cushion so
-/// transient mismatch between our pre-trim weight estimate and the
-/// post-serialisation byte count never produces a coinbase larger than
-/// what bitcoin-core was told to reserve.
+/// Headroom over the byte-equivalent of `coinbase_weight_budget` (BIP-141
+/// weight units; `bytes ≈ weight / 4` for non-witness outputs), so a
+/// mismatch between the pre-trim weight estimate and the serialised size
+/// never yields a coinbase larger than bitcoin-core reserved.
 const TDP_COINBASE_SIZE_HEADROOM_BYTES: u32 = 256;
 
-/// Derive [`TdpCoinbaseConstraints`] from `pplns.coinbase_weight_budget`.
-///
-/// **Invariant**: bitcoin-core must be told via `CoinbaseOutputConstraints`
-/// IPC how much space the pool will append to coinbase outputs. If the
-/// PPLNS trimmer emits more bytes than core reserved, the resulting block
-/// exceeds template weight expectations and **bitcoin-core rejects it.**
-/// This conversion couples the trimmer's budget to the IPC-advertised
-/// constraint so the two can never drift apart through a TOML edit on one
-/// side alone.
 /// The `bitcoin` network a configured [`bp_config::Network`] parses and
 /// builds addresses for. testnet4 shares the `tb` HRP and address bytes with
 /// testnet3, and rust-bitcoin 0.32 has no Testnet4 variant, so both map to
@@ -357,26 +310,26 @@ pub(crate) fn bitcoin_network(n: bp_config::Network) -> bitcoin::Network {
     }
 }
 
-/// Derive the bitcoin-core `CoinbaseOutputConstraints` for a given coinbase
-/// weight budget. **Single source of truth** for the budget→reservation
-/// mapping — both the boot path and the runtime autoscaler
-/// ([`crate::coinbase_autoscaler`]) call this so core's reservation can never
-/// drift from what the PPLNS trimmer was told to fit.
+/// Derive the bitcoin-core `CoinbaseOutputConstraints` for a coinbase weight
+/// budget. **Single source of truth** for budget→reservation: the boot path
+/// and the runtime autoscaler ([`crate::coinbase_autoscaler`]) both call it,
+/// so core's reservation never drifts from what the trimmer fits. A coinbase
+/// larger than core reserved makes core reject the block.
 pub(crate) fn tdp_constraint_for_budget(weight_budget: u32) -> TdpCoinbaseConstraints {
-    // BIP-141 weight = (base × 3) + total. For non-witness-only coinbase
-    // outputs that's ~ 4 × bytes; we use ceil to err on the side of more
-    // headroom (operator never asked for less than `weight_budget` worth).
+    // Non-witness outputs weigh ~4 × bytes; ceil errs on the side of more
+    // headroom.
     let bytes_strict = weight_budget.div_ceil(4);
     let max_additional_size = bytes_strict.saturating_add(TDP_COINBASE_SIZE_HEADROOM_BYTES);
     TdpCoinbaseConstraints {
         max_additional_size,
-        // Coinbase outputs are paid-to-address scripts (P2PKH / P2SH /
-        // P2WPKH / P2WSH / P2TR + the witness commitment OP_RETURN); none
-        // of these execute opcodes that count as sigops. Keep at 0.
+        // Pay-to-address scripts and the witness commitment OP_RETURN
+        // count no sigops.
         max_additional_sigops: 0,
     }
 }
 
+/// The default stream's reservation, coupled to `pplns.coinbase_weight_budget`
+/// so a TOML edit cannot move the trimmer's budget without core's reservation.
 fn coinbase_constraints_from_pplns_budget(
     pplns: Option<&bp_config::PplnsConfig>,
 ) -> TdpCoinbaseConstraints {
@@ -386,10 +339,9 @@ fn coinbase_constraints_from_pplns_budget(
     tdp_constraint_for_budget(weight_budget)
 }
 
-/// Spawn one TDP worker against the IPC socket with a given coinbase
-/// reservation. The pool runs multiple streams (one per reservation class)
-/// against the SAME bitcoind — each is a separate IPC connection; `label`
-/// distinguishes them in logs.
+/// Spawn one TDP worker with a given coinbase reservation. Each reservation
+/// class is a separate IPC connection to the same bitcoind; `label` tells
+/// them apart in logs.
 fn spawn_tdp_stream(
     cfg: &TdpConfig,
     constraints: TdpCoinbaseConstraints,
@@ -420,12 +372,9 @@ fn spawn_tdp_stream(
 
 // ─── GeoIP (optional) ─────────────────────────────────────────────
 
-/// Construct the GeoIP service handle. Hard-codes `http://ip-api.com`
-/// and a 10-minute cache TTL (config knobs would be net-new). Failures
-/// only ever come from the `validate()` step (empty base URL) — never
-/// from network I/O.
-/// If the upstream service is unreachable at boot, lookups during
-/// the pool's runtime quietly cache `None` for 10 min.
+/// Construct the GeoIP service handle (`http://ip-api.com`, 10-minute cache
+/// TTL). Failures come only from config validation, never from network
+/// I/O; an unreachable upstream just caches `None` for 10 min.
 fn spawn_geoip() -> Option<GeoIpServiceHandle> {
     let cfg = GeoIpConfig::default();
     let client = match ReqwestGeoIpClient::new(cfg.base_url.clone(), Duration::from_secs(5)) {
@@ -449,13 +398,9 @@ fn spawn_geoip() -> Option<GeoIpServiceHandle> {
 
 // ─── Metrics (optional) ───────────────────────────────────────────
 
-/// Install the global Prometheus recorder + spawn the `/metrics`
-/// HTTP listener — gated on `[metrics] enabled = true` in the TOML
-/// (default off; the recorder calls aren't wired yet). If the bind
-/// port is already in use (another
-/// process / a previous instance that didn't release), we log and
-/// continue — the pool itself doesn't depend on the exporter being
-/// up; only operator dashboards do.
+/// Install the global Prometheus recorder and spawn the `/metrics`
+/// listener, gated on `[metrics] enabled = true` (default off). A bind
+/// failure is logged and ignored: only dashboards depend on the exporter.
 fn spawn_metrics(cfg: &bp_config::MetricsConfig) -> Option<MetricsServiceHandle> {
     if !cfg.enabled {
         info!("metrics: disabled ([metrics] enabled = false); set to true to expose /metrics");
@@ -534,8 +479,8 @@ mod tests {
         assert!(url.ends_with("?sslmode=require"));
     }
 
-    /// Parses the `redis://` URL the connection used to be opened from, so
-    /// the typed info is checked against the URL semantics it replaced.
+    /// Parses the equivalent `redis://` URL, so the typed info is checked
+    /// against URL semantics.
     fn redis_info_from_url(url: &str) -> redis::ConnectionInfo {
         redis::IntoConnectionInfo::into_connection_info(url).unwrap()
     }

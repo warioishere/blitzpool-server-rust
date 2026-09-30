@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! BIP-54 (Consensus Cleanup) compliance for blocks the Rust pool mines
+//! BIP-54 (Consensus Cleanup) compliance for blocks the pool mines
 //! through the SV2 TDP path against a real `bitcoin-node v31`.
 //!
-//! Rust analogue of sv2-apps PR #453 (`integration-tests/tests/bip54_compliance.rs`).
 //! BIP-54 requires that the coinbase transaction of every block:
 //!   * have its `nLockTime` set to `block_height - 1`,
 //!   * have its sole input's `nSequence` set to a non-final value (not `0xffffffff`), and
 //!   * have a witness-stripped serialized size that is not exactly 64 bytes.
 //!
-//! The Rust pool sources its coinbase fields from Core's `NewTemplate` over
-//! IPC. This test proves the full chain is BIP-54-compliant:
+//! The pool sources its coinbase fields from Core's `NewTemplate` over
+//! IPC. This test pins that the full chain is BIP-54-compliant:
 //!   1. Core 31's template provider emits `coinbase_tx_locktime = height-1`
 //!      and a non-final `coinbase_tx_input_sequence`,
 //!   2. the pool's [`build_mining_job_from_tdp`] preserves both fields in the
@@ -74,8 +73,8 @@ async fn coinbase_from_core31_template_is_bip54_compliant_and_accepted() {
 
     let (template, prev_hash) = wait_for_paired_template(&mut rx).await;
 
-    // The block we are about to mine sits on top of the current tip; its
-    // height is encoded in the coinbase scriptsig prefix (BIP-34).
+    // The block to be mined sits on top of the current tip; its height is
+    // encoded in the coinbase scriptsig prefix (BIP-34).
     let block_height =
         decode_bip34_height(&template.coinbase_prefix).expect("template carries a BIP-34 height");
 
@@ -127,7 +126,7 @@ async fn coinbase_from_core31_template_is_bip54_compliant_and_accepted() {
     check_coinbase_bip54(&non_witness, block_height)
         .expect("pool-built coinbase must satisfy BIP-54");
 
-    // Plus explicit parsed-field assertions (the PR #453 checks).
+    // Plus explicit parsed-field assertions.
     let tx = bitcoin::Transaction::consensus_decode(&mut non_witness.as_slice())
         .expect("coinbase must round-trip through rust-bitcoin");
     assert!(tx.is_coinbase(), "first tx must be a coinbase");
@@ -181,9 +180,9 @@ async fn coinbase_from_core31_template_is_bip54_compliant_and_accepted() {
         "chain must advance by exactly one block (got {after_height}, expected {})",
         before_height + 1
     );
-    // We submitted exactly `non_witness` (witness-wrapped); acceptance at
-    // height `block_height` proves those coinbase bytes — and thus the
-    // asserted BIP-54 invariants — pass full consensus validation.
+    // The submitted coinbase is exactly `non_witness` (witness-wrapped), so
+    // acceptance at `block_height` means those bytes, and the asserted
+    // BIP-54 invariants, pass full consensus validation.
     assert_eq!(
         after_height, block_height,
         "accepted tip height must match the coinbase's BIP-34 height"
@@ -192,5 +191,3 @@ async fn coinbase_from_core31_template_is_bip54_compliant_and_accepted() {
     tdp.shutdown().expect("TDP clean shutdown");
     node.shutdown().await.expect("regtest clean shutdown");
 }
-
-// ── Helpers (mirrors crates/bp-mining-job/tests/regtest_e2e.rs) ────────

@@ -5,8 +5,8 @@
 //!
 //! Fields mirror the JSON output of bitcoin-core v29+. Fields that may be
 //! absent in older / newer versions are wrapped in `Option`. Unknown
-//! fields are silently ignored by `serde` so adding new fields in future
-//! bitcoind releases does not break us.
+//! fields are silently ignored by `serde` so new fields in future
+//! bitcoind releases do not break parsing.
 
 use serde::{Deserialize, Serialize};
 
@@ -111,10 +111,9 @@ mod tests {
 
     // ---- Fixture-based parsing tests ----
     //
-    // These exercise just the deserialization side of bitcoin-core's RPC
-    // output. They don't validate the SQL/HTTP wire path (that's phase-3
-    // regtest territory) — they catch shape-drift between our struct
-    // definitions and the JSON the daemon actually emits.
+    // These exercise only the deserialization of bitcoin-core's RPC output
+    // (the HTTP path is covered by the regtests) — they catch shape-drift
+    // between the struct definitions and the JSON the daemon emits.
 
     #[test]
     fn block_header_in_chain_parses_positive_confirmations() {
@@ -204,8 +203,8 @@ mod tests {
 
     #[test]
     fn mining_info_parses_minimal_subset() {
-        // Older / pruned builds might omit currentblock*. Our struct
-        // marks those optional so this should still parse.
+        // Older / pruned builds might omit currentblock*. The struct
+        // marks those optional so this still parses.
         let json = r#"{
             "blocks": 851234,
             "difficulty": 79351641.4,

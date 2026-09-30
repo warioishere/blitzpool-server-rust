@@ -87,8 +87,8 @@ pub struct CommandHandler {
 
 impl CommandHandler {
     /// Build a handler with only the adapter sinks wired — engine
-    /// readers default to `None` (read commands fall back to the
-    /// deferred-stub reply). Use [`Self::with_engines`] to attach
+    /// readers default to `None` (engine read commands fall back to a
+    /// not-configured reply). Use [`Self::with_engines`] to attach
     /// engine handles.
     pub fn new(
         pool: PgPool,
@@ -131,8 +131,7 @@ impl CommandHandler {
     /// Attach engine-reader handles so the engine-driven read
     /// commands (`/pplns_status`, `/pplns_top`, `/group_status`,
     /// `/group_members`, `/show_workers`) can answer with live data
-    /// instead of the "noch nicht verfügbar"-fallback. Returns the
-    /// same handler for builder-style chaining at Phase-7 setup.
+    /// instead of the not-configured fallback. Builder-style.
     pub fn with_engines(
         mut self,
         pplns: Option<Arc<bp_pplns_engine::engine::PplnsEngine>>,
@@ -948,10 +947,9 @@ impl CommandHandler {
         lang: Language,
         target: Option<&str>,
     ) -> String {
-        // ntfy resets the origin address immediately. (Telegram goes
-        // through `send_bestdiff_confirm` — the yes/no inline keyboard —
-        // and never reaches this handler; the arms below stay only for
-        // a possible explicit-address Telegram path / exhaustiveness.)
+        // ntfy resets the origin address immediately. Telegram normally
+        // goes through the `send_bestdiff_confirm` yes/no keyboard; its
+        // arms below keep the match exhaustive.
         let candidates: Vec<AddressId> = match (transport, target) {
             (_, Some(addr)) => match parse_address(addr) {
                 Some(a) => vec![a],
@@ -1087,11 +1085,9 @@ impl CommandHandler {
     }
 
     /// Resolve the contextual address for read commands. For ntfy the
-    /// topic IS the address. For Telegram we walk the chat's
-    /// subscriptions and pick the `is_default=true` row — if there's
-    /// only one subscription the default-flag is implicit. Returns
-    /// `None` when no candidate can be found, so the caller can
-    /// emit the "please supply an address" reply.
+    /// topic IS the address. For Telegram it is the chat's
+    /// `is_default=true` subscription, or the only one if there is just
+    /// one. `None` lets the caller ask for an address.
     async fn origin_address(&self, transport: &Transport) -> Option<AddressId> {
         match transport {
             Transport::Ntfy { address } => Some(address.clone()),

@@ -21,8 +21,8 @@ pub struct BudgetTelemetry {
     /// The cut threshold actually applied this build (`budget` minus the
     /// safety margin). Denominator for the utilization ratio.
     pub effective_budget: u32,
-    /// How many miners the budget folded into `weight_P` (settled
-    /// off-chain via their balance instead of an own output).
+    /// How many miners the blockspace cut dropped from the published set
+    /// (settled via their balance instead of an own output).
     pub trimmed_count: u32,
 }
 

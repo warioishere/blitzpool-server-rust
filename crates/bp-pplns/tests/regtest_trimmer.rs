@@ -4,7 +4,7 @@
 //! weight model) end-to-end against a real `bitcoin-node v31` regtest
 //! validator.
 //!
-//! Architecturally this closes the loop between three layers:
+//! It covers three layers:
 //!
 //! 1. **Cut math** (`bp_pplns::build_weight_distribution`) — orders the
 //!    candidates in the §4 coinbase order (wire weight desc, address
@@ -12,10 +12,8 @@
 //!    coinbase weight (structural base + safety margin + witness
 //!    commitment + one worst-case pool output + *actual per-address
 //!    output weights*: 124 WU P2WPKH, 172 WU P2TR) fits the configured
-//!    `coinbase_weight_budget`. Folded miners' wire weights move into
-//!    `weight_P` (§3.1 blesses `weight_P` carrying value held on behalf
-//!    of unrepresented miners) — they get no on-chain output but keep
-//!    their settlement claim.
+//!    `coinbase_weight_budget`. Cut miners leave the published set:
+//!    they get no on-chain output but keep their settlement claim.
 //! 2. **§4 evaluation + bytes assembly** —
 //!    `WeightDistribution::payout_entries_at(T)` yields the concrete
 //!    `(address, sats)` vector (pool output first, `floor(weight·T/W)`
@@ -47,10 +45,9 @@
 //! ## What this regtest guards that unit tests can't
 //!
 //! - **`max_additional_size` coupling** (bin/blitzpool's
-//!   `coinbase_constraints_from_pplns_budget`) — bitcoin-core was told
-//!   how much room to reserve based on `coinbase_weight_budget`; the
-//!   cut's output must actually fit, or core rejects the found block
-//!   (an overweight coinbase = rejected block = lost money).
+//!   `coinbase_constraints_from_pplns_budget`) — bitcoin-core reserves
+//!   room based on `coinbase_weight_budget`; the cut's output must
+//!   actually fit, or core rejects the found block.
 //! - **End-to-end SegWit block weight**: `total_block_weight ≤ 4 M`
 //!   including the witness commitment + the coinbase witness.
 //! - **Bytes-acceptance per address type** under realistic mix — the
@@ -136,8 +133,7 @@ async fn pplns_blockspace_cut_pure_p2wpkh_fits_about_396_in_budget_50000() {
         coinbase_weight_wu, 49_788,
         "pure P2WPKH coinbase weight drifted (expected 49788 WU, got {coinbase_weight_wu})"
     );
-    // Hard invariant kept as defense-in-depth — if the equality above
-    // is loosened in a future refactor this still pins the budget cap.
+    // Pins the budget cap even if the exact equality above is loosened.
     assert!(
         coinbase_weight_wu <= BUDGET,
         "coinbase weight {coinbase_weight_wu} WU exceeded budget {BUDGET} WU"
@@ -215,7 +211,7 @@ async fn pplns_blockspace_cut_mixed_5050_lands_between_extremes() {
 /// 2. Build the §4 `WeightDistributionInput` from the miner list with
 ///    1 share each + the configured budget.
 /// 3. Call `build_weight_distribution` → assert the cut fired and the
-///    folded miners kept their settlement entries (wire_weight == 0).
+///    cut miners kept their settlement entries (wire_weight == 0).
 /// 4. Evaluate `payout_entries_at(T)` for the template's revenue →
 ///    `Vec<PayoutEntry>` → TDP+MiningJob.
 /// 5. Brute-force a nonce + submit_solution.
@@ -279,12 +275,8 @@ async fn run_trim_scenario(
         "a firing cut implies utilization ≥ 1.0 (got {})",
         dist.budget_telemetry.utilization()
     );
-    // §4-model replacement for the former trim-redistribution check:
-    // the old allocator debited trimmed miners and redistributed their
-    // sats to kept ones; the weight model instead folds their wire
-    // weight into `weight_P` (§3.1) — folded miners get NO output but
-    // remain in `entries` with `wire_weight == 0` and their settlement
-    // score intact.
+    // Cut miners get NO output but remain in `entries` with
+    // `wire_weight == 0` and their settlement score intact.
     assert_eq!(
         dist.entries.len(),
         pushed_count,

@@ -2,11 +2,10 @@
 
 //! Unit-level fan-out tests for the share-hook impls. No PG, no flush.
 //!
-//! The hooks impl `bp_share_hook`'s protocol-agnostic traits. SV1+SV2
-//! servers project their native
-//! `ShareAccept` / `ShareReject` into the shared view via adapters in
-//! the respective `bp-stratum-v{1,2}::shared_adapter` modules — tests
-//! here drive the shared view directly.
+//! The hooks impl `bp_share_hook`'s protocol-agnostic traits; the SV1 and
+//! SV2 servers project their native `ShareAccept` / `ShareReject` into the
+//! shared view in their `shared_adapter` modules. These tests drive the
+//! shared view directly.
 
 use std::sync::Arc;
 

@@ -2,19 +2,17 @@
 
 //! `GroupSoloEngineConfig` — engine-wide tunables.
 //!
-//! Per-group settings (`finder_bonus_sats`, `round_reset_preset`,
+//! Per-group settings (`finder_bonus_ppm`, `round_reset_preset`,
 //! `round_reset_timezone`, `round_reset_interval_days`) live in the
-//! `pplns_group` DB row keyed by `groupId`. The engine reads those
-//! on demand at `get_payout_distribution` / round-reset time. Only
-//! knobs that apply across *all* groups live here.
+//! `pplns_group` DB row keyed by `groupId` and are read on demand at
+//! distribution-build / round-reset time. Only knobs that apply across
+//! *all* groups live here.
 //!
-//! Several fee/min-payout/weight-budget knobs are intentionally duplicated
-//! with `bp_pplns_engine::config::PplnsEngineConfig`: each engine owns its own
-//! typed config and `bin/blitzpool` populates both from the TOML. They are NOT
-//! one source — `[group_fees]` carries this engine's fee address, percent and
-//! weight budget, `[pplns]` the other's, and they routinely differ (a pool can
-//! run 1 % PPLNS and 1.5 % on the group lane). Only the fee **address** falls
-//! back from `[group_fees].address` to `[pplns].fee_address`.
+//! The fee/min-payout/weight-budget knobs mirror
+//! `bp_pplns_engine::config::PplnsEngineConfig` on purpose but are separate
+//! values: `[group_fees]` feeds this engine, `[pplns]` the other, and they
+//! may differ. Only the fee **address** falls back from
+//! `[group_fees].address` to `[pplns].fee_address`.
 
 use bp_common::{AddressId, Sats};
 use bp_pplns::{
@@ -25,11 +23,9 @@ use bp_pplns::{
 /// Engine-wide construction knobs.
 #[derive(Debug, Clone)]
 pub struct GroupSoloEngineConfig {
-    /// Coinbase output that receives the pool fee — and, under the weight
-    /// model, the §4 residual `pay_P`. **Required**, and
-    /// [`Self::try_new`] refuses without it, exactly as the PPLNS engine
-    /// does (the check lives in the one shared
-    /// `bp_pplns::validate_fee_payout_budget`, so the two cannot drift).
+    /// Coinbase output that receives the pool fee and the §4 residual
+    /// `pay_P`. **Required**: [`Self::try_new`] refuses without it, via the
+    /// check shared with the PPLNS engine (`bp_pplns::validate_fee_payout_budget`).
     ///
     /// Resolved from `[group_fees].address` with a fallback to
     /// `[pplns].fee_address`; a pool that sets neither cannot pay a
@@ -40,16 +36,15 @@ pub struct GroupSoloEngineConfig {
     pub fee_percent: f64,
 
     /// Operational minimum on-chain payout. A member below this gets NO
-    /// output, and their share falls into the §4 residual — i.e. to the pool
-    /// (`WithheldValue::ToPool`). There is no group ledger and no
-    /// carry-forward: Group-Solo remembers nothing between blocks, which is
-    /// what `GroupService`'s coinbase-capacity cap on membership buys.
+    /// output, and their share falls into the §4 residual, i.e. to the pool
+    /// (`WithheldValue::ToPool`). No group ledger and no carry-forward: that
+    /// holds only while `GroupService` caps membership at coinbase capacity.
     /// Clamped upward to `DUST_LIMIT_SATS` (546).
     pub min_payout_sats: Sats,
 
     /// Coinbase weight budget (WU). Handed straight to bitcoin-core
-    /// over the Group-Solo TDP IPC stream — there is no `bitcoin.conf`
-    /// knob to keep in sync. `[group_fees] coinbase_weight_budget`;
+    /// over the Group-Solo TDP IPC stream, so no `bitcoin.conf` knob
+    /// needs to match. `[group_fees] coinbase_weight_budget`;
     /// floored at `bp_pplns::MIN_COINBASE_WEIGHT_BUDGET`.
     pub coinbase_weight_budget: u32,
 
@@ -57,12 +52,11 @@ pub struct GroupSoloEngineConfig {
     pub snapshot_ttl_secs: u32,
 
     /// Blocks between subsidy halvings on the network this pool runs
-    /// on — the input to the settlement gate's floor
+    /// on, the input to the settlement gate's floor
     /// (`bp_share::block_subsidy_sats`). NOT an operator knob: it is
-    /// derived from the configured network at boot, because regtest
-    /// halves every 150 blocks and the mainnet 210 000 would make
-    /// every regtest block past height 150 look like it had burned
-    /// part of its own subsidy.
+    /// derived from the configured network at boot, since regtest halves
+    /// every 150 blocks and the mainnet 210 000 would make every regtest
+    /// block past height 150 look like it burned part of its subsidy.
     pub subsidy_halving_interval: u32,
 }
 
@@ -80,13 +74,11 @@ impl Default for GroupSoloEngineConfig {
 }
 
 impl GroupSoloEngineConfig {
-    /// Validate field-level invariants. Mirrors
-    /// `PplnsEngineConfig::try_new` so the two engines accept the
-    /// same env values cleanly.
+    /// Validate field-level invariants, the same way
+    /// `PplnsEngineConfig::try_new` does.
     pub fn try_new(self) -> Result<Self, ConfigError> {
-        // The fee / min-payout / coinbase-budget invariants are shared with
-        // the PPLNS engine; the checks + thresholds live in bp-pplns and map
-        // into this engine's ConfigError via `From` (field order preserved).
+        // The fee / min-payout / coinbase-budget checks live in bp-pplns,
+        // shared with the PPLNS engine, and map into ConfigError via `From`.
         validate_fee_payout_budget(
             self.fee_address.as_ref().map(|a| a.as_str()),
             self.fee_percent,
@@ -129,9 +121,8 @@ mod tests {
         }
     }
 
-    /// The pool output is structural under §4, so there is no such thing
-    /// as a usable config without one — and a pool that boots without it
-    /// pays 100 % of every block to whichever miner connected.
+    /// The pool output is structural under §4, so no config without a fee
+    /// address is usable.
     #[test]
     fn the_default_config_is_refused_because_it_has_no_fee_address() {
         assert_eq!(
@@ -247,11 +238,7 @@ mod tests {
         );
     }
 
-    /// A non-zero fee still validates. (The `fee_suppressed()` helper this
-    /// used to also assert on is gone: it answered "is there a fee output?"
-    /// with `fee_address.is_none() || fee_percent <= 0.0`, and §4 makes the
-    /// pool output structural at every fee. Nothing in production read it —
-    /// the same dead assumption that put `max_coinbase_outputs` one over.)
+    /// A non-zero fee validates.
     #[test]
     fn a_non_zero_fee_validates() {
         GroupSoloEngineConfig {

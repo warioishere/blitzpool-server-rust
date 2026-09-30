@@ -2,7 +2,7 @@
 
 //! Buffered share-touch flusher.
 //!
-//! On the share hot path we collect per-session updates (best-diff sample,
+//! The share hot path collects per-session updates (best-diff sample,
 //! current vardiff target, channel count, last-seen) in a shared
 //! [`TouchBuffer`] and flush them every [`flush_interval`](super::config)
 //! into the per-session `client:live:*` Redis hashes (see
@@ -30,7 +30,7 @@ use tracing::{debug, warn};
 
 use crate::live_store::LiveSessionStore;
 
-/// Buffer key. Matches the natural PK of the per-share UPDATE
+/// Buffer key: the session row's natural key
 /// (address + clientName + sessionId).
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct TouchKey {
@@ -67,8 +67,8 @@ impl TouchKeyRef<'_> {
 // `Hash` must feed the hasher the same bytes as `TouchKey`'s derived
 // `Hash` so a `TouchKeyRef` lookup lands on a `TouchKey`-inserted entry:
 // derive(Hash) on the struct hashes address, client_name, session_id in
-// declaration order, and `str`/`String` hash identically — so we hash the
-// same three in the same order. The `hashbrown_lookup_matches_owned_key`
+// declaration order, and `str`/`String` hash identically, so this hashes
+// the same three in the same order. The `hashbrown_lookup_matches_owned_key`
 // test pins this invariant.
 impl std::hash::Hash for TouchKeyRef<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -118,10 +118,8 @@ impl Default for TouchBuffer {
 
 impl TouchBuffer {
     /// Lock the map, recovering the guard if a previous holder panicked
-    /// (poisoning). The critical sections here can't panic, but recovering
-    /// instead of `.expect()`-panicking keeps a stray poison from turning
-    /// every subsequent accepted share into a panic — same posture as the
-    /// engine's shutdown path.
+    /// (poisoning), so a stray poison cannot turn every subsequent
+    /// accepted share into a panic.
     fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<TouchKey, TouchEntry>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -141,11 +139,9 @@ impl TouchBuffer {
         channel_count: i32,
         updated_at_ms: i64,
     ) {
-        // Keep non-finite values out of the buffer entirely — the same
-        // guard the hashrate sampler has. They would reach Redis as
-        // "inf"/"NaN", which the write script's `tonumber` rejects and a
-        // reader's `parse::<f64>()` happily turns into an infinity that
-        // poisons every sum it lands in.
+        // Keep non-finite values out of the buffer (as the hashrate
+        // sampler does): stored as "inf"/"NaN" in Redis, a reader's
+        // `parse::<f64>()` turns them into values that poison every sum.
         if !share_diff.is_finite() {
             return;
         }
@@ -188,8 +184,8 @@ impl TouchBuffer {
     /// after a failed flush. Live writes (concurrent shares that landed
     /// after the drain) are newer than the snapshot, so for the
     /// "latest-wins" fields they win unconditionally — the snapshot
-    /// only fills `None` slots. For `share_diff` we still take the
-    /// running max (kommutativ).
+    /// only fills `None` slots. `share_diff` takes the running max, which
+    /// is commutative.
     fn rebuffer(&self, snap: HashMap<TouchKey, TouchEntry>) {
         let mut guard = self.guard();
         for (k, v) in snap {
@@ -210,7 +206,7 @@ impl TouchBuffer {
         }
     }
 
-    /// Snapshot size — used by tests + lib metrics surface.
+    /// Number of buffered sessions.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.guard().len()
@@ -371,9 +367,8 @@ mod tests {
     }
 
     /// Non-finite samples never enter the buffer: they would reach
-    /// Redis as "inf"/"NaN", which the write script cannot parse and a
-    /// reader's `parse::<f64>()` turns into an infinity that poisons
-    /// every sum it lands in.
+    /// Redis as "inf"/"NaN", which a reader's `parse::<f64>()` turns
+    /// into values that poison every sum they land in.
     #[test]
     fn non_finite_samples_are_dropped_at_the_door() {
         let b = TouchBuffer::default();

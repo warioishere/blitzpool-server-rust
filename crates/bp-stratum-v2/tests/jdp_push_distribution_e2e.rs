@@ -28,17 +28,14 @@
 //!    the extension being un-negotiated).
 //! 7. **The JDP → Mining seam** — an accepted declaration is resolvable in the
 //!    bridge under its issued token, carrying the binding, the declared tip
-//!    and the ext 0x0003/distribution_id TLV Field. That is everything the
-//!    mining connection judges a Full-Template `SetCustomMiningJob` against,
-//!    and it was previously untested: removing the registration call left the
-//!    whole suite green.
+//!    and the ext 0x0003/distribution_id TLV Field: everything the mining
+//!    connection judges a Full-Template `SetCustomMiningJob` against.
 //! 8. **SV2 JDP/AllocateMiningJobToken.Success base protocol** — a connection
 //!    that never negotiates 0x0003 is answered with exactly ONE designated
 //!    payout output at 0 sats paying the miner itself, and that token reaches
 //!    the bridge as an allocation. Coinbase-only mode never declares
 //!    (SV2 JDP/Coinbase-only Mode), so this allocate is the only record the
-//!    mining
-//!    side will have of it.
+//!    mining side has of it.
 //!
 //! Needs no bitcoin-node / TDP / PG — declare-time validation runs
 //! entirely against the published distribution.
@@ -179,11 +176,9 @@ impl CurrentPrevHashProvider for FixedPrevHash {
 /// otherwise the one SV2 JDP/AllocateMiningJobToken.Success designated payout
 /// output at 0 sats paying the miner itself.
 ///
-/// It has to be spelled out here rather than borrowed from
-/// [`JdpServerHooks::no_op`], whose base-path answer is an EMPTY output
-/// vector. That designates nothing, so the base-protocol allocation would
-/// register nothing in the bridge and the assertions below would pass
-/// against a pool that serves no Coinbase-only JDC at all.
+/// Spelled out rather than borrowed from [`JdpServerHooks::no_op`], whose
+/// base-path answer is an EMPTY output vector: that registers nothing in the
+/// bridge, and the base-protocol assertions would prove nothing.
 struct BaseModeAllocateResolver;
 
 #[async_trait]
@@ -426,13 +421,9 @@ async fn jdp_push_distribution_end_to_end() {
     // all.
     //
     // No race: the registration happens BEFORE the Success frame is
-    // written (see `run_jdp_connection`), so holding the frame means the
-    // entry is already there.
-    //
-    // This seam had no coverage. Disabling the registration call
-    // outright left all 447 unit tests and every integration test green,
-    // while every real Full-Template JDC would have been answered
-    // `invalid-mining-job-token` — fatal for an SRI jd-client.
+    // written, so holding the frame means the entry is already there.
+    // Without it every Full-Template JDC is answered
+    // `invalid-mining-job-token`, which clients treat as fatal.
     let declared_token =
         Token(<[u8; 16]>::try_from(declared_token.as_slice()).expect("16-byte job token"));
     let job_ref = bridge
@@ -611,11 +602,9 @@ async fn jdp_push_distribution_end_to_end() {
     // ── Connection 3: a refused setup is answered, then closed ────────
     //
     // SV2 Overview/SetupConnection.Error: `SetupConnection.Error` is sent
-    // "prior to closing the connection". Both halves matter and are asserted
-    // here: the client must LEARN why (the error frame arrives), and the
-    // socket must then go (the next read ends). Without the close the pool
-    // holds an FD for a session that can do nothing — there is no idle timeout
-    // on this path.
+    // "prior to closing the connection". Both halves are asserted: the error
+    // frame arrives, then the socket closes. Without the close the pool holds
+    // an FD for a session that can do nothing; this path has no idle timeout.
     let (mut reader3, mut writer3) = connect_jdc(addr).await;
     write_msg(&mut writer3, setup_connection_wrong_protocol(addr.port())).await;
     match read_jdc(&mut reader3).await {
@@ -630,8 +619,7 @@ async fn jdp_push_distribution_end_to_end() {
         other => panic!("expected SetupConnectionError, got {other:?}"),
     }
     // The server closes: reading again ends rather than hanging. A
-    // timeout here means the connection stayed open — the bug this
-    // asserts against.
+    // timeout here means the connection stayed open.
     let after = tokio::time::timeout(Duration::from_secs(5), reader3.read_frame()).await;
     match after {
         Ok(Err(_)) => {}
@@ -646,8 +634,7 @@ async fn jdp_push_distribution_end_to_end() {
     // is the pool's ONLY record of the token — the mining connection resolves
     // it here and holds the custom job's coinbase to the script registered
     // with it. Without the entry this JDC is answered
-    // `invalid-mining-job-token` on every job it ever builds, which an SRI
-    // jd-client treats as fatal.
+    // `invalid-mining-job-token` on every job, which clients treat as fatal.
     let (mut reader4, mut writer4) = connect_jdc(addr).await;
     write_msg(&mut writer4, setup_connection_coinbase_only(addr.port())).await;
     expect_setup_success(read_jdc(&mut reader4).await);
@@ -738,9 +725,9 @@ const SCRIPT_SIG_HEAD: [u8; 3] = [0x03, 0xC8, 0x00];
 /// one input, the null outpoint, the scriptSig length, then a BIP-34 height
 /// push. It stops where the extranonce slot begins.
 ///
-/// This used to be `b"cb-prefix"`. The declare-time validation now rebuilds the
-/// whole transaction from prefix + zeroed slot + suffix (the slot width comes
-/// out of the prefix's scriptSig length), so a placeholder no longer parses.
+/// It has to parse: declare-time validation rebuilds the whole transaction
+/// from prefix + zeroed slot + suffix, taking the slot width from the
+/// prefix's scriptSig length.
 fn coinbase_prefix() -> Vec<u8> {
     use bitcoin::consensus::Encodable;
     let mut p = Vec::new();
@@ -1058,17 +1045,13 @@ async fn try_read_jdc(reader: &mut Reader, within: Duration) -> Option<JdcInboun
 /// and publish as soon as it becomes known — driven by the next inbound frame,
 /// not by a timer.
 ///
-/// This is the state machine itself, over a real Noise connection, because
-/// that is the part the pure decision tests cannot reach: `build_for_miner`
-/// answering `ModeUnknown` is one thing, the loop then holding back the push,
-/// keeping pool-wide denied and retrying on the next frame is another.
+/// Runs the session loop over a real Noise connection, since holding back
+/// the push and retrying on the next frame is beyond the pure decision tests.
 ///
-/// ⭐ The publisher interval here is **one hour**. So the distribution that
-/// arrives in the second half cannot have come from the publisher's tick —
-/// only the per-frame retry can have produced it. That is the whole point of
-/// the mechanism: on the tick alone a JDC would sit for up to a minute with no
-/// distribution, declare without one, and a PPLNS address would be refused
-/// `custom-jobs-require-solo` — a wrong distribution traded for a fatal one.
+/// ⚠️ The publisher interval here is **one hour**, so the distribution that
+/// arrives in the second half can only come from the per-frame retry. On the
+/// tick alone a JDC would declare without a distribution, and a PPLNS
+/// address would be refused `custom-jobs-require-solo`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_is_served_nothing_until_its_mode_is_known() {
     let noise_config = NoiseConfig::new(TEST_PUB.parse().unwrap(), TEST_PRV.parse().unwrap());
@@ -1207,17 +1190,15 @@ async fn a_session_is_served_nothing_until_its_mode_is_known() {
 
 /// What the mode gate answers for this session's miner, switchable mid-test.
 ///
-/// Three answers because the transitions between them are the thing under
-/// test: a session starts not knowing, and the answer it eventually gets can
-/// be either a tailored plan or "you are on the pool-wide one".
+/// The transitions between these answers are what is under test: a session
+/// starts not knowing, then gets either a tailored plan or the pool-wide one.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GateAnswer {
     Unknown,
     Solo,
     /// The same address on a tailored plan that pays a GROUP. Distinct from
-    /// [`GateAnswer::Solo`] because the two are the mid-session flip
-    /// `cache_sync` performs on a group join, and they are indistinguishable
-    /// by owner address — only by accounting.
+    /// [`GateAnswer::Solo`] because a group join flips between the two
+    /// mid-session, and only the accounting tells them apart.
     GroupSolo,
     PoolWide,
 }
@@ -1225,12 +1206,9 @@ enum GateAnswer {
 struct FlippableSource {
     answer: std::sync::Mutex<GateAnswer>,
     next_id: AtomicU64,
-    /// Bumped to make the pool-wide fingerprint change, which is the ONLY
-    /// thing that makes the publisher publish again. Left alone, the publisher
-    /// goes quiet — the state a real pool is in whenever its window is quiet,
-    /// and the state that makes "the session catches itself up" testable at
-    /// all: with the publisher still pushing, a missing catch-up would be
-    /// papered over by the next tick.
+    /// Bumped to change the pool-wide fingerprint, the ONLY thing that makes
+    /// the publisher publish again. Left alone the publisher goes quiet, so a
+    /// session catch-up is observable rather than masked by the next tick.
     generation: AtomicU64,
     miner: AddressId,
 }
@@ -1278,10 +1256,9 @@ impl PayoutDistributionSource for FlippableSource {
         }
     }
 
-    /// The SAME field `build_for_miner` reads, mapped to a stream — the
-    /// production source reads one gate for both, and a double that could
-    /// disagree with itself would prove nothing about a fix whose whole
-    /// subject is the two answers agreeing.
+    /// The SAME field `build_for_miner` reads, mapped to a stream: the
+    /// production source reads one gate for both, so the double must not be
+    /// able to disagree with itself.
     async fn current_mode(&self, _miner_address: &AddressId) -> Option<StreamKind> {
         match *self.answer.lock().unwrap() {
             GateAnswer::Unknown => None,
@@ -1352,9 +1329,8 @@ async fn allocate(reader: &mut Reader, writer: &mut Writer, request_id: u32) -> 
 ///
 /// The two are not ordered against each other: an allocate republishes the
 /// session's tailored plan, so a `SetPayoutDistribution` can arrive between a
-/// declare and its answer. Draining with a timeout instead made every such
-/// site a fixed wait where nothing was pending and a race where something
-/// was, and swallowed genuinely misdelivered frames on top.
+/// declare and its answer. Reading to the answer avoids a timed drain, which
+/// would race and swallow misdelivered frames.
 async fn read_declare_answer(reader: &mut Reader) -> JdcInbound {
     for _ in 0..4 {
         match read_jdc(reader).await {
@@ -1369,9 +1345,8 @@ async fn read_declare_answer(reader: &mut Reader) -> JdcInbound {
 /// rate limit.
 ///
 /// Every `DeclareMiningJob` needs its own: an allocate token identifies one
-/// piece of work, so declaring against it spends it — whichever way that
-/// declaration ends — the same way a conformant JDC uses them, popping one
-/// off its queue per declaration.
+/// piece of work, so declaring against it spends it whichever way the
+/// declaration ends.
 async fn next_token(reader: &mut Reader, writer: &mut Writer, request_id: u32) -> Vec<u8> {
     respect_token_rate_limit().await;
     allocate(reader, writer, request_id).await
@@ -1441,14 +1416,11 @@ async fn respect_token_rate_limit() {
 /// A session that waited out its mode and turns out to be PPLNS must be caught
 /// up on the CURRENT pool-wide distribution, not merely un-denied.
 ///
-/// While it waited it was excluded from the pool-wide pushes — correctly, the
-/// pool did not know they were its. So the last id it holds is whatever was
-/// current when it connected, and by the time the mode arrives that id has
-/// fallen out of the ext 0x0003/Grace Window. Lifting the denial alone
-/// leaves it declaring against a stale id and answered
-/// `stale-payout-distribution`, which is not a benign error: `stale-chain-tip`
-/// is the only code an SRI jd-client retries, every other one sends it off the
-/// pool into solo fallback.
+/// While it waited it was excluded from the pool-wide pushes, so the id it
+/// holds may have fallen out of the ext 0x0003/Grace Window by the time the
+/// mode arrives. Lifting the denial alone leaves it declaring against a stale
+/// id and answered `stale-payout-distribution`, which clients do not retry
+/// (only `stale-chain-tip` is benign).
 ///
 /// The publisher goes quiet before the flip (an unchanged fingerprint is not
 /// republished), so the frame the client receives cannot have come from a tick.
@@ -1477,9 +1449,8 @@ async fn a_session_that_waited_out_its_mode_is_caught_up_on_the_pool_wide_distri
         "nothing may be published while the mode is unknown"
     );
 
-    // The window moves on without it. This is the gap the catch-up exists for:
-    // the id the client holds stops being current, and it has no way to learn
-    // that on its own.
+    // The window moves on without it: the id the client holds stops being
+    // current, and it cannot learn that on its own.
     source.generation.store(1, Ordering::SeqCst);
     wait_until(Duration::from_secs(5), || {
         bridge
@@ -1535,10 +1506,8 @@ async fn a_session_that_waited_out_its_mode_is_caught_up_on_the_pool_wide_distri
 /// Bring a session to: served the Solo plan its address was on, gate then
 /// flipped to Group-Solo, nothing sent since the flip.
 ///
-/// The prologue of every mode-move test, and shared because each of them
-/// stands up a real JDP server on a real socket — duplicated, a change to the
-/// harness has to be made twice or one test silently stops testing the flip it
-/// names.
+/// The shared prologue of every mode-move test, so a harness change reaches
+/// all of them.
 async fn served_solo_then_joined_a_group(
     source: &Arc<FlippableSource>,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
@@ -1583,18 +1552,13 @@ fn flippable_source() -> Arc<FlippableSource> {
 ///
 /// ext 0x0003/Grace Window keeps the immediately-previous entry of a slot
 /// acceptable, so republishing over a stale plan leaves it declarable for one
-/// more distribution. The declare-time mode check hides that almost everywhere
-/// — almost, because it can only refuse when the pool HAS an answer, and "no
-/// live mining session for this address" is not an answer. A miner going
-/// offline is not exotic; it is a rig rebooting.
+/// more distribution. The declare-time mode check can only refuse when the
+/// pool knows the mode, and a rebooting rig leaves it unknown.
 ///
-/// ⚠️ Both drivers, and the ALLOCATE one is the reason this test is a loop.
-/// The allocate arm republishes the tailored plan on every token request and
-/// knew nothing about modes moving, while the re-ask arm that did know then
-/// found nothing left to do — an SRI jd-client allocates before nearly every
-/// declare, so in production the flip was almost always observed there. The
-/// drop lives in `republish_tailored` for exactly that reason: one place, all
-/// three callers.
+/// ⚠️ The loop drives the flip both by declare and by allocate: clients
+/// allocate before nearly every declare, so the allocate path is where a
+/// flip is usually observed. The drop lives in `republish_tailored`, shared
+/// by all callers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_plan_for_a_mode_that_moved_is_dropped_not_superseded() {
     for drive_with_allocate in [false, true] {
@@ -1672,17 +1636,14 @@ async fn the_plan_for_a_mode_that_moved_is_dropped_not_superseded() {
 /// A session already being served re-asks its mode, and a group join mid-flight
 /// is answered with a new plan — not left on the one built for the mode before.
 ///
-/// This is the production path `cache_sync::reconcile_gate_modes` walks: it
-/// flips a live address from Solo to Group-Solo the moment a join is approved,
-/// deliberately WITHOUT a reconnect. Until this existed the JDP side never
-/// asked again, so the session kept being served the Solo plan and the mining
-/// side refused every custom job built on it — fatal for an SRI jd-client,
-/// which treats every code but `stale-chain-tip` as a reason to leave the pool.
+/// `cache_sync::reconcile_gate_modes` flips a live address from Solo to
+/// Group-Solo when a join is approved, without a reconnect. Without the
+/// re-ask the session would keep the Solo plan and the mining side would
+/// refuse every custom job built on it.
 ///
-/// Driven by a DECLARE and deliberately not by an allocate: an allocate
-/// rebuilds the tailored plan unconditionally, so a test driven by one would
-/// pass with the re-ask removed and prove nothing. A declare is also the frame
-/// that matters — it is where a coinbase gets blessed.
+/// Driven by a DECLARE, not an allocate: an allocate rebuilds the tailored
+/// plan unconditionally and would pass without the re-ask. A declare is also
+/// where a coinbase gets blessed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_served_session_is_handed_a_new_plan_when_its_mode_moves() {
     let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
@@ -1724,10 +1685,7 @@ async fn a_served_session_is_handed_a_new_plan_when_its_mode_moves() {
     // works, which is the whole difference from hanging until a reconnect.
     //
     // On its OWN token, because the refused declare above spent the one it
-    // named — a declaration spends its token whichever way it ends. That
-    // costs the recovery nothing a conformant client feels: it holds a queue
-    // of tokens and refills it fire-and-forget after every pop, so the next
-    // one is already in hand.
+    // named: a declaration spends its token whichever way it ends.
     let token = next_token(&mut reader, &mut writer, 6).await;
     // Not a drain: the allocate arm republishes the tailored plan, and if it
     // did, the declare below has to name what the pool holds NOW rather than
@@ -1753,21 +1711,13 @@ async fn a_served_session_is_handed_a_new_plan_when_its_mode_moves() {
 /// token is answered `invalid-mining-job-token`, on the wire, end to end.
 ///
 /// SV2 JDP/Full-Template Mode gives a JDC "a token (allocated by JDS), so it
-/// can use it to identify some unique work" — one token, one piece of work.
-/// Ours let a token carry declarations for its whole 1 h TTL, and the pool's
-/// only limit on that side sits on `AllocateMiningJobToken`, a message the
-/// JDC then no longer had to send. Every declaration costs a snapshot of the
-/// pool's template transactions, a clone of each of them, and — where a
-/// validation socket is configured — a bitcoin-core round-trip.
+/// can use it to identify some unique work": one token, one piece of work.
+/// Spending the token keeps the `AllocateMiningJobToken` rate limit the bound
+/// on declarations per connection, each of which costs a template snapshot
+/// and possibly a node round-trip.
 ///
-/// No conformant client notices: it pops one token per `DeclareMiningJob` and
-/// refills its queue fire-and-forget, so it has never had a second
-/// declaration to spend one on.
-///
-/// Both directions are pinned here, because the second half is worthless
-/// without the first: the SAME frame that is refused the second time is
-/// accepted the first time, so the refusal cannot be coming from the
-/// declaration's own content.
+/// Both directions are pinned: the SAME frame refused the second time is
+/// accepted the first time, so the refusal cannot come from its content.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_declaration_on_the_same_token_is_refused() {
     let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
@@ -1812,13 +1762,11 @@ async fn a_second_declaration_on_the_same_token_is_refused() {
 /// The other half: the token a declaration is ANSWERED with must not authorise
 /// the next one.
 ///
-/// A `new_mining_job_token` is minted through the same generator as an
-/// allocate, so nothing about its bytes says which of the two it is. What
-/// separates them is that the pool never files it under the allocations, and
-/// this is the only test that would notice if it started: it presents the
-/// token the JDS actually put on the wire, not one built beside the store.
-/// Chaining declarations off declaration tokens would mint a fresh one every
-/// time, with no allocate in sight and nothing rate-limiting it.
+/// A `new_mining_job_token` comes from the same generator as an allocate
+/// token; only the fact that the pool never files it under the allocations
+/// separates them. The test presents the token the JDS actually put on the
+/// wire. Otherwise declarations could chain off declaration tokens with no
+/// allocate and no rate limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_declaration_token_cannot_itself_authorise_a_declaration() {
     let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
@@ -1867,17 +1815,13 @@ async fn a_declaration_token_cannot_itself_authorise_a_declaration() {
 ///
 /// `distribution_acceptance` under `JdpSession` scope PREFERS a session's
 /// tailored slot whenever it has one, and does so without looking at the
-/// settlement epoch. A slot left behind therefore answers for every pool-wide
-/// id the session is pushed afterwards, and answers `Stale` to all of them:
-/// the session is refused for the life of the connection while the pool
-/// believes it is serving it correctly.
+/// settlement epoch. A slot left behind would answer `Stale` for every
+/// pool-wide id pushed afterwards, refusing the session for the life of the
+/// connection.
 ///
-/// Reached here through an ext 0x0003/Implementation Notes settlement, which
-/// is what invalidates a tailored slot and makes the session re-ask what it
-/// should be served — by which time the answer has changed.
-///
-/// The declare at the end is what pins it: the id the pool has just pushed,
-/// against the coinbase the pool published, must be accepted.
+/// Reached through an ext 0x0003/Implementation Notes settlement, which
+/// invalidates a tailored slot and makes the session re-ask its mode.
+/// The final declare pins it: the id just pushed must be accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tailored_session_that_becomes_pplns_drops_its_tailored_slot() {
     let bridge = Arc::new(RwLock::new(JdpDeclaredJobRegistry::new()));
@@ -1952,9 +1896,9 @@ impl DeclaredJobValidator for ClosedSessions {
 }
 
 /// A JDP connection that goes away releases what the node-side validator
-/// holds for it. Upstream's engine keeps a per-session entry and only drops it
-/// when told; session ids are never reused, so an entry nobody releases stays
-/// for the life of the process.
+/// holds for it. The validation engine keeps a per-session entry until told,
+/// and session ids are never reused, so an unreleased entry stays for the
+/// life of the process.
 ///
 /// Both directions: nothing is released while the connection is still open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

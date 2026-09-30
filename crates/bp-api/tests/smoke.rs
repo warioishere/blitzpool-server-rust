@@ -262,10 +262,8 @@ async fn info_chart_invalid_range_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// `14d` is a valid preset — the /stats page reads a 14-day average
-/// and used to pull the 30-day `1m` payload to get it. Before the
-/// preset existed this exact request answered 400, so the assertion
-/// pins the addition and not just "some range parses".
+/// `14d` is a valid preset (the /stats page reads a 14-day average);
+/// the request answers 200, not 400.
 #[tokio::test]
 async fn info_chart_accepts_fourteen_day_range() {
     let Some(pool) = connect_or_skip().await else {
@@ -509,10 +507,9 @@ async fn client_reset_best_difficulty_succeeds() {
     };
     let router = build_router(minimal_state(pool));
     // The reset path resets `address_settings.bestDifficulty` AND deletes
-    // the address's `best_difficulty_tracker_entity` row. A wrong table
-    // name in that DELETE (the table is `_entity`-suffixed) makes the
-    // endpoint 500 at runtime — this pins it to 200. Valid bech32
-    // mainnet test vector with no real data in the dev DB.
+    // the address's `best_difficulty_tracker_entity` row; the raw SQL is
+    // only checked at runtime, so this pins the endpoint to 200. Valid
+    // bech32 mainnet test vector with no real data in the dev DB.
     let resp = router
         .oneshot(
             Request::builder()
@@ -536,10 +533,9 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
     };
     // A worker page shows the per-reason breakdown against `rejectedCount`.
     // A reason with a column but no field in `WorkerChartEntry` is a reject
-    // the operator sees in the total and cannot find in the breakdown —
-    // which is what happened to version rolling between migration 0010 and
-    // the field being added. Five distinct counts, so a field wired to the
-    // wrong column shows up as a wrong number rather than a coincidence.
+    // the operator sees in the total and cannot find in the breakdown. Five
+    // distinct counts, so a field wired to the wrong column shows up as a
+    // wrong number rather than a coincidence.
     let addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
     let worker = "chart_breakdown_probe";
     // `client_entity."sessionId"` is varchar(8).
@@ -583,7 +579,7 @@ async fn worker_chart_breaks_rejects_down_by_every_reason() {
     .expect("seed stats");
     tx.commit().await.expect("commit");
 
-    // The worker page composes live fields from Redis now.
+    // The worker page composes live fields from Redis.
     let Some(state) = state_with_live_store(pool.clone()).await else {
         return;
     };

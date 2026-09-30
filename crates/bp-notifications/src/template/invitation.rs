@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Payout-group invitation template — sent by
-//! `PplnsGroupInvitationService.createInvitation()`.
+//! Payout-group invitation template, rendered by the
+//! `EmailHooks::send_invitation` implementation.
 
 use chrono::{DateTime, Utc};
 

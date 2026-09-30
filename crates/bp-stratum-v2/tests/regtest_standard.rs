@@ -8,7 +8,7 @@
 //! handshake against a fake miner connected over a real `TcpStream`.
 //!
 //! Covers:
-//!   1. Noise-XK handshake succeeds with the SRI test key-pair.
+//!   1. Noise-XK handshake succeeds with the test key-pair.
 //!   2. SV2 `SetupConnection` (protocol=0 Mining) → `SetupConnectionSuccess`
 //!      wire roundtrip with `parse_message_frame_with_tlvs` +
 //!      `encode_mining_outbound`.
@@ -16,15 +16,9 @@
 //!      with pool-allocated extranonce-prefix.
 //!   4. `current_template` snapshot is populated after `generate_to_self`.
 //!
-//! Block-acceptance is deliberately NOT argued from transitivity here —
-//! that argument was refuted on 2026-05-17, when the SV2-Extended submit
-//! path turned out to reconstruct the coinbase differently from
-//! `bp-mining-job`'s helpers and produced blocks core rejected (see
-//! `regtest_extended_block_submit.rs`). A Standard-channel share is
-//! carried all the way to an accepted block in
-//! `regtest_stream_routing.rs`, which drives a real `SubmitSharesStandard`
-//! and asserts the tip rises. What this test owns instead is the wire
-//! contract of the handshake itself — the fields below.
+//! Block acceptance is proven elsewhere: `regtest_stream_routing.rs` drives
+//! a real `SubmitSharesStandard` to an accepted block and asserts the tip
+//! rises. This test owns the wire contract of the handshake itself.
 //!
 //! Skipped (with a printed warning) when `bitcoin-node` is not installed
 //! at the host's default location or via `BITCOIN_NODE_PATH`.
@@ -71,13 +65,9 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
 
     // ── Spawn TDP, subscribe FIRST, then force a template emission ────
     //
-    // `tokio::sync::broadcast` does not replay messages sent before
-    // any receiver existed. If we mine the template-forcing block
-    // before calling `subscribe()`, the resulting `TemplateUpdate`
-    // can be dropped on the floor — the server then never sees a
-    // template and `wait_until(current_template().is_some())` times
-    // out. Mirror the ordering from `bp-mining-job/tests/regtest_e2e.rs`:
-    // spawn → subscribe → generate → wait.
+    // `tokio::sync::broadcast` does not replay messages sent before any
+    // receiver existed, so a template forced before `subscribe()` can be
+    // lost. Order: spawn → subscribe → generate → wait.
     let tdp = TdpHandle::spawn(
         TdpConfig::new(node.ipc_socket_path())
             .with_fee_threshold(1)
@@ -86,7 +76,7 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
     .expect("TdpHandle::spawn against regtest IPC");
     let updates_rx = tdp.subscribe();
     // Mine one more block so the translator pairs its first
-    // NewTemplate+SetNewPrevHash before we accept the miner.
+    // NewTemplate+SetNewPrevHash before the miner connects.
     node.generate_to_self(1)
         .await
         .expect("mine 1 to force TDP emit");
@@ -196,10 +186,9 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
     ));
     write_any_message(&mut writer, open).await;
 
-    // Drain frames until we see OpenStandardMiningChannelSuccess (we
-    // may also get NewMiningJob + SetNewPrevHash interleaved). Budget
-    // 5 s. The translator should fire a NewMiningJob immediately after
-    // the OpenChannel because the current_template is already set.
+    // Drain frames until OpenStandardMiningChannelSuccess and a
+    // NewMiningJob arrive (SetNewPrevHash / SetTarget may interleave).
+    // Budget 5 s; the job follows the open because a template is set.
     let mut got_open_success = false;
     let mut got_new_mining_job = false;
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
@@ -235,10 +224,8 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
         got_open_success,
         "OpenStandardMiningChannelSuccess must arrive within 5 s"
     );
-    // Mine one more block so the translator broadcasts a fresh
-    // NewBlock to our open channel — gives us the SetNewPrevHash +
-    // NewMiningJob fan-out if we didn't see one already from the
-    // pre-existing template.
+    // No job yet: mine one more block to force a fresh
+    // SetNewPrevHash + NewMiningJob fan-out to the open channel.
     if !got_new_mining_job {
         node.generate_to_self(1)
             .await
@@ -268,5 +255,3 @@ async fn sv2_standard_channel_end_to_end_against_regtest() {
     node.shutdown().await.expect("regtest shutdown");
     let _ = accept_handle.await;
 }
-
-// ── Helpers ─────────────────────────────────────────────────────────

@@ -19,8 +19,7 @@ pub const POOL_BLOCKS_PENDING_APPLY: &str = "pool_blocks_pending_apply";
 ///
 /// **This one should be zero.** Every entry is a block whose coinbase paid
 /// miners on-chain and whose ledger entry they never got. Nothing else
-/// reads that store, so without this gauge the only trace is a log line
-/// that scrolls away.
+/// reads that store, so this gauge is its only standing signal.
 pub const POOL_BLOCKS_UNBOOKABLE: &str = "pool_blocks_unbookable";
 
 // ── Core→Satellite stream consumers ─────────────────────────────────

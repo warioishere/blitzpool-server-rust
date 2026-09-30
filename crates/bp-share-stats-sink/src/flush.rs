@@ -7,7 +7,7 @@
 //!
 //! **Per-flusher failure isolation**: one flusher's PG error doesn't abort the tick.
 //! The accumulator-drain/confirm contract preserves un-confirmed
-//! deltas for the next tick — same idempotency story PPLNS uses.
+//! deltas for the next tick.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,8 +69,7 @@ impl Default for Accumulators {
     }
 }
 
-/// Drives one full coordinator tick. Returns the per-flusher health
-/// transitions so the caller can emit telemetry. Drain + bulk-upsert +
+/// Drives one full coordinator tick. Drain + bulk-upsert +
 /// confirm are sequenced **per flusher** so a failure on one table
 /// leaves its accumulator un-confirmed (next tick re-includes the
 /// snapshot) while other flushers proceed.
@@ -85,8 +84,8 @@ pub async fn flush_once(
     flush_pool_rejected(pool, accs, health).await;
     // Sequenced: capture the per-worker rejected-diff fan-out from the
     // client_statistics snapshot so the worker_totals step can apply it
-    // alongside the accepted-share totals. Same row-lock-avoidance
-    // keep `worker_shares_entity` writes serial.
+    // alongside the accepted-share totals in one upsert, keeping the
+    // `worker_shares_entity` writes serial (no row-lock contention).
     let worker_rejected_fanout = flush_client_statistics(pool, accs, health, batch_size).await;
     flush_client_rejected(pool, accs, health).await;
     flush_address_settings(pool, accs, health).await;
@@ -257,8 +256,8 @@ async fn flush_client_statistics(
     }
     let mut worker_rejected: HashMap<(String, String), f64> = HashMap::new();
     if !confirmed_keys.is_empty() {
-        // Build per-worker rejected-fan-out from the confirmed slice only —
-        // we don't want to fan unverified data into worker_shares.
+        // Build the per-worker rejected fan-out from the confirmed slice
+        // only, so unwritten data never reaches worker_shares.
         for key in &confirmed_keys {
             if let Some(rec) = snapshot.get(*key) {
                 let total = rec.rejected_diff_total();

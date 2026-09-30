@@ -6,16 +6,13 @@
 //! One ext 0x0003/Payout Computation evaluation serves every consumer: the JDS
 //! builds the expected output vector from `(distribution, T)` and the
 //! validator compares a declared coinbase POSITIONALLY against it
-//! (ext 0x0003/Output Verification — the spec fixes the output order, so
-//! containment games like paying two distributions at once are structurally
-//! impossible; nothing here needs the old multiset machinery).
+//! (ext 0x0003/Output Verification: the spec fixes the output order, so a
+//! coinbase cannot satisfy two distributions at once).
 //!
-//! `T` is taken as the sum of the declared coinbase's output values. That is
-//! self-consistent: an ext 0x0003/Payout Computation-correct vector for
-//! revenue `T'` sums to exactly `T'` (the pool output absorbs the
-//! remainder), so any tampering either changes the sum — and with it every
-//! recomputed amount — or changes a position; both are caught by the
-//! compare.
+//! `T` is the sum of the declared output values. A correct vector for revenue
+//! `T'` sums to exactly `T'` (the pool output absorbs the remainder), so any
+//! deviation either changes the sum, and with it every recomputed amount, or
+//! changes a position; the compare catches both.
 
 use bitcoin::consensus::{Decodable, Encodable};
 use bitcoin::{Amount, ScriptBuf, TxOut};
@@ -112,17 +109,14 @@ pub enum DistributionViolation {
     /// distribution block.
     NonZeroTrailingOutput { position: usize },
     /// The distribution itself cannot be evaluated (zero weight sum /
-    /// malformed additional output) — a registry entry this JDS
-    /// published should never trip this; treat as internal.
+    /// malformed additional output). Internal: a distribution this JDS
+    /// published should never trip this.
     Uncomputable,
-    /// The declared output values do not sum to a representable revenue.
-    /// No coinbase can pay more than the money supply, so this is a
-    /// malformed declaration rather than an internal failure.
+    /// The declared output values do not sum to a representable revenue:
+    /// a malformed declaration, since no coinbase exceeds the money supply.
     RevenueOverflow,
-    /// The declared coinbase pays nothing at all. Self-consistent (every
-    /// ext 0x0003/Payout Computation amount is 0 at T = 0) and therefore
-    /// invisible to the compare, but it is a block that forfeits its own
-    /// subsidy — never a job a pool should declare valid.
+    /// The declared coinbase pays nothing. Self-consistent under the compare
+    /// (every amount is 0 at T = 0), but the block forfeits its subsidy.
     ZeroRevenue,
 }
 
@@ -137,9 +131,7 @@ pub fn validate_coinbase_outputs_against_distribution(
     dust_limits: &[u32],
     additional_outputs: &[Vec<u8>],
 ) -> Result<u64, DistributionViolation> {
-    // Checked: these values come off the wire from the JD-client, and a
-    // plain `sum()` would panic on overflow in a debug build and wrap in
-    // release — letting a crafted declaration pick which.
+    // Checked sum: the values are untrusted wire input.
     let t: u64 = declared
         .iter()
         .try_fold(0u64, |acc, o| acc.checked_add(o.value.to_sat()))
@@ -159,24 +151,13 @@ pub fn validate_coinbase_outputs_against_distribution(
             Some(_) => {}
         }
     }
-    // Defense-in-depth: with `T := Σ declared`, a matching prefix
-    // already forces every trailing output to 0 (the prefix alone sums
-    // to T). This check only becomes load-bearing if T is ever derived
-    // from something other than the declared outputs — keep it so that
-    // change cannot silently open a valued-trailing-output hole.
+    // With `T := Σ declared` a matching prefix already forces every trailing
+    // output to 0; this check keeps that true if T is ever derived otherwise.
     //
-    // Trailing outputs are checked for VALUE only, deliberately.
-    // ext 0x0003/Payout Computation also requires the witness commitment to
-    // come last, but that is a construction rule for the JDC;
-    // ext 0x0003/Output Verification defines this verifier's job as
-    // recompute-and-compare "allowing only JDC-appended 0-value outputs in
-    // position 4", and that is what this is. Nor is it a consensus "last":
-    // BIP-141 takes the HIGHEST-index output matching the commitment pattern,
-    // so a 0-value output after it is inert unless it matches too — in which
-    // case the JDC has invalidated its own block and forfeited its own payout
-    // with it. bitcoind is the authority on that, and rejects it at submit.
-    // Checking it here would mix "does this coinbase pay the published
-    // distribution?" (ours) with "is this block valid?" (not ours).
+    // Trailing outputs are checked for VALUE only. ext 0x0003/Output
+    // Verification defines the job as recompute-and-compare "allowing only
+    // JDC-appended 0-value outputs in position 4"; the witness-commitment-last
+    // rule is a JDC construction rule, and block validity is bitcoind's call.
     for (offset, got) in declared[expected.len()..].iter().enumerate() {
         if got.value != Amount::ZERO {
             return Err(DistributionViolation::NonZeroTrailingOutput {
@@ -237,9 +218,8 @@ mod tests {
         );
     }
 
-    /// The declared values are untrusted wire input: a sum that cannot
-    /// be represented must be rejected, not panic (debug) or wrap
-    /// (release) into a revenue the client effectively chose.
+    /// A declared sum that does not fit in a u64 is rejected as
+    /// `RevenueOverflow`.
     #[test]
     fn declared_revenue_overflow_is_rejected() {
         let huge = u64::MAX / 2 + 1;
@@ -403,7 +383,7 @@ mod tests {
         let payouts: [WeightedOutput; 0] = [];
         let declared = vec![
             txout(999, script(0xFF)),
-            txout(1, script(0x77)), // someone slipping themselves a sat
+            txout(1, script(0x77)), // valued trailing output
         ];
         // T = 1000 → expected pool output = 1000, declared says 999.
         assert_eq!(
@@ -418,9 +398,8 @@ mod tests {
         let pool = wo(0xFF, 1);
         assert_eq!(
             validate_coinbase_outputs_against_distribution(&[], &pool, &[], &[], &[]),
-            // A coinbase with no outputs pays nothing — caught by the
-            // revenue check before the positional compare gets to call
-            // it a missing output.
+            // No outputs pays nothing: the revenue check fires before the
+            // positional compare.
             Err(DistributionViolation::ZeroRevenue)
         );
     }

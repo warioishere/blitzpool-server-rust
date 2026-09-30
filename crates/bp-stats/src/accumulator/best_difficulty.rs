@@ -6,10 +6,8 @@
 //! seen per address in the current flush window, plus the firmware/vendor
 //! string of the share that set it. The flush folds it into
 //! `address_settings_entity."bestDifficulty"` via `GREATEST`, so the
-//! persisted all-time best self-corrects every tick — there is no
-//! long-lived write-through cache to diverge after an out-of-band reset
-//! (the reset zeroes the row; the next flush's window max is `GREATEST`ed
-//! straight back in).
+//! persisted all-time best self-corrects every tick and no long-lived
+//! cache can diverge from it after an out-of-band reset of the row.
 
 use std::collections::HashMap;
 

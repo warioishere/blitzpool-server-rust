@@ -112,7 +112,7 @@ mod tests {
     fn current_slot_is_in_the_future_or_present_within_one_slot_width() {
         let s = TimeSlot::current();
         let now = now_millis();
-        // current slot end is > now (we're still in it) and ≤ now + slot width.
+        // current slot end is > now (still in progress) and ≤ now + slot width.
         assert!(s.as_millis() > now);
         assert!(s.as_millis() <= now + SLOT_DURATION_MS);
     }
@@ -141,8 +141,7 @@ mod tests {
     fn chart_cutoff_is_at_least_one_slot_behind_current_at_slot_start() {
         let cur = TimeSlot::current();
         let cutoff = chart_visibility_cutoff_slot();
-        // cutoff <= current always — the visibility buffer can't push us
-        // forward.
+        // cutoff <= current always: the visibility buffer only moves it back.
         assert!(cutoff <= cur);
     }
 }

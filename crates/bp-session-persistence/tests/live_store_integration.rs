@@ -114,9 +114,8 @@ async fn ttl(conn: &mut ConnectionManager, key: &str) -> i64 {
         .expect("TTL")
 }
 
-/// One touch flush must land in both stores, and the Redis hash must
-/// carry a TTL — a Lua body that lost its EXPIRE leaves TTL = -1, which
-/// under prod's `volatile-lru` is an immortal, un-evictable key.
+/// One touch flush lands in the session's Redis hash, and the hash carries
+/// a TTL: a key without one (TTL = -1) is immortal under `volatile-lru`.
 #[tokio::test]
 async fn touch_flush_dual_writes_hash_and_ttl() {
     let Some(pool) = pg_or_skip().await else {
@@ -215,17 +214,13 @@ async fn a_late_consumed_share_keeps_its_acceptance_time() {
     cleanup(&pool, prefix).await;
 }
 
-/// The session half of a best-difficulty reset. `/bestdiff_reset` used
-/// to clear only the per-address total, so every worker row kept
-/// rendering the old high — one miner's dashboard showed 8.23T next to
-/// an address total of 880M until the next share.
+/// The session half of a best-difficulty reset: `/bestdiff_reset` clears
+/// the per-session best too, so worker rows do not keep the old high.
 ///
 /// Pins the three properties that make the clear safe: it removes the
 /// one field and leaves the live telemetry beside it, it is scoped to a
 /// single address, and it really drops the high-water mark rather than
-/// masking it — the touch script's `tonumber(HGET ...)` must read the
-/// absent field as "no sample" so a LOWER later share becomes the new
-/// best instead of losing to a ghost.
+/// masking it, so a LOWER later share becomes the new best.
 #[tokio::test]
 async fn clearing_the_live_best_takes_one_field_from_one_address() {
     let Some(pool) = pg_or_skip().await else {
@@ -381,8 +376,7 @@ async fn best_difficulty_is_monotone_across_flushes() {
 
 /// The sampler's write must NOT extend a session's liveness — that is
 /// the touch path's job (the sampler keeps writing fades for minutes
-/// after the shares stop). An unconditional EXPIRE in the hashrate
-/// script would reset the 10 s TTL to 300.
+/// after the shares stop), so a shortened TTL stays short.
 #[tokio::test]
 async fn hashrate_write_does_not_refresh_liveness() {
     let Some(pool) = pg_or_skip().await else {
@@ -436,10 +430,9 @@ async fn hashrate_write_does_not_refresh_liveness() {
 }
 
 /// When the sampler's HSET CREATES the key (share landed after the hash
-/// expired), the conditional EXPIRE must still fire — without it the
-/// fresh key has no TTL and is immortal under `volatile-lru`. The
-/// resulting hash is partial (only `hash_rate`); readers must tolerate
-/// that, so the test pins it.
+/// expired), the conditional EXPIRE still fires, so the fresh key is not
+/// immortal under `volatile-lru`. The resulting hash is partial (only
+/// `hash_rate`); readers must tolerate that, so the test pins it.
 #[tokio::test]
 async fn hashrate_write_on_fresh_key_sets_ttl() {
     let Some(pool) = pg_or_skip().await else {
@@ -476,9 +469,6 @@ async fn hashrate_write_on_fresh_key_sets_ttl() {
         "a sampler-created key without TTL is immortal under volatile-lru, got {t}"
     );
 
-    // The unflushed touch buffer would rebuffer into PG on shutdown's
-    // final drain against a row that was never born — harmless, but
-    // drain it consciously.
     handle.shutdown().await;
     cleanup(&pool, prefix).await;
 }

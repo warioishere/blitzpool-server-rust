@@ -111,14 +111,11 @@ pub async fn found_block_miner_at_height(
 /// miss without first checking that the coinbase paid nobody else.
 ///
 /// **A row is not an accounting.** Every clause requires a row that moved
-/// VALUE, because a block can produce rows that account for nothing. The
+/// VALUE, because a block can produce rows that account for nothing: the
 /// PPLNS apply writes a 0-sat `pending` row for every address that is live
 /// in the window but absent from the block's distribution ("late
-/// arrivers"), so a distribution that paid nobody at all still leaves rows
-/// behind — measured on a block whose coinbase paid 100 % to the pool
-/// output: no miner claim, no miner payment, and a `history_inserted`
-/// greater than zero. Under a plain `EXISTS` that block reads as booked
-/// and this check, which exists to find exactly that, stays silent.
+/// arrivers"), so a distribution that paid nobody still leaves rows behind.
+/// A plain `EXISTS` would read such a block as booked.
 pub async fn payout_recorded_at_height(pool: &PgPool, height: i32) -> Result<bool, DbError> {
     let found = sqlx::query_scalar!(
         r#"SELECT (
@@ -144,9 +141,7 @@ pub async fn payout_recorded_at_height(pool: &PgPool, height: i32) -> Result<boo
 }
 
 /// All rows from `blocks_entity` projected down to
-/// `{height, minerAddress, worker, sessionId}`. No WHERE, no ORDER BY —
-/// Uses `query_as` (no `.sqlx` metadata required for the untyped
-/// projection).
+/// `{height, minerAddress, worker, sessionId}`, unordered.
 pub async fn find_found_blocks(pool: &PgPool) -> Result<Vec<FoundBlockRow>, DbError> {
     // Filter out dev-seed rows (`synthseed*` miner addresses from
     // bootstrap fixtures); they have no payout value and would

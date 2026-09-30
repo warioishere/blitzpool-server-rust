@@ -6,9 +6,8 @@
 //! Integration tests for `bp-group-solo-engine::round` (state + snapshot)
 //! against docker-Redis.
 //!
-//! Each test uses a distinct Redis logical DB (0–15); tests skip
-//! cleanly via `eprintln!` if the URL is unreachable. Group-ids are
-//! kept unique per test so within-DB tests don't interfere either.
+//! Each test uses a distinct Redis logical DB and skips via `eprintln!` if
+//! the URL is unreachable. Group ids are unique per test as well.
 
 use bp_group_mgmt::group::PayoutMode;
 use bp_group_solo_engine::round::{
@@ -22,9 +21,8 @@ const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
 
 async fn connect_or_skip(test_db: u8) -> Option<ConnectionManager> {
     let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    // Fold this binary's local number into its own DB range — see
-    // `bp_test_support::redis_db`. Without it every binary's 0..15
-    // land on the same 16 databases and FLUSHDB each other mid-run.
+    // Fold this binary's local number into its own DB range (see
+    // `bp_test_support::redis_db`) so binaries do not FLUSHDB each other.
     let test_db =
         bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_ROUND, test_db).await;
     let url = format!("{base}/{test_db}");
@@ -84,7 +82,7 @@ async fn record_share_writes_all_keys() {
         .expect("ok");
 
     let mut conn = conn;
-    // No per-share zset — round state is the per-address aggregate.
+    // Round state is the per-address aggregate.
     let total_str: String = conn.get(key_total(group)).await.unwrap();
     assert!((total_str.parse::<f64>().unwrap() - 100.0).abs() < 1e-9);
     let by_addr: f64 = conn
@@ -101,9 +99,9 @@ async fn record_share_writes_all_keys() {
         .parse()
         .unwrap();
     assert_eq!(last_at, 1_700_000_000_000);
-    // This call passes `None` for the share_id, so no dedup marker is
-    // written — the marker's scoring is pinned in
-    // `record_share_is_idempotent_per_share_id`.
+    // `None` share_id, so no dedup marker is written; the marker's scoring
+    // is pinned in `record_share_is_idempotent_per_share_id`. The counter
+    // key is unused and must stay unwritten.
     let counter_exists: bool = conn.exists(key_counter(group)).await.unwrap();
     assert!(
         !counter_exists,
@@ -142,8 +140,8 @@ async fn read_by_address_returns_aggregate() {
     let store = GroupRoundStore::new(conn.clone());
     let group = "g_fallback1";
 
-    // record_share maintains the by-address aggregate directly (no per-share
-    // zset). Two shares for foo, one for bar.
+    // record_share maintains the by-address aggregate directly. Two shares
+    // for foo, one for bar.
     store
         .record_share(None, group, "bc1qfoo", 30.0, 1700)
         .await
@@ -173,8 +171,8 @@ async fn reset_for_block_found_preserves_last_accepted_share_at() {
     let store = GroupRoundStore::new(conn.clone());
     let group = "g_reset_blockfound";
 
-    // Use a share_id so the dedup zset (`key_applied`) gets populated — the
-    // reset must wipe it too, else stale markers break exactly-once next round.
+    // Use a share_id so the dedup zset (`key_applied`) gets populated; the
+    // reset must keep it (asserted below).
     store
         .record_share(Some("ep1:0"), group, "bc1qfoo", 50.0, 1_700_000_000_001)
         .await
@@ -205,16 +203,10 @@ async fn reset_for_block_found_preserves_last_accepted_share_at() {
         last_at_exists,
         "last-accepted-share-at preserved across block-found reset"
     );
-    // MONEY: the dedup set must OUTLIVE the reset.
-    //
-    // The satellite dispatches a batch of up to 256 shares and only then
-    // ACKs it. If a reset lands in that gap, a redelivery (process death
-    // mid-batch, or a failed ack) finds no markers and REAPPLIES those
-    // shares into the fresh round — work already accounted for in the round
-    // that was just wiped, credited a second time to whoever was in the
-    // batch. Right after a reset the round is empty, so they can dominate
-    // it. PPLNS never had this hole: `pplns:applied` is scored by a
-    // monotonic counter and is never reset.
+    // MONEY: the dedup set must OUTLIVE the reset. The satellite ACKs a
+    // batch only after dispatching it; if a reset lands in that gap, a
+    // redelivery without markers would credit work from the wiped round a
+    // second time, into a fresh round it can dominate.
     assert!(
         applied_exists,
         "the dedup zset must survive a round reset, or an un-ACKed satellite \
@@ -249,10 +241,9 @@ async fn reset_full_wipes_everything_including_last_accepted() {
     let applied_exists: bool = conn.exists(key_applied(group)).await.unwrap();
     assert!(!last_at_exists, "last-accepted-share-at wiped");
     assert!(!rejected_exists, "rejected-shares wiped");
-    // Even a full (calendar) reset leaves the dedup set alone — see
-    // `reset_for_block_found_preserves_last_accepted_share_at`. A calendar
-    // reset discards the round's work deliberately; reapplying an un-ACKed
-    // batch into the fresh one would hand those miners an unearned start.
+    // Even a full (calendar) reset keeps the dedup set: it discards the
+    // round's work deliberately, and reapplying an un-ACKed batch into the
+    // fresh round would hand those miners an unearned start.
     assert!(
         applied_exists,
         "the dedup zset must survive a full reset too"
@@ -499,9 +490,8 @@ async fn multiple_groups_redis_state_is_isolated() {
 
 // ── Test 12 — record_share is idempotent per share_id ───────────────
 //
-// Group-Solo's half of the exactly-once foundation: a redelivered share
-// (same share_id) is a no-op against the round, while distinct ids
-// accumulate normally. Exercises RECORD_SHARE_LUA's dedup path.
+// A redelivered share (same share_id) is a no-op against the round, while
+// distinct ids accumulate normally (RECORD_SHARE_LUA's dedup path).
 #[tokio::test]
 async fn record_share_is_idempotent_per_share_id() {
     let conn = match connect_or_skip(11).await {
@@ -530,8 +520,7 @@ async fn record_share_is_idempotent_per_share_id() {
         .expect("ok");
     assert!(applied2, "a fresh share_id must append");
 
-    // The round counted exactly two shares (200), not three — the dedup
-    // marker zset keeps the redelivery out of the aggregate.
+    // The round counted exactly two shares (200), not three.
     let mut conn = conn;
     let applied_card: u64 = conn.zcard(key_applied(group)).await.unwrap();
     assert_eq!(
@@ -558,9 +547,8 @@ async fn record_share_is_idempotent_per_share_id() {
         "by-address must also exclude the dup"
     );
 
-    // The marker is scored by the SHARE'S OWN accept time, not by a
-    // per-group counter. That is exactly what lets the set outlive a round
-    // reset — a counter-scored set had to be wiped with the counter.
+    // The marker is scored by the SHARE'S OWN accept time, which stays
+    // monotonic across resets and so lets the set outlive a round reset.
     let score: f64 = conn
         .zscore(key_applied(group), "ep1:0")
         .await
@@ -570,18 +558,11 @@ async fn record_share_is_idempotent_per_share_id() {
 
 // ── The dedup marker must outlive a round reset ────────────────────
 //
-// MONEY. The satellite dispatches a batch of up to 256 shares to the sinks
-// and only ACKs the whole batch afterwards. A reset landing in that gap used
-// to delete the dedup markers with the round, so a redelivery — process
-// death mid-batch, which is every unclean restart, or a failed ack — found
-// no marker and REAPPLIED those shares into the fresh round. That is work
-// already accounted for in the round that was just wiped, credited a second
-// time; and right after a reset the round is empty, so a redelivered batch
-// can dominate it.
-//
-// PPLNS never had this hole (`pplns:applied` is scored by a monotonic
-// counter and is never reset), which is what made it an asymmetry between
-// two implementations of one contract rather than a shared limitation.
+// MONEY. The satellite ACKs a batch only after dispatching it to the sinks.
+// A share redelivered after a reset in that gap (unclean restart, failed
+// ack) must still be deduped, or work from the wiped round is credited a
+// second time into a fresh round it can dominate. Same contract as PPLNS's
+// never-reset `pplns:applied`.
 
 #[tokio::test]
 async fn a_redelivered_share_is_still_deduped_across_a_round_reset() {
@@ -685,10 +666,9 @@ async fn windowed_record_aggregates_into_buckets() {
     assert!((agg["bc1qfoo"] - 50.0).abs() < 1e-9, "foo summed in-bucket");
     assert!((agg["bc1qbar"] - 70.0).abs() < 1e-9);
 
-    // The windowed record also stamps the live `last-accepted-share-at` hash on
-    // every accepted share (the source the member-list view reads, Redis-first,
-    // so active miners aren't shown "never mined" before the group's first
-    // block-found). It holds each address's MOST RECENT share timestamp.
+    // The windowed record also stamps `last-accepted-share-at` on every
+    // accepted share (the member-list view reads it, so active miners do not
+    // show as "never mined"). It holds each address's MOST RECENT timestamp.
     let foo_last = store
         .read_last_accepted_share_at(group, "bc1qfoo")
         .await
@@ -727,11 +707,10 @@ async fn windowed_record_aggregates_into_buckets() {
 // Buckets older than `window_ms` relative to `now_ms` are dropped, and the
 // `window:by-address` aggregate is decremented by exactly the dropped bucket's
 // per-address contribution (hDel-ing addresses that hit zero).
-/// MONEY. A trim that decrements an address below zero — a bucket ahead of
-/// the aggregate, which the per-key Redis backup can restore — must remove
-/// the field, as the PPLNS trim does. Left at a negative value it reads as
-/// absent AND swallows the address's next shares until they climb back
-/// over zero: work in the window that the payout never sees.
+/// MONEY. A trim that decrements an address below zero (a bucket ahead of
+/// the aggregate, which the per-key Redis backup can restore) must remove
+/// the field, as the PPLNS trim does. A negative value would swallow the
+/// address's next shares: work in the window the payout never sees.
 #[tokio::test]
 async fn windowed_trim_does_not_strand_a_negative_entry() {
     let conn = match connect_or_skip(21).await {
@@ -771,8 +750,8 @@ async fn windowed_trim_does_not_strand_a_negative_entry() {
         raw.is_none(),
         "the underflowed entry must be removed, found {raw:?}"
     );
-    // What the field would have cost: the address mines on, and that work
-    // must count in full, not first pay off a phantom -30.
+    // The address mines on, and that work must count in full, not first
+    // pay off a phantom -30.
     store
         .record_share_windowed(None, group, "bc1qold", 20.0, 5 * bkt)
         .await
@@ -826,9 +805,8 @@ async fn windowed_trim_drops_aged_buckets() {
 // ── Test 15 — read_payout_shares(Window) trims on read (idle group) ─
 //
 // The dispatcher trims before reading, so even a group that went idle after
-// recording sees a fenster-current distribution at payout-build time. PROP
-// mode reads the independent per-round aggregate — the branch picks the right
-// keyspace.
+// recording sees a current window at payout-build time. PROP mode reads the
+// independent per-round aggregate; the branch picks the right keyspace.
 #[tokio::test]
 async fn read_payout_shares_window_trims_on_read() {
     let conn = match connect_or_skip(14).await {
@@ -935,8 +913,8 @@ async fn windowed_record_is_idempotent_per_share_id() {
 //
 // The reject lane has the same bucket / index / aggregate shape as the
 // accepted lane. The PROP running tally (`rejected-shares`) must stay
-// untouched: that tally never shrinks, and reading it against a windowed
-// denominator is exactly the 75 % "reject rate" this lane replaces.
+// untouched: that tally never shrinks, so against a windowed denominator it
+// would not be a rate of anything.
 #[tokio::test]
 async fn windowed_reject_lands_in_its_bucket_and_window_aggregate() {
     let conn = match connect_or_skip(17).await {
@@ -1111,9 +1089,7 @@ async fn round_stats_window_reads_the_reject_lane_not_the_running_tally() {
 // Both directions: a PROP forget touches only the round keys (the window
 // lanes keep the address), a Window forget removes the address from every
 // live bucket of both lanes plus the aggregates and returns the window
-// contribution. Before this, a kicked Window member stayed in
-// `window:by-address`, which is the coinbase source, until their buckets
-// aged out.
+// contribution, since `window:by-address` is the coinbase source.
 #[tokio::test]
 async fn forget_member_window_removes_the_address_from_both_lanes() {
     let conn = match connect_or_skip(20).await {

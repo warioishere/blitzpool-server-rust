@@ -44,9 +44,9 @@ pub(crate) fn shared_accepted<'a>(
 
 /// Maps SV2's per-protocol reject reasons onto the canonical
 /// `bp_stats::RejectedReason`. `None` for the protocol-validity rejects
-/// that do not count toward the per-address rejected-stats. `BadExtranonceSize`
-/// never reaches this (it's a pre-share-validation reject — see
-/// `feedback-sv2-bad-extranonce-size-hard-reject`).
+/// that do not count toward the per-address rejected-stats.
+/// `BadExtranonceSize` is a pre-share-validation reject and never reaches
+/// this in practice.
 fn map_sv2_reject(reason: RejectReason) -> Option<RejectedReason> {
     match reason {
         // A share for a retired job is stale; one for a job the channel

@@ -49,13 +49,11 @@ const CHALLENGE_TTL_MINUTES: i64 = 15;
 
 /// Top bytes the SV1/SV2 extranonce allocators own. See the module doc.
 ///
-/// Derived from the allocator's own worker ids rather than restated as a
-/// literal: the rule is "everything up to and including the highest assigned
-/// worker partition", and a third allocator claiming worker 2 must widen this
-/// gate in the same edit. The DB carries the same bound as
-/// `pplns_custom_extranonce_prefix_unreserved` (migration 0012) — SQL cannot
-/// import a Rust constant, so that copy is unavoidable and named here so a
-/// change to one goes looking for the other.
+/// Derived from the allocators' worker ids: the rule is "everything up to and
+/// including the highest assigned worker partition", and a third allocator must
+/// widen this gate in the same edit. ⚠️ The DB carries the same bound as the
+/// `pplns_custom_extranonce_prefix_unreserved` check (SQL cannot import a Rust
+/// constant); change both together.
 const RESERVED_TOP_BYTE_MAX: u32 =
     if bp_common::extranonce::SV1_WORKER_ID > bp_common::extranonce::SV2_WORKER_ID {
         bp_common::extranonce::SV1_WORKER_ID
@@ -232,10 +230,8 @@ struct SetResponse {
 /// `/extranonce/token`. Kept in the header rather than the body so it stays
 /// out of request-body logs and is separated from the payload.
 ///
-/// **Atomic**: every entry lands or none does. A partially-applied batch
-/// would leave the fleet in a state the operator never asked for, which for
-/// a setting that decides what the miners hash on is worse than a clean
-/// rejection.
+/// **Atomic**: every entry lands or none does, so the fleet never ends up in
+/// a half-applied state nobody asked for.
 ///
 /// In-batch conflicts are diagnosed here (naming the offending worker)
 /// rather than left to the database, which could only report the constraint.
@@ -368,10 +364,9 @@ async fn verify_token(pool: &PgPool, address: &AddressId, presented: &str) -> Re
 /// `bp-stratum-v2`): the worker is whatever follows the FIRST dot of
 /// `user_identity`, taken verbatim, and an absent one becomes `"default"`.
 ///
-/// Deliberately does NOT trim or lowercase: the core stores the miner's bytes
-/// as-is, so the override is looked up by `(address, worker)` with a
-/// case-sensitive worker. Normalising here would silently fail to match a
-/// miner authorising as `Rig1` — the row would exist and never apply.
+/// Deliberately does NOT trim or lowercase: the core looks the override up by
+/// the miner's worker bytes as-is, so a normalised row would never match a
+/// miner authorising as `Rig1`.
 fn normalize_worker(raw: &str) -> String {
     if raw.is_empty() {
         "default".to_string()
@@ -558,8 +553,7 @@ mod tests {
     }
 
     /// The signed challenge is address-bound and verifies with a genuine
-    /// signature — guards the message format against drifting out of sync with
-    /// what actually gets signed (which would make every token issue fail).
+    /// signature, pinning the message format to what actually gets signed.
     #[test]
     fn signed_challenge_message_verifies() {
         let sk = SecretKey::from_slice(&[0x11u8; 32]).unwrap();

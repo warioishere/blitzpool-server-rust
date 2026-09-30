@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `bp_share_hook` trait impls gated on mining-mode = Group-Solo.
+//! `bp_share_hook` trait impls gated on mining-mode = Group-Solo. The hook
+//! surface is protocol-neutral, so the same impl serves SV1 and SV2.
 //!
-//! Engines used to impl `bp_stratum_v1::hooks::AcceptedShareSink` +
-//! `RejectedShareSink` directly. The
-//! per-share hook surface is decoupled from the wire protocol via
-//! `bp-share-hook` so the same impl serves both SV1 + SV2 servers.
-//!
-//! Group-Solo's `recordShare` is per-group. Both the accepted and rejected
-//! sinks read the producer-stamped `mode` / `group_id` off the share — the
-//! Core composite resolves them once from the mode gate at fan-out — so these
-//! sinks hold no gate and run unchanged on the Satellite off the stream.
+//! The sinks read the producer-stamped `mode` / `group_id` off the share
+//! (the Core resolves them once from the mode gate at fan-out), so they
+//! hold no gate and run unchanged on the Satellite off the stream.
 
 use async_trait::async_trait;
 use bp_common::{warn_throttled, LogThrottle, MiningMode};
@@ -28,7 +23,7 @@ use crate::engine::GroupSoloEngine;
 const RECORD_SHARE_WARN_THROTTLE_MS: i64 = 5_000;
 
 /// `SharedAcceptedShareSink` impl that records the share against the
-/// address's Group-Solo round iff the gate resolves it.
+/// address's Group-Solo round when the share is stamped Group-Solo.
 pub struct GroupSoloAcceptedShareSink {
     engine: GroupSoloEngine,
     warn_throttle: LogThrottle,
@@ -54,8 +49,7 @@ impl SharedAcceptedShareSink for GroupSoloAcceptedShareSink {
         let Some(group_id) = share.group_id.and_then(|g| Uuid::parse_str(g).ok()) else {
             return;
         };
-        // Share's Core-accept time, not now() — see the PPLNS sink for
-        // why: replayed/backlogged shares under the Core/Satellite split
+        // Share's Core-accept time, not now(): replayed/backlogged shares
         // must keep their original accept time, not the consume time.
         let ts_ms = share.ts_ms;
         if let Err(e) = self
@@ -104,9 +98,7 @@ impl SharedRejectedShareSink for GroupSoloRejectedShareSink {
         let Some(addr) = share.address else {
             return;
         };
-        // Producer-stamped group id — the Core composite resolved it from the
-        // mode gate at fan-out, so there's no gate query here and the sink
-        // runs unchanged on the Satellite off the rejected stream.
+        // Producer-stamped group id, resolved by the Core at fan-out.
         let Some(group_id_str) = share.group_id else {
             return;
         };

@@ -1,45 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SV1 server composition — Phase 7.4b (per-port hooks) +
-//! Phase 7.4c (listener moved to [`crate::stratum`]).
+//! SV1 server composition: one [`StratumV1Server`] per port (solo,
+//! solo-high-diff, and with PPLNS pplns + pplns-high-diff). The accept loop
+//! is in [`crate::stratum`], which shares each port between SV1 and SV2.
+//! Each server's [`ServerHooks`] carry:
 //!
-//! Builds one [`StratumV1Server`] per port (solo + solo-high-diff +
-//! optionally pplns + pplns-high-diff). The TCP-accept loop lives in
-//! `stratum.rs` because it's now protocol-detect-multiplexed (SV1 +
-//! SV2 share the same listening port and dispatch via
-//! the first-byte router in `stratum.rs`). Each server has its own
-//! [`ServerHooks`] clone wired to:
-//!
-//! - **block_sink**: [`TdpBlockSubmissionSink`] (shared across all
-//!   ports — it's stateless, holds only a clone of `TdpHandle`).
-//! - **accepted_sink / rejected_sink**: shared `EngineHandles`
-//!   composite sinks (PPLNS + Group-Solo + ShareStats + best-diff,
-//!   all mode-gated internally).
-//! - **session_persistence**: a [`ModeGatePopulatingPersistence`]
-//!   wrapper that publishes the resolved
-//!   [`MiningModeResult`] into the
-//!   shared mode-gate on `register_session`, decrements the refcount
-//!   on `deregister_session`, then forwards to the engine-layer
+//! - **block_sink**: [`TdpBlockSubmissionSink`], shared across ports.
+//! - **accepted_sink / rejected_sink**: the shared, mode-gated composite
+//!   sinks from `EngineHandles`.
+//! - **session_persistence**: [`ModeGatePopulatingPersistence`], which
+//!   publishes the resolved [`MiningModeResult`] into the mode gate on
+//!   register, refcounts it down on deregister, then forwards to the
 //!   [`SessionPersistenceHook`](bp_session_persistence::SessionPersistenceHook).
 //!
-//! ## Why one server per port
+//! One server per port because a server clones one `ServerHooks` into every
+//! connection, and the fallback mode for a non-group address is per-port
+//! state. The extra translator tasks fire only on TDP updates.
 //!
-//! `StratumV1Server` captures one `ServerHooks` at spawn time and
-//! clones it into every connection. Mode-gate population needs the
-//! per-port `payout_mode` to know which `MiningModeResult` to publish
-//! when an address isn't a group member — that's per-port state, so
-//! we spawn one server per port. The cost is 4× translator tasks +
-//! 4× template broadcast channels; the translator fires only on TDP
-//! updates (~30 s cadence) so the overhead is negligible.
-//!
-//! ## Address-resolution at authorize
-//!
-//! When a miner authorizes, [`ModeGatePopulatingPersistence`]
-//! consults the shared [`GroupLookup`] (impl'd for production by
-//! `GroupService`). If the address is in an active group, the
-//! published mode is `MiningModeResult::group_solo(group_id)`;
-//! otherwise the port's `payout_mode` (Solo or Pplns) drives the
-//! result. Group-Solo (per-address membership) preempts the port choice.
+//! Mode at authorize: active Group-Solo membership ([`GroupLookup`]) wins,
+//! then Blockparty admin, otherwise the port's `payout_mode`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -60,11 +39,9 @@ use crate::boot::FoundationHandles;
 use crate::engines::{BlitzpoolModeGate, EngineHandles};
 use crate::group_service::SharedGroupService;
 
-/// Per-port SV1 server bundle. One entry per `[stratum]`/`[pplns]`
-/// port the operator enabled. Consumed by [`crate::stratum::spawn`]
-/// which binds a single shared listener per port and protocol-detects
-/// the first byte to dispatch into either this `server` or the SV2
-/// equivalent.
+/// Per-port SV1 server, one per enabled `[stratum]`/`[pplns]` port.
+/// [`crate::stratum::spawn`] binds one listener per port and dispatches on
+/// the first byte to this server or the SV2 one.
 pub(crate) struct Sv1PortServer {
     pub(crate) port_config: PortConfig,
     pub(crate) server: StratumV1Server,
@@ -82,14 +59,10 @@ pub(crate) enum StratumV1SpawnError {
     },
 }
 
-/// Build one [`StratumV1Server`] per port + its
-/// [`bp_stratum_v1::ServerHooks`] clone. Returns an empty vec when
-/// TDP is unavailable (`--skip-tdp`) — SV1 has no jobs to serve
-/// without a template source.
-///
-/// The actual TCP-accept loop lives in [`crate::stratum::spawn`]; this
-/// function only constructs the servers + threads them back so the
-/// caller can build a per-port unified-protocol accept loop on top.
+/// Build one [`StratumV1Server`] per port with its
+/// [`bp_stratum_v1::ServerHooks`]. Empty when TDP is unavailable
+/// (`--skip-tdp`): no template source, no jobs. The accept loop is in
+/// [`crate::stratum::spawn`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_per_port_servers(
     cfg: &AppConfig,
@@ -113,10 +86,8 @@ pub(crate) fn build_per_port_servers(
         .validate()
         .map_err(|e| StratumV1SpawnError::ServerConfig(e.to_string()))?;
 
-    // Phase 7.7: block_sink fans block-found events to the per-mode
-    // engine ledger (PPLNS / Group-Solo `on_block_found`) +
-    // notification dispatcher, in addition to the existing TDP
-    // submit_solution path.
+    // Submits the solution via TDP and fans the block-found event to the
+    // per-mode engines and the notification dispatcher.
     let block_sink = TdpBlockSubmissionSink::wired(
         tdp.clone(),
         cfg,
@@ -139,10 +110,8 @@ pub(crate) fn build_per_port_servers(
     let lookup: Arc<dyn GroupLookup> = group_service.service.clone();
     let mut out: Vec<Sv1PortServer> = Vec::with_capacity(port_configs.len());
 
-    // One pool-wide extranonce1 allocator shared across every SV1 port, so
-    // two miners can never be handed the same prefix — not even on
-    // different ports. Worker 1 keeps SV1's prefixes disjoint from the SV2
-    // server's worker-0 space.
+    // One pool-wide extranonce1 allocator across every SV1 port, so no two
+    // miners share a prefix. Worker 1 keeps SV1 disjoint from SV2's worker 0.
     let extranonce = SharedExtranonce::new();
 
     for port_config in port_configs {
@@ -192,12 +161,10 @@ pub(crate) fn build_server_config(cfg: &AppConfig) -> ServerConfig {
     sc
 }
 
-/// Build the per-port configs from `[stratum]` + (optional)
-/// `[pplns]`. Always at least 2 Solo entries; up to 4 when PPLNS is
-/// enabled. The high-diff PPLNS port mirrors
-/// `high_diff_start_difficulty` (no separate field in the
-/// PPLNS config schema — kept consistent with the operator-facing
-/// "high-diff" knob in `[stratum]`).
+/// Build the per-port configs from `[stratum]` and optional `[pplns]`:
+/// 2 Solo ports, plus 2 PPLNS ports when PPLNS is enabled. The PPLNS
+/// high-diff port uses `[stratum]`'s `high_diff_start_difficulty`, one
+/// high-diff threshold for both modes.
 pub(crate) fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
     let mut ports = Vec::with_capacity(4);
 
@@ -231,10 +198,7 @@ pub(crate) fn build_port_configs(cfg: &AppConfig) -> Vec<PortConfig> {
             ..PortConfig::new(pplns.port, pplns.start_difficulty as f64)
         });
 
-        // PPLNS high-diff — mirror high_diff_start_difficulty
-        // (operator-facing "high-diff threshold" is one value across
-        // both payout modes; the PPLNS schema doesn't carry a
-        // separate one).
+        // PPLNS high-diff: shares `[stratum]`'s high-diff start difficulty.
         ports.push(PortConfig {
             payout_mode: MiningMode::Pplns,
             target_shares_per_minute: cfg.stratum.high_diff_target_shares_per_minute as f64,
@@ -287,10 +251,8 @@ fn build_port_hooks(
 
 // ─── GroupLookup trait (group_id resolution) ──────────────────────
 
-/// Address → active-group-id lookup surface. Decouples the wrapper
-/// from the heavy `GroupService<H>` generic so unit tests can inject
-/// a fake without standing up a `PgPool`. The single production impl
-/// is on `GroupService<H>` below.
+/// Address → active-group-id lookup. Decouples the wrapper from the
+/// `GroupService<H>` generic so unit tests need no `PgPool`.
 #[async_trait]
 pub(crate) trait GroupLookup: Send + Sync {
     /// Cache-only lookup. Returns `Some(group_id)` only when the
@@ -311,11 +273,10 @@ impl<H: GroupServiceHooks + Send + Sync + 'static> GroupLookup for GroupService<
 
 // ─── BlockpartyAdminLookup trait (admin → routable-party-id) ───────
 
-/// Narrow admin-lookup surface over the heavy `BlockpartyApi`, mirroring
-/// [`GroupLookup`]. Lets `resolve_mode` ask "is this address the admin of
-/// a **routable** (Ready/Active) Blockparty?" without unit tests having to
-/// stand up the full service. In Blockparty only the admin address hashes;
-/// members are payout recipients, so admin-keyed resolution is correct.
+/// Narrow admin lookup over `BlockpartyApi`, like [`GroupLookup`]: "is this
+/// address the admin of a **routable** (Ready/Active) Blockparty?". Only
+/// the admin hashes in Blockparty; members are payout recipients, so the
+/// mode resolves admin-keyed.
 #[async_trait]
 pub(crate) trait BlockpartyAdminLookup: Send + Sync {
     /// `Some(group_id)` only when `address` is the admin of a Ready/Active
@@ -336,22 +297,17 @@ impl BlockpartyAdminLookup for BlockpartyApiAdminLookup {
 
 // ─── ModeGatePopulatingPersistence ────────────────────────────────
 
-/// Wraps a `SharedSessionPersistence` impl and, on every
-/// register/deregister, also publishes / refcounts the resolved
-/// `MiningModeResult` into the shared [`BlitzpoolModeGate`].
+/// Wraps a `SharedSessionPersistence` and, on every register/deregister,
+/// publishes / refcounts the resolved `MiningModeResult` in the shared
+/// [`BlitzpoolModeGate`].
 ///
-/// **Per-port** — the `port_payout_mode` field captures the fallback
-/// mode for addresses that aren't in any active group. Every port gets
-/// its own instance per protocol, built by [`Self::for_port`]: SV1 and
-/// SV2 must not share one, because `sessions` is keyed by session ids
-/// each protocol mints on its own.
+/// **Per port and protocol** ([`Self::for_port`]): `port_payout_mode` is
+/// the fallback for addresses in no active group, and SV1 and SV2 must not
+/// share an instance because `sessions` is keyed by ids each protocol mints
+/// on its own.
 ///
-/// **session→address tracking**: the SV1
-/// `SessionPersistence::deregister_session` API only carries the
-/// `session_id`; the address is not re-provided. We keep a local
-/// `Mutex<HashMap<SessionId, String>>` populated on register so the
-/// deregister path can resolve the address back and call
-/// `mode_gate.clear_mode` correctly under refcounting.
+/// `deregister_session` carries only the session id, so `sessions` maps it
+/// back to the address for `mode_gate.clear_mode`.
 pub(crate) struct ModeGatePopulatingPersistence {
     port_payout_mode: MiningMode,
     mode_gate: Arc<BlitzpoolModeGate>,
@@ -403,15 +359,13 @@ impl ModeGatePopulatingPersistence {
         }
     }
 
-    /// Resolve `address` → `MiningModeResult`. Cache-only group
-    /// lookup (the `AddressCache` is rebuilt on every membership
-    /// change so cache-only is the correct read path here).
+    /// Resolve `address` → `MiningModeResult`. The group lookup is
+    /// cache-only; the `AddressCache` is rebuilt on every membership change.
     async fn resolve_mode(&self, address: &str) -> MiningModeResult {
         let address_id = match AddressId::new(address.to_string()) {
             Ok(a) => a,
-            // The SV1 authorize handler already validated the address
-            // shape; defensive fallthrough to the port's payout-mode
-            // result rather than panic on this branch.
+            // Authorize already validated the address; fall back to the
+            // port mode rather than panic.
             Err(_) => return mode_from_port(self.port_payout_mode),
         };
         // Group-Solo membership wins (active group only).
@@ -463,17 +417,15 @@ impl SharedSessionPersistence for ModeGatePopulatingPersistence {
     }
 }
 
-/// Map a port's `payout_mode` enum to a `MiningModeResult`. SV1 port
-/// configs only carry Solo or Pplns; a `GroupSolo` port config is a
-/// configuration error (group membership is per-address, not
-/// per-port) — we fall through to `solo()` defensively.
+/// Map a port's `payout_mode` to a `MiningModeResult`. Port configs only
+/// carry Solo or Pplns.
 fn mode_from_port(m: MiningMode) -> MiningModeResult {
     match m {
         MiningMode::Pplns => MiningModeResult::pplns(),
         MiningMode::Solo => MiningModeResult::solo(),
-        // Group-Solo and Blockparty are per-address modes, not per-port —
-        // a port config naming either is a misconfiguration. Defensively
-        // fall through to solo so the coinbase is at least spendable.
+        // Group-Solo and Blockparty are per-address modes; a port naming
+        // either is a misconfiguration, and solo keeps the coinbase
+        // spendable.
         MiningMode::GroupSolo | MiningMode::Blockparty => MiningModeResult::solo(),
     }
 }
@@ -816,9 +768,8 @@ mod tests {
             None,
             inner.clone(),
         );
-        // Never registered — deregister must not panic + must still
-        // forward to the inner sink so PG soft-delete attempts still
-        // run (no-op on the SQL side, but the contract is fan-out).
+        // Never registered: deregister must not panic and still forwards
+        // to the inner sink.
         wrapper.deregister_session("ghost-session").await;
         assert_eq!(inner.deregister_calls.lock().await.len(), 1);
     }

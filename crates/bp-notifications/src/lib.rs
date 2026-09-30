@@ -2,7 +2,7 @@
 
 //! Notifications crate for blitzpool-rust.
 //!
-//! Five layers:
+//! Layers:
 //!
 //! - [`template`] — pure email-template rendering (`subject`/`html`/`text`).
 //! - [`adapter`] — outbound transports (SMTP, Telegram, ntfy, FCM, Web-Push).
@@ -15,9 +15,7 @@
 //!   ntfy SSE) that turn upstream traffic into `command::dispatch` calls.
 //! - [`cron`] — periodic self-checks (network-difficulty poller,
 //!   best-difficulty cron) that emit events through the dispatcher.
-//!
-//! Read-style commands (`/stats`, `/show_workers`, `/pplns_status`,
-//! `/group_status`, etc.) need engine-reader wiring and are deferred.
+//! - `format` — pure de/en message formatting shared by the above.
 
 pub mod adapter;
 pub mod command;

@@ -671,9 +671,9 @@ async fn recently_deleted_sessions_are_listed_and_revivable() {
 
 #[tokio::test]
 async fn update_sv2_user_agent_by_address_bumps_updated_at() {
-    // Regression guard: updateSv2UserAgentByAddress must refresh updatedAt,
-    // otherwise a downstream-report refining a worker's userAgent would leave
-    // a stale "last seen" timestamp. Lock the bump in.
+    // The UPDATE must refresh updatedAt, otherwise a
+    // downstream report refining a worker's userAgent would leave a stale
+    // "last seen" timestamp.
     let Some(pool) = connect_or_skip().await else {
         return;
     };

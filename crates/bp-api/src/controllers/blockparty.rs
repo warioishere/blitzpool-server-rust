@@ -207,8 +207,7 @@ impl From<BlockpartyBlockHistoryRow> for HistoryRowView {
 // ─── Helpers ──────────────────────────────────────────────────────
 
 /// `a***@e***.com` — see [`crate::utils::mask_email`] for the full
-/// specification. Re-exported as a thin alias so call sites in this
-/// controller don't need to change shape.
+/// specification.
 fn mask_email(email: &str) -> String {
     crate::utils::mask_email(email)
 }
@@ -846,8 +845,8 @@ fn _status_ref(_: BlockpartyStatus) {}
 mod tests {
     use super::*;
 
-    /// Pin DTO serialized JSON shapes. The UI binds on field names + types —
-    /// any unintended schema drift shows up as a test failure here.
+    /// Pins the DTOs' serialized JSON shapes, which the UI binds on by field
+    /// name and type.
     #[test]
     fn group_public_view_json_shape() {
         let row = BlockpartyGroupRow {

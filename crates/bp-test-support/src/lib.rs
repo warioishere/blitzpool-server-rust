@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared helpers for the regtest / integration test suites.
-//!
-//! These were previously copy-pasted (and had quietly drifted) across
-//! ~15 `tests/` files. Centralising them here means a fix lands once.
-//! This crate is only ever a `dev-dependency`.
+//! Shared helpers for the regtest / integration test suites, kept in one
+//! place so a fix lands once. This crate is only ever a `dev-dependency`.
 
 #![allow(clippy::print_stderr)]
 
@@ -26,22 +23,12 @@ pub const PG_DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:15433/p
 
 /// Set this to turn every Redis/Postgres skip into a **failure**.
 ///
-/// The skip default is right for CI-without-services and for a contributor
-/// who has not started the containers. It is wrong for the run you intend
-/// to believe, because a skipped test passes: `$?` cannot tell a suite that
-/// exercised Postgres from one that never reached it.
-///
-/// Measured 2026-08-10, which is why this exists. The Docker daemon died
-/// part-way through a full-suite run. Every Redis/Postgres test after that
-/// point skipped, and the totals came out **identical** to the healthy run
-/// — 2104 passed either way. Nothing in the exit code, the failure count or
-/// the passed-count distinguished them; only `grep -c skipping` did, and
-/// only because the run happened to use `--nocapture`. Checking the
-/// containers before the run does not help either: they were up at the
-/// start.
-///
-/// With this set, that outage is a red suite at the moment it happens,
-/// naming the service and the URL.
+/// The skip default suits CI-without-services and a contributor who has not
+/// started the containers. It is wrong for a run meant as evidence: a
+/// skipped test passes, so neither the exit code nor the passed-count can
+/// tell a suite that exercised Postgres from one that never reached it, and
+/// a service that dies mid-run is invisible. With this set, an unreachable
+/// service fails the test, naming the service and the URL.
 pub const REQUIRE_SERVICES_ENV: &str = "BP_REQUIRE_TEST_SERVICES";
 
 /// Whether an unreachable service must fail rather than skip.
@@ -78,12 +65,9 @@ fn skip_or_fail<T>(reason: String) -> Option<T> {
 /// [`skip_or_fail`] with the decision passed in, so both branches can be
 /// exercised without mutating the environment.
 ///
-/// Returns the skip line rather than printing it. The verification protocol
-/// counts `grep -c skipping` over the whole run and expects **0** on a
-/// healthy one, so a unit test that reached an `eprintln!("… skipping")`
-/// would put a permanent 3 in that count and quietly destroy the only
-/// measurement that distinguishes a real run from a skipped one. Printing
-/// stays in [`skip_or_fail`], which no test calls.
+/// Returns the skip line rather than printing it: a healthy run must count
+/// **0** for `grep -c skipping`, so a unit test of this function must not
+/// print one. Printing stays in [`skip_or_fail`], which no test calls.
 fn skip_decision(required: bool, reason: String) -> Option<String> {
     assert!(
         !required,
@@ -168,13 +152,10 @@ pub struct AcceptedBlock {
 /// brute-force a nonce that meets the regtest target, submit it through
 /// `tdp`, and require bitcoin-core to extend the chain by one.
 ///
-/// This is the step every money regtest ends with, and it used to be
-/// copy-pasted into each of them — two of the copies were byte-identical
-/// down to the parameter list. It is one function because the failure it
-/// reports is subtle and worth wording once: `submit_solution` is
-/// fire-and-forget, so a coinbase whose outputs do not sum to the template
-/// value, or that carries a dust output or a malformed script, is rejected
-/// with no error the pool ever sees — the tip simply does not move.
+/// `submit_solution` is fire-and-forget, so a coinbase whose outputs do not
+/// sum to the template value, or that carries a dust output or a malformed
+/// script, is rejected with no error the pool ever sees: the tip simply
+/// does not move. The panic message names those causes.
 ///
 /// `fingerprint` is the distribution's settlement identity, carried in the
 /// job so a block found on it books through the distribution it actually
@@ -309,8 +290,7 @@ pub async fn wait_for_paired_template(
 /// requiring `future_template` (the loose variant used by the
 /// mempool-delta / autoscale tests that re-template without a tip change).
 /// Drop-in for the strict variant (same `(rx)` signature) — callers alias
-/// it as `wait_for_paired_template`. 15s budget (superset of the 10s/15s
-/// the old copies used).
+/// it as `wait_for_paired_template`. 15s budget.
 pub async fn wait_for_any_paired_template(
     rx: &mut broadcast::Receiver<TemplateUpdate>,
 ) -> (NewTemplate, SetNewPrevHash) {
@@ -344,16 +324,11 @@ pub async fn wait_for_any_paired_template(
 /// `blockparty_member` — `blockparty_member` has
 /// `ON DELETE CASCADE` from `blockparty_group`, so removing the parent is
 /// strictly more thorough than removing the child, and removing only the
-/// child leaves the parent behind.
-///
-/// That difference was a permanent, cross-branch failure. Measured
-/// 2026-08-10: the two blockparty regtests pick a **fixed** admin address
-/// (`deterministic_p2wpkh_regtest([0xa1; 32])` /  `[0xc1; 32]`) and
-/// `blockparty_group` has `UQ_blockparty_group_admin_address`, so one
-/// interrupted run left an orphaned group row and every later run — on any
-/// branch, including unmodified `main` — failed `create_group` with
-/// `AdminAddressTaken` forever after. Cleaning by member address could not
-/// help: the row holding the constraint was the one it did not touch.
+/// child leaves the parent behind. The blockparty regtests use a fixed
+/// admin address and `blockparty_group` has
+/// `UQ_blockparty_group_admin_address`, so an orphaned group row from an
+/// interrupted run would fail every later `create_group` with
+/// `AdminAddressTaken`.
 ///
 /// The member address is still worth passing: a non-admin address may hold
 /// `UQ_blockparty_member_address` under a group whose own admin is not in
@@ -376,18 +351,10 @@ pub async fn cleanup_blockparty_rows(pool: &PgPool, addrs: &[&str]) {
 /// Per-test-binary logical-DB ranges.
 ///
 /// `connect_redis_or_skip` **flushes** the DB it opens, so two tests
-/// sharing one wipe each other's state mid-run. Everything in a `cargo
-/// test` run is concurrent — tests within a binary and the binaries
-/// themselves — so isolation has to hold across the whole workspace, not
-/// just per file.
+/// sharing one wipe each other's state mid-run. Isolation has to hold
+/// across the whole workspace, not just per file.
 ///
-/// It did not. Measured 2026-08-03: **135 assignments on 16 databases**,
-/// every one of them 6–12× overbooked. That is not a flake, it is an
-/// arithmetic problem, and it cost two debugging rounds in one session:
-/// a test green alone and red in the suite, twice, for two different
-/// neighbours.
-///
-/// So each test binary owns `RANGE` consecutive databases and keeps its
+/// Each test binary owns `RANGE` consecutive databases and keeps its
 /// own 0-based numbering inside them. A binary needs a distinct base
 /// here; a test needs a number no sibling in the SAME binary uses.
 pub mod redis_db {
@@ -407,15 +374,9 @@ pub mod redis_db {
     pub const PPLNS_STREAM_EQUIV: u16 = 9 * RANGE;
     pub const PPLNS_WINDOW: u16 = 10 * RANGE;
 
-    // The regtest binaries. These used to call `connect_redis_or_skip` with a
-    // RAW index (8, 9, 10, 11, 13) and so landed inside `BLITZPOOL_BIN`'s
-    // range — `regtest_pplns_block_submit`'s 10 and
-    // `regtest_group_solo_block_submit`'s 10 were literally the same database,
-    // and both flush. Nothing ever broke because `cargo test` runs test
-    // BINARIES one after another, so the collision partners were never awake
-    // at the same time. That is a property of the runner, not of the tests:
-    // `cargo-nextest` runs binaries concurrently and would surface all of it
-    // at once.
+    // The regtest binaries get their own ranges too: `cargo test` runs
+    // binaries one after another, but `cargo-nextest` runs them concurrently,
+    // so a shared index would be wiped by a neighbour's flush.
     pub const RT_PPLNS_BLOCK_SUBMIT: u16 = 11 * RANGE;
     pub const RT_SPLIT_E2E: u16 = 12 * RANGE;
     pub const RT_POOL_NEUTRAL_PAYOUT: u16 = 13 * RANGE;
@@ -425,7 +386,7 @@ pub mod redis_db {
     ///
     /// ⚠️ Index **31** of this range is lent to TWO `bp-api` test
     /// binaries — `smoke.rs` and `custom_extranonce_guard.rs` — both
-    /// NO-FLUSH and write-free, since their endpoints now need a live
+    /// NO-FLUSH and write-free, since their endpoints need a live
     /// store to answer at all. Don't claim it for a session-persistence
     /// test, and don't add a write to either borrower without moving
     /// them apart first.
@@ -446,12 +407,10 @@ pub mod redis_db {
 /// override a container's command**, so CI's Valkey has 16 and there is
 /// no way to pass `--databases` to it as a service.
 ///
-/// Rather than let that difference turn into a silent `SELECT` failure —
-/// which `connect_redis_or_skip` would report as "Redis unreachable" and
-/// **skip**, the exact failure mode that hid a whole suite earlier today
-/// — the index is folded into whatever the server offers. On 512 every
-/// binary is isolated; on 16 the folding lands tests back on top of each
-/// other exactly as they were before, which is no worse than today.
+/// Rather than let that difference turn into a `SELECT` failure, which
+/// `connect_redis_or_skip` would report as "Redis unreachable" and silently
+/// **skip**, the index is folded into whatever the server offers. On 544
+/// every binary is isolated; on 16 tests share databases again.
 async fn redis_database_count() -> u16 {
     static COUNT: tokio::sync::OnceCell<u16> = tokio::sync::OnceCell::const_new();
     *COUNT
@@ -602,11 +561,9 @@ mod tests {
         }
     }
 
-    /// The point of the knob: with it set, an unreachable service is a
-    /// FAILURE. Asserted through `skip_decision` rather than by re-deriving
-    /// the rule, because the bug it guards against is a decision function
-    /// that returns a skip no matter what — which no test of
-    /// `value_requires_services` alone would catch.
+    /// With the knob set, an unreachable service is a FAILURE. Asserted
+    /// through `skip_decision` so a decision function that skips no matter
+    /// what cannot pass.
     #[test]
     #[should_panic(expected = "BP_REQUIRE_TEST_SERVICES")]
     fn a_set_value_turns_an_unreachable_service_into_a_failure() {
@@ -620,9 +577,8 @@ mod tests {
         );
     }
 
-    /// `=true` has to work too — nobody reads the docs for which truthy
-    /// spelling was chosen, and a value that silently means "skip" would
-    /// reinstate the exact failure this knob exists to catch.
+    /// Any truthy spelling demands services, so a value that looks set
+    /// never silently means "skip".
     #[test]
     fn truthy_spellings_other_than_one_also_count() {
         for value in ["true", "yes", "always"] {

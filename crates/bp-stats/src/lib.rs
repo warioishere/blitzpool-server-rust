@@ -14,17 +14,17 @@
 //!
 //! - [`slot`] — `TimeSlot` newtype + helpers (current slot, chart
 //!   visibility cutoff, slot-end alignment).
-//! - [`buffer`] — three generic primitives:
+//! - [`buffer`] — the generic primitives:
 //!   [`buffer::SwapBuffer`], [`buffer::NumberDeltaBuffer`],
 //!   [`buffer::NestedDeltaBuffer`], [`buffer::RecordDeltaBuffer`].
-//! - [`accumulator`] — six domain types built on top of the buffers,
+//! - [`accumulator`] — the domain types built on top of the buffers,
 //!   each wrapping a `Mutex<…>` so `add_*` from the stratum path is
 //!   thread-safe.
 //! - [`health`] — `FlushHealthMonitor` counts consecutive flush failures
 //!   per flusher and surfaces a one-shot threshold-crossing signal.
 //!
 //! The bulk-flush queries (PG `unnest(...)` upserts) and the cron schedule
-//! are deferred to the service-wiring layer.
+//! live in the service-wiring layer.
 
 pub mod accumulator;
 pub mod buffer;

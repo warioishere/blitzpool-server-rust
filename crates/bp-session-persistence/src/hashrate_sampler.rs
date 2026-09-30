@@ -2,10 +2,9 @@
 
 //! Live per-session hashrate sampler.
 //!
-//! Owns the `hash_rate` field of the `client:live:*` hashes. On every
-//! accepted share we
-//! accumulate the share's **credited** difficulty (`effective_difficulty`)
-//! into a persistent per-session bucket. Every `sample_interval`
+//! Owns the `hash_rate` field of the `client:live:*` hashes. Every
+//! accepted share adds its **credited** difficulty (`effective_difficulty`)
+//! to a persistent per-session bucket. Every `sample_interval`
 //! (default 60 s) each bucket is turned into a hashrate estimate
 //!
 //! ```text
@@ -13,7 +12,7 @@
 //! ```
 //!
 //! — the identical formula the hashrate chart applies per 10-min slot, so
-//! the live figure and the chart agree. We then write a **2-sample moving
+//! the live figure and the chart agree. The written value is a **2-sample moving
 //! average** of the current + previous window's estimate:
 //! `displayed = (prev + rate) / 2` (or `rate` alone for a session's very
 //! first window). Over a 60 s window vardiff keeps ~10–15 shares, enough
@@ -42,10 +41,9 @@ use crate::touch_buffer::{TouchKey, TouchKeyRef};
 
 /// Consecutive zero-share windows after which a faded session is dropped
 /// from the map. The fade itself reaches 0 after two empty windows
-/// (R → R/2 → 0); we keep the session for a third window that re-writes the
-/// 0, so a transient DB failure on the terminal 0-write gets one automatic
-/// retry before the entry is dropped (the entry going stale otherwise would
-/// freeze a dead rig at R/2 until the key's TTL expires).
+/// (R → R/2 → 0); a third window re-writes the 0, so a transient failure
+/// on the terminal 0-write gets one retry instead of freezing a dead rig
+/// at R/2 until the key's TTL expires.
 const MAX_EMPTY_WINDOWS: u32 = 3;
 
 /// Per-session sampling state. Persists across windows so a stopped
@@ -193,10 +191,8 @@ pub(crate) async fn sample_and_write(
 /// runtime stall that would understate elapsed and overstate the rate.
 /// Missed ticks are skipped rather than burst-fired.
 ///
-/// No boot reconcile any more: a previous process's leftover rates live
-/// in TTL'd Redis keys that age out on their own within minutes — the
-/// ghost-value problem the old PG column needed a startup reset for
-/// cannot exist here.
+/// No boot reconcile: a previous process's leftover rates live in TTL'd
+/// Redis keys that age out on their own.
 ///
 /// Returns when `shutdown_rx` resolves — no final flush, the values are
 /// ephemeral and recomputed from live shares on the next boot.

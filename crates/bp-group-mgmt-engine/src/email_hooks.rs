@@ -7,7 +7,7 @@
 //! `bp-notifications::template::*`.
 //!
 //! Best-effort: failed sends are logged and swallowed by the caller.
-//! We split this out so tests can swap in [`CapturingEmailHooks`] to
+//! A trait so tests can swap in [`CapturingEmailHooks`] to
 //! assert what would have been sent without standing up SMTP.
 
 use async_trait::async_trait;
@@ -54,9 +54,8 @@ pub trait EmailHooks: Send + Sync {
     async fn send_join_decision(&self, ctx: JoinDecisionEmailContext);
 }
 
-/// No-op email sink. Used by Phase-7 wiring when SMTP isn't
-/// configured + by integration tests where the SMTP fan-out is
-/// out-of-scope.
+/// No-op email sink. Used when SMTP isn't configured and by
+/// integration tests where the SMTP fan-out is out of scope.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopEmailHooks;
 

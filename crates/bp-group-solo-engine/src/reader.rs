@@ -7,10 +7,6 @@
 //!   [`ReaderView::round_stats`]
 //! - `/api/pplns/groups/:groupId/best-difficulty` ⇒
 //!   [`ReaderView::best_difficulty`]
-//!
-//! `/api/pplns/groups/:groupId/blocks` (block-history list) is
-//! deferred to a consumer-driven bp-db read query; the underlying
-//! `PplnsGroupBlockHistoryRow` row-struct already exists in bp-db.
 
 use bp_db::find_group;
 use bp_group_mgmt::group::PayoutMode;

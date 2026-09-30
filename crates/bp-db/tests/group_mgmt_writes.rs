@@ -698,7 +698,7 @@ async fn expire_invitations_only_flips_past_due() {
     let flipped = expire_pending_pplns_group_invitations(&pool, 1_000)
         .await
         .expect("exp");
-    assert!(flipped >= 1); // at least our `past` row; other test rows may share the sweep
+    assert!(flipped >= 1); // at least the `past` row; other test rows may share the sweep
     let past_now = find_pplns_group_invitations_pending_for_group_directed(&pool, gid)
         .await
         .expect("by-g");

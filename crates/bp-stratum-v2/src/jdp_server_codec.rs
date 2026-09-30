@@ -146,7 +146,7 @@ fn decode_declare(m: Sv2DeclareMiningJob<'_>) -> Result<DeclareMiningJobInput, C
         coinbase_tx_prefix: m.coinbase_tx_prefix.as_bytes().to_vec(),
         coinbase_tx_suffix: m.coinbase_tx_suffix.as_bytes().to_vec(),
         wtxid_list,
-        // excess_data dropped — DEFERRED
+        // excess_data is dropped (see module docs).
     })
 }
 
@@ -253,9 +253,8 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<JdpWireFrame, Code
         } => AnyMessageOwned::JobDeclaration(JobDeclarationOwned::ProvideMissingTransactions(
             Sv2ProvideMissingTransactions {
                 request_id,
-                // u32 → u16 cast (SV2 wire field is u16; our local
-                // type uses u32 for ergonomic reasons. Values >65535
-                // would be a wtxid-list of >64K txs — impossible).
+                // The wire field is u16. Positions index a `Seq064K`
+                // wtxid list, so they always fit.
                 unknown_tx_position_list: unknown_tx_position_list
                     .into_iter()
                     .map(|x| x as u16)

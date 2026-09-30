@@ -3,9 +3,9 @@
 //! `/api/address/ownership/*` — prove control of a BTC address by signing a
 //! server-issued challenge with the address's key.
 //!
-//! A generic "this address proved control" primitive (a 2nd equivalent option
-//! to the verified-email binding for group-invite eligibility, and — later —
-//! the auth gate for the custom-extranonce override).
+//! A generic "this address proved control" primitive: an equivalent option to
+//! the verified-email binding for group-invite eligibility; the
+//! custom-extranonce controller reuses its signature verification.
 //!
 //! Flow: `challenge {address}` returns an exact message to sign → the wallet
 //! signs it (Sparrow/Electrum text-paste, or a hardware wallet) → `verify
@@ -273,8 +273,8 @@ where
 /// `pub(crate)` so the custom-extranonce controller authorises its changes with
 /// the same verification rather than a second copy of it.
 // The per-address-type `match` arms each run a distinct verification (recover +
-// re-derive + compare) — keeping the explicit `if` inside each arm is clearer
-// for security review than collapsing into match guards, so allow the lint.
+// re-derive + compare); an explicit `if` inside each arm reads more clearly
+// than collapsed match guards, so allow the lint.
 #[allow(clippy::collapsible_match)]
 pub(crate) fn verify_message_signature(
     address: &str,
@@ -399,16 +399,10 @@ mod tests {
         bip322::sign_simple_encoded(address, message, &[wif], None).expect("bip322 signing")
     }
 
-    // Covers the FIRST branch of `verify_message_signature`. Every other test
-    // here drives a recoverable signature, where the BIP-322 attempt fails and
-    // falls through to the legacy path — so without this one the `bip322` call
-    // was only ever exercised on its error return, and a `bip322` crate bump
-    // could change what the pool accepts as proof of address ownership without
-    // a single test noticing.
-    //
-    // Taproot is the case that matters most: `MessageSignature::from_base64`
-    // cannot represent a taproot signature, so for `bc1p…` addresses BIP-322 is
-    // the ONLY route. If it breaks, those miners cannot prove ownership at all.
+    // Covers the BIP-322 branch of `verify_message_signature` on its success
+    // path; the other tests reach it only on its error return. Taproot matters
+    // most: `MessageSignature::from_base64` cannot represent a taproot
+    // signature, so for `bc1p…` addresses BIP-322 is the ONLY route.
     #[test]
     fn bip322_signature_verifies_for_segwit_and_taproot() {
         let (sk, _pk, cpk) = test_key();
@@ -434,28 +428,17 @@ mod tests {
         );
     }
 
-    // REGRESSION GUARD for a remotely reachable panic that `bip322` 0.0.10 had
-    // and 0.0.11 fixed — its changelog does not mention it.
-    //
-    // `verify_simple_encoded` decodes the caller's base64 straight into a
-    // `Witness`, so the witness is attacker-controlled. For a P2SH address
-    // 0.0.10 took `witness[1]` as the public key and then computed
-    // `pub_key.wpubkey_hash().unwrap()` — and `wpubkey_hash()` returns `Err`
-    // for an UNCOMPRESSED key, which `PublicKey::from_slice` happily accepts.
-    // So a 65-byte key at witness[1] panicked the handler. `POST
-    // /api/address/ownership/verify` is unauthenticated (5/min per IP) and the
-    // router installs no `CatchPanicLayer`.
-    //
-    // 0.0.11 turned that `unwrap()` into a typed error. This test asserts the
-    // input is REJECTED rather than fatal; pin `bip322` back to 0.0.10 and it
-    // panics instead of returning `None`.
+    // A P2SH-P2WPKH witness carrying an UNCOMPRESSED key is rejected with
+    // `None`, not a panic. The witness comes straight from the caller's
+    // base64 and the router installs no `CatchPanicLayer`, so the `bip322`
+    // dependency must return an error for it.
     #[test]
     fn a_crafted_witness_with_an_uncompressed_key_is_rejected_not_fatal() {
         use bitcoin::consensus::encode::serialize;
         use bitcoin::Witness;
 
         let (sk, _pk, cpk) = test_key();
-        // P2SH-P2WPKH — the address family that reached the unwrap.
+        // P2SH-P2WPKH: the family whose verifier hashes witness[1] as a key.
         let addr = Address::p2shwpkh(&cpk, Network::Bitcoin).to_string();
 
         let uncompressed = bitcoin::PublicKey {
@@ -464,8 +447,7 @@ mod tests {
         };
         assert_eq!(uncompressed.to_bytes().len(), 65, "must be uncompressed");
 
-        // Two items so 0.0.10's `witness.len() > 1` guard is satisfied; item 1
-        // is the key it would have hashed.
+        // Two items, so item 1 is read as the public key.
         let mut witness = Witness::new();
         witness.push([0x30u8; 72]); // shape-only stand-in for a signature
         witness.push(uncompressed.to_bytes());

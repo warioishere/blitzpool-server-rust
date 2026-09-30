@@ -3,23 +3,18 @@
 //! `bp_share_hook::SharedAcceptedShareSink` impl, mode-gated on
 //! `MiningMode == PPLNS`.
 //!
-//! Engines used to impl `bp_stratum_v1::hooks::AcceptedShareSink`
-//! directly. All per-share engine hooks are now decoupled from the
-//! wire protocol via the
-//! [`bp_share_hook::SharedAcceptedShareSink`] trait: SV1 and SV2
-//! Stratum servers each carry a thin adapter that projects their
-//! native `ShareAccept` into the shared view, so this impl serves
-//! both protocols. The share carries its producer-resolved
-//! [`bp_share_hook::MiningMode`], so this sink just checks
-//! `share.mode == Pplns` — no mode-gate query.
+//! Per-share engine hooks are decoupled from the wire protocol via the
+//! [`bp_share_hook::SharedAcceptedShareSink`] trait: SV1 and SV2 each
+//! carry a thin adapter into the shared view, so this impl serves both.
+//! The share carries its producer-resolved [`bp_share_hook::MiningMode`],
+//! so this sink checks `share.mode == Pplns` without a mode-gate query.
 //!
 //! # Block-submission hook
 //!
-//! `PplnsBlockSubmissionSink` is **NOT** provided here because the
-//! block-submission trait surface is still protocol-specific (it
-//! carries the full `ShareAccept` for the TDP `submit_solution` call).
-//! That stays in `bin/blitzpool` Phase-7 wiring where the TDP-stream
-//! context (block height) joins with the share-accept payload.
+//! No block-submission sink is provided here: that trait surface is
+//! protocol-specific (it carries the full `ShareAccept` for the TDP
+//! `submit_solution` call), so it is wired in `bin/blitzpool` where the
+//! TDP-stream context (block height) joins the share-accept payload.
 
 use async_trait::async_trait;
 use bp_common::{warn_throttled, LogThrottle, MiningMode};
@@ -37,8 +32,7 @@ use crate::engine::PplnsEngine;
 /// window iff the address resolves to PPLNS mode.
 ///
 /// Composed into the SV1 / SV2 server hooks via the per-protocol
-/// adapters (`Sv1AcceptedShareAdapter` / `Sv2AcceptedShareAdapter`)
-/// in `bin/blitzpool`.
+/// adapters in `bin/blitzpool`.
 pub struct PplnsAcceptedShareSink {
     engine: PplnsEngine,
     warn_throttle: LogThrottle,
@@ -56,9 +50,8 @@ impl PplnsAcceptedShareSink {
 #[async_trait]
 impl SharedAcceptedShareSink for PplnsAcceptedShareSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        // Mode is resolved once by the producer and stamped on the share;
-        // the sink reads it instead of querying a gate, so under the split
-        // the consumer needs no gate.
+        // Mode is resolved once by the producer and stamped on the share,
+        // so the consumer needs no gate.
         if share.mode != MiningMode::Pplns {
             return;
         }

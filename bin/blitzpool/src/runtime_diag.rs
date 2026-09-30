@@ -52,9 +52,8 @@ fn spawn_watchdog() -> JoinHandle<()> {
                 );
             }
             next += WATCHDOG_TICK;
-            // Re-sync if we fell so far behind that the next deadline is
-            // already in the past, so one stall doesn't emit a burst of
-            // catch-up ticks.
+            // Re-sync when the next deadline is already past, so one stall
+            // doesn't emit a burst of catch-up ticks.
             if next < now {
                 next = now + WATCHDOG_TICK;
             }

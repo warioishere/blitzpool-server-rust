@@ -1,32 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! HTTP API for the Rust port of the Blitzpool admin/UI surface.
+//! HTTP API for the Blitzpool admin/UI surface.
 //!
 //! Built on `axum` + a typed [`AppState`] threaded through every
-//! handler. Each `controllers/<name>.rs` module owns ~10 endpoints
-//! and exposes a `routes()` helper returning an axum
-//! `Router<SharedState<H, M>>`.
-//!
-//! ## Module status
-//!
-//! - ✅ `controllers::info` — `/api/info/*` + `/pool` + `/network` +
-//!   `/health` + `/info/block-template`. Chart / accepted / workers /
-//!   rejected / shares endpoints are deferred (need new bp-db time-range
-//!   readers).
-//! - ✅ `controllers::pplns` — 7 reader endpoints driven by
-//!   `PplnsEngine::reader()` (the `/chart` time-series endpoint is in
-//!   the same deferred bucket).
-//! - ✅ `controllers::groups`
-//! - ✅ `controllers::client`
-//! - ✅ `controllers::invitation`
-//! - ✅ writers
+//! handler. Each `controllers/<name>.rs` module exposes a `routes()`
+//! helper returning an axum `Router<SharedState<H, M>>`.
 //!
 //! ## Route prefixes
 //!
 //! Group routes are mounted under `/api/pplns/groups/*` and invitation
-//! routes under `/api/pplns/invitations/*`, matching the upstream
-//! controller prefixes (`pplns/groups`, `pplns/invitations`). UI fetch
-//! URLs must use these exact prefixes.
+//! routes under `/api/pplns/invitations/*`. UI fetch URLs use these exact
+//! prefixes.
 
 mod controllers;
 pub mod email_hooks;

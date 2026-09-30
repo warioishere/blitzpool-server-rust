@@ -9,11 +9,11 @@
 //! - `monthly`   — 1st of month
 //! - `custom`    — daily fire, gated by `roundResetIntervalDays`
 //!
-//! On fire, the runner wipes the full round state (shares zset,
-//! counter, total, by-address, rejected-shares, best-share,
-//! last-accepted-share-at, and all per-finder snapshots) and stamps
+//! On fire, the runner wipes the full round state (total, by-address,
+//! rejected-shares, best-share, last-accepted-share-at, window keys and
+//! all per-finder snapshots; the dedup set survives) and stamps
 //! `lastRoundResetAt` to now. A 60-second guard on `lastRoundResetAt`
-//! prevents scheduled-vs-scheduled double-fire.
+//! prevents a double fire.
 //!
 //! `chrono-tz` ships the IANA TZ database compiled into the binary,
 //! so the calendar-boundary math is OS-independent. DST handling for
@@ -42,10 +42,9 @@ use crate::round::{GroupRoundStore, RoundError};
 /// `lastRoundResetAt` gate.
 pub const RESET_DEBOUNCE_MS: i64 = 60_000;
 
-/// DST-tolerance window for `custom` preset elapsed-check: the
-/// configured interval may shrink/grow by up to 12 h across a DST
-/// transition. Without tolerance, a 7-day-interval cron that lands
-/// 23.5 h after the 6th daily-fire wouldn't fire on the 7th.
+/// DST-tolerance window for the `custom` preset elapsed-check. Across a
+/// DST transition a day is 23 h or 25 h, so without tolerance a
+/// 7-day-interval cron could miss its 7th daily fire.
 pub const DST_TOLERANCE_MS: i64 = 12 * 60 * 60 * 1000;
 
 #[derive(Debug, Error)]
@@ -99,8 +98,9 @@ pub struct ResetSchedule {
 }
 
 impl ResetSchedule {
-    /// Construct from raw DB-row fields. Returns `Ok(None)` if the
-    /// group has no preset configured (silent silently-no-op case).
+    /// Construct from raw DB-row fields. Returns `Ok(None)` when there is
+    /// nothing to schedule: no preset, no timezone, or `custom` without an
+    /// interval.
     pub fn from_row_fields(
         group_id: Uuid,
         preset: Option<&str>,
@@ -149,7 +149,7 @@ pub fn compute_next_fire(
         if let Some(last_ms) = last_reset_at_ms {
             let interval_ms = schedule.interval_days.unwrap_or(0) as i64 * 86_400_000;
             let earliest_ms = last_ms + interval_ms - DST_TOLERANCE_MS;
-            // Step through daily fires until we find one ≥ earliest_ms.
+            // Step through daily fires until one is ≥ earliest_ms.
             for _ in 0..(schedule.interval_days.unwrap_or(1) as i64 + 2) {
                 if candidate.timestamp_millis() >= earliest_ms {
                     break;
@@ -226,9 +226,8 @@ fn next_month_first_midnight(now: DateTime<Tz>) -> DateTime<Tz> {
 // ── Reset action ────────────────────────────────────────────────────
 
 /// Composes the reset operation across Redis + PG. NOT a single TX
-/// (Redis + PG can't be transactional together). Order minimises
-/// partial-state risk: Redis state wiped first, then PG state, then
-/// stamp.
+/// (Redis + PG can't be transactional together): the Redis state is
+/// wiped first and the PG stamp comes last.
 pub struct GroupResetRunner<C: Clock> {
     pool: PgPool,
     round: GroupRoundStore,
@@ -262,10 +261,8 @@ impl<C: Clock> GroupResetRunner<C> {
             }
         }
 
-        // Custom-preset elapsed check (defence-in-depth — the cron
-        // task SHOULD have gated already, but this lets the runner be
-        // invoked as a standalone action without surprising the admin
-        // by firing too early).
+        // Custom-preset elapsed check. The cron task gates already; this
+        // keeps a standalone invocation from firing too early.
         if let (Some(preset_str), Some(interval_days)) = (
             group.round_reset_preset.as_deref(),
             group.round_reset_interval_days,
@@ -305,8 +302,8 @@ impl<C: Clock> GroupResetRunner<C> {
     }
 }
 
-// Manual Clone because the derive would require `C: Clone`. Same
-// pattern as `InflightResultCache` — clone the Arc<C>.
+// Manual Clone because the derive would require `C: Clone`; the Arc<C>
+// is cloned instead.
 impl<C: Clock> Clone for GroupResetRunner<C> {
     fn clone(&self) -> Self {
         Self {
@@ -321,8 +318,8 @@ impl<C: Clock> Clone for GroupResetRunner<C> {
 
 /// Spawn a per-group cron task. The task sleeps until the next
 /// scheduled fire (calendar-aligned in the group's TZ), runs the
-/// reset, then loops. The schedule is captured at spawn time —
-/// bin/blitzpool's wiring re-spawns the task on group config changes.
+/// reset, then loops. The schedule is captured at spawn time, so a
+/// group config change re-spawns the task (`reschedule_group`).
 pub fn spawn_per_group_task<C: Clock>(
     runner: GroupResetRunner<C>,
     schedule: ResetSchedule,
@@ -481,7 +478,7 @@ mod tests {
         let last_ms = (now - ChronoDuration::days(2)).timestamp_millis();
         let next = compute_next_fire(&s, Some(last_ms), now);
         // Earliest fire ≈ last + 7d - 12h. Daily candidates step
-        // forward from next-midnight (2026-05-17 00:00) until we
+        // forward from next-midnight (2026-05-17 00:00) until they
         // cross the threshold.
         let last_dt = now - ChronoDuration::days(2);
         let earliest = last_dt + ChronoDuration::days(7) - ChronoDuration::hours(12);
@@ -514,8 +511,7 @@ mod tests {
 
     #[test]
     fn reset_runner_is_cloneable_without_c_clone_bound() {
-        // Sanity: manual Clone impl works for non-Clone C generics.
-        // We just verify the type compiles.
+        // Compile-time check: the manual Clone impl works for a non-Clone C.
         fn _accepts<C: Clock>(r: GroupResetRunner<C>) -> GroupResetRunner<C> {
             r.clone()
         }

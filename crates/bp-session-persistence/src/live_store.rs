@@ -2,20 +2,17 @@
 
 //! Redis writer for the per-session live hashes (`client:live:*`).
 //!
-//! Mirrors the two `client_entity` hot-write paths into one Redis hash
-//! per session (key schema in [`bp_common::live_client_key`]):
+//! Two hot-write paths share one Redis hash per session (key schema in
+//! [`bp_common::live_client_key`]):
 //!
 //! - the touch flush ([`crate::touch_buffer`]) writes best/current
 //!   difficulty, channel count and the last-seen timestamp, and
-//!   **refreshes the TTL** — exactly the liveness role `updatedAt`
-//!   plays in Postgres;
+//!   **refreshes the TTL**: it is the session's liveness signal;
 //! - the hashrate sampler ([`crate::hashrate_sampler`]) writes only
 //!   `hash_rate` and sets the TTL **only when its HSET created the
-//!   key** — the sampler keeps writing fades for up to 3 windows after
+//!   key**: the sampler keeps writing fades for up to 3 windows after
 //!   the shares stop, and letting those writes refresh the TTL would
-//!   extend a dead session's liveness past the touch-derived rule
-//!   (the same split the old PG columns had: the hashrate writer never
-//!   bumped `updatedAt`).
+//!   extend a dead session's liveness past the touch-derived rule.
 //!
 //! Both writes are Lua scripts so HSET and EXPIRE land as one
 //! indivisible step: prod Redis runs `volatile-lru`, where a key that
@@ -24,8 +21,7 @@
 //!
 //! `best_difficulty` is max-merged against the stored value inside the
 //! script. The touch buffer only maxes within one 30 s flush window, so
-//! a plain HSET would let a later window regress the session's best;
-//! Postgres gets the same cross-flush monotonicity from `GREATEST`.
+//! a plain HSET would let a later window regress the session's best.
 
 use bp_common::live_client_key::client_live_key;
 use hashbrown::HashMap;
@@ -40,15 +36,13 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::touch_buffer::{TouchEntry, TouchKey};
 
-/// Keys per script invocation. ~700 active sessions on prod today, so a
-/// flush is 2 round trips; the cap keeps one EVAL's argument list (and
-/// its blocking time on the server) bounded if the pool grows 10×.
+/// Keys per script invocation. The cap keeps one EVAL's argument list
+/// (and its blocking time on the server) bounded as the pool grows.
 const CHUNK: usize = 400;
 
 /// Touch write. `ARGV[1]` = TTL seconds, then a stride of 4 per key:
-/// best difficulty, current difficulty (empty string = "no sample", the
-/// `Option::None` mirror of the SQL `COALESCE`), channel count,
-/// last-seen epoch-ms.
+/// best difficulty, current difficulty (empty string = "no sample", keeps
+/// the stored value), channel count, last-seen epoch-ms.
 const TOUCH_LIVE_LUA: &str = r#"
 local ttl = tonumber(ARGV[1])
 for i = 1, #KEYS do

@@ -1,60 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Background cron wiring — Phase 7.5.
+//! Background crons, split into two groups by process role.
 //!
-//! Spawns the 4 cron loops that are wireable today with the
-//! foundation + engines + hooks state already constructed by
-//! `boot.rs` / `engines.rs` / `hooks.rs`:
+//! Maintenance (`payout`/accounting role):
+//! - **`kill_dead_clients`** (60 s): soft-deletes `client_entity` rows past
+//!   the birth grace whose session no front holds any more, and revives
+//!   rows that kept mining through a soft-delete.
+//! - **`old_stats_cleanup`** (hourly), **`old_blocks_cleanup`** (daily),
+//!   **`stale_push_cleanup`** (weekly): table retention.
+//! - **`invitation_expiry`** (hourly) and **`join_request_expiry`** (daily),
+//!   in `bp_group_mgmt_engine::cron`.
 //!
-//! 1. **`kill_dead_clients`** (every 60 s) — soft-deletes `client_entity`
-//!    rows past the 5-minute birth grace whose session no front holds any
-//!    more. Catches sessions whose disconnect path didn't fire cleanly
-//!    (network drop without a clean FIN, a front that restarted). The
-//!    verdict comes first-hand from the fronts' published live set
-//!    (`crate::live_sessions`): a session a front still holds is alive
-//!    whatever its share flow says. Only where no front publishes
-//!    sessions does the older rule decide — `client:live:*` hash gone on
-//!    two consecutive passes. Candidates from
-//!    `bp_db::find_stale_active_sessions`, soft-delete via
-//!    `bp_db::soft_delete_sessions`.
-//! 2. **`invitation_expiry`** (hourly) — flips
-//!    `pplns_group_invitation` rows from `pending → expired` past their
-//!    `expiresAt`. Lives in `bp_group_mgmt_engine::cron`.
-//! 3. **`join_request_expiry`** (daily) — same for stale
-//!    `pplns_group_join_request` rows past 30 days. Same crate.
-//! 4. **`network_difficulty`** (every 10 min) — polls mempool.space's
-//!    `currentDifficulty`, persists it, and (when `[notifications.fcm]`
-//!    is configured) fans out FCM pushes to subscribers on a change.
-//!    Lives in `bp_notifications::cron::network_difficulty`.
+//! Notifications (`notify` role):
+//! - **`network_difficulty`** (10 min): persists the network difficulty and
+//!   pushes changes when a push adapter is configured.
+//! - **`hourly_stats`**: Telegram / ntfy digests; spawned only when one of
+//!   those adapters exists ([`crate::listeners::ListenerHandles`]).
+//! - **`best_difficulty`** (60 s): pushes a new per-address best via the
+//!   [`bp_notifications::dispatcher::NotificationDispatcher`]; its baseline
+//!   is seeded at spawn so a restart does not re-notify every cached best.
 //!
-//! Phase 7.6 adds:
-//!
-//! 5. **`hourly_stats`** (hourly) — emits per-address `/stats` +
-//!    `/show_workers` digests through whichever of the
-//!    Telegram / ntfy adapters are configured. Only spawns when at
-//!    least one of the two listener adapters is live (passed in
-//!    through [`crate::listeners::ListenerHandles`]).
-//!
-//! Phase 7.7 adds the final cron:
-//!
-//! 6. **`best_difficulty`** (60 s) — scans `address_settings.bestDifficulty`
-//!    for every push-subscribed address; when a value strictly
-//!    increases over the in-memory baseline the cron fires a per-address
-//!    best-diff push via the [`bp_notifications::dispatcher::NotificationDispatcher`].
-//!    The tracker is seeded from the same scan source at spawn time so
-//!    the first tick after a restart doesn't re-notify every cached best.
-//!    Skipped when no dispatcher is available.
-//!
-//! ## Shutdown
-//!
-//! Every cron in this module returns a `tokio::sync::watch::Sender<bool>`
-//! (the convention the existing cron-spawn helpers all use). Sending
-//! `true` on the channel ends the loop after the current tick. The
-//! aggregate [`CronHandles::shutdown`] sends `true` on all of them in
-//! parallel and waits briefly for the loops to observe it before
-//! returning — the worst case is one cron's tick-interval, but all
-//! ticks short-circuit on the shutdown branch of their `tokio::select!`
-//! so the actual delay is sub-millisecond.
+//! [`CronHandles::shutdown`] signals every loop; each loop exits on the
+//! shutdown branch of its `tokio::select!`, so the delay is not a full tick.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -85,18 +52,15 @@ use crate::live_sessions::RedisLiveSessions;
 /// Tick of the `kill_dead_clients` poller.
 const KILL_DEAD_TICK: Duration = Duration::from_secs(60);
 
-/// Staleness cutoff for the `kill_dead_clients` sweep — sessions whose
-/// `updatedAt` is older than this become sweep CANDIDATES (the verdict
-/// is their `client:live:*` key's existence). Also wired into the
-/// session-persistence engine as the TTL of those hashes, so the two
-/// clocks agree (see `engines::spawn_session_persistence`).
+/// Staleness cutoff for the `kill_dead_clients` sweep: sessions whose
+/// `updatedAt` is older than this become sweep candidates. Also the TTL of
+/// the `client:live:*` hashes (see `engines::spawn_session_persistence`),
+/// so the two clocks agree.
 pub(crate) const STALE_CLIENT_TTL: Duration = Duration::from_secs(5 * 60);
 
-/// Per-cron startup phase offsets (seconds) — picked as small prime
-/// numbers so concurrent tick collisions across compound periods are
-/// minimised. Adjust here if a new cron lands; aim for distinct
-/// offsets within each (60 s, 60 min, 24 h) period family so two
-/// crons in the same family never align on boot.
+/// Per-cron startup offsets, small primes so ticks of different crons
+/// rarely collide. Keep them distinct within each period family
+/// (60 s, 60 min, 24 h) so two crons of one family never align.
 pub(crate) mod offsets {
     use std::time::Duration;
     pub(crate) const KILL_DEAD: Duration = Duration::from_secs(0);
@@ -113,12 +77,8 @@ pub(crate) mod offsets {
 
 // ─────────────────────────────────────────────────────────────────
 
-/// Build an interval whose first tick fires at
-/// `now + period + stagger` and every `period` after that. The
-/// extra `+ period` matches the existing "skip the immediate fire"
-/// pattern (`ticker.tick().await` discards the t=0 tick); using
-/// `interval_at` lets us combine both into a single primitive
-/// without an explicit pre-loop `sleep`.
+/// Interval whose first tick fires at `now + period + stagger` and every
+/// `period` after that, so no cron fires immediately on boot.
 fn staggered_interval(period: Duration, stagger: Duration) -> tokio::time::Interval {
     let start = tokio::time::Instant::now() + period + stagger;
     let mut t = tokio::time::interval_at(start, period);
@@ -126,68 +86,52 @@ fn staggered_interval(period: Duration, stagger: Duration) -> tokio::time::Inter
     t
 }
 
-/// Aggregate of every Phase 7.5 cron handle. Each cron exposes its
-/// own shutdown signal; [`Self::shutdown`] fires them all and awaits the
-/// kill-dead-clients loop's `JoinHandle` (the other 3 crons run
-/// detached on the tokio runtime).
+/// Shutdown handles of every spawned cron. [`Self::shutdown`] signals them
+/// all and awaits the locally owned loops; the helper-spawned crons run
+/// detached.
 pub(crate) struct CronHandles {
     inner: Option<Inner>,
 }
 
 struct Inner {
-    // ── Maintenance crons — the `payout`/accounting role. DB upkeep + group
-    //    lifecycle crons; no notification dispatcher.
-    //    `None` when this process doesn't run maintenance (e.g. a `notify`-only
-    //    process). ──
-    /// Cancellation handle for the locally-spawned kill_dead_clients
-    /// task. The cron helpers in `bp-group-mgmt-engine` /
-    /// `bp-notifications` use `watch::Sender<bool>` (their internal
-    /// convention); we use a `CancellationToken` here because the
-    /// kill_dead_clients task is owned by this module directly.
+    // ── Maintenance crons (`payout`/accounting role); `None` when this
+    //    process does not run maintenance. ──
+    /// Locally owned loops use a `CancellationToken`; the helper crons in
+    /// `bp-group-mgmt-engine` / `bp-notifications` use `watch::Sender<bool>`.
     kill_dead_cancel: Option<CancellationToken>,
     kill_dead_join: Option<JoinHandle<()>>,
-    /// Hourly stats-purge cron + matching daily rpc-block-purge cron.
-    /// Same `CancellationToken` convention as kill_dead_clients.
+    /// Hourly stats purge.
     old_stats_cancel: Option<CancellationToken>,
     old_stats_join: Option<JoinHandle<()>>,
     old_blocks_cancel: Option<CancellationToken>,
     old_blocks_join: Option<JoinHandle<()>>,
     invitation_expiry_shutdown: Option<watch::Sender<bool>>,
     join_request_expiry_shutdown: Option<watch::Sender<bool>>,
-    // ── Notification crons — the `notify` role. Push/digest fan-out via the
-    //    dispatcher + adapters. `None` when this process doesn't run
-    //    notifications (e.g. a `payout`-only process). ──
+    // ── Notification crons (`notify` role); `None` when this process does
+    //    not run notifications. ──
     network_difficulty_shutdown: Option<watch::Sender<bool>>,
-    /// `Some` when at least one of Telegram / ntfy was configured
-    /// (and therefore the hourly-stats cron has a fan-out path).
-    /// `None` when both adapters were absent — cron is skipped at
-    /// `spawn` and there's nothing to signal here.
+    /// `None` when neither Telegram nor ntfy is configured: the cron has
+    /// nowhere to fan out and is not spawned.
     hourly_stats_shutdown: Option<watch::Sender<bool>>,
-    /// `Some` when the dispatcher is wired (any push/Telegram/ntfy
-    /// adapter present). `None` when the dispatcher was `None` at
-    /// spawn — best-diff cron is skipped.
+    /// `None` when there is no dispatcher: the best-diff cron is not spawned.
     best_difficulty_shutdown: Option<watch::Sender<bool>>,
-    /// Whether the network-difficulty cron has any push adapter (FCM or
-    /// UnifiedPush); if not, the cron still runs (keeps tracker row
-    /// fresh) but no notifications fire. Used only by
-    /// [`CronHandles::log_summary`] for an operator-visible note.
+    /// Whether the network-difficulty cron has a push adapter (FCM or
+    /// UnifiedPush). Without one it still keeps the tracker row fresh.
+    /// Only reported by [`CronHandles::log_summary`].
     network_difficulty_has_push: bool,
-    /// Whether `hourly_stats` actually has Telegram / ntfy adapters.
-    /// Used only for the summary line.
+    /// Which adapters `hourly_stats` has; only for the summary line.
     hourly_stats_telegram: bool,
     hourly_stats_ntfy: bool,
-    /// Weekly stale push-subscription hard-delete. Maintenance role. `None`
-    /// when this process doesn't run maintenance.
+    /// Weekly stale push-subscription hard-delete (maintenance role).
     stale_push_cancel: Option<CancellationToken>,
     stale_push_join: Option<JoinHandle<()>>,
-    /// Which cron groups this process actually spawned — for the summary line.
+    /// Which cron groups this process spawned, for the summary line.
     ran_maintenance: bool,
     ran_notifications: bool,
 }
 
 impl CronHandles {
-    /// Log a one-line summary of which crons are live. Called from
-    /// `main.rs` right after `spawn`.
+    /// Log a one-line summary of which crons are live.
     pub(crate) fn log_summary(&self) {
         match &self.inner {
             None => info!("crons summary: not spawned"),
@@ -211,9 +155,7 @@ impl CronHandles {
         }
     }
 
-    /// Send the shutdown signal to every cron and await the
-    /// kill_dead_clients task's exit. Idempotent — calling twice is a
-    /// no-op on the second pass because `inner` is taken.
+    /// Signal every cron to stop and await the locally owned loops.
     pub(crate) async fn shutdown(mut self) {
         let Some(inner) = self.inner.take() else {
             return;
@@ -247,10 +189,8 @@ impl CronHandles {
         if let Some(tx) = inner.best_difficulty_shutdown {
             let _ = tx.send(true);
         }
-        // Only the locally-owned tasks (kill_dead + the cleanups)
-        // are joinable here; the other crons are detached `tokio::spawn`s
-        // inside their helpers, so sending `true` on their shutdown channel
-        // ends their loop on the next select iteration (sub-millisecond).
+        // Only the locally owned loops are joinable; the helper crons are
+        // detached and end on their next select iteration.
         if let Some(join) = inner.kill_dead_join {
             if let Err(err) = join.await {
                 warn!(%err, "crons: kill_dead_clients join failed");
@@ -274,16 +214,11 @@ impl CronHandles {
     }
 }
 
-/// Spawn all background crons. Pulls the `PgPool` from
-/// [`FoundationHandles`] and the FCM adapter (when configured) from
-/// [`ProductionHooks`]. Cron tick + cutoff constants are hardcoded; if
-/// an operator ever needs to tune these, add a `[cron]` block in
-/// `bp-config` later.
+/// Spawn the background crons. Ticks and cutoffs are constants, not config.
 ///
-/// `run_maintenance` (the `payout`/accounting role) gates the DB-upkeep + group
-/// lifecycle crons; `run_notifications` (the `notify` role)
-/// gates the push/digest crons. A process running both (e.g. the default
-/// satellite back) spawns everything; a split process spawns only its group.
+/// `run_maintenance` (the `payout`/accounting role) gates the DB-upkeep and
+/// group lifecycle crons; `run_notifications` (the `notify` role) gates the
+/// push/digest crons.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn(
     foundation: &FoundationHandles,
@@ -356,9 +291,7 @@ pub(crate) async fn spawn(
     let ntfy_adapter: Option<Arc<NtfyAdapter>> = listeners.ntfy_adapter();
     let hourly_stats_telegram = telegram_adapter.is_some();
     let hourly_stats_ntfy = ntfy_adapter.is_some();
-    // Skip the cron entirely when neither adapter exists: the hourly
-    // digest would have nowhere to fan out and the per-row DB scan
-    // would burn CPU for nothing.
+    // Without an adapter the digest has nowhere to go; skip the DB scan.
     let hourly_stats_shutdown = if run_notifications && (hourly_stats_telegram || hourly_stats_ntfy)
     {
         Some(spawn_hourly_stats_cron(
@@ -419,17 +352,13 @@ pub(crate) async fn spawn(
     }
 }
 
-/// Dead-session sweep, 60 s tick. Tick fires after the first interval,
-/// never immediately, so we don't race a just-spawned session that
-/// hasn't had its first `updatedAt` write yet.
+/// Dead-session sweep, 60 s tick; the first tick waits one interval so a
+/// just-spawned session is never raced.
 ///
 /// `updatedAt` is only stamped at birth/re-register/soft-delete, so age
-/// alone means "past the birth grace", not "dead". The verdict on a
-/// candidate is the fronts' published live set first (a held session is
-/// alive, full stop) and the `client:live:*` hash second, where no front
-/// publishes sessions — see [`sweep_dead_sessions_once`]. ⚠️ Fail-open on
-/// Redis trouble: "cannot ask" must skip the tick, never sweep — sweeping
-/// connected miners is the exact bug this shape exists to prevent.
+/// alone means "past the birth grace", not "dead"; the verdict is in
+/// [`sweep_dead_sessions_once`]. ⚠️ Fail-open on Redis trouble: "cannot
+/// ask" skips the tick and never sweeps, or connected miners get retired.
 fn spawn_kill_dead_clients_loop(
     pool: PgPool,
     redis: redis::aio::ConnectionManager,
@@ -457,8 +386,8 @@ fn spawn_kill_dead_clients_loop(
                             "crons.kill_dead_clients: reconciled sessions"
                         ),
                         Err(err) => {
-                            // Start the two-observation rule over: what we
-                            // learned before an outage is not evidence after it.
+                            // Restart the two-observation rule: what was seen
+                            // before an outage is not evidence after it.
                             strikes.clear();
                             warn!(
                                 err,
@@ -478,15 +407,10 @@ fn spawn_kill_dead_clients_loop(
 /// Bounded by the candidate count, replaced wholesale every pass.
 type StrikeSet = std::collections::HashSet<(String, String, String)>;
 
-/// How far back the repair half looks for a session it should un-delete:
-/// the whole life of a soft-deleted row. Past
-/// [`CLIENT_HARD_DELETE_RETENTION`] the row is gone and there is nothing
-/// left to un-delete; anything shorter is a window in which a wrong
-/// soft-delete turns permanent. It was 15 minutes — measured 2026-09-10
-/// on prod, a miner that paused ~70 min with its socket open was retired
-/// and never revived. The query stays small either way — measured the
-/// same day on prod: 120 rows soft-deleted in the last 20 minutes, 898
-/// in the last two hours, against 712 active rows.
+/// How far back the repair half looks for a session to un-delete: the whole
+/// life of a soft-deleted row. Past [`CLIENT_HARD_DELETE_RETENTION`] the row
+/// is gone; anything shorter leaves a window in which a wrong soft-delete
+/// turns permanent (a miner paused for an hour with its socket open).
 const REVIVE_LOOKBACK: Duration = CLIENT_HARD_DELETE_RETENTION;
 
 /// What one reconcile pass did.
@@ -503,30 +427,21 @@ impl SweepOutcome {
 
 /// One reconcile pass between the birth rows and the live hashes.
 ///
-/// **Kill half.** Candidates come from PG (past the birth grace). The
-/// verdict is first-hand where it can be: a session that a front still
-/// holds — published by the process with the socket, see
-/// `crate::live_sessions` — is alive, whatever its share flow says. That
-/// is what keeps a miner that pauses with its connection open (standby
-/// overnight, a slow rig) from being retired. Where no front publishes
-/// sessions, the live key decides — and only a session whose key was
-/// missing on TWO consecutive passes is swept. One observation is not
-/// evidence: after a Redis restart the keyspace is legitimately empty
-/// (the live hashes are deliberately excluded from the backup allowlist)
-/// until the next touch flush repopulates it 30 s later, and a
-/// single-observation sweep landing in that window would retire the
-/// entire pool at once.
+/// **Kill half.** Candidates come from PG (past the birth grace). A session
+/// a front still holds (`crate::live_sessions`) is alive whatever its share
+/// flow says, so a miner paused with its connection open is kept. Where no
+/// front publishes sessions, the live key decides, and only a key missing
+/// on TWO consecutive passes sweeps: after a Redis restart the keyspace is
+/// legitimately empty (live hashes are not backed up) until the next touch
+/// flush, and a single observation in that window would retire every miner.
 ///
-/// **Repair half.** A session soft-deleted within [`REVIVE_LOOKBACK`]
-/// whose live hash has been written SINCE the soft-delete kept mining
-/// through it, so the soft-delete was wrong and is undone. Only a live
-/// session can satisfy that: a cleanly disconnected one stops touching,
-/// so its `updated_at_ms` stays older than its `deletedAt` until the key
-/// expires. This restores the self-healing the touch UPDATE used to
-/// provide through `"deletedAt" = NULL`, which left with the hot writes.
+/// **Repair half.** A session soft-deleted within [`REVIVE_LOOKBACK`] whose
+/// live hash was written after the soft-delete kept mining through it, so
+/// the soft-delete is undone. A cleanly disconnected session stops
+/// touching, so its `updated_at_ms` stays older than its `deletedAt`.
 ///
-/// Any error aborts the pass without sweeping anything — "cannot ask
-/// Redis" and "no key" must never collapse into the same answer.
+/// Any error aborts the pass without sweeping: "cannot ask Redis" and
+/// "no key" must never collapse into the same answer.
 async fn sweep_dead_sessions_once(
     pool: &PgPool,
     redis: &redis::aio::ConnectionManager,
@@ -551,10 +466,9 @@ async fn sweep_kill_half(
         strikes.clear();
         return Ok(0);
     }
-    // `Err` is "cannot ask" and aborts the pass like any other Redis
-    // failure; `None` is "no front publishes sessions" (a front on the
-    // previous binary, a Redis just restarted) and leaves the key verdict
-    // below in charge, which is all this cron had before.
+    // `Err` is "cannot ask" and aborts the pass; `None` is "no front
+    // publishes sessions" (e.g. Redis just restarted) and leaves the key
+    // verdict below in charge.
     let held = RedisLiveSessions::new(redis.clone())
         .sessions()
         .await
@@ -660,17 +574,15 @@ const STALE_PUSH_SUBSCRIPTION_TTL: Duration = Duration::from_secs(90 * 24 * 60 *
 const STATS_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// 2-hour cutoff for soft-deleted clients before hard-delete.
 ///
-/// Was 24 h. Nothing needs the corpses that long: the device-status
-/// gate's restart seed looks back `SEED_LOOKBACK` = 1 h, and the
-/// "known device" decision is carried by the reported state in Redis
-/// (7-day TTL), not by these rows. What the long window did do is bloat
-/// the table — measured 2026-08-06 on prod: ~71k retained rows against
-/// ~740 live ones, scattering the live rows over ~250 heap pages that
-/// every bulk writer then re-logs as full-page writes.
+/// Nothing reads them longer: the device-status gate's restart seed looks
+/// back `SEED_LOOKBACK` = 1 h, and "known device" lives in Redis (7-day
+/// TTL). Keeping them longer bloats the table and scatters the live rows
+/// over many heap pages that every bulk writer re-logs.
 const CLIENT_HARD_DELETE_RETENTION: Duration = Duration::from_secs(2 * 60 * 60);
 
-/// Hourly cron: purge 14-day-old stats from the four per-session
-/// tables + hard-delete soft-deleted clients older than 1 day.
+/// Hourly cron: purge stats older than `STATS_RETENTION`, hard-delete
+/// clients soft-deleted longer than [`CLIENT_HARD_DELETE_RETENTION`], and
+/// drop expired email verifications.
 pub(crate) fn spawn_old_stats_cleanup(pool: PgPool, cancel: CancellationToken) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = staggered_interval(HOURLY_TICK, offsets::OLD_STATS_CLEANUP);
@@ -799,12 +711,9 @@ mod sweep_tests {
     use bp_common::live_client_key::client_live_key;
     use bp_test_support::{connect_pg_or_skip, connect_redis_in_range_or_skip, redis_db};
 
-    // ⚠️ Indices, not literals elsewhere in this binary: the
-    // block-confirmation regtests claim 17–23 through named `DB_*`
-    // constants, and `connect_redis_in_range_or_skip` FLUSHES the
-    // database it opens — taking one of theirs wipes a money-path
-    // regtest mid-run. Grep for `const DB_` as well as call sites
-    // before picking a number.
+    // ⚠️ `connect_redis_in_range_or_skip` FLUSHES the database it opens, and
+    // other tests in this binary claim indices through named `DB_*`
+    // constants. Grep for `const DB_` as well as call sites before picking.
     const DB_TWO_STRIKE: u8 = 24;
     const DB_KEY_RETURNS: u8 = 25;
     const DB_REVIVE: u8 = 26;
@@ -836,9 +745,8 @@ mod sweep_tests {
         reg.register_session(session, address, worker, None).await;
     }
 
-    /// The kill half queries `client_entity` pool-wide, so two of these
-    /// running at once would sweep each other's fixtures — one would
-    /// then report the fail-open guard as broken when it is not.
+    /// The kill half queries `client_entity` pool-wide, so these tests must
+    /// not run concurrently or they sweep each other's fixtures.
     static SWEEP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn upsert(session: &str, address: &str) -> bp_db::ClientUpsert {
@@ -904,11 +812,9 @@ mod sweep_tests {
             .expect("ttl");
     }
 
-    /// The two-strike rule AND the verdict's selectivity in one pass
-    /// pair: a missing key is not evidence on its own (pass 1 sweeps
-    /// nothing), and on the second pass only the session that is still
-    /// keyless dies — the live-keyed one survives however old its birth
-    /// row is.
+    /// Two-strike rule: pass 1 sweeps nothing, and on pass 2 only the
+    /// keyless session dies; the live-keyed one survives however old its
+    /// birth row is.
     #[tokio::test]
     async fn a_missing_key_sweeps_only_on_the_second_pass() {
         let _guard = SWEEP_LOCK.lock().await;
@@ -950,9 +856,8 @@ mod sweep_tests {
         cleanup(&pool, addr).await;
     }
 
-    /// A key that reappears between the two passes clears the strike —
-    /// this is the Redis-restart case, where the keyspace is briefly
-    /// empty before the touch flush repopulates it.
+    /// A key that reappears between the two passes clears the strike (the
+    /// Redis-restart case, keyspace briefly empty before the touch flush).
     #[tokio::test]
     async fn a_key_that_comes_back_between_passes_is_never_swept() {
         let _guard = SWEEP_LOCK.lock().await;
@@ -987,10 +892,9 @@ mod sweep_tests {
         cleanup(&pool, addr).await;
     }
 
-    /// The repair half: a session that kept mining THROUGH its
-    /// soft-delete (its live hash was written after the stamp) is
-    /// revived. The negative control is a session whose hash predates
-    /// the stamp — a clean disconnect — which must stay retired.
+    /// Repair half: a session whose live hash was written after its
+    /// soft-delete stamp is revived; one whose hash predates the stamp
+    /// (a clean disconnect) stays retired.
     #[tokio::test]
     async fn a_session_that_mined_through_its_soft_delete_is_revived() {
         let _guard = SWEEP_LOCK.lock().await;
@@ -1037,15 +941,9 @@ mod sweep_tests {
         cleanup(&pool, addr).await;
     }
 
-    /// The front's word outranks the key. Three sessions past their
-    /// birth grace, none of them touched: the one a front still holds
-    /// survives both passes with no live key at all — that is a miner
-    /// paused with its socket open — while the one nobody holds is
-    /// swept on the second pass, and the one with a live key survives
-    /// on the key alone, so the older verdict still stands behind the
-    /// new one.
-    ///
-    /// Fails against the key-only verdict: the held session is swept.
+    /// The front's word outranks the key: a held session without a live
+    /// key survives both passes, an unheld keyless one is swept on pass 2,
+    /// and an unheld one with a live key survives on the key alone.
     #[tokio::test]
     async fn a_session_a_front_still_holds_is_never_swept() {
         let _guard = SWEEP_LOCK.lock().await;
@@ -1088,12 +986,9 @@ mod sweep_tests {
         cleanup(&pool, addr).await;
     }
 
-    /// Held is not enough: the front has to hold the session under the
-    /// row's own device. An SV1 connection can re-authorize under a new
-    /// worker name, and the row of the name it left is dead even though
-    /// its session id is very much alive.
-    ///
-    /// Fails against a match on the session id alone.
+    /// The front has to hold the session under the row's own device: an
+    /// SV1 connection can re-authorize under a new worker name, and the
+    /// row of the name it left is dead although its session id is alive.
     #[tokio::test]
     async fn a_session_held_under_another_worker_is_swept() {
         let _guard = SWEEP_LOCK.lock().await;
@@ -1124,9 +1019,8 @@ mod sweep_tests {
         cleanup(&pool, addr).await;
     }
 
-    /// Fail-open: when Redis cannot be asked, the sweep must SKIP —
-    /// "cannot ask" and "no key" are different answers, and confusing
-    /// them sweeps actively-hashing miners.
+    /// Fail-open: when Redis cannot be asked, the sweep skips; "cannot
+    /// ask" and "no key" are different answers.
     #[tokio::test]
     async fn sweep_skips_everything_when_redis_is_unreachable() {
         let _guard = SWEEP_LOCK.lock().await;
@@ -1148,8 +1042,7 @@ mod sweep_tests {
         };
         let port = listener.local_addr().expect("addr").port();
         // Track the forwarders too: aborting only the accept loop leaves
-        // established connections ALIVE, and a healthy connection answers
-        // EXISTS — the opposite of the outage this test stages.
+        // established connections alive, and those would still answer.
         let conns: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
             Default::default();
         let conns_in_loop = conns.clone();

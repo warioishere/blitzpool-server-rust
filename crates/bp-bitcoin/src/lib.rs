@@ -10,7 +10,7 @@
 //!   TDP (`bp-template-distribution`).
 //! - Block submission for pool-built templates — those go through
 //!   `TdpHandle::submit_solution` (TDP-direct architecture).
-//! - ZMQ block notifications — replaced by TDP `SetNewPrevHash`.
+//! - Block notifications — the pool follows the tip via TDP `SetNewPrevHash`.
 //!
 //! ## The `submitblock` exception
 //!

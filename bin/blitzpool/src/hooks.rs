@@ -1,26 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Production hook impls — Phase 7.3.
+//! Production hook impls for the Noop-by-default trait surfaces of bp-api
+//! and the group-mgmt engine:
 //!
-//! Wires the three "Noop-by-default" trait surfaces that the bp-api +
-//! group-mgmt-engine layers expose against real backends:
+//! 1. **`bp_api::EmailVerificationHooks`** — the verification link on
+//!    register and a binding-change warning on FCFS-lock rejection.
+//! 2. **`bp_group_mgmt_engine::EmailHooks`** — invitation and
+//!    join-decision emails.
+//! 3. **`bp_group_mgmt_engine::GroupServiceHooks`** — last-active lookup
+//!    and kick / dissolve cleanup of the Group-Solo Redis state.
 //!
-//! 1. **`bp_api::EmailVerificationHooks`** — `/api/email/register` +
-//!    `/api/email/verify/:token` flow. Sends a verification link
-//!    (`/#/email/verify/<token>`) on register and a
-//!    binding-change-attempt warning on FCFS-lock rejection.
-//! 2. **`bp_group_mgmt_engine::EmailHooks`** — invitation send +
-//!    join-decision (approved / rejected) emails fired from the
-//!    `InvitationService` + `JoinRequestService` admin paths.
-//! 3. **`bp_group_mgmt_engine::GroupServiceHooks`** — last-active
-//!    lookup, kick / dissolve cleanup against `GroupRoundStore`'s
-//!    Redis keys, min-payout floor lookup.
-//!
-//! **BlockSubmissionSink** is not here: it needs the `ShareAccept`
-//! extranonce fields to rebuild the witness coinbase for
-//! `TdpHandle::submit_solution`, so it co-locates with the Stratum
-//! wiring instead — [`crate::block_sink::TdpBlockSubmissionSink`],
-//! which implements both the SV1 and the SV2 sink trait.
+//! The block sink lives with the Stratum wiring
+//! ([`crate::block_sink::TdpBlockSubmissionSink`]): it needs the share's
+//! extranonce fields to rebuild the coinbase.
 
 use std::sync::Arc;
 
@@ -57,36 +49,25 @@ use uuid::Uuid;
 use crate::boot::FoundationHandles;
 use crate::engines::EngineHandles;
 
-/// Aggregate of every production hook impl. Phase 7.4 threads this
-/// into the bp-api `AppState` builder + the engine-spawn override
-/// paths so the Stratum + HTTP entry points pick up real backends
-/// instead of the Noop defaults.
+/// Every production hook impl, handed to the bp-api `AppState` and the
+/// engine wiring.
 ///
-/// **Concrete types vs. `Arc<dyn _>`**: the bp-api `AppState` is
-/// generic over `H: GroupServiceHooks` + `M: EmailHooks`, so the
-/// `group_service` + `invitation_email` fields hold concrete impls
-/// (the `SmtpInvitationEmailHooks` wrapper internally holds an
-/// `Option<Arc<SmtpAdapter>>` so the type stays the same regardless
-/// of whether `[smtp]` was configured). The `email_verification`
-/// field keeps `Arc<dyn _>` because `AppState` already stores it as a
-/// trait object.
+/// `AppState` is generic over `H: GroupServiceHooks` + `M: EmailHooks`, so
+/// `group_service` and `invitation_email` are concrete types (the SMTP
+/// wrapper holds an `Option` so its type does not depend on `[smtp]`);
+/// `email_verification` is a trait object as `AppState` stores it.
 pub(crate) struct ProductionHooks {
     pub(crate) email_verification: Arc<dyn EmailVerificationHooks>,
     pub(crate) invitation_email: Arc<SmtpInvitationEmailHooks>,
     pub(crate) group_service: Arc<ProductionGroupServiceHooks>,
-    /// Concrete FCM adapter, exposed so the Phase 7.5 cron-wiring
-    /// (`bin/blitzpool::crons`) can hand it to
-    /// [`spawn_network_difficulty_cron`] without re-building the adapter.
-    /// `None` when `[notifications.fcm]` is not configured — the
-    /// network-difficulty cron will still spawn and keep the tracker row
-    /// fresh, just without push fan-out.
+    /// FCM adapter for the crons ([`spawn_network_difficulty_cron`]).
+    /// `None` when `[notifications.fcm]` is not configured; the cron then
+    /// keeps the tracker row fresh without push fan-out.
     ///
     /// [`spawn_network_difficulty_cron`]: bp_notifications::cron::network_difficulty::spawn_network_difficulty_cron
     pub(crate) fcm: Option<Arc<FcmAdapter>>,
-    /// Concrete Web-Push adapter, exposed so Phase 7.7's dispatcher
-    /// builder can wire it into `NotificationDispatcher::new` without
-    /// re-parsing the VAPID config. `None` when `[notifications.web_push]`
-    /// isn't configured.
+    /// Web-Push adapter for the `NotificationDispatcher`. `None` when
+    /// `[notifications.web_push]` is not configured.
     pub(crate) web_push: Option<Arc<WebPushAdapter>>,
 }
 
@@ -106,10 +87,8 @@ pub(crate) enum HooksError {
     WebPush(AdapterError),
 }
 
-/// Build every production hook from `cfg` + the live handles. Each
-/// adapter constructor returns an error rather than panicking on
-/// bad config so the operator gets a pointed boot-time failure
-/// instead of a Stratum-time NPE.
+/// Build every production hook from `cfg` and the live handles. Bad
+/// adapter config is a boot-time error, not a runtime failure.
 pub(crate) async fn spawn(
     cfg: &AppConfig,
     foundation: &FoundationHandles,
@@ -183,10 +162,6 @@ fn build_fcm_adapter(cfg: &AppConfig) -> Result<Option<Arc<FcmAdapter>>, HooksEr
 
 fn build_web_push_adapter(cfg: &AppConfig) -> Result<Option<Arc<WebPushAdapter>>, HooksError> {
     let Some(wp) = cfg.notifications.web_push.as_ref() else {
-        // VAPID-less Web-Push (plain POST) is still useful for ntfy-
-        // compat servers; if the operator hasn't configured the
-        // [notifications.web_push] table at all, the adapter just
-        // stays absent.
         return Ok(None);
     };
     let adapter = WebPushAdapter::new(Some(VapidConfig {
@@ -201,10 +176,9 @@ fn build_web_push_adapter(cfg: &AppConfig) -> Result<Option<Arc<WebPushAdapter>>
 
 // ─── EmailVerificationHooks impl ─────────────────────────────────
 
-/// SMTP-backed email-verification hook. The inner `Option` keeps the
-/// struct type-fixed regardless of whether `[smtp]` was configured —
-/// `None` ⇒ every method is a quiet no-op: when SMTP isn't enabled the
-/// verify-email pathway silently disables itself instead of failing requests.
+/// SMTP-backed email-verification hook. Without `[smtp]` every method is a
+/// quiet no-op, so the verify-email path disables itself instead of
+/// failing requests.
 pub(crate) struct SmtpEmailVerificationHooks {
     smtp: Option<Arc<SmtpAdapter>>,
 }
@@ -259,9 +233,8 @@ impl EmailVerificationHooks for SmtpEmailVerificationHooks {
 
 // ─── bp-group-mgmt-engine::EmailHooks impl ───────────────────────
 
-/// SMTP-backed invitation + join-decision email hook. Same Option-
-/// keeps-type-fixed pattern as [`SmtpEmailVerificationHooks`] — when
-/// SMTP isn't configured the methods are quiet no-ops.
+/// SMTP-backed invitation + join-decision email hook; like
+/// [`SmtpEmailVerificationHooks`], a quiet no-op without SMTP.
 pub(crate) struct SmtpInvitationEmailHooks {
     smtp: Option<Arc<SmtpAdapter>>,
 }
@@ -334,16 +307,12 @@ pub(crate) struct ProductionGroupServiceHooks {
 #[async_trait]
 impl GroupServiceHooks for ProductionGroupServiceHooks {
     async fn last_active_for_member(&self, group_id: Uuid, address: &AddressId) -> Option<i64> {
-        // Redis holds the per-share timestamp, stamped on every accepted
-        // share. It is the only source: the PG fallback that used to sit
-        // behind this read the Group-Solo balance row, and there are no
-        // balance rows any more.
+        // Redis is the only source: the timestamp is stamped on every
+        // accepted share, and Group-Solo keeps no ledger row.
         //
-        // `None` makes the caller fall back to `joined_at`, so a Redis
-        // loss without a restore makes a long-standing member look
-        // freshly joined and therefore kickable. The restore path exists
-        // (`--restore-redis-state`); the alternative was keeping a whole
-        // ledger table alive to carry one timestamp.
+        // `None` makes the caller fall back to `joined_at`, so a Redis loss
+        // without `--restore-redis-state` makes a long-standing member look
+        // freshly joined and therefore kickable.
         let group_key = group_id.to_string();
         match self
             .group_solo
@@ -416,11 +385,9 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
             );
         }
 
-        // Nothing to settle in Postgres. A kicked member's fair share is
-        // the round state that just left with them: `forget_member`
-        // removed their shares from the round, so the next distribution
-        // splits proportionally between whoever is left. That IS the
-        // redistribution — it needs no balance row, and there is none.
+        // Nothing to settle in Postgres: `forget_member` removed their
+        // shares from the round, so the next distribution splits between
+        // whoever is left. That is the redistribution.
     }
 
     async fn on_group_dissolved(&self, group_id: Uuid) {
@@ -440,9 +407,8 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
             }
         }
         // Redis: delete every snapshot of this group, per-finder and per-job.
-        // The per-job keys are spared by every other wipe because they back
-        // live jobs; here the group is gone, so no block of it can be booked
-        // and leaving them would just burn a TTL's worth of memory.
+        // Other wipes spare the per-job keys because they back live jobs;
+        // a dissolved group can book no block, so they go too.
         let mut snap_conn = self.group_solo.round().connection_for_snapshot();
         if let Err(err) = bp_group_solo_engine::round::snapshot::delete_everything_for_group(
             &mut snap_conn,
@@ -471,10 +437,9 @@ impl GroupServiceHooks for ProductionGroupServiceHooks {
     }
 
     async fn apply_round_reset_config(&self, group: &PplnsGroupRow) {
-        // Re-arm this group's round-reset cron at runtime so a settings change
-        // (preset / interval / timezone) takes effect immediately, without a
-        // pool restart. The engine tears down the old per-group task and spawns
-        // a fresh one — or none, if the group cleared its preset or dissolved.
+        // Re-arm this group's round-reset cron so a settings change takes
+        // effect without a restart: the old per-group task is replaced by a
+        // fresh one, or none if the preset was cleared or the group dissolved.
         self.group_solo.reschedule_group(group);
     }
 }
@@ -487,10 +452,7 @@ fn epoch_ms_to_utc(ms: i64) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
-// pull AddressEmailRow via find_address_email — silence "unused
-// import" because Phase 7.4 will use this for the verification
-// resend path. Kept here so the compile-time wiring confirms the
-// helper exists.
+// Keeps the `find_address_email` import in use.
 async fn _ensure_find_address_email_resolves(db: &Db, addr: &AddressId) {
     let _ = find_address_email(db.pool(), addr).await;
 }
@@ -508,10 +470,8 @@ mod tests {
 
     #[test]
     fn epoch_ms_to_utc_falls_back_to_now_on_invalid_input() {
-        // i64::MIN is out of the valid range for chrono::DateTime<Utc>;
-        // the fallback path should return a finite "now" instead of
-        // panicking. We can't assert the exact value so we just
-        // confirm it doesn't wrap to a sentinel.
+        // i64::MIN is out of chrono's range; the fallback returns "now"
+        // instead of panicking.
         let dt = epoch_ms_to_utc(i64::MIN);
         assert!(dt.timestamp_millis() > 0);
     }

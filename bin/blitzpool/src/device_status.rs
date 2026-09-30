@@ -1,36 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `DeviceStatusSink` implementations — Phase 7.7.
-//!
-//! SV1 and SV2 both fire [`bp_share_hook::DeviceStatusSink`], a small
-//! online/offline trait. The bin builds one of two concrete impls:
+//! [`bp_share_hook::DeviceStatusSink`] implementations, fired by SV1 and SV2:
 //!
 //! - [`DispatcherDeviceStatusSink`] — feeds the in-process
-//!   [`crate::device_status_gate::Gate`], which debounces and later hands
-//!   the confirmed message to the `NotificationDispatcher`. Used by any
-//!   process that holds the dispatcher (e.g. a front co-located with the
-//!   `notify` role).
+//!   [`crate::device_status_gate::Gate`], which debounces and hands the
+//!   confirmed message to the `NotificationDispatcher`. For a process that
+//!   holds the dispatcher (a front co-located with the `notify` role).
 //! - [`ProducingDeviceStatusSink`] — `XADD`s the event to the Core→Satellite
-//!   `device:status` stream. Used by a split **front** (Core), which has no
-//!   dispatcher; the Satellite drains the stream and feeds the gate. This
-//!   is the cross-process route, mirroring the block-found stream — without it
-//!   a split front would silently drop device-status notifications.
+//!   `device:status` stream for a split front without a dispatcher; the
+//!   Satellite drains it into its gate. It publishes unfiltered: the front
+//!   holds no subscription state, and device events fire per
+//!   connect/disconnect, not per share.
 //!
-//!   It publishes unfiltered, deliberately: the front holds no subscription
-//!   state, so the "does anyone want this?" question is answered on the
-//!   Satellite. Device events fire on connect/disconnect rather than per
-//!   share, so the stream traffic that buys is small.
-//!
-//! The bin-side adapter fills the metadata the rendered message uses:
-//! `user_agent`, threaded through `on_device_event` from the SV1 subscribe UA /
-//! SV2 vendor.
-//!
-//! `is_returning` is deliberately NOT resolved here. It used to be a
-//! `client_entity` lookup per event, but the gate decides it now — it is the
-//! only place that knows whether the subscriber was actually told the device
-//! was gone, which is what the word means. The flag is only ever read for an
-//! online message, and the gate overwrites it on exactly that path, so
-//! computing it here cost one query per connect and was discarded every time.
+//! `is_returning` is NOT resolved here: only the gate knows whether the
+//! subscriber was told the device was gone, and it sets the flag on the
+//! online path, the only one that reads it.
 
 use std::sync::Arc;
 
@@ -44,10 +28,9 @@ use redis::aio::ConnectionManager;
 use tracing::warn;
 
 /// Wire form of a [`DeviceStatusEvent`] for the Core→Satellite `device:status`
-/// stream. Plain serde types — the bin owns the wire format, same as
-/// `BlockFoundEvent`. `is_returning` stays on the wire (the field is part of
-/// the shape a Satellite may already be reading) but is always `false`: the
-/// gate on the receiving side sets it.
+/// stream. Plain serde types; the bin owns the wire format, like
+/// `BlockFoundEvent`. `is_returning` is part of the wire shape but always
+/// `false`: the receiving gate sets it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DeviceStatusStreamEvent {
     pub address: String,
@@ -72,9 +55,9 @@ impl From<&DeviceStatusEvent> for DeviceStatusStreamEvent {
 }
 
 impl DeviceStatusStreamEvent {
-    /// Reconstruct the dispatcher event on the Satellite. Returns `None` if the
-    /// address no longer parses (shouldn't happen — the Core validated it
-    /// before publishing — but the consumer must not panic on bad data).
+    /// Reconstruct the dispatcher event on the Satellite. `None` if the
+    /// address does not parse; the Core validated it, but the consumer must
+    /// not panic on bad data.
     pub(crate) fn into_event(self) -> Option<DeviceStatusEvent> {
         let address = match AddressId::new(self.address.clone()) {
             Ok(a) => a,
@@ -98,13 +81,9 @@ impl DeviceStatusStreamEvent {
     }
 }
 
-/// Build the [`DeviceStatusEvent`] from the raw Stratum hook fields: parse the
-/// address and assemble the event. Shared by both sink impls. Returns `None`
-/// when the address shape is invalid (the event is dropped — nothing to
-/// notify).
-///
-/// `is_returning` is left `false`; see the module header for why this is not
-/// the layer that can answer it.
+/// Build the [`DeviceStatusEvent`] from the raw Stratum hook fields, for
+/// both sinks. `None` (event dropped) on an invalid address.
+/// `is_returning` is left `false`; the gate answers it (see module docs).
 fn build_event(
     address: &str,
     worker: &str,
@@ -136,16 +115,11 @@ fn build_event(
     })
 }
 
-/// The device-status sink Stratum feeds, handed to both protocols. With an
-/// in-process dispatcher (a front co-located with the `notify` role) events
-/// go straight to its gate; without one the front publishes to the
-/// `device:status` stream so the Satellite fans them out — never a silent
-/// drop. Stratum only spawns on the front, so no `gate` means "no co-located
-/// dispatcher", not "notifications off".
-///
-/// One instance serves both protocols: it holds only shared handles (the
-/// gate `Arc`, the stream producer), so neither side can end up wired to the
-/// other destination.
+/// The device-status sink for both protocols. With an in-process dispatcher
+/// events go straight to its gate; without one they go to the
+/// `device:status` stream for the Satellite. No `gate` means "no co-located
+/// dispatcher", not "notifications off". One instance serves both
+/// protocols, so they cannot be wired to different destinations.
 pub(crate) fn stratum_sinks(
     gate: Option<(
         Arc<crate::device_status_gate::Gate>,
@@ -163,15 +137,13 @@ pub(crate) fn stratum_sinks(
 /// [`Gate`](crate::device_status_gate::Gate). Cheap to clone
 /// (`Arc`-internal).
 ///
-/// Nothing is sent here — the gate's sweeper decides when a transition is
-/// real and dispatches it. That indirection is what stops a flapping
-/// connection from producing one push per TCP event.
+/// Nothing is sent here: the gate's sweeper decides when a transition is
+/// real, so a flapping connection does not produce one push per TCP event.
 #[derive(Clone)]
 pub(crate) struct DispatcherDeviceStatusSink {
     gate: Arc<crate::device_status_gate::Gate>,
-    /// Addresses with a device-status subscriber. Events for anything
-    /// else are dropped here, before the gate allocates any state —
-    /// nobody would ever receive the resulting message.
+    /// Addresses with a device-status subscriber; other events are dropped
+    /// before the gate allocates any state.
     subscribers: crate::device_status_gate::SubscribedAddresses,
 }
 
@@ -207,11 +179,9 @@ impl DeviceStatusSink for DispatcherDeviceStatusSink {
     }
 }
 
-/// Publishes both SV1 + SV2 device-status events to the Core→Satellite
-/// `device:status` stream. Used by a split front (Core) that has no in-process
-/// dispatcher; the Satellite's [`crate::device_status_consumer`] drains the
-/// stream and fans the event out. Cheap to clone (`StreamProducer` is
-/// `Arc`-internal).
+/// Publishes SV1 + SV2 device-status events to the Core→Satellite
+/// `device:status` stream for a front without a dispatcher; the Satellite's
+/// [`crate::device_status_consumer`] drains it.
 #[derive(Clone)]
 pub(crate) struct ProducingDeviceStatusSink {
     producer: StreamProducer<DeviceStatusStreamEvent>,
@@ -236,9 +206,8 @@ impl ProducingDeviceStatusSink {
         };
         let wire = DeviceStatusStreamEvent::from(&event);
         if let Err(err) = self.producer.publish(&wire).await {
-            // Best-effort like the dispatcher path: a publish failure costs one
-            // online/offline push, not money. Log so the operator sees Redis
-            // trouble, but never fail the Stratum connection over it.
+            // Best-effort: a failure costs one push, not money, and must never
+            // fail the Stratum connection.
             warn!(%err, address, is_online, "device-status: stream publish failed — event dropped");
         }
     }

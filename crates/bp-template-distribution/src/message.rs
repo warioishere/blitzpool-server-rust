@@ -7,13 +7,13 @@
 //! directly:
 //!
 //! - **API stability.** The upstream `stratum-core` library is pinned to whatever
-//!   `bitcoin_core_sv2` pins, and its majors move. Decoupling our public API
+//!   `bitcoin_core_sv2` pins, and its majors move. A local public API
 //!   shields downstream crates (`bp-stratum-v1`, `bp-stratum-v2`,
-//!   eventually `bp-api`) from breaking changes there.
+//!   `bp-api`) from breaking changes there.
 //! - **Owned bytes.** Upstream payloads come in a borrowed `'decoder` flavour and
-//!   an `*Owned` flavour; the owned one already copies, but we still want a
-//!   trivially-clonable `Vec<u8>` so `broadcast::Sender` can fan out without
-//!   reference counting tricks.
+//!   an `*Owned` flavour; plain `Vec<u8>` fields keep the payloads trivially
+//!   clonable so `broadcast::Sender` can fan out without reference-counting
+//!   tricks.
 //! - **Surface area.** Pool consumers only ever care about the four payloads
 //!   below — there is no need to expose the `CoinbaseOutputConstraints` /
 //!   `RequestTransactionData` / `SubmitSolution` variants on the *outbound*
@@ -110,7 +110,7 @@ pub fn apply_to_snapshot(snapshot: &mut TemplateSnapshot, update: &TemplateUpdat
 /// `transaction_list` is the ordered list of raw, witness-serialised
 /// transactions, exactly as bitcoin-core delivered them. `excess_data` is
 /// the opaque blob the SV2 spec reserves for "anything else the validator
-/// needs" — in practice today it carries the SegWit commitment.
+/// needs"; in practice it carries the SegWit commitment.
 #[derive(Debug, Clone)]
 pub struct RequestTransactionDataSuccess {
     pub template_id: u64,
@@ -126,7 +126,7 @@ pub struct RequestTransactionDataError {
 }
 
 impl TemplateUpdate {
-    /// Convert from the upstream `TemplateDistribution` enum to our owned
+    /// Convert from the upstream `TemplateDistribution` enum to the owned
     /// wrap. Returns `None` for inbound-only variants
     /// (`CoinbaseOutputConstraints`, `RequestTransactionData`,
     /// `SubmitSolution`) which never travel outbound and so should never
@@ -430,8 +430,8 @@ mod tests {
 }
 
 /// Inbound message types that pool consumers can send **into** the TDP
-/// worker. Each maps directly to a `TemplateDistribution` variant; we keep
-/// the wrap so the upstream type is not part of our public API.
+/// worker. Each maps directly to a `TemplateDistribution` variant; the wrap
+/// keeps the upstream type out of this crate's public API.
 #[derive(Debug, Clone)]
 pub enum TdpRequest {
     /// Re-advertise coinbase output constraints (size + sigops). The TDP

@@ -40,15 +40,12 @@ pub const BUDGET_SAFETY_MARGIN_WU: u32 = 200;
 ///
 /// Below this the cut publishes NOTHING, and §4 makes the pool output
 /// the residual (`pay_P = T − Σpay`), so the pool takes the entire
-/// block while every miner books their full claim as credit against
-/// coins it already holds. That is why this is a hard config floor and
-/// not a warning: a budget under it is not a degraded pool, it is a
-/// pool that keeps the miners' money.
+/// block while every miner books their full claim as credit. Hence a
+/// hard config floor, not a warning.
 ///
 /// The worst-case output weight ([`COINBASE_OUTPUT_WEIGHT`], P2TR /
-/// P2WSH) is deliberate — the guarantee has to hold whatever address
-/// types the miners bring. A P2WPKH-only population physically fits at
-/// 1012, but nothing stops one P2TR miner from joining.
+/// P2WSH) is deliberate: the guarantee has to hold whatever address
+/// types the miners bring.
 pub const MIN_COINBASE_WEIGHT_BUDGET: u32 = COINBASE_BASE_WEIGHT
     + BUDGET_SAFETY_MARGIN_WU
     + COINBASE_WITNESS_COMMITMENT_WEIGHT
@@ -59,10 +56,7 @@ pub const MIN_COINBASE_WEIGHT_BUDGET: u32 = COINBASE_BASE_WEIGHT
 /// the miner cut (50 %).
 ///
 /// A typo guard, not a policy: half the pot to one member already
-/// makes the proportional split nearly meaningless. Chosen ABOVE the
-/// 32 % that the previous 1-BTC sats cap worked out to against a
-/// 3.125-BTC block, so converting an existing configuration can never
-/// silently clamp it down.
+/// makes the proportional split nearly meaningless.
 ///
 /// Must stay below 1 000 000: the bonus weight is `S·ppm/(1e6 − ppm)`
 /// and the divisor has to remain positive.
@@ -85,18 +79,14 @@ pub fn resolve_min_payout_sats(raw: Option<&str>) -> Sats {
 /// can't parse (junk / migration artifacts / seed-test rows like
 /// `synthseed800001`).
 ///
-/// Defensive sanitizer for the distribution input: an unparseable
-/// address that reaches `build_payout_outputs` (bp-mining-job) fails
-/// `address_to_script`, which aborts the *entire* coinbase build — so
-/// one junk ledger row would block every miner's job. Dropping it from
-/// the distribution is strictly safer (the row is simply not paid this
-/// block; it stays in the ledger).
+/// An unparseable address fails `address_to_script` in
+/// `build_payout_outputs` (bp-mining-job), which aborts the whole coinbase
+/// build for every miner. Dropping it from the distribution instead leaves
+/// the row unpaid this block but still in the ledger.
 ///
-/// This does NOT validate the network — a wrong-network address (e.g.
-/// a `tb1…` testnet address on a mainnet pool) parses here but would
-/// still fail `require_network` at coinbase-build time. That case can't
-/// arise from the normal share path (addresses are network-checked at
-/// connection time) and is left to the build-time check.
+/// Does NOT validate the network: a wrong-network address parses here and
+/// is left to `require_network` at coinbase-build time (the share path
+/// network-checks addresses at connection time).
 pub fn is_valid_payout_address(address: &str) -> bool {
     !address.is_empty() && Address::from_str(address).is_ok()
 }
@@ -113,8 +103,8 @@ pub fn output_weight_for_address(address: &str) -> u32 {
         return COINBASE_OUTPUT_WEIGHT;
     };
     // `address_type()` lives on `Address<NetworkChecked>`. `assume_checked`
-    // does not validate the network — it only flips the type-system marker
-    // so we can read the script type without committing to a Network.
+    // does not validate the network; it only flips the type-system marker
+    // so the script type can be read without committing to a Network.
     match unchecked.assume_checked().address_type() {
         Some(AddressType::P2wpkh) => 124,
         Some(AddressType::P2sh) => 128,
@@ -134,21 +124,12 @@ pub fn output_weight_for_address(address: &str) -> u32 {
 /// even on a degenerate sub-overhead budget.
 ///
 /// **The pool output is reserved unconditionally**, matching what
-/// `build_weight_distribution`'s blockspace cut actually does. This used to
-/// take a `has_fee_output` flag, left over from a model where a 0 % fee
-/// meant no fee output. §4 ended that: `pay_P` is the residual, so
-/// `pool_weight_for` floors at 1 and `payout_entries_at` emits the pool
-/// output at every fee — a 0 % fee just makes it small, not absent. With
-/// the flag `false` this returned ONE MORE than the cut can publish, so
-/// `GroupService` admitted a member the coinbase then folded away, and
-/// under `WithheldValue::ToPool` their whole share went to the pool. That
-/// is exactly the ledger-free invariant `coinbase_max_members` exists to
-/// hold.
-///
-/// The flag had also drifted across its three callers — two derived it as
-/// `fee_address.is_some() && fee_percent > 0.0`, the capacity cron as
-/// `fee_address.is_some()` alone. Removing it makes all three agree by
-/// construction.
+/// `build_weight_distribution`'s blockspace cut does: under §4 `pay_P` is
+/// the residual, so the pool output exists at every fee, even 0 %. One
+/// slot too many here would let `GroupService` admit a member the coinbase
+/// cannot pay, and under `WithheldValue::ToPool` their whole share would
+/// go to the pool, breaking the ledger-free invariant
+/// `coinbase_max_members` exists to hold.
 pub fn max_coinbase_outputs(budget: u32) -> u64 {
     let fixed = COINBASE_BASE_WEIGHT
         + BUDGET_SAFETY_MARGIN_WU
@@ -207,17 +188,8 @@ pub enum FeePayoutBudgetError {
 /// (`pay_P = T − Σ pay`), so a distribution without one cannot exist:
 /// `build_weight_distribution` refuses, the payout resolver falls back to a
 /// solo coinbase, and that coinbase pays **100 % of the block to whichever
-/// miner happened to connect** — every block, indefinitely, with one
-/// `warn!` per job and no fingerprint, so the loss is not even booked.
-///
-/// That is the same outcome the [`MIN_COINBASE_WEIGHT_BUDGET`] floor below
-/// already refuses outright ("not a degraded pool, a pool that keeps the
-/// miners' money"); this was its other half, left open. The example config
-/// has always said a fee address is *required when the mode is enabled* —
-/// this is what makes that true rather than aspirational.
-///
-/// A boot that stops here costs the operator one config line. The failure
-/// it replaces costs a whole block and cannot be undone.
+/// miner happened to connect**, with no fingerprint, so nothing is booked.
+/// Refusing to boot costs one config line; that failure costs a block.
 pub fn validate_fee_payout_budget(
     fee_address: Option<&str>,
     fee_percent: f64,
@@ -247,10 +219,7 @@ pub fn validate_fee_payout_budget(
     }
     // Enough budget for at least one miner output, or the distribution
     // publishes nothing and the §4 residual hands the pool the whole
-    // block. This used to check `base + margin` alone — 528 — which is
-    // less than the blockspace cut's own fixed reservation, so every
-    // budget from 529 to 1059 passed validation and then published no
-    // outputs at all. See [`MIN_COINBASE_WEIGHT_BUDGET`].
+    // block. See [`MIN_COINBASE_WEIGHT_BUDGET`].
     if coinbase_weight_budget < MIN_COINBASE_WEIGHT_BUDGET {
         return Err(FeePayoutBudgetError::WeightBudgetTooLow {
             value: coinbase_weight_budget,
@@ -409,14 +378,8 @@ mod tests {
         assert_eq!(output_weight_for_address(""), 0);
     }
 
-    /// The pool output costs one member slot, always.
-    ///
-    /// This replaces a test that compared the old `has_fee_output` flag
-    /// against itself (`without_fee == with_fee + 1`). It could not fail
-    /// while the flag existed, and it never looked at what the builder
-    /// reserves — so it cemented the very off-by-one it was meant to
-    /// guard. The real guarantee is cross-checked against
-    /// `build_weight_distribution` in
+    /// The pool output costs one member slot, always. The guarantee is
+    /// cross-checked against `build_weight_distribution` in
     /// `weights::tests::the_member_ceiling_is_what_the_blockspace_cut_publishes`.
     #[test]
     fn max_outputs_reserves_a_slot_for_the_pool_output() {
@@ -452,10 +415,8 @@ mod tests {
 
     /// MONEY: a pool with no usable fee address builds no distribution at
     /// all, so every PPLNS / Group-Solo job falls back to a solo coinbase
-    /// paying 100 % of the block to whichever miner connected — silently,
-    /// indefinitely, and without a fingerprint, so nothing even books the
-    /// loss. It has to be refused at construction, exactly like the
-    /// weight-budget floor is.
+    /// paying 100 % of the block to whichever miner connected, with nothing
+    /// booked. It is refused at construction, like the weight-budget floor.
     #[test]
     fn a_pool_without_a_usable_fee_address_is_refused() {
         // Absent, empty and whitespace-only are the same operator mistake:
@@ -522,15 +483,10 @@ mod tests {
     }
 
     /// The floor has to be the number the BUILDER needs, not a smaller
-    /// one that merely looks structural.
-    ///
-    /// It used to be `base + margin` = 528, while the blockspace cut
-    /// reserves `base + witness commitment + pool output` = 688 out of
-    /// `budget − margin` before it appends the first miner output. Every
-    /// budget from 529 to 1059 therefore passed validation and then
-    /// published nothing at all — and §4 makes the pool output the
-    /// residual, so the pool took the entire block while every miner
-    /// booked their full claim as credit against coins it already held.
+    /// one that merely looks structural: the blockspace cut reserves
+    /// `base + witness commitment + pool output` = 688 out of
+    /// `budget − margin` before it appends the first miner output, and a
+    /// budget that publishes nothing hands the pool the whole block.
     #[test]
     fn budget_floor_is_what_the_blockspace_cut_actually_reserves() {
         // Exactly the cut's own arithmetic, spelled out independently.
@@ -544,8 +500,8 @@ mod tests {
         );
         assert_eq!(MIN_COINBASE_WEIGHT_BUDGET, 1_060);
 
-        // The old floor sat inside the dead zone — pin that it is now
-        // rejected, or this whole class of config comes back.
+        // `base + margin` alone is not enough: everything below the
+        // floor is refused.
         let old_floor = COINBASE_BASE_WEIGHT + BUDGET_SAFETY_MARGIN_WU;
         assert!(old_floor < MIN_COINBASE_WEIGHT_BUDGET);
         for dead in [old_floor + 1, 700, 1_012, MIN_COINBASE_WEIGHT_BUDGET - 1] {

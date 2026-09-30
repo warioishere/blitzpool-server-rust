@@ -37,9 +37,7 @@ use crate::format::{format_number_suffix, Language};
 const MEMPOOL_CURRENT_DIFF: &str = "https://mempool.space/api/v1/mining/hashrate/3d";
 const MEMPOOL_NEXT_ADJUST: &str = "https://mempool.space/api/v1/difficulty-adjustment";
 
-// ── Small shared client builder so the listener can pass one Client
-// down to all read commands (keeps connection pool reuse). For tests
-// we always inline a default 5s-timeout client.
+// ── HTTP client for the mempool.space-backed read commands (5 s timeout).
 
 fn default_http_client() -> Client {
     Client::builder()

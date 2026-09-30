@@ -8,9 +8,9 @@
 //! - **Join request**: user → group. Admin reviews + approves/rejects.
 //!
 //! Trust anchor is the same as for invitations — the requesting
-//! address must have a verified email binding (snapshotted on the
-//! request row so approve/reject mail reaches the right inbox even if
-//! the user later rebinds).
+//! address must be verified by email or a signature ownership proof.
+//! A verified email is snapshotted on the request row so approve/reject
+//! mail reaches the right inbox even if the user later rebinds.
 
 use std::sync::Arc;
 
@@ -90,7 +90,7 @@ impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
     /// validation:
     ///
     /// 1. Group exists, is public, not dissolved.
-    /// 2. Address shape valid + has a verified email binding.
+    /// 2. Address shape valid + verified (email or signature proof).
     /// 3. Address isn't already a member of any group.
     /// 4. Address isn't over the global pending cap.
     /// 5. No (group, address) row currently in cooldown.
@@ -103,9 +103,9 @@ impl<H: GroupServiceHooks, M: EmailHooks> JoinRequestService<H, M> {
         address: &str,
         message: Option<&str>,
     ) -> Result<PplnsGroupJoinRequestRow, JoinRequestServiceError> {
-        // (1) Group must exist, be public, not dissolved. We don't
-        // distinguish private-but-exists vs not-found
-        // ("don't leak existence of private groups").
+        // (1) Group must exist, be public, not dissolved. Private and
+        // not-found answer the same, so a private group's existence
+        // does not leak.
         let group = bp_db::find_group(&self.pool, group_id).await?;
         let group = match group {
             Some(g) if g.dissolved_at.is_none() && g.is_public => g,

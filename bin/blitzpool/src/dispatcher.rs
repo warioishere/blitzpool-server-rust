@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `NotificationDispatcher` construction — Phase 7.7.
+//! `NotificationDispatcher` construction.
 //!
 //! Builds the single `Arc<NotificationDispatcher>` that fans
 //! engine-side events (`block_found`, `best_diff`, `device_status`)
-//! out across whichever transport adapters are live. The adapter
-//! handles come from already-built singletons:
+//! out across whichever transport adapters are live. The adapters are
+//! the already-built singletons, so each has one state:
 //!
 //! - **FCM** + **Web-Push** from [`crate::hooks::ProductionHooks`]
-//!   (Phase 7.3 / 7.7 — also used by the API push-register paths).
+//!   (also used by the API push-register paths).
 //! - **Telegram** + **ntfy** from [`crate::listeners::ListenerHandles`]
-//!   (Phase 7.6 — same adapter instances also drive the long-poll +
-//!   SSE listener loops, so per-adapter state stays consistent).
+//!   (also driving the long-poll + SSE listener loops).
 //!
-//! Returns `None` when none of the four adapters are configured —
-//! callers (cron-wiring + block-sink + device-status hooks) then
-//! collapse their `notify_*` calls into no-ops rather than building
-//! pointless event payloads.
+//! Returns `None` when none of the four adapters are configured, so
+//! callers skip building event payloads nobody receives.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,10 +27,8 @@ use crate::boot::FoundationHandles;
 use crate::hooks::ProductionHooks;
 use crate::listeners::ListenerHandles;
 
-/// Build the dispatcher Arc when any of `[notifications.*]` is wired.
-/// Returns `None` when every transport is absent — operational
-/// staging deployments with no push channels skip the dispatcher
-/// entirely.
+/// Build the dispatcher Arc when any of `[notifications.*]` is wired;
+/// `None` when every transport is absent.
 pub(crate) fn build(
     foundation: &FoundationHandles,
     hooks: &ProductionHooks,
@@ -53,10 +48,9 @@ pub(crate) fn build(
         return None;
     }
 
-    // Use the in-memory per-chat language map from the command handler
-    // (shared with the listener loops so /deutsch / /english take effect
-    // for outbound Telegram notifications). Fall back to an empty map
-    // when no listeners are configured.
+    // The command handler's per-chat language map, shared so /deutsch /
+    // /english apply to outbound Telegram notifications too. Empty when
+    // no listeners are configured.
     let chat_languages: ChatLanguageMap = listeners
         .chat_languages()
         .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));

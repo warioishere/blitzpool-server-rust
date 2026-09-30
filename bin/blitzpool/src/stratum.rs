@@ -1,38 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Unified SV1+SV2 listener coordinator — Phase 7.4c.
+//! Unified SV1+SV2 listeners: one TCP listener per configured port serves
+//! both protocols, so miners keep their configured `[stratum]` ports.
 //!
-//! Owns one TCP listener per configured port (solo + solo-high-diff +
-//! optionally pplns + pplns-high-diff). For each connection: peek the
-//! first byte, classify via [`detect`], dispatch
-//! to either the SV1 server's `accept_connection` (existing SV1
-//! handshake) or the SV2 server's `accept_connection` (Noise XK
-//! handshake). HTTP requests on a stratum port get closed with a
-//! `WARN` (HTTP→bp-api proxy fallback is a deferred polish item);
-//! TLS ClientHello gets closed silently to keep probe noise out of
-//! the connection logs.
-//!
-//! One "Unified Stratum server (V1 + V2)" per port fronts both
-//! protocols on the same TCP address.
-//!
-//! ## Why per-port unified listener (not separate ports)
-//!
-//! Operators have BitAxes / NerdQAxes pointed at the existing
-//! `[stratum]` ports. Migrating to a separate SV2 port would force
-//! every miner to re-configure. Serving both protocols on the same
-//! port keeps the deploy story "swap the binary; nothing else changes".
-//!
-//! ## Architecture
-//!
-//! 1. [`crate::stratum_v1::build_per_port_servers`] returns one
-//!    `Sv1PortServer` per port (no listener bound).
-//! 2. [`crate::stratum_v2::build_per_port_servers`] returns one
-//!    `Sv2PortServer` per port (no listener bound) — same port set.
-//! 3. For each port: bind a single `TcpListener`, spawn an
-//!    [`accept_loop`] that peeks → dispatches → hands the socket to
-//!    the matching server.
-//! 4. Shutdown: cancel the shared token + drive each per-port server's
-//!    own shutdown to completion.
+//! [`crate::stratum_v1::build_per_port_servers`] and
+//! [`crate::stratum_v2::build_per_port_servers`] build one server each per
+//! port (same port set, no listener). Each port's [`accept_loop`] peeks the
+//! first byte, classifies it via [`detect`] and hands the socket to the SV1
+//! server or the SV2 one (Noise XK). HTTP is closed with a `WARN`; a TLS
+//! ClientHello is closed silently to keep probe noise out of the logs.
 
 use std::sync::{Arc, RwLock};
 
@@ -114,9 +90,9 @@ pub(crate) enum StratumSpawnError {
     },
 }
 
-/// Spawn the unified SV1+SV2 stratum listeners. Returns an empty
-/// handle when TDP is unavailable (`--skip-tdp`) — both protocols
-/// fail open with warns, the listener bind would be pointless.
+/// Spawn the unified SV1+SV2 stratum listeners. Returns an empty handle
+/// when TDP is unavailable (`--skip-tdp`): without templates there are no
+/// jobs to serve.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn(
     cfg: &AppConfig,
@@ -132,12 +108,10 @@ pub(crate) async fn spawn(
     // apply must invalidate the published payout distributions exactly
     // like a JDP-declared one. Filled once the JDP server exists.
     settle: crate::settlement::SettlementSignal,
-    // THE JDP bridge — the same `Arc` the JDP server registers into, passed
-    // in rather than built here. It is the only channel between the two
-    // servers: `jdp_server` writes declared jobs and base-protocol
-    // allocations, `SetCustomMiningJob` on this side reads them. Two
-    // instances resolve nothing, and the symptom is total —
-    // `invalid-mining-job-token` on every custom job a JDC ever builds.
+    // THE JDP bridge: the same `Arc` the JDP server registers into. The JDP
+    // server writes declared jobs and allocations, `SetCustomMiningJob`
+    // here reads them; a second instance would fail every custom job with
+    // `invalid-mining-job-token`.
     bridge: Arc<RwLock<JdpDeclaredJobRegistry>>,
 ) -> Result<StratumHandles, StratumSpawnError> {
     if foundation.tdp.is_none() {
@@ -145,10 +119,8 @@ pub(crate) async fn spawn(
         return Ok(StratumHandles::empty());
     }
 
-    // Single production resolver, fanned out to both protocols. Lives
-    // here because it's the join point where the SV1 + SV2 hook
-    // builders both need an `Arc<dyn PayoutResolver>` (each in its
-    // own trait shape; same concrete impl).
+    // One resolver for both protocols; each takes it as its own
+    // `PayoutResolver` trait.
     let production_resolver = Arc::new(crate::payout_resolver::ProductionPayoutResolver::new(
         engines.mode_gate.clone(),
         engines.pplns.clone(),
@@ -162,18 +134,15 @@ pub(crate) async fn spawn(
     let sv1_resolver: Arc<dyn bp_stratum_v1::PayoutResolver> = production_resolver.clone();
     let sv2_resolver: Arc<dyn bp_stratum_v2::hooks::PayoutResolver> = production_resolver;
 
-    // ONE pool-wide MiningJob cache shared across every SV1 AND SV2
-    // port server. All of them ride the same TDP streams, and the
-    // cache key is content-based, so an SV1 PPLNS build and an SV2
-    // Standard-channel build for the same template are literally the
-    // same entry.
+    // ONE pool-wide MiningJob cache for every SV1 and SV2 port server: they
+    // share the TDP streams and the key is content-based, so identical
+    // builds are one entry.
     let job_cache = Arc::new(bp_mining_job::MiningJobCache::new());
 
-    // The front is the only process that knows, first-hand, which
-    // devices are connected: it holds the sockets. Publish that set so
-    // the notify side can answer "is this miner online?" without having
-    // to infer it from share activity. One registry per process, wrapping
-    // the shared persistence hook so both protocols feed it.
+    // Only the front knows first-hand which devices are connected; publish
+    // that set so the notify side need not infer it from share activity.
+    // One registry per process, wrapping the shared persistence hook so
+    // both protocols feed it.
     let live_sessions = Arc::new(crate::live_sessions::LiveSessionRegistry::new(
         Arc::new(engines.session_persistence_hook.clone()),
         foundation.redis.clone(),
@@ -216,10 +185,9 @@ pub(crate) async fn spawn(
         settle,
     );
 
-    // Pair SV1 + SV2 servers by port. Both builders enumerate ports
-    // identically (SV1's `build_port_configs`); guard with an assert
-    // so future divergence trips a CI failure rather than silently
-    // mis-dispatching.
+    // Pair SV1 + SV2 servers by port. Both enumerate ports via SV1's
+    // `build_port_configs`; the asserts fail loudly on divergence instead
+    // of mis-dispatching.
     assert_eq!(
         sv1_servers.len(),
         sv2_servers.len(),
@@ -312,32 +280,25 @@ async fn accept_loop(listener: TcpListener, dispatch: PortDispatch, cancel: Canc
 }
 
 /// How long sent data may stay unacknowledged before the kernel drops the
-/// connection. Without it a miner that vanished without closing (power
-/// cut, unplugged) kept its session for ~18 min: the pool keeps sending
-/// jobs, so the keepalive never runs, and Linux retransmits for
-/// `tcp_retries2` rounds before it gives up.
+/// connection. A miner that vanished without closing still gets jobs, so
+/// keepalive never runs, and without this Linux retransmits for
+/// `tcp_retries2` rounds before giving up.
 #[cfg(target_os = "linux")]
 const STRATUM_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
 
 /// Socket options every accepted stratum connection gets, SV1 and SV2
 /// alike. Failures are logged and the connection is served anyway.
 fn tune_stratum_socket(socket: &TcpStream, peer: std::net::SocketAddr, port: u16) {
-    // Disable Nagle's algorithm: stratum is latency-sensitive small-frame
-    // request/response. With Nagle on, the Nagle + delayed-ACK interaction
-    // adds ~40 ms per round-trip (most visible on SV2 share acks). Set it
-    // once here so both SV1 and SV2 connections inherit it.
+    // No Nagle: small latency-sensitive frames, and Nagle plus delayed ACK
+    // adds ~40 ms per round-trip.
     if let Err(err) = socket.set_nodelay(true) {
         warn!(%err, ?peer, port, "stratum: set_nodelay(true) failed (continuing)");
     }
-    // Enable TCP keepalive so long-lived but quiet miner connections (idle
-    // between shares / new templates) don't get silently evicted from an
-    // upstream NAT/firewall state table, and a dead peer on an idle
-    // connection is detected: start probing after 60 s idle, then every
-    // 20 s, drop after 4 missed probes (~140 s). Keepalive only probes a
-    // connection with nothing unacknowledged in flight; a dead peer the pool
-    // is still sending jobs to is caught by the user timeout below. The
-    // per-socket SO_KEEPALIVE opt-in is required — the
-    // net.ipv4.tcp_keepalive_* sysctls only tune the timing once it's on.
+    // Keepalive keeps quiet connections in NAT/firewall tables and detects
+    // a dead peer on an idle connection: probe after 60 s idle, every 20 s,
+    // drop after 4 misses. It only probes a connection with nothing in
+    // flight; the user timeout below covers the rest. The per-socket opt-in
+    // is required; the sysctls only tune the timing.
     let keepalive = TcpKeepalive::new()
         .with_time(std::time::Duration::from_secs(60))
         .with_interval(std::time::Duration::from_secs(20))
@@ -446,9 +407,7 @@ fn detect(first_byte: u8) -> Detected {
 /// `Ok(None)` when the peer closed the connection before sending
 /// anything; `Err(_)` for any I/O error.
 async fn peek_first_byte(socket: &TcpStream) -> std::io::Result<Option<u8>> {
-    // `TcpStream::peek` yields until at least one byte is available or
-    // the peer closes the connection. Returns 0 on peer-close, n>0
-    // otherwise.
+    // `peek` returns 0 on peer-close.
     let mut buf = [0u8; 1];
     match socket.peek(&mut buf).await? {
         0 => Ok(None),
@@ -473,13 +432,12 @@ pub(crate) struct PortTemplates {
 impl PortTemplates {
     /// Subscribe BEFORE snapshotting: anything broadcast between the two ends
     /// up in both, and the assembler dedupes on template_id. The snapshot
-    /// covers the bitcoin-core bootstrap pair (NewTemplate + SetNewPrevHash)
-    /// the broadcast usually sends before a per-port subscriber exists; see
-    /// `feedback-tdp-initial-template-drain` for the race.
+    /// covers the bootstrap pair (NewTemplate + SetNewPrevHash) broadcast
+    /// before a per-port subscriber exists.
     ///
-    /// Every port carries ALL alt streams — mode is per-address, not per-port,
-    /// so a Group-Solo / Blockparty member can connect on any port and must be
-    /// routable onto its stream.
+    /// Every port carries ALL alt streams: mode is per-address, so a
+    /// Group-Solo / Blockparty member on any port must be routable onto its
+    /// stream.
     pub(crate) fn subscribe(
         tdp: &bp_template_distribution::TdpHandle,
         foundation: &FoundationHandles,

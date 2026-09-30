@@ -3,11 +3,10 @@
 //! SPIKE: can TWO concurrent TDP/IPC connections to ONE bitcoind each hold
 //! their own template (with their own `block_reserved_weight`)?
 //!
-//! This is the make-or-break assumption for the per-mode multi-stream coinbase
-//! reservation: the sv2-apps `BitcoinCoreSv2TDP` keeps exactly one template
-//! client per connection, so N reservations means N TDP connections to the same
-//! node. If bitcoin-core's IPC can't serve two concurrent template clients, the
-//! whole approach is dead and we rethink. This test proves it can.
+//! The per-mode multi-stream coinbase reservation depends on it: a TDP
+//! connection holds exactly one template client, so N reservations means N TDP
+//! connections to the same node. This test pins that bitcoin-core's IPC serves
+//! two concurrent template clients.
 
 use std::time::Duration;
 
@@ -92,16 +91,9 @@ async fn two_concurrent_tdp_connections_both_get_templates() {
     let mut acc_pplns = PairAcc::default();
 
     // Each connection emits a startup pair for the PRE-generate tip as soon as
-    // it attaches. Taking exactly one pair per connection after mining is what
-    // made this test flaky: whether that startup pair lands before or after
-    // `subscribe()` is a scheduler race, and when it landed after, one side
-    // reported the stale startup template (id 0, old tip) while the other was
-    // already on the freshly mined one.
-    //
-    // Collect it up front instead, so the skip path below is exercised on
-    // every run rather than only under unlucky timing. Bounded: if a pair was
-    // emitted before `subscribe()` it is simply gone, and nothing here depends
-    // on having seen it.
+    // it attaches, and whether it lands before or after `subscribe()` is a
+    // scheduler race. Collect it up front so the skip path below runs every
+    // time. Bounded: a pair emitted before `subscribe()` is simply gone.
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             tokio::select! {
@@ -155,8 +147,8 @@ async fn two_concurrent_tdp_connections_both_get_templates() {
         startup_tip.is_some(),
     );
 
-    // The startup pair really was collected and then skipped — otherwise this
-    // run did not exercise the path the fix is about.
+    // The startup pair really was collected and then skipped, otherwise this
+    // run did not exercise the skip path.
     assert!(
         startup_tip.is_some(),
         "expected to observe the startup template pair before mining"

@@ -41,11 +41,7 @@
 //! - **In:** TDP message exchange (templates out, solutions and tx-data
 //!   requests in), startup `CoinbaseOutputConstraints`, graceful shutdown.
 //! - **Out:** SV1 `mining.notify` translation (lives in `bp-stratum-v1`),
-//!   SV2 frame serialisation (`bp-stratum-v2`), JDP (`bp-job-declaration`,
-//!   same topology pattern).
-//!
-//! See `memory/project-tdp-direct-architecture.md` for the rationale and
-//! `MIGRATION_PLAN.md` §4 step 7b for the larger picture.
+//!   SV2 frame serialisation and JDP (both `bp-stratum-v2`).
 
 mod assembler;
 mod config;

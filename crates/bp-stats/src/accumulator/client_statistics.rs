@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-client per-slot share statistics — the big 10-field-per-bucket
-//! accumulator that backs the `client_statistics` PG table.
+//! Per-client per-slot share statistics: the multi-field accumulator that
+//! backs the `client_statistics` PG table.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ pub struct ClientStatisticsKey {
     pub slot: TimeSlot,
 }
 
-/// The 10-field bucket. `shares` is the **diff sum**; the `*_count`
+/// One bucket. `shares` is the **diff sum**; the `*_count`
 /// fields are share counts (integer-valued floats); the `*_diff1` fields
 /// are diff sums broken down by rejection reason.
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -42,7 +42,7 @@ pub struct ClientStatisticsRecord {
     pub rejected_version_rolling_count: f64,
     pub rejected_version_rolling_diff1: f64,
     /// Shares whose job existed but had been retired past the grace window.
-    /// Its own pair (migration 0011), not folded into job-not-found: this is
+    /// Its own pair, not folded into job-not-found: this is
     /// the ordinary tail of a block transition, that one is work the pool
     /// never had.
     pub rejected_stale_count: f64,

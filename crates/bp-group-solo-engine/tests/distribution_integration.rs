@@ -8,7 +8,7 @@
 //! docker-Redis + docker-PG.
 //!
 //! Each test uses a fresh group (UUID-generated) and a distinct
-//! Redis logical DB (0–15) to avoid cross-test interference.
+//! Redis logical DB to avoid cross-test interference.
 
 use std::sync::Arc;
 
@@ -33,14 +33,9 @@ const FEE_ADDR: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
 /// Finder addresses `bitcoin::Address` can actually PARSE.
 ///
 /// `AddressId` only checks the shape, so a placeholder like `bc1qfinder`
-/// passes it and is then dropped by the distribution build's
-/// `is_valid_payout_address` sanitize pass. Six tests below used such
-/// placeholders, which meant every one of them ran against an EMPTY share
-/// map — `per_finder_snapshots_are_isolated` compared two snapshots that
-/// were empty and therefore identical whatever the code did, and
-/// `concurrent_same_finder_builds_share_one_compute` deduped a
-/// distribution with no payouts in it. Both are only meaningful with real
-/// addresses.
+/// passes it and is then dropped by the build's `is_valid_payout_address`
+/// sanitize pass, leaving an EMPTY share map that makes snapshot and
+/// dedup comparisons meaningless.
 const FINDER_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 const FINDER_B: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
 
@@ -54,9 +49,8 @@ struct Harness {
 async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Harness> {
     let pg_url = std::env::var("BP_PG_URL").unwrap_or_else(|_| PG_URL.to_string());
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    // Fold this binary's local number into its own DB range — see
-    // `bp_test_support::redis_db`. Without it every binary's 0..15
-    // land on the same 16 databases and FLUSHDB each other mid-run.
+    // Fold this binary's local number into its own DB range (see
+    // `bp_test_support::redis_db`) so binaries do not FLUSHDB each other.
     let redis_db =
         bp_test_support::redis_db_in_range(bp_test_support::redis_db::GS_DISTRIBUTION, redis_db)
             .await;
@@ -211,8 +205,8 @@ async fn build_with_shares_returns_payouts_and_writes_snapshot() {
     };
     assert!(score_of(&addr_a) > score_of(&addr_b));
 
-    // The schema-2 snapshot must be readable under the weights
-    // fingerprint — the key a block-found booking resolves.
+    // The weight snapshot must be readable under the weights
+    // fingerprint, the key a block-found booking resolves.
     let mut conn = h.round.connection_for_snapshot();
     let snap = bp_group_solo_engine::round::snapshot::read_weight_snapshot_for(
         &mut conn,
@@ -275,8 +269,7 @@ async fn build_for_nonexistent_group_returns_group_not_found() {
 
 #[tokio::test]
 async fn finder_bonus_from_db_row_is_applied() {
-    // 3 200 ppm (0.32 %) — what migration 0009 turns the old 1M-sat
-    // bonus into against a 3.125-BTC subsidy.
+    // 3 200 ppm (0.32 %), ~1M sats against a 3.125-BTC subsidy.
     let h = match spawn_or_skip(2, Some(3_200)).await {
         Some(h) => h,
         None => return,
@@ -298,10 +291,9 @@ async fn finder_bonus_from_db_row_is_applied() {
         .await
         .expect("ok");
 
-    // §4 folds the bonus into the finder's SINGLE weight — one output
-    // per address (the old dedicated bonus output no longer exists).
-    // With equal 50/50 shares the finder's one output must exceed the
-    // peer's by ~1M sats (the configured bonus).
+    // §4 folds the bonus into the finder's SINGLE weight, one output per
+    // address. With equal 50/50 shares the finder's one output must exceed
+    // the peer's by ~1M sats (the configured bonus).
     let entries = result
         .distribution
         .payout_entries_at(312_500_000)
@@ -328,8 +320,8 @@ async fn finder_bonus_from_db_row_is_applied() {
         other_total
     );
     // 3 200 ppm of the miner cut, off the top: on a 312.5M block with
-    // the harness fee that is ~1M sats, and it is EXACT rather than a
-    // projection — the bonus is plain score weight now.
+    // the harness fee that is ~1M sats, and EXACT because the bonus is
+    // plain score weight.
     let diff = finder_total - other_total;
     let pot = bp_share::miner_pot_sats(result.distribution.fee_ppm, 312_500_000) as i64;
     let expected = pot * 3_200 / 1_000_000;
@@ -369,8 +361,8 @@ async fn per_finder_snapshots_are_isolated() {
         .await
         .expect("ok");
 
-    // The per-(group, finder) key now carries the schema-2 WEIGHT
-    // snapshot; read it back through the weight parser.
+    // The per-(group, finder) key carries the WEIGHT snapshot; read it
+    // back through the weight parser.
     let mut conn = h.round.connection_for_snapshot();
     let s1 = bp_group_solo_engine::round::snapshot::read_weight_snapshot(
         &mut conn,
@@ -468,21 +460,11 @@ async fn invalidate_all_triggers_fresh_compute() {
 
 // ── Test 7 — empty round bootstraps to the finder, not the pool ─────
 
-/// MONEY: a Group-Solo round is EMPTY right after every reset —
-/// `reset_for_block_found` / `reset_full` / `manual_reset` all DEL the
-/// by-address hash, and `read_by_address` has no bucket fallback. A build
-/// in that gap used to return an entry list with nothing in it, and that
-/// is not a harmless empty answer: `weight_P` floors at 1 and §4 makes the
-/// pool output the residual, so the §4 vector was a SINGLE output paying
-/// the entire block to the fee address. The list is not empty either, so
-/// the job path served it.
-///
-/// The prospective finder now claims that block instead. Nobody is robbed
-/// — with an empty round no member holds a share — and the pool still
-/// takes exactly its fee.
-///
-/// The test this replaces asserted only `reference_revenue_sats`, which is
-/// an input echoed back. It could not have seen the payout at all.
+/// MONEY: a Group-Solo round is EMPTY right after every reset. With no
+/// member entries, `weight_P` floors at 1 and §4 makes the pool output the
+/// residual, so the vector would pay the entire block to the fee address.
+/// The prospective finder claims that block instead: with an empty round
+/// no member holds a share, and the pool still takes exactly its fee.
 #[tokio::test]
 async fn an_empty_round_pays_the_finder_not_the_whole_block_to_the_pool() {
     let h = match spawn_or_skip(6, None).await {
@@ -529,7 +511,7 @@ async fn an_empty_round_pays_the_finder_not_the_whole_block_to_the_pool() {
     assert_eq!(paid.iter().map(|(_, s)| *s).sum::<u64>(), T, "Σ == T");
 
     // And it is BOOKABLE: the bootstrap distribution is an ordinary one,
-    // so its snapshot landed under its own fingerprint.
+    // so its snapshot lands under its own fingerprint.
     assert!(
         result.snapshot_written,
         "a bootstrap block must be bookable like any other"

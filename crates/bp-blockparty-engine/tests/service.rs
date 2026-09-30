@@ -4,18 +4,18 @@
 #![allow(clippy::needless_return)]
 
 //! Integration tests for `bp_blockparty_engine::BlockpartyService`
-//! against the local docker-PG (`blitzpool-rust-pg` on :15433).
+//! against the local docker-PG (`bp-test-pg` on :15433).
 //!
 //! Coverage:
-//! - createGroup + DRAFT initial status (+ cache hit)
-//! - addMember auto-flips DRAFT → CONFIRMING (+ cache sync)
-//! - markMemberConfirmed promotes CONFIRMING → READY and the
+//! - `create_group` + DRAFT initial status (+ cache hit)
+//! - `add_member` auto-flips DRAFT → CONFIRMING (+ cache sync)
+//! - `mark_member_confirmed` promotes CONFIRMING → READY and the
 //!   load-bearing routing-cache invariant: routable + pending-fee
 //!   guards both flip in lockstep with the DB
-//! - onShareAccepted promotes READY → ACTIVE (and ONLY from READY)
+//! - `on_share_accepted` promotes READY → ACTIVE (and ONLY from READY)
 //! - dissolve cooldown gates ACTIVE within the 7-day silence window
 //! - dissolve frees member and admin addresses for the next party
-//! - onBlockFound is idempotent on duplicate (groupId, blockHash)
+//! - `on_block_found` is idempotent on duplicate (groupId, blockHash)
 //! - name collision rejects second create
 
 use std::sync::Arc;
@@ -141,9 +141,8 @@ async fn delete_signature(pool: &PgPool, address: &str) {
         .await;
 }
 
-/// Best-effort row cleanup. We use unique-per-test addresses + names so
-/// concurrent runs don't collide, and the FK CASCADE on group dissolve
-/// would take care of children — but tests don't always reach dissolve.
+/// Best-effort row cleanup. Addresses and names are unique per test so
+/// concurrent runs don't collide; not every test reaches dissolve.
 async fn cleanup(pool: &PgPool, name: &str, admin_addr: &str) {
     let _ = sqlx::query(r#"DELETE FROM blockparty_group WHERE name = $1"#)
         .bind(name)
@@ -287,10 +286,9 @@ async fn join_via_link_adds_unconfirmed_member_and_mints_token() {
 
 #[tokio::test]
 async fn join_via_link_admits_signature_verified_email_less_base58_address() {
-    // The unified gate's whole point: an address with NO verified email but a
-    // valid signature-ownership proof may join. Uses a mixed-case legacy Base58
-    // address to also prove the case-normalization fix (the proof is stored
-    // verbatim `1BvBM…`; the gate must not lowercase it).
+    // An address with NO verified email but a valid signature-ownership proof
+    // may join. The mixed-case legacy Base58 address pins that the gate does
+    // not lowercase it (the proof is stored verbatim `1BvBM…`).
     let Some(pool) = connect_or_skip().await else {
         return;
     };

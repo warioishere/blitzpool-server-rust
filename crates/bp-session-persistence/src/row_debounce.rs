@@ -2,39 +2,25 @@
 
 //! Debounced client-row birth.
 //!
-//! `client_entity` used to get its row synchronously at authorize plus a
-//! soft-delete at disconnect — two committed statements per connection,
-//! no matter how short. Measured on prod (2026-08-06): ~43k connections
-//! per day never submit a share, and 95 % of those disconnect within one
-//! second. Their statements were pure overhead, and the rows they left
-//! behind (soft-deleted, retained for the hard-delete window) bloated the
-//! table every other `client_entity` writer pays for through full-page
-//! writes.
-//!
-//! So the row is born late: `register_session` only records the session
-//! in the in-memory [`RowDebounce`] map, and the birth flush writes it —
-//! batched, one statement per tick — once it has survived
-//! `row_debounce` (default 15 s). A session that disconnects while still
-//! pending just drops out of the map: zero statements. Teardown
-//! soft-deletes only sessions that were actually born.
+//! A `client_entity` row is born late: `register_session` only records
+//! the session in the in-memory [`RowDebounce`] map, and the birth flush
+//! writes it (batched, one statement per tick) once it has survived
+//! `row_debounce` (default 15 s). Most short-lived connections never
+//! submit a share; one that disconnects while still pending costs zero
+//! statements. Teardown soft-deletes only sessions that were born.
 //!
 //! The debounce must stay well below the device-status gate's
-//! `online_dwell` (90 s): the gate's liveness lookup drops
-//! `(address, worker)` keys that have no `client_entity` row yet, so a
-//! row late by more than the dwell would make the gate treat a connected
-//! device as absent. 15–20 s of birth latency disappears inside the
-//! dwell.
+//! `online_dwell` (90 s): the gate drops `(address, worker)` keys that
+//! have no `client_entity` row yet, so a longer delay would make it treat
+//! a connected device as absent.
 //!
-//! ## The teardown race, and why it is left to `kill_dead_clients`
+//! ## The teardown race is left to `kill_dead_clients`
 //!
-//! A session can disconnect in the moment its row is in flight: the
-//! entry is already drained (so `deregister` sees nothing pending) and
-//! not yet marked born (so no soft-delete runs). The flush then commits
-//! a row for a dead session. That ghost is exactly the case the 60 s
-//! `kill_dead_clients` cron exists for — a teardown that did not stamp
-//! its row — and is swept within its 5-min staleness window. The gate is
-//! unaffected either way: its session counts come from the fronts' Redis
-//! live-session sets, not from this table.
+//! A session that disconnects while its row is in flight is already
+//! drained (nothing pending) and not yet born (no soft-delete), so the
+//! flush commits a row for a dead session. `kill_dead_clients` sweeps
+//! exactly such unstamped rows. The gate is unaffected: its session
+//! counts come from the fronts' Redis live-session sets.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -54,11 +40,10 @@ use crate::touch_buffer::TouchKey;
 /// this — they retry indefinitely, like the touch buffer's rebuffer.
 pub(crate) const MAX_BIRTH_ATTEMPTS: u32 = 3;
 
-/// One not-yet-born session. Values captured at `register_session`
-/// (authorize) so the row the flush writes is exactly the row the old
-/// synchronous path wrote — same `userAgent` (incl. the SV2
-/// `jd-client/sv2` placeholder the downstream-report refinement matches
-/// on), same authorize-time `startTime`/`firstSeen`.
+/// One not-yet-born session. Values are captured at `register_session`
+/// (authorize) so the row carries the authorize-time `userAgent` (incl.
+/// the SV2 `jd-client/sv2` placeholder the downstream-report refinement
+/// matches on) and authorize-time `startTime`/`firstSeen`.
 pub(crate) struct PendingRow {
     pub user_agent: Option<String>,
     pub start_time_ms: i64,
@@ -77,18 +62,10 @@ struct Inner {
     /// (which is `sessionId`-wide, covering every worker of the
     /// session).
     ///
-    /// Entries leave at deregister, so this tracks the currently-connected
-    /// born sessions. Two cases add an entry nothing will ever remove, both
-    /// bounded and deliberately not engineered around:
-    ///
-    /// - the teardown-race below: a session that disconnects between its
-    ///   drain and its `mark_born` leaves its id here. That window is one
-    ///   bulk INSERT wide, so at prod rates it is single-digit entries per
-    ///   day — a few hundred bytes a year.
-    /// - a teardown that never fires at all (task aborted mid-shutdown).
-    ///   The same miss leaves a live `client_entity` row for
-    ///   `kill_dead_clients` to sweep, which is the louder symptom of the
-    ///   two, and the process is ending anyway.
+    /// Entries leave at deregister. Two bounded cases leave an entry
+    /// behind for good: a session that disconnects between its drain and
+    /// its `mark_born` (a window one bulk INSERT wide), and a teardown that
+    /// never fires (task aborted mid-shutdown).
     born: HashSet<String>,
 }
 
@@ -111,9 +88,8 @@ impl RowDebounce {
     /// Record a freshly-authorized session. Overwrites a pending entry
     /// for the same triple (defensive re-register): latest authorize
     /// wins, retry budget resets. A re-register of an already-born
-    /// session pends again — the birth flush's `ON CONFLICT` arm then
-    /// refreshes the row and clears its soft-delete, which is what the
-    /// synchronous upsert did.
+    /// session pends again; the birth flush's `ON CONFLICT` arm then
+    /// refreshes the row and clears its soft-delete.
     pub(crate) fn register(
         &self,
         address: &str,
@@ -225,9 +201,8 @@ pub(crate) async fn flush_once(debounce: &RowDebounce, pool: &PgPool, min_age: D
         Err(bulk_err) => {
             // Per-row isolation. The bulk statement is all-or-nothing, so
             // a single bad row (22001 over-long name) would otherwise
-            // poison every session in the batch — and an unbounded retry
-            // would poison every FUTURE batch too, which is exactly how
-            // the abandoned upsert-touch design failed.
+            // block every session in the batch, and with unbounded retry
+            // every later batch too.
             warn!(
                 error = %bulk_err,
                 rows = due.len(),
@@ -275,10 +250,10 @@ pub(crate) async fn flush_once(debounce: &RowDebounce, pool: &PgPool, min_age: D
 
 /// Spawned birth-flush loop. Returns when `shutdown_rx` resolves.
 ///
-/// Deliberately NO final drain on shutdown, unlike the touch flush: a
-/// front that is shutting down is closing its sockets, so every still-
-/// pending session is about to end — writing its row now would only
-/// create work for `kill_dead_clients`.
+/// No final drain on shutdown, unlike the touch flush: a front that is
+/// shutting down is closing its sockets, so every still-pending session
+/// is about to end and its row would only create work for
+/// `kill_dead_clients`.
 pub(crate) async fn run_birth_loop(
     debounce: std::sync::Arc<RowDebounce>,
     pool: PgPool,

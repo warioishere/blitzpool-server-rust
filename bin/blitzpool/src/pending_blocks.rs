@@ -13,19 +13,14 @@
 //! What is parked are the **inputs**, not a computed result: the
 //! distribution's settlement inputs plus what the block's coinbase
 //! actually paid. Both are immutable, so the apply recomputes from them
-//! and lands on the same satoshis however long the wait was. Freezing a
-//! computed result instead is what used to force a re-base pass over
-//! every balance row at apply time; there is nothing to re-base now.
+//! and lands on the same satoshis however long the wait was.
 //!
 //! ## Why Redis (not Postgres)
 //!
-//! The store must survive a pool restart inside the confirmation window
-//! (else a restart loses the pending apply — the same drift the whole
-//! feature prevents). Valkey is already AOF/RDB-persistent and holds the
-//! payout window + snapshots, so this is consistent with the existing
-//! trust model and needs no schema migration. Entries are stored
-//! **without a TTL** so the `volatile-lru` eviction policy (which only
-//! evicts keys that have an expiry) can never drop them.
+//! The store must survive a restart inside the confirmation window.
+//! Valkey is AOF/RDB-persistent and already holds the payout window and
+//! snapshots. Entries have **no TTL**, so `volatile-lru` eviction (which
+//! only evicts keys with an expiry) can never drop them.
 
 use redis::{aio::ConnectionManager, AsyncCommands, RedisError};
 
@@ -73,8 +68,8 @@ pub(crate) struct PendingBlock {
 }
 
 /// Which engine settles a block. The stored shape stays `group: Option`:
-/// parked blocks carry no TTL, so a format change would have the watcher
-/// prune every block parked before the deploy as unparsable.
+/// parked blocks carry no TTL, so a format change would make the watcher
+/// prune already-parked blocks as unparsable.
 pub(crate) enum SettlementMode<'a> {
     Pplns,
     GroupSolo(&'a PendingGroup),
@@ -145,11 +140,8 @@ pub(crate) async fn remove_pending_block(
 
 /// How many blocks are parked under `key`.
 ///
-/// One `HLEN` — cheap enough to run every confirmation pass. It exists
-/// because [`UNBOOKABLE_KEY`] had no reader at all: the error that parks a
-/// block there promises the operator its distribution is preserved, and
-/// nothing ever said the store was non-empty. A count is the smallest
-/// honest answer to that.
+/// One `HLEN`, cheap enough for every confirmation pass. Makes a non-empty
+/// [`UNBOOKABLE_KEY`] visible to the operator.
 pub(crate) async fn count_pending_at(
     conn: &mut ConnectionManager,
     key: &str,

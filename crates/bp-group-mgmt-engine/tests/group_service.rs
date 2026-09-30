@@ -115,7 +115,7 @@ async fn cleanup_group(pool: &PgPool, group_id: Uuid) {
         .await;
 }
 
-// ─── createGroup ───────────────────────────────────────────────────────────
+// ─── create_group ──────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn create_group_happy_path_returns_token_and_seeds_creator() {
@@ -259,7 +259,7 @@ async fn create_group_rejects_address_already_in_group() {
     cleanup_group(&pool, g1.group.id).await;
 }
 
-// ─── addMember ────────────────────────────────────────────────────────────
+// ─── add_member ───────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn group_active_from_creation_and_stays_after_add() {
@@ -329,7 +329,7 @@ async fn add_member_rejects_address_in_other_group() {
     cleanup_group(&pool, g2.group.id).await;
 }
 
-// ─── requireAdminToken ────────────────────────────────────────────────────
+// ─── require_admin_token ──────────────────────────────────────────────────
 
 #[tokio::test]
 async fn require_admin_token_rejects_invalid() {
@@ -369,7 +369,7 @@ async fn require_admin_token_rejects_invalid() {
     cleanup_group(&pool, g.group.id).await;
 }
 
-// ─── removeMember ────────────────────────────────────────────────────────
+// ─── remove_member ───────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn remove_member_creator_rejected() {
@@ -481,7 +481,7 @@ async fn remove_member_keeps_group_active_down_to_creator() {
     cleanup_group(&pool, g.group.id).await;
 }
 
-// ─── transferCreator ─────────────────────────────────────────────────────
+// ─── transfer_creator ────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn transfer_creator_rotates_role_and_token() {
@@ -572,7 +572,7 @@ async fn transfer_creator_rejects_non_member() {
     cleanup_group(&pool, g.group.id).await;
 }
 
-// ─── updateRoundResetConfig ──────────────────────────────────────────────
+// ─── update_round_reset_config ───────────────────────────────────────────
 
 #[tokio::test]
 async fn update_round_reset_config_applies_and_fires_hook() {
@@ -684,7 +684,7 @@ async fn update_round_reset_rejects_a_bonus_past_the_ppm_cap() {
     cleanup_group(&pool, g.group.id).await;
 }
 
-// ─── dissolveGroup ───────────────────────────────────────────────────────
+// ─── dissolve_group ──────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn dissolve_group_removes_members_and_marks_row() {
@@ -771,8 +771,7 @@ async fn address_cache_reflects_membership_changes() {
     cleanup_group(&pool, g.group.id).await;
 }
 
-/// A single corrupt/legacy member address (here: an embedded space, the
-/// exact shape that crashed boot during the prod cutover) must NOT fail
+/// A single corrupt member address (here: an embedded space) must NOT fail
 /// the whole rebuild — the bad row is skipped, every good member still
 /// routes to its group.
 #[tokio::test]
@@ -795,8 +794,7 @@ async fn address_cache_rebuild_skips_invalid_address_member() {
         .expect("g");
 
     // Raw-insert a member whose address contains a space — bypasses the
-    // `AddressId` guard the service normally enforces, simulating the
-    // migrated legacy rows that previously crashed the boot-time rebuild.
+    // `AddressId` guard the service normally enforces.
     let bad = format!("12CWLwaD4WmZ PKRF{}", Uuid::new_v4().simple());
     sqlx::query(
         "INSERT INTO pplns_group_member (\"groupId\", address, role) VALUES ($1, $2, 'member')",
@@ -840,10 +838,9 @@ async fn address_cache_rebuild_skips_invalid_address_member() {
 // These tests pin that the join path — not the UI — is where that is
 // refused.
 
-/// A group with `maxMembers = NULL` is NOT uncapped. The column only ever
-/// expressed the operator's own, tighter limit; the coinbase ceiling
-/// applies regardless, which is what covers every group that predates the
-/// cap without a migration.
+/// A group with `maxMembers = NULL` is NOT uncapped. The column expresses
+/// only the operator's own, tighter limit; the coinbase ceiling applies
+/// regardless.
 #[tokio::test]
 async fn null_max_members_still_stops_at_the_coinbase_ceiling() {
     let pool = match connect_or_skip().await {
@@ -915,9 +912,8 @@ async fn operator_max_members_still_binds_below_the_ceiling() {
     cleanup_group(&pool, g.group.id).await;
 }
 
-/// `maxMembers` used to be validated against a round 100 000. That number
-/// has nothing to do with what a coinbase can pay, so an admin could set a
-/// cap the pool could never honour and only find out on a found block.
+/// `maxMembers` above the coinbase ceiling is refused: such a cap would be a
+/// promise the coinbase cannot keep, noticed only on a found block.
 #[tokio::test]
 async fn max_members_above_the_coinbase_ceiling_is_refused() {
     let pool = match connect_or_skip().await {

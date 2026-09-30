@@ -66,14 +66,11 @@ pub struct GroupService<H: GroupServiceHooks> {
     /// can carry — the HARD member ceiling, above the operator's own
     /// optional `maxMembers`.
     ///
-    /// A group that outgrows its coinbase does not fail loudly: the
-    /// distribution's blockspace cut silently drops the members that no
-    /// longer fit, and they are paid nothing for that block. Refusing
-    /// the join instead keeps that case unreachable by construction,
-    /// which is what lets Group-Solo run without a ledger to carry the
-    /// difference. Derived from `[group_fees].coinbase_weight_budget`,
-    /// which is a fixed TOML value — unlike PPLNS, nothing rescales it
-    /// at runtime, so a cap checked against it cannot go stale.
+    /// Past it the blockspace cut silently drops members from the coinbase
+    /// and they are paid nothing for that block; refusing the join keeps
+    /// that unreachable, which is what lets Group-Solo run without a
+    /// ledger. Derived from the fixed `[group_fees].coinbase_weight_budget`,
+    /// so a cap checked against it cannot go stale.
     coinbase_max_members: u64,
     /// Cross-mode collision reader. When wired, `create_group` and
     /// `add_member_without_admin` refuse addresses already in a
@@ -128,8 +125,7 @@ impl<H: GroupServiceHooks> GroupService<H> {
     /// `maxMembers` when set, never above what the coinbase can carry.
     ///
     /// `NULL` means "no operator limit", not "no limit" — the coinbase
-    /// ceiling still applies, so legacy rows are covered without a
-    /// migration.
+    /// ceiling still applies.
     fn effective_member_cap(&self, group_max_members: Option<i32>) -> i64 {
         let coinbase_cap = self.coinbase_max_members.min(i64::MAX as u64) as i64;
         match group_max_members {
@@ -264,7 +260,7 @@ impl<H: GroupServiceHooks> GroupService<H> {
         name: &str,
         creator_address: &str,
     ) -> Result<GroupCreateResult, GroupServiceError> {
-        // Existing callers default to the classic PROP-per-round mode.
+        // PROP-per-round is the default mode.
         self.create_group_with_mode(name, creator_address, PayoutMode::Prop)
             .await
     }
@@ -383,12 +379,9 @@ impl<H: GroupServiceHooks> GroupService<H> {
         );
 
         let now = now_ms();
-        // DB-side atomic: insert member + recompute active in one TX —
-        // mirrors `remove_member`. Without the TX a failure between the
-        // insert and the active-recompute leaves the member persisted but
-        // `active` stale; a retry then hits AlreadyMember and can't repair
-        // the flag (the group would silently route no shares despite
-        // having ≥ MIN_MEMBERS_ACTIVE members).
+        // Insert member + recompute active in one TX, like `remove_member`:
+        // a failure in between would leave `active` stale, and a retry hits
+        // AlreadyMember and cannot repair the flag.
         let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
         // Count inside the TX so a concurrent add can't slip past the cap.
         let current = bp_db::count_pplns_group_members_for_group(&mut *tx, group_id).await?;
@@ -415,7 +408,7 @@ impl<H: GroupServiceHooks> GroupService<H> {
     /// Admin path to remove a non-creator member. Enforces the
     /// kick-inactivity window (`kick_inactivity_days`) and runs Redis
     /// cleanup AFTER the DB transaction commits so a Redis failure
-    /// doesn't leave us with an inconsistent DB state.
+    /// cannot leave the DB state inconsistent.
     pub async fn remove_member(
         &self,
         group_id: Uuid,
@@ -544,7 +537,7 @@ impl<H: GroupServiceHooks> GroupService<H> {
     ) -> Result<PplnsGroupRow, GroupServiceError> {
         let group = self.require_admin_token(group_id, token).await?;
 
-        // Cross-field consistency check before we touch the DB.
+        // Cross-field consistency check before touching the DB.
         if let (PatchField::Set(p), PatchField::Set(_)) =
             (&settings.preset, &settings.interval_days)
         {
@@ -568,8 +561,8 @@ impl<H: GroupServiceHooks> GroupService<H> {
             }
         }
 
-        // Build the resolved config we'd see after the PATCH applies —
-        // needed for the cross-field validation that follows.
+        // The config as it stands after the PATCH, for the cross-field
+        // validation that follows.
         let resolved = resolve_after_patch(&group, &settings);
         validate_resolved_round_reset(&resolved)?;
 

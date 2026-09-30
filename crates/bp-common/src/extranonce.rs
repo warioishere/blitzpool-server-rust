@@ -19,64 +19,44 @@
 //! - **Different cache key** ⟺ a shared prefix is harmless: the coinbases,
 //!   and therefore the headers, differ no matter what the prefix is.
 //!
-//! The payout set is part of that key, and this pool is non-custodial, so
-//! the distinction is not academic: Solo / Group-Solo / Blockparty sessions
-//! each hash their own payout outputs and can never collide with a
-//! different address, whatever prefix they hold. PPLNS is the mode where
-//! the prefix carries the entire burden — `build_distribution(reward_sats)`
-//! is address-independent, so every PPLNS miner on a stream hashes one
-//! identical coinbase.
+//! Solo / Group-Solo / Blockparty sessions each hash their own payout
+//! outputs, so they never collide whatever prefix they hold. PPLNS is where
+//! the prefix carries the entire burden: every PPLNS miner on a stream
+//! hashes one identical coinbase.
 //!
-//! The allocator nonetheless guarantees prefixes unique **pool-wide**, not
-//! merely per coinbase class. That is deliberate: the global guarantee
-//! subsumes the per-class one, costs nothing (a worker partition holds
-//! 2^24 prefixes — orders of magnitude past any realistic connection
-//! count), and spares every caller from having to reason about which mode
-//! a session ended up resolving to. Treat pool-wide uniqueness as a
-//! simplifying invariant, not as a claim that a shared prefix is always
-//! harmful.
+//! The allocator still guarantees prefixes unique **pool-wide**: it
+//! subsumes the per-class guarantee, costs nothing (2^24 prefixes per
+//! partition), and spares callers from reasoning about a session's mode.
+//! It is a simplifying invariant, not a claim that a shared prefix is
+//! always harmful.
 //!
 //! ## Allocation strategy
 //!
-//! Prefixes live in a per-worker partition. The prefix is 4 bytes; the top
-//! 8 bits select the worker (0..=255) and the remaining 24 bits are the
-//! per-worker prefix counter. The allocator hands out the next free
-//! big-endian integer starting from 1 (we skip 0 because some firmwares
-//! treat `extranonce_prefix == all-zero` as "no prefix"). On release the
-//! prefix returns to the pool; reuse is allowed.
+//! The prefix is 4 bytes; the top 8 bits select the worker (0..=255) and
+//! the remaining 24 bits are the per-worker counter. The allocator hands
+//! out the next free big-endian integer starting from 1 (some firmwares
+//! treat an all-zero `extranonce_prefix` as "no prefix"). Released
+//! prefixes are reused.
 //!
-//! The worker partition is what lets the SV1 and SV2 servers share this
-//! allocator without ever handing out overlapping prefixes: each protocol
-//! builds ONE [`SharedExtranonceAllocator`] on its own worker id and hands
-//! it to every one of its port servers, so an SV1 prefix (`0x01…`) and an
-//! SV2 prefix (`0x00…`) can never collide even though the two protocols run
-//! separate instances. The partition is a namespace split, not a rationing
-//! device — it buys the two instances freedom from having to coordinate (no
-//! shared instance, no shared lock, no cross-crate wiring), and uniqueness
-//! falls out by construction.
+//! Each protocol builds ONE [`SharedExtranonceAllocator`] on its own worker
+//! id and shares it across all of its ports, so SV1 (`0x01…`) and SV2
+//! (`0x00…`) prefixes never collide without the two instances having to
+//! coordinate. Within a protocol the instance must be shared: an allocator
+//! per port would start every port at the same prefix, and two PPLNS ports
+//! hash the same coinbase.
 //!
-//! Within a protocol the instance must be shared across ports: an allocator
-//! per port starts every port at the same prefix, and two PPLNS ports hash
-//! the same coinbase.
-//!
-//! Only workers 0 and 1 are assigned; **workers 2..=255 are unowned**, so
-//! nothing is ever emitted from `0x02…`..`0xFF…`. That is headroom, not
-//! waste: a partition serves 2^24 concurrent prefixes, so two of them
-//! already cover both protocols with room to spare, and any future
-//! independent allocator (another protocol, another region) can claim a
-//! worker id and stay collision-free without talking to the others. The
-//! same property makes the unowned range the natural home for a
-//! hand-administered prefix: no counter will ever reach it.
+//! Only workers 0 and 1 are assigned; **workers 2..=255 are unowned**, so no
+//! counter ever emits `0x02…`..`0xFF…`. That makes the range the home for a
+//! hand-administered prefix, and room for any further independent
+//! allocator to claim a worker id.
 //!
 //! The 4-byte prefix is the pool's part of `bp_mining_job`'s 12-byte
 //! coinbase extranonce slot (`EXTRANONCE_SLOT_LEN`), leaving 8 for the
-//! miner — SV1's fixed 4-byte extranonce1 + 8-byte extranonce2. The bump
-//! from 8 → 12 came from the Braiins Hashpower marketplace, which requires
-//! `extranonce2_size >= 7` on the miner side.
+//! miner (SV1's `extranonce2`), because the Braiins Hashpower marketplace
+//! requires `extranonce2_size >= 7`.
 //!
-//! `ExtranonceAllocator` is crate-private on purpose: the only way in is
-//! [`SharedExtranonceAllocator`], so no server can build an allocator of
-//! its own — the per-port copy that handed every port the same prefixes.
+//! `ExtranonceAllocator` is crate-private so the only way in is
+//! [`SharedExtranonceAllocator`]; no server can build a per-port allocator.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,11 +72,8 @@ pub enum ExtranonceError {
 
 /// Worker-partition ids reserved per stratum protocol. The top byte of a
 /// 4-byte prefix carries the worker id, so allocators built on distinct
-/// workers hand out disjoint prefixes — this is what lets the SV1 and SV2
-/// servers share the extranonce space (one allocator instance per worker)
-/// without ever colliding. Keep both reservations here so the
-/// cross-protocol uniqueness invariant lives in one place rather than as
-/// magic numbers spread across the protocol crates.
+/// workers hand out disjoint prefixes. Both reservations live here so the
+/// cross-protocol uniqueness invariant is in one place.
 ///
 /// Each protocol builds one [`SharedExtranonceAllocator`] on its id: SV2 on
 /// this one (worker 0 → `0x00…` prefixes), SV1 on [`SV1_WORKER_ID`]
@@ -338,7 +315,7 @@ mod tests {
         assert_eq!(mgr.allocated_count(), 0);
     }
 
-    // ── Extra Rust-side invariants ──────────────────────────────────
+    // ── Encoding and exhaustion ─────────────────────────────────────
 
     /// Big-endian encoding: prefix=1 must be 0x00,0x00,0x00,0x01.
     /// Skips 0 so the first allocation lands at 1.

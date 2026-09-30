@@ -13,8 +13,6 @@
 //! is the §4 residual `pay_P = T − Σpay` — it absorbs every remainder, so the
 //! outputs sum to `T` exactly. There is no drift budget to spend: solvency,
 //! ledger symmetry and idempotency are not negotiable, and neither is the sum.
-//! (This used to claim "a few thousand sats of drift is acceptable during the
-//! migration". The migration is over and the weight model removed the slack.)
 //!
 //! # Module layout
 //!
@@ -30,12 +28,9 @@
 //! - [`distribution`] — `build_distribution` wrapper around the shared
 //!   weight build + snapshot write, `bp_coinbase_snapshot::build_and_snapshot`.
 //! - [`sweep`] — daily 03:00 UTC `tokio`-loop that pair-cancels
-//!   abandoned credits ↔ debits. Group-solo dust-absorption lives in
-//!   the future `bp-group-solo-engine` crate.
-//! - [`hooks`] — `bp_stratum_v1::hooks::{AcceptedShareSink,
-//!   BlockSubmissionSink}` impls (and SV2 equivalents once that hook
-//!   surface lands). Mode-aware: only records if the share's address
-//!   resolves to PPLNS.
+//!   abandoned credits ↔ debits.
+//! - [`hooks`] — `bp_share_hook::SharedAcceptedShareSink` impl for SV1 and
+//!   SV2. Mode-aware: only records shares stamped as PPLNS.
 //! - [`reader`] — read-only views consumed by `bp-api` (ledger
 //!   summary, per-miner status, window stats, …).
 //! - [`engine`] — top-level `PplnsEngine` that wires window + ledger

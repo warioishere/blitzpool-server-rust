@@ -288,7 +288,7 @@ async fn bulk_insert_payout_history_handles_negative_block_height_for_sweep() {
 
 #[tokio::test]
 async fn apply_distribution_tx_atomicity_rollback_undoes_both_writes() {
-    // Verifies the contract bp-pplns-engine will rely on: a TX that
+    // Verifies the contract bp-pplns-engine relies on: a TX that
     // wraps a balance-upsert + a history-insert rolls BOTH back if the
     // caller aborts.
     let pool = match connect_or_skip().await {

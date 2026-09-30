@@ -3,34 +3,25 @@
 //! Regtest: SV2 per-mode stream routing — Solo, Group-Solo and Blockparty
 //! through ONE driver.
 //!
-//! The SV2 counterpart of `bp-stratum-v1/tests/regtest_stream_routing.rs`.
-//! Same scenario, different protocol side, and the protocol side is the whole
-//! reason both exist: here the stream swap is triggered by
-//! `OpenStandardMiningChannel` in `run_mining_connection` (over a Noise-XK
-//! session), not by `mining.authorize` in `run_connection`.
+//! The SV2 counterpart of `bp-stratum-v1/tests/regtest_stream_routing.rs`:
+//! here the stream swap is triggered by `OpenStandardMiningChannel` in
+//! `run_mining_connection` (over Noise-XK), not by `mining.authorize`.
 //!
-//! Two independent guards make each proof tight:
-//!   1. A recording block-sink captures the `StreamKind` of every block-submit.
-//!      The mode's own kind proves the OpenChannel swap fired; had it not, the
-//!      sink would record `Pplns` — the stream every connection boots on
-//!      before its mode is resolved — and the test fails.
-//!   2. The chain advancing proves the mode's handle actually knew the job's
-//!      `template_id` — template_ids collide across streams, so a mis-routed
-//!      submit would be rejected and the height would not move.
+//! Two independent guards:
+//!   1. A recording block-sink captures the `StreamKind` of every submit. The
+//!      mode's own kind proves the OpenChannel swap fired; without it the sink
+//!      would record `Pplns`, the stream every connection boots on.
+//!   2. The chain advancing proves the mode's handle knew the job's
+//!      `template_id` (template ids collide across streams, so a mis-routed
+//!      submit would be rejected).
 //!
-//! The three modes differ only in the reservation their stream advertises and
-//! in how many outputs the coinbase carries, so they share [`run_scenario`]:
+//! The modes differ only in reservation and coinbase output count, so they
+//! share [`run_scenario`], which classifies every `SubmitShares*` response:
 //!
 //!   * **Solo** pays one output, against a tiny fixed reservation.
 //!   * **Group-Solo** additionally proves a ~50-member P2TR coinbase fits the
 //!     production 10 000-WU reservation through the SV2 coinbase builder.
 //!   * **Blockparty** routes at the production 8 000-WU reservation.
-//!
-//! Sharing the loop is deliberate: as three files these carried three copies of
-//! the same miner loop, and the copies had already begun to diverge — only Solo
-//! and Blockparty classified each `SubmitShares*` response, so a Group-Solo run
-//! that failed reported "height did not rise" with nothing to say why. The one
-//! driver here classifies for all three.
 //!
 //! Skipped (with a printed warning) when `bitcoin-node` is not installed.
 
@@ -442,7 +433,7 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
     .await;
 
     // Capture the first NewMiningJob (built from the mode's template post-swap):
-    // it carries channel_id + job_id + version + min_ntime we need to submit.
+    // it carries the channel_id, job_id, version and min_ntime to submit with.
     let mut job: Option<(u32, u32, u32)> = None;
     let mut ntime: Option<u32> = None;
     let _ = tokio::time::timeout(Duration::from_secs(8), async {
@@ -506,7 +497,7 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
                         errors.push(String::from_utf8_lossy(e.error_code.as_bytes()).to_string());
                     }
                     AnyMessageOwned::Mining(MiningOwned::SubmitSharesSuccess(_)) => successes += 1,
-                    // Track job refresh so we don't submit against a stale id.
+                    // Track job refreshes so submits never use a stale id.
                     // A future job keeps the previous ntime until its
                     // SetNewPrevHash arrives (handled below).
                     AnyMessageOwned::Mining(MiningOwned::NewMiningJob(j)) => {
@@ -546,5 +537,3 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
         errors,
     }
 }
-
-// ── helpers (mirror regtest_standard.rs) ────────────────────────────────

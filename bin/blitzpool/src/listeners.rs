@@ -1,30 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Telegram long-poll + ntfy SSE listener wiring — Phase 7.6.
+//! Telegram long-poll + ntfy SSE listener wiring.
 //!
-//! For each `[notifications.telegram]` / `[notifications.ntfy]` block
-//! that's configured, this module:
+//! For each configured `[notifications.telegram]` / `[notifications.ntfy]`
+//! block this builds the outbound adapter ([`TelegramAdapter`] /
+//! [`NtfyAdapter`]), shared by the listener's reply path and the
+//! `hourly_stats` cron (via [`ListenerHandles::telegram_adapter`] +
+//! [`ListenerHandles::ntfy_adapter`]); builds one [`CommandHandler`] with
+//! both engine readers so read-side commands answer with live data; and
+//! spawns the loops, each stopped by `send(true)` on its `watch::Sender`.
 //!
-//! 1. Builds the corresponding **outbound adapter**
-//!    ([`TelegramAdapter`] / [`NtfyAdapter`]). Same adapter handles
-//!    flow into both the listener's reply path and the
-//!    `hourly_stats` cron (the cron-wiring lives in `crons.rs` and
-//!    receives the adapters back through [`ListenerHandles::telegram_adapter`]
-//!    + [`ListenerHandles::ntfy_adapter`]).
-//! 2. Builds a single [`CommandHandler`] shared between the two
-//!    listeners, with both engine readers attached so the read-side
-//!    commands (`/pplns_status`, `/group_status`, `/show_workers`, …)
-//!    answer with live data rather than the deferred-stub fallback.
-//! 3. Spawns the long-poll / SSE loop. Each helper inside
-//!    `bp-notifications` returns a `watch::Sender<bool>` that ends
-//!    the loop on `send(true)`.
-//!
-//! If neither `[notifications.telegram]` nor `[notifications.ntfy]` is
-//! configured (typical for staging / API-only deployments), the
-//! returned [`ListenerHandles`] is the inert
-//! [`ListenerHandles::disabled`] form — `shutdown` is a no-op and the
-//! `_adapter()` accessors return `None`. The `hourly_stats` cron is
-//! then skipped at the `crons::spawn` site.
+//! With neither block configured the result is
+//! [`ListenerHandles::disabled`]: `shutdown` is a no-op, the adapter
+//! accessors return `None`, and the `hourly_stats` cron is skipped.
 
 use std::sync::Arc;
 
@@ -63,9 +51,8 @@ struct Inner {
 }
 
 impl ListenerHandles {
-    /// Inert placeholder for early-exit paths (e.g. `--check-*`).
-    /// Kept on a separate constructor so the spawn function can stay
-    /// straight-line.
+    /// Inert placeholder for early-exit paths (e.g. `--check-*`) and
+    /// deployments without any listener configured.
     pub(crate) fn disabled() -> Self {
         Self { inner: None }
     }
@@ -156,10 +143,9 @@ pub(crate) fn spawn(
     // /subscribe or /remove refreshes its SSE topic set immediately.
     let ntfy_reconnect = Arc::new(Notify::new());
 
-    // CommandHandler is shared between both listeners — it owns the
-    // adapter clones used for replies (Telegram replies via Telegram,
-    // ntfy replies via ntfy). Attach the engine readers so live data
-    // flows into the read-side commands.
+    // One handler for both listeners; it replies over the transport a
+    // command arrived on, and the engine readers feed live data into the
+    // read-side commands.
     let handler = Arc::new(
         CommandHandler::new(pool.clone(), telegram_adapter.clone(), ntfy_adapter.clone())
             .with_redis(Some(foundation.redis.clone()))

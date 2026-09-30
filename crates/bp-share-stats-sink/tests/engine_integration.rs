@@ -5,15 +5,12 @@
 
 //! End-to-end orchestration test: spawn `ShareStatsEngine` with a tight
 //! flush interval, push data via the shared `Accumulators` handle (the
-//! same handle the SV1 hooks would mutate), wait for the cron task to
+//! same handle the share hooks mutate), wait for the cron task to
 //! tick, verify PG, then shutdown and confirm final-drain.
 //!
-//! This is the "Stratum→Stats-flow" test the migration plan calls for
-//! (user-confirmed scope 2026-05-16): it drives the full lifecycle
-//! (spawn → tick → flush → shutdown → final drain) end-to-end through
-//! the public engine API. The actual SV1 hook impls (which translate
-//! `record_accepted` / `record_rejected` into accumulator deltas) are
-//! covered separately by `hooks_unit.rs` and `flush_integration.rs`.
+//! The hook impls (which translate `record_accepted` / `record_rejected`
+//! into accumulator deltas) are covered by `hooks_unit.rs` and
+//! `flush_integration.rs`.
 
 use std::time::Duration;
 
@@ -80,8 +77,8 @@ async fn cleanup(pool: &PgPool, slot_time_ms: i64, prefix: &str) {
 /// background flush has committed it or `timeout` elapses. Returns `None` on
 /// timeout so the caller can fail with its own message.
 ///
-/// The flush is asynchronous, so any fixed sleep is a bet on how fast the
-/// runner is. CI lost that bet.
+/// The flush is asynchronous, so a fixed sleep would depend on how fast the
+/// runner is.
 async fn poll_accepted(pool: &PgPool, slot_ms: i64, timeout: Duration) -> Option<f32> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -126,8 +123,8 @@ async fn engine_spawn_tick_flushes_to_pg_then_shutdown_drains() {
         .await
         .expect("spawn engine");
 
-    // Push data via the shared accumulators handle — same path SV1 hooks
-    // would take when a real Stratum server is wired up.
+    // Push data via the shared accumulators handle, the same path the
+    // share hooks take.
     let accs = handle.accumulators();
     accs.pool_shares.add_accepted(slot, 50.0, 50.0);
     accs.pool_rejected
@@ -198,8 +195,8 @@ async fn engine_reader_exposes_pending_residuals_before_flush() {
         seed_on_spawn: false,
         startup_offset: Duration::ZERO,
     };
-    // Construct without spawning so we can mutate accumulators before
-    // verifying the reader's view.
+    // Construct without spawning, so the accumulators can be mutated
+    // before the reader's view is checked.
     let engine = ShareStatsEngine::new(cfg, pool).expect("new engine");
     let reader = engine.reader();
     let accs = engine.accumulators();
@@ -215,10 +212,8 @@ async fn engine_reader_exposes_pending_residuals_before_flush() {
 
 #[tokio::test]
 async fn engine_handle_shutdown_is_idempotent_against_dropped_handle() {
-    // Smoke test: dropping the handle without explicit shutdown does not
-    // panic. The background task aborts cleanly once its JoinHandle goes
-    // out of scope; this verifies that drop-without-shutdown is safe in
-    // call sites that don't go through the explicit drain.
+    // Dropping the handle without an explicit shutdown must not panic, for
+    // call sites that never go through the drain.
     let _guard = ENGINE_TEST_LOCK.lock().await;
     let Some(pool) = connect_or_skip().await else {
         return;
@@ -240,8 +235,8 @@ async fn engine_handle_shutdown_is_idempotent_against_dropped_handle() {
         // are still set, but Drop is a no-op on this type. The
         // background task continues until something else cancels it.
     }
-    // Give the dropped task a moment to be reclaimed; if it had
-    // panicked tokio would log it. We just want this to not crash.
+    // Give the detached task a moment to run; a panic there would be
+    // logged by tokio.
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 

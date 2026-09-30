@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! K1-lock attempted-takeover notice — sent by `AddressEmailService`
-//! when an existing address↔email binding refuses a re-registration.
+//! K1-lock attempted-takeover notice — sent by the API's email
+//! controller when an existing address↔email binding refuses a
+//! re-registration.
 
 use super::content::EmailContent;
 use super::helpers::{

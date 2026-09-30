@@ -11,8 +11,8 @@
 //! # Modules
 //!
 //! - [`config`] — `PrometheusConfig` (bind addr).
-//! - [`constants`] — metric names + label names. Single source of truth
-//!   to avoid typo-drift between emit-sites and Grafana queries.
+//! - [`constants`] — metric names + label names, shared by emit-sites and
+//!   Grafana queries.
 //! - [`recorder`] — typed helpers (`set_stream_consumer_lag`,
 //!   `set_parked_block_counts`, …) wrapping the `metrics::*!` macros.
 //! - [`service`] — `MetricsService::spawn(config)` installs the global

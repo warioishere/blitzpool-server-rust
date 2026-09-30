@@ -21,10 +21,9 @@ use bp_pplns_engine::ledger::{
 };
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-/// `apply_distribution` takes the caller's transaction now, because the
-/// balance read it settles against has to be locked in the same one (see
-/// the function's docs). These tests hand it their own, which is exactly
-/// what the engine does.
+/// `apply_distribution` takes the caller's transaction, because the balance
+/// read it settles against has to be locked in the same one. These tests
+/// hand it their own, as the engine does.
 async fn apply_in_tx(
     pool: &PgPool,
     block_height: i32,
@@ -175,10 +174,9 @@ async fn apply_distribution_replay_idempotent() {
     let first = apply_in_tx(&pool, block_height, &rows, &balances, 1_700_000_000_000).await;
     assert_eq!(first.history_inserted, 1);
 
-    // Replay: same block_height + same address triggers the
-    // (blockHeight, address) UNIQUE-collision-DO-NOTHING path. The balance
-    // upsert is now SKIPPED (gated on a non-zero history insert), so a replay
-    // can never double-count the accumulated totalPaidSats.
+    // Replay: the height already holds the same value-bearing rows, so
+    // `apply_distribution` writes nothing and totalPaidSats cannot be
+    // double-counted.
     let second = apply_in_tx(&pool, block_height, &rows, &balances, 1_700_000_060_000).await;
     assert_eq!(
         second.history_inserted, 0,
@@ -409,15 +407,10 @@ async fn touch_buffer_flush_once_empty_returns_zero() {
 
 // ── The settlement must LOCK the balances it reads ──────────────────
 //
-// The block-found balance write is absolute (`current + delta`). If
-// `current` is read outside the transaction that writes it, anything
-// committing in between is silently undone — and there IS another writer,
-// the daily dust sweep, whose targets (open balance, no recent shares) are
-// exactly the balance-only entries a distribution carries.
-//
-// The read therefore happens inside the apply transaction under
-// `FOR UPDATE`. This proves the lock is really taken: a second connection
-// asking for the same row with a short `lock_timeout` must be refused.
+// The block-found balance write is absolute (`current + delta`), and the
+// daily dust sweep writes the same rows, so `current` is read under
+// `FOR UPDATE` inside the apply transaction. A second connection asking
+// for the same row with a short `lock_timeout` must be refused.
 
 #[tokio::test]
 async fn the_settlement_read_locks_the_rows_it_will_write() {

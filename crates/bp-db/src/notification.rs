@@ -277,10 +277,8 @@ pub struct PushSubscriptionRow {
     #[sqlx(rename = "blockNotificationsEnabled")]
     pub block_notifications_enabled: bool,
     /// `"unified_push"` or `"fcm"` (lowercase, as written by the
-    /// `/api/push/*` register endpoints). Raw string kept — it's a
-    /// stable 2-value enum but introducing a typed enum at this layer is
-    /// over-engineering until a caller actually branches on it.
-    /// Consumers compare case-insensitively to tolerate legacy casing.
+    /// `/api/push/*` register endpoints). Kept as a raw string because no
+    /// caller branches on it; consumers compare case-insensitively.
     #[sqlx(rename = "subscriptionType")]
     pub subscription_type: String,
     #[sqlx(rename = "networkDiffNotificationsEnabled")]
@@ -937,7 +935,7 @@ pub async fn update_ntfy_sub_language(
 /// Distinct list of addresses that have at least one non-soft-deleted
 /// push subscription — for the dispatcher's in-memory presence cache
 /// bootstrap so the per-event fan-out can skip the 3-table lookup for
-/// addresses we know have no subscribers.
+/// addresses known to have no subscribers.
 pub async fn find_addresses_with_push_subscription(
     pool: &PgPool,
 ) -> Result<Vec<AddressId>, DbError> {
@@ -1000,10 +998,6 @@ pub async fn find_addresses_for_ntfy_listener(pool: &PgPool) -> Result<Vec<Addre
 /// honoured per transport at send time; the scan also keeps each address's
 /// tracker baseline current, so a user who switches best-diff back on is not
 /// greeted with a stale "new best" for work done while it was off.
-///
-/// Scanning push rows only (what the cron used to do) meant an address
-/// subscribed on Telegram or ntfy alone never got a best-diff message,
-/// whatever its flag said.
 pub async fn find_best_difficulty_scan_addresses(pool: &PgPool) -> Result<Vec<AddressId>, DbError> {
     let rows = sqlx::query!(
         r#"SELECT address AS "address!: AddressId"
@@ -1029,11 +1023,8 @@ pub async fn find_best_difficulty_scan_addresses(pool: &PgPool) -> Result<Vec<Ad
 /// ntfy is deliberately not routed for device status).
 ///
 /// The device-status gate uses this to decide which devices are worth
-/// tracking at all. On a pool where almost no address has a device
-/// subscription that turns a per-device state machine over every miner
-/// into one over a handful — and, more importantly, keeps the sweeper
-/// from doing a subscription lookup per address for messages nobody
-/// would receive.
+/// tracking at all, so the sweeper does not look up subscriptions for
+/// messages nobody would receive.
 pub async fn find_device_notification_addresses(pool: &PgPool) -> Result<Vec<AddressId>, DbError> {
     let rows = sqlx::query!(
         r#"SELECT address AS "address!: AddressId"

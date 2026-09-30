@@ -9,9 +9,8 @@
 //! call [`BlockpartyCache::set_admin_status`] for the new value. If the
 //! cache drifts from the DB the routing guards either pin shares to the
 //! pool-fee fallback for a confirmed party, or skip the Blockparty
-//! coinbase for one whose members have all confirmed. Grep this file
-//! for `set_admin_status` to audit: every status-mutation site must
-//! have a matching cache write.
+//! coinbase for one whose members have all confirmed. Every
+//! status-mutation site has a matching `set_admin_status` call.
 
 use std::sync::Arc;
 
@@ -38,9 +37,8 @@ use bp_common::now_ms;
 // ─── Config + result types ─────────────────────────────────────────
 
 /// Construction-time config knobs. The pool fee address + percent are
-/// resolved from environment in the bin/blitzpool boot layer (env keys
-/// `[group_fees].address`/`.percent`, address falling back to `[pplns].fee_address`)
-/// and handed in here as values.
+/// resolved by the bin/blitzpool boot layer (`[group_fees].address`/`.percent`,
+/// address falling back to `[pplns].fee_address`) and handed in as values.
 #[derive(Clone, Debug)]
 pub struct BlockpartyServiceConfig {
     pub fee_address: Option<AddressId>,
@@ -763,8 +761,8 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
         .await
         .map_err(|e| BlockpartyServiceError::Db(bp_db::DbError::Sqlx(e)))?;
         // Admin's edit authorship counts as their re-confirmation of the
-        // new splits. Explicitly stamping the timestamp also self-heals
-        // rows where confirmedAt was previously null.
+        // new splits; stamping it unconditionally also covers an admin row
+        // whose confirmedAt is null.
         sqlx::query!(
             r#"UPDATE blockparty_member
                SET "confirmedAt" = $2, "updatedAt" = $2
@@ -810,10 +808,9 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
             .map(|h| h.as_str())
             .or(member.member_token_hash.as_deref());
 
-        // Atomic: persist the confirm AND recompute the group status in one
-        // TX. A crash between the two (the old non-atomic version) could
-        // leave a fully-confirmed party permanently stuck in CONFIRMING —
-        // never routable despite every member having confirmed.
+        // Confirm and status recompute share one TX: a crash between them
+        // would leave a fully-confirmed party stuck in CONFIRMING, never
+        // routable.
         let mut tx = self.pool.begin().await.map_err(bp_db::DbError::from)?;
         bp_db::update_blockparty_member_confirmed(
             &mut *tx,
@@ -935,13 +932,11 @@ impl<H: BlockpartyHooks> BlockpartyService<H> {
     /// size the coinbase reservation (when the party is now READY) and
     /// refresh the routing-guard cache. Both are idempotent.
     ///
-    /// The reservation is sized after the status flip (not before, as the
-    /// previous non-atomic version did). The ~1 ms window where status is
-    /// READY but the reservation hasn't grown yet is harmless: the
-    /// Blockparty distribution trimmer rolls any members beyond the budget
-    /// into the pool-fee output, so a block built in that window is still
-    /// VALID (only fairness, not validity, depends on the reservation —
-    /// see `bp_blockparty::build_blockparty_distribution`).
+    /// The reservation is sized after the status flip. The short window
+    /// where status is READY but the reservation hasn't grown yet is
+    /// harmless: the distribution trimmer rolls members beyond the budget
+    /// into the pool-fee output, so a block built then is still valid
+    /// (see `bp_blockparty::build_blockparty_distribution`).
     async fn apply_status_side_effects(&self, group_id: Uuid, outcome: &RecomputeOutcome) {
         if outcome.target == BlockpartyStatus::Ready {
             if let Some(reservation) = self.reservation.as_ref() {
@@ -1128,10 +1123,9 @@ struct RecomputeOutcome {
 /// always consistent with the roster it was derived from.
 ///
 /// The two confirm paths (`mark_member_confirmed` / `confirm_as_member`)
-/// call this INSIDE the same TX as their member-confirm write, which
-/// closes the stuck-state where a crash between the confirm and the
-/// recompute left a fully-confirmed party permanently CONFIRMING (never
-/// routable). `recompute_status` wraps it in a standalone TX for callers
+/// call this INSIDE the same TX as their member-confirm write, so a crash
+/// between the two cannot leave a fully-confirmed party stuck in
+/// CONFIRMING. `recompute_status` wraps it in a standalone TX for callers
 /// that don't need that coupling.
 ///
 /// Promotes CONFIRMING → READY when all members are confirmed; demotes

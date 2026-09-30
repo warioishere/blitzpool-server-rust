@@ -2,30 +2,20 @@
 
 //! JDP server wiring.
 //!
-//! Binds a single listener on `[sv2].jdp_port` and dispatches each
-//! socket into [`StratumV2JdpServer::accept_connection`]. Unlike the
-//! mining ports, JDP doesn't multiplex with anything else — Job
-//! Declaration Clients (JDCs) speak the JDP sub-protocol straight
-//! after the Noise handshake.
+//! Binds one listener on `[sv2].jdp_port` and hands each socket to
+//! [`StratumV2JdpServer::accept_connection`]. Unlike the mining ports,
+//! JDP shares its port with nothing: JDCs speak JDP right after the Noise
+//! handshake.
 //!
-//! Production wiring replaces
-//! [`bp_stratum_v2::jdp_server::JdpServerHooks::no_op`] with
-//! [`crate::jdp_hooks::build_jdp_hooks`] — full production
-//! `AllocateResolver` (PayoutResolver-backed), `CurrentPrevHashProvider`
-//! (TDP snapshot), and `JdpBlockSubmissionSink` (`submitblock` RPC for
-//! orphan-protection redundancy), plus the
-//! [`TemplateTxCache`]-backed `TemplateTxProvider`, gated on
-//! `[sv2].jdp_orphan_submitblock = true`: when the pool resubmits
-//! blocks itself, the cache cuts JDC-side `ProvideMissingTransactions`
-//! payloads from ~1 MB to the handful of txs the JDC has and the pool
-//! doesn't. In default mode (orphan-resubmit off) the cache is not
-//! spawned — pool ignores the declared tx-bytes anyway.
+//! The hooks come from [`crate::jdp_hooks::build_jdp_hooks`] (in place of
+//! [`bp_stratum_v2::jdp_server::JdpServerHooks::no_op`]). The
+//! [`TemplateTxCache`]-backed tx provider runs only with
+//! `[sv2].jdp_orphan_submitblock = true`: when the pool resubmits blocks
+//! itself, it cuts `ProvideMissingTransactions` down to the txs the pool
+//! lacks; otherwise the declared tx bytes are not needed.
 //!
-//! ## When JDP is disabled
-//!
-//! If `[sv2].jdp_enabled = false` or `jdp_port` is absent, this
-//! module's `spawn` returns an empty handle with a single `info!`
-//! log. JDP is off by default; operators flip it on deliberately.
+//! JDP is off by default: without `[sv2].jdp_enabled = true` `spawn`
+//! returns an empty handle.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -67,11 +57,9 @@ impl JdpHandles {
         }
     }
 
-    /// Public variant of [`Self::disabled`] for the `--skip-tdp`
-    /// startup-path in main.rs (TDP is required to spawn the JDP
-    /// hooks — production `JdpAllocateResolver` reads the latest
-    /// template's `coinbase_tx_value_remaining`, and the block-submit
-    /// path needs TDP to relate prev_hashes).
+    /// [`Self::disabled`] for the `--skip-tdp` startup path: the JDP hooks
+    /// need TDP (the allocate resolver reads the latest template's
+    /// `coinbase_tx_value_remaining`, block submit relates prev hashes).
     pub(crate) fn disabled_for_init() -> Self {
         Self::disabled()
     }
@@ -124,11 +112,8 @@ pub(crate) async fn spawn(
     // `distribution_id` (ext 0x0003/SetPayoutDistribution).
     redis: redis::aio::ConnectionManager,
     // ext 0x0003/Implementation Notes settlement fan-out, created by the
-    // caller because the block sinks are built before this server exists and
-    // must reach the SAME registry: a settlement from any source invalidates
-    // the published distributions, not just a JDP-declared one. This is also
-    // where the registry handle gets attached, so the signal can reach it
-    // locally.
+    // caller because the block sinks are built before this server and must
+    // reach the SAME registry. The registry handle is attached to it here.
     settle: crate::settlement::SettlementSignal,
 ) -> Result<JdpHandles, JdpSpawnError> {
     if !cfg.sv2.jdp_enabled {
@@ -154,11 +139,10 @@ pub(crate) async fn spawn(
         fee_address,
     });
 
-    // SV2 JDP/Job Declarator Server: hand declared jobs to bitcoin-core for a
-    // real verdict when the operator points us at the node's IPC socket. Unset
-    // → trusted, as before. A configured-but-unusable socket stops boot: a
-    // pool that logs "validation on" while validating nothing is worse than
-    // one that refuses to start.
+    // SV2 JDP/Job Declarator Server: declared jobs go to bitcoin-core for a
+    // verdict when a validation socket is configured; unset means trusted.
+    // A configured but unusable socket stops boot rather than claiming
+    // validation that does not happen.
     let job_validator = match cfg.sv2.jdp_validation_socket_path.clone() {
         Some(socket_path) => crate::jdp_hooks::ProductionJobValidator::connect(
             socket_path,
@@ -217,8 +201,7 @@ pub(crate) async fn spawn(
     })
 }
 
-/// Used the same shape as the stratum accept-loop but without
-/// protocol-detect — JDP is single-protocol per its port.
+/// Like the stratum accept loop, without protocol detection.
 async fn jdp_accept_loop(
     listener: TcpListener,
     server: StratumV2JdpServer,

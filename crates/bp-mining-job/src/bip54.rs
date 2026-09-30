@@ -8,12 +8,11 @@
 //! bitcoin-core owns and enforces the rest (timewarp timestamp limits, the
 //! 2500-sigop per-transaction cap, transaction selection).
 //!
-//! The Rust pool sources its coinbase fields from Core's SV2 `NewTemplate`
-//! over IPC, so against a BIP-54-aware node (Core 31 emits `nLockTime =
-//! height - 1` and a non-final `nSequence` of `0xfffffffe`) the constructed
-//! coinbase is already compliant. This module codifies the rules so the
-//! property can be asserted in tests and re-checked on coinbase bytes the
-//! pool assembles itself.
+//! The pool sources its coinbase fields from Core's SV2 `NewTemplate` over
+//! IPC, so against a BIP-54-aware node (Core 31 emits `nLockTime =
+//! height - 1` and a non-final `nSequence` of `0xfffffffe`) the coinbase is
+//! already compliant. This module codifies the rules so tests can assert
+//! them on coinbase bytes the pool assembles itself.
 //!
 //! The three coinbase rules:
 //!  1. the witness-stripped serialized size must NOT be exactly 64 bytes,

@@ -3,12 +3,9 @@
 //! `InflightResultCache<K, V, E>` — per-key dedup of concurrent
 //! `compute()` callers + TTL-based result caching.
 //!
-//! In-flight-promise coalescing pattern. The use case: one NewTemplate fans out
-//! to N OpenMiningChannel responses, each of which calls
-//! `getPayoutDistribution(block_reward_sats)`. Without coalescing
-//! every concurrent caller would trigger a fresh Redis-window-read +
-//! PG-balance-read + math-build, hammering both backends for a
-//! result that's identical across all callers.
+//! One NewTemplate fans out to N channels that all ask for the same payout
+//! distribution; coalescing turns those N Redis + Postgres reads and
+//! builds into one, since the result is identical for every caller.
 //!
 //! Behavior:
 //!
@@ -46,10 +43,7 @@ enum Slot<V, E> {
 /// Every invalidation bumps `generation`. A leader records the
 /// generation it started under, so when it finishes it can tell whether
 /// an invalidation landed mid-compute — in which case its result is
-/// already superseded and must not be cached. Without this, an
-/// invalidation that arrives while a compute is in flight is silently
-/// lost: the leader would install its pre-invalidation value for the
-/// full TTL.
+/// already superseded and must not be cached for the full TTL.
 struct Inner<K, V, E> {
     slots: HashMap<K, Slot<V, E>>,
     generation: u64,
@@ -91,8 +85,8 @@ where
     }
 
     /// Look up `key`; if a fresh cached result exists return it; else
-    /// either run `compute` (we're the leader) or subscribe to the
-    /// in-flight broadcast (we're a follower).
+    /// either run `compute` as the leader or subscribe to the leader's
+    /// in-flight broadcast as a follower.
     ///
     /// On compute success the result is cached for `ttl`. On failure
     /// the slot is dropped immediately — no negative caching, the next
@@ -102,8 +96,8 @@ where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<V, E>>,
     {
-        // Critical section: probe the cache, install in-flight slot
-        // if we're the leader, otherwise grab a follower receiver.
+        // Critical section: probe the cache, install the in-flight slot
+        // as leader, or take a follower receiver.
         // `generation_at_start` is the invalidation epoch the leader
         // computes under (see `Inner`).
         let (receiver, generation_at_start) = {
@@ -115,7 +109,7 @@ where
                 }
                 Some(Slot::InFlight(tx)) => Some(tx.subscribe()),
                 _ => {
-                    // No entry OR expired entry — we're the leader.
+                    // No entry OR expired entry: this caller leads.
                     let (tx, _) = broadcast::channel::<SharedResult<V, E>>(1);
                     state.slots.insert(key.clone(), Slot::InFlight(tx));
                     None
@@ -125,25 +119,19 @@ where
         };
 
         if let Some(mut rx) = receiver {
-            // Wait for the leader to publish. `recv()` returns
-            // `RecvError::Closed` if the leader's sender was dropped
-            // without sending (shouldn't happen unless the leader
-            // panicked — surface as Lagged-equivalent via fresh compute
-            // on retry).
+            // Wait for the leader to publish.
             return match rx.recv().await {
                 Ok(result) => result,
                 Err(_) => {
-                    // Leader dropped the sender — only happens if the
-                    // leader's task panicked. Surface a default-constructed
-                    // E so the caller's error path runs. Consumers whose
-                    // error type can't reasonably default should retry by
-                    // calling `get_or_compute` again themselves.
+                    // The leader dropped the sender without sending, i.e. its
+                    // task panicked. A default-constructed E sends the caller
+                    // down its error path; the next call recomputes.
                     Err(Arc::new(E::default()))
                 }
             };
         }
 
-        // We're the leader.
+        // Leader path.
         let outcome = compute().await;
         let shared: SharedResult<V, E> = match outcome {
             Ok(v) => Ok(Arc::new(v)),
@@ -155,9 +143,8 @@ where
         let prev = {
             let mut state = self.state.lock().expect("inflight mutex poisoned");
             let prev = state.slots.remove(&key);
-            // Cache only if no invalidation landed while we computed —
-            // otherwise this value is already superseded and installing
-            // it would resurrect pre-invalidation state for a full TTL.
+            // Cache only if no invalidation landed during the compute;
+            // otherwise the value is already superseded.
             if let Ok(value) = &shared {
                 if state.generation == generation_at_start {
                     state.slots.insert(
@@ -172,10 +159,9 @@ where
             prev
         };
         if let Some(Slot::InFlight(tx)) = prev {
-            // Best-effort broadcast — if there are no followers it
-            // returns `Err(SendError)` which we ignore. Followers still
-            // get this result even when it wasn't cached: it is the
-            // value they queued for, and the next caller recomputes.
+            // Best-effort: with no followers `send` errs, which is fine.
+            // Followers get this result even when it was not cached: it is
+            // the value they queued for, and the next caller recomputes.
             let _ = tx.send(shared.clone());
         }
         shared
@@ -334,10 +320,9 @@ mod tests {
         );
     }
 
-    /// An invalidation that lands *while* a compute is in flight must
-    /// not be lost. The leader started from pre-invalidation state, so
-    /// caching its result would resurrect that state for a full TTL —
-    /// and every later caller would read it.
+    /// An invalidation that lands *while* a compute is in flight is not
+    /// lost: the leader's result, computed from pre-invalidation state, is
+    /// returned to its caller but not cached.
     #[tokio::test]
     async fn invalidate_during_inflight_is_not_resurrected() {
         let cache: Arc<InflightResultCache<u64, u64, FakeError>> =

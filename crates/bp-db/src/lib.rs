@@ -23,16 +23,15 @@
 //! **Anything beyond find_by_pk** (filtered, batched, time-windowed,
 //! with-soft-delete, RETURNING-id INSERT, conditional UPSERT, …) has
 //! multiple plausible signatures whose right shape only becomes clear at
-//! the consumer site. Those are added 2-at-a-time as call sites
-//! emerge (Design-Prinzip 9: extract abstractions on demand, never
-//! speculatively).
+//! the consumer site. Those are added when a call site needs them, never
+//! speculatively.
 //!
 //! # SQL verification status
 //!
 //! Write queries and point-read queries use the compile-time `sqlx::query!`
 //! / `sqlx::query_as!` macros backed by the `.sqlx` offline cache. A small
 //! number of aggregate read queries (e.g. `find_user_agents`,
-//! `find_found_blocks`) still use the runtime `query_as` form where the
+//! `find_found_blocks`) use the runtime `query_as` form where the
 //! projection is derived — those are type-checked at the `FromRow` boundary.
 
 mod address;

@@ -10,18 +10,12 @@
 //! against a real Redis instance.
 //!
 //! Gated on a local docker-Redis at `redis://127.0.0.1:16379` (override
-//! with `BP_REDIS_URL`). Tests skip cleanly via `eprintln!` + early
-//! return if the instance isn't reachable, so CI without a Redis
-//! container stays green.
+//! with `BP_REDIS_URL`). Tests skip via `eprintln!` + early return if the
+//! instance is not reachable.
 //!
-//! Each test runs against a *different* Redis logical DB (0..=15), so
-//! cargo's default parallel test runner doesn't interleave their state.
-//!
-//! Spin up the container with:
-//!
-//! ```sh
-//! docker run -d --name blitzpool-rust-redis -p 16379:6379 redis:7-alpine
-//! ```
+//! Each test runs against its own Redis logical DB inside this binary's
+//! range (`bp_test_support::redis_db`), so parallel tests do not
+//! interleave their state.
 
 use std::collections::HashMap;
 
@@ -37,9 +31,8 @@ const DEFAULT_URL: &str = "redis://127.0.0.1:16379";
 /// keyspace. Returns `None` (test should skip) if the URL is unreachable.
 async fn connect_or_skip(test_db: u8) -> Option<ConnectionManager> {
     let base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    // Fold this binary's local number into its own DB range — see
-    // `bp_test_support::redis_db`. Without it every binary's 0..15
-    // land on the same 16 databases and FLUSHDB each other mid-run.
+    // Map into this binary's own DB range (`bp_test_support::redis_db`) so
+    // binaries do not FLUSHDB each other's databases.
     let test_db =
         bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_WINDOW, test_db).await;
     let url = format!("{base}/{test_db}");
@@ -83,10 +76,9 @@ async fn connect_or_skip(test_db: u8) -> Option<ConnectionManager> {
 
 /// `max_age_days` for tests that are not about ageing.
 ///
-/// Explicitly a very long window rather than `0`. The constructor floors the
-/// value at one day, so a literal `0` reads as "rule off" and quietly means
-/// "24 hours" — which these tests survive only because [`ts`] stamps their
-/// shares near now. Writing the intent out removes the trap.
+/// Explicitly a very long window rather than `0`: the constructor floors the
+/// value at one day, so a literal `0` would look like "rule off" but mean
+/// "24 hours".
 const AGE_RULE_OFF: u32 = 3650;
 
 /// Build a `WindowStore` with a given bucket size. `bucket_shares = 1` makes
@@ -109,11 +101,9 @@ fn make_store(
 
 /// Share timestamp for tests that are NOT about ageing, anchored near now.
 ///
-/// These used to pass a hardcoded `ts(0)` (Nov 2023) as a value
-/// `record_share` ignored. It does not ignore it any more — it is the bucket's
-/// index score — so the constant would now mean "every bucket is three years
-/// old" and the age rule would empty the window out from under tests that are
-/// about weight trimming. The offset keeps their relative order.
+/// The timestamp is the bucket's index score, so a fixed old value would let
+/// the age rule empty the window under tests that are about weight trimming.
+/// The offset keeps their relative order.
 fn ts(offset: u64) -> u64 {
     (bp_common::now_ms() as u64) - 1_000_000 + offset
 }
@@ -260,20 +250,11 @@ async fn trim_window_drops_oldest_over_window_size() {
 
 // ── The snapshot write is all-or-nothing ────────────────────────────
 //
-// It used to be three round trips — `DEL`, `HSET`, `EXPIRE` — and between the
-// first two the snapshot DID NOT EXIST. That window is the one case
-// `read_weight_snapshot_with_retry` deliberately does not retry: it takes
-// `Ok(None)` at face value because "a genuinely missing snapshot will not
-// appear", which is true of an expired key and false of this one. Both sides
-// run on the front — the template build writes, the Stratum block-found path
-// reads — so a block found in that window is parked with no settlement
-// inputs. A single script closes it.
-//
-// The race itself cannot be pinned in a test that is not flaky; atomicity is
-// structural (one `Script` invocation). What IS deterministic is the reason
-// the `DEL` has to stay inside it, and that is what this asserts: a rewrite
-// with FEWER entries must not leave the longer one's fields behind, or the
-// parser reads a truncated entry list as a longer one.
+// `DEL`, `HSET` and `EXPIRE` run as one script: `read_weight_snapshot_with_retry`
+// takes `Ok(None)` at face value, so a reader must never see the key between
+// `DEL` and `HSET`. Atomicity itself is structural and not testable without
+// flakiness; this pins why the `DEL` must be inside: a rewrite with FEWER
+// entries must not leave the longer one's fields behind.
 
 #[tokio::test]
 async fn rewriting_a_snapshot_with_fewer_entries_leaves_no_stale_fields() {
@@ -348,17 +329,11 @@ async fn rewriting_a_snapshot_with_fewer_entries_leaves_no_stale_fields() {
 //
 // MONEY. The aggregate is a sum of non-negative difficulties, so a trim can
 // only decrement past zero if a bucket holds more for an address than the
-// aggregate ever received. The `DUMP`-per-key Redis backup produces exactly
-// that: it captures `window:by-address` and the `bucket:*` hashes at
-// DIFFERENT instants, so a restore can hand the trim a bucket that is ahead
-// of the aggregate.
-//
-// The old trim only `HDEL`ed a field within 1e-9 of zero, so a materially
-// negative one was left sitting there — and `read_window_by_address` filters
-// `diff > 0`, which drops that address out of the window ENTIRELY. Silently
-// unpaid until it earns its way back in. The field is removed either way now
-// (a negative is unpayable), but the trim counts the underflows so the
-// operator hears about the skew instead of it passing as a clean trim.
+// aggregate ever received, which a per-key backup restore can produce (it
+// captures `window:by-address` and the `bucket:*` hashes at different
+// instants). The field is removed either way (a negative is unpayable and
+// `read_window_by_address` filters `diff > 0`), and the trim counts the
+// underflows so the skew is visible.
 
 #[tokio::test]
 async fn a_bucket_ahead_of_the_aggregate_does_not_strand_a_negative_entry() {
@@ -505,8 +480,8 @@ async fn bootstrap_rebuilds_empty_hash_from_buckets() {
     };
     let (store, _) = make_store(conn.clone(), 1_000_000.0, 10_000);
 
-    // Seed buckets directly (no by-address hash), as if cold-started after a
-    // deploy that bucketed the window but lost the aggregate hash.
+    // Seed buckets directly with no by-address hash: buckets survived, the
+    // aggregate key was lost.
     let mut seed = conn.clone();
     let _: f64 = seed.hincr(bucket_key("0"), "bc1qa", 10.0).await.unwrap();
     let _: f64 = seed.hincr(bucket_key("0"), "bc1qb", 20.0).await.unwrap();
@@ -542,7 +517,7 @@ async fn bootstrap_is_noop_when_hash_populated() {
     // Buckets say one thing...
     let _: f64 = seed.hincr(bucket_key("0"), "bc1qa", 10.0).await.unwrap();
     let _: () = seed.zadd(KEY_BUCKETS, "0", 0u64).await.unwrap();
-    // ...but the live hash (maintained by the prior pool) says another.
+    // ...but the live hash says another.
     let _: () = seed
         .hset(KEY_WINDOW_BY_ADDRESS, "bc1qz", "42.0")
         .await
@@ -742,10 +717,9 @@ async fn bucketed_window_matches_exact_per_share_window() {
 //
 // The bucket id is `floor(pplns:counter / bucket_shares)` over a counter
 // nothing resets, so the divisor decides where new work lands relative to
-// the buckets already in the FIFO index. These two pin both directions, so
-// the doc on `WindowStore::bucket_shares` is an executable claim and not a
-// comment: raising it strands new shares BELOW the live set (where the trim
-// eats them), lowering it does not.
+// the buckets already in the FIFO index. These two pin both directions of a
+// change: in either case new work must sort after the live set and the trim
+// must take the oldest bucket.
 
 /// Fill a window until the trim is active and several buckets are live,
 /// then return the live bucket ids.
@@ -769,16 +743,9 @@ async fn fill_until_trimming(
     ids
 }
 
-/// Raising `bucket_shares` used to strand new work: ids are `floor(counter /
-/// bucket_shares)`, so a bigger divisor puts the next share BELOW every live
-/// id, and while the index was scored by id that made it the FIFO head — the
-/// next thing the trim took, ahead of buckets months older. This test used to
-/// assert exactly that, as documented behaviour.
-///
-/// Scoring the index by wall-clock removes the defect rather than guarding
-/// against it: new work is always the most recent, so it always sorts last,
-/// whatever its id. The id arithmetic below is unchanged — only its
-/// consequence is gone.
+/// Raising `bucket_shares` puts the next share's id BELOW every live id
+/// (`floor(counter / bucket_shares)`), but the index is scored by wall-clock,
+/// so new work still sorts last and the trim takes the oldest bucket first.
 #[tokio::test]
 async fn raising_bucket_shares_no_longer_strands_new_work() {
     let mut conn = match connect_or_skip(6).await {
@@ -903,13 +870,12 @@ async fn lowering_bucket_shares_keeps_new_work_above_the_live_window() {
 // ── Age rule ────────────────────────────────────────────────────────
 //
 // The size rule (`total > window_factor × difficulty`) cannot fire on a pool
-// whose window sits far below its cap — measured on prod at 0.15 % of it — so
-// a miner that stops mining keeps its weight indefinitely. These cover the age
-// rule that fixes it, the control that it does not fire early, and the score
-// conversion that starts the clock on a pre-existing window.
+// whose window sits far below its cap, so without an age rule a miner that
+// stops mining keeps its weight indefinitely. These cover the age rule, the
+// control that it does not fire early, and the legacy score conversion.
 
 /// `net_diff` high enough that `4 × net_diff` is unreachable, so only the age
-/// rule can drop anything — the prod situation, in miniature.
+/// rule can drop anything.
 const UNREACHABLE_SIZE_DIFF: f64 = 1e12;
 const DAY_MS: u64 = 86_400_000;
 
@@ -935,8 +901,7 @@ async fn an_old_bucket_is_dropped_by_age_even_far_below_the_size_cap() {
     let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 1, 90);
 
     // One share per bucket. A's carries a 100-day-old accept time, which is
-    // what the index scores it with — no test backdoor needed, this is the
-    // ordinary path.
+    // what the index scores it with on the ordinary path.
     store
         .record_share(None, "addr_a", 100.0, ms_ago(100))
         .await
@@ -1089,9 +1054,8 @@ async fn restamping_legacy_scores_keeps_the_window_and_its_order() {
         "FIFO order must survive — lexicographic order would put 10 before 2"
     );
 
-    // Now actually run the rule against the converted index. Asserting the
-    // zset alone proved nothing about the trim; this is the claim that
-    // matters — freshly stamped buckets are young and must all survive.
+    // Run the rule against the converted index: freshly stamped buckets are
+    // young and must all survive a trim.
     store
         .record_share(None, "addr_trigger", 10.0, ms_ago(0))
         .await
@@ -1109,15 +1073,9 @@ async fn restamping_legacy_scores_keeps_the_window_and_its_order() {
 
 /// An entry that can never be dropped must not block the ones behind it.
 ///
-/// This is the half the previous version of this test missed. It asserted the
-/// inert entry survived — which it does either way — and stopped there, so it
-/// passed just as happily when that entry wedged the whole rule. An entry
-/// below the score floor carries the lowest possible score, so it sits at rank
-/// 0 forever; while the age rule inspected only the head it answered "not too
-/// old", returned {0,0} on every append, and nothing behind it could ever age
-/// out. Selecting by score range steps over it instead.
-///
-/// Fails against head-only inspection: the 100-day-old bucket survives.
+/// An entry below the score floor has the lowest possible score and sits at
+/// rank 0 forever. The age rule selects by score range, so it steps over that
+/// entry; inspecting only the head would let the 100-day-old bucket survive.
 #[tokio::test]
 async fn an_inert_entry_does_not_block_the_buckets_behind_it() {
     let Some(mut conn) = connect_or_skip(20).await else {
@@ -1125,15 +1083,13 @@ async fn an_inert_entry_does_not_block_the_buckets_behind_it() {
     };
     let (store, _nd) = make_aged_store(conn.clone(), /*bucket_shares=*/ 1, 90);
 
-    // The inert entry goes in FIRST. Order matters, and getting it wrong is
-    // how the first draft of this test came to pass against the very code it
-    // was written to reject: every `record_share` runs a trim, so an aged
-    // bucket created beforehand is already gone by the time the entry that is
-    // supposed to shield it arrives.
+    // The inert entry goes in FIRST: every `record_share` runs a trim, so an
+    // aged bucket created beforehand would already be gone and the test
+    // would prove nothing.
     //
-    // An id-scored entry appears AFTER startup, so no conversion pass follows
-    // it — a `RESTORE` into a live pool, or an old binary still draining. Its
-    // score is the lowest possible, so it is the head from here on.
+    // An id-scored entry can appear after startup, when no conversion pass
+    // follows (e.g. a `RESTORE` into a live pool). Its score is the lowest
+    // possible, so it is the head from here on.
     let _: () = conn.zadd(KEY_BUCKETS, "9999", 1.0).await.unwrap();
 
     // Opened 100 days ago. While it is the only bucket it is also the active
@@ -1180,15 +1136,10 @@ async fn an_inert_entry_does_not_block_the_buckets_behind_it() {
 /// the trim remove it while shares are still going into it.
 ///
 /// The active bucket is identified from the counter, not by "spare the last
-/// entry" — and the fixture is built so only the counter gives the right
-/// answer. The active bucket is opened by a REPLAYED share whose accept time
+/// entry", and the fixture is built so only the counter gives the right
+/// answer: the active bucket is opened by a REPLAYED share whose accept time
 /// is older than the completed bucket before it, so it sorts FIRST. A rule
-/// that spares the last entry spares the wrong bucket here and drops the one
-/// still filling. An earlier version of this test put the active bucket last,
-/// where both rules agree, and so proved nothing about which one was in force.
-///
-/// Fails against the "stop at the last bucket" guard: `addr_b` is gone and
-/// `addr_a` survives.
+/// that spared the last entry would drop `addr_b` and keep `addr_a`.
 #[tokio::test]
 async fn the_currently_filling_bucket_is_never_dropped() {
     let Some(mut conn) = connect_or_skip(21).await else {

@@ -30,7 +30,7 @@ pub struct AdminToken(String);
 #[derive(Debug, Clone)]
 pub struct InvitationToken(String);
 
-/// Hex-encoded SHA-256 of a token. What we store in PG.
+/// Hex-encoded SHA-256 of a token. What gets stored in PG.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenHash(String);
 

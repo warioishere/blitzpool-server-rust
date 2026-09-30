@@ -10,26 +10,12 @@
 //!
 //! **Standard**, **Extended** and **job-declaration** channels alike.
 //!
-//! A second, JDC-specific controller used to live here: a share-COUNT
-//! algorithm on a fixed interval, selected by an `is_jdc` channel flag.
-//! It was removed because its premise does not hold. The reasoning was
-//! that a job-declaration client pre-filters shares against its own
-//! target, so the pool loses sight of the share distribution and cannot
-//! estimate a rate. What the client actually filters against is the
-//! target the POOL assigned it, forwarding only shares that meet it — so
-//! what reaches us is exactly what a direct miner sends: shares at the
-//! difficulty we set. The classic estimator only ever needed that
-//! aggregate arrival rate; the per-miner distribution behind the client
-//! was never an input. A JDC also runs no vardiff of its own on the
-//! pool-facing channel — it only applies our `SetTarget` — so the pool
-//! retargeting it is not optional.
-//!
-//! The count-based controller was also strictly weaker: one estimate per
-//! CONNECTION rather than per channel (which SV2 difficulty is), counting
-//! shares instead of summing their difficulty (wrong across a retarget,
-//! where a channel's shares span two difficulties), and holding its last
-//! output below two shares per interval. The `is_jdc` flag that selected
-//! it was never set outside tests, so it never ran in production.
+//! A job-declaration client needs no separate controller: it forwards only
+//! shares meeting the target the POOL assigned it, so the pool sees exactly
+//! what a direct miner sends, and the estimator only needs that aggregate
+//! arrival rate. A JDC runs no vardiff of its own on the pool-facing
+//! channel (it only applies the pool's `SetTarget`), so the pool must
+//! retarget it.
 
 pub use bp_vardiff::{
     Clock, SystemClock, TestClock, VarDiffEngine, VARDIFF_CACHE_SIZE, VARDIFF_CACHE_WINDOW_MS,

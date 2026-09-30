@@ -3,21 +3,14 @@
 //! Chain-observed reconciliation: did every block the pool actually mined
 //! reach the ledger?
 //!
-//! Every other block-found path starts from something the pool was *told* —
-//! a share it accepted, a solution a JD-client pushed. Each of those can be
-//! missed (a snapshot that expired, a Redis blip, an event dropped on a
-//! deploy) or, on the JDP path, asserted by a peer that never did the work.
-//! This one starts from the chain instead: the pool runs bitcoin-core and can
-//! read the coinbase of every block that actually landed. A block whose
-//! coinbase pays the pool is the pool's, whatever the pool's own bookkeeping
-//! thinks — and if there is no record of it, that is a payout somebody is owed
-//! and nobody booked.
+//! The booking paths start from something the pool was *told* (an accepted
+//! share, a pushed JDP solution), and each can be missed. This check starts
+//! from the chain: a block whose coinbase pays the pool is the pool's, and
+//! without a ledger record it is a payout somebody is owed.
 //!
-//! **Reports, never books.** It is a check on the booking paths, so it must
-//! not become one: the booking needs the distribution behind a coinbase, which
-//! the chain does not carry. What it produces is the operator's list of blocks
-//! to reprocess — and, when it stays empty, evidence that the paths it watches
-//! are working.
+//! **Reports, never books.** Booking needs the distribution behind a
+//! coinbase, which the chain does not carry. The output is the operator's
+//! list of blocks to reprocess.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -106,9 +99,8 @@ impl PoolMarkers {
 
 /// Does an address's payout mode keep a ledger the pool has to book into?
 ///
-/// Solo does not — it pays in the coinbase and records nothing, so a Solo
-/// block with no payout row is normal, not a miss. Without this distinction
-/// the check would flag every Solo block and be ignored within a week.
+/// Solo does not: it pays in the coinbase and records nothing, so a Solo
+/// block with no payout row is normal, not a miss.
 pub(crate) trait ModeLedger: Send + Sync {
     fn keeps_a_ledger(&self, miner_address: &str) -> bool;
 }
@@ -143,17 +135,11 @@ pub(crate) fn pool_outputs_of_coinbase(
 /// Value-bearing coinbase outputs paying somebody who is neither the pool
 /// nor the miner the block was registered under.
 ///
-/// This is what makes a missing booking visible on a mode that keeps no
-/// ledger. The Solo exemption below asks the miner's ADDRESS whether a
-/// ledger row was due — and the address is exactly the wrong witness: a
-/// job-declaring client whose address is Solo-gated can mine a coinbase
-/// that pays a SHARED distribution (it references the pool-wide payout
-/// list), and then those miners are owed a ledger entry while the finder's
-/// mode says none was due. The coinbase is the honest witness, and this
-/// check is the only place that holds it.
-///
-/// A genuine Solo coinbase pays the miner plus, at most, a fee marker — so
-/// this comes out empty and the exemption still stands.
+/// The Solo exemption reads the miner's address mode, but a job-declaring
+/// client with a Solo-gated address can mine a coinbase that pays a shared
+/// distribution, and those miners are owed a ledger entry. The coinbase
+/// says who was actually paid. A genuine Solo coinbase pays the miner plus
+/// at most a fee marker, so this comes out empty and the exemption stands.
 pub(crate) fn third_party_outputs_of_coinbase(
     coinbase: &bp_bitcoin::DecodedTransaction,
     markers: &PoolMarkers,
@@ -366,19 +352,10 @@ async fn inspect_block(
             gap: Gap::NeverRegistered,
         }));
     };
-    // Registered. Whether a missing payout row is a fault depends on the
-    // mode: Solo pays in the coinbase and keeps no ledger, so it has none by
-    // design. Only a mode that books can be missing a booking.
-    //
-    // But the mode is read off the miner's ADDRESS, and that is not the same
-    // question as "was anybody owed a ledger entry for this block". A
-    // job-declaring client can reference a SHARED payout distribution while
-    // its own address is Solo-gated; its coinbase then pays those miners and
-    // the exemption would wave the block through. So the exemption needs
-    // BOTH: the mode keeps no ledger AND the coinbase paid nobody but the
-    // finder and the pool. Either one alone is a blind spot — and this is
-    // the widening direction, so no block that was checked before stops
-    // being checked (a one-miner PPLNS block still is, on the mode).
+    // Solo keeps no ledger, so a missing payout row is expected there. The
+    // exemption needs BOTH: the miner's mode keeps no ledger AND the coinbase
+    // paid nobody but the finder and the pool (see
+    // `third_party_outputs_of_coinbase`).
     let third_parties = third_party_outputs_of_coinbase(&coinbase, markers, &miner);
     if !modes.keeps_a_ledger(&miner) && third_parties.is_empty() {
         return Ok(None);
@@ -423,15 +400,9 @@ mod tests {
         }
     }
 
-    /// MONEY: the Solo exemption asks the miner's ADDRESS whether a ledger
-    /// row was due, and that is the wrong witness.
-    ///
-    /// A job-declaring client whose address is Solo-gated can reference the
-    /// pool-wide payout distribution and mine a coinbase that pays THOSE
-    /// miners. They are owed a ledger entry; the finder's mode says none was
-    /// due, so the exemption waved the block through and this check — the one
-    /// component that holds the coinbase — stayed silent. The coinbase is the
-    /// honest witness: it names who was actually paid.
+    /// MONEY: a Solo-gated finder whose coinbase pays a shared distribution
+    /// is not exempt; the coinbase, not the finder's mode, names who is owed
+    /// a ledger entry. A genuine Solo coinbase stays exempt.
     #[test]
     fn a_coinbase_paying_third_parties_is_not_a_solo_payout() {
         const MINER: &str = "bc1qsolominer";
@@ -446,8 +417,8 @@ mod tests {
             "a real Solo coinbase must stay exempt or every Solo block false-alarms"
         );
 
-        // The Befund-2 shape: the same Solo-gated finder, but the coinbase
-        // pays a shared distribution's miners.
+        // The same Solo-gated finder, but the coinbase pays a shared
+        // distribution's miners.
         let shared = coinbase(vec![
             out(Some("bc1qpoolfee"), 0.046875),
             out(Some("bc1qpplnsminer1"), 2.0),
@@ -480,11 +451,7 @@ mod tests {
         assert!(third_party_outputs_of_coinbase(&cb, &markers(), MINER).is_empty());
     }
 
-    /// A zero-fee deployment has no marker output, so the check cannot
-    /// recognise its blocks. Refusing to construct is what makes that visible
-    /// instead of a task that quietly reports nothing forever.
-    /// A height that could not be read must be walked again, not skipped for
-    /// good — the whole point of the check is that nothing goes unlooked-at.
+    /// A height that could not be read is walked again, not skipped for good.
     #[test]
     fn a_height_that_errored_is_not_marked_checked() {
         assert_eq!(
@@ -511,14 +478,14 @@ mod tests {
         assert_eq!(scan_start(Some(50), 120, DEFAULT_LOOKBACK), 51);
         // First pass after a restart: the lookback window.
         assert_eq!(scan_start(None, 500, DEFAULT_LOOKBACK), 356);
-        // A chain shorter than the window starts at height 1 rather than
-        // underflowing, and not at genesis: its coinbase can never have paid
-        // the pool, and bitcoin-core refuses to return it, so reading it only
-        // produced a "could not check block" warning on every fresh start.
+        // A chain shorter than the window starts at height 1: no underflow,
+        // and never genesis, whose coinbase bitcoin-core does not return.
         assert_eq!(scan_start(Some(3), 3, DEFAULT_LOOKBACK), 1);
         assert_eq!(scan_start(None, 10, DEFAULT_LOOKBACK), 1);
     }
 
+    /// A zero-fee deployment has no marker output, so the check refuses to
+    /// construct rather than run and silently find nothing.
     #[test]
     fn pool_markers_refuses_an_empty_configuration() {
         assert!(PoolMarkers::new(Vec::<String>::new()).is_none());

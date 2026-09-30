@@ -2,14 +2,11 @@
 
 //! `PplnsEngineConfig` — typed knobs for the PPLNS service-engine.
 //!
-//! Mirrors the `[pplns]` TOML section in
-//! `blitzpool.env`, plus a few engine-internal tunables (trim batch size,
-//! snapshot TTL). Construction is fallible via [`PplnsEngineConfig::try_new`]
-//! so the caller sees field-level errors before the engine spins up.
-//!
-//! Only knobs the *engine itself* needs at construction live here. Things
-//! like the listener port and vardiff start-difficulty are
-//! bp-stratum-v1/v2's concern and not duplicated here.
+//! Mirrors the `[pplns]` TOML section plus a few engine-internal tunables
+//! (trim batch size, snapshot TTL). Construction is fallible via
+//! [`PplnsEngineConfig::try_new`] so field-level errors surface before the
+//! engine spins up. Listener port and vardiff settings belong to
+//! bp-stratum-v1/v2 and are not duplicated here.
 
 use bp_common::{AddressId, Sats};
 use bp_pplns::{
@@ -21,22 +18,19 @@ use bp_pplns::{
 ///
 /// All fields validated by [`PplnsEngineConfig::try_new`]. [`Default`] is a
 /// field-filler for the `..Default::default()` spread, NOT a usable config:
-/// it leaves `fee_address` unset, which `try_new` refuses. There is no
-/// sensible default for the address a pool's fee is paid to, and defaulting
-/// it to "none" is exactly the shape that pays every block to one miner.
+/// it leaves `fee_address` unset, which `try_new` refuses. The fee address
+/// has no sensible default, and "none" would pay every block to one miner.
 #[derive(Debug, Clone)]
 pub struct PplnsEngineConfig {
     /// Coinbase output that receives the pool fee — and, under the weight
     /// model, the §4 residual `pay_P`. **Required**, and
     /// [`Self::try_new`] refuses without it.
     ///
-    /// It used to be documented as optional ("fee suppressed"). It never
-    /// was: `build_weight_distribution` cannot produce a distribution
-    /// without a pool output, so a pool that started without one served
-    /// every PPLNS job a solo coinbase paying the whole block to one
-    /// miner. The `Option` survives only because the type is threaded
-    /// through the reader's public `/api/pplns/fees` shape; construction
-    /// guarantees it is `Some`.
+    /// `build_weight_distribution` cannot produce a distribution without a
+    /// pool output; without one every PPLNS job would be a solo coinbase
+    /// paying the whole block to one miner. The `Option` exists only for the
+    /// reader's public `/api/pplns/fees` shape; construction guarantees
+    /// `Some`.
     pub fee_address: Option<AddressId>,
 
     /// Pool fee % as f64 (e.g. `1.5` for 1.5%). Must be `[0.0, 100.0]`.
@@ -62,30 +56,21 @@ pub struct PplnsEngineConfig {
 
     /// Snapshot TTL in seconds.
     ///
-    /// Snapshots are keyed by the payout list they distribute, so one is
-    /// written per distinct distribution — roughly (connections × template
-    /// rate) — and only the applied block's own key is deleted. The TTL is
-    /// therefore what bounds the keyspace. Nothing else does: the 10-minute
-    /// `pplns:*` Redis→Postgres backup deliberately SKIPS per-job snapshot
-    /// keys (`redis_backup::is_per_job_snapshot`), so once one expires its
-    /// settlement inputs are gone from every store.
+    /// One snapshot is written per distinct distribution and only the
+    /// applied block's own key is deleted, so the TTL is what bounds the
+    /// keyspace. The Redis->Postgres backup skips per-job snapshot keys
+    /// (`redis_backup::is_per_job_snapshot`), so an expired snapshot is gone
+    /// from every store.
     ///
-    /// A snapshot is only useful while a job built from it can still be
-    /// mined, and a job is GC-eligible once `bp_jobs_lifecycle`'s
-    /// `retention_ms` (10 min) has passed since it retired. The default of
-    /// 1200 s is twice that — comfortably past any job's life, without
-    /// hoarding an hour's worth of dead distributions the way the previous
-    /// 3600 did. That value made sense when a single shared key was
-    /// overwritten in place; per-job keys it merely multiplies.
+    /// A snapshot is only useful while a job built from it can be mined; a
+    /// job is GC-eligible 10 min (`bp_jobs_lifecycle`'s `retention_ms`)
+    /// after it retired. The default of 1200 s is twice that.
     ///
-    /// This is deliberately NOT sized against the confirmation window, and
-    /// a found block must not depend on it being: at depth 3 the gated
-    /// apply lands ~20 min after the block, against a TTL whose clock
-    /// started when the winning job was built. That race is lost about half
-    /// the time. The Core therefore resolves a found block's snapshot at
-    /// the block-found instant and carries it in the parked blob — see
-    /// `PplnsEngine::weight_snapshot_for_block_found`. Raising this value
-    /// would only make the old race less visible, not correct.
+    /// ⚠️ Deliberately NOT sized against the confirmation window: the gated
+    /// apply can land after the TTL expires. A found block's snapshot is
+    /// resolved at the block-found instant and carried in the parked blob
+    /// (`PplnsEngine::weight_snapshot_for_block_found`), so settlement never
+    /// depends on this value.
     pub snapshot_ttl_secs: u32,
 
     /// Shares per count-bucket for the window (default 10000). Higher = less
@@ -125,9 +110,9 @@ pub struct PplnsEngineConfig {
     /// on — the input to the settlement gate's floor
     /// (`bp_share::block_subsidy_sats`). NOT an operator knob: it is
     /// derived from the configured network at boot, because regtest
-    /// halves every 150 blocks and the mainnet 210 000 would make
-    /// every regtest block past height 150 look like it had burned
-    /// part of its own subsidy.
+    /// halves every 150 blocks and the mainnet 210 000 would make every
+    /// regtest block past height 150 look like it burned part of its
+    /// subsidy.
     pub subsidy_halving_interval: u32,
 }
 
@@ -232,9 +217,8 @@ mod tests {
         }
     }
 
-    /// The pool output is structural under §4, so there is no such thing
-    /// as a usable config without one — and a pool that boots without it
-    /// pays 100 % of every block to whichever miner connected.
+    /// The pool output is structural under §4; without a fee address every
+    /// block would pay 100 % to one miner.
     #[test]
     fn the_default_config_is_refused_because_it_has_no_fee_address() {
         assert_eq!(
@@ -406,11 +390,7 @@ mod tests {
         ));
     }
 
-    /// A non-zero fee still validates. (The `fee_suppressed()` helper this
-    /// used to also assert on is gone: it answered "is there a fee output?"
-    /// with `fee_address.is_none() || fee_percent <= 0.0`, and §4 makes the
-    /// pool output structural at every fee. Nothing in production read it —
-    /// the same dead assumption that put `max_coinbase_outputs` one over.)
+    /// A non-zero fee validates.
     #[test]
     fn a_non_zero_fee_validates() {
         PplnsEngineConfig {

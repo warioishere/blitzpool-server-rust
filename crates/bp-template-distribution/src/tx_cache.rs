@@ -37,9 +37,7 @@
 //! before returning, so the broadcast receiver is registered before
 //! the cache returns control to the caller. Without this, a
 //! `tokio::spawn` of the loop could miss the first `NewTemplate` that
-//! the TDP worker emits between handle-attach and task-poll. Mirrors
-//! the same race fixed for SV1/SV2 regtests
-//! (`memory/feedback-tdp-initial-template-drain.md`).
+//! the TDP worker emits between handle-attach and task-poll.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

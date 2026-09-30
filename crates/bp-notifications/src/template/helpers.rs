@@ -38,8 +38,8 @@ pub(crate) fn escape_html(s: &str) -> String {
 }
 
 /// Attribute-safe escape — `&` and `"` only. Used inside
-/// `href="…"` where `<` `>` `'` are valid in URL contexts and we want
-/// to keep the output compact.
+/// `href="…"`, where `<` `>` `'` are valid in URL contexts; escaping
+/// only the two keeps the output compact.
 pub(crate) fn escape_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -120,8 +120,8 @@ This is a transactional email from Blitz Pool. If you did not expect this messag
 }
 
 /// Inline-styled button anchor. `primary=true` uses the indigo fill,
-/// `primary=false` is a transparent outline button (currently unused
-/// by any template but kept for completeness).
+/// `primary=false` is a transparent outline button (no template uses
+/// it).
 pub(crate) fn button_html(href: &str, label: &str, primary: bool) -> String {
     if primary {
         format!(
@@ -142,10 +142,9 @@ pub(crate) fn button_html(href: &str, label: &str, primary: bool) -> String {
     }
 }
 
-/// `Date.prototype.toUTCString()` equivalent — RFC 7231 `IMF-fixdate`,
-/// e.g. `"Sat, 16 May 2026 12:34:56 GMT"`. Two-digit zero-padded day
-/// matches V8 / JavaScriptCore behaviour. Used for `expires_at`
-/// rendering inside the templates.
+/// RFC 7231 `IMF-fixdate` with a two-digit zero-padded day, e.g.
+/// `"Sat, 16 May 2026 12:34:56 GMT"`. Used for `expires_at` rendering
+/// inside the templates.
 pub(crate) fn format_utc_string(ts: &DateTime<Utc>) -> String {
     ts.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }

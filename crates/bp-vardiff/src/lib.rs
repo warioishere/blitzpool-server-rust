@@ -3,102 +3,63 @@
 //! Per-session VarDiff engine + ckpool-style race-window clamp.
 //!
 //! Pure-math crate; its only dependency is `bp-common`, for
-//! [`HASHES_PER_DIFFICULTY_1`]. Shared between `bp-stratum-v1` (which
-//! sends the result as `mining.set_difficulty` JSON) and `bp-stratum-v2`
-//! (which sends the result as a binary `SetTarget` frame on Standard /
-//! Extended channels). The vardiff math is wire-format-agnostic — only
-//! the framing layer differs.
-//!
-//! Originally lived in `bp-stratum-v1::vardiff`; extracted to its own
-//! crate 2026-05-16 when bp-stratum-v2 was about to grow its own copy.
-//!
-//! Implements the per-session VarDiff algorithm (shares-per-minute
-//! retarget) and the `effectiveJobDifficulty` helper used for the
-//! ckpool-style race-window clamp. This is the pool's only retarget
-//! algorithm — SV1, SV2 Standard, SV2 Extended and job-declaration
+//! [`HASHES_PER_DIFFICULTY_1`]. Shared by `bp-stratum-v1`
+//! (`mining.set_difficulty`) and `bp-stratum-v2` (`SetTarget`): the math is
+//! wire-format-agnostic, only the framing differs. It is the pool's only
+//! retarget algorithm; SV1, SV2 Standard, SV2 Extended and job-declaration
 //! channels all run it.
 //!
-//! Two pieces:
-//!
-//! - [`VarDiffEngine`] tracks per-session live hashrate (10-minute slots,
-//!   `(prev + current) * 2^32 / elapsed_seconds`) AND the sliding 5-min /
-//!   30-sample submission cache used to retarget the session difficulty.
-//!   `update_hash_rate` is called for every accepted share;
+//! - [`VarDiffEngine`] tracks per-session live hashrate (10-minute slots)
+//!   and the sliding 5-min / 30-sample submission cache that drives the
+//!   retarget. `update_hash_rate` runs for every accepted share;
 //!   `suggested_difficulty` is polled on a timer (default every 60 s).
-//!
-//! - [`effective_job_difficulty`] is the share-validation race-clamp:
-//!   when a vardiff ratchet flips the session difficulty up, in-flight
-//!   shares for jobs already issued at the OLD diff would otherwise be
-//!   rejected as "Difficulty too low" even though the miner was working
-//!   on exactly the target we'd given them. The clamp validates and
-//!   credits those shares at `min(current, old)` so the miner gets paid
-//!   for the work they actually did.
+//! - [`effective_job_difficulty`] is the race-window clamp: shares for jobs
+//!   issued before a difficulty raise are validated and credited at
+//!   `min(current, old)`, because the miner did exactly the work it was
+//!   asked for.
 //!
 //! ## Silence easing (opt-in)
 //!
-//! The retarget math is a feedback loop whose only sensor is the arriving
-//! share stream — and every rate estimate here historically ended its
-//! observation window at the LAST share's timestamp. A session that went
-//! quiet therefore kept being evaluated against a frozen window: the
-//! controller went blind exactly when it most needed to act, and the
-//! difficulty stayed pinned where the miner could no longer reach it.
+//! The only sensor of the feedback loop is the share stream. Without easing,
+//! every estimate ends its window at the last share, so a session that goes
+//! quiet is judged against a frozen window and its difficulty stays where
+//! the miner can no longer reach it.
 //!
-//! With [`VarDiffEngine::with_silence_easing`] enabled, the estimators end
-//! their window at *now* instead: elapsed time without submissions is real
-//! observation time with zero arrivals, so silence itself lowers the
-//! estimate and the ordinary retarget mechanism walks the difficulty down
-//! — no second estimator, no timers, no special-case state. The estimate
-//! decays as 1/T (one halving per doubling of the silence), which is
-//! exactly the information-theoretic envelope a silent session justifies.
+//! With [`VarDiffEngine::with_silence_easing`], the estimators end their
+//! window at *now*: silence is observation time with zero arrivals, so the
+//! estimate decays as 1/T and the ordinary retarget walks the difficulty
+//! down. Three rules bound it:
 //!
-//! Three rules bound it:
-//!
-//! - **Rejected submissions count as alive.** A miner in a reject storm
-//!   (duplicate/stale bursts from an exhausted Standard-channel search
-//!   space) is hashing at full rate against a stale job; lowering its
-//!   difficulty would not help and floods on the next job. Servers stamp
-//!   [`VarDiffEngine::note_submission`] for every rejected share, and the
-//!   silence tail only counts time after the last submission of ANY kind.
-//! - **Bounded descent** ([`VARDIFF_SILENCE_MAX_DESCENT_FACTOR`]): the
-//!   silence argument can pull the estimate at most 16× below the rate
-//!   measured before the silence began.
+//! - **Rejected submissions count as alive.** A miner in a reject storm is
+//!   hashing at full rate against a stale job; lowering its difficulty would
+//!   flood on the next job. Servers call [`VarDiffEngine::note_submission`]
+//!   for every rejected share, and the silence tail starts after the last
+//!   submission of any kind.
+//! - **Bounded descent** ([`VARDIFF_SILENCE_MAX_DESCENT_FACTOR`]): at most
+//!   16× below the rate measured before the silence began.
 //! - **Bounded up-step** ([`VARDIFF_MAX_UP_STEP_FACTOR`]): no single
-//!   retarget raises the difficulty more than 8×, so recovery from an
-//!   eased-down state cannot overshoot and a burst-inflated window cannot
-//!   spike the target.
+//!   retarget raises the difficulty more than 8×.
 //!
 //! ## Before the first share (same switch)
 //!
-//! Easing needs a window to widen, so it needs at least one share. A
-//! session that has never landed one is upstream of it: the estimators
-//! have no sensor reading at all, and an over-assigned session — a proxy
-//! that lost most of its workers, a device weaker than the
-//! `nominal_hash_rate` it declared — sits at a difficulty it cannot reach
-//! with nothing to lower it. The help is gated behind the very share the
-//! too-high difficulty is suppressing.
+//! A session that has never landed a share has no window to widen; an
+//! over-assigned one (a proxy that lost most of its workers, a device
+//! weaker than its declared `nominal_hash_rate`) would sit at a difficulty
+//! it cannot reach. Zero arrivals over a difficulty history `D(t)` bound
+//! the hashrate from above, which maps to `D = k·τ / ∫dt/D(t)` (see
+//! [`VARDIFF_NO_SHARE_CONFIDENCE_K`]). This is independent of the port's
+//! share rate and of how often the caller ticks.
 //!
-//! Here the waiting itself is the measurement. Zero arrivals over a
-//! difficulty history `D(t)` bound the hashrate from above at confidence
-//! α, and that bound maps to a difficulty in one step:
-//! `D = k·τ / ∫dt/D(t)` (see [`VARDIFF_NO_SHARE_CONFIDENCE_K`]). Unlike a
-//! fixed per-cycle divisor this knows the difference between a quiet
-//! minute on a 0.6 shares/min port and a quiet minute on a 15 shares/min
-//! port, and it does not care how often the caller ticks.
-//!
-//! Bounded the same way: the descent parks at
-//! [`VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR`] below the opening difficulty
-//! (it only has to get the session from *never* to *occasionally* — one
-//! share hands over to the bootstrap, which converges in a single step),
-//! it may only ever propose a strict decrease, and
-//! [`VarDiffEngine::note_submission`] spends the accumulated evidence
-//! because a rejected share is still a hash that met the target.
+//! The descent parks at [`VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR`] below the
+//! opening difficulty (one share hands over to the bootstrap), only ever
+//! proposes a strict decrease, and [`VarDiffEngine::note_submission`]
+//! resets the evidence because a rejected share still met the target.
 //!
 //! Both halves need [`VarDiffEngine::note_difficulty_assigned`] on every
 //! difficulty assignment, whatever the route.
 //!
-//! The engine is owned `&mut` by its connection task — no internal locks.
-//! A [`Clock`] trait makes the time source injectable so tests can pin
-//! deterministic timestamps.
+//! The engine is owned `&mut` by its connection task (no internal locks);
+//! the [`Clock`] trait makes time injectable for tests.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,52 +101,43 @@ pub const VARDIFF_WARMUP_MS: u64 = 60_000;
 pub const VARDIFF_DEFAULT_TARGET_SHARES_PER_MIN: f64 = 6.0;
 
 /// Silence easing: hard floor of the descent, as a factor below the rate
-/// measured before the silence began. A session that is not slow but GONE
-/// (hashboards off, socket alive) parks at most this far below its last
-/// measured rate instead of sinking to `min_difficulty` — bounding the
-/// share flood it produces on return to `16×` the target rate for at most
-/// one check interval. 16 fully rescues every realistic throttle
-/// (solar/night 2–10×, power modes 2–4×, dead hashboards ~3×) and keeps
-/// even a 100×-throttled rig alive at ~2 shares/min; pathological drops
-/// (TH→kH) are the bootstrap path's job, not this bound's.
+/// measured before the silence began. A session that is gone rather than
+/// slow (hashboards off, socket alive) parks here instead of sinking to
+/// `min_difficulty`, which bounds its share flood on return to 16× the
+/// target rate for one check interval. 16 covers realistic throttles
+/// (solar/night, power modes, dead hashboards); larger drops are the
+/// bootstrap path's job.
 pub const VARDIFF_SILENCE_MAX_DESCENT_FACTOR: f64 = 16.0;
 
-/// Silence easing: cap on a single UPWARD retarget. Protects against a
-/// rate estimate inflated by a burst (a job-declaration client drains its
-/// optimistic-mining share cache in a bundle) and paces the recovery of an
-/// eased-down session: from the descent floor back to equilibrium in one
-/// 8× step plus one small one, while an estimate that is wrong by more
-/// than 8× gets a second interval to prove itself before being trusted.
+/// Silence easing: cap on a single upward retarget. Guards against an
+/// estimate inflated by a burst (a job-declaration client flushing its
+/// optimistic-mining shares at once) and paces recovery of an eased-down
+/// session, so an estimate wrong by more than 8× gets a second interval
+/// before it is trusted.
 pub const VARDIFF_MAX_UP_STEP_FACTOR: f64 = 8.0;
 
 /// No-share descent: the confidence constant `k = ln(1/α)` of the Poisson
 /// upper bound on a hashrate that has produced no share at all.
 ///
-/// Shares arrive at `λ = H / (D · 2^32)`, so observing none while the
-/// assigned difficulty follows `D(t)` has probability `e^-((H/2^32)·S)`
-/// with `S = ∫dt/D(t)`. The hashrates that survive at level α are exactly
-/// `H ≤ k · 2^32 / S`. 3.0 is α = 5 %.
+/// Shares arrive at `λ = H / (D · 2^32)`, so seeing none while the assigned
+/// difficulty follows `D(t)` has probability `e^-((H/2^32)·S)` with
+/// `S = ∫dt/D(t)`; at level α that leaves `H ≤ k · 2^32 / S`. 3.0 is α = 5 %.
 ///
-/// **Not a tuning knob.** α = 1 % would be 4.605 — a 1.5× difference, less
-/// than one rung of the power-of-two ladder every proposal is rounded onto
-/// anyway. Changing it changes nothing you can observe.
+/// Not a tuning knob: α = 1 % (4.605) differs by less than one rung of the
+/// power-of-two ladder every proposal is rounded onto.
 pub const VARDIFF_NO_SHARE_CONFIDENCE_K: f64 = 3.0;
 
 /// No-share descent: hard floor, as a factor below the difficulty the
 /// session opened with. The counterpart of
 /// [`VARDIFF_SILENCE_MAX_DESCENT_FACTOR`] for a session that has never
-/// landed a share, where there is no measured pre-silence rate to bound
-/// against — only the difficulty that was assigned from a declared
-/// hashrate we have just decided not to believe.
+/// landed a share, where the only reference is the difficulty assigned from
+/// a declared hashrate that is not being believed.
 ///
-/// The descent does NOT have to reach equilibrium: one accepted share
-/// hands over to the under-sampled bootstrap, which converges in a single
-/// step. It only has to get the miner from *never* to *occasionally*. 256
-/// covers a proxy that lost 99.6 % of its workers, and on a
-/// `high_diff_start_difficulty = 1000000` port it still parks near 3900,
-/// where even a badly over-assigned miner produces a share or two a
-/// minute. Going looser buys little and costs a bigger flood if a fully
-/// idle session returns at full power.
+/// The descent only has to get the miner from *never* to *occasionally*:
+/// one accepted share hands over to the under-sampled bootstrap. 256 covers
+/// a proxy that lost 99.6 % of its workers and parks a 1,000,000 start near
+/// 3900; looser costs a bigger flood when an idle session returns at full
+/// power.
 pub const VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR: f64 = 256.0;
 
 // ── Clock ────────────────────────────────────────────────────────────
@@ -193,30 +145,11 @@ pub const VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR: f64 = 256.0;
 /// Monotonic-ish millisecond clock. Real-world impl wraps `SystemTime`;
 /// tests use [`TestClock`] for deterministic advance.
 ///
-/// # Why the pool's epoch-ms clock lives in the vardiff crate
-///
-/// It reads oddly — the JDP server and the Stratum session state are not
-/// vardiff — and it has been proposed for `bp-common` more than once. Decided
-/// 2026-08-23 to keep it here, on these grounds:
-///
-/// - **The move would remove no dependency.** Exactly two crates take this
-///   one: `bp-stratum-v1` and `bp-stratum-v2`, and both run `VarDiffEngine`
-///   anyway. Nothing depends on this crate ONLY for the clock, so nothing gets
-///   lighter.
-/// - **There is a second `Clock` in the workspace, deliberately.**
-///   `bp_cron_utils::Clock` returns `chrono::DateTime<Utc>` because
-///   calendar-aligned scheduling needs date-time math. Putting this one in the
-///   shared-vocabulary crate would make `bp_common::Clock` read as THE pool
-///   clock while covering only half the pool's time.
-/// - **`bp-common` takes time, it does not source it.** `LogThrottle::allow`
-///   receives a `now_ms`, and its one production caller passes a share's own
-///   `ts_ms` — the stamp that travelled with the data. A clock there would
-///   make that crate a time source for the first time.
-///
-/// What was NOT the argument, because measuring did not support it:
-/// injectability. It is a call-site choice, not a crate-location one — 54 uses
-/// here are injected through a type parameter and 24 call `SystemClock.now_ms()`
-/// directly, and moving the trait changes neither number.
+/// It lives here rather than in `bp-common` because its only users,
+/// `bp-stratum-v1` and `bp-stratum-v2`, run `VarDiffEngine` anyway, and
+/// `bp-common` takes time as an argument instead of sourcing it.
+/// `bp_cron_utils::Clock` is a separate trait on purpose: calendar-aligned
+/// scheduling needs `chrono::DateTime<Utc>`.
 ///
 /// Not to be confused with `bp_common::now_ms`, which is `i64` for Postgres,
 /// reads the system clock at the call site and is deliberately NOT injectable.
@@ -290,24 +223,17 @@ impl<T: Clock + ?Sized> Clock for std::sync::Arc<T> {
 /// path apply to every difficulty the pool assigns; each caller keeps its own
 /// guards (zero, `min_difficulty`, sub-1) in front of it.
 ///
-/// **Powers of two only, and always upward.** Both halves were measured on
-/// a live translating proxy, and each half fixes a different failure:
+/// **Powers of two only, and always upward.**
 ///
-/// - *Powers of two:* a translating proxy rounds an assigned difficulty UP to
-///   a power of two when it lowers it into an SV1 `mining.set_difficulty`,
-///   so a difficulty like 2887 reached the miner as 4096 while the pool kept
-///   booking shares at 2887 — 29.5 % of a miner's work went uncredited.
-/// - *Upward:* rounding to the NEAREST rung goes down as often as up, and a
-///   downstream that requested a difficulty via `UpdateChannel` rejects a
-///   lower one as a protocol error — the translator logs "SetTarget response
-///   has target which is higher than requested target … Ignoring this
-///   pending update" and the miner simply keeps its old difficulty. Rounding
-///   down therefore does not mis-size the target, it discards the
-///   assignment. Up is always accepted.
+/// - *Powers of two:* a translating proxy rounds an assigned difficulty up to
+///   a power of two for SV1 `mining.set_difficulty`; any other value means
+///   the miner works at a higher difficulty than the pool books.
+/// - *Upward:* a downstream that requested a difficulty via `UpdateChannel`
+///   ignores a lower one (a higher target) as a protocol error and keeps its
+///   old difficulty, so rounding down discards the assignment.
 ///
-/// The cost of rounding up is at most a factor of two in share rate, which
-/// the estimator absorbs; the cost of the other two is real work nobody is
-/// paid for.
+/// Rounding up costs at most a factor of two in share rate, which the
+/// estimator absorbs.
 pub fn round_up_to_power_of_two(val: f64) -> f64 {
     let lower = 2_f64.powf(val.log2().floor());
     // The tolerance matters: a value that is a power of two apart from
@@ -322,23 +248,19 @@ pub fn round_up_to_power_of_two(val: f64) -> f64 {
 
 /// ckpool-style per-job difficulty clamp.
 ///
-/// When a vardiff ratchet flips the session difficulty up, miner firmware
-/// typically only applies the new target on the next `mining.notify` —
-/// shares for jobs already in flight were legitimately computed against
-/// the OLD target. Without this clamp those shares get rejected as
-/// "Difficulty too low" even though the miner did what we told it to do.
+/// Miner firmware typically applies a raised target only on the next
+/// `mining.notify`, so shares for jobs already in flight were legitimately
+/// computed against the OLD target and must not be rejected as
+/// "Difficulty too low".
 ///
-/// Returns the difficulty to use for BOTH the validation `>=` check AND
-/// downstream accounting (PPLNS recordShare, group-solo recordShare,
-/// per-mode hashrate, share totals). Keeping these in lock-step prevents
-/// the miner from getting credit at the post-ratchet diff for work they
-/// actually did at the pre-ratchet diff.
+/// Returns the difficulty for BOTH the validation `>=` check AND all
+/// downstream accounting (PPLNS, group-solo, per-mode hashrate, share
+/// totals), so a share is never credited above the difficulty it was
+/// mined at.
 ///
-/// `job_id_int = None` corresponds to a `parseInt` failure on the wire-
-/// hex jobId (malformed submission); falls back to `currentDiff`.
-///
-/// `diff_change_job_id = None` means no ratchet has happened since the
-/// session started — the clamp is inactive and `currentDiff` always wins.
+/// `job_id_int = None` (job id not parseable) falls back to `current_diff`.
+/// `diff_change_job_id = None` means no raise since the session started,
+/// so the clamp is inactive.
 pub fn effective_job_difficulty(
     job_id_int: Option<u64>,
     current_diff: f64,
@@ -413,26 +335,20 @@ pub struct VarDiffEngine<C: Clock> {
     shares: f64,
 
     // Silence easing (opt-in; see the module doc). `last_submission_ms`
-    // is the liveness sensor: stamped by every accepted share
-    // (`update_hash_rate`) AND every rejected one (`note_submission`),
-    // because the question it answers is "have we heard from this miner
-    // at all" — a rejecting miner is alive, just unlucky or stale.
+    // is the liveness sensor, stamped by every accepted AND rejected share:
+    // a rejecting miner is alive, just unlucky or stale.
     silence_easing: bool,
     last_submission_ms: Option<u64>,
 
-    // No-share descent (same opt-in switch). Evidence that a session which
-    // has NEVER landed a share is over-assigned is the waiting itself, and
-    // the sufficient statistic for "zero arrivals under a difficulty that
-    // changed along the way" is the inverse-difficulty-time
-    // `S = ∫dt/D(t)`. `no_share_accum_s_per_diff` holds S over the closed
-    // segments; the still-open one is added at read time.
+    // No-share descent (same switch). The sufficient statistic for zero
+    // arrivals under a changing difficulty is `S = ∫dt/D(t)`;
+    // `no_share_accum_s_per_diff` holds S over the closed segments, the
+    // open one is added at read time.
     //
     // The open segment is measured against `no_share_segment_difficulty`,
-    // NOT against the `client_difficulty` the caller passes. That is
-    // deliberate: if a difficulty assignment ever fails to call
-    // `note_difficulty_assigned`, the stored value is stale-HIGH, S grows
-    // too slowly and the engine descends too LITTLE. A missed wiring site
-    // costs responsiveness, never safety.
+    // not the caller's `client_difficulty`: if an assignment skips
+    // `note_difficulty_assigned`, the stored value is stale-high and the
+    // engine descends too little, never too much.
     no_share_accum_s_per_diff: f64,
     no_share_segment_start_ms: u64,
     no_share_segment_difficulty: f64,
@@ -492,17 +408,15 @@ impl<C: Clock> VarDiffEngine<C> {
     }
 
     /// Enable/disable silence easing (module doc, "Silence easing").
-    /// Builder-style so the many existing construction sites stay
-    /// untouched and keep proving that the default (off) is inert.
+    /// Off by default, and off leaves the engine's behaviour unchanged.
     pub fn with_silence_easing(mut self, enabled: bool) -> Self {
         self.silence_easing = enabled;
         self
     }
 
-    /// Seed the difficulty the session opens with. Builder-style for the
-    /// same reason as [`Self::with_silence_easing`], and required for the
-    /// no-share descent to have anything to measure: without it the
-    /// engine knows the miner is quiet but not what it is quiet *at*.
+    /// Seed the difficulty the session opens with. Required for the
+    /// no-share descent: without it the engine knows the miner is quiet but
+    /// not what it is quiet *at*.
     pub fn with_initial_difficulty(mut self, difficulty: f64) -> Self {
         if difficulty.is_finite() && difficulty > 0.0 {
             self.opening_difficulty = difficulty;
@@ -515,16 +429,13 @@ impl<C: Clock> VarDiffEngine<C> {
     /// route: a vardiff retarget it suggested itself, an `UpdateChannel`
     /// from a proxy, an SV1 `mining.suggest_difficulty`.
     ///
-    /// Closes the open no-share segment into the accumulator **at the
-    /// difficulty that was actually in force for it**, then opens a new
-    /// one. Also advances the bootstrap denominator anchor, but only while
-    /// no share has ever been accepted: work done at a difficulty too high
-    /// to produce shares is invisible, yet its elapsed time would still
-    /// land in that denominator and drag the first post-descent estimate
-    /// far below the truth. Moving the anchor keeps
-    /// `lifetime_difficulty_sum` and the span it is divided by covering
-    /// the same stretch of time — an invariant that holds because the sum
-    /// is exactly 0 whenever the anchor moves.
+    /// Closes the open no-share segment **at the difficulty that was in
+    /// force for it**, then opens a new one. While no share has ever been
+    /// accepted it also moves the bootstrap anchor: time spent at a
+    /// difficulty too high to produce shares would otherwise drag the first
+    /// post-descent estimate far below the truth. The sum is exactly 0
+    /// whenever the anchor moves, so numerator and denominator keep
+    /// covering the same span.
     ///
     /// No-op when easing is off, like [`Self::note_submission`].
     pub fn note_difficulty_assigned(&mut self, difficulty: f64) {
@@ -537,16 +448,11 @@ impl<C: Clock> VarDiffEngine<C> {
             self.last_assignment_was_a_raise = self.no_share_segment_difficulty > 0.0
                 && difficulty > self.no_share_segment_difficulty;
             self.no_share_segment_difficulty = difficulty;
-            // The descent floor is measured against the HIGHEST difficulty
-            // this session has ever carried, not the one it opened with.
-            // Latching it at construction let a later raise (an SV1
-            // `mining.suggest_difficulty`, a proxy revising its declared
-            // rate) leave the floor stranded far below what is actually in
-            // force — a session started at 16384 and raised to 500000 could
-            // then be walked down to 64, roughly 7800× rather than the 256×
-            // the constant promises. A lowering must NOT move it, or the
-            // floor would ratchet down with every descent step and stop
-            // bounding anything at all.
+            // The descent floor is anchored to the HIGHEST difficulty the
+            // session has carried, so a later raise (`mining.suggest_difficulty`,
+            // a revised declared rate) keeps the 256× bound relative to what
+            // is in force. A lowering must not move it, or the floor would
+            // ratchet down with every descent step.
             self.opening_difficulty = self.opening_difficulty.max(difficulty);
         }
         if self.lifetime_difficulty_sum == 0.0 {
@@ -589,18 +495,12 @@ impl<C: Clock> VarDiffEngine<C> {
     }
 
     /// Liveness heartbeat for submissions that do NOT reach
-    /// [`Self::update_hash_rate`] — i.e. rejected shares. A miner whose
-    /// submissions are being rejected (duplicates against an exhausted
-    /// search space, stale/aged-out jobs) is hashing, not silent; stamping
-    /// it here keeps silence easing from misreading a reject storm as a
-    /// dead session and walking its difficulty down. No-op when easing is
-    /// off: `last_submission_ms` is read only by the silence paths, so the
-    /// default path skips even the clock read.
-    /// Liveness ONLY. It deliberately does not touch the no-share
-    /// descent's evidence, because "we heard something" and "the miner
-    /// reached the target we set" are different claims and only the
-    /// second one refutes the descent's premise. Use
-    /// [`Self::note_target_reached`] for the second.
+    /// [`Self::update_hash_rate`], i.e. rejected shares. A miner whose
+    /// shares are rejected is hashing, not silent, so silence easing must
+    /// not walk its difficulty down. No-op when easing is off.
+    /// Liveness ONLY: it leaves the no-share evidence alone, because a
+    /// submission is not proof the miner reached the target. Use
+    /// [`Self::note_target_reached`] for that.
     pub fn note_submission(&mut self) {
         if self.silence_easing {
             self.last_submission_ms = Some(self.clock.now_ms());
@@ -614,12 +514,10 @@ impl<C: Clock> VarDiffEngine<C> {
     /// the difficulty in force.
     ///
     /// A below-target reject (`DifficultyTooLow` / `LowDifficulty`) must
-    /// NOT come through here. It is the miner telling us the opposite —
-    /// that it is hashing but cannot clear the bar — which is the exact
-    /// symptom the descent exists to correct. Spending the evidence on it
-    /// pins `S` to the gap between two rejects and the difficulty never
-    /// falls, so the feature would miss precisely the sessions it was
-    /// built for.
+    /// NOT come through here: it shows the miner is hashing but cannot clear
+    /// the bar, exactly what the descent corrects. Spending the evidence on
+    /// it would pin `S` to the gap between two rejects and the difficulty
+    /// would never fall.
     pub fn note_target_reached(&mut self) {
         if self.silence_easing {
             let now = self.clock.now_ms();
@@ -657,16 +555,11 @@ impl<C: Clock> VarDiffEngine<C> {
     /// or `None` when there is no such evidence (easing off, a share
     /// already accepted, still in warmup, nothing accumulated yet).
     ///
-    /// This is the same Poisson bound the descent uses, minus the
-    /// "must be a strict decrease" rule, and it exists so a caller can
-    /// weigh a *declared* hashrate against what we have actually observed.
-    ///
-    /// The distinction matters: "this channel has never had a share
-    /// accepted" is the NORMAL state of a proxy that just opened its
-    /// channel and is only now gaining workers. Refusing its declaration
-    /// on that basis throws away the one piece of information we have.
-    /// Refusing it because a long silence at a known difficulty rules the
-    /// number out is a different claim, and the only defensible one.
+    /// The same Poisson bound the descent uses, minus the strict-decrease
+    /// rule, so a caller can weigh a *declared* hashrate against what was
+    /// observed. "No share yet" alone is the normal state of a freshly
+    /// opened proxy channel and is no reason to refuse its declaration;
+    /// a long silence at a known difficulty that rules the number out is.
     pub fn silence_implied_max_difficulty(&self) -> Option<f64> {
         if !self.silence_easing || self.has_accepted_share() {
             return None;
@@ -706,17 +599,10 @@ impl<C: Clock> VarDiffEngine<C> {
         let now = self.clock.now_ms();
         let slot = slot_for(now);
 
-        // Liveness sensor: an accepted share is a submission. Gated like
-        // `note_submission` so the default (easing-off) path leaves the
-        // field — which nothing else reads — untouched.
-        //
-        // An accepted share is also the strongest possible proof that the
-        // miner reaches the assigned target, so it spends the no-share
-        // evidence too. Folded in here rather than left to a second
-        // `note_target_reached()` call at the caller: `now` is already in
-        // hand, so this costs nothing, whereas the separate call added a
-        // second clock read per accepted share on the hot path — and an
-        // accepted share can no longer forget to do it.
+        // Liveness sensor, gated like `note_submission`. An accepted share
+        // also proves the miner reaches the assigned target, so it spends
+        // the no-share evidence here, reusing `now` instead of a second
+        // clock read on the hot path.
         if self.silence_easing {
             self.last_submission_ms = Some(now);
             self.no_share_accum_s_per_diff = 0.0;
@@ -749,14 +635,10 @@ impl<C: Clock> VarDiffEngine<C> {
                 self.current_slot_time_ms = now;
                 self.current_slot = Some(slot);
                 self.shares = target_difficulty;
-                // Silence easing: recompute the rate across the gap. The
-                // rotation branch historically left `hash_rate` frozen at
-                // its pre-gap value, so the FIRST share after a long
-                // silence would quote the pre-silence rate and ratchet a
-                // just-eased session straight back up (the v1 sawtooth).
-                // Recomputing over the real elapsed span replaces the
-                // stale measurement with an honest one that includes the
-                // gap. Gated so the default stays byte-identical.
+                // Silence easing: recompute the rate across the gap, so the
+                // first share after a long silence does not quote the
+                // pre-silence rate and ratchet a just-eased session straight
+                // back up. Gated so the default path is unchanged.
                 if self.silence_easing {
                     let elapsed_ms = now.saturating_sub(self.previous_slot_time_ms);
                     let work = self.previous_shares + self.shares;
@@ -814,99 +696,62 @@ impl<C: Clock> VarDiffEngine<C> {
     pub fn suggested_difficulty(&self, client_difficulty: f64) -> Option<f64> {
         if self.submission_cache.len() < VARDIFF_SAMPLE_THRESHOLD {
             // Under-sampled: hold during warmup, then retarget from the miner's
-            // MEASURED rate. The earlier heuristic divided the *current* diff by
-            // `target_shares_per_minute` on every call — a value independent of
-            // the actual rate — so a miner that stayed under-sampled (one device
-            // per channel after the per-channel vardiff split sees only its own
-            // ~⅓ of the shares) compounded it down geometrically into a runaway
-            // to the floor. Both rate sources below feed the SAME
-            // rate→difficulty conversion the fully-sampled path uses, so they
-            // converge to the miner's real equilibrium in one step and do NOT
-            // depend on `client_difficulty` — repeated calls can't compound.
+            // MEASURED rate. Both rate sources below feed the same
+            // rate→difficulty conversion as the fully-sampled path and do NOT
+            // depend on `client_difficulty`, so they converge in one step and
+            // repeated calls cannot compound.
             let now = self.clock.now_ms();
             if now.saturating_sub(self.submission_cache_start_ms) <= VARDIFF_WARMUP_MS {
                 return None;
             }
             // Prefer the slot-measured hashrate (needs ≥2 shares in one slot);
-            // else bootstrap from lifetime diff-work over elapsed time. The
-            // latter is the only signal an ultra-sparse miner provides — a
-            // 50 kH/s device that takes hours to land one share at a too-high
-            // diff never gets 2-in-a-slot, so without this its diff is never
-            // lowered and it stays stuck (cpuminer-fallback devices land here).
-            // Anchored to cumulative accepted difficulty + the fixed engine-
-            // start time, so it estimates the true rate (incl. the time-to-
-            // first-share, which itself encodes the hashrate) and can't compound.
+            // else bootstrap from lifetime diff-work over elapsed time, the only
+            // signal an ultra-sparse miner (never 2 shares in a slot) provides.
+            // The time-to-first-share is part of that span and itself encodes
+            // the hashrate.
             let rate = if self.hash_rate > 0.0 {
                 if self.silence_easing {
-                    // Frozen `hash_rate` was the sawtooth's fuel: it is only
-                    // recomputed when a share arrives, so after a silence it
-                    // still quotes the pre-slowdown rate and would ratchet a
-                    // just-rescued session straight back up. The decayed read
-                    // extends the same measurement window to *now*.
+                    // `hash_rate` is only recomputed when a share arrives, so
+                    // after a silence it still quotes the pre-slowdown rate.
+                    // The decayed read extends its window to *now*.
                     self.silence_decayed_slot_rate()
                 } else {
                     self.hash_rate
                 }
             } else if self.lifetime_difficulty_sum > 0.0 {
-                // Anchored at `bootstrap_epoch_ms`, which equals
-                // `submission_cache_start_ms` unless the no-share descent
-                // moved it. It has to: a stretch spent at a difficulty too
-                // high to produce shares contributes elapsed time but no
-                // observable work, so leaving it in this denominator makes
-                // the first share after a descent read far slower than the
-                // miner is — and pushes the difficulty down again.
+                // Anchored at `bootstrap_epoch_ms`, which the no-share
+                // descent moves past time spent at a difficulty too high to
+                // produce shares; that time holds no observable work and would
+                // make the first share read far slower than the miner is.
                 let elapsed_ms = now.saturating_sub(self.bootstrap_epoch_ms);
-                // The warmup gate above is anchored at engine start, so
-                // once the epoch moves it no longer says anything about
-                // THIS window — and this branch has no up-step cap. An
-                // assignment landing shortly before a tick left a window of
-                // milliseconds, and one share divided by it read as a 32–64×
-                // hashrate increase, uncapped, straight onto the wire. Hold
-                // until the anchored window is itself long enough to carry a
-                // rate. The epoch is frozen by the first accepted share, so
-                // this waits at most one warmup and then never again.
+                // The warmup gate above is anchored at engine start and this
+                // branch has no up-step cap, so a window of milliseconds after
+                // a moved epoch would turn one share into a huge uncapped
+                // raise. Hold until the anchored window itself spans a warmup;
+                // the first accepted share freezes the epoch, so this waits at
+                // most once.
                 if elapsed_ms <= VARDIFF_WARMUP_MS {
                     return None;
                 }
                 let elapsed_s = elapsed_ms as f64 / 1000.0;
                 self.lifetime_difficulty_sum * HASHES_PER_DIFFICULTY_1 / elapsed_s
             } else if self.silence_easing {
-                // No accepted share, ever. The classic estimators are blind
-                // here — their only sensor is a share — so an over-assigned
-                // session (a proxy that lost most of its workers, a device
-                // weaker than the `nominal_hash_rate` it declared) sits at a
-                // difficulty it cannot reach and nothing lowers it. That is
-                // the gap this closes: the easing that would
-                // help is gated behind the very share the too-high
-                // difficulty is suppressing.
-                //
-                // The waiting IS the measurement. Shares are Poisson at
-                // `λ = H / (D·2^32)`, so zero arrivals while the difficulty
-                // followed `D(t)` has probability `e^-((H/2^32)·S)` for
-                // `S = ∫dt/D(t)`. Inverting at confidence α leaves
-                // `H ≤ k·2^32/S`, and converting that upper bound to the
-                // difficulty which would hit the configured share rate
-                // collapses to `D = k·τ/S` — `τ` being the target gap,
-                // which `target_submission_per_second` already holds.
-                //
-                // Self-calibrating, and that is the point: the proposal only
-                // falls below the current difficulty once the silence has
-                // run past ~k expected share gaps. A port targeting 0.6
-                // shares/min is untouched by 60 s of quiet; one targeting 15
-                // is not. A fixed per-cycle divisor cannot tell those apart.
+                // No accepted share, ever: the share-based estimators are
+                // blind, so an over-assigned session would sit at a difficulty
+                // it cannot reach. The waiting is the measurement: the Poisson
+                // upper bound `H ≤ k·2^32/S` converts to `D = k·τ/S`, with `τ`
+                // = `target_submission_per_second`. It only falls below the
+                // current difficulty once the silence exceeds ~k expected
+                // share gaps, so it calibrates itself to the port's rate.
                 return self.no_share_descent(now, client_difficulty);
             } else {
                 // Easing off: no accepted share means nothing to estimate
-                // from, so hold (pre-descent behaviour, kept byte-identical).
+                // from, so hold.
                 return None;
             };
-            // NO up-step cap here. The under-sampled path is client-
-            // independent and documented to converge in ONE step (a fast
-            // miner starting at too-low difficulty jumps straight to
-            // equilibrium; it cannot compound). Capping it to 8× would
-            // throttle that legitimate convergence to several intervals of
-            // flooding. The cap guards the windowed path, where eased-
-            // recovery overshoot and burst-inflated windows actually live.
+            // NO up-step cap here: this path is client-independent and
+            // converges in one step, so an 8× cap would only stretch a fast
+            // miner's legitimate jump over several intervals of flooding.
             let target = rate * self.target_submission_per_second / HASHES_PER_DIFFICULTY_1;
             if !target.is_finite() {
                 return None;
@@ -918,25 +763,16 @@ impl<C: Clock> VarDiffEngine<C> {
         let first_t = self.submission_cache.front().expect("≥ threshold").time_ms;
         let last_t = self.submission_cache.back().expect("≥ threshold").time_ms;
         let closed_ms = last_t.saturating_sub(first_t);
-        // Open interval (silence easing): the observation window ends at
-        // *now*, not at the last share — elapsed time with zero arrivals is
-        // evidence, so a quiet stretch lowers the estimate along a 1/T
-        // envelope and the ordinary deadband+step below turn that into a
-        // paced descent (~one halving per doubling of the silence). The tail
-        // counts only TRUE silence: it starts at the last submission of any
-        // kind, so a reject storm holds the estimate frozen (classic
-        // behaviour) instead of easing a miner that is hashing against a
-        // stale job. In steady state the tail is ~one inter-share gap
-        // (~3% of the window) — deep inside the deadband.
+        // Open interval (silence easing): the window ends at *now*, so a
+        // quiet stretch lowers the estimate along 1/T and the deadband+step
+        // below turn that into a paced descent. The tail starts at the last
+        // submission of any kind, so a reject storm holds the estimate. In
+        // steady state the tail is ~one share gap, deep inside the deadband.
         //
-        // Gated on `closed_ms > 0`: a window whose shares all share one
-        // millisecond (a drained JDC burst) carries no measurable rate —
-        // dividing by a zero span is meaningless and the descent floor
-        // below has no pre-silence rate to bound against. So we do NOT ease
-        // from a zero-span window; `total_ms` stays 0 and the guard below
-        // returns `None` (hold the difficulty) rather than letting an
-        // unbounded 1/T decay sink it to the floor. Easing resumes as soon
-        // as a later share gives the window a real span.
+        // Gated on `closed_ms > 0`: a window whose shares all carry one
+        // millisecond (a flushed job-declaration burst) has no measurable
+        // rate and no pre-silence rate to floor against, so `total_ms` stays
+        // 0 and the guard below holds the difficulty.
         let total_ms = if self.silence_easing && closed_ms > 0 {
             closed_ms.saturating_add(self.true_silence_tail_ms())
         } else {
@@ -948,12 +784,10 @@ impl<C: Clock> VarDiffEngine<C> {
         }
 
         let mut difficulty_per_second = sum / diff_seconds;
-        // Bounded descent: silence may argue the rate at most 16× below the
-        // closed-window (pre-silence) measurement. No stored anchor — the
-        // closed window IS the pre-silence rate, so the bound can never go
-        // stale when the difficulty changes through a non-share route
-        // (suggest_difficulty, UpdateChannel). `closed_ms > 0` is guaranteed
-        // here: if it were 0 the block above would have returned `None`.
+        // Bounded descent: at most 16× below the closed-window (pre-silence)
+        // rate. The closed window is the anchor, so the bound cannot go
+        // stale when the difficulty changes through a non-share route.
+        // `closed_ms > 0` here, or the block above would have returned.
         if self.silence_easing {
             debug_assert!(closed_ms > 0, "eased with a zero-span window");
             let pre_silence_rate = sum / (closed_ms as f64 / 1000.0);
@@ -981,33 +815,25 @@ impl<C: Clock> VarDiffEngine<C> {
     /// Poisson upper confidence bound on a hashrate that has produced no
     /// share at all. Derivation in [`VARDIFF_NO_SHARE_CONFIDENCE_K`].
     ///
-    /// Because `S` grows by `Δt/D` each cycle and `D` is set to `k·τ/S`,
-    /// one cycle multiplies `S` by `(1 + Δt/(k·τ))` — a CONSTANT geometric
-    /// descent per cycle, independent of how deep it already is. It is
-    /// also independent of the check interval: evidence accumulates across
-    /// ticks, so halving `difficulty_check_interval_ms` halves the step
-    /// instead of stalling the descent.
+    /// Each cycle multiplies `S` by `(1 + Δt/(k·τ))`: a constant geometric
+    /// descent, independent of depth and of the check interval (evidence
+    /// accumulates across ticks).
     ///
-    /// Two bounds, both LOWER bounds, which is what makes them survive
-    /// `nearest_difficulty_step` rounding UP afterwards (rounding up cannot
-    /// break a floor — the mistake that cost this branch its `cap_up_step`
-    /// guarantee once already):
+    /// Both bounds are LOWER bounds, so the upward rounding in
+    /// `nearest_difficulty_step` cannot break them:
     /// - [`VARDIFF_NO_SHARE_MAX_DESCENT_FACTOR`] below the opening
     ///   difficulty, applied before the rounding;
     /// - `min_difficulty`, applied inside `nearest_difficulty_step`.
     ///
-    /// And one invariant: **zero arrivals can never justify raising a
-    /// difficulty**, so a candidate that is not a strict decrease is
-    /// dropped. That also disposes of the ladder's one real hazard here —
-    /// a raw estimate that rounds back up onto the rung already in force
-    /// proposes nothing, and since `S` keeps growing, a later cycle
-    /// crosses. The descent paces itself rather than stalling.
+    /// Invariant: **zero arrivals never justify raising a difficulty**, so a
+    /// candidate that is not a strict decrease is dropped. An estimate that
+    /// rounds back onto the rung in force proposes nothing; `S` keeps
+    /// growing, so a later cycle crosses.
     fn no_share_descent(&self, now: u64, client_difficulty: f64) -> Option<f64> {
         let s = self.no_share_inverse_difficulty_time(now);
         if !s.is_finite() || s <= 0.0 {
-            // No segment with a known difficulty yet: the engine was never
-            // told what the session is quiet AT, so there is nothing to
-            // bound. Hold, exactly as before the descent existed.
+            // No segment with a known difficulty yet: the engine does not
+            // know what the session is quiet AT, so hold.
             return None;
         }
         let raw = VARDIFF_NO_SHARE_CONFIDENCE_K * self.target_submission_per_second / s;
@@ -1022,23 +848,16 @@ impl<C: Clock> VarDiffEngine<C> {
         }
     }
 
-    /// Slot hashrate with the observation window extended to *now*: the
-    /// frozen `hash_rate` divided the accumulated work by the span up to
-    /// the LAST share; this divides the same work by that span plus the
-    /// true-silence tail. Identical to `hash_rate` while submissions flow
-    /// (tail = 0, including during a reject storm), decays with silence,
-    /// and is floored at the frozen measurement /
+    /// Slot hashrate with the observation window extended to *now*: the same
+    /// work as `hash_rate`, divided by its span plus the true-silence tail.
+    /// Equal to `hash_rate` while submissions flow (including a reject
+    /// storm), and floored at `hash_rate` /
     /// [`VARDIFF_SILENCE_MAX_DESCENT_FACTOR`] like the windowed path.
     fn silence_decayed_slot_rate(&self) -> f64 {
-        // The under-sampled path has no deadband — it proposes whenever
-        // it runs — so an unguarded decay would let ordinary Poisson gaps
-        // nudge the estimate and flap a healthy early session between
-        // neighbouring steps. Decay therefore only engages once the tail
-        // exceeds both the measurement window itself and five target
-        // gaps (the same magnitude the windowed branch's deadband needs
-        // before it can act): anything shorter reads as normal spacing
-        // and returns the frozen measurement, byte-identical to easing
-        // off.
+        // The under-sampled path has no deadband, so ordinary Poisson gaps
+        // would flap a healthy early session between neighbouring steps.
+        // Decay engages only once the tail exceeds both the measurement
+        // window and five target gaps; anything shorter returns `hash_rate`.
         let tail_ms = self.true_silence_tail_ms();
         let gap_ms = (self.target_submission_per_second * 1000.0) as u64;
         let threshold_ms = self
@@ -1056,33 +875,22 @@ impl<C: Clock> VarDiffEngine<C> {
     }
 
     /// Cap an upward retarget at [`VARDIFF_MAX_UP_STEP_FACTOR`] × the
-    /// current difficulty. No-op when silence easing is disabled (the
-    /// default stays byte-identical) or when `client_difficulty` is not a
-    /// usable number.
+    /// current difficulty. No-op when silence easing is disabled or when
+    /// `client_difficulty` is not a usable number.
     ///
-    /// The cap is lowered to a power of two before it is applied, because
-    /// [`Self::nearest_difficulty_step`] rounds UP afterwards: capping at a raw
-    /// `8 × current` and then stepping to the next rung lands ABOVE the cap and
-    /// the guarantee is gone (measured: cap 384, assigned 512). Snapping the cap
-    /// down to a rung makes it survive the rounding, at the price of an
-    /// effective ceiling between 4× and 8× rather than exactly 8×. A bound that
-    /// holds loosely beats one that reads 8× and does not hold.
+    /// The cap is snapped down to a power of two first, because
+    /// [`Self::nearest_difficulty_step`] rounds UP afterwards and a raw
+    /// `8 × current` cap would land above itself. The effective ceiling is
+    /// therefore between 4× and 8×.
     fn cap_up_step(&self, target: f64, client_difficulty: f64) -> f64 {
         if !self.silence_easing {
             return target;
         }
-        // The cap's documented purpose is to make an estimate that is wrong
-        // by more than 8× spend ONE further interval proving itself — not
-        // to ration every genuine increase at 8× per interval. Applied
-        // blanket it did the latter: a channel whose real rate jumps 128×
-        // (a rental proxy attaching a farm) walked 512 → 4096 → 32768 →
-        // 262144, three intervals of flooding at up to 128× the target rate
-        // — 12 minutes with the shipped 240 s interval.
-        //
-        // So the cap applies to the FIRST raise only. Once a raise has been
-        // assigned and the next window still argues for more, the rate has
-        // survived a full interval of fresh shares and has proven exactly
-        // what the cap asked it to prove.
+        // The cap makes an estimate wrong by more than 8× spend ONE further
+        // interval proving itself; it must not ration a genuine large jump
+        // (a rental proxy attaching a farm) at 8× per interval. So it
+        // applies to the first raise only: if the next window still argues
+        // for more, the rate has survived a full interval of fresh shares.
         if self.last_assignment_was_a_raise {
             return target;
         }
@@ -1111,17 +919,16 @@ impl<C: Clock> VarDiffEngine<C> {
     }
 }
 
-/// 10-min slots labeled by their END timestamp. Same formula bp-stats uses
-/// for its `SlotEnd::for_time` — we don't take a dep here, the engine only
-/// cares about slot equality.
+/// 10-min slots labeled by their END timestamp, the same formula as
+/// bp-stats' `SlotEnd::for_time`. No dependency on it: the engine only
+/// compares slots for equality.
 fn slot_for(timestamp_ms: u64) -> u64 {
     (timestamp_ms / VARDIFF_SLOT_DURATION_MS) * VARDIFF_SLOT_DURATION_MS + VARDIFF_SLOT_DURATION_MS
 }
 
 /// Slot hashrate in hashes/second: total credited difficulty (`work`, in
-/// difficulty units) over the observation span. The single definition
-/// behind the frozen same-slot / rotation reads and the silence-decayed
-/// read. Returns 0.0 for a non-positive span.
+/// difficulty units) over the observation span, shared by the same-slot,
+/// rotation and silence-decayed reads. Returns 0.0 for a zero span.
 fn slot_hashrate(work: f64, span_ms: u64) -> f64 {
     if span_ms == 0 {
         return 0.0;
@@ -1131,8 +938,7 @@ fn slot_hashrate(work: f64, span_ms: u64) -> f64 {
 
 /// Silence-easing descent floor: never let `value` fall more than
 /// [`VARDIFF_SILENCE_MAX_DESCENT_FACTOR`] below `base` (the pre-silence
-/// measurement). One definition for both the windowed rate and the
-/// slot-rate paths so they cannot drift.
+/// measurement). Shared by the windowed and slot-rate paths.
 fn floor_descent(value: f64, base: f64) -> f64 {
     value.max(base / VARDIFF_SILENCE_MAX_DESCENT_FACTOR)
 }
@@ -1141,7 +947,7 @@ fn floor_descent(value: f64, base: f64) -> f64 {
 mod tests {
     use super::*;
 
-    // ── effective_job_difficulty (5 spec cases) ──────────────────────────
+    // ── effective_job_difficulty ─────────────────────────────────────────
 
     #[test]
     fn effective_diff_returns_current_when_no_ratchet_has_happened() {
@@ -1174,8 +980,8 @@ mod tests {
 
     #[test]
     fn effective_diff_also_clamps_on_downward_ratchet_symmetry() {
-        // ckpool stratifier.c:6204-6205 — both directions use MIN.
-        // MIN(100, 200) = 100 — share at 150 on an old job accepts.
+        // Both directions use MIN, like ckpool: MIN(100, 200) = 100, so a
+        // share at 150 on an old job is accepted.
         assert_eq!(
             effective_job_difficulty(Some(49), 100.0, 200.0, Some(50)),
             100.0
@@ -1196,21 +1002,18 @@ mod tests {
         VarDiffEngine::new(clock, target, min)
     }
 
-    /// Every rung is a power of two, with nothing in between.
-    ///
-    /// The ladder used to carry a `lower * 1.5` rung. It was removed because a
-    /// translating proxy rounds an assigned difficulty UP to a power of two on
-    /// the way to the miner, so a 1.5x rung arrives as something the pool never
-    /// assigned and every share booked against it under-counts the miner's work.
+    /// Every rung is a power of two, with nothing in between: a translating
+    /// proxy rounds any other value up on the way to the miner, and shares
+    /// booked at the assigned value would under-count the miner's work.
     #[test]
     fn nearest_step_returns_only_powers_of_two() {
         let e = engine_with_clock(TestClock::new(0), 6.0, 0.00001);
         // Exact powers of two are returned unchanged.
         assert_eq!(e.nearest_difficulty_step(1024.0), Some(1024.0));
         assert_eq!(e.nearest_difficulty_step(2048.0), Some(2048.0));
-        // The old 1.5x rung is gone, and rounding is always UP: a downstream
-        // that requested a difficulty discards a lower one as a protocol error,
-        // so the assignment would be lost rather than merely mis-sized.
+        // No 1.5x rung, and rounding is always UP: a downstream that requested
+        // a difficulty discards a lower one as a protocol error, so the
+        // assignment would be lost rather than merely mis-sized.
         assert_eq!(e.nearest_difficulty_step(1536.0), Some(2048.0));
         assert_eq!(e.nearest_difficulty_step(1100.0), Some(2048.0));
         assert_eq!(e.nearest_difficulty_step(2000.0), Some(2048.0));
@@ -1362,11 +1165,9 @@ mod tests {
 
     #[test]
     fn under_sampled_single_share_bootstraps_down_from_lifetime_rate() {
-        // The finding: a miner that lands exactly ONE share never establishes a
-        // slot hashrate (needs 2-in-a-slot), so pre-fix it returned None forever
-        // and its diff was never lowered — an ultra-sparse device (NMMiner/CPU
-        // on the cpuminer 0.1 fallback) stuck too high. The bootstrap estimates
-        // the rate from cumulative accepted difficulty over elapsed time (the
+        // A miner that lands exactly ONE share never establishes a slot
+        // hashrate (needs 2-in-a-slot). The bootstrap estimates the rate from
+        // cumulative accepted difficulty over elapsed time (the
         // time-to-first-share encodes the hashrate), so it retargets DOWN.
         let clock = TestClock::new(0);
         let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001); // tsps = 10
@@ -1376,8 +1177,7 @@ mod tests {
         clock.advance_ms(80_000); // elapsed 80s (> warmup 60s)
                                   // target = lifetime_sum * tsps / elapsed_s = 1024 * 10 / 80 = 128.
         let expected = 128.0;
-        // Client-independent (proves it can't compound on repeated per-share
-        // calls the way the old client_diff/target ratchet did).
+        // Client-independent, so repeated per-share calls cannot compound.
         for client in [16384.0, 1024.0, 1.0, 0.001] {
             assert_eq!(
                 e.suggested_difficulty(client),
@@ -1392,7 +1192,7 @@ mod tests {
         // A steady ultra-sparse miner (one share per 700s, always in a distinct
         // 10-min slot so the slot hashrate never engages → pure bootstrap path).
         // Its per-share target must CONVERGE to the rate-derived equilibrium, not
-        // keep shrinking toward the floor call-over-call (the old runaway).
+        // keep shrinking toward the floor call-over-call.
         let clock = TestClock::new(0);
         let min_diff = 0.00001;
         let mut e = VarDiffEngine::new(&clock, 6.0, min_diff); // tsps = 10
@@ -1423,13 +1223,9 @@ mod tests {
 
     #[test]
     fn under_sampled_past_warmup_retargets_from_measured_hashrate_not_current_diff() {
-        // Regression: the old under-sampled fallback was `client_difficulty /
-        // target_shares_per_minute`, applied on EVERY retarget call. A miner
-        // that stayed under-sampled (one device per channel after the
-        // per-channel vardiff split) had its diff divided by the constant each
-        // share → a geometric runaway to the floor. The fix retargets from the
-        // measured hashrate, independent of the current diff, so it converges
-        // in one step and repeated calls cannot compound.
+        // The under-sampled path retargets from the measured hashrate,
+        // independent of the current diff, so it converges in one step and
+        // repeated calls cannot compound toward the floor.
         let clock = TestClock::new(0);
         let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001); // target/min => tsps = 10
                                                               // 2 shares at diff 1000, 20s apart → hashrate = 2000 * 2^32 / 20s.
@@ -1505,7 +1301,6 @@ mod tests {
     #[test]
     fn suggested_diff_respects_configured_floor() {
         // Same low rate but a 500.0 floor → suggestion clamps to 500.0.
-        // Verifies the "respects configured floor" behavior.
         let clock = TestClock::new(1_000);
         let mut e = VarDiffEngine::new(&clock, 6.0, 500.0);
         populate_cache(&mut e, &clock, 30, 0.1);
@@ -1623,8 +1418,8 @@ mod tests {
 
     #[test]
     fn easing_off_holds_through_any_silence() {
-        // The historical freeze, pinned as the default: with the switch
-        // off, an hour of total silence changes nothing.
+        // Default: with the switch off, an hour of total silence changes
+        // nothing.
         let clock = TestClock::new(1_000);
         let mut e = VarDiffEngine::new(&clock, 6.0, 0.00001);
         fill_equilibrium(&mut e, &clock);
@@ -1755,9 +1550,9 @@ mod tests {
     #[test]
     fn descent_bound_is_rate_based_not_anchor_based() {
         // The bound derives from the measured pre-silence rate, not from
-        // a stored difficulty anchor — so a difficulty raised through a
+        // a stored difficulty anchor, so a difficulty raised through a
         // non-share route mid-silence (UpdateChannel, suggest_difficulty)
-        // cannot deepen the descent (the v1 stale-anchor finding).
+        // cannot deepen the descent.
         let clock = TestClock::new(1_000);
         let mut e = eased_engine(&clock);
         fill_equilibrium(&mut e, &clock);
@@ -1776,10 +1571,9 @@ mod tests {
 
     #[test]
     fn under_sampled_slot_rate_decays_with_silence() {
-        // The frozen slot hashrate was the sawtooth's fuel in v1: it is
-        // only recomputed on a share, so after a silence it still quotes
-        // the pre-slowdown rate. The eased read extends its window to
-        // now and floors at frozen/16.
+        // The slot hashrate is only recomputed on a share, so after a
+        // silence it still quotes the pre-slowdown rate. The eased read
+        // extends its window to now and floors at frozen/16.
         let clock = TestClock::new(0);
         let mut on = eased_engine(&clock);
         let mut off = VarDiffEngine::new(&clock, 6.0, 0.00001);
@@ -1821,17 +1615,9 @@ mod tests {
         }
     }
 
-    /// The declining-miner case: a session advertises 10× its real
-    /// hashrate, is assigned a difficulty from that inflated figure, and
-    /// therefore lands no share at all. Timed there as "OpenChannel → first
-    /// SubmitShares". A clock-driven controller reaches a reachable
-    /// difficulty in a handful of cycles; a purely share-triggered one
-    /// never retargets at all, because its only sensor is the share the
-    /// too-high difficulty is suppressing.
-    ///
-    /// Before the descent existed this test measured 0 of 15 cycles
-    /// proposing anything, with easing on AND off — we behaved like the
-    /// ckpool port. Now the flag decides.
+    /// A session that advertises 10× its real hashrate and lands no share:
+    /// with easing on it reaches a difficulty it can hit within a handful
+    /// of cycles; with easing off nothing is proposed.
     #[test]
     fn a_declining_miner_is_rescued_before_its_first_share() {
         // Advertised 10×: the pool assigns 100_000 where the miner can only
@@ -1840,7 +1626,7 @@ mod tests {
         let assigned = 100_000.0;
         let reachable = 10_000.0;
 
-        // Easing off: the pre-descent behaviour, unchanged.
+        // Easing off: hold.
         let clock = TestClock::new(1_000);
         let mut off = VarDiffEngine::new(&clock, 6.0, 0.00001).with_initial_difficulty(assigned);
         let mut diff = assigned;
@@ -1872,8 +1658,7 @@ mod tests {
 
     /// The property a fixed per-cycle divisor cannot have: whether a quiet
     /// minute is evidence depends on how many shares that minute was
-    /// supposed to carry. SRI's rule scores every zero-share interval as a
-    /// flat 100 % error and applies the same `h/3` to both of these.
+    /// supposed to carry.
     #[test]
     fn quiet_is_judged_against_the_expected_share_rate() {
         // 0.6 shares/min → a 100 s mean gap. 90 s of quiet is ordinary.
@@ -1901,10 +1686,7 @@ mod tests {
     }
 
     /// Evidence accumulates across ticks, so the descent does not depend on
-    /// how often the caller asks. This matters in production: the shipped
-    /// `difficulty_check_interval_ms` is 240 s and gets dropped to 30 s for
-    /// testing — a rule keyed on the interval alone would stall completely
-    /// at the short setting.
+    /// `difficulty_check_interval_ms`.
     #[test]
     fn descent_does_not_depend_on_the_check_interval() {
         let mut results = Vec::new();
@@ -1931,8 +1713,7 @@ mod tests {
 
     /// A raw estimate that rounds back up onto the rung already in force
     /// must propose nothing — and the descent must NOT stall there, because
-    /// `S` keeps growing and a later cycle crosses. "The descent silently
-    /// stops" is precisely the failure a green suite hides.
+    /// `S` keeps growing and a later cycle crosses.
     #[test]
     fn a_proposal_that_rounds_onto_the_current_rung_waits_and_then_crosses() {
         let clock = TestClock::new(1_000);
@@ -2036,12 +1817,8 @@ mod tests {
     /// A reject that still CLEARED the assigned target — the
     /// exhausted-search-space duplicate burst, a stale job — proves the
     /// miner reaches the difficulty, so it spends the evidence and the
-    /// session is held rather than walked down.
-    ///
-    /// (Originally written with `note_submission`, which encoded the
-    /// premise review finding 3 refuted: that ANY reject proves the target
-    /// was met. It does not — see
-    /// `below_target_rejects_do_not_spend_the_descent_evidence`.)
+    /// session is held rather than walked down. Below-target rejects are
+    /// different; see `below_target_rejects_do_not_spend_the_descent_evidence`.
     #[test]
     fn rejects_that_reached_the_target_hold_the_descent() {
         let clock = TestClock::new(1_000);
@@ -2066,12 +1843,10 @@ mod tests {
         assert!(diff < 65_536.0, "descent must resume after the storm ends");
     }
 
-    /// The regression this feature would otherwise create. The bootstrap
-    /// divides accumulated work by elapsed time; a stretch spent at an
-    /// unreachable difficulty contributes time but no observable work, so
-    /// leaving it in the denominator makes the first share after a long
-    /// descent read far slower than the miner is — and drives the
-    /// difficulty down again instead of settling it.
+    /// The bootstrap divides accumulated work by elapsed time; time spent at
+    /// an unreachable difficulty holds no observable work, so it must not
+    /// sit in the denominator and make the first share after a descent read
+    /// far slower than the miner is.
     #[test]
     fn the_first_share_after_a_descent_is_not_diluted_by_the_silence() {
         let clock = TestClock::new(1_000);
@@ -2142,9 +1917,8 @@ mod tests {
         );
     }
 
-    /// Review regression (finding 5): the up-step cap charged a proving
-    /// interval per 8×, not once. A genuine 128× rate jump then took three
-    /// intervals — 12 minutes of flooding at the shipped 240 s cadence.
+    /// The up-step cap charges a proving interval once, not per 8×: a
+    /// genuine 128× rate jump reaches equilibrium within two intervals.
     #[test]
     fn a_proven_raise_is_not_rationed_at_eight_times_per_interval() {
         let clock = TestClock::new(0);
@@ -2188,11 +1962,9 @@ mod tests {
         );
     }
 
-    /// Review regression (finding 6): the descent floor must track the
-    /// highest difficulty the session has ever carried. Latched at
-    /// construction, a later raise left it stranded — a session opened at
-    /// 16384 and raised to 500000 could be walked ~7800× down instead of
-    /// the 256× the constant promises.
+    /// The descent floor tracks the highest difficulty the session has ever
+    /// carried, so a later raise keeps the 256× bound relative to the
+    /// difficulty in force.
     #[test]
     fn the_descent_floor_follows_a_later_raise() {
         let clock = TestClock::new(1_000);
@@ -2215,12 +1987,9 @@ mod tests {
         );
     }
 
-    /// Review regression (finding 1, MEASURED as a 32–64× RAISE): moving
-    /// the bootstrap anchor detached that branch from the warmup gate,
-    /// which is anchored at engine start. An assignment landing shortly
-    /// before a tick left a window of milliseconds; one share divided by it
-    /// read as an enormous hashrate, and this branch carries NO up-step cap
-    /// by design, so it went straight to the wire.
+    /// A bootstrap anchor moved shortly before the first share leaves a
+    /// window of milliseconds; the branch has no up-step cap, so it must
+    /// hold until that window spans a warmup rather than propose a raise.
     #[test]
     fn a_freshly_moved_bootstrap_anchor_cannot_manufacture_a_raise() {
         for gap_ms in [1u64, 200, 500, 5_000, 59_000] {
@@ -2239,11 +2008,9 @@ mod tests {
         }
     }
 
-    /// Review regression (finding 3): a below-target reject is the miner
-    /// telling us it cannot clear the bar — the exact symptom the descent
-    /// corrects. Spending the evidence on it pinned `S` to the gap between
-    /// two rejects, so the difficulty never fell and the feature missed
-    /// precisely the sessions it was built for.
+    /// A below-target reject shows the miner cannot clear the bar, which is
+    /// what the descent corrects, so it must not spend the evidence; a
+    /// reject that did clear the bar must.
     #[test]
     fn below_target_rejects_do_not_spend_the_descent_evidence() {
         let clock = TestClock::new(1_000);
@@ -2313,11 +2080,10 @@ mod tests {
     /// - missed RAISE → stored is too LOW → `S` grows too fast → descends
     ///   too MUCH. NOT harmless.
     ///
-    /// This pins both directions so the asymmetry is visible, and it is why
-    /// every raising path (`handle_update_channel`, SV1
-    /// `mining.suggest_difficulty`, the cpuminer fallback, the vardiff
-    /// retarget) must call the hook — the no-share branch itself can only
-    /// ever propose a decrease, so it cannot create this case on its own.
+    /// This is why every raising path (`UpdateChannel`, SV1
+    /// `mining.suggest_difficulty`, the SV1 cpuminer fallback, the vardiff
+    /// retarget) must call the hook;
+    /// the no-share branch itself only ever proposes a decrease.
     #[test]
     fn a_missed_assignment_hook_errs_toward_descending_too_little() {
         // Missed LOWERING: engine still believes 1024, caller is at 64.
@@ -2353,14 +2119,9 @@ mod tests {
         assert_eq!(e.suggested_difficulty(100_000.0), None);
     }
 
-    /// The cap must survive the ladder. Rounding happens AFTER the cap, so a
-    /// cap that is not itself a rung gets stepped over and the "at most 8×"
-    /// guarantee silently disappears.
-    ///
-    /// Regression for exactly that: with `client_difficulty = 48` the raw cap is
-    /// 384, which is not a power of two. Capping at 384 and then rounding up
-    /// yields 512 — 10.7× the current difficulty, past the bound the constant
-    /// promises.
+    /// The cap must survive the ladder: rounding happens AFTER the cap, so a
+    /// raw cap of 384 (`client_difficulty = 48`) would round up to 512,
+    /// past the 8× bound.
     #[test]
     fn up_step_cap_survives_the_power_of_two_ladder() {
         let clock = TestClock::new(1_000);
@@ -2385,10 +2146,10 @@ mod tests {
 
     #[test]
     fn up_step_cap_bounds_burst_inflated_windows() {
-        // A window whose samples all arrive in one bundle (a JDC draining
-        // its optimistic-mining cache) implies an absurd rate over a tiny
-        // span. The cap limits the resulting jump to 8× per retarget; the
-        // uncapped engine would leap 96×.
+        // A window whose samples all arrive in one bundle (a job-declaration
+        // client flushing its optimistic-mining shares) implies an absurd
+        // rate over a tiny span. The cap limits the resulting jump to 8× per
+        // retarget; the uncapped engine would leap 96×.
         let clock = TestClock::new(1_000);
         let mut on = eased_engine(&clock);
         let mut off = VarDiffEngine::new(&clock, 6.0, 0.00001);
@@ -2405,13 +2166,11 @@ mod tests {
 
     #[test]
     fn recovery_converges_without_a_sawtooth() {
-        // The v1 killer, replayed as a closed-loop regression: a healthy
-        // session throttles 10×, goes silent, gets eased down — and then
-        // resumes submitting. v1 snapped back to the pre-silence
-        // difficulty and re-stranded the miner three times over. Here the
-        // recovery may wobble once (first share briefly re-trusts the
-        // last measured rate, capped at 8×), then must settle near the
-        // throttled equilibrium and stay.
+        // Closed loop: a healthy session throttles 10×, goes silent, gets
+        // eased down, then resumes submitting. The recovery may wobble once
+        // (the first share briefly re-trusts the last measured rate, capped
+        // at 8×), must never snap back to the pre-silence difficulty, and
+        // must settle near the throttled equilibrium.
         let clock = TestClock::new(1_000);
         let mut e = eased_engine(&clock);
         fill_equilibrium(&mut e, &clock);
@@ -2452,7 +2211,7 @@ mod tests {
         // Settled near the throttled equilibrium (10.24 d/s × 10 s target
         // gap ≈ 102 → parked around 48..192 by the deadband), and the
         // excursions are over: at most ONE proposal above 256 in the
-        // whole recovery (v1 produced a >2048 spike per cycle, thrice).
+        // whole recovery.
         assert!(
             (48.0..=192.0).contains(&client),
             "must settle near the throttled equilibrium, got {client}"
@@ -2464,23 +2223,20 @@ mod tests {
         );
     }
 
-    // ── review regressions (v2 max review) ────────────────────────────
+    // ── silence easing edge cases ─────────────────────────────────────
 
     #[test]
     fn zero_span_window_holds_instead_of_sinking() {
-        // Review finding: a full (>=5-sample) window whose shares all share
-        // one millisecond (closed_ms == 0, a drained JDC burst) bypassed the
-        // 16x descent floor, so the 1/T decay sank the session to the floor
-        // and it flooded on return. Fix: a zero-span window carries no
-        // measurable rate, so easing holds the difficulty instead.
+        // A full window whose shares all carry one millisecond
+        // (closed_ms == 0) has no measurable rate and no pre-silence rate
+        // to floor against, so easing holds the difficulty.
         let clock = TestClock::new(1_000);
         let mut e = eased_engine(&clock);
         for _ in 0..30 {
             e.update_hash_rate(1024.0, true); // no clock advance → all one ms
         }
         assert_eq!(e.cache_len(), VARDIFF_CACHE_SIZE);
-        // Two days of silence: the buggy version returned a target sinking
-        // toward min_difficulty; the fix holds.
+        // Two days of silence: still held.
         clock.advance_ms(48 * 3_600_000);
         assert_eq!(
             e.suggested_difficulty(1024.0),
@@ -2500,11 +2256,9 @@ mod tests {
 
     #[test]
     fn bootstrap_convergence_is_not_capped_by_easing() {
-        // Review finding: cap_up_step throttled EVERY upward retarget when
-        // easing was on, including the under-sampled bootstrap's documented
-        // one-step convergence — so a fast miner starting far too low crept
-        // up 8x per interval instead of jumping to equilibrium. Fix: the cap
-        // no longer guards the bootstrap path. On/off must now agree there.
+        // The up-step cap does not guard the under-sampled bootstrap, so a
+        // fast miner starting far too low jumps to equilibrium in one step
+        // and on/off agree there.
         let clock = TestClock::new(0);
         let mut on = eased_engine(&clock);
         let mut off = VarDiffEngine::new(&clock, 6.0, 0.00001);
@@ -2525,7 +2279,7 @@ mod tests {
             "under-sampled path"
         );
         // Check at the instant of the last share: tail is 0, so no decay —
-        // this isolates the cap removal from the (correct) silence decay.
+        // this isolates the cap from the silence decay.
         let up_on = on.suggested_difficulty(1.0).expect("must retarget up");
         let up_off = off.suggested_difficulty(1.0).expect("must retarget up");
         assert_eq!(
@@ -2540,9 +2294,8 @@ mod tests {
 
     #[test]
     fn note_submission_is_inert_when_easing_off() {
-        // The gate that keeps the default path byte-identical: with easing
-        // off, note_submission neither reads the clock nor arms the silence
-        // sensor, so it can never influence a (disabled) eased read.
+        // With easing off, note_submission neither reads the clock nor arms
+        // the silence sensor, so it cannot influence the default path.
         let clock = TestClock::new(1_000);
         let mut off = VarDiffEngine::new(&clock, 6.0, 0.00001);
         populate_cache(&mut off, &clock, 30, 1024.0);

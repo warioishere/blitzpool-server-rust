@@ -4,9 +4,8 @@
 //!
 //! Key layout (`{groupId}` is the UUID of the `pplns_group` row):
 //!
-//! - `groupsolo:{groupId}:counter` — LEGACY. Scored the dedup zset until
-//!   that moved to the share's own timestamp; nothing reads it now, and the
-//!   reset paths still delete it so old keys do not linger.
+//! - `groupsolo:{groupId}:counter` — unused; the reset paths delete it so
+//!   stale keys do not linger.
 //! - `groupsolo:{groupId}:total` — float string, Σ diff in round
 //! - `groupsolo:{groupId}:by-address` — hash `addr → diff` aggregate
 //! - `groupsolo:{groupId}:rejected-shares` — hash `addr → diff` rejected
@@ -24,18 +23,16 @@
 //! round-stats view divides rejected by accepted work of the SAME period.
 //! The reset paths clean both layouts.
 //!
-//! Two reset paths exist (PROP semantics; `Window` groups skip the per-block
-//! gate entirely):
+//! Two reset paths (`Window` groups skip the per-block gate entirely):
 //!
 //! `reset_for_block_found` wipes total, by-address, rejected-shares,
-//! best-share, and all per-finder snapshots, but preserves
-//! `last-accepted-share-at` (PROP semantics: inactivity clock survives
-//! across blocks) and `applied` (the dedup set — see [`key_applied`]).
+//! best-share and all per-finder snapshots, but keeps
+//! `last-accepted-share-at` (the inactivity clock survives across blocks)
+//! and `applied` (the dedup set, see [`key_applied`]).
 //!
-//! `reset_full` wipes everything including `last-accepted-share-at` —
-//! except `applied`, which must outlive a reset so an un-ACKed satellite
-//! batch is not reapplied into the fresh round.
-//! Used by the scheduled (calendar-aligned) cron reset path.
+//! `reset_full` (scheduled cron reset) also wipes `last-accepted-share-at`,
+//! but still keeps `applied` so an un-ACKed satellite batch is not
+//! reapplied into the fresh round.
 
 pub mod snapshot;
 
@@ -49,10 +46,9 @@ use tracing::warn;
 
 // ── Key helpers ─────────────────────────────────────────────────────
 
-/// Produce the `groupsolo:{group_id}:{suffix}` key. `group_id` is
-/// caller-provided (typically the UUID string of the `pplns_group`
-/// row); we don't impose a shape so admin tooling can use a
-/// well-known sentinel for tests.
+/// Produce the `groupsolo:{group_id}:{suffix}` key. `group_id` is usually
+/// the `pplns_group` row's UUID; no shape is imposed so tests and admin
+/// tooling can use a sentinel.
 fn key(group_id: &str, suffix: &str) -> String {
     format!("groupsolo:{group_id}:{suffix}")
 }
@@ -78,18 +74,12 @@ pub fn key_best_share(group_id: &str) -> String {
 /// Dedup zset `share_id → timestamp_ms` for exactly-once `record_share`,
 /// per group. Capped to the newest `DEDUP_KEEP` ids by rank.
 ///
-/// Scored by the SHARE'S OWN accept time, not by the per-group counter it
-/// used to use. The score's only job is rank ordering for the trim, and a
-/// counter-based one forced this zset to be wiped by every round reset
-/// (a reset zeroes the counter, so surviving high scores would have trimmed
-/// fresh low-scored markers). Wiping it meant a satellite batch that was
-/// dispatched but not yet ACKed got REAPPLIED into the fresh round on
-/// redelivery. A timestamp is monotonic across resets, so this set now
-/// survives them — matching PPLNS, whose `pplns:applied` was never reset.
+/// Scored by the share's own accept time: the score only orders the trim,
+/// and a timestamp stays monotonic across round resets, so this set can
+/// survive them (like PPLNS's `pplns:applied`). A dispatched but un-ACKed
+/// satellite batch is then still deduped after a reset.
 ///
-/// Slight disorder between producers is harmless here: at a 100 000-deep
-/// horizon, trimming a marginally newer marker before a marginally older
-/// one changes nothing.
+/// Slight disorder between producers is harmless at a 100 000-deep horizon.
 pub fn key_applied(group_id: &str) -> String {
     key(group_id, "applied")
 }
@@ -97,11 +87,10 @@ pub fn key_applied(group_id: &str) -> String {
 // ── Window-mode keys (PayoutMode::Window only) ──────────────────────
 //
 // A `Window`-mode group keeps its payout distribution in a sliding TIME
-// window instead of a single PROP round. Layout mirrors the count-bucketed
-// PPLNS window but is **time-bucketed** (bucket id = `floor(now_ms /
-// WINDOW_BUCKET_MS)`) and trimmed by AGE, all under the per-group
+// window instead of a PROP round: time-bucketed (bucket id =
+// `floor(now_ms / WINDOW_BUCKET_MS)`), trimmed by age, all under the
 // `groupsolo:{id}:` prefix so backup/restore (SCAN MATCH `groupsolo:*`)
-// covers it automatically. The window has two lanes of identical shape:
+// covers it. Two lanes of identical shape:
 //
 // - `groupsolo:{id}:wbuckets` — zset, score = member = bucket id (FIFO by time)
 // - `groupsolo:{id}:wbucket:{bid}` — hash `addr → Σdiff` for that time bucket
@@ -109,12 +98,11 @@ pub fn key_applied(group_id: &str) -> String {
 //   window aggregate, maintained lock-step with the buckets in Lua
 //
 // and, for rejected work, `wrbuckets` / `wrbucket:{bid}` / `window:rejected`.
-// The rejected lane feeds only the round-stats view, never a payout, but it
-// is trimmed by the same window as the accepted lane: a rate computed from
-// a windowed numerator and an unbounded denominator (what the plain
-// `rejected-shares` tally would give) is not a rate of anything.
+// The rejected lane feeds only the round-stats view, never a payout. It is
+// trimmed by the same window so the reject rate compares one period with
+// itself.
 //
-// `applied` (the dedup set) is reused from the PROP layout so the
+// `applied` (the dedup set) is shared with the PROP layout, so the
 // exactly-once contract is identical across modes.
 
 /// The two sliding-window lanes of a `Window`-mode group. Same bucket /
@@ -174,32 +162,27 @@ pub fn key_window_by_address(group_id: &str) -> String {
     WindowLane::Accepted.aggregate_key(group_id)
 }
 
-/// Time-bucket granularity for the sliding window: 1 hour. A 1-day window is
-/// 24 buckets, a 30-day window 720 — storage is O(buckets × miners), not
-/// O(shares). Fixed constant (not config) so the bucket math is stable across
-/// a window-length change; the bound is enforced by being a `const`.
+/// Time-bucket granularity for the sliding window: 1 hour. Storage is
+/// O(buckets × miners), not O(shares). A constant, not config, so bucket ids
+/// stay stable across a window-length change.
 pub const WINDOW_BUCKET_MS: i64 = 60 * 60 * 1000;
 
-/// How many recent `share_id`s the per-group dedup set retains. Mirrors
-/// the PPLNS window horizon — only un-acked in-flight shares are ever
-/// redelivered, so a few-thousand horizon is ample; 100k is negligible.
+/// How many recent `share_id`s the per-group dedup set retains. Only
+/// un-acked in-flight shares are ever redelivered, so this is ample.
 const DEDUP_KEEP: i64 = 100_000;
 
 /// Atomic, optionally-idempotent append of one accepted Group-Solo share.
-/// Round state is the per-address aggregate only (no per-share zset — PROP
-/// needs sums, not individual shares). `KEYS[1]`=total, `[2]`=by-address,
+/// Round state is the per-address aggregate only (PROP needs sums, not
+/// individual shares). `KEYS[1]`=total, `[2]`=by-address,
 /// `[3]`=last-accepted-share-at, `[4]`=applied. `ARGV[1]`=difficulty (string),
 /// `[2]`=address, `[3]`=timestamp_ms (string),
-/// `[4]`=share_id (empty ⇒ no dedup), `[5]`=keep-count. Same exactly-once
-/// contract as the PPLNS window: with a
-/// `share_id`, a redelivered share is a no-op and the marker is recorded in
-/// the same script, so a consumer crash between apply and ack can't
-/// double-count the round. No trim — Group-Solo is a PROP round.
+/// `[4]`=share_id (empty ⇒ no dedup), `[5]`=keep-count. With a `share_id`, a
+/// redelivered share is a no-op and the marker is recorded in the same
+/// script, so a consumer crash between apply and ack cannot double-count.
 /// Returns 1 on append, 0 on a deduped no-op.
 ///
-/// `timestamp_ms` does double duty: the `last-accepted-share-at` touch and
-/// the dedup marker's score — see [`key_applied`] for why that is not the
-/// counter any more.
+/// `timestamp_ms` is both the `last-accepted-share-at` value and the dedup
+/// marker's score (see [`key_applied`]).
 const RECORD_SHARE_LUA: &str = r#"
 local has_dedup = ARGV[4] ~= ''
 if has_dedup and redis.call('ZSCORE', KEYS[4], ARGV[4]) then
@@ -223,11 +206,9 @@ return 1
 /// `[5]`=bucket_id,
 /// `[6]`=timestamp_ms (also the dedup marker's score — see [`key_applied`]).
 ///
-/// Aggregates the share into its time bucket + the window aggregate +
-/// registers the bucket in the index zset, all indivisibly so a snapshot taken
-/// mid-write can't see a partial update. Same exactly-once contract as the PROP
-/// `RECORD_SHARE_LUA`: with a `share_id`, a redelivered share is a deduped
-/// no-op. Returns 1 on append, 0 on a deduped no-op.
+/// Bucket, window aggregate and index are updated indivisibly so a snapshot
+/// taken mid-write cannot see a partial update. Same exactly-once contract
+/// as `RECORD_SHARE_LUA`. Returns 1 on append, 0 on a deduped no-op.
 const RECORD_SHARE_WINDOWED_LUA: &str = r#"
 local has_dedup = ARGV[3] ~= ''
 if has_dedup and redis.call('ZSCORE', KEYS[1], ARGV[3]) then
@@ -252,17 +233,14 @@ return 1
 /// Decrements window:by-address by exactly the dropped bucket's per-address
 /// contribution. Returns `{dropped, underflowed}`: `dropped` is 1 when a
 /// bucket went and 0 when the oldest bucket is still within the window (or
-/// none exist) — the caller loops until it sees 0. Single-instance Valkey
-/// (not cluster), so building the bucket key from a prefix inside the
-/// script is safe.
+/// none exist); the caller loops until it sees 0. Building the bucket key
+/// inside the script is safe because Valkey runs single-instance, not cluster.
 ///
 /// Near-zero AND negative remainders are `HDEL`ed, the same rule as the
-/// PPLNS trim (`bp-pplns-engine`'s `TRIM_BATCH_LUA`, which explains the
-/// cause). A negative one can only come from a bucket that is ahead of
-/// the aggregate — the per-key backup restores them from different
-/// instants — and left in place it would swallow the address's next
-/// shares until they climbed back over zero. `underflowed` counts those
-/// addresses so the skew is heard rather than cleaned up silently.
+/// PPLNS trim. A negative one means a bucket is ahead of the aggregate (the
+/// per-key backup restores them from different instants); left in place it
+/// would swallow the address's next shares. `underflowed` counts those
+/// addresses so the skew is logged, not cleaned up silently.
 const TRIM_WINDOW_LUA: &str = r#"
 local oldest = redis.call('ZRANGE', KEYS[1], 0, 0)
 if #oldest < 1 then return {0, 0} end
@@ -295,11 +273,8 @@ return {1, underflowed}
 /// `KEYS[1]`=wrbuckets (index zset), `[2]`=window:rejected, `[3]`=wrbucket:{bid}.
 /// `ARGV[1]`=difficulty (string), `[2]`=address, `[3]`=bucket_id.
 ///
-/// The rejected lane has no dedup (rejects carry no share id — the pool
-/// never acks them, so nothing redelivers them) and no `last-accepted`
-/// touch (a reject is not an accepted share). That is why this is not
-/// `RECORD_SHARE_WINDOWED_LUA` with empty arguments: those two steps are
-/// what the accepted lane does on top of the bucket append.
+/// No dedup (rejects carry no share id and are never redelivered) and no
+/// `last-accepted` touch (a reject is not an accepted share).
 const RECORD_REJECT_WINDOWED_LUA: &str = r#"
 redis.call('HINCRBYFLOAT', KEYS[3], ARGV[2], ARGV[1])
 redis.call('ZADD', KEYS[1], ARGV[3], ARGV[3])
@@ -355,14 +330,12 @@ impl GroupRoundStore {
 
     /// Append one accepted share to the round, optionally exactly-once.
     ///
-    /// Runs the whole append (total/by-address increments + the
-    /// `last-accepted-share-at` touch, + the dedup marker) as one
-    /// indivisible Lua script (`RECORD_SHARE_LUA`) — same atomicity the old
-    /// `MULTI/EXEC` gave. With a `Some(share_id)` it also dedups: a
-    /// redelivered share whose id is still in the per-group dedup set is a
-    /// no-op, and the marker is recorded in the same script. `None` keeps
-    /// the plain append for direct round tests / admin tooling. No trim —
-    /// Group-Solo is a PROP round, wiped on block-found.
+    /// The whole append (total/by-address increments, the
+    /// `last-accepted-share-at` touch, the dedup marker) runs as one Lua
+    /// script (`RECORD_SHARE_LUA`). With `Some(share_id)` a redelivered
+    /// share still in the dedup set is a no-op; `None` is the plain append
+    /// for tests and admin tooling. No trim: a PROP round is wiped on
+    /// block-found.
     ///
     /// Returns `true` on a real append, `false` on a deduped no-op.
     pub async fn record_share(
@@ -431,9 +404,8 @@ impl GroupRoundStore {
     /// Trim the sliding window: drop every time bucket older than
     /// `window_ms` relative to `now_ms`, in BOTH lanes (accepted and
     /// rejected — one window, one age). Idempotent — a no-op when the window
-    /// is empty or all buckets are still fresh. Loops one bucket per script
-    /// call (like the PPLNS window) so any single Redis-blocking script stays
-    /// small while keeping per-bucket atomicity.
+    /// is empty or all buckets are still fresh. One bucket per script call
+    /// keeps each Redis-blocking script small while staying atomic per bucket.
     pub async fn trim_window(
         &self,
         group_id: &str,
@@ -521,13 +493,13 @@ impl GroupRoundStore {
             .collect())
     }
 
-    /// Mode-aware payout read — the single chokepoint every payout/audit/stats
-    /// reader funnels through so it automatically sees the right distribution:
+    /// Mode-aware payout read, the single chokepoint every payout/audit/stats
+    /// reader goes through so each sees the right distribution:
     ///
     /// - `Prop` → the per-round `by-address` aggregate ([`Self::read_by_address`]).
-    /// - `Window` → trim the window to `[now_ms - window_ms, now_ms]` first
-    ///   (so even an idle group's distribution is fenster-current at read time)
-    ///   then read the window aggregate ([`Self::read_window_by_address`]).
+    /// - `Window` → trim to `[now_ms - window_ms, now_ms]` first (so even an
+    ///   idle group's distribution is current at read time), then read the
+    ///   window aggregate ([`Self::read_window_by_address`]).
     pub async fn read_payout_shares(
         &self,
         group_id: &str,
@@ -544,13 +516,10 @@ impl GroupRoundStore {
         }
     }
 
-    /// Per-time-bucket, per-address contribution across the live window —
-    /// drives the `/api/pplns/groups/:id/window-timeline` chart. Trims first
-    /// (so the timeline matches the payout window), reads every remaining
-    /// bucket's `addr → diff` hash in a single pipelined round-trip, and
-    /// returns `(bucket_id, map)` oldest→newest (`bucket_id` is hours-since-
-    /// epoch, i.e. `timestamp_ms / WINDOW_BUCKET_MS`). Empty when the window
-    /// has no live buckets.
+    /// Per-time-bucket, per-address contribution across the live window, for
+    /// the `/api/pplns/groups/:id/window-timeline` chart. Trims first so the
+    /// timeline matches the payout window, and returns `(bucket_id, map)`
+    /// oldest→newest (`bucket_id` = `timestamp_ms / WINDOW_BUCKET_MS`).
     pub async fn read_window_timeline(
         &self,
         group_id: &str,
@@ -585,10 +554,9 @@ impl GroupRoundStore {
             .collect())
     }
 
-    /// Delete all `Window`-mode keys for a group (every live time bucket via
-    /// the index zset, plus the index zset + window aggregate). Folded into the
-    /// reset paths so a dissolve / scheduled-reset cleans window state too,
-    /// even though `Window` groups never hit the per-block reset gate.
+    /// Delete all `Window`-mode keys for a group (every live bucket via the
+    /// index zset, plus the index and aggregate). Part of both reset paths so
+    /// a dissolve or scheduled reset cleans window state too.
     async fn delete_window_keys(
         &self,
         conn: &mut ConnectionManager,
@@ -671,12 +639,9 @@ impl GroupRoundStore {
 
     /// Update the best-share record if `(address, difficulty,
     /// timestamp_ms)` strictly improves on the stored value. Returns
-    /// `true` when the record was replaced. Compare-and-swap via
-    /// Redis MULTI/EXEC + WATCH would be the strictly-correct
-    /// pattern; for the round-best-share we accept the tiny race
-    /// (two concurrent improvers, last write wins) — the round wipes
-    /// on block-found anyway, and a stale-by-microseconds best-share
-    /// is a cosmetic display issue, not a correctness one.
+    /// `true` when the record was replaced. Not a compare-and-swap: two
+    /// concurrent improvers race and the last write wins, which is only a
+    /// cosmetic display issue.
     pub async fn update_best_share_if_better(
         &self,
         group_id: &str,
@@ -706,9 +671,9 @@ impl GroupRoundStore {
 
     // ── Round-reset paths ──────────────────────────────────────────
 
-    /// Block-found reset: wipe round state but preserve
-    /// `last-accepted-share-at` (PROP semantics — inactivity clock
-    /// survives). Caller drains snapshots separately via
+    /// Block-found reset: wipe round state but keep
+    /// `last-accepted-share-at` (the inactivity clock survives). Caller
+    /// drains snapshots separately via
     /// [`snapshot::delete_all_for_group`].
     pub async fn reset_for_block_found(&self, group_id: &str) -> Result<(), RoundError> {
         let mut conn = self.conn.clone();
@@ -717,22 +682,11 @@ impl GroupRoundStore {
             key_by_address(group_id),
             key_rejected_shares(group_id),
             key_best_share(group_id),
-            // `key_applied` — the dedup zset — is deliberately NOT here.
-            //
-            // It used to be, and it had to be: the marker was scored by the
-            // per-group counter, which resets here, so stale high-scored
-            // entries would have made `ZREMRANGEBYRANK` trim freshly-added
-            // low-scored markers. But wiping it opened a hole PPLNS does not
-            // have (`pplns:applied` is never reset — its counter is
-            // monotonic): a batch of up to 256 shares dispatched by the
-            // satellite but not yet ACKed, with a reset landing in between,
-            // would be REAPPLIED into the fresh round on redelivery — work
-            // already accounted for in the round that was just wiped.
-            //
-            // The marker is scored by the share's own `timestamp_ms` now, so
-            // rank order survives a reset and the zset does not need to.
-            // `key_counter` stays in this list only to clear keys written by
-            // versions that scored by it; nothing reads it any more.
+            // `key_applied` (the dedup zset) is deliberately NOT here: a
+            // satellite batch dispatched but not yet ACKed when the reset
+            // lands would otherwise be reapplied into the fresh round on
+            // redelivery. Its timestamp scores keep rank order across resets.
+            // `key_counter` is unused and only cleared here.
             key_counter(group_id),
         ];
         let _: i64 = conn.del(keys).await?;
@@ -743,8 +697,8 @@ impl GroupRoundStore {
     }
 
     /// Scheduled (calendar-aligned) reset: wipe everything including
-    /// `last-accepted-share-at`. Caller deletes the group's balance
-    /// rows + per-finder snapshots separately.
+    /// `last-accepted-share-at`. Caller deletes the per-finder snapshots
+    /// separately.
     pub async fn reset_full(&self, group_id: &str) -> Result<(), RoundError> {
         let mut conn = self.conn.clone();
         let keys = vec![
@@ -753,8 +707,8 @@ impl GroupRoundStore {
             key_rejected_shares(group_id),
             key_best_share(group_id),
             key_last_accepted_share_at(group_id),
-            // NOT `key_applied` — see `reset_for_block_found` for why the
-            // dedup set must survive a reset. Legacy counter key only.
+            // NOT `key_applied`: see `reset_for_block_found`. The counter
+            // key is unused and only cleared here.
             key_counter(group_id),
         ];
         let _: i64 = conn.del(keys).await?;
@@ -767,9 +721,8 @@ impl GroupRoundStore {
     // ── Reads ──────────────────────────────────────────────────────
 
     /// Hot read of per-address contribution from the `by-address` hash
-    /// (O(distinct miners)) — the authoritative round state. There is no
-    /// per-share zset to fall back to: `record_share` maintains this hash on
-    /// every accepted share, and it has the same AOF durability the zset had.
+    /// (O(distinct miners)), the authoritative round state; `record_share`
+    /// maintains it on every accepted share.
     pub async fn read_by_address(
         &self,
         group_id: &str,
@@ -847,13 +800,8 @@ impl GroupRoundStore {
 
     // ── Member operations (admin-triggered) ────────────────────────
 
-    /// Subtract the address's contribution from the round (kick
-    /// flow). Returns the diff-1-weighted amount removed so the
-    /// caller can refund / redistribute as group policy dictates.
-    /// Return a fresh `ConnectionManager` clone for snapshot writes /
-    /// reads. The connection is multiplexed and cheap to clone;
-    /// distribution.rs uses this to call `snapshot::write_snapshot`
-    /// without holding the store's internal handle.
+    /// A `ConnectionManager` clone for snapshot writes/reads (multiplexed,
+    /// cheap to clone).
     pub fn connection_for_snapshot(&self) -> ConnectionManager {
         self.conn.clone()
     }
@@ -865,9 +813,9 @@ impl GroupRoundStore {
     /// removed from the payout source so the caller can log it; the rest of
     /// the group then splits proportionally between whoever is left.
     ///
-    /// The mode has to come from the caller: this store has no group row,
-    /// and a kick that only cleans the PROP keys leaves a Window member in
-    /// the coinbase until their buckets age out — that is what this replaced.
+    /// The mode comes from the caller because this store has no group row;
+    /// cleaning only the PROP keys would leave a Window member in the
+    /// coinbase until their buckets age out.
     pub async fn forget_member(
         &self,
         group_id: &str,
@@ -878,14 +826,10 @@ impl GroupRoundStore {
 
         let removed_diff = match mode {
             PayoutMode::Prop => {
-                // The member's round contribution IS their by-address
-                // aggregate — no per-share scan needed.
                 let removed_diff =
                     read_hash_f64(&mut conn, key_by_address(group_id), address).await?;
-                // Decrement total + drop the address's slots. Single pipeline
-                // for cross-key coherence (MULTI/EXEC not necessary because no
-                // concurrent caller mutates these for the same address during
-                // a kick — admin flow is serialized at the engine level).
+                // A plain pipeline suffices: admin flows are serialized at the
+                // engine level, so nothing else mutates this address meanwhile.
                 let mut pipe = redis::pipe();
                 if removed_diff > 0.0 {
                     pipe.cmd("INCRBYFLOAT")
@@ -907,10 +851,8 @@ impl GroupRoundStore {
                     address,
                 )
                 .await?;
-                // Every live bucket of both lanes, then the aggregates. The
-                // aggregate stays lock-step with its buckets: a later trim of
-                // a bucket that no longer holds the address decrements
-                // nothing for it.
+                // Every live bucket of both lanes, then the aggregates, so a
+                // later trim decrements nothing for this address.
                 let mut pipe = redis::pipe();
                 for lane in WindowLane::ALL {
                     let bucket_ids: Vec<i64> = conn.zrange(lane.index_key(group_id), 0, -1).await?;
@@ -924,9 +866,8 @@ impl GroupRoundStore {
             }
         };
 
-        // Shared tail: the inactivity clock and, if it pointed at this
-        // address, the best share (next share sets a fresh one; losing a
-        // best-share record is cosmetic, so read-then-DEL is enough).
+        // Inactivity clock, and the best share if it belongs to this address
+        // (cosmetic, so read-then-DEL is enough).
         let _: i64 = conn
             .hdel(key_last_accepted_share_at(group_id), address)
             .await?;

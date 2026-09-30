@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Crate-level error umbrella. Grows as modules land.
+//! Crate-level error umbrella.
 //!
-//! Per Design Principle 9: narrow per-module errors live with the
-//! module that produces them (`config::ConfigError` etc.); this enum
-//! only captures failures callers need to handle at the engine
-//! boundary. Each variant carries the underlying narrow error via
+//! Narrow per-module errors live with the module that produces them
+//! (`config::ConfigError` etc.); this enum only captures failures callers
+//! handle at the engine boundary, each wrapping its narrow error via
 //! `#[from]`.
 
 use crate::config::ConfigError;

@@ -3,9 +3,8 @@
 //! `/api/downstream-report` — in-memory store of SV2 JDC-downstream
 //! miner reports (5-min TTL, keyed by `jdcUserIdentity`).
 //!
-//! `storeReport` also pushes a vendor-derived userAgent into
-//! the matching client_entity row (`ClientService.updateSv2UserAgentByAddress`).
-//! That side-effect is wired via `bp_db::update_sv2_user_agent_by_address`.
+//! Storing a report also writes a vendor-derived userAgent into the
+//! matching client_entity rows via `bp_db::update_sv2_user_agent_by_address`.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -20,8 +19,7 @@ use crate::state::SharedState;
 
 const TTL_MS: i64 = 5 * 60 * 1000;
 
-/// In-memory report store. Process-global singleton — keeps the same
-/// semantics for `/api/downstream-report` GET visibility. Each entry
+/// In-memory report store, a process-global singleton. Each entry
 /// stores the report + receive timestamp; entries past TTL are dropped
 /// on every read.
 static STORE: Lazy<Mutex<HashMap<String, (DownstreamMinerReport, i64)>>> =

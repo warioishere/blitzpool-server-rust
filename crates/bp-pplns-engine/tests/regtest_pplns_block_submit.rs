@@ -7,37 +7,17 @@
 //! E2E: `PplnsEngine::build_distribution()` → multi-output coinbase →
 //! `bitcoin-node` accepts the block.
 //!
-//! Closes the gap that the existing `bp-mining-job` and
-//! `bp-stratum-v2` regtests left open: those test the coinbase-assembly
-//! and SV2 submit paths with hand-built payout lists, but never
-//! exercise the path where the PPLNS engine *itself* produces the
-//! N-output distribution that goes into the coinbase. A subtle math bug
-//! in the engine (rounding, dust-floor, fee subtraction, weight-budget
-//! adaptive trim) would produce a coinbase whose `outputs[i].value`
-//! sums don't match `coinbasevalue`, which bitcoin-core rejects with
-//! `bad-cb-amount` — undetectable without an end-to-end regtest like
-//! this one.
+//! Here the PPLNS engine itself produces the N-output distribution. Any
+//! engine math error (rounding, dust floor, fee, budget trim) that makes the
+//! output values miss `coinbasevalue` is rejected by bitcoin-core with
+//! `bad-cb-amount`, which only an end-to-end run shows.
 //!
-//! Sequence:
-//! 1. Bring up a real `bitcoin-node v31` regtest instance.
-//! 2. Connect a fresh Redis logical DB + PG (test prefix-isolated).
-//! 3. Spawn the PPLNS engine with the test infrastructure as backing.
-//! 4. Seed the window with three miner addresses at different share
-//!    weights (so the resulting distribution has three non-trivial
-//!    percentages).
-//! 5. Attach `TdpHandle`, drain the startup template pair, mine one
-//!    block for a fresh template at the post-IBD tip.
-//! 6. Call `build_distribution(coinbase_tx_value_remaining)` on the
-//!    engine — get back the payout list it would put in the coinbase.
-//! 7. Feed that payout list into `bp_mining_job::build_mining_job_from_tdp`,
-//!    construct the witness coinbase with zero extranonces, brute-force
-//!    a regtest-target nonce, submit via `TdpHandle::submit_solution`.
-//! 8. Assert chain tip advances by one — proves bitcoin-core accepted
-//!    the engine-built distribution.
+//! Sequence: seed three miners at different weights, attach the TDP, mine
+//! one block for a fresh template, build the engine's distribution for its
+//! reward, assemble and submit the block, and assert the tip advanced.
 //!
-//! Test gating:
-//! - Skips cleanly when bitcoin-node binary is missing.
-//! - Skips cleanly when local Redis (16379) or PG (15433) is not up.
+//! Skips when the bitcoin-node binary, Redis (16379) or PG (15433) is
+//! unavailable.
 
 use std::time::Duration;
 
@@ -61,12 +41,11 @@ use bp_test_support::{
     mine_and_submit_payouts, redis_db, wait_for_paired_template,
 };
 
-/// This binary's own numbering inside [`redis_db::RT_PPLNS_BLOCK_SUBMIT`].
-/// The three numbers only have to be distinct from each other — the base
-/// keeps them clear of every other test binary.
+/// This binary's own numbering inside [`redis_db::RT_PPLNS_BLOCK_SUBMIT`];
+/// the three numbers must be distinct from each other.
 const REDIS_TEST_DB: u8 = 0;
-/// Separate logical DB for the non-empty-merkle-path variant so it can run
-/// in parallel with the sibling test without colliding on FLUSHDB.
+/// Separate logical DB for the non-empty-merkle-path variant, which runs in
+/// parallel with the sibling test.
 const REDIS_TEST_DB_TXS: u8 = 1;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -93,8 +72,7 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
 
     // ── Three deterministic miner addresses + fee addr ────────────
     //
-    // Production runs with a fee_address (1.5%) configured. Mirror
-    // that so the engine's residuum path matches real-world behavior.
+    // A fee address is configured so the residuum path matches production.
     let addr_alice = deterministic_p2wpkh_regtest([0x11; 32]);
     let addr_bob = deterministic_p2wpkh_regtest([0x22; 32]);
     let addr_charlie = deterministic_p2wpkh_regtest([0x33; 32]);
@@ -102,12 +80,8 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
 
     // ── Spawn the PPLNS engine against the test backing ───────────
     //
-    // `window_size = window_factor × network_difficulty`. With the
-    // default `window_factor=4.0` and three seeded shares of 100, 200,
-    // 300 (sum=600), the network-difficulty needs to be ≥ 150 for the
-    // window to retain all three; we pick 1000 for comfortable
-    // headroom so the trimmer doesn't drop our oldest entries before
-    // `build_distribution` runs.
+    // `window_size = window_factor (4) × network_difficulty` must hold the
+    // seeded 600, so the difficulty needs to be >= 150; 1000 leaves headroom.
     let net_diff = NetworkDifficulty::new(1_000.0);
     let engine = PplnsEngine::spawn(
         test_engine_config(&addr_fee),
@@ -167,9 +141,7 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
         .build_distribution(reward_sats)
         .await
         .expect("build_distribution");
-    // The §4 evaluation at this template's revenue. Bit-exact shape:
-    // 3 seeded miners + the pool output → exactly 4 coinbase outputs
-    // (pool/fee first, then the share outputs).
+    // 3 seeded miners + the pool output -> exactly 4 outputs, pool first.
     let entries = dist
         .distribution
         .payout_entries_at(reward_sats)
@@ -196,9 +168,8 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
             "miner {miner} must appear in exactly one output (got {n})"
         );
     }
-    // Sanity-check the sat sums: the §4 vector consumes exactly the
-    // revenue (pay_P absorbs rounding), otherwise bitcoin-core would
-    // reject with `bad-cb-amount` regardless of any other math.
+    // The §4 vector consumes exactly the revenue (pay_P absorbs rounding),
+    // otherwise bitcoin-core rejects with `bad-cb-amount`.
     let total_payout_sats: u64 = entries.iter().map(|(_, s)| *s).sum();
     assert_eq!(
         total_payout_sats, reward_sats,
@@ -232,26 +203,17 @@ async fn pplns_three_miner_distribution_block_accepted_by_core() {
     tdp.shutdown().expect("TDP clean shutdown");
     node.shutdown().await.expect("regtest clean shutdown");
     cleanup_pplns_state(&pg, &payouts).await;
-    // The Redis DB is FLUSHDB'd at the next test run's connect; nothing
-    // to drain here. Wedging the shutdown signal lets the engine's
-    // background tasks see `cancelled` and exit gracefully before the
-    // test process exits.
-    let _ = Difficulty(1.0); // silence "unused" if a refactor drops the import
+    // The Redis DB is flushed at the next run's connect.
+    let _ = Difficulty(1.0); // keeps the import used
 }
 
-/// E2E with a NON-EMPTY merkle path: fund the mempool with real wallet
-/// transactions, wait for the TDP to emit a template that includes them
-/// (so `merkle_path` is non-empty), build the coinbase, reconstruct the
-/// root via `merkle_root_from_coinbase` over the real branch, and submit
-/// to bitcoin-core.
+/// E2E with a non-empty merkle path: fund the mempool with wallet
+/// transactions, wait for a template that includes them, reconstruct the
+/// root via `merkle_root_from_coinbase` over the real branch, and submit.
 ///
-/// The other block-submit regtests mine on an empty mempool, so their
-/// `merkle_path` is empty and the merkle fold is the trivial identity
-/// (root == coinbase txid). This is the only test that exercises the
-/// merkle-branch combination loop end-to-end against real bitcoin-core —
-/// a byte-order or sibling-concatenation bug in `merkle_root_from_coinbase`
-/// would make the header's merkle root mismatch the block's transactions
-/// and bitcoin-core would reject the submission (stuck tip).
+/// The other block-submit regtests mine on an empty mempool, where the
+/// merkle fold is the identity; this one pins the branch combination
+/// (byte order, sibling concatenation) against bitcoin-core.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn pplns_block_with_real_txs_nonempty_merkle_path_accepted_by_core() {
@@ -331,9 +293,8 @@ async fn pplns_block_with_real_txs_nonempty_merkle_path_accepted_by_core() {
         .expect("mine 1 for a fresh template");
     let (_empty_template, prev_hash) = wait_for_paired_template(&mut rx).await;
 
-    // ── Fund the mempool: several wallet txs so the next template carries
-    //    a non-empty merkle path. The node's matured coinbase (from the
-    //    101-block warmup) funds these sends. ──
+    // ── Fund the mempool from the matured warmup coinbase so the next
+    //    template carries a non-empty merkle path. ──
     for _ in 0..4 {
         let dest = node.new_address("bech32").await.expect("dest address");
         node.wallet_call("sendtoaddress", serde_json::json!([dest, 0.01]))
@@ -341,8 +302,8 @@ async fn pplns_block_with_real_txs_nonempty_merkle_path_accepted_by_core() {
             .expect("sendtoaddress");
     }
 
-    // The tip hasn't moved (we didn't mine), so `prev_hash` still applies;
-    // wait for the mempool-delta template that now includes our txs.
+    // The tip has not moved, so `prev_hash` still applies; wait for the
+    // mempool-delta template that includes the new txs.
     let template = wait_for_template_with_txs(&mut rx).await;
     assert!(
         !template.merkle_path.is_empty(),
@@ -404,8 +365,7 @@ async fn wait_for_template_with_txs(rx: &mut broadcast::Receiver<TemplateUpdate>
 }
 
 async fn cleanup_pplns_state(pool: &PgPool, payouts: &[PayoutEntry]) {
-    // Delete only the balance rows for the addresses the test seeded;
-    // leaves any other lingering rows alone.
+    // Only the rows for the addresses this test seeded.
     for p in payouts {
         let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
             .bind(&p.address)
@@ -416,13 +376,10 @@ async fn cleanup_pplns_state(pool: &PgPool, payouts: &[PayoutEntry]) {
 
 fn test_engine_config(fee_addr: &str) -> PplnsEngineConfig {
     PplnsEngineConfig {
-        // Disable the daily dust sweep + push the touch-buffer flush
-        // out to an hour so neither background task fires during the
-        // short test window.
+        // Neither background task may fire during the test.
         dust_sweep_enabled: false,
         touch_flush_interval_secs: 3_600,
-        // Match production: PPLNS deployments always have a fee
-        // address and a non-zero fee percent configured.
+        // PPLNS deployments always have a fee address and a non-zero fee.
         fee_address: Some(AddressId::new(fee_addr.to_string()).expect("fee addr valid")),
         fee_percent: 1.5,
         min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
@@ -430,14 +387,11 @@ fn test_engine_config(fee_addr: &str) -> PplnsEngineConfig {
     }
 }
 
-// Silence the unused `AddressId` import if a refactor drops the only
-// call site above. Kept on the import list so future test cases that
-// need it don't have to re-add.
+// Keeps the `AddressId` import used.
 #[allow(dead_code)]
 fn _force_addr_id(_: AddressId) {}
 
-/// The `TdpCoinbaseTemplate` view of a `NewTemplate`. Pure field lowering —
-/// extracted because all three tests in this file need the identical literal.
+/// The `TdpCoinbaseTemplate` view of a `NewTemplate`.
 fn coinbase_template_from(t: &NewTemplate) -> TdpCoinbaseTemplate<'_> {
     TdpCoinbaseTemplate {
         coinbase_prefix: &t.coinbase_prefix,
@@ -453,19 +407,13 @@ fn coinbase_template_from(t: &NewTemplate) -> TdpCoinbaseTemplate<'_> {
 /// Separate logical DB for the coinbase↔ledger equality variant.
 const REDIS_TEST_DB_LEDGER: u8 = 2;
 
-/// E2E: the ledger books exactly what the block's coinbase paid — even
-/// after a later distribution build displaced the shared snapshot key.
+/// E2E: the ledger books exactly what the block's coinbase paid, even
+/// after a later distribution build (a JD-client-style request, or a
+/// template refresh) ran. Booking resolves through the job's fingerprint,
+/// not through whatever build came last.
 ///
-/// This is the end-to-end form of the bug the fingerprint keying exists for.
-/// The pool builds the job a block is mined on; some other build (here a
-/// JD-client-style request for its own payout value, in production also a
-/// plain template refresh) then overwrites `pplns:snapshot`. Reading that key
-/// at block-found yields a distribution belonging to no block, and the reward
-/// check refuses — the found block's payout is never applied.
-///
-/// Asserted here against a real accepted block: every `coinbase` audit row
-/// the ledger wrote corresponds byte-for-byte to an output of the coinbase
-/// transaction bitcoin-core accepted — same scriptPubKey, same satoshis.
+/// Every `coinbase` audit row must match an output of the accepted coinbase
+/// by scriptPubKey and satoshis.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
     use bitcoin::consensus::Decodable;
@@ -603,7 +551,6 @@ async fn ledger_books_exactly_what_the_accepted_coinbase_paid() {
         .on_block_found(accepted.height as i32, &actual, None, Some(fingerprint))
         .await
         .expect("the mined job's own distribution must resolve for booking");
-    // (apply happens inside on_block_found now)
 
     // ── The ledger must match the coinbase the chain accepted ────
     let rows: Vec<(String, i64)> = sqlx::query_as(

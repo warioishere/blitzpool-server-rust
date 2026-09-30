@@ -4,8 +4,8 @@
 #![allow(clippy::needless_return)]
 
 //! Which addresses the best-difficulty cron scans:
-//! `find_best_difficulty_scan_addresses` against the push-only
-//! `find_addresses_with_push_subscription` it replaced there.
+//! `find_best_difficulty_scan_addresses`, compared with the push-only
+//! `find_addresses_with_push_subscription`.
 
 use bp_common::AddressId;
 use bp_db::{
@@ -72,10 +72,9 @@ fn addr(s: &str) -> AddressId {
     AddressId::new(s.to_string()).expect("valid test AddressId")
 }
 
-/// An address subscribed on Telegram or ntfy alone is scanned — the push-only
-/// query the cron used before never saw it, so it never got a best-diff
-/// message whatever its flag said. Asserted against that query in the same
-/// test, so the gap it closes is pinned rather than assumed.
+/// An address subscribed on Telegram or ntfy alone is scanned. The push-only
+/// query is asserted in the same test to miss it, so the difference between
+/// the two is pinned rather than assumed.
 ///
 /// Also: a Telegram row with best-diff switched OFF is still scanned (the
 /// flag is checked at send time; the scan keeps the tracker baseline
@@ -131,7 +130,7 @@ async fn best_diff_scan_covers_every_transport() {
 
     let has = |set: &[String], a: &str| set.iter().any(|s| s == a);
 
-    // The gap: the old source misses Telegram- and ntfy-only addresses.
+    // The push-only query misses Telegram- and ntfy-only addresses.
     assert!(
         !has(&push_only, TELEGRAM_ONLY) && !has(&push_only, NTFY_ONLY),
         "precondition: the push-only query does not see Telegram/ntfy-only addresses"

@@ -188,9 +188,8 @@ impl AddressId {
 /// wallets may present them uppercase (QR-code optimization) but the
 /// canonical wire form is lowercase. Legacy P2PKH / P2SH (base58) IS
 /// case-sensitive — different cases are different addresses with
-/// different checksums — and is left untouched. Lowercasing everything
-/// instead once mangled Base58 addresses, so a verified legacy address
-/// never matched its own row.
+/// different checksums — and is left untouched, or a legacy address would
+/// never match its own row.
 ///
 /// Whitespace is trimmed. Empty input maps to empty output.
 pub fn normalize_btc_address(address: &str) -> String {
@@ -317,9 +316,8 @@ impl FromStr for MiningMode {
 /// pool runs one stream per reservation class against a single bitcoind
 /// (separate IPC connections).
 ///
-/// **Phase 2** gives every non-PPLNS payout mode its own fixed-reservation
-/// stream: `Solo` (1–2 outputs), `GroupSolo` (member-count sized), and
-/// `Blockparty` (member-count sized). Only `Pplns` is PPLNS-autoscaled, and
+/// Every non-PPLNS payout mode has its own fixed-reservation stream:
+/// `Solo` (1–2 outputs), `GroupSolo` and `Blockparty` (member-count sized). Only `Pplns` is PPLNS-autoscaled, and
 /// it serves PPLNS exclusively (it is also the default/boot stream).
 ///
 /// [`StreamKind::for_mode`] is the **single source of truth** for the
@@ -401,27 +399,13 @@ pub struct UnknownMiningModeError(pub String);
 ///
 /// `i64` and not `u64` because this is the width the values are stored and
 /// compared at: Postgres `bigint` columns, and [`LogThrottle::allow`] below.
-/// Converting at every boundary is what five separate crates were doing.
 ///
-/// It was five byte-identical copies (`bp-api`, `bp-blockparty-engine`,
-/// `bp-group-mgmt-engine`, `bp-session-persistence`, `bp-share-hook`) plus two
-/// more in tests. Identical copies do not announce themselves when one of them
-/// changes, which is the whole reason they are one function now.
+/// **Not a clock abstraction**: it reads the system clock and cannot be
+/// substituted in a test. For controllable time use `bp_vardiff::Clock`
+/// (epoch-ms `u64`) or `bp_cron_utils::Clock` (`chrono::DateTime<Utc>`).
+/// Where data carries its own timestamp (a share's `ts_ms`), prefer that.
 ///
-/// **This is not a clock abstraction and must not become one.** It reads the
-/// system clock at the call site and cannot be substituted in a test. The pool
-/// has two injectable clocks and they stay where they are: `bp_vardiff::Clock`
-/// for epoch-ms `u64` (Stratum session state, vardiff, the JDP server) and
-/// `bp_cron_utils::Clock` for `chrono::DateTime<Utc>` (calendar-aligned
-/// scheduling). A caller that needs to control time in a test wants one of
-/// those, not this.
-///
-/// Note also what the code around here does instead wherever it can: it takes
-/// the timestamp that travelled WITH the data. The one production caller of
-/// [`LogThrottle::allow`] passes a share's own `ts_ms`, not a reading of now.
-///
-/// Saturates to 0 if the system clock is before the epoch, which is the same
-/// answer every copy gave.
+/// Saturates to 0 if the system clock is before the epoch.
 pub fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -499,10 +483,9 @@ impl LogThrottle {
 macro_rules! warn_throttled {
     ($throttle:expr, $now_ms:expr, $($fields:tt)+) => {
         if let Some(suppressed) = $throttle.allow($now_ms) {
-            // `$crate::tracing`, not `::tracing`: the macro is exported, and
-            // routing through our own re-export means a caller does not need
-            // `tracing` as a direct dependency to use it. The doctest above is
-            // what proves that — it is compiled as its own crate.
+            // `$crate::tracing`, not `::tracing`: through this crate's
+            // re-export a caller needs no direct `tracing` dependency. The
+            // doctest above, compiled as its own crate, pins that.
             $crate::tracing::warn!(suppressed, $($fields)+);
         }
     };
@@ -800,8 +783,7 @@ mod tests {
     fn mining_mode_parse_rejects_unknown() {
         let err = MiningMode::from_str("groupsolo").unwrap_err();
         assert_eq!(err, UnknownMiningModeError("groupsolo".to_string()));
-        // Pre-kebab variants must be rejected — protect against accidental
-        // schema drift.
+        // Only the exact kebab-case strings parse.
         assert!(MiningMode::from_str("Solo").is_err());
         assert!(MiningMode::from_str("PPLNS").is_err());
         assert!(MiningMode::from_str("group_solo").is_err());

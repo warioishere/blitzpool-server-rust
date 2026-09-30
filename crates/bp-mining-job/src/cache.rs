@@ -3,41 +3,34 @@
 //! Pool-wide memoization of built [`MiningJob`]s.
 //!
 //! On every template broadcast each connection (SV1) / channel (SV2)
-//! builds a `MiningJob` for its resolved payout set. For PPLNS the
-//! payout set is identical across every connection, so N connections
-//! re-run the exact same build — including one
-//! [`crate::address_to_script`] parse PER payout output — N times per
-//! template. This cache collapses those into one build shared as
+//! builds a `MiningJob` for its resolved payout set. Under PPLNS that set
+//! is identical across connections, so without a cache N connections
+//! repeat the same build, including one [`crate::address_to_script`]
+//! parse per payout output. This cache shares one build as
 //! `Arc<MiningJob>`.
 //!
 //! Two memoization levels:
 //!
 //! 1. **Job level** — the fully-serialized `MiningJob`, keyed by EVERY
-//!    input of [`crate::build_mining_job_from_tdp`] (network, payouts,
-//!    all TDP coinbase fields, pool identifier, extranonce-slot size).
-//!    Key equality ⇒ input equality ⇒ byte-identical build, so the
-//!    cache can never hand out wrong coinbase bytes; payout sets that
-//!    differ per finder (Solo / Group-Solo / Blockparty) get distinct
-//!    keys by construction — no per-mode special-casing.
+//!    input of [`crate::build_mining_job_from_tdp`]. Key equality means
+//!    input equality means a byte-identical build, so the cache never
+//!    hands out wrong coinbase bytes, and per-finder payout sets
+//!    (Solo / Group-Solo / Blockparty) get distinct keys without any
+//!    per-mode special-casing.
 //! 2. **Payout-outputs level** — the parsed `(sats, script)` outputs,
-//!    keyed by (network, payouts, reward). A job-level miss with an
-//!    already-seen payout set (different slot size on SV2 Extended, or
-//!    a template refresh that left the reward unchanged) reuses the
-//!    parsed scripts and only re-serializes.
+//!    keyed by (network, payouts, reward). A job-level miss with a known
+//!    payout set (other SV2 Extended slot size, or a template refresh
+//!    with an unchanged reward) reuses the parsed scripts.
 //!
 //! ## Concurrency
 //!
 //! Both levels are instances of one generic [`CoalescingSlotMap`]. Its
-//! mutex guards ONLY map operations (lookup / insert / prune) — never a
-//! build. Each key owns a slot with its own mutex: the first caller for
-//! a key becomes the leader and builds while holding just that slot's
-//! lock, so callers for OTHER keys build in parallel exactly as they
-//! did pre-cache (Solo / Group-Solo payout sets are distinct per
-//! connection — those must not serialize behind one pool-wide lock),
-//! while same-key callers (PPLNS broadcast storm) wait on their slot
-//! and then share the leader's result instead of thundering-herd-
-//! rebuilding it. A failed build leaves the slot empty — no negative
-//! caching, the next caller retries.
+//! mutex guards ONLY map operations (lookup / insert / prune), never a
+//! build. Each key owns a slot with its own mutex: the first caller
+//! builds as leader under just that slot's lock, so distinct keys
+//! (Solo / Group-Solo, one set per connection) build in parallel while
+//! same-key callers (a PPLNS broadcast) wait and share the leader's
+//! result. A failed build leaves the slot empty; the next caller retries.
 //!
 //! Across the two levels the lock order is job-slot → outputs-map →
 //! outputs-slot: a job-slot leader takes the outputs map lock (released
@@ -595,11 +588,9 @@ impl MiningJobCache {
 
     /// Refresh the `last_used` of the outputs entry for
     /// (network, reward, payouts) and return its shared payouts Arc, if
-    /// one exists. Called on every `get_or_build` — including a pure
-    /// job-hit — so the backing outputs entry can never age out from
-    /// under a live job (which would waste the address-parse
-    /// memoization it exists for), and so a new job entry reuses the one
-    /// payouts allocation instead of cloning the vec again.
+    /// one exists. Called on every `get_or_build`, including a pure
+    /// job-hit, so the backing outputs entry never ages out under a live
+    /// job and a new job entry reuses the one payouts allocation.
     fn touch_outputs(
         &self,
         network: Network,
@@ -1044,11 +1035,9 @@ mod tests {
 
     #[test]
     fn job_hit_refreshes_backing_outputs_entry() {
-        // Regression: a pure job-hit never reaches get_or_parse_outputs,
-        // so it must still refresh the backing outputs entry's last_used
-        // — otherwise a long run of hits on a stable template would let
-        // the shared outputs entry age out from under the live job and
-        // force a needless address reparse for the next distinct job key.
+        // A pure job-hit never reaches get_or_parse_outputs, yet it must
+        // still refresh the backing outputs entry's last_used so that entry
+        // does not age out under a live job.
         let (prefix, outputs) = tdp_fixture();
         let tmpl = template(&prefix, &outputs);
         let payouts = payouts_two_way();

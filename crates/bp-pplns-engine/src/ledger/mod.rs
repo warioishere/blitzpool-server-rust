@@ -69,25 +69,19 @@ pub fn pending_row(address: AddressId, delta_sats: Sats) -> AuditRow {
 ///
 /// On any error the transaction rolls back — neither write lands.
 ///
-/// **Why step 1 asks the block rather than counting inserted rows.**
-/// This used to run the balance upsert whenever the history insert had
-/// reported rows inserted, reasoning that the `(blockHeight, address)`
-/// UNIQUE swallows a replay. That is only true while the row set is the
-/// same on both attempts, and it is not: the caller appends one row per
-/// "late arriver" — an address live in the PPLNS window at APPLY time,
-/// absent from the snapshot. The window moves between attempts, so a
-/// single new miner makes the insert report progress on an
-/// already-booked block, and the balance write is ABSOLUTE
-/// (`current + delta`) against a `current` re-read after the first
-/// commit. Measured on a replay: a withheld miner's credit went
-/// 2 999 → 5 998 sat, and a credit paid out twice is satoshis the other
-/// miners fund.
+/// **Why step 1 asks the block rather than counting inserted rows.** The
+/// `(blockHeight, address)` UNIQUE only swallows a replay while the row set
+/// is identical, and it is not: the caller appends one row per "late
+/// arriver" (live in the window at apply time, absent from the snapshot),
+/// and the window moves between attempts. A replay would then report
+/// progress and re-apply the ABSOLUTE balance write (`current + delta`)
+/// against a `current` that already includes the first booking, paying a
+/// credit twice at the other miners' expense.
 ///
-/// The danger is SEQUENTIAL replay, which is what the confirmation
-/// watcher produces when its post-apply `remove_pending_block` fails (its
-/// error is deliberately ignored) or the process dies in that window.
-/// Concurrent duplicates are handled by the row locks the caller takes
-/// before this runs — see below.
+/// Sequential replay happens when the confirmation watcher's post-apply
+/// `remove_pending_block` fails (its error is ignored) or the process dies
+/// in that window. Concurrent duplicates are handled by the row locks the
+/// caller takes before this runs, see below.
 ///
 /// **Takes the caller's transaction rather than opening one.** The
 /// balance write is absolute (`current + delta`), so the `current` it was
@@ -117,20 +111,14 @@ pub async fn apply_distribution(
     balances: &[BalanceWrite],
     now_ms: i64,
 ) -> Result<ApplyDistributionResult, LedgerError> {
-    // Height is the only identity a booked block has here — the table has no
-    // `blockHash` column and is UNIQUE on `(blockHeight, address)`. So "this
-    // height has history" answers two different questions at once: a harmless
-    // redelivery of the SAME block, and a second, DIFFERENT block at the same
-    // height (a reorg replaced the one already booked). The first must pass
-    // silently; the second is a block whose miners were paid on-chain and
-    // whose settlement is about to be skipped.
-    //
-    // They are told apart by what the booking WOULD be rather than by which
-    // block it is, which is the question that actually matters: if the rows
-    // already recorded match the value-bearing rows this apply would write,
-    // replaying moves nothing either way — even for a genuinely different
-    // block, because two blocks that pay the same coinbase settle the same
-    // deltas and booking them twice would double-apply them.
+    // Height is the only identity a booked block has here (no `blockHash`
+    // column, UNIQUE on `(blockHeight, address)`). Existing history is
+    // either a redelivery of the same block, which must pass silently, or a
+    // different block at the same height after a reorg, whose settlement
+    // must not be skipped silently. They are told apart by the booking
+    // itself: if the recorded value-bearing rows match what this apply
+    // would write, replaying moves nothing, even for a different block that
+    // paid the same coinbase.
     let booked = bp_db::pplns_booked_value_rows_at_height(&mut *tx, block_height).await?;
     if !booked.is_empty() {
         let mut want: Vec<(String, i64)> = rows
@@ -179,7 +167,7 @@ pub async fn apply_distribution(
 
     // Past the gate above this block has no history, so both writes are
     // this apply's first and only ones. The `ON CONFLICT DO NOTHING` on
-    // the insert stays as the constraint-level backstop it always was.
+    // the insert is a constraint-level backstop.
     let history_inserted = bulk_insert_pplns_payout_history(&mut *tx, &history_rows).await?;
     let balances_affected = bulk_upsert_pplns_balances(&mut *tx, &balance_rows).await?;
 
@@ -199,21 +187,6 @@ pub struct BalanceWrite {
     pub balance_sats: Sats,
     pub total_paid_sats: Sats,
 }
-
-// The struct used to carry `balance_before` / `total_paid_before` — a
-// baseline for re-basing an absolute write onto whatever touched the row
-// in between. Both were WRITE-ONLY: `apply_distribution` maps
-// `BalanceWrite` into `BalanceUpsert`, which has no such fields, so
-// nothing ever read them. Their doc named `PplnsEngine::apply_prepared`
-// as the re-baser; that function has not existed since the design moved
-// to freezing a block's INPUTS instead of a computed result. Computing
-// the balances at apply time is what removed the need: `current` is read
-// moments before the write, in the same call.
-//
-// What that leaves is a narrow window between that read and the commit,
-// against the one other writer of `balanceSats` — the daily 03:00 UTC
-// dust sweep (`sweep::update_pplns_balance_sats`). Neither the removed
-// fields nor anything else guarded it; they only claimed to.
 
 #[cfg(test)]
 mod tests {

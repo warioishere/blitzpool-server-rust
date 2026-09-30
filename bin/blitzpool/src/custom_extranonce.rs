@@ -4,17 +4,13 @@
 //! server at channel-open.
 //!
 //! The API process writes `pplns_custom_extranonce`; the core (this process)
-//! reads it. They are separate processes, so the core can't see a write
-//! instantly — it reloads the whole table on a fixed interval. The table holds
-//! a handful of rows (one paying customer), so a full reload is one cheap
-//! query, and a change lands on the core within one interval and applies at the
-//! worker's next channel-open.
+//! reloads the whole table on a fixed interval, since it cannot see the other
+//! process's writes. The table holds a handful of rows, so a full reload is one
+//! cheap query; a change applies at the worker's next channel-open.
 //!
-//! The cache is read at channel-open (once per connection) and — for a
-//! connection that carries an override — on each template broadcast to pick up
-//! a live change. The lookup is allocation-free (a nested `address -> worker`
-//! map keyed by `&str` at both levels), so it adds nothing measurable to those
-//! paths.
+//! The cache is read at channel-open and, for a connection that carries an
+//! override, on each template broadcast. The lookup is allocation-free, so it
+//! adds nothing measurable to those paths.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};

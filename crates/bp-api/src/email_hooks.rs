@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Outbound email hooks the `/api/email/*` controller calls into.
-//! Covers the `sendVerification` / `sendBindingChangeAttempt` pair —
+//! Covers the verification and binding-change-attempt mails —
 //! production wiring routes through
 //! `bp-notifications::adapter::smtp::SmtpAdapter` +
 //! the verification / binding-change templates.

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Push-style payload shared by FCM + Web-Push + (eventually) APN.
+//! Push-style payload shared by FCM + Web-Push.
 
 /// Event-kind tag for FCM `data.type` (`"best_difficulty"`,
 /// `"block_found"`, `"device_status"`, `"network_difficulty"`). The

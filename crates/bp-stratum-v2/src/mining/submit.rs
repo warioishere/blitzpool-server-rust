@@ -1,43 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Share-validation hot path for both **Standard** and **Extended** SV2
-//! mining channels. Pure logic — no I/O, no broadcasting, no DB. The
-//! per-share side-effect fan-out (PPLNS / group-solo `record_share`,
-//! `addAcceptedShare` accumulators, block-found bookkeeping, external-
-//! shares submit) is the caller's job and runs on top of the
-//! [`crate::hooks`] trait boundaries.
+//! Share validation for **Standard** and **Extended** SV2 mining channels.
+//! Pure logic, no I/O: the per-share side effects (PPLNS / group-solo
+//! accounting, accumulators, block-found bookkeeping) are the caller's job,
+//! behind the [`crate::hooks`] trait boundaries.
 //!
-//! Share-validation handler for both Standard and Extended channels.
-//! The two share the same skeleton — channel-lookup → duplicate-check →
-//! job-lookup → classification → header-assembly → hash → target-check —
-//! but differ in:
+//! Both paths run duplicate-check, classification, header assembly, hash
+//! and target check. Standard uses the merkle root stored when the
+//! `NewMiningJob` was sent; Extended rebuilds the coinbase from the job's
+//! prefix, extranonce prefix, the submitted extranonce and suffix, and walks
+//! the job's merkle path.
 //!
-//! - **Standard**: looks up the **stored merkle root** the miner
-//!   received in `NewMiningJob` (store-on-send pattern — avoids
-//!   recomputing the merkle root on every share, which is more reliable).
-//!   Extranonce is implicitly zero-filled in the coinbase slot.
-//! - **Extended**: reconstructs the coinbase from
-//!   `extJob.coinbase_prefix + extJob.extranonce_prefix +
-//!   submission.extranonce + extJob.coinbase_suffix`, walks the
-//!   `extJob.merkle_path` to derive the root, then assembles the
-//!   header. Worker-name override via ext 0x0002 TLV is the caller's
-//!   responsibility (call [`crate::extensions::resolve_share_worker_name_from_tlv`]
-//!   before passing the worker name down to the share-stats fan-out).
-//!
-//! Returns [`ShareValidation::Accepted`] with the assembled header,
-//! the share's submission difficulty (post-hash), the job-specific
-//! effective difficulty (for accounting), the classification
-//! (`Active` vs `StaleCreditable` — both credit, see
-//! [`bp_jobs_lifecycle::JobClassification`]), and the `is_block_candidate`
-//! flag: the hash meets the job's network target
-//! ([`bp_mining_job::meets_network_target`]).
-//! Or [`ShareValidation::Rejected`] carrying one of four SV2 wire
-//! codes: `invalid-channel-id`, `invalid-job-id`, `stale-share`,
-//! `difficulty-too-low`.
-//!
-//! Wire codes are kept as `&'static str` constants — they're consumed
-//! by the SV2 `SubmitSharesError.error_code` field (`Str0_32`). The
-//! caller serializes the chosen literal directly without paraphrasing.
+//! The result is [`ShareValidation::Accepted`] (header, submission and
+//! credited difficulty, [`bp_jobs_lifecycle::JobClassification`], and whether
+//! the hash meets the job's network target via
+//! [`bp_mining_job::meets_network_target`]) or [`ShareValidation::Rejected`]
+//! with the wire code the caller writes into `SubmitSharesError.error_code`
+//! verbatim.
 
 use bp_jobs_lifecycle::JobClassification;
 use bp_mining_job::{
@@ -46,11 +25,9 @@ use bp_mining_job::{
 use bp_share::{calculate_difficulty, sha256d_from_parts, Difficulty, Target};
 use smallvec::SmallVec;
 
-/// Inline storage for the per-share `extranonce` buffer. Extended-channel
-/// extranonce sizes are negotiated per-connection and capped well below
-/// 32 bytes in practice (typical ASIC firmwares pick 4–16). At 16 bytes
-/// inline we cover the realistic upper bound without a heap allocation
-/// per share; larger sizes silently fall back to a Vec.
+/// Inline storage for the per-share `extranonce` buffer. 16 inline bytes
+/// cover the sizes miners negotiate without a heap allocation per share;
+/// larger sizes spill to the heap.
 pub type ExtranonceBytes = SmallVec<[u8; 16]>;
 
 use super::channel::{
@@ -71,9 +48,9 @@ pub const ERR_INVALID_CHANNEL_ID: &str = "invalid-channel-id";
 pub const ERR_INVALID_JOB_ID: &str = "invalid-job-id";
 
 /// Job id resolves to a retired entry past
-/// [`bp_jobs_lifecycle::LifecycleConfig::grace_ms`]. Kept separate from
+/// [`bp_jobs_lifecycle::LifecycleConfig::grace_ms`]. Separate from
 /// `ERR_DUPLICATE_SHARE` because they are different faults, not because the
-/// spec separates them — see the note on the code strings below.
+/// spec separates them (see the note below).
 pub const ERR_STALE_SHARE: &str = "stale-share";
 
 /// Duplicate `(job_id, nonce, ntime, version[, extranonce])` tuple
@@ -82,26 +59,19 @@ pub const ERR_STALE_SHARE: &str = "stale-share";
 /// **None of these strings is spec-assigned.** SV2 Mining/SubmitShares.Error
 /// types `error_code` as a bare `STR0_255` and SV2 Overview/Error Codes says
 /// the list "can differ between implementations" and that a receiver MUST
-/// log-no-op on unknown codes. The vocabulary here is convention shared with
-/// the SRI clients, so it can be extended — but a downstream that treats an
-/// unknown code as fatal is the one breaking the spec, not us.
+/// log-no-op on unknown codes. The vocabulary is convention shared with
+/// common clients and can be extended; a downstream that treats an unknown
+/// code as fatal is outside the spec.
 pub const ERR_DUPLICATE_SHARE: &str = "duplicate-share";
 
-/// Header hash didn't meet the job-specific target. Includes the case
-/// where `meets_target` returns false even though the miner's own
-/// pre-filter said it should — that's typically a vardiff race or a
-/// malformed extranonce.
+/// Header hash didn't meet the job-specific target.
 pub const ERR_DIFFICULTY_TOO_LOW: &str = "difficulty-too-low";
 
 /// Miner-supplied `extranonce.len()` doesn't match the channel's
-/// negotiated `rollable_extranonce_size`. Not in the SV2-spec
-/// canonical error-code list.
-/// **Hard-reject implementation**: if extranonce size differs, the
-/// reconstructed coinbase ≠ what the miner hashed → the header-hash
-/// we validate against ISN'T the miner's hash → we'd be crediting
-/// un-verified hashpower. Hard-reject closes the cheating-vector.
-/// See memory `feedback-sv2-bad-extranonce-size-hard-reject` for the
-/// rationale.
+/// negotiated `rollable_extranonce_size`. A hard reject: with a different
+/// size the reconstructed coinbase is not what the miner hashed, so the
+/// validated hash would not be the miner's and the credited work would be
+/// unverified.
 pub const ERR_BAD_EXTRANONCE_SIZE: &str = "bad-extranonce-size";
 
 // ── Reject reasons ───────────────────────────────────────────────────
@@ -149,14 +119,12 @@ impl RejectReason {
 /// the TDP `SubmitSolution` path.
 #[derive(Clone, Debug)]
 pub struct ShareAccept {
-    /// `Active` or `StaleCreditable`. Both credit the share; the caller
-    /// may want to bookkeep them separately for diagnostics.
+    /// `Active` or `StaleCreditable`. Both credit the share.
     pub classification: JobClassification,
     /// Difficulty the share is **credited at** — the job-specific difficulty
-    /// stored at send-time (SV2 Mining/SubmitShares.Error). Used by both PPLNS
-    /// / group-solo accounting and the `add_accepted_share` accumulators. May
-    /// be lower than the session's current diff when the share was issued
-    /// before a vardiff ratchet.
+    /// stored at send-time (SV2 Mining/SubmitShares.Error). Feeds the payout
+    /// accounting and the accepted-share accumulators; may be below the
+    /// session's current difficulty after a vardiff increase.
     pub effective_difficulty: Difficulty,
     /// Difficulty the share **actually solved for**, derived from the
     /// header hash. Drives the block-found gate and the personal-best
@@ -165,20 +133,14 @@ pub struct ShareAccept {
     /// 80-byte block header that produced the hash. The block-submit path
     /// assembles a found block from it.
     pub header: [u8; 80],
-    /// `sha256d(header)` in LE byte order — the share's identity, the
-    /// PoW result.
+    /// `sha256d(header)` in LE byte order.
     pub hash: [u8; 32],
-    /// True when the submission difficulty meets or exceeds the network
-    /// difficulty derived from the job's `n_bits`. bitcoind is the
-    /// authoritative validator — this only triggers the
+    /// True when the hash meets the network target from the job's `n_bits`.
+    /// bitcoind stays the authoritative validator; this only triggers the
     /// `TdpHandle::submit_solution` path.
     pub is_block_candidate: bool,
-    /// TDP template id the job was built against. `Some` for jobs the
-    /// pool issued from a pool-side template (Extended channels with
-    /// pool-built jobs), `None` for `SetCustomMiningJob`-declared
-    /// jobs (no pool-side template reference) and for Standard
-    /// channels until [`StandardJobContext`] threads the template id
-    /// through (Standard block-submit path).
+    /// TDP template id the job was built against. `None` for
+    /// `SetCustomMiningJob`-declared jobs, which have no pool-side template.
     pub template_id: Option<u64>,
     /// Copied off [`crate::mining::jobs::ExtendedJob::jdp_claims_the_block`]:
     /// `true` when a block found on this job will be claimed by the JDP
@@ -187,40 +149,26 @@ pub struct ShareAccept {
     /// Standard path, which has no custom jobs.
     pub jdp_claims_the_block: bool,
     /// Identity of the payout list the job's coinbase pays. The block sink
-    /// hands it to the PPLNS engine so the ledger books the distribution
-    /// this block actually paid, not whatever the shared snapshot key holds
-    /// by then. Zeroed when the pool did not build the coinbase.
+    /// hands it on so the ledger books the distribution this block actually
+    /// paid, not whatever the shared snapshot key holds by then. Zeroed when
+    /// the pool did not build the coinbase.
     pub payouts_fingerprint: [u8; 32],
-    /// Fully-assembled **witness-form** coinbase transaction bytes
-    /// (BIP-141 layout: marker `0x00` + flag `0x01` inserted after
-    /// version, 32-zero coinbase witness reserved value inserted
-    /// before locktime). Ready to be passed to
-    /// `TdpHandle::submit_solution`'s `coinbase_tx` argument.
-    ///
-    /// Populated by [`validate_submit_extended`] (rebuilds the stratum coinbase
-    /// from per-channel + per-job state) AND by [`validate_submit_standard`]
-    /// (from the per-job `StandardJobEntry::coinbase_stratum` stored at
-    /// NewMiningJob send-time). **Empty** only when the job carries no pool-side
-    /// coinbase — a `SetCustomMiningJob`-declared job — in which case block-found
-    /// surfaces a WARN in the bin block-sink instead of submitting.
+    /// Witness-form (BIP-141) coinbase transaction, ready for
+    /// `TdpHandle::submit_solution`'s `coinbase_tx`. Built only for block
+    /// candidates, by both validators. Empty for a `SetCustomMiningJob`-declared
+    /// job, which carries no pool-side coinbase; the block sink then logs a
+    /// WARN instead of submitting.
     pub witness_coinbase: Vec<u8>,
-    /// Effective per-share worker name. `Some(value)` when ext 0x0002
-    /// (Worker-Specific Hashrate Tracking) was negotiated AND the miner
-    /// appended a valid Worker-ID TLV to this share
-    /// (ext 0x0002/Behavior Based on Negotiation). `None` means the caller
-    /// should fall back to the channel-default `user_identity` from
-    /// `OpenExtendedMiningChannel`.
-    ///
-    /// Always `None` for Standard-channel shares (channel-default only).
-    /// Always `None` for Extended-channel shares whose connection did not
-    /// negotiate ext 0x0002 (ext 0x0002/Behavior Based on Negotiation — "the
-    /// server MUST ignore unexpected TLV fields").
+    /// Per-share worker name. `Some` when ext 0x0002 was negotiated and the
+    /// share carries a valid Worker-ID TLV (ext 0x0002/Behavior Based on
+    /// Negotiation); `None` means the caller uses the channel's
+    /// `user_identity`. Always `None` on Standard channels, and on connections
+    /// without ext 0x0002, whose TLVs "the server MUST ignore".
     pub effective_worker_name: Option<String>,
-    /// Block-reward portion the coinbase claims — the per-job pinned
-    /// `coinbase_tx_value_remaining` (subsidy + fees the pool's coinbase
-    /// keeps). The block-found fan-out passes this to the per-mode engine
-    /// ledger (`on_block_found`). `0` for `SetCustomMiningJob`-declared jobs
-    /// (no pool template; the JDC owns the block-submit + accounting).
+    /// Block-reward portion the coinbase claims: the job's pinned
+    /// `coinbase_tx_value_remaining`, passed to the per-mode ledger on a
+    /// found block. `0` for `SetCustomMiningJob`-declared jobs, whose
+    /// accounting the JDC owns.
     pub coinbase_tx_value_remaining: u64,
 }
 
@@ -251,8 +199,8 @@ pub enum ShareValidation {
 // ── Submit-frame inputs (minimal shape — wire types belong elsewhere) ─
 
 /// Inputs from a deserialized `SubmitSharesStandard` frame, narrowed to
-/// what the validator actually reads. Wrapped in our own struct so the
-/// validator stays decoupled from `stratum_core::mining_sv2`'s lifetimes.
+/// what the validator reads, so it stays decoupled from
+/// `stratum_core::mining_sv2`'s lifetimes.
 #[derive(Clone, Copy, Debug)]
 pub struct SubmitSharesStandardInput {
     pub channel_id: u32,
@@ -274,99 +222,60 @@ pub struct SubmitSharesExtendedInput {
     pub version: u32,
     pub ntime: u32,
     pub extranonce: ExtranonceBytes,
-    /// The TLVs the frame carried after the `SubmitSharesExtended` base
-    /// payload, as the frame parser decoded them. Carries the ext 0x0002
-    /// Worker-ID TLV when the miner uses Worker-Specific Hashrate Tracking;
-    /// empty when there are none.
-    ///
-    /// Resolved into [`ShareAccept::effective_worker_name`] by
-    /// [`validate_submit_extended`] via
-    /// [`crate::extensions::resolve_share_worker_name_from_tlv`] —
-    /// ext 0x0002/Behavior Based on Negotiation: scan-for-known-TLV semantics,
-    /// TLV-order-irrelevant.
+    /// TLVs decoded after the `SubmitSharesExtended` base payload, e.g. the
+    /// ext 0x0002 Worker-ID TLV. Resolved into
+    /// [`ShareAccept::effective_worker_name`] via
+    /// [`crate::extensions::resolve_share_worker_name_from_tlv`]; order does
+    /// not matter (ext 0x0002/Behavior Based on Negotiation).
     pub tlvs: Vec<stratum_core::parsers_sv2::Tlv>,
 }
 
 // ── Standard-channel job context ─────────────────────────────────────
 
-/// Per-job context the **Standard**-channel validator needs from the
-/// caller. The validator stays pure by accepting the resolved values
-/// directly as arguments.
+/// Per-job context the **Standard**-channel validator needs, resolved by
+/// the caller so the validator stays pure.
 #[derive(Clone, Copy, Debug)]
 pub struct StandardJobContext<'a> {
-    /// `block.version` from the template the job was built against
-    /// (BIP-310 version-rolling applies via XOR-mask in
-    /// [`validate_submit_standard`]).
+    /// `block.version` from the template the job was built against.
     pub template_version: i32,
     /// 32-byte previous-block hash from the template.
     pub prev_hash: [u8; 32],
     /// `n_bits` (`block.bits`) from the template — encodes the network
     /// target the block-found gate checks.
     pub n_bits: u32,
-    /// Job classification from the central registry (`JobNotFound` /
-    /// `Active` / `StaleCreditable` / `StaleRejected`). `None` for
-    /// genuinely missing jobs.
+    /// Job classification from the central registry.
     pub classification: JobClassification,
-    /// TDP template id the job was built against. Threaded through
-    /// to [`ShareAccept::template_id`] so the block-sink can pass it
-    /// to `TdpHandle::submit_solution` on a block-candidate. `None`
-    /// for `SetCustomMiningJob`-derived jobs.
+    /// TDP template id the job was built against, carried to
+    /// [`ShareAccept::template_id`] for `TdpHandle::submit_solution`.
+    /// `None` for `SetCustomMiningJob`-derived jobs.
     pub template_id: Option<u64>,
-    /// Full pre-assembled non-witness coinbase bytes (matches the
-    /// merkle root the miner hashed against). Source: stored on
-    /// [`crate::mining::jobs::StandardJobEntry::coinbase_stratum`]
-    /// at `NewMiningJob` send time. Empty when the job was declared
-    /// via `SetCustomMiningJob` (no pool template) — block-submit
-    /// then falls through to a WARN at the bin block-sink.
+    /// Non-witness coinbase bytes matching the merkle root the miner hashed,
+    /// from [`crate::mining::jobs::StandardJobEntry::coinbase_stratum`].
+    /// Empty for a `SetCustomMiningJob`-declared job.
     pub coinbase_stratum: &'a [u8],
-    /// Identity of the payout list this job's coinbase pays — copied off
-    /// the `MiningJob` it was built from. Lets a block found on this job
-    /// look up the exact distribution the pool must book, instead of the
-    /// shared snapshot key whichever later build overwrote. Zeroed for
-    /// jobs the pool did not build the coinbase for (`SetCustomMiningJob`).
+    /// Identity of the payout list this job's coinbase pays, copied off the
+    /// `MiningJob`, so a block found on this job books exactly that
+    /// distribution rather than a later build's snapshot. Zeroed for jobs
+    /// the pool did not build the coinbase for.
     pub payouts_fingerprint: [u8; 32],
     /// Block-reward portion the coinbase claims (per-job pinned
-    /// `coinbase_tx_value_remaining`). Threaded onto [`ShareAccept`].
+    /// `coinbase_tx_value_remaining`).
     pub coinbase_tx_value_remaining: u64,
 }
 
 // ── Standard validation ──────────────────────────────────────────────
 
-/// Validate a `SubmitSharesStandard` frame. Pure function: takes the
-/// pre-resolved per-channel state + the per-job context, returns a
-/// [`ShareValidation`] without touching any external resource.
+/// Validate a `SubmitSharesStandard` frame against pre-resolved channel
+/// state and job context.
 ///
-/// **Caller's prep work** (before this function):
-/// 1. Look up `channel = channels.get(submission.channel_id)` —
-///    `None` → emit [`RejectReason::InvalidChannelId`] directly (we
-///    can't do it here because we need `&ChannelState`).
-/// 2. Look up `job_id` in the central `JobRegistry` (or the per-channel
-///    Standard maps) → if not found, emit
-///    [`RejectReason::InvalidJobId`]. If found, fold the classification
-///    + the template metadata into a [`StandardJobContext`].
-/// 3. Look up `(job_difficulty, merkle_root)` from
-///    [`crate::mining::jobs::StandardJobMaps`] — if missing, emit
-///    [`RejectReason::InvalidJobId`] directly.
+/// The caller resolves the channel ([`RejectReason::InvalidChannelId`] when
+/// missing) and the job's classification, difficulty and merkle root from
+/// [`crate::mining::jobs::StandardJobMaps`] ([`RejectReason::InvalidJobId`]
+/// when missing).
 ///
-/// **What this function does**:
-/// 1. Reject up-front if `channel.kind != Standard`
-///    (defensive — caller shouldn't call this for an Extended channel).
-/// 2. Duplicate-check the dedup tuple against the channel's submission
-///    cache. Hit → [`RejectReason::StaleShare`].
-/// 3. Reject if `classification == StaleRejected`.
-/// 4. Build the 80-byte header from `(submission.version,
-///    prev_hash, stored_merkle_root, ntime, n_bits, nonce)`.
-/// 5. Compute `sha256d(header)` and the implied submission difficulty.
-/// 6. Compare against `difficulty_to_target(job_difficulty)`. Miss →
-///    [`RejectReason::DifficultyTooLow`].
-/// 7. Otherwise build [`ShareAccept`] with `is_block_candidate =
-///    meets_network_target(hash, job_ctx.n_bits)`.
-///
-/// The dedup-cache **write** is the caller's responsibility — it
-/// happens INSIDE this function only when the share validates (so a
-/// duplicate share that arrives mid-validation can't poison the cache).
-/// On accept the function inserts the [`StandardDedupKey`] before
-/// returning.
+/// The [`StandardDedupKey`] goes into the submission cache only on accept,
+/// so a rejected share never makes a later valid resubmission look like a
+/// duplicate.
 pub fn validate_submit_standard(
     channel: &mut ChannelState,
     submission: &SubmitSharesStandardInput,
@@ -375,8 +284,8 @@ pub fn validate_submit_standard(
     job_ctx: &StandardJobContext<'_>,
 ) -> ShareValidation {
     if channel.kind != ChannelKind::Standard {
-        // Defensive — bug at the call site, not a wire-protocol error.
-        // We still return InvalidJobId so the connection keeps running.
+        // A call-site error, not a wire-protocol one; rejecting keeps the
+        // connection running.
         return ShareValidation::Rejected(RejectReason::InvalidJobId.into());
     }
 
@@ -398,9 +307,7 @@ pub fn validate_submit_standard(
 
     // `submission.version` is the FULL nVersion (SV2 spec:
     // `SubmitSharesStandard.version` is the "Full nVersion field"), so it
-    // goes into the header as-is. The old code XOR'd it against the
-    // template version and then XOR'd it back, which was an identity
-    // dressed up as version-rolling arithmetic.
+    // goes into the header as-is.
     let header = build_block_header(
         submission.version as i32,
         &job_ctx.prev_hash,
@@ -416,19 +323,14 @@ pub fn validate_submit_standard(
         return ShareValidation::Rejected(RejectReason::DifficultyTooLow.into());
     }
 
-    // Accept — record dedup AFTER all rejects so a duplicate of a
-    // bad share doesn't get logged as duplicate.
+    // Recorded only after every reject, so a resubmission of a bad share is
+    // not reported as a duplicate.
     channel.submission_cache.insert_standard(dedup_key);
 
     let is_block_candidate = meets_network_target(&pow.submission_hash, job_ctx.n_bits);
-    // Witness-form coinbase for the block-found path.
-    // Built only for block-candidates; per-share allocation cost is
-    // negligible on the rare candidate path.
-    //
-    // Empty `coinbase_stratum` means the job was declared via
-    // `SetCustomMiningJob` (no pool template available) — block-submit
-    // then falls through to a WARN at the bin block-sink instead of
-    // sending malformed bytes to bitcoin-core.
+    // Built only for block candidates. An empty `coinbase_stratum` (a
+    // `SetCustomMiningJob` job) yields no coinbase rather than malformed
+    // bytes for bitcoind.
     let witness_coinbase = if is_block_candidate && !job_ctx.coinbase_stratum.is_empty() {
         assemble_witness_coinbase(job_ctx.coinbase_stratum)
     } else {
@@ -445,8 +347,7 @@ pub fn validate_submit_standard(
         jdp_claims_the_block: false,
         payouts_fingerprint: job_ctx.payouts_fingerprint,
         witness_coinbase,
-        // Standard-channel shares never carry a per-share Worker-ID
-        // TLV — channel-default attribution only.
+        // Standard-channel shares carry no Worker-ID TLV.
         effective_worker_name: None,
         coinbase_tx_value_remaining: job_ctx.coinbase_tx_value_remaining,
     }))
@@ -458,13 +359,9 @@ pub fn validate_submit_standard(
 /// needs, plus the per-job target the caller already computed via
 /// [`ChannelState::target_for`].
 ///
-/// Passing these as a borrowed view (rather than `&mut ChannelState`)
-/// lets the caller hand the validator a `&mut` borrow of *only* the
-/// dedup cache while still holding a `&` borrow of the `ExtendedJob`
-/// that lives in the same channel — disjoint-field borrows that the
-/// whole-`&mut ChannelState` signature could not express, forcing a
-/// per-share clone of the job. Mirrors the SV1 `validate_submit`
-/// projection (`SessionContext` + `&mut share_cache`).
+/// A view instead of `&mut ChannelState` lets the caller lend only the
+/// dedup cache mutably while holding a shared borrow of the `ExtendedJob`
+/// in the same channel, so no per-share clone of the job is needed.
 #[derive(Clone, Copy, Debug)]
 pub struct ExtendedChannelView {
     pub kind: ChannelKind,
@@ -477,31 +374,16 @@ pub struct ExtendedChannelView {
     pub job_lifecycle: LifecycleConfig,
 }
 
-/// Validate a `SubmitSharesExtended` frame. Pure function with the
-/// same shape as [`validate_submit_standard`], but the caller passes
-/// the resolved [`ExtendedJob`] reference (storage lives on the
-/// channel) and the validator handles coinbase reconstruction +
-/// merkle-path walking itself.
+/// Validate a `SubmitSharesExtended` frame against the resolved
+/// [`ExtendedJob`], rebuilding the coinbase and walking the merkle path.
 ///
-/// **Caller's prep work**: channel lookup only (`None` → emit
-/// [`RejectReason::InvalidChannelId`] directly). Everything else —
-/// extended-job lookup, classification, the block-found gate —
-/// happens inside.
+/// An extranonce-size mismatch is a hard reject (`bad-extranonce-size`),
+/// see [`ERR_BAD_EXTRANONCE_SIZE`].
 ///
-/// **Extranonce-size mismatch is a HARD reject** with wire-code
-/// `bad-extranonce-size`. Hard-reject implementation:
-/// when extranonce sizes differ, the reconstructed coinbase ≠ what
-/// the miner hashed, so the header-hash we'd validate against isn't
-/// the miner's hash. Accepting would credit un-verified hashpower —
-/// see memory `feedback-sv2-bad-extranonce-size-hard-reject`.
-///
-/// `job_difficulty` is the per-job target the share validates against
-/// (SV2 Mining/SubmitShares.Error). Caller resolves it from
-/// `channel.standard_jobs.job_id_to_difficulty` if present, else falls back to
-/// `channel.session_difficulty`. The **network** target for the
-/// block-found gate is read from `ext_job.n_bits` (pinned at send-time, SV2
-/// Mining/SubmitShares.Error strict) — NOT the current template, so a
-/// block-change between job-send and submit can't reclassify the share.
+/// `job_difficulty` is the per-job difficulty the share validates against
+/// (SV2 Mining/SubmitShares.Error). The network target for the block-found
+/// gate comes from `ext_job.n_bits`, pinned at send-time, so a block change
+/// between job-send and submit cannot reclassify the share.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_submit_extended(
     submission_cache: &mut SubmissionCache,
@@ -555,10 +437,8 @@ pub fn validate_submit_extended(
         return ShareValidation::Rejected(RejectReason::StaleShare.into());
     }
 
-    // Extranonce-size check — HARD reject on mismatch.
-    // Hard-reject is required — soft-accepting would be unsafe since
-    // the reconstructed coinbase would diverge from what the miner
-    // hashed, and we'd credit un-verified work.
+    // Hard reject: with a different size the reconstructed coinbase is not
+    // what the miner hashed, so the work would be credited unverified.
     if submission.extranonce.len() != view.extranonce_size as usize {
         tracing::warn!(
             channel_id = submission.channel_id,
@@ -571,25 +451,19 @@ pub fn validate_submit_extended(
         return ShareValidation::Rejected(RejectReason::BadExtranonceSize.into());
     }
 
-    // 1. Reconstruct the coinbase exactly how the miner does it:
+    // 1. Reconstruct the coinbase byte-for-byte as the miner does:
     //
     //   coinbase = ext_job.coinbase_prefix
     //            + ext_job.extranonce_prefix
     //            + submission.extranonce
     //            + ext_job.coinbase_suffix
     //
-    // `ext_job.coinbase_prefix` here is the bytes BEFORE the
-    // extranonce slot — the job build no longer bakes the extranonce
-    // prefix into it (doing so would double-count the prefix on the
-    // miner side, since miners append it themselves at share-build
-    // time). Validator must mirror miner's reconstruction byte-for-byte
-    // or the resulting hash diverges → 100% diff-too-low rejections.
+    // `coinbase_prefix` excludes the extranonce prefix, because miners
+    // append that themselves.
     //
-    // The prefix is read off the JOB, never off the channel:
+    // The extranonce prefix is read off the JOB, never off the channel:
     // SV2 Mining/SetExtranoncePrefix is effective only from the next job on,
-    // so a share for an older job was built with that job's prefix. Taking
-    // it from the channel would reject every in-flight share of the old
-    // job after a prefix change.
+    // so a share for an older job was built with that job's prefix.
     let coinbase_parts: [&[u8]; 4] = [
         &ext_job.coinbase_prefix[..],
         &ext_job.extranonce_prefix[..],
@@ -597,21 +471,16 @@ pub fn validate_submit_extended(
         &ext_job.coinbase_suffix[..],
     ];
 
-    // 2. Coinbase txid = sha256d(prefix + extranonce_prefix + extranonce +
-    //    suffix). Streamed into the hasher so the accepted-share hot path never
-    //    allocates the full coinbase `Vec` — it's only materialised (via
-    //    `coinbase_parts.concat()`) in the two cold branches below that need the
-    //    bytes: the difficulty-too-low reject diagnostics and the (rare)
-    //    block-candidate witness coinbase.
+    // 2. Coinbase txid, streamed into the hasher so the hot path never
+    //    allocates the full coinbase. It is only concatenated in the cold
+    //    branches below: reject diagnostics and the block-candidate coinbase.
     let coinbase_txid = sha256d_from_parts(&coinbase_parts);
 
     // 3. Walk the merkle path to derive the root.
     let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &ext_job.merkle_path);
 
-    // 4. Assemble the 80-byte header. Version-mask is XOR'd against
-    //    `submission.version` verbatim — the extended twin of the standard
-    //    path above, and for the same reason: SV2 submits the full nVersion,
-    //    so there is nothing to reconstruct against `ext_job.version`.
+    // 4. Assemble the 80-byte header with `submission.version` verbatim, as
+    //    on the Standard path: SV2 submits the full nVersion.
     let header = build_block_header(
         submission.version as i32,
         &ext_job.prev_hash,
@@ -624,11 +493,8 @@ pub fn validate_submit_extended(
     let pow = calculate_difficulty(&header);
     let job_target = view.job_target;
 
-    // Per-share difficulty trace for debugging. Gated by the
-    // `stratum_share_logs` config flag (threaded in as
-    // `debug_share_logs`); still emitted at DEBUG, so it also needs
-    // `RUST_LOG=...,bp_stratum_v2=debug` to surface.
-    // Format: `🎯 Extended share difficulty: X (target: Y)` with .2f.
+    // Gated by the `stratum_share_logs` config flag and emitted at DEBUG, so
+    // it also needs `RUST_LOG=...,bp_stratum_v2=debug` to surface.
     if debug_share_logs {
         tracing::debug!(
             channel_id = submission.channel_id,
@@ -640,11 +506,9 @@ pub fn validate_submit_extended(
     }
 
     if !job_target.is_met_by_le(&pow.submission_hash) {
-        // Reject with full diagnostic dump (coinbase + merkle_root +
-        // header) so we can byte-cross-check against what the miner
-        // built from the wire NewExtendedMiningJob frame. If the bytes
-        // the validator hashed don't match the miner's, this log is the
-        // only way to spot it without instrumenting the miner.
+        // Full byte dump (coinbase, merkle root, header) so the hashed bytes
+        // can be compared with what the miner built from the
+        // NewExtendedMiningJob frame without instrumenting the miner.
         let to_hex = |b: &[u8]| -> String {
             let mut s = String::with_capacity(b.len() * 2);
             for x in b {
@@ -689,19 +553,14 @@ pub fn validate_submit_extended(
     // the gate uses the template the miner hashed against, not the latest
     // one.
     let is_block_candidate = meets_network_target(&pow.submission_hash, ext_job.n_bits);
-    // Witness-form coinbase for the block-found path. Built only for
-    // block-candidates to keep the per-share allocation off the hot
-    // path (every non-candidate share goes through the validator,
-    // ~95+% of them).
+    // Built only for block candidates, keeping the allocation off the hot path.
     let witness_coinbase = if is_block_candidate {
         assemble_witness_coinbase(&coinbase_parts.concat())
     } else {
         Vec::new()
     };
-    // ext 0x0002 Worker-ID TLV resolution
-    // (ext 0x0002/Behavior Based on Negotiation). `Some(_)` means the TLV
-    // names a worker and the caller attributes the share to it instead of
-    // the channel's worker.
+    // ext 0x0002/Behavior Based on Negotiation: `Some(_)` attributes the
+    // share to the TLV's worker instead of the channel's.
     let effective_worker_name = crate::extensions::resolve_share_worker_name_from_tlv(
         &submission.tlvs,
         ext_0x0002_negotiated,
@@ -733,8 +592,8 @@ mod tests {
     }
 
     fn easy_diff() -> Difficulty {
-        // Difficulty 1 / 2^32 — the minimum we can reasonably test against
-        // a SHA256d output without a CPU-search. Any random hash beats it.
+        // Difficulty 1 / 2^32: any SHA256d output meets it, so no CPU search
+        // is needed.
         Difficulty(1.0 / 4_294_967_296.0)
     }
 
@@ -769,8 +628,8 @@ mod tests {
             prev_hash: prev,
             n_bits,
             min_ntime: 0,
-            // Must match `ext_channel()`'s prefix: these fixtures pair up, and
-            // the validator now reconstructs the coinbase from the JOB's prefix.
+            // Must match `ext_channel()`'s prefix: the validator rebuilds the
+            // coinbase from the job's prefix.
             extranonce_prefix: vec![0u8; 4],
             difficulty: Difficulty(1.0 / 4_294_967_296.0),
             coinbase_tx_value_remaining: 5_000_000_000,
@@ -818,10 +677,8 @@ mod tests {
         }
     }
 
-    /// Test shim: projects the channel into the `ExtendedChannelView` +
-    /// `&mut submission_cache` the validator now takes, so the existing
-    /// `&mut channel`-style call sites keep their shape. (The production
-    /// handler does this projection inline to drop the per-share job clone.)
+    /// Test shim: projects the channel into the `ExtendedChannelView` and
+    /// `&mut submission_cache` the validator takes.
     fn validate_ext(
         ch: &mut ChannelState,
         sub: &SubmitSharesExtendedInput,
@@ -872,8 +729,7 @@ mod tests {
         );
     }
 
-    /// Spec note: `From<RejectReason> for ShareReject` populates the
-    /// wire code automatically.
+    /// `From<RejectReason> for ShareReject` populates the wire code.
     #[test]
     fn share_reject_from_reason_populates_wire_code() {
         let r: ShareReject = RejectReason::StaleShare.into();
@@ -884,8 +740,7 @@ mod tests {
 
     #[test]
     fn standard_accepts_easy_share_with_max_target() {
-        // With easy_diff() → target = MAX, ANY hash meets the target.
-        // We expect Accept.
+        // With easy_diff() the target is MAX, so any hash meets it.
         let mut ch = std_channel();
         let stored_merkle = [0xDD; 32];
         let out = validate_submit_standard(
@@ -907,9 +762,8 @@ mod tests {
         assert_eq!(ch.submission_cache.len(), 1);
     }
 
-    /// Duplicate submit on the same key is rejected as `stale-share`.
-    /// First call accepts + writes cache; second call sees the cache
-    /// hit and rejects WITHOUT modifying anything else.
+    /// A resubmission of the same key is rejected as `duplicate-share`
+    /// without a second cache insert.
     #[test]
     fn standard_rejects_duplicate_submit() {
         let mut ch = std_channel();
@@ -1005,9 +859,8 @@ mod tests {
         }
     }
 
-    /// Difficulty mismatch — hash doesn't meet job target.
-    /// We construct an impossibly hard target (DIFF_ONE × huge factor)
-    /// so the random submission hash won't meet it.
+    /// A hash that misses the job target is rejected as `difficulty-too-low`
+    /// and leaves the dedup cache untouched.
     #[test]
     fn standard_rejects_below_job_target() {
         let mut ch = std_channel();
@@ -1033,10 +886,9 @@ mod tests {
     /// is the "Full nVersion field"), so no reconstruction happens — unlike
     /// SV1, which submits a masked subset and rebuilds per BIP-310.
     ///
-    /// Both directions are covered, and the second is the one that pins the
-    /// difference from an OR-based pool: a miner must be able to **clear** a
-    /// bit the template set. ckpool's SV1 path (`*data32 |= version_mask`)
-    /// cannot express that; taking the submitted version verbatim can.
+    /// Both directions are covered; the second pins that a miner can
+    /// **clear** a bit the template set, which an OR-based reconstruction
+    /// cannot express.
     #[test]
     fn standard_header_version_is_the_submitted_version_verbatim() {
         let ctx = std_ctx(JobClassification::Active);
@@ -1110,8 +962,8 @@ mod tests {
             ShareValidation::Accepted(a) => {
                 assert_eq!(a.classification, JobClassification::Active);
                 assert!(!a.is_block_candidate);
-                // 5a: the per-job block reward is threaded onto the accept so
-                // the block-found fan-out can write the engine ledger.
+                // The per-job block reward is carried onto the accept for the
+                // block-found ledger write.
                 assert_eq!(
                     a.coinbase_tx_value_remaining,
                     job.coinbase_tx_value_remaining
@@ -1122,13 +974,10 @@ mod tests {
         assert_eq!(ch.submission_cache.len(), 1);
     }
 
-    /// 5b (SV2 Mining/SubmitShares.Error strict): the block-candidate gate
-    /// reads the `n_bits` **pinned on the job at send-time**, not any
-    /// current/latest template. A job pinned with a trivial target yields a
-    /// block-candidate for the same easy share that a difficulty-1 job
-    /// (`extended_accepts_easy_share`) classifies as non-candidate — proving
-    /// the gate is per-job, so a block-change between send and submit can't
-    /// reclassify an in-flight share.
+    /// The block-candidate gate reads the `n_bits` pinned on the job at
+    /// send-time (SV2 Mining/SubmitShares.Error): the same easy share is a
+    /// candidate here and not in `extended_accepts_easy_share`, so a block
+    /// change between send and submit cannot reclassify an in-flight share.
     #[test]
     fn extended_block_candidate_uses_per_job_pinned_n_bits() {
         let mut ch = ext_channel();
@@ -1203,9 +1052,8 @@ mod tests {
         }
     }
 
-    /// Extranonce-size mismatch is a HARD reject with wire-code
-    /// `bad-extranonce-size`. The hard-reject closes the cheating-vector.
-    /// See memory `feedback-sv2-bad-extranonce-size-hard-reject`.
+    /// An extranonce-size mismatch is a hard reject with wire code
+    /// `bad-extranonce-size` and no dedup write.
     #[test]
     fn extended_extranonce_size_mismatch_hard_rejects() {
         let mut ch = ext_channel();
@@ -1223,8 +1071,8 @@ mod tests {
         assert_eq!(ch.submission_cache.len(), 0, "no dedup write on reject");
     }
 
-    /// Wrong channel kind defensively rejects (caller bug; shouldn't
-    /// reach the wire as a real error, just keeps the connection alive).
+    /// A wrong channel kind is rejected rather than panicking, keeping the
+    /// connection alive.
     #[test]
     fn standard_validator_rejects_extended_channel() {
         let mut ch = ext_channel();

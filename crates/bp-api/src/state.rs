@@ -24,8 +24,8 @@ use crate::email_hooks::EmailVerificationHooks;
 use crate::response_cache::ResponseCache;
 
 /// Inner appstate fields. Wrapped in an `Arc` for cheap cloning into
-/// the axum router. We use a phantom-typed pair `<H, M>` for the
-/// hook trait + email trait — concrete impl is injected at bin level.
+/// the axum router. The generic pair `<H, M>` is the hook trait + email
+/// trait — the concrete impl is injected at bin level.
 pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     pub pool: PgPool,
     /// Redis connection — used by the mode endpoint to read the live
@@ -76,11 +76,9 @@ pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     /// preview so the UI's coinbase tile shows the same pool tag the
     /// real coinbase would carry.
     pub pool_identifier: String,
-    /// Solo-mode dev fee, exactly as the payout resolver receives it.
-    ///
-    /// The block-template preview used to read the PPLNS fee config here,
-    /// which is a different pool of money: a solo miner was shown a fee
-    /// output its real `mining.notify` never carried.
+    /// Solo-mode dev fee, exactly as the payout resolver receives it, so
+    /// the block-template preview shows a solo miner the fee output its
+    /// real `mining.notify` carries (not the PPLNS fee).
     pub solo_fee: bp_mining_job::SoloFeeConfig,
     /// Per-endpoint response cache. Handlers that opt in use
     /// `cache.get_or_fetch(...)` to skip DB / RPC work on repeat

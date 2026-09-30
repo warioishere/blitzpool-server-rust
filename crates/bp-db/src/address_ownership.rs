@@ -7,8 +7,8 @@
 //! - `pplns_address_ownership`   — the verified ownership binding (PK address).
 //!
 //! A generic "this address proved control of its key" primitive: consumed by the
-//! group-invite eligibility gate (a 2nd option next to the verified email) and,
-//! later, the custom-extranonce override auth gate.
+//! group-invite eligibility gate (a 2nd option next to the verified email) and
+//! the custom-extranonce override auth gate.
 
 use bp_common::AddressId;
 use sqlx::{postgres::PgPool, FromRow};
@@ -207,7 +207,7 @@ pub async fn addresses_with_ownership_proof(
 /// True when the address is verified by EITHER a confirmed email binding
 /// (`pplns_address_email.verifiedAt`) OR a signature ownership proof
 /// (`pplns_address_ownership`). This is the unified onboarding gate — a joining
-/// address must satisfy one of the two. Existing verified emails keep counting.
+/// address must satisfy one of the two.
 pub async fn is_address_verified(pool: &PgPool, address: &AddressId) -> Result<bool, DbError> {
     sqlx::query_scalar!(
         r#"SELECT (

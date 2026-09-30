@@ -297,11 +297,10 @@ pub async fn find_custom_extranonces_for_address(
 
 /// Every override, for the stratum core's in-memory cache.
 ///
-/// The core refreshes this periodically instead of hitting PG per connection:
-/// the table holds a handful of rows (one paying customer), so a full read costs
-/// one query per refresh regardless of how many miners are connected. The API
-/// process writes; the core reads — they are separate processes, so a change
-/// lands on the core within one refresh interval rather than instantly.
+/// The core refreshes this periodically instead of hitting PG per connection;
+/// the table holds a handful of rows, so a full read is one cheap query. The
+/// API process writes and the core reads, so a change lands on the core within
+/// one refresh interval rather than instantly.
 pub async fn all_custom_extranonces(pool: &PgPool) -> Result<Vec<CustomExtranonceRow>, DbError> {
     let rows = sqlx::query!(
         r#"SELECT

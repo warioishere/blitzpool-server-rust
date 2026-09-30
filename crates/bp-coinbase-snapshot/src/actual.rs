@@ -31,8 +31,7 @@ pub struct ActualCoinbase {
 
 impl ActualCoinbase {
     /// Decompose a real coinbase transaction. Output 0 is the pool
-    /// output by the §4 output order (also true of every coinbase this
-    /// pool ever built: fee/pool output first). Outputs whose script
+    /// output by the §4 output order. Outputs whose script
     /// has no address form (OP_RETURN, witness commitment) carry no
     /// value under §4 and are counted only into `total_value_sats`.
     pub fn from_coinbase(coinbase: &Transaction, network: Network) -> Self {

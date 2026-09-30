@@ -4,12 +4,10 @@
 
 //! The public leaderboard behind `/api/info` → `highScores`.
 //!
-//! `find_high_scores` had no test at all, which is how it went unnoticed
-//! that it read the one column `/bestdiff_reset` zeroes: a miner clearing
-//! their own best also deleted their entry from the pool's hall of fame,
-//! and the flush's `GREATEST` could never bring it back (it only ever
-//! offers the CURRENT window's max). Migration 0014 split the two values;
-//! this pins that the list reads the reset-immune one.
+//! The list must read `allTimeBestDifficulty`, not the column
+//! `/bestdiff_reset` zeroes: otherwise a miner clearing their own best
+//! would drop off the leaderboard, and the flush's `GREATEST` could never
+//! restore the entry (it only offers the CURRENT window's max).
 //!
 //! Needs `bp-test-pg` (15433) — skips when it is unreachable, so watch
 //! the passed-count.

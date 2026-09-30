@@ -13,8 +13,8 @@ use super::error::{AdapterError, AdapterResult};
 use crate::template::EmailContent;
 
 // Custom transactional-email headers — lettre's `Header` trait requires
-// one type per distinct header-name so we instantiate four trivial
-// wrappers via a macro.
+// one type per distinct header-name, hence four trivial wrappers via a
+// macro.
 macro_rules! email_header {
     ($ty:ident, $name:literal) => {
         #[derive(Clone)]
@@ -56,7 +56,7 @@ pub struct SmtpConfig {
 
 /// SMTP send adapter — attaches `List-Unsubscribe` /
 /// `Auto-Submitted` / `Precedence` headers on every message so
-/// Gmail / Outlook keep us out of the bulk-folder.
+/// Gmail / Outlook keep the mail out of the bulk folder.
 pub struct SmtpAdapter {
     transport: AsyncSmtpTransport<Tokio1Executor>,
     from: String,

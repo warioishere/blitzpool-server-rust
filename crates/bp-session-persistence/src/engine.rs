@@ -3,12 +3,12 @@
 //! Composite handle exposing the hook impls + the buffered share-touch
 //! flusher.
 //!
-//! Nothing here writes a statement per event any more. The connection
-//! path (authorize/disconnect) is debounced — see `RowDebounce`: a
-//! session's row is born only once it has survived `row_debounce`, so
-//! probe connections never reach Postgres. Everything on the SHARE path
-//! is buffered, because at ~250 shares/s a statement per share dominates
-//! the DB write budget:
+//! Nothing here writes a statement per event. The connection path
+//! (authorize/disconnect) is debounced (see `RowDebounce`): a session's
+//! row is born only once it has survived `row_debounce`, so probe
+//! connections never reach Postgres. Everything on the share path is
+//! buffered, because a statement per share would dominate the DB write
+//! budget:
 //!
 //! - `RowDebounce` → one bulk `INSERT … ON CONFLICT` for the due row
 //!   births every `row_flush_interval` (default 5 s).
@@ -18,8 +18,7 @@
 //!   hashes per `hashrate_sample_interval` (default 60 s).
 //! - `DiffStatBuffer` → one bulk upsert into
 //!   `client_difficulty_statistics_entity` every
-//!   `diff_stat_flush_interval` (default 30 s). Batched since 2026-08-05;
-//!   the inline version burst at every restart and hour rollover.
+//!   `diff_stat_flush_interval` (default 30 s).
 
 use std::sync::Arc;
 

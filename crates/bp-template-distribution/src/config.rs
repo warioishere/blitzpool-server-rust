@@ -15,7 +15,7 @@ pub const DEFAULT_RECONNECT_BACKOFF_SECS: u64 = 2;
 /// Default mempool fee delta (in satoshis) that triggers a fresh `NewTemplate`.
 ///
 /// 100 000 sat ≈ 0.001 BTC. Bigger than the upstream example's 100-sat
-/// default — we want one template per meaningful fee bump, not noise.
+/// default: one template per meaningful fee bump, not noise.
 pub const DEFAULT_FEE_THRESHOLD: u64 = 100_000;
 
 /// Default minimum interval (in seconds) between two consecutive non-tip

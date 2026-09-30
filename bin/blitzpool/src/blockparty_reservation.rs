@@ -4,25 +4,22 @@
 //!
 //! Implements [`bp_blockparty_engine::CoinbaseReservation`] over the Blockparty
 //! TDP stream. When a party reaches `Ready` (roster final, about to mine), the
-//! engine calls [`TdpCoinbaseReservation::ensure_capacity_for_members`]; we
-//! compute the coinbase weight the roster needs and, if it exceeds what's
-//! currently reserved, raise bitcoin-core's reservation via
+//! engine calls [`TdpCoinbaseReservation::ensure_capacity_for_members`], which
+//! computes the coinbase weight the roster needs and, if it exceeds what is
+//! reserved, raises bitcoin-core's reservation via
 //! [`TdpHandle::set_coinbase_constraints`].
 //!
-//! **High-water-mark.** The reservation only ever grows (across all active
-//! parties sharing the one Blockparty stream) and never drops below the
-//! configured floor (`[blockparty].coinbase_weight_budget`). For any party that
-//! fits the floor the call is a no-op — so the common case has zero
-//! reservation churn and zero template lag. A raise only happens for a party
-//! larger than the floor, and reaches templates within ~one TDP cycle; keeping
-//! the floor ≥ the realistic max party means that lagging path is never the
-//! validity guarantee, only headroom.
+//! **High-water-mark.** The reservation only grows (across all parties sharing
+//! the one Blockparty stream) and never drops below the floor
+//! (`[blockparty].coinbase_weight_budget`). A party that fits the floor is a
+//! no-op, so the common case has no template lag. A raise reaches templates
+//! within about one TDP cycle; keeping the floor at or above the realistic max
+//! party makes that lagging path headroom, not the validity guarantee.
 //!
 //! Blockparty does NOT weight-trim (unlike Group-Solo / PPLNS), so this sizing
-//! is how a larger-than-floor party stays valid. Beyond
-//! [`BLOCKPARTY_MAX_RESERVATION_WU`] the reservation caps out (pathological
-//! party guard); such a party is logged and would risk rejection — far past any
-//! realistic size.
+//! is how a larger-than-floor party stays valid. The reservation caps at
+//! [`BLOCKPARTY_MAX_RESERVATION_WU`]; a party beyond it is logged and risks
+//! rejection, far past any realistic size.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -37,9 +34,9 @@ use tracing::{info, warn};
 
 use crate::boot::tdp_constraint_for_budget;
 
-/// Hard cap on the Blockparty coinbase reservation (weight units). Defends
-/// block space against a pathologically large party — ~289 P2TR members, far
-/// beyond any realistic party. A party past this caps out (no further raise).
+/// Hard cap on the Blockparty coinbase reservation (weight units), bounding
+/// the block space a party can claim: ~289 P2TR members, far beyond any
+/// realistic party.
 const BLOCKPARTY_MAX_RESERVATION_WU: u32 = 50_000;
 
 /// Sizes the Blockparty TDP stream's coinbase reservation to the largest party
@@ -100,9 +97,8 @@ impl CoinbaseReservation for TdpCoinbaseReservation {
             .await
         {
             Ok(()) => {
-                // Store unconditionally to `target`: concurrent callers may race,
-                // but each only ever raises, so the reservation converges to the
-                // largest requested and stays there (high-water).
+                // Concurrent callers may race; `fetch_max` keeps the largest
+                // requested budget (high-water).
                 self.current_budget_wu.fetch_max(target, Ordering::AcqRel);
                 info!(
                     member_count,

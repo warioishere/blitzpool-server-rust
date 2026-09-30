@@ -10,9 +10,9 @@
 //! in-flight dedup of concurrent callers.
 //!
 //! Gated on both docker-Redis (Port 16379) and docker-PG (Port 15433);
-//! tests skip cleanly via `eprintln!` if either is missing. PG state
-//! is cleaned by per-test prefix DELETE; Redis state isolated by
-//! per-test DB number (0..=15).
+//! tests skip via `eprintln!` if either is missing. PG state is cleaned
+//! by per-test prefix DELETE; Redis state is isolated by per-test DB
+//! number inside this binary's `bp_test_support::redis_db` range.
 
 use std::sync::Arc;
 
@@ -24,8 +24,7 @@ use bp_pplns_engine::distribution::{
 use bp_pplns_engine::window::{NetworkDifficulty, WindowStore};
 
 /// Pool-output recipient. §4 makes `pay_P` structural, so the weight model
-/// has no distribution without one. One constant because three harnesses
-/// in this file configured the same literal separately.
+/// has no distribution without one. Shared by every harness in this file.
 const FEE_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 use redis::{aio::ConnectionManager, Client};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -155,12 +154,9 @@ async fn cleanup(pool: &PgPool, prefix: &str) {
 
 /// Every test owns its OWN pair of addresses.
 ///
-/// `pplns_balance` is keyed on the address alone and is shared by every
-/// test in this target — they only differ by Redis database. While they
-/// all used the same two literals, one test's `cleanup_addresses` deleted
-/// the balance row another was mid-way through asserting on. Distinct
-/// addresses per test is what makes them independent; the Redis database
-/// index alone never did.
+/// `pplns_balance` is keyed on the address alone and shared by every test
+/// in this target, so distinct addresses (not the Redis database index) are
+/// what keep one test's `cleanup_addresses` off another's rows.
 async fn cleanup_addresses(pool: &PgPool, addresses: &[&str]) {
     for addr in addresses {
         let _ = sqlx::query("DELETE FROM pplns_balance WHERE address = $1")
@@ -174,10 +170,9 @@ async fn cleanup_addresses(pool: &PgPool, addresses: &[&str]) {
 
 /// `max_age_days` for tests that are not about ageing.
 ///
-/// Explicitly a very long window rather than `0`. The constructor floors the
-/// value at one day, so a literal `0` reads as "rule off" and quietly means
-/// "24 hours" — which these tests survive only because their shares are
-/// stamped near now. Writing the intent out removes the trap.
+/// Explicitly a very long window rather than `0`: the constructor floors the
+/// value at one day, so a literal `0` would look like "rule off" but mean
+/// "24 hours".
 const AGE_RULE_OFF: u32 = 3650;
 
 #[tokio::test]
@@ -252,9 +247,8 @@ async fn build_folds_open_balances_into_distribution() {
     let window = build_window(&h).await;
     seed_share(&window, ADDR_MINER, 100.0, 1_700_000_000_001).await;
 
-    // Debtor has a -5_000 balance (owes the pool from a previous trim
-    // bonus). When debtor is NOT in the current window, the distribution
-    // should still consider them.
+    // Debtor has a -5_000 balance and is NOT in the current window; the
+    // distribution must still carry it.
     seed_open_balance(&h.pool, ADDR_DEBTOR, -5_000, 0).await;
 
     let result = h.builder.build(312_500_000).await.expect("build ok");
@@ -376,9 +370,7 @@ async fn distinct_rewards_each_get_their_own_compute() {
 //
 // The reference-independent half — the Redis window read and the
 // Postgres ledger query — is identical for every build and must be
-// loaded once, not once per caller. (The push model removed the old
-// per-JDC-value burst; distinct references now only arise across
-// template changes, but the dedup still has to hold.)
+// loaded once, not once per caller.
 
 #[tokio::test]
 async fn concurrent_distinct_rewards_share_one_inputs_load() {
@@ -486,21 +478,14 @@ async fn distinct_references_share_one_fingerprinted_snapshot() {
 
 // ── Test 6 — empty window: refused here, bootstrapped per-miner ──────
 
-/// MONEY: an empty window must not produce a servable distribution.
-///
-/// It used to return an entry list with nothing in it, and that is not a
-/// harmless empty answer: `weight_P` floors at 1 and §4 makes the pool
-/// output the residual, so `payout_entries_at` yielded a SINGLE output
-/// paying the WHOLE block to the fee address — and the list is not empty,
-/// so the job path served it and settlement then booked nothing (every
-/// claim is 0 at `score_total == 0`).
+/// MONEY: an empty window must not produce a servable distribution. With
+/// `weight_P` flooring at 1 and §4 making the pool output the residual, an
+/// empty entry list would pay the WHOLE block to the fee address, and
+/// settlement would book nothing (every claim is 0 at `score_total == 0`).
 ///
 /// The shared build is the one that must refuse: its result is cached by
 /// revenue alone and handed to every PPLNS connection, so it has no single
 /// miner it could name as the claimant.
-///
-/// The test this replaces asserted `entries.is_empty()` — i.e. it pinned
-/// the defect as the contract.
 #[tokio::test]
 async fn an_empty_window_is_refused_by_the_shared_build() {
     let h = match connect_or_skip(13, "test_dist_empty_").await {
@@ -526,8 +511,8 @@ async fn an_empty_window_is_refused_by_the_shared_build() {
 /// The other half: the per-miner bootstrap build DOES answer, and it pays
 /// the asking miner rather than the pool.
 ///
-/// This is what keeps the refusal above from bricking a fresh pool — the
-/// window fills only from accepted shares, and shares come only from jobs.
+/// This keeps the refusal above from locking out a fresh pool: the window
+/// fills only from accepted shares, and shares come only from jobs.
 #[tokio::test]
 async fn the_bootstrap_build_pays_the_asking_miner() {
     let h = match connect_or_skip(4, "test_dist_boot_").await {
@@ -571,7 +556,7 @@ async fn the_bootstrap_build_pays_the_asking_miner() {
             .map(|(_, s)| *s)
             .sum()
     };
-    // THE money assertion: the pool takes its fee and not the block.
+    // The money assertion: the pool takes its fee and not the block.
     // `weight_P` carries only the fee whatever the ledger owes, so this
     // holds regardless of any leftover balance rows.
     let fee_only = T * u64::from(result.distribution.fee_ppm) / 1_000_000;
@@ -605,15 +590,10 @@ async fn the_bootstrap_build_pays_the_asking_miner() {
 //
 // The Harness owns the WindowStore inside the DistributionBuilder, but
 // tests need a separate handle to seed shares + read the snapshot
-// directly. Constructing a parallel WindowStore against the same
-// connection is fine (ConnectionManager is multiplexed).
+// directly. A sibling store against the same Redis DB is fine
+// (ConnectionManager is multiplexed).
 
 async fn build_window(h: &Harness) -> WindowStore {
-    // Tests need a parallel WindowStore against the same Redis DB the
-    // harness chose so they can seed shares + inspect the snapshot
-    // directly. The harness's builder owns its WindowStore internally;
-    // making a sibling against the same DB is fine because
-    // ConnectionManager is multiplexed.
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
     let db = redis_db_for_prefix(&h.address_prefix);
     let db =
@@ -626,9 +606,8 @@ async fn build_window(h: &Harness) -> WindowStore {
 }
 
 fn redis_db_for_prefix(prefix: &str) -> u8 {
-    // Mirror the manual db assignments in `#[tokio::test]`s above.
-    // Brittle but kept obvious — change this table if you renumber the
-    // tests.
+    // Mirrors the manual db assignments in the tests; change this table
+    // when renumbering them.
     match prefix {
         "test_dist_e2e_" => 8,
         "test_dist_ledger_" => 9,
@@ -651,26 +630,13 @@ fn redis_db_for_prefix(prefix: &str) -> u8 {
 // `pplns_payouts` turns any `build_distribution` error into "serve no job",
 // so a build that returns `Err` leaves every miner in the window without one
 // until it recovers. A Redis blip on the snapshot write must therefore not
-// fail the build: the distribution is correct and is about to become a
-// coinbase. Losing the snapshot costs a reprocess; losing the distribution
-// costs the pool's miners their hashing time over a fault that changed
-// nothing about who is owed what.
+// fail the build: losing the snapshot costs a reprocess, losing the
+// distribution costs the miners their hashing time.
 //
-// The write is made to fail for real, not mocked — but the injection has to
-// be LOCAL. `CONFIG SET maxmemory 1` was used here originally and is
-// server-global: while it was in force, every other test writing to this
-// Redis — in this file and in other crates running concurrently — failed with
-// OOM. That was the whole flake.
-//
-// Occupying the snapshot key with a wrong-typed value was the next attempt.
-// It cannot work: `write_weight_snapshot` issues `DEL` before its `HSET`, so
-// it clears the obstacle itself — and it aims at `pplns:snapshot:<fingerprint>`
-// anyway, not the bare prefix. Measured 2026-08-03: the write succeeded and
-// the test asserted nothing about its own subject.
-//
-// A read-only Redis ACL user is the injection that holds. It is scoped to
-// THIS connection, so concurrent tests are untouched, and it reproduces the
-// production shape exactly: reads keep working, every write is refused.
+// The write fails for real via a read-only Redis ACL user. It is scoped to
+// THIS connection (a server-global knob like `maxmemory` would break
+// concurrent tests), and reads keep working while every write is refused. A
+// wrong-typed value on the key would not do: the write `DEL`s it first.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
@@ -689,10 +655,8 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
 
     const ACL_USER: &str = "bp_test_readonly_snapshot";
     let redis_base = std::env::var("BP_REDIS_URL").unwrap_or_else(|_| REDIS_URL.to_string());
-    // The SAME logical DB the harness seeded into. Hardcoding the local
-    // number here worked only while local numbers WERE the raw index; the
-    // per-binary ranges made that silently point at an empty database and
-    // the distribution came back empty.
+    // The SAME logical DB the harness seeded into, mapped through this
+    // binary's range; the raw local number would point at an empty DB.
     let db = redis_db_for_prefix(&h.address_prefix);
     let db =
         bp_test_support::redis_db_in_range(bp_test_support::redis_db::PPLNS_DISTRIBUTION, db).await;
@@ -781,15 +745,12 @@ async fn snapshot_write_failure_still_returns_the_pplns_distribution() {
 //
 // The window IS the shares: without it there is nothing to distribute and
 // nothing may be invented, so the build fails and the resolver serves no
-// job. The ledger is a set of PROMISES on top of that split, and a promise
-// that cannot be read right now is not a promise that is lost — it still
-// sits in `pplns_balance`. Failing the build over it would blank every
-// PPLNS job in the pool during a Postgres fault that costs nothing but a
-// one-block delay in repayments, while `record_share` (Redis only) keeps
-// crediting every miner correctly throughout.
+// job. The ledger is a set of PROMISES on top of that split; one that cannot
+// be read right now still sits in `pplns_balance`. Failing the build over it
+// would blank every PPLNS job during a Postgres fault that only delays
+// repayments by a block, so the build degrades to score-only instead.
 //
-// The pair below pins both halves, with a control on each so neither can
-// pass for an unrelated reason.
+// The pair below pins both halves, with a control on each.
 
 /// A `PgPool` that will never connect. Used to make the ledger read fail
 /// for real rather than mocking the decision away.
@@ -807,9 +768,7 @@ async fn an_unreadable_ledger_degrades_to_a_score_only_distribution() {
         Some(h) => h,
         None => return,
     };
-    // Own pair, per the rule above: these appear nowhere else that writes
-    // `pplns_balance`. Reusing another test's addresses had this test
-    // deleting its own seeded balance out from under itself.
+    // Own pair: these appear nowhere else that writes `pplns_balance`.
     const ADDR_A: &str = "bc1q307hujcervvdfr73ntlam2f7w65j6gs9zcnf39";
     const ADDR_B: &str = "bc1qywnf55acqpxr0lekg2gmy2s46pzxqze99j0u9y";
     const REWARD: u64 = 312_500_000;

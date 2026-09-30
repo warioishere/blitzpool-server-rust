@@ -8,13 +8,12 @@
 //!
 //! `build_notify_frame` borrows all its hex from caches: the header-constant
 //! fields (prev_hash, version, n_bits, header_timestamp) from the template, and
-//! the coinbase (coinb1/coinb2) from the shared `MiningJob`. Every one of those
-//! is identical for all clients on a template, so re-encoding per client was
-//! pure waste. The output frame Vec is additionally pre-sized to an upper
-//! bound, so serde_json writes it without a realloc — that Vec is then the
-//! builder's only allocation. The bench reports:
-//!   - **allocations per build** — asserts the builder is down to a single
-//!     alloc, and shows the 6 per-client hex encodings the caches removed.
+//! the coinbase (coinb1/coinb2) from the shared `MiningJob`, because each is
+//! identical for all clients on a template. The output frame Vec is pre-sized
+//! to an upper bound, so serde_json writes it without a realloc — that Vec is
+//! the builder's only allocation. The bench reports:
+//!   - **allocations per build** — asserts a single alloc, and shows the 6
+//!     per-client hex encodings the caches avoid.
 //!   - **ns/op** (criterion).
 //!
 //! Run: `cargo bench -p bp-stratum-v1 --bench notify`
@@ -30,7 +29,7 @@ use bp_mining_job::{
 use bp_stratum_v1::{build_notify_frame, swap_endian_words, ActiveSV1Template};
 use criterion::{Criterion, Throughput};
 
-// ── Counting allocator: tallies every alloc/realloc so we can read the
+// ── Counting allocator: tallies every alloc/realloc to read the
 //    allocation count across one isolated call. ──
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
@@ -104,9 +103,9 @@ fn allocs_for_notify(t: &ActiveSV1Template, job: &MiningJob) -> usize {
     n
 }
 
-/// The hex encodings the caches remove from every per-client build — 4 on the
+/// The hex encodings the caches keep out of every per-client build — 4 on the
 /// template (prev_hash + version + n_bits + ntime) and 2 on the shared
-/// `MiningJob` (coinb1 + coinb2) — what the old `build_notify_frame` paid per call.
+/// `MiningJob` (coinb1 + coinb2) — i.e. what an uncached build would pay per call.
 fn allocs_for_removed_encodes(t: &ActiveSV1Template, job: &MiningJob) -> usize {
     let before = ALLOCS.load(Ordering::Relaxed);
     let a = hex::encode(swap_endian_words(&t.prev_hash));

@@ -23,10 +23,8 @@ use bp_template_distribution::{ActiveTemplate, TemplateChange};
 
 /// Single broadcast event from the translator to per-connection tasks.
 /// The template rides in an `Arc`: the `tokio::sync::broadcast::Sender`
-/// clones the payload once per subscriber, and without the `Arc` every
-/// connection would deep-copy the whole template (coinbase prefix/output
-/// buffers + merkle path, ~1 KB) on every block change — N refcount
-/// bumps instead of N allocations. Field reads deref transparently.
+/// clones the payload once per subscriber, so this is N refcount bumps per
+/// block change instead of N deep copies of the template.
 #[derive(Clone, Debug)]
 pub struct TemplateBroadcast {
     pub template: Arc<ActiveTemplate>,

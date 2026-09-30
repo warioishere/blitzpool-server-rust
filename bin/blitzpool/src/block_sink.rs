@@ -4,31 +4,25 @@
 //!
 //! When a Stratum share's hash meets the network target the template's
 //! `n_bits` encodes, the per-protocol server fires the block-submission
-//! hook. The Rust port
-//! routes those through [`TdpBlockSubmissionSink`] which assembles the
-//! witness-form coinbase from the share's owned `MiningJob` snapshot
-//! plus the parsed extranonces, then calls
+//! hook, routed through [`TdpBlockSubmissionSink`], which assembles the
+//! witness-form coinbase from the share's `MiningJob` snapshot plus the
+//! parsed extranonces and calls
 //! `bp_template_distribution::TdpHandle::submit_solution(...)`.
 //!
 //! Bitcoin Core's IPC `SubmitSolution` consumes:
 //! - `template_id`     — taken from `accept.template.template_id`
-//! - `version`         — extracted from the 80-byte header bytes 0..4
-//!   (miner-rolled via `BIP-310` version-rolling; we read it back
-//!   from the assembled header rather than the template's pre-roll
-//!   version field)
+//! - `version`         — header bytes 0..4, read back from the assembled
+//!   header because the miner may have rolled it (BIP-310)
 //! - `header_timestamp` — header bytes 68..72
 //! - `header_nonce`    — header bytes 76..80
 //! - `coinbase_tx`     — the witness-form coinbase, derived from
 //!   `MiningJob::witness_coinbase_with_extranonce(&enonce1, &enonce2)`
 //!
-//! bitcoin-core re-derives `prev_hash` + `merkle_root` from the
-//! template + coinbase, so we don't pass them through the IPC call.
-//! It validates the full block synchronously; an `Ok(())` from
-//! `submit_solution` means accepted-or-already-known. Any error from
-//! the IPC channel is logged at WARN — the block path is best-effort
-//! from the SV1 server's perspective (the share is already credited
-//! by the time this hook fires; failing to forward to core only
-//! means we lose the block reward, not the share count).
+//! bitcoin-core re-derives `prev_hash` + `merkle_root` from the template +
+//! coinbase and validates the full block synchronously; `Ok(())` means
+//! accepted-or-already-known. An IPC error is logged at WARN: the share is
+//! already credited when this hook fires, so a failed forward loses the
+//! block reward, not the share count.
 //!
 //! SV1 and SV2 differ only in where the coinbase bytes come from (SV1
 //! reassembles them from the job + extranonces, SV2 hands them over); the
@@ -107,11 +101,9 @@ pub(crate) struct BlockFoundEvent {
     /// side has to fall back to a late read under the fingerprint, which
     /// usually finds nothing.
     ///
-    /// The wire name stays `groupsolo_weight_snapshot`: this rides a
-    /// Redis stream that other processes replay, and a rolling deploy has
-    /// both spellings in flight at once. The Rust name is generic because
-    /// the field never was Group-Solo-specific — treating it as such is
-    /// exactly what left PPLNS without one.
+    /// The wire name is `groupsolo_weight_snapshot` because this rides a
+    /// Redis stream that other processes replay; the field serves every
+    /// snapshot-backed mode, not only Group-Solo.
     #[serde(default, rename = "groupsolo_weight_snapshot")]
     pub weight_snapshot: Option<bp_coinbase_snapshot::StoredWeightSnapshot>,
     /// Identity of the payout list this block's coinbase pays, taken off the
@@ -123,8 +115,8 @@ pub(crate) struct BlockFoundEvent {
     /// pool did not build the coinbase (`SetCustomMiningJob`) or the job path
     /// carries no fingerprint.
     ///
-    /// Named for PPLNS because that is where it started; the name is on the
-    /// wire format of a stream other processes replay, so it stays.
+    /// The `pplns_` name is part of the wire format of a stream other
+    /// processes replay; the field serves every mode.
     #[serde(default)]
     pub pplns_payouts_fingerprint: Option<[u8; 32]>,
     /// What the found block's coinbase ACTUALLY paid, decoded from the
@@ -173,13 +165,8 @@ impl Booking {
     }
 }
 
-/// What identifies a JDC-found block in `blocks_entity`.
-///
-/// The four used to travel as four consecutive `String` parameters through two
-/// signatures — trait method and the concrete one it forwards to — where any
-/// two could be exchanged in silence. They were, deliberately, in a check:
-/// `cargo check` and 175 `blitzpool` tests stayed green with the session id in
-/// the address column and the header in the hash column.
+/// What identifies a JDC-found block in `blocks_entity`. Named fields, so
+/// the four strings cannot be exchanged silently at a call site.
 ///
 /// ⚠️ `session_id` lands in `blocks_entity."sessionId"`, which is
 /// `varchar(8)`. Postgres does not truncate on INSERT, it errors.
@@ -197,21 +184,9 @@ pub(crate) struct FoundBlockRecord {
 /// [`BlockFoundEvent`], against the half [`TdpBlockSubmissionSink::emit_block_found`]
 /// resolves on the Core (`mode`, `group_id`, `height`, `weight_snapshot`).
 ///
-/// A struct because these travelled as eight positional parameters through
-/// that one signature, four of them `String` and one `Option<String>`.
-/// Measured 2026-08-22: exchanging `worker` and `session_id` — writing the
-/// literal `"jdp"` into `blocks_entity."sessionId"` and the session id into
-/// `"worker"` — compiled and left all 179 `blitzpool` tests green. The one
-/// pairing that IS caught, address against session id, is caught by
-/// `varchar(8)` refusing the longer value rather than by any test, and only
-/// when a database is reachable at all.
-///
-/// Named fields do not make the exchange impossible — `address:
-/// session_id.clone()` still compiles. They make it visible AT THE CALL SITE
-/// instead of only in the signature, which is the whole distance between a
-/// reviewable mistake and an invisible one. Making it impossible needs a
-/// newtype per string; that reaches far past this boundary and was weighed
-/// against it deliberately.
+/// A struct because several of these are same-typed strings: named fields do
+/// not make an exchange impossible, but they make it visible at the call
+/// site instead of only in the signature.
 struct BlockFoundInputs {
     /// Miner-authorized payout address. Also what the mode gate is asked, so
     /// a wrong value here does not merely mis-record a column: it books the
@@ -226,7 +201,7 @@ struct BlockFoundInputs {
     /// Big-endian block-hash hex. Not an `Option` here even though
     /// [`BlockFoundEvent::block_hash`] is one: every caller has the hash. The
     /// event keeps its `Option` because it is deserialized off a stream that
-    /// other processes replay, so events predating the field still arrive.
+    /// other processes replay, where events without the field may arrive.
     block_hash: String,
     /// The 80-byte header as hex (LE), for `blocks_entity.blockData`.
     block_data: String,
@@ -300,10 +275,9 @@ pub(crate) struct BlockFoundApplier {
     /// A settlement from ANY source invalidates every published payout
     /// distribution: the published weights encode the pre-settlement
     /// balances, so a 0x0003 JDC still mining them would pay those
-    /// balances a second time. Wiring it only to JDP-declared blocks left
-    /// every SV1/SV2 block skipping the invalidation; wiring it only
-    /// in-process left every block skipping it under the role split,
-    /// where the process that books is not the one holding the registry.
+    /// balances a second time. It covers SV1/SV2 blocks as well as
+    /// JDP-declared ones, and works across the role split, where the
+    /// process that books is not the one holding the registry.
     settle: Option<crate::settlement::SettlementSignal>,
 }
 
@@ -328,10 +302,7 @@ impl TdpBlockSubmissionSink {
 
     /// The sink as the binary wires it: the ONE way SV1, SV2 and the JDP
     /// ledger booker build theirs, so a block books the same way whichever of
-    /// them found it. They used to be three hand-copied builder chains, and
-    /// the JDP copy had lost `with_settle_handle` — a block it booked on the
-    /// immediate path (parking failed) never invalidated the published
-    /// distributions.
+    /// them found it.
     ///
     /// On the front the sink also produces onto the block-found stream: the
     /// payout satellite applies the ledger and the notify satellite fans out
@@ -538,7 +509,7 @@ impl TdpBlockSubmissionSink {
 
     /// Height of the just-found block, derived from its parent (`prev_hash` in
     /// the 80-byte header) — NOT `get_block_count() + 1`. `submit_solution` may
-    /// have already connected the block by the time we'd query the tip, making
+    /// already have connected the block when the tip is queried, making
     /// `tip + 1` one too high; the parent's height + 1 is the found block's
     /// height regardless of submit/propagation timing. Falls back to the tip
     /// query only if the parent lookup is unavailable (so a height hiccup never
@@ -631,8 +602,8 @@ impl TdpBlockSubmissionSink {
         // Stamp the distribution the winning job's coinbase pays into the
         // event, looked up by that job's payout-list fingerprint, so the apply
         // side books exactly that. A zeroed fingerprint means the pool did not
-        // build this coinbase (`SetCustomMiningJob`) — there is no
-        // distribution of ours to find.
+        // build this coinbase (`SetCustomMiningJob`) — there is no pool
+        // distribution to find.
         let job_payouts_fingerprint = pplns_payouts_fingerprint.filter(|fp| fp != &[0u8; 32]);
         let weight_snapshot = self
             .resolve_weight_snapshot(
@@ -660,7 +631,7 @@ impl TdpBlockSubmissionSink {
         };
 
         // The front publishes to the stream (the payout Satellite applies). On
-        // a publish failure we fall back to in-process apply so a Redis blip
+        // a publish failure it falls back to in-process apply so a Redis blip
         // never silently drops the ledger write — the apply is PG-idempotent,
         // so a later redelivery is a no-op.
         match self.block_found_producer.as_ref() {
@@ -689,13 +660,8 @@ impl TdpBlockSubmissionSink {
     /// Resolve the settlement inputs a found block's coinbase was built
     /// from, for the event the apply side consumes.
     ///
-    /// **Every mode is decided here, by an exhaustive `match`.** It used to
-    /// be `if mode == GroupSolo`, and PPLNS fell out of it silently: its
-    /// blob went to the apply side empty and the apply re-read the
-    /// fingerprint key `confirmation_depth` blocks later, by which time the
-    /// key had usually expired and the settlement inputs were gone for good.
-    /// An `if` cannot be exhaustive; a `match` can, so the next mode cannot
-    /// be forgotten the same way.
+    /// **Every mode is decided here, by an exhaustive `match`**, so no mode
+    /// can silently go without its settlement inputs.
     ///
     /// Resolving HERE — at the block-found instant, on the process that
     /// holds the engines — is the point. The key is certainly alive now and
@@ -830,9 +796,9 @@ impl BlockFoundApplier {
     /// the Satellite's block-found stream consumer uses this to run the same
     /// apply the front runs in-process on a publish-failure fallback.
     ///
-    /// `settle` is an argument, not a builder step: the payout satellite's
-    /// applier was built without it, so a block it booked on the immediate
-    /// path never invalidated the published distributions.
+    /// `settle` is an argument, not a builder step, so no applier can be
+    /// built that books a block without invalidating the published
+    /// distributions.
     pub(crate) fn new(
         pplns: Option<PplnsEngine>,
         group_solo: Option<GroupSoloEngine>,
@@ -1240,7 +1206,7 @@ impl BlockFoundApplier {
                             // below rather than returning: a block nobody can
                             // book is exactly the one the operator has to hear
                             // about. The Core logged which of the reasons it
-                            // was; see `resolve_group_solo_distribution`.
+                            // was; see `resolve_weight_snapshot`.
                             error!(
                                 address = address_str,
                                 group_id = group_id_str,
@@ -1267,7 +1233,7 @@ impl BlockFoundApplier {
 
     /// Fire the block-found notification fan-out (dispatcher only — no ledger,
     /// no RPC, no engines). It's the tail of [`Self::apply_block_found`] (so the
-    /// front's publish-failure fallback notifies as before), and the entry
+    /// front's publish-failure fallback notifies too), and the entry
     /// point for the **notify-only** Satellite consumer (`notify` role), which
     /// holds the dispatcher but no engines. A no-op when no dispatcher is wired
     /// (e.g. the `payout` process, which does ledger-only).
@@ -1369,8 +1335,8 @@ impl TdpBlockSubmissionSink {
     /// emit the block-found. The one path SV1 and SV2 share; they differ
     /// only in where `solution.coinbase_tx` comes from.
     ///
-    /// The submit is best-effort (a failure only logs): the block-found is
-    /// emitted either way, as it always was.
+    /// A failed submit means the block never reached bitcoin-core, so it is
+    /// logged and nothing is emitted.
     pub(crate) async fn submit_and_emit(
         &self,
         solution: PoolBuiltSolution<'_>,
@@ -1470,8 +1436,7 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
         // that: the JDP `PushSolution` path matches a solution against a
         // DECLARED job, so it never sees a Coinbase-only one
         // (SV2 JDP/Coinbase-only Mode — that mode never declares), whether or
-        // not a distribution backs it. Deciding on the distribution instead
-        // left every Coinbase-only 0x0003 block unrecorded AND unsettled.
+        // not a distribution backs it.
         //
         // Recording a claimed block here too would write the
         // `blocks_entity` row twice — the insert has no `ON CONFLICT` — and
@@ -1556,8 +1521,8 @@ impl Sv2BlockSubmissionSink for TdpBlockSubmissionSink {
 /// transaction — settlement then has no actuals and the block is
 /// reported-not-booked rather than booked from a guess.
 ///
-/// Strict through [`decode_whole_tx`], as the JDP path always was: a
-/// coinbase decoded from a prefix would book the prefix's outputs.
+/// Strict through [`decode_whole_tx`], like the JDP path: a coinbase
+/// decoded from a prefix would book the prefix's outputs.
 fn decode_actual_coinbase(
     witness_coinbase: &[u8],
     network: bitcoin::Network,
@@ -1576,11 +1541,10 @@ fn decode_actual_coinbase(
 /// Decode a transaction and require that it consumed EVERY byte.
 ///
 /// `Transaction::consensus_decode` reads from a slice and stops when it has a
-/// complete transaction. On a malformed input that happens to start with a
-/// valid one it therefore SUCCEEDS, silently, on a prefix — which is how a
-/// double-wrapped coinbase turned into a 21-byte transaction with no inputs
-/// instead of an error. Anything reassembled into a block, or booked from,
-/// has to be the whole thing, so a remainder is a failure.
+/// complete transaction, so on a malformed input that starts with a valid one
+/// it SUCCEEDS silently on a prefix (a double-wrapped witness coinbase decodes
+/// this way). Anything reassembled into a block, or booked from, has to be the
+/// whole thing, so a remainder is a failure.
 pub(crate) fn decode_whole_tx(bytes: &[u8]) -> Option<bitcoin::Transaction> {
     let mut cursor = bytes;
     let tx = <bitcoin::Transaction as bitcoin::consensus::Decodable>::consensus_decode(&mut cursor)
@@ -1598,8 +1562,8 @@ pub(crate) fn decode_whole_tx(bytes: &[u8]) -> Option<bitcoin::Transaction> {
 
 /// Compute the standard Bitcoin block hash display form (big-endian
 /// hex) from the assembled 80-byte header. `bp_share::sha256d` returns
-/// the digest in little-endian "internal" order; we reverse and hex-
-/// encode for the human-facing form bitcoind / explorers use.
+/// the digest in little-endian "internal" order; it is reversed and
+/// hex-encoded for the form bitcoind / explorers use.
 fn block_hash_display(header: &[u8; 80]) -> String {
     let mut hash = bp_share::sha256d(header);
     hash.reverse();
@@ -1628,15 +1592,12 @@ mod tests {
 
     /// ext 0x0003/Implementation Notes: a block booked through a Stratum
     /// sink's IMMEDIATE (ungated) apply must invalidate every published payout
-    /// distribution, exactly like a JDP-declared one does.
+    /// distribution, exactly like a JDP-declared one does. The published
+    /// weights encode the pre-settlement balances, so a 0x0003 JDC still
+    /// mining them would pay those balances out a second time.
     ///
-    /// This was wired for the confirmation-gated path and the JDP sink only.
-    /// The published weights encode the pre-settlement balances, so a 0x0003
-    /// JDC still mining them would pay those balances out a second time.
-    ///
-    /// The slot itself can no longer be forgotten — `stratum::spawn` and both
-    /// `build_per_port_servers` take it as a required argument. What this test
-    /// covers is the other half: that a filled slot actually settles.
+    /// `stratum::spawn` and both `build_per_port_servers` take the slot as a
+    /// required argument; this test pins that a filled slot actually settles.
     #[tokio::test(flavor = "current_thread")]
     async fn immediate_apply_settles_the_published_distributions() {
         use bp_stratum_v2::bridge::{JdpDeclaredJobRegistry, PayoutDistributionEntry};
@@ -1796,9 +1757,8 @@ mod tests {
         );
     }
 
-    /// `Booking` rides the stream as the old `reward_sats` field, so an
-    /// event from a producer that predates the enum must mean the same
-    /// thing to a new consumer, and the other way round.
+    /// `Booking` rides the stream as the `reward_sats` field, so both wire
+    /// forms must round-trip to the same `Booking` on every consumer.
     #[test]
     fn booking_round_trips_through_the_wire_reward_field() {
         for booking in [
@@ -1815,7 +1775,7 @@ mod tests {
             let back: BlockFoundEvent = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(back.booking(), booking);
         }
-        // What an older producer wrote for a record-only block.
+        // A record-only block as a producer writes it: a null reward.
         let mut old = serde_json::to_value(record_only_event()).expect("to value");
         old["reward_sats"] = serde_json::Value::Null;
         let back: BlockFoundEvent = serde_json::from_value(old).expect("from value");

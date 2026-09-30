@@ -4,17 +4,12 @@
 //! so `on_block_found` mutates the ledger against the exact state
 //! committed at template-build time, even across a pool restart.
 //!
-//! Wire format (stable across deploy transitions):
+//! Hash layout: `schema` (`"3"`), the scalars `weightP`, `feePpm`,
+//! `feeAddress`, `referenceRevenueSats`, `scoreTotal`, `entry_count`, and
+//! per entry `e{i}_addr` / `e{i}_score` / `e{i}_balance` / `e{i}_wire` /
+//! `e{i}_dust`.
 //!
-//! - `blockRewardSats` — scalar
-//! - `consideredAddresses` — pipe-`|`-separated string
-//! - `distribution_count` / `balanceAfter_count` — array length scalars
-//! - `d{i}_addr` / `d{i}_pct` / `d{i}_sats` — one triple per
-//!   distribution entry
-//! - `b{i}_addr` / `b{i}_sats` — one pair per balanceAfter entry
-//!
-//! Callers pass a fully-built `key`: PPLNS uses a fixed `pplns:snapshot`;
-//! Group-Solo builds `groupsolo:{groupId}:snapshot:{finderAddress}`.
+//! Callers pass a fully-built `key`; the key scheme is per mode.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -29,7 +24,7 @@ pub async fn delete_snapshot(conn: &mut ConnectionManager, key: &str) -> Result<
 }
 
 // ===========================================================================
-// Weight snapshot (schema 2) — settlement INPUTS, not satoshi outcomes
+// Weight snapshot (schema 3) — settlement INPUTS, not satoshi outcomes
 // ===========================================================================
 
 /// One address in a stored weight distribution — the raw settlement
@@ -53,27 +48,20 @@ pub struct WeightSnapshotEntry {
 
 /// Persistent form of a weight distribution (schema 3).
 ///
-/// Where the schema-1 `StoredSnapshot` froze the OUTCOME (exact
-/// sats per output, valid for exactly one reward), this freezes the
-/// INPUTS: settlement recomputes each address's claim from
+/// This freezes the settlement INPUTS, not the satoshi outcome:
+/// settlement recomputes each address's claim from
 /// `bp_share::claim_sats(score_weight, score_total, fee_ppm, T_actual)`
-/// and books `claim − actually_paid` against the balance — correct at
-/// ANY actual revenue, which is what makes one snapshot serve the pool's
-/// own templates and every JDC's independently-valued jobs alike.
+/// and books `claim − actually_paid` against the balance. That is
+/// correct at ANY actual revenue, so one snapshot serves the pool's own
+/// templates and every JDC's independently-valued jobs alike. The finder
+/// bonus is a proportion, already inside `score_weight`.
 ///
-/// Schema 3 dropped the `finder_bonus` field: the bonus is a proportion
-/// now, already inside `score_weight`.
-/// `deny_unknown_fields` is load-bearing, not tidiness. This struct is
-/// serialized into the confirmation-gated pending-block queue, which
-/// outlives a deploy by the whole confirmation window — far longer than
-/// any snapshot TTL. A blob frozen by a pre-proportion build still
-/// carries `finder_bonus`, and serde's default is to ignore a field it
-/// no longer knows: the bonus would vanish from `extras_total` while
-/// the coinbase had already paid it, and settlement would book the
-/// finder a debt of nearly the whole bonus with the other members
-/// taking the mirror credit. Refusing the blob outright makes it an
-/// unparsable pending entry — pruned with a warning, having moved no
-/// money.
+/// `deny_unknown_fields` is load-bearing: this struct is serialized into
+/// the confirmation-gated pending-block queue, which outlives a deploy by
+/// the whole confirmation window. A blob carrying a field this build does
+/// not know (e.g. `finder_bonus`) would otherwise parse with that value
+/// silently dropped from the settlement math; refused, it is pruned with
+/// a warning and moves no money.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredWeightSnapshot {
@@ -97,17 +85,12 @@ impl StoredWeightSnapshot {
     /// `X` — the satoshi promises this distribution carried on top of
     /// the pure score split, recomputed the way the build computed it.
     ///
-    /// Not a stored field, and deliberately so: it is a pure function
-    /// of what IS stored (every entry's score weight and ledger
-    /// balance, the fee and the reference revenue), and one shared
-    /// [`bp_share::project_extras`] serving both sides is the only way
-    /// build and settlement cannot drift apart. A second copy of this
-    /// formula would be the next bug.
+    /// Not a stored field on purpose: it is a pure function of what IS
+    /// stored, and one shared [`bp_share::project_extras`] serving both
+    /// build and settlement is what keeps the two from drifting apart.
     ///
-    /// The finder bonus is NOT in here any more: it is a proportion,
-    /// carried as plain score weight, so it is exact at every revenue
-    /// and has nothing to project. Only satoshi-denominated promises —
-    /// ledger balances — still reach this.
+    /// Only satoshi-denominated promises (ledger balances) reach this; the
+    /// finder bonus is a proportion carried as score weight.
     pub fn extras_total(&self) -> i64 {
         let extras = bp_share::extras_from_ledger(
             self.entries
@@ -146,18 +129,12 @@ impl StoredWeightSnapshot {
     }
 }
 
-/// Persist a weight snapshot under `key` with `ttl_seconds`. Same
-/// DEL + HSET + EXPIRE shape (and rationale) as [`write_weight_snapshot`];
-/// the `schema` field is what keeps the formats from ever hydrating
-/// through the wrong parser.
+/// Persist a weight snapshot under `key` with `ttl_seconds`, as one
+/// atomic DEL + HSET + EXPIRE (see `WRITE_SNAPSHOT_LUA`).
 ///
-/// Schema 3: the finder bonus left this payload. A schema-2 hash still
-/// carries `finderBonusAddr`/`finderBonusSats`, and its `extras_total`
-/// INCLUDED that bonus — so hydrating one through the schema-3 parser
-/// would compute every claim against a pot short by the bonus, booking
-/// the finder a debt and the other members the mirror credit on a block
-/// whose coinbase was perfectly correct. Refusing it is a
-/// `SnapshotMissing`, which is logged loudly and books nothing.
+/// The `schema` field keeps a hash of any other format from hydrating
+/// through this parser: its settlement math differs, so the reader treats
+/// it as `SnapshotMissing`, which is logged loudly and books nothing.
 pub async fn write_weight_snapshot(
     conn: &mut ConnectionManager,
     key: &str,
@@ -200,26 +177,15 @@ pub async fn write_weight_snapshot(
 /// `KEYS[1]` = the snapshot key. `ARGV[1]` = TTL seconds, then alternating
 /// field/value pairs.
 ///
-/// Three separate round trips is what this replaces, and it was wrong twice
-/// over. Between the `DEL` and the `HSET` the snapshot **did not exist**,
-/// and a read landing there is the one case
-/// [`read_weight_snapshot_with_retry`] deliberately does not retry: it takes
-/// `Ok(None)` at face value on the grounds that a missing snapshot "will not
-/// appear". Here it would have, microseconds later — and the caller maps that
-/// `None` to a found block parked with no settlement inputs. The two sides
-/// are the same process: the template build writes, the Stratum block-found
-/// path reads.
+/// Atomic so no reader ever sees the key between `DEL` and `HSET`:
+/// [`read_weight_snapshot_with_retry`] takes a missing snapshot as final,
+/// and the caller parks the found block with no settlement inputs. It also
+/// means a fault mid-write cannot leave an existing snapshot deleted.
 ///
-/// The second failure is the one the write's own retry policy already
-/// documents: a fault between the `DEL` and the `HSET` left the key
-/// **deleted**, so a build that would have been a harmless rewrite of an
-/// existing snapshot destroyed it instead. A script is all-or-nothing, so
-/// that cannot happen either.
-///
-/// The `DEL` stays: a rebuild with FEWER entries has to drop the fields the
-/// longer one left behind, or the parse reads a truncated entry list as a
-/// longer one. Fields are set one at a time rather than through `unpack`, to
-/// keep the argument count off Lua's C-stack limit at a full member set.
+/// The `DEL` is needed: a rebuild with FEWER entries has to drop the fields
+/// the longer one left behind. Fields are set one at a time rather than
+/// through `unpack`, to keep the argument count off Lua's C-stack limit at
+/// a full member set.
 const WRITE_SNAPSHOT_LUA: &str = r#"
 redis.call('DEL', KEYS[1])
 for i = 2, #ARGV, 2 do
@@ -230,8 +196,7 @@ return 1
 "#;
 
 /// Load a weight snapshot, or `Ok(None)` when the key is missing, has
-/// a different schema (including every schema-1 snapshot), or fails to
-/// parse. Same warn-not-crash policy as [`read_weight_snapshot`].
+/// a different schema or type, or fails to parse (warned, never a crash).
 pub async fn read_weight_snapshot(
     conn: &mut ConnectionManager,
     key: &str,
@@ -336,9 +301,8 @@ pub async fn read_weight_snapshot_with_retry(
 }
 
 fn parse_weight_hash(h: &HashMap<String, String>) -> Option<StoredWeightSnapshot> {
-    // Exact match, so a schema-2 hash (bonus still in `extras`) can
-    // never hydrate into the schema-3 settlement math — see
-    // `write_weight_snapshot`.
+    // Exact match: a hash of any other schema must never hydrate into
+    // this settlement math — see `write_weight_snapshot`.
     if h.get("schema")?.as_str() != "3" {
         return None;
     }
@@ -368,8 +332,8 @@ fn parse_weight_hash(h: &HashMap<String, String>) -> Option<StoredWeightSnapshot
     })
 }
 
-/// Returns true if the error is a `WRONGTYPE` from Redis (legacy STRING
-/// snapshot on a key that's expected to be a Hash).
+/// Returns true if the error is a `WRONGTYPE` from Redis (a non-Hash value
+/// on a snapshot key).
 fn is_wrongtype(e: &RedisError) -> bool {
     matches!(
         e.kind(),
@@ -382,7 +346,7 @@ mod tests {
     use super::*;
     use bp_common::{AddressId, Sats};
 
-    // ---- weight snapshot (schema 2) ----
+    // ---- weight snapshot (schema 3) ----
 
     fn weight_snapshot_fixture() -> StoredWeightSnapshot {
         StoredWeightSnapshot {
@@ -441,16 +405,11 @@ mod tests {
         assert_eq!(parsed, s);
     }
 
-    /// A schema-2 hash — written before the bonus became a proportion —
-    /// must NOT hydrate, even though every field the schema-3 parser
-    /// reads is present and well-formed.
-    ///
-    /// Its `extras_total` included the finder bonus; schema 3's does
-    /// not. Parsing it would measure every claim against a pot short by
-    /// the bonus, booking the finder a debt of nearly the whole bonus
-    /// and the other members the mirror credit — real satoshis moved
-    /// between miners on a correctly-paid block. Returning `None` makes
-    /// it a `SnapshotMissing` instead: loud, and it books nothing.
+    /// A schema-2 hash (finder bonus in satoshis) must NOT hydrate, even
+    /// though every field the schema-3 parser reads is present and
+    /// well-formed: its `extras_total` differs, so claims would be measured
+    /// against the wrong pot. `None` makes it a `SnapshotMissing`, which
+    /// books nothing.
     #[test]
     fn parse_weight_hash_refuses_a_schema_2_bonus_hash() {
         let s = weight_snapshot_fixture();
@@ -464,15 +423,9 @@ mod tests {
         );
     }
 
-    /// The OTHER carrier of a pre-proportion snapshot: the JSON blob in
-    /// the confirmation-gated pending-block queue, which survives a
-    /// deploy for the whole confirmation window.
-    ///
-    /// Serde's default would ignore the retired `finder_bonus` field and
-    /// hand settlement a snapshot whose `extras_total` is short by the
-    /// bonus the coinbase already paid. `deny_unknown_fields` turns that
-    /// into a parse error, which the pending store prunes and warns on
-    /// instead of mis-booking.
+    /// A pending-block JSON blob carrying a `finder_bonus` field is refused
+    /// (`deny_unknown_fields`) rather than parsed with the bonus silently
+    /// dropped from `extras_total`; the same blob without it round-trips.
     #[test]
     fn a_pending_blob_carrying_the_retired_bonus_is_refused() {
         let s = weight_snapshot_fixture();
@@ -487,7 +440,7 @@ mod tests {
             "a blob still carrying finder_bonus must not deserialize into the \
              proportional model — its bonus would silently leave `extras_total`"
         );
-        // The same blob without the retired field is still perfectly good.
+        // The same blob without that field parses.
         let clean = serde_json::to_string(&s).unwrap();
         assert_eq!(
             serde_json::from_str::<StoredWeightSnapshot>(&clean).expect("round-trips"),
@@ -495,7 +448,7 @@ mod tests {
         );
     }
 
-    /// `schema-1 hashes never hydrate through the weight parser`
+    /// A hash in any other layout never hydrates through the weight parser.
     #[test]
     fn parse_weight_hash_rejects_schema_1() {
         let mut h = HashMap::new();
@@ -505,7 +458,7 @@ mod tests {
         assert!(parse_weight_hash(&h).is_none());
     }
 
-    /// `truncated entry list refuses to hydrate`
+    /// A truncated entry list refuses to hydrate.
     #[test]
     fn parse_weight_hash_truncated_entries_returns_none() {
         let s = weight_snapshot_fixture();
@@ -514,7 +467,7 @@ mod tests {
         assert!(parse_weight_hash(&h).is_none());
     }
 
-    /// `from_distribution lowers the built distribution 1:1`
+    /// `from_distribution` lowers the built distribution 1:1.
     #[test]
     fn from_distribution_lowers_faithfully() {
         use std::collections::HashMap as StdMap;
@@ -549,9 +502,8 @@ mod tests {
 
     /// Settlement measures every claim against `pot − X`, and it
     /// re-derives `X` here instead of reading it off a stored field.
-    /// If that re-derivation ever disagreed with the build, the
-    /// coinbase and the ledger would be splitting two different pots
-    /// and every block would mint liabilities.
+    /// It must match the build, or the coinbase and the ledger would split
+    /// two different pots.
     #[test]
     fn extras_total_reproduces_the_build() {
         use std::collections::HashMap as StdMap;
@@ -559,9 +511,9 @@ mod tests {
         let a2 = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
         let fee = AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").unwrap();
         let shares = StdMap::from([(a1.clone(), 3.0), (a2.clone(), 1.0)]);
-        // The bonus is a proportion now — plain score weight, nothing to
-        // project — so what still has to reproduce is the LEDGER side:
-        // credits, debts, and a promise larger than the block.
+        // The bonus is plain score weight with nothing to project, so what
+        // has to reproduce is the LEDGER side: credits, debts, and a
+        // promise larger than the block.
         for (balances, bonus_ppm) in [
             (StdMap::new(), 0u32),
             (StdMap::from([(a1.clone(), Sats(10_000_000))]), 0),

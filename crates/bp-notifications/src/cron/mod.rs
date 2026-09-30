@@ -5,10 +5,11 @@
 //! - [`network_difficulty`] — polls mempool.space every 10 min, upserts
 //!   `network_difficulty_tracker_entity`, and emits a push to subscribers
 //!   when the difficulty value changes.
-//! - [`best_difficulty`] — every 60 s, scans `address_settings_entity`
-//!   for every address with at least one push subscription and emits a
-//!   push if the persisted best has advanced since the last cron tick
-//!   for that address.
+//! - [`best_difficulty`] — every 60 s, reads the persisted best of every
+//!   subscribed address and notifies when it has advanced past the
+//!   tracked baseline.
+//! - `hourly_stats` — hourly stats / workers digest for Telegram and
+//!   ntfy subscribers that enabled it.
 
 pub mod best_difficulty;
 pub mod hourly_stats;

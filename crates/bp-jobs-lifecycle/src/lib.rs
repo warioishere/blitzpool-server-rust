@@ -5,15 +5,10 @@
 //! template-indirection) and `bp-stratum-v2` (per-channel
 //! `extended_jobs: HashMap<u32, ExtendedJob>`).
 //!
-//! The pattern is the same in both protocols, the storage shapes are
-//! different. This crate carries the **math + constants + classifier +
-//! aging algorithm**; each consumer keeps its own storage struct and
-//! exposes its own public API around the shared primitives.
-//!
-//! Originally lived in `bp-stratum-v1::jobs` and was duplicated in
-//! `bp-stratum-v2::mining::jobs`; extracted 2026-05-16 (the same week
-//! `bp-vardiff` was extracted) so both protocols keep their lifecycle
-//! constants in lock-step. The default values are:
+//! The storage shapes differ between the protocols, the pattern does not.
+//! This crate carries the **math + constants + classifier + aging
+//! algorithm**, so both protocols keep their lifecycle constants in
+//! lock-step; each consumer keeps its own storage struct and API.
 //!
 //! | Field | Set by | Default | Reason |
 //! |---|---|---|---|
@@ -21,13 +16,10 @@
 //! | `retention_ms` | `[stratum] job_retention_ms` | `600000` | Retired entries past 10 min are GC-eligible |
 //! | `min_retained` | not configurable | `3` | Floor to protect the newest 3 entries from aging — guards startup-window where everything is fresh |
 //!
-//! Why retire-not-clear at all: previously the jobs map was wiped
-//! synchronously on block change BEFORE broadcasting the new
-//! `mining.notify` / `NewExtendedMiningJob`. In-flight shares for the
-//! just-cleared old job got rejected with the wrong code
-//! (`invalid-job-id` instead of `stale-share`). SV2 spec §5.3.14
-//! distinguishes the two; SV1 has no separate stale code but still
-//! benefits from accepting near-block-change shares with credit.
+//! Why retire-not-clear: on a block change, in-flight shares for the old
+//! job must still find it, so SV2 answers `stale-share` rather than
+//! `invalid-job-id` (the spec distinguishes the two) and SV1 can credit
+//! shares that arrive just after the block change.
 //!
 //! ## Two primitives
 //!
@@ -46,11 +38,9 @@
 //!
 //! ## Why no retire helper
 //!
-//! Stamping `retired_at = Some(now)` on every entry that doesn't have
-//! one is just `for entry in map.values_mut() { if get(entry).is_none()
-//! { set(entry, now); } }`. Wrapping that in a generic two-closure
-//! helper is more boilerplate than it saves. Each consumer writes the
-//! 3-line loop directly with whichever field name they chose.
+//! Stamping `retired_at = Some(now)` on every unretired entry is a
+//! 3-line loop; a generic two-closure helper would cost more boilerplate
+//! than it saves, so each consumer writes the loop with its own fields.
 
 use std::collections::HashMap;
 use std::hash::Hash;

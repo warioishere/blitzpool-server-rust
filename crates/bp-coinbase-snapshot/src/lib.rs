@@ -3,17 +3,14 @@
 //! Shared persistence + ledger primitives for the coinbase-payout
 //! engines (`bp-pplns-engine`, `bp-group-solo-engine`).
 //!
-//! Both engines carried near-identical copies of:
-//!
 //! - [`snapshot`] — the Redis-hash format + write/read/delete that bridges template-build-time coinbase distribution to block-found ledger application.
 //! - [`share_map_from_redis_hash`] — the Redis share aggregate → validated distribution input.
 //! - [`ledger`] — the row-type discriminator + apply-distribution result / error types.
 //!
-//! Consolidating them here keeps the wire format (stable across
-//! deploy transitions) and the DB row-type strings as one source of
-//! truth — a format change can no longer drift between the two engines.
-//! Each engine keeps only its mode-specific wrappers (PPLNS: a fixed
-//! key; Group-Solo: per-(group, finder) keys + SCAN cleanup).
+//! One copy keeps the wire format (stable across deploys) and the DB
+//! row-type strings identical for both engines. Each engine keeps only
+//! its mode-specific wrappers (PPLNS: a fixed key; Group-Solo:
+//! per-(group, finder) keys + SCAN cleanup).
 
 pub mod actual;
 pub mod budget;
@@ -43,13 +40,11 @@ pub use snapshot::{
 /// Both payout engines build their distribution input this way: PPLNS
 /// from the sliding-window hash, Group-Solo from the per-round hash.
 /// Entries whose address fails `AddressId` validation are skipped with
-/// a warn (defensive — a buggy upstream could have pushed an invalid
-/// address into Redis; better to drop that one share than fail the
-/// whole distribution). Non-positive diffs are skipped too.
+/// a warn: dropping that one share beats failing the whole
+/// distribution. Non-positive diffs are skipped too.
 ///
 /// `invalid_address_warning` is the engine-specific log line emitted on
-/// a rejected address (the only thing that differed between the two
-/// copies).
+/// a rejected address.
 pub fn share_map_from_redis_hash(
     raw: &HashMap<String, f64>,
     invalid_address_warning: &str,

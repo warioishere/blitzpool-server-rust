@@ -2,21 +2,12 @@
 
 //! `/api/pplns/groups/*` — group reader + writer endpoints.
 //!
-//! **Prefix note**: routes are mounted at `/api/pplns/groups/*`. UI
-//! fetch URLs must match.
-//!
-//! **Admin-token auth**: the 12 routes that always require an admin
-//! token sit behind a single
-//! [`crate::middleware::admin_auth::require_admin`] tower middleware,
-//! applied via `route_layer` on a dedicated sub-router. Handlers pull
-//! the validated `AdminAuth` out of request extensions and pass the
-//! token through to the service layer; the service-level
-//! `require_admin_token` call becomes defence-in-depth.
-//!
-//! The three handlers where the token is *optional* (`by_id`,
-//! `open_invite_active`, `list_join_requests` — token influences
-//! response shape rather than gating access) keep the inline
-//! `admin_token(&headers)` plus a per-handler conditional check.
+//! Routes that always require an admin token sit behind
+//! [`crate::middleware::admin_auth::require_admin`] on a dedicated
+//! sub-router; the service-level `require_admin_token` check stays as
+//! defence-in-depth. Where the token is optional (`by_id`,
+//! `open_invite_active`, `list_join_requests`) it shapes the response
+//! rather than gating access, so those handlers check it inline.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -49,11 +40,9 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    // Sub-router for routes that always require a valid `x-admin-token`
-    // header. `route_layer` applies the middleware only to currently-
-    // registered routes (no late routes will be added to this sub-
-    // router after the layer call), so this is the canonical pattern
-    // for per-route auth in axum 0.7.
+    // Routes that always require a valid `x-admin-token` header.
+    // `route_layer` applies only to routes registered before it, so every
+    // admin route must be added above the layer call.
     let admin_routes = Router::new()
         // ─── admin writers ───────────────────────────────────────
         .route("/api/pplns/groups/:id/transfer", post(transfer::<H, M>))
@@ -318,22 +307,13 @@ where
     }))
 }
 
-/// `deny_unknown_fields` so a client writing the RETIRED
-/// `finderBonusSats` is told, instead of being lied to.
-///
-/// Every field is `#[serde(default)]` (that is the PATCH semantics —
-/// absent means untouched), so without this a body carrying only
-/// `{"finderBonusSats": ...}` deserializes to all-untouched and the
-/// handler answers 200 with a summary that has no such key. The admin
-/// sees a successful save that changed nothing, and nothing is logged.
-/// A pool deployed ahead of its UI hits exactly that, so the failure
-/// has to be loud.
+/// PATCH body: an absent field is untouched. `deny_unknown_fields`
+/// makes an unknown key (e.g. the retired `finderBonusSats`) a 400
+/// instead of a 200 that silently changed nothing.
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateSettingsBody {
-    /// `Some(value)` → set to value, `Some("clear")` interpreted via the
-    /// patch helper. We just default to Untouched/Set semantics; clear
-    /// is signalled by `null` (JSON null = clear).
+    /// Absent = untouched, a value = set, JSON `null` = clear.
     #[serde(default)]
     preset: Option<Option<String>>,
     #[serde(default)]
@@ -369,11 +349,8 @@ where
     M: EmailHooks + 'static,
 {
     let svc = require_group_service(&state)?;
-    // The bonus is a FRACTION of the miner cut now, so it cannot exceed
-    // the block by construction — the old "is this more sats than the
-    // subsidy?" guard (and its bitcoin-RPC lookup) has nothing left to
-    // catch. What remains is the plain range check, which the service
-    // layer's validator owns.
+    // The finder bonus is a fraction of the miner cut, so it cannot exceed
+    // the block by construction; its range check lives in the service layer.
     let preset = match &body.preset {
         None => PatchField::Untouched,
         Some(None) => PatchField::Clear,
@@ -408,15 +385,9 @@ where
 
 /// Block subsidy in sats for `height` on `network`.
 ///
-/// A thin network→interval mapping over [`bp_share::block_subsidy_sats`],
-/// which owns the halving math. Settlement gates on that same function
-/// (a coinbase paying less than its own subsidy is refused), so a second
-/// copy of the rule here is a copy that can drift from the one deciding
-/// whether a block gets booked.
-///
-/// Regtest halves every 150 blocks, every other network every 210 000.
-/// Heights beyond `i32` cannot describe a real block; they clamp, and
-/// the shared function answers 0 for them anyway.
+/// Maps the network to its halving interval and delegates to
+/// [`bp_share::block_subsidy_sats`], the same function settlement gates on,
+/// so there is one halving rule. Heights beyond `i32` clamp (subsidy 0).
 pub(crate) fn block_subsidy_sats(height: u64, network: bitcoin::Network) -> u64 {
     let interval = match network {
         bitcoin::Network::Regtest => bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
@@ -442,17 +413,10 @@ struct GroupCoinbaseCapacity {
 }
 
 /// `GET /api/pplns/groups/coinbase-capacity` — how many members fit in the
-/// fixed group-solo coinbase weight budget. Global (the budget is engine-wide,
-/// not per group), so the UI subtracts a group's own member count to show the
-/// remaining headroom. Uses the shared, fee-output-correct
+/// engine-wide group-solo coinbase weight budget. Uses
 /// [`max_coinbase_outputs`](bp_pplns_engine::max_coinbase_outputs), the same
-/// ceiling `GroupService` refuses a join against.
-///
-/// This is the ceiling an external capacity monitor divides into: fill level =
-/// `members.length` from `GET /api/pplns/groups/:id`. For PPLNS the pair is
-/// `GET /api/pplns/distribution` (length) over `maxMinerOutputsAdaptive` from
-/// `GET /api/pplns/fees` — note the PPLNS budget autoscales and is NOT this
-/// one.
+/// ceiling `GroupService` refuses a join against. The PPLNS budget autoscales
+/// and is not this one (see `maxMinerOutputsAdaptive` on `/api/pplns/fees`).
 async fn coinbase_capacity<H, M>(
     State(state): State<SharedState<H, M>>,
 ) -> Result<Json<GroupCoinbaseCapacity>, ApiError>
@@ -468,11 +432,8 @@ where
     Ok(Json(GroupCoinbaseCapacity {
         max_members: bp_pplns_engine::max_coinbase_outputs(cfg.coinbase_weight_budget),
         weight_budget: cfg.coinbase_weight_budget,
-        // Constant now, and the field's documented meaning is what became
-        // constant: §4 makes the pool output structural, so a slot is
-        // reserved at every fee. It used to report `false` for a 0 %-fee
-        // pool, which is precisely where the ceiling was one too high.
-        // Kept on the wire because the UI declares it; drop both together.
+        // The pool output is structural, so a slot is reserved at every fee
+        // (0 % included). Kept on the wire because the UI declares it.
         has_fee_output: true,
     }))
 }
@@ -813,10 +774,8 @@ struct GroupSummary {
 
 impl From<bp_db::PplnsGroupRow> for GroupSummary {
     fn from(r: bp_db::PplnsGroupRow) -> Self {
-        // Window-mode groups never calendar-reset — the reset preset is the
-        // sliding-window LENGTH, not a wipe. Don't advertise a phantom
-        // `nextResetAt` (it made the UI show a countdown to a reset that never
-        // fires); the UI renders the window length instead.
+        // Window-mode groups never calendar-reset: their preset is the
+        // sliding-window length, so there is no `nextResetAt` to advertise.
         let next_reset_at = match PayoutMode::parse_or_default(&r.payout_mode) {
             PayoutMode::Window => None,
             PayoutMode::Prop => next_reset_at(&r).map(crate::time_range::format_iso_ms),
@@ -1090,8 +1049,8 @@ struct MemberEntry {
     joined_at: String,
     #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     hashrate: f64,
-    /// All-time best difficulty for the member (folded in so the UI no longer
-    /// fetches per-member client info by full address).
+    /// All-time best difficulty for the member, served here so the UI never
+    /// needs a member's full address to fetch it.
     #[serde(serialize_with = "crate::time_range::ser_f64_jsnum")]
     best_difficulty: f64,
     /// Earliest worker start (uptime basis), ISO-8601; None when offline.
@@ -1156,18 +1115,15 @@ where
             let total_hashrate: f64 = per_addr_hashrate.values().sum();
             let addr_strings: Vec<String> = addrs.iter().map(|a| a.as_str().to_string()).collect();
             let labels = build_member_labels(&addr_strings);
-            // Batch the signature-ownership lookup (admin-only, for the
-            // verified-via badge) into one query rather than one per member —
-            // avoids an N+1 fan-out on the roster read.
+            // Signature-ownership lookup for the admin-only verified-via
+            // badge, batched into one query for the whole roster.
             let owned_signatures = if is_admin {
                 bp_db::addresses_with_ownership_proof(&s.pool, &addr_strings).await?
             } else {
                 std::collections::HashSet::new()
             };
 
-            // Roster-wide session stats in two round trips instead of two
-            // per member: the loop below used to issue one PG query and
-            // one Redis pipeline each, awaited in sequence.
+            // Roster-wide session stats in two round trips, not two per member.
             let sessions =
                 bp_db::find_active_sessions_for_addresses(&s.pool, &addr_strings).await?;
             let live = crate::error::or_degraded(
@@ -1219,9 +1175,8 @@ where
                     None
                 };
                 let hashrate = per_addr_hashrate.get(addr_str).copied().unwrap_or(0.0);
-                // Per-member worker stats folded in server-side (best-diff /
-                // uptime / last-seen) so the UI no longer fetches per-member
-                // client info by full address.
+                // Per-member worker stats (best-diff / uptime / last-seen) are
+                // served here so the UI never needs a member's full address.
                 let start_time = start_times.get(addr_str).copied();
                 let last_seen = last_seen_by_address.get(addr_str).copied().or(start_time);
                 let best_difficulty = bp_db::find_address_settings(&s.pool, &m.address)
@@ -1249,12 +1204,9 @@ where
             }
             let mut summary = GroupSummary::from(group);
             if !is_admin {
-                // The creator is a member too and is pseudonymised in `entries`;
-                // don't re-leak their full address via the flattened summary to
-                // anonymous / member callers. Only an admin-token caller (the
-                // creator managing the group) sees it. The UI derives
-                // isCreator / "created by" from the member roster (isSelf +
-                // role + addressLabel), so it needs no creatorAddress here.
+                // The creator is pseudonymised in `entries` like every member;
+                // only an admin-token caller sees the full address. The UI
+                // derives isCreator / "created by" from the roster instead.
                 summary.creator_address = None;
             }
             Ok(GroupDetailResponse {
@@ -1498,11 +1450,9 @@ where
 
 /// One row per address the round store knows, accepted OR rejected.
 ///
-/// A member whose accepted work fell out of the window (or who has only
-/// rejects this round) used to vanish from the rows while still counting
-/// in `total_rejected`, so the group-wide reject figure could not be
-/// reconciled against the table. Such an address now gets a row with zero
-/// shares. Sorted by shares, descending.
+/// An address with only rejects this round gets a zero-share row, so the
+/// group-wide `total_rejected` reconciles against the table. Sorted by
+/// shares, descending.
 fn distribution_entries(
     group_id: Uuid,
     per_address: HashMap<String, f64>,
@@ -1808,9 +1758,8 @@ where
     H: GroupServiceHooks + 'static,
     M: EmailHooks + 'static,
 {
-    // Admin and non-admin responses both omit the secret token when
-    // the caller isn't an admin — key on `is_admin` so we don't leak
-    // the admin variant to a public viewer via shared cache.
+    // Only the admin variant carries the token, so the cache key includes
+    // `is_admin` to keep it from reaching a public viewer.
     let token = verified_admin_token(&state, id, &headers)
         .await?
         .map(str::to_string);
@@ -2013,11 +1962,8 @@ fn jr_to_api_error(e: bp_group_mgmt_engine::JoinRequestServiceError) -> ApiError
 
 // ─── GET /api/groups/:id/chart + /accepted + /rejected ───────────
 //
-// Aggregations across the current member list of the group. Each
-// endpoint reads `client_statistics_entity` / `client_rejected_
-// statistics_entity` rows for every member address in the configured
-// time window and bins them into the same slot grid the per-address
-// endpoints use.
+// Aggregations across the group's current members, binned into the same
+// slot grid the per-address endpoints use.
 
 use crate::controllers::info::{rejected_by_reason_slots, RejectSlotsResponse};
 use crate::time_range::{
@@ -2251,10 +2197,8 @@ mod tests {
         s.map(|v| v == "1" || v == "true").unwrap_or(false)
     }
 
-    /// A settings PATCH from a pre-proportion UI must be REFUSED, not
-    /// silently no-op'd. Without `deny_unknown_fields` this body
-    /// deserializes to all-untouched and the caller gets a 200 for a
-    /// save that changed nothing.
+    /// A settings PATCH carrying the retired `finderBonusSats` is refused,
+    /// not accepted as an all-untouched no-op.
     #[test]
     fn settings_patch_refuses_the_retired_finder_bonus_sats() {
         let old_ui = r#"{"finderBonusSats": 50000000}"#;
@@ -2264,9 +2208,8 @@ mod tests {
         );
     }
 
-    /// The shapes the current UI actually sends — full and partial —
-    /// must all still deserialize, so the guard above cannot quietly
-    /// break the admin page it is meant to protect.
+    /// Every body shape the UI sends, full and partial, still deserializes
+    /// under `deny_unknown_fields`.
     #[test]
     fn settings_patch_accepts_every_shape_the_ui_sends() {
         for body in [

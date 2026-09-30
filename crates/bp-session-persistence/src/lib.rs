@@ -3,11 +3,9 @@
 //! Per-session client-row persistence + per-session difficulty stats.
 //!
 //! Persists `client_entity` rows on authorize/disconnect and records the
-//! per-session difficulty statistics on the share hot-path. Best
-//! difficulty is no longer handled here — it folds into the batched
-//! stats-sink flush (`bp-share-stats-sink`), so there is no per-share
-//! write-through cache to diverge after an out-of-band reset. Decomposes
-//! into:
+//! per-session difficulty statistics on the share hot-path. The
+//! persisted best difficulty belongs to the batched stats-sink flush
+//! (`bp-share-stats-sink`), not to this crate. Decomposes into:
 //!
 //! - **[`hooks::SessionPersistenceHook`]** — `bp_share_hook::SharedSessionPersistence`
 //!   impl. On `register_session` (miner authorize), pends the

@@ -29,8 +29,8 @@ impl GeoLocation {
     /// Predicate used by the service to decide whether to cache the
     /// result as a positive hit (`Some(GeoLocation)`) or as a negative
     /// hit (`None`). A "success"-status response with both city +
-    /// country empty is treated as a negative — caches `None` so we
-    /// don't re-query the same unmappable IP for 10 minutes.
+    /// country empty is treated as a negative — caches `None` so the
+    /// same unmappable IP is not re-queried for 10 minutes.
     pub fn is_meaningful(&self) -> bool {
         let has_city = self.city.as_deref().is_some_and(|c| !c.is_empty());
         let has_country = self.country.as_deref().is_some_and(|c| !c.is_empty());
@@ -110,8 +110,8 @@ impl<C: GeoIpClient> GeoIpService<C> {
         }
 
         // Cache miss — HTTP lookup. Any failure / unmeaningful payload
-        // gets cached as `None` so we don't hammer ip-api on repeat
-        // calls for the same address.
+        // gets cached as `None` so repeat calls for the same address
+        // do not hammer ip-api.
         let result = match self.client.lookup(ip).await {
             Ok(resp) if resp.status == "success" => {
                 let loc = GeoLocation {

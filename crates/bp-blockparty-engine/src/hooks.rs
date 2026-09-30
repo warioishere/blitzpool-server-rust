@@ -14,13 +14,13 @@
 use async_trait::async_trait;
 use bp_common::AddressId;
 
-/// Cross-crate dependency surface. Currently minimal: one lookup.
+/// Cross-crate dependency surface: one lookup.
 #[async_trait]
 pub trait BlockpartyHooks: Send + Sync {
     /// Return the verified email-binding for `address`, or `None` if no
-    /// binding exists / is unverified. Service callers gate `addMember`
-    /// on a non-`None` return — bare addMember without verified email
-    /// surfaces as [`crate::BlockpartyServiceError::EmailNotVerified`].
+    /// binding exists / is unverified. `add_member` without a verified email
+    /// (and without a signature proof) surfaces as
+    /// [`crate::BlockpartyServiceError::EmailNotVerified`].
     async fn verified_email_for(&self, address: &AddressId) -> Option<String>;
 }
 

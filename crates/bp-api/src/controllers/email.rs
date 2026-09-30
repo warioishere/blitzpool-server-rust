@@ -3,8 +3,7 @@
 //! `/api/email/*` — register-verify flow for address↔email bindings.
 //!
 //! The verified-email binding is the trust anchor for the whole
-//! invitation flow (memory `feedback-bp-api-ts-100-percent-parity`),
-//! so the JSON shapes here are part of the cut-over surface.
+//! invitation flow; the UI depends on the exact JSON shapes here.
 
 use axum::{
     extract::{Path, State},

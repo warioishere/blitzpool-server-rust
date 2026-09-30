@@ -22,17 +22,9 @@
 //! - [`join_request`] — join-request [`join_request::JoinRequestStatus`]
 //!   enum, message validator, and staleness check.
 //!
-//! ## What's deferred
-//!
-//! - DB-coupled service operations (`createGroup` / `addMember` /
-//!   `removeMember` / `transferCreator` / `dissolveGroup` / etc.) →
-//!   service-wiring crate (depends on `bp-db` write extension).
-//! - Email sending (`emailService.sendInvitation`) → `bp-notifications`.
-//! - Address-cache rebuild for `getGroupForAddress` → service-wiring
-//!   (`group_for_address` in the bin).
-//! - Cron schedules for invitation/join-request expiry → service-wiring.
-//! - IANA timezone validation → service-wiring (depends on OS + a
-//!   timezone crate; here we only enforce non-empty shape).
+//! DB-coupled operations (group/member lifecycle, address lookup, expiry
+//! crons) and IANA timezone validation live in the service-wiring layer;
+//! this crate only enforces the timezone's non-empty shape.
 
 pub mod constants;
 pub mod group;

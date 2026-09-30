@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! bp-api HTTP listener — Phase 7.4a.
+//! bp-api HTTP listener.
 //!
 //! Builds the production [`AppState`] from the live foundation +
 //! engine + hook aggregates, then binds an `axum::serve` task on
-//! `[api] port`. The HTTP server is the first of the three TCP
-//! services the binary brings up (HTTP, SV1, SV2); Stratum binding
-//! follows in Phase 7.4b/c.
-//!
-//! `build_app_state` plumbs each foundation / engine / hook field
-//! into the corresponding `AppState` slot — see the function body
-//! for the detailed mapping. `GroupService`, `InvitationService`,
-//! and `JoinRequestService` are constructed here (not in
-//! `engines::spawn`) because they're the bp-api-layer composition
-//! of the engine hooks rather than long-lived background services.
+//! `[api] port`. `InvitationService` and `JoinRequestService` are
+//! constructed here (not in `engines::spawn`) because they compose
+//! the engine hooks for the API layer rather than being long-lived
+//! background services.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -77,12 +71,10 @@ pub(crate) async fn spawn(
         .map_err(|source| ApiServerError::Bind { addr, source })?;
     info!(%addr, "bp-api: listening");
 
-    // Serve with per-connection peer-address info so the rate-limiter's
-    // IP key extractor has a fallback when no `x-forwarded-for` /
-    // `x-real-ip` / `Forwarded` header is present (direct hits, or a
-    // proxy that doesn't set them). Without this, rate-limited routes
-    // respond 500 `Unable To Extract Key!` instead of admitting the
-    // request keyed by peer IP.
+    // Per-connection peer-address info gives the rate-limiter's IP key
+    // extractor a fallback when no `x-forwarded-for` / `x-real-ip` /
+    // `Forwarded` header is present; without it rate-limited routes answer
+    // 500 `Unable To Extract Key!`.
     let make_service = router.into_make_service_with_connect_info::<SocketAddr>();
     let join = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, make_service).await {
@@ -94,9 +86,7 @@ pub(crate) async fn spawn(
     Ok(ApiServerHandle { addr, join })
 }
 
-/// Construct the AppState from the live aggregates. Public for
-/// `--check-api-state` flag (future) + unit tests that want to
-/// inspect the produced state.
+/// Construct the AppState from the live aggregates.
 fn build_app_state(
     cfg: &AppConfig,
     foundation: &FoundationHandles,

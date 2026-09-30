@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Engine spawning + share-sink composition — Phase 7.2.
+//! Engine spawning + share-sink composition.
 //!
 //! Builds the four service-layer engines on top of [`FoundationHandles`]:
 //!
-//! 1. **PPLNS engine** — only when `[pplns]` is present in the config.
-//! 2. **Group-Solo engine** — always; Group-Solo is a first-class mode
-//!    that runs in parallel with PPLNS regardless of port enablement.
-//! 3. **Share-stats engine** — mode-blind accumulator coordinator; always
-//!    on.
-//! 4. **Session-persistence engine** — synchronous PG write-through for
+//! 1. **PPLNS engine**: only when `[pplns]` is present in the config.
+//! 2. **Group-Solo engine**: always; it runs in parallel with PPLNS
+//!    regardless of port enablement.
+//! 3. **Share-stats engine**: mode-blind accumulator coordinator; always on.
+//! 4. **Session-persistence engine**: synchronous PG write-through for
 //!    the client + best-difficulty tables; always on.
 //!
 //! Then composes them into:
@@ -40,13 +39,10 @@
 //! ## Network difficulty bootstrap
 //!
 //! PPLNS needs an initial [`NetworkDifficulty`] (the `4 * net_diff`
-//! window-sizing factor reads it). We boot-fetch it once via
-//! `getmininginfo`; refresh is Phase 7.5's `bp-notifications`
-//! network-difficulty cron's job (it already polls `mempool.space`).
-//! The bitcoin RPC handle in 7.1 is liveness-pinged, so this call is
-//! expected to succeed; on transient failure we default to `1.0` and
-//! warn — the window degrades gracefully (slightly under-sized) until
-//! the cron's first tick lands.
+//! window-sizing factor reads it), fetched once at boot via
+//! `getmininginfo`; the payout role refreshes it afterwards
+//! (`crate::network_difficulty`). On a transient failure it defaults to
+//! `1.0` with a warning, and the window is under-sized until the refresh.
 
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
@@ -83,26 +79,22 @@ use uuid::Uuid;
 
 use crate::boot::FoundationHandles;
 
-/// Long-lived engine + sink aggregate. Phase 7.4 + 7.5 thread this
-/// into the Stratum servers + cron schedules.
+/// Long-lived engine + sink aggregate, threaded into the Stratum servers
+/// and cron schedules.
 pub(crate) struct EngineHandles {
     pub(crate) pplns: Option<PplnsEngine>,
     pub(crate) group_solo: GroupSoloEngine,
     pub(crate) stats: ShareStatsEngineHandle,
     pub(crate) session_persistence: SessionPersistenceEngineHandle,
     pub(crate) mode_gate: Arc<BlitzpoolModeGate>,
-    /// The front's producing Stratum fan-out sinks — built only on the front,
-    /// where Stratum feeds them; they stamp each share and publish it onto the
-    /// Redis stream. `None` on the satellite: it has no Stratum listeners; its
-    /// stream consumer builds its own sink set from these engines (see
-    /// `build_accepted_sinks`), so building one here too would be a dead
-    /// duplicate.
+    /// The front's producing Stratum fan-out sinks: they stamp each share and
+    /// publish it onto the Redis stream. `None` off the front, where the
+    /// stream consumer builds its own sink set (`build_accepted_sinks`).
     pub(crate) accepted_sink: Option<Arc<CompositeAcceptedShareSink>>,
     pub(crate) rejected_sink: Option<Arc<dyn SharedRejectedShareSink>>,
     pub(crate) session_persistence_hook: SessionPersistenceHook,
-    /// Optional Blockparty handle. Wired only when the feature is
-    /// configured at boot; `None` keeps PayoutResolver + block-sink on
-    /// the existing Solo / PPLNS / Group-Solo paths.
+    /// Blockparty handle, wired only when the feature is configured; `None`
+    /// keeps PayoutResolver + block-sink on the Solo / PPLNS / Group-Solo paths.
     pub(crate) blockparty: Option<Arc<dyn bp_blockparty_engine::BlockpartyApi>>,
 }
 
@@ -128,9 +120,8 @@ pub(crate) enum EngineError {
 
 /// Fetch this Core process's share-id epoch: `INCR core:epoch`. Unique per
 /// boot, so producer share_ids stay globally unique across Core restarts
-/// (the dedup discriminator — see [`ShareSequencer`]). Redis is already a
-/// hard dependency at this point in boot, so a failure here is fatal and
-/// surfaces as a pointed error rather than a silent collision.
+/// (the dedup discriminator; see [`ShareSequencer`]). A failure is fatal
+/// rather than risking a silent id collision.
 async fn fetch_core_epoch(redis: &redis::aio::ConnectionManager) -> Result<u64, EngineError> {
     let mut conn = redis.clone();
     let epoch: u64 = redis::cmd("INCR")
@@ -145,22 +136,20 @@ async fn fetch_core_epoch(redis: &redis::aio::ConnectionManager) -> Result<u64, 
 /// Role-aware (see [`Role`]):
 ///
 /// - A **front** (`front` role) runs the accounting engines *read-only*
-///   (`spawn_core`, no ledger-mutating crons) — they exist only so the
-///   `PayoutResolver` can build coinbase distributions. Its accepted- and
-///   rejected-share fan-outs are each a single [`ProducingSink`] that
-///   publishes every (already share_id-/mode-stamped) share onto the Redis
-///   stream for the Satellite to consume.
+///   (`spawn_core`, no ledger-mutating crons) so the `PayoutResolver` can
+///   build coinbase distributions. Its accepted- and rejected-share fan-outs
+///   are each a single [`ProducingSink`] that publishes every stamped share
+///   onto the Redis stream for the Satellite.
 /// - The **back** (`payout` / `stats`) spawns the full engines; its share
 ///   sinks are driven by the stream consumer off `build_accepted_sinks` /
-///   `build_rejected_sinks`, so no in-process composite is built here.
+///   `build_rejected_sinks`.
 pub(crate) async fn spawn(
     cfg: &AppConfig,
     handles: &FoundationHandles,
 ) -> Result<EngineHandles, EngineError> {
-    // Read-only engines (skip the ledger-mutating crons) on every process
-    // that doesn't run the payout accounting — the front builds coinbases
-    // from them, the API serves reads from them. Only the `payout` role runs
-    // them full (with crons).
+    // Read-only engines (no ledger-mutating crons) on every process without
+    // the `payout` role: the front builds coinbases from them, the API
+    // serves reads from them.
     let read_only = !cfg.has_role(Role::Payout);
     let mode_gate = Arc::new(BlitzpoolModeGate::new());
     let pplns = spawn_pplns(cfg, handles, read_only).await?;
@@ -168,10 +157,8 @@ pub(crate) async fn spawn(
     let stats = spawn_stats(cfg, handles).await?;
     let session_persistence = spawn_session_persistence(handles).await?;
 
-    // Only the front builds the Stratum fan-out sinks, and it always produces
-    // to the Redis streams (the Satellite consumes them). A pure back / api
-    // process has no Stratum and consumes (or doesn't touch) the streams
-    // instead, so it skips them (and the `core:epoch` INCR).
+    // Only the front builds the Stratum fan-out sinks (and INCRs
+    // `core:epoch`); it always produces to the Redis streams.
     let (accepted_sink, rejected_sink) = if cfg.has_role(Role::Front) {
         let core_epoch = fetch_core_epoch(&handles.redis).await?;
         let accepted =
@@ -200,9 +187,8 @@ pub(crate) async fn spawn(
         accepted_sink,
         rejected_sink,
         session_persistence_hook,
-        // Filled in by main.rs once `blockparty_service::spawn` has run —
-        // it needs the GroupService, which is built after the engines.
-        // Stays `None` when the Blockparty feature is not configured.
+        // Filled in by main.rs after `blockparty_service::spawn`, which
+        // needs the GroupService built after the engines.
         blockparty: None,
     })
 }
@@ -228,11 +214,10 @@ async fn spawn_pplns(
     );
     let redis = handles.redis.clone();
     let pool = handles.db.pool().clone();
-    // Core runs read-only (no touch-flush / dust-sweep crons) — it only
+    // Core runs read-only (no touch-flush / dust-sweep crons): it only
     // reads the window for the PayoutResolver's coinbase distributions.
-    // Read-only after boot, that is: the constructor's one-shot window
-    // passes (aggregate bootstrap, bucket-score conversion) run in every
-    // role, and `PplnsEngine::spawn_inner` says why they are not gated.
+    // The constructor's one-shot window passes still run in every role;
+    // `PplnsEngine::spawn_inner` says why.
     let engine = if core {
         PplnsEngine::spawn_core(engine_cfg, redis, pool, net_diff).await?
     } else {
@@ -244,9 +229,8 @@ async fn spawn_pplns(
 /// Blocks between subsidy halvings for the configured network. The
 /// settlement gate refuses to book a coinbase paying less than the
 /// block's own subsidy, so this has to be the network's real schedule:
-/// regtest halves every 150 blocks, and feeding it the mainnet 210 000
-/// would make every regtest block past height 150 look like it had
-/// burned money and stop the harnesses booking anything.
+/// regtest halves every 150 blocks, and with the mainnet 210 000 every
+/// regtest block past height 150 would look underpaid and not book.
 fn subsidy_halving_interval(network: bp_config::Network) -> u32 {
     match network {
         bp_config::Network::Regtest => bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
@@ -286,9 +270,7 @@ fn to_pplns_engine_config(
 
 /// Best-effort fetch of the current network difficulty for PPLNS
 /// window-sizing. Falls back to `1.0` on transient failure (with a
-/// `warn`), so the engine can still spawn — the
-/// `bp-notifications::cron::network_difficulty` refresh task
-/// (Phase 7.5) keeps the value fresh during runtime.
+/// `warn`), so the engine can still spawn.
 async fn bootstrap_network_difficulty(handles: &FoundationHandles) -> NetworkDifficulty {
     match handles.bitcoin_rpc.get_mining_info().await {
         Ok(info) => NetworkDifficulty::new(info.difficulty),
@@ -326,9 +308,8 @@ async fn spawn_group_solo(
 }
 
 fn to_group_solo_engine_config(cfg: &AppConfig) -> Result<GroupSoloEngineConfig, EngineError> {
-    // Group-Solo + Blockparty share a `[group_fees]` lane independent
-    // from PPLNS. Fall back to `[pplns]` for backward compatibility
-    // with PPLNS-only deployments.
+    // Group-Solo + Blockparty share a `[group_fees]` lane independent from
+    // PPLNS, falling back to `[pplns]` when it is absent.
     let (fee_address, fee_percent) = crate::blockparty_service::resolve_group_fees(cfg)
         .map_err(|(raw, err)| EngineError::InvalidAddress(raw, err))?;
     let base = GroupSoloEngineConfig {
@@ -337,22 +318,17 @@ fn to_group_solo_engine_config(cfg: &AppConfig) -> Result<GroupSoloEngineConfig,
         // VALIDITY-CRITICAL: the distribution trims the coinbase to this budget,
         // and boot reserves exactly the same budget on the Group-Solo TDP stream
         // (`tdp_constraint_for_budget(cfg.group_fees.coinbase_weight_budget)`).
-        // The two MUST be the same value — otherwise the trimmer fits a coinbase
-        // larger than bitcoin-core reserved and rejects the block. Mirrors the
+        // The two MUST be the same value, or the trimmer fits a coinbase larger
+        // than bitcoin-core reserved and the block is rejected. Mirrors the
         // PPLNS engine↔default-stream coupling.
         coinbase_weight_budget: cfg.group_fees.coinbase_weight_budget,
         subsidy_halving_interval: subsidy_halving_interval(cfg.network),
-        // The `min_payout_sats` floor is shared between PPLNS + Group-
-        // Solo: both engines read the same value. When `[pplns]` is
-        // configured we reuse its value; otherwise the engine's own
-        // default applies.
+        // The `min_payout_sats` floor is shared between PPLNS + Group-Solo:
+        // `[pplns]`'s value when configured, else the engine default.
         //
-        // NOT `unwrap_or_default()`: that is `Sats(0)`, not the engine
-        // default, and the `..GroupSoloEngineConfig::default()` below
-        // cannot supply it either — struct update syntax only fills
-        // fields that are absent, and this one is present. A deployment
-        // with no `[pplns]` block therefore failed validation at boot
-        // with "min_payout_sats must be ≥ 546, got 0".
+        // NOT `unwrap_or_default()`: that is `Sats(0)`, which fails
+        // validation, and the `..GroupSoloEngineConfig::default()` below
+        // does not fill a field that is set explicitly.
         min_payout_sats: cfg.pplns.as_ref().map_or_else(
             || GroupSoloEngineConfig::default().min_payout_sats,
             |p| Sats(p.min_payout_sats),
@@ -392,13 +368,11 @@ async fn spawn_session_persistence(
     handles: &FoundationHandles,
 ) -> Result<SessionPersistenceEngineHandle, EngineError> {
     let cfg = SessionPersistenceConfig {
-        // Same duration as the sweep's staleness cutoff, but NOT the
-        // same instant: the cutoff runs from the row's birth (updatedAt
-        // is only stamped at birth / re-register / soft-delete), while
-        // this TTL runs from the last touch flush and is refreshed every
-        // 30 s. For a session mining all day the two are hours apart —
-        // by design, since the age is only a birth grace and the key is
-        // the actual liveness signal. Tuning one does not move the other.
+        // Same duration as the sweep's staleness cutoff, but NOT the same
+        // instant: the cutoff runs from the row's birth (updatedAt is only
+        // stamped at birth / re-register / soft-delete), while this TTL runs
+        // from the last touch flush and is refreshed every 30 s. The age is
+        // only a birth grace; the key is the liveness signal.
         live_ttl: crate::crons::STALE_CLIENT_TTL,
         ..SessionPersistenceConfig::default()
     };
@@ -406,9 +380,8 @@ async fn spawn_session_persistence(
         live_ttl_secs = cfg.live_ttl.as_secs(),
         "session-persistence: spawning engine"
     );
-    // The shared multiplexed manager, not a dedicated connection — the
-    // live-hash scripts are short non-blocking commands; dedicated
-    // connections are reserved for blocking XREAD consumers.
+    // The shared multiplexed manager: the live-hash scripts are short
+    // non-blocking commands; dedicated connections are for blocking XREADs.
     let handle = SessionPersistenceEngine::spawn(
         cfg,
         handles.db.pool().clone(),
@@ -420,28 +393,21 @@ async fn spawn_session_persistence(
 
 // ─── BlitzpoolModeGate (sync address→mode cache) ──
 
-/// In-memory `(address → MiningModeResult, refcount)` map. Empty in
-/// 7.2; Phase 7.4's Stratum-side authorize path calls
-/// [`Self::set_mode`] when a miner authorizes on a port (the port's
-/// marker drives the mode). Addresses absent from the map default to
-/// `Solo`.
+/// In-memory `(address → MiningModeResult, refcount)` map. The Stratum
+/// authorize path calls [`Self::set_mode`] when a miner authorizes on a port
+/// (the port's marker drives the mode). Addresses absent from the map
+/// default to `Solo`.
 ///
-/// **Refcounting**: each authorize bumps the count for `address`;
-/// each disconnect decrements via [`Self::clear_mode`]. Entry is
-/// dropped only when the count returns to zero. This handles the
-/// case where the same address has multiple concurrent connections
-/// (BitAxe + cpuminer using the same payout address): one disconnect
-/// must not clear mode information the other connection still relies
-/// on. Mode resolution remains last-write-wins — if the operator
-/// adds the miner to a group between connections, the second
-/// authorize's `MiningModeResult` overwrites the cached mode while
-/// keeping the refcount bumped.
+/// **Refcounting**: each authorize bumps the count for `address`; each
+/// disconnect decrements via [`Self::clear_mode`], and the entry is dropped
+/// only at zero, so one of several concurrent connections for the same
+/// address cannot clear mode information the others still rely on. The mode
+/// itself is last-write-wins, so a re-authorize picks up a membership change.
 ///
-/// [`lookup_mode`](Self::lookup_mode) (used by the share producer + the
-/// payout resolver + block-found) and [`group_for_address`](Self::group_for_address)
-/// (used by the rejected composite's group-id stamp) read the same map. The
-/// map's lock is held only across a single `HashMap::get`, so per-share
-/// contention is negligible.
+/// [`lookup_mode`](Self::lookup_mode) and
+/// [`group_for_address`](Self::group_for_address) read the same map. The lock
+/// is held only across a single `HashMap::get`, so per-share contention is
+/// negligible.
 pub(crate) struct BlitzpoolModeGate {
     inner: Mutex<HashMap<String, RefcountedMode>>,
 }
@@ -459,11 +425,9 @@ impl BlitzpoolModeGate {
         }
     }
 
-    /// Phase 7.4 hook: called from the Stratum-server authorize path
-    /// to publish the resolved mode for `address`. Increments the
-    /// refcount; last-write-wins on the mode itself (a re-authorize
-    /// from the same address picks up any membership change since
-    /// the previous connection).
+    /// Called from the Stratum-server authorize path to publish the resolved
+    /// mode for `address`. Increments the refcount; last-write-wins on the
+    /// mode itself.
     pub(crate) fn set_mode(&self, address: &str, result: MiningModeResult) {
         let mut guard = self.inner.lock().expect("mode-gate mutex poisoned");
         guard
@@ -478,12 +442,9 @@ impl BlitzpoolModeGate {
             });
     }
 
-    /// Phase 7.4 hook: called from the Stratum-server disconnect path.
-    /// Decrements the refcount + removes the entry when the count
-    /// returns to zero. Calling `clear_mode` for an address never
-    /// `set_mode`'d is a no-op (defensive — a deregister event for an
-    /// unauthorized session shouldn't reach here, but if it does, we
-    /// just ignore it).
+    /// Called from the Stratum-server disconnect path. Decrements the
+    /// refcount and removes the entry at zero. A no-op for an address never
+    /// `set_mode`'d.
     pub(crate) fn clear_mode(&self, address: &str) {
         let mut guard = self.inner.lock().expect("mode-gate mutex poisoned");
         if let Some(entry) = guard.get_mut(address) {
@@ -506,17 +467,15 @@ impl BlitzpoolModeGate {
     /// The mode ONLY if this address has a live mining session — `None` when
     /// the gate has never been told, which is a different answer from Solo.
     ///
-    /// The gate is session-scoped (`set_mode` on register, `clear_mode` on
-    /// deregister), and for Solo vs PPLNS there is no persistent record to
-    /// fall back on: the port the miner connects to IS the declaration. So an
-    /// address the gate does not know is genuinely undecided, and
+    /// The gate is session-scoped, and for Solo vs PPLNS there is no
+    /// persistent record: the port the miner connects to IS the declaration.
+    /// So an unknown address is genuinely undecided, and
     /// [`Self::lookup_mode`]'s Solo default is a guess.
     ///
-    /// Callers that only need to route a live connection can keep guessing —
-    /// by then a session exists, so the guess never fires. A caller that acts
-    /// BEFORE the session exists must not: the JDP allocate publishes a payout
-    /// distribution off this answer, and a JDC allocates ~8 s before its
-    /// mining channel opens, so it would publish against a guess every time.
+    /// Routing a live connection may use the guess, since a session exists by
+    /// then. A caller that acts BEFORE the session exists must not: the JDP
+    /// allocate publishes a payout distribution off this answer, and a JDC
+    /// allocates before its mining channel opens.
     pub(crate) fn lookup_known(&self, address: &str) -> Option<MiningModeResult> {
         let guard = self.inner.lock().expect("mode-gate mutex poisoned");
         guard.get(address).map(|e| e.mode.clone())
@@ -533,8 +492,7 @@ impl BlitzpoolModeGate {
 
     /// Resolve an address to its **Group-Solo** `group_id` — `None` for any
     /// other mode (a Blockparty address carries a group_id too, but it is not
-    /// a Group-Solo group). The single source of the Group-Solo group filter
-    /// the rejected composite stamps from.
+    /// a Group-Solo group). The rejected composite stamps from this filter.
     pub(crate) fn group_for_address(&self, address: &str) -> Option<Uuid> {
         let r = self.lookup_mode(address);
         match r.mode {
@@ -543,10 +501,9 @@ impl BlitzpoolModeGate {
         }
     }
 
-    /// Snapshot the connected addresses currently gated `Solo` or `GroupSolo`
-    /// — the only modes the cache-sync reconcile flips on a group-membership
-    /// change. Returns `(address, mode)` pairs (a small clone under a brief
-    /// lock); PPLNS/Blockparty addresses are never touched.
+    /// Snapshot the connected addresses currently gated `Solo` or `GroupSolo`,
+    /// the only modes the cache-sync reconcile flips on a group-membership
+    /// change, as `(address, mode)` pairs.
     pub(crate) fn group_transition_candidates(&self) -> Vec<(String, MiningModeResult)> {
         let guard = self.inner.lock().expect("mode-gate mutex poisoned");
         guard
@@ -557,11 +514,10 @@ impl BlitzpoolModeGate {
     }
 
     /// Update the cached mode for an **already-connected** address WITHOUT
-    /// bumping its refcount — used by the cache-sync reconcile to flip a live
-    /// miner between Solo and Group-Solo when its group membership changes, so
-    /// its running connection's shares route to the right place on the next
-    /// share with no reconnect. No-op for an address that isn't connected
-    /// (absent from the map) — we never resurrect a disconnected entry.
+    /// bumping its refcount. The cache-sync reconcile uses it to flip a live
+    /// miner between Solo and Group-Solo on a membership change, without a
+    /// reconnect. No-op for an address that isn't connected, so a
+    /// disconnected entry is never resurrected.
     pub(crate) fn override_mode(&self, address: &str, result: MiningModeResult) {
         let mut guard = self.inner.lock().expect("mode-gate mutex poisoned");
         if let Some(e) = guard.get_mut(address) {
@@ -574,46 +530,32 @@ impl BlitzpoolModeGate {
 
 /// Fan-out impl of [`SharedAcceptedShareSink`]. Each contained sink
 /// receives every accepted share; mode-gating happens internally per
-/// sink. Sequential `await` chain — keeps the share-path simple and
-/// the ordering deterministic; concurrent fan-out via `join_all`
-/// would shave latency at the cost of dropped-share-on-panic
-/// semantics that we don't need (these sinks are all
-/// log-and-continue on internal failure).
+/// sink. A sequential `await` chain keeps the ordering deterministic; the
+/// sinks all log-and-continue on internal failure.
 pub(crate) struct CompositeAcceptedShareSink {
     /// Copy-on-write behind an [`ArcSwap`] so a one-shot startup append (via
     /// [`Self::push`]) can extend the fan-out after the composite is already
-    /// wrapped in `Arc`, **without putting a lock on the per-share read
-    /// path**.
+    /// wrapped in `Arc`, **without a lock on the per-share read path**.
     ///
-    /// The read path is `load_full()` — one atomic load plus a refcount bump
-    /// — and the resulting `Arc` is held across the `await`s of the fan-out.
-    /// This replaces a `Mutex<Vec<_>>` whose read path locked and then deep-
-    /// cloned the whole `Vec` on **every accepted share**, i.e. a process-wide
-    /// lock acquisition + one allocation per share, paid forever for what is
-    /// only a startup-time mutation. (The `Vec` clone existed because the
-    /// fan-out `await`s each sink, so a `std` guard cannot be held across it;
-    /// `ArcSwap` removes both the lock and the clone.)
+    /// The read path is `load_full()` (one atomic load plus a refcount bump),
+    /// and the resulting `Arc` is held across the `await`s of the fan-out,
+    /// where a `std` guard could not be held.
     sinks: ArcSwap<Vec<Arc<dyn SharedAcceptedShareSink>>>,
-    /// Assigns the producer `share_id` to every accepted share. This is the
-    /// single fan-out point every share crosses regardless of protocol, so
-    /// it is exactly where the id is stamped today — and where the stream
-    /// producer will assign it under the Core/Satellite split.
+    /// Assigns the producer `share_id` to every accepted share, at the single
+    /// fan-out point every share crosses regardless of protocol.
     sequencer: ShareSequencer,
     /// Resolves each share's payout mode once, here at the fan-out point,
-    /// so the mode is stamped onto the share and the downstream sinks read
-    /// it instead of re-querying the gate per sink. Under the split the
-    /// stream producer holds the authoritative Core gate and does the same.
+    /// so the mode is stamped onto the share and downstream sinks (and the
+    /// Satellite, which has no gate) read it instead of querying a gate.
     gate: Arc<BlitzpoolModeGate>,
 }
 
 impl CompositeAcceptedShareSink {
-    /// Append an extra sink to the fan-out. Intended for one-shot
-    /// startup wiring (e.g. Blockparty, whose handle is constructed
-    /// after the rest of the engines).
+    /// Append an extra sink to the fan-out. Intended for one-shot startup
+    /// wiring (e.g. Blockparty, constructed after the rest of the engines).
     ///
     /// Copy-on-write: builds the new list and swaps the pointer, so readers
-    /// concurrently fanning out a share keep iterating their own consistent
-    /// snapshot. Startup-only, so the clone here is not on any hot path.
+    /// mid-fan-out keep iterating their own consistent snapshot.
     pub(crate) fn push(&self, sink: Arc<dyn SharedAcceptedShareSink>) {
         let mut next = Vec::clone(&self.sinks.load_full());
         next.push(sink);
@@ -624,13 +566,11 @@ impl CompositeAcceptedShareSink {
 #[async_trait]
 impl SharedAcceptedShareSink for CompositeAcceptedShareSink {
     async fn record_accepted(&self, share: SharedAcceptedShare<'_>) {
-        // One atomic load + refcount bump; no lock, no `Vec` clone. Held
-        // across the fan-out `await`s below.
+        // One atomic load + refcount bump, held across the fan-out below.
         let snapshot = self.sinks.load_full();
-        // Stamp the producer fields here — one id + one mode resolution per
-        // share, assigned at the single point every share crosses, before
-        // any sink sees it. The adapters left them blank; idempotent sinks
-        // key their dedup on share_id, mode-gated sinks read share.mode.
+        // Stamp the producer fields before any sink sees the share: the
+        // adapters leave them blank; idempotent sinks key their dedup on
+        // share_id, mode-gated sinks read share.mode.
         let share_id = self.sequencer.next_id();
         let resolved = self.gate.lookup_mode(share.address);
         let share = SharedAcceptedShare {
@@ -640,10 +580,8 @@ impl SharedAcceptedShareSink for CompositeAcceptedShareSink {
             ..share
         };
         for (i, sink) in snapshot.iter().enumerate() {
-            // diag: per-sink timing — one of these inline accepted-share
-            // sinks occasionally blocks the connection loop for ~1s. Index
-            // order = build_accepted_sinks (money: [pplns?], group-solo;
-            // aux: stats, best-difficulty, touch, diff-stats, live-marker).
+            // diag: per-sink timing, since an inline sink blocks the
+            // connection loop while it runs.
             let t0 = std::time::Instant::now();
             sink.record_accepted(share).await;
             let us = t0.elapsed().as_micros();
@@ -656,20 +594,18 @@ impl SharedAcceptedShareSink for CompositeAcceptedShareSink {
 
 pub(crate) struct CompositeRejectedShareSink {
     sinks: Vec<Arc<dyn SharedRejectedShareSink>>,
-    /// Stamps each rejected share's `group_id` once, here at the single
-    /// fan-out point (the only side holding the gate), so the Group-Solo
-    /// reject sink reads it instead of querying a gate — and so the Satellite
-    /// gets it off the rejected stream.
+    /// Stamps each rejected share's `group_id` once, here at the fan-out
+    /// point (the only side holding the gate), so the Satellite reads it off
+    /// the rejected stream.
     gate: Arc<BlitzpoolModeGate>,
 }
 
 #[async_trait]
 impl SharedRejectedShareSink for CompositeRejectedShareSink {
     async fn record_rejected(&self, share: SharedRejectedShare<'_>) {
-        // Stamp the Group-Solo group id (only — a Blockparty address also
-        // carries a group_id, but the rejected fan-out has no Blockparty
-        // sink, and crediting its reject to the Group-Solo engine would be
-        // wrong). `group_for_address` applies exactly that filter.
+        // Group-Solo group ids only: a Blockparty address carries a group_id
+        // too, but its reject must not be credited to the Group-Solo engine.
+        // `group_for_address` applies that filter.
         let group_id = share
             .address
             .and_then(|addr| self.gate.group_for_address(addr))
@@ -700,8 +636,7 @@ pub(crate) struct AcceptedSinkSet {
 }
 
 /// Build the per-engine accepted-share sinks, split by durability class.
-/// Driven by the Satellite stream consumer (the front produces to the stream
-/// rather than fanning out in-process).
+/// Driven by the Satellite stream consumer.
 pub(crate) fn build_accepted_sinks(
     pplns: Option<&PplnsEngine>,
     group_solo: &GroupSoloEngine,
@@ -785,12 +720,10 @@ mod tests {
     use bp_share_stream::StreamConsumer;
     use bp_test_support::{connect_redis_in_range_or_skip, redis_db};
 
-    /// The settlement gate refuses to book a coinbase paying less than
-    /// the block's own subsidy, so this mapping decides whether the
-    /// pool's own regtests can book anything at all: regtest halves
-    /// every 150 blocks, and the harnesses mine well past that. Handing
-    /// the engines the mainnet 210 000 would over-state the subsidy by
-    /// 4× at height 500 and refuse every block they find.
+    /// The settlement gate refuses a coinbase paying less than the block's
+    /// own subsidy, and regtest halves every 150 blocks: with the mainnet
+    /// 210 000 the engines would over-state the subsidy and refuse regtest
+    /// blocks past that height.
     #[test]
     fn regtest_gets_its_own_halving_schedule() {
         assert_eq!(
@@ -881,15 +814,9 @@ mod tests {
         percent = 1.0
     "#;
 
-    /// A pool that does not run PPLNS must still boot.
-    ///
-    /// `min_payout_sats` is shared between PPLNS and Group-Solo, and the
-    /// Group-Solo builder used `unwrap_or_default()` for the missing
-    /// case — which is `Sats(0)`, not the engine default, because struct
-    /// update syntax cannot fill a field that is explicitly set. Every
-    /// deployment without a `[pplns]` block died at startup with
-    /// "group-solo config invalid: min_payout_sats must be ≥ 546, got 0"
-    /// — an error naming a mode the operator may not even use.
+    /// A pool that does not run PPLNS must still boot: without `[pplns]` the
+    /// shared `min_payout_sats` is the Group-Solo engine default, not
+    /// `Sats(0)`, which would fail validation.
     #[test]
     fn a_pool_without_pplns_still_builds_its_group_solo_config() {
         let cfg: bp_config::AppConfig =
@@ -929,11 +856,8 @@ mod tests {
 
     // ── CompositeAcceptedShareSink: ArcSwap fan-out list ─────────────
     //
-    // The list is appended exactly once at startup (Blockparty) and then
-    // read on EVERY accepted share. It used to be a `Mutex<Vec<_>>` whose
-    // read path locked and deep-cloned the whole `Vec` per share; it is now
-    // an `ArcSwap` read via `load_full()` (atomic load + refcount bump).
-    // These tests pin the semantics that change had to preserve.
+    // The list is appended once at startup (Blockparty) and read on EVERY
+    // accepted share via `load_full()`. These tests pin its semantics.
 
     /// Counts how often it was invoked, so a fan-out can be observed.
     struct CountingSink(std::sync::Arc<std::sync::atomic::AtomicUsize>);
@@ -972,9 +896,8 @@ mod tests {
         }
     }
 
-    /// `push` must be visible to reads that happen after it — the whole
-    /// point of the late-append (Blockparty is wired after the composite
-    /// is already inside an `Arc`).
+    /// `push` must be visible to reads that happen after it (Blockparty is
+    /// wired after the composite is already inside an `Arc`).
     #[tokio::test]
     async fn composite_push_is_visible_to_later_reads() {
         let composite = empty_composite();
@@ -989,8 +912,8 @@ mod tests {
         );
     }
 
-    /// Every sink in the list is fanned out to, in order — `load_full()`
-    /// must expose the complete list, not a truncated snapshot.
+    /// Every sink in the list is fanned out to: `load_full()` exposes the
+    /// complete list.
     #[tokio::test]
     async fn composite_fans_out_to_every_pushed_sink() {
         let composite = empty_composite();
@@ -1005,9 +928,8 @@ mod tests {
         assert_eq!(composite.sinks.load().len(), 2);
     }
 
-    /// Copy-on-write: a snapshot taken before a `push` keeps its own view.
-    /// This is what makes the lock unnecessary — a reader mid-fan-out is
-    /// never mutated underneath.
+    /// Copy-on-write: a snapshot taken before a `push` keeps its own view, so
+    /// a reader mid-fan-out is never mutated underneath.
     #[test]
     fn composite_push_is_copy_on_write() {
         let composite = empty_composite();
@@ -1022,11 +944,9 @@ mod tests {
     }
 
     /// Core mode: the producing composite stamps `share_id` + `mode` at the
-    /// single fan-out point and publishes the owned share onto the shared
-    /// accepted-share stream — exactly what the Satellite consumes. Proven
-    /// end-to-end: build the composite, feed one borrowed share for a
-    /// PPLNS-gated address, then read it back off the stream and assert the
-    /// stamped fields survived.
+    /// single fan-out point and publishes the owned share onto the
+    /// accepted-share stream the Satellite consumes; read back through a
+    /// consumer group, the stamped fields survive.
     #[tokio::test]
     async fn producing_composite_stamps_and_publishes_to_stream() {
         let Some(conn) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 6).await else {
@@ -1039,8 +959,8 @@ mod tests {
 
         let composite = build_producing_composite(gate, conn.clone(), 7);
 
-        // Adapter-shaped input: share_id blank + mode Solo — the composite
-        // overwrites both from the gate before publishing.
+        // Adapter-shaped input: share_id blank + mode Solo; the composite
+        // overwrites both before publishing.
         let share = SharedAcceptedShare {
             address: addr,
             worker: "rig1",
@@ -1073,23 +993,16 @@ mod tests {
         assert!((owned.effective_difficulty - 1024.0).abs() < 1e-9);
     }
 
-    /// `is_pplns` / `mode_for` were removed with the dead gate traits; the
-    /// gate's live API is `lookup_mode`. This reads the resolved mode.
+    /// The resolved mode via `lookup_mode`.
     fn mode_of(gate: &BlitzpoolModeGate, address: &str) -> MiningMode {
         gate.lookup_mode(address).mode
     }
 
-    /// The Solo default above is a GUESS, and one caller must not take it.
-    ///
-    /// `lookup_known` is how that caller asks instead. The distinction is not
-    /// cosmetic: the JDP allocate publishes a payout distribution off this
-    /// answer, and a JDC allocates ~8 s before its mining channel opens — so
-    /// at that moment the gate knows nothing about EVERY address, and a Solo
-    /// answer would publish a Solo plan for a PPLNS miner or a Group-Solo
-    /// finder. Both are money errors, in opposite directions.
-    ///
-    /// Asserted against `lookup_mode` in the same test so the two cannot
-    /// quietly converge on one answer again.
+    /// `lookup_known` tells an undecided address apart from Solo, where
+    /// `lookup_mode` guesses Solo. The JDP allocate publishes a payout
+    /// distribution before the mining channel opens, and a Solo guess there
+    /// would publish a Solo plan for a PPLNS miner or a Group-Solo finder.
+    /// Asserted against `lookup_mode` so the two answers stay distinct.
     #[test]
     fn lookup_known_tells_unknown_apart_from_solo() {
         let gate = BlitzpoolModeGate::new();
@@ -1120,8 +1033,7 @@ mod tests {
             Some(MiningMode::Pplns)
         );
 
-        // Cleared with the session — a disconnected miner is undecided again,
-        // which is why this cannot be answered from history either.
+        // Cleared with the session: a disconnected miner is undecided again.
         gate.clear_mode("bc1qpplns");
         assert_eq!(gate.lookup_known("bc1qpplns"), None);
     }
@@ -1152,8 +1064,8 @@ mod tests {
 
     #[test]
     fn mode_gate_group_solo_with_invalid_uuid_returns_none() {
-        // Defence-in-depth: a malformed UUID in the gate → GroupModeGate
-        // falls through to None rather than panicking on the share path.
+        // A malformed UUID in the gate yields None from `group_for_address`
+        // rather than panicking on the share path.
         let gate = BlitzpoolModeGate::new();
         gate.set_mode("bc1qgs", MiningModeResult::group_solo("not-a-uuid"));
         assert_eq!(gate.group_for_address("bc1qgs"), None);
@@ -1223,8 +1135,7 @@ mod tests {
 
     #[test]
     fn mode_gate_clear_unknown_address_is_noop() {
-        // Disconnect for an address that never authorized — defensive
-        // path; must not panic.
+        // Disconnect for an address that never authorized must not panic.
         let gate = BlitzpoolModeGate::new();
         gate.clear_mode("bc1qnever_seen");
         assert_eq!(mode_of(&gate, "bc1qnever_seen"), MiningMode::Solo);

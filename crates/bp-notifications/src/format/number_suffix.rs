@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `NumberSuffix.to(value)` port — formats e.g. `158_000_000_000_000`
-//! as `"158.00T"` (best-difficulty display).
+//! SI-suffix number formatting — e.g. `158_000_000_000_000` as
+//! `"158.00T"` (best-difficulty display).
 
 const SUFFIXES: [&str; 11] = ["", "k", "M", "G", "T", "P", "E", "Z", "Y", "R", "Q"];
 

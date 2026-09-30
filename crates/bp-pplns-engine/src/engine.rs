@@ -31,8 +31,8 @@
 //!   template-build path (and the JDP coinbase-outputs request path),
 //!   wraps the inflight cache.
 //! - [`PplnsEngine::on_block_found`] — called when a PPLNS-mode finder
-//!   wins a block; reads the snapshot persisted at template-build
-//!   time, applies the ledger TX, then deletes the snapshot.
+//!   wins a block; settles against the snapshot persisted at
+//!   template-build time and applies the ledger TX.
 //! - [`PplnsEngine::shutdown`] — flips the cancel watch so background
 //!   tasks exit cleanly.
 
@@ -112,18 +112,14 @@ pub enum EngineError {
 impl EngineError {
     /// Would retrying this ever succeed?
     ///
-    /// The confirmation watcher re-applies a pending block on every
-    /// tick and only drops it once the apply returns `Ok`. That is
-    /// right for a database blip and wrong for a verdict: a snapshot
-    /// that expired, a coinbase that burned its own subsidy or an
-    /// address that will not parse produce the SAME failure forever,
-    /// so retrying them is an infinite loop that hides the block
-    /// behind a repeating warning instead of surfacing it once.
+    /// The confirmation watcher re-applies a pending block every tick
+    /// until the apply returns `Ok`. That suits a database blip, not a
+    /// verdict: an expired snapshot, a coinbase below its own subsidy or
+    /// an unparsable address fail the same way forever, so retrying would
+    /// hide the block behind a repeating warning.
     ///
-    /// Terminal here does not mean the block is lost — it means no
-    /// automatic path can book it, and the operator reprocess reads
-    /// the block's own coinbase off the chain rather than the parked
-    /// blob.
+    /// Terminal means no automatic path can book the block; the operator
+    /// reprocess reads the block's own coinbase off the chain.
     pub fn is_terminal(&self) -> bool {
         match self {
             EngineError::Config(_)
@@ -215,23 +211,17 @@ impl PplnsEngine {
             config.abandoned_balance_days,
         );
         // Cold-start safety: if the by-address aggregate is empty but buckets
-        // exist (fresh deploy / lost key), rebuild it once from the buckets.
-        // No-op at a normal cutover, where the previous pool version already
-        // maintains the hash. After this the hash
-        // is kept current incrementally; there is no periodic full recalc.
+        // exist (lost key), rebuild it once from the buckets. After this the
+        // hash is kept current incrementally; there is no periodic full recalc.
         window.bootstrap_window_if_needed().await?;
-        // Convert a bucket index written before the scores were timestamps.
-        // Must run before the first trim, or the age rule reads ids as 1970
-        // and drops the whole window. Idempotent, so it stays as a permanent
-        // guard rather than a one-release migration.
+        // Convert bucket-id scores to timestamps. Must run before the first
+        // trim, or the age rule reads ids as 1970 and drops the whole window.
+        // Idempotent.
         //
-        // Deliberately NOT gated on `background_tasks`, so it runs in every
-        // role, Core included. The trim runs wherever the share stream is
-        // consumed, and that is a role question this constructor does not
-        // see: `background_tasks` is the Payout role alone, while a Stats
-        // satellite without Front consumes the stream too. A gate here could
-        // leave exactly the trimming process unconverted. The cost of running
-        // it everywhere is one empty ZRANGEBYSCORE per boot.
+        // Deliberately NOT gated on `background_tasks`: the trim runs wherever
+        // the share stream is consumed, which this constructor cannot see
+        // (a Stats satellite without Front consumes it too). The cost is one
+        // empty ZRANGEBYSCORE per boot.
         window.restamp_legacy_bucket_scores().await?;
         let dist_cfg = DistributionConfig::from_engine_config(&config);
         let distribution_builder = DistributionBuilder::new(pool.clone(), window.clone(), dist_cfg);
@@ -241,10 +231,9 @@ impl PplnsEngine {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
-        // Spawn background tasks. We don't track JoinHandles in the
-        // engine because shutdown is signalled by `cancel_tx` and the
-        // tasks self-terminate. If callers need precise join semantics
-        // they should wrap the engine in their own supervisor.
+        // JoinHandles are not tracked: shutdown is signalled by `cancel_tx`
+        // and the tasks self-terminate. Callers needing precise join
+        // semantics wrap the engine in their own supervisor.
         //
         // Core mode (`background_tasks == false`) skips them entirely:
         // touch-flush + dust-sweep write the ledger, which is the
@@ -291,7 +280,7 @@ impl PplnsEngine {
     /// Hot path. Called per accepted share AFTER the stratum layer has
     /// resolved mode = PPLNS.
     ///
-    /// Atomically appends the share to the window (Redis MULTI/EXEC),
+    /// Atomically appends the share to the window (one Lua script),
     /// records the `lastAcceptedShareAt` touch (60s-buffered to PG),
     /// and invalidates the distribution cache so the next
     /// `build_distribution` call sees the new share.
@@ -314,12 +303,8 @@ impl PplnsEngine {
             return Ok(());
         }
         self.inner.touch_buffer.mark(address, timestamp_ms as i64);
-        // The distribution depends on (window + ledger); a new share
-        // changes the window. Invalidate so the next template-build
-        // call sees fresh state. Invalidating per-reward would let
-        // stale entries for *other* reward values survive — the whole
-        // cache is keyed by reward, so dropping all entries is
-        // correct (and cheap: one HashMap::clear).
+        // A new share changes the window, and the cache is keyed by reward,
+        // so every entry is stale: drop them all (one HashMap::clear).
         self.inner.distribution_builder.invalidate_all();
         Ok(())
     }
@@ -375,18 +360,13 @@ impl PplnsEngine {
     /// Look up the settlement inputs the found block's coinbase was built
     /// from, so the Core can stamp them into the block-found event.
     ///
-    /// This exists for the same reason as Group-Solo's namesake, and it is
-    /// resolved at the same moment: at the block-found instant, where the
-    /// snapshot key is certainly still alive. The confirmation-gated apply
-    /// runs `confirmation_depth` blocks later — about 20 minutes at depth 3,
-    /// against a 20-minute [`crate::config::PplnsEngineConfig::snapshot_ttl_secs`]
-    /// whose clock started when the winning JOB was built. Reading it only
-    /// then loses the race about half the time, and losing it is not a
-    /// delay: the inputs are gone from every store (the Redis→Postgres
-    /// backup skips per-job snapshot keys on purpose), so what the
-    /// withheld miners were owed can no longer be computed from anything.
-    /// The block's own coinbase says who WAS paid, never what the unpaid
-    /// were entitled to.
+    /// Resolved at the block-found instant, like Group-Solo's namesake,
+    /// while the snapshot key is still alive. The confirmation-gated apply
+    /// runs `confirmation_depth` blocks later, which can outlast
+    /// [`crate::config::PplnsEngineConfig::snapshot_ttl_secs`] (counted from
+    /// when the winning job was built). Per-job snapshot keys are not backed
+    /// up, and the block's coinbase says who WAS paid, never what the unpaid
+    /// were owed, so without this the withheld claims would be lost.
     ///
     /// `weights_fingerprint` is the identity of the winning job's payout
     /// list, carried on the job the share was built on. The build that
@@ -413,10 +393,8 @@ impl PplnsEngine {
     /// `snapshot` is the distribution's settlement inputs. The Core
     /// resolves them at found-time and both paths carry them in — the
     /// confirmation-gated one in the parked blob, the immediate one
-    /// straight through. `None` is the fallback for the case where that
-    /// resolution failed (a Redis blip at the worst moment): the
-    /// fingerprint is then read back here, which is a second chance, not
-    /// the design.
+    /// straight through. `None` means that resolution failed (a Redis
+    /// blip); the fingerprint is then read back here as a second chance.
     ///
     /// Idempotent on redelivery without a guard of its own:
     /// [`crate::ledger::apply_distribution`] checks the height's existing
@@ -454,10 +432,9 @@ impl PplnsEngine {
         payouts_fingerprint: Option<[u8; 32]>,
     ) -> Result<ApplyDistributionResult, EngineError> {
         // 1. Snapshot source: the blob the Core resolved at found-time,
-        //    else a late read under the fingerprint. The late read is the
-        //    fallback for a Redis blip at the found instant, not the
-        //    design — by now the key has usually TTL'd out (see
-        //    `weight_snapshot_for_block_found`).
+        //    else a late read under the fingerprint (fallback for a Redis
+        //    blip at the found instant; the key may have expired by now,
+        //    see `weight_snapshot_for_block_found`).
         let snapshot = match snapshot {
             Some(s) => s,
             None => {
@@ -480,9 +457,8 @@ impl PplnsEngine {
 
         // The one hard gate: a coinbase that pays less than its own
         // subsidy destroyed money it was entitled to. No mempool drift,
-        // no stale projection base and no job-declaring client's own
-        // template can produce that, so it never fires on a healthy
-        // block — and a block that DID do it is not one to book blind.
+        // stale projection base or job-declaring client's template can
+        // produce that, so such a block is not booked blind.
         let subsidy = block_subsidy_sats(block_height, self.inner.config.subsidy_halving_interval);
         if actual.total_value_sats < subsidy {
             error!(
@@ -499,13 +475,12 @@ impl PplnsEngine {
         }
         // 2. Settle. The balance write is absolute (`current + delta`), so
         //    `current` MUST be read under `FOR UPDATE` in the same
-        //    transaction that writes it — otherwise the daily dust sweep,
-        //    whose targets are exactly the balance-only entries a
-        //    distribution carries, can commit between the two and have its
-        //    work silently undone. The Redis window read stays OUTSIDE the
-        //    transaction: it only decides which addresses get a 0-sat
-        //    late-arriver audit row, and a Redis stall must not hold a PG
-        //    transaction open.
+        //    transaction that writes it, or the daily dust sweep (which
+        //    targets exactly the balance-only entries a distribution
+        //    carries) could commit in between and be undone. The Redis
+        //    window read stays OUTSIDE the transaction: it only decides
+        //    which addresses get a 0-sat late-arriver audit row, and a
+        //    Redis stall must not hold a PG transaction open.
         let now_ms = chrono::Utc::now().timestamp_millis();
         let current_window = self.inner.window.read_window_by_address().await?;
         let addresses = Self::addresses_to_settle(&snapshot, actual);
@@ -543,9 +518,7 @@ impl PplnsEngine {
     /// Sorted, and that is load-bearing: `FOR UPDATE` acquires row locks
     /// in the order the plan emits them, so a stable ordering here (and
     /// the matching `ORDER BY address` in the query) is what keeps two
-    /// transactions touching the same two rows from deadlocking. The set
-    /// used to come straight out of a `HashSet`, i.e. a different order
-    /// every run.
+    /// transactions touching the same two rows from deadlocking.
     fn addresses_to_settle(
         snapshot: &StoredWeightSnapshot,
         actual: &ActualCoinbase,
@@ -575,9 +548,7 @@ impl PplnsEngine {
     /// row — `T − Σ claims` is the pool's by construction.
     ///
     /// Pure: `existing` comes in already read and LOCKED by the caller's
-    /// transaction. It used to do that read itself, from the pool and
-    /// outside the writing transaction, which is precisely the window the
-    /// dust sweep could commit into.
+    /// transaction, so the dust sweep cannot commit between read and write.
     fn build_writes_from_weight_snapshot(
         snapshot: &StoredWeightSnapshot,
         current_window: &HashMap<String, f64>,
@@ -713,9 +684,8 @@ impl PplnsEngine {
         Ok((audit_rows, balance_writes))
     }
 
-    /// Drop one cached distribution entry. Called by the engine itself
-    /// on share-record; exposed so manual admin tooling can force a
-    /// recompute too.
+    /// Drop one cached distribution entry, so admin tooling can force a
+    /// recompute for one reward.
     pub fn invalidate_distribution(&self, block_reward_sats: u64) {
         self.inner
             .distribution_builder

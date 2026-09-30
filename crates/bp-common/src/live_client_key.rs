@@ -46,22 +46,17 @@ pub const F_CHANNEL_COUNT: &str = "channel_count";
 /// key's life — the writer max-merges against the stored value.
 ///
 /// Deliberately ephemeral: a Redis restart or an eviction resets it to
-/// 0 and it climbs again from the shares seen afterwards. That is
-/// acceptable because the value was always scoped to one session (every
-/// reconnect started it over anyway) and nothing durable reads it. The
-/// all-time best per address lives in `address_settings_entity` and is
-/// untouched by any of this — if the two ever need to agree, that is
-/// the one to trust.
+/// 0. It is scoped to one session and nothing durable reads it. The
+/// all-time best per address lives in `address_settings_entity`; if the
+/// two ever disagree, that is the one to trust.
 pub const F_BEST_DIFFICULTY: &str = "best_difficulty";
 /// Hash field: epoch-ms timestamp of the freshest accepted share.
 pub const F_UPDATED_AT_MS: &str = "updated_at_ms";
 
 /// Anything that identifies one mining session. The live-hash key is
-/// this triple, and it was being rebuilt by hand at seven call sites
-/// across three crates — a fourth component or a normalisation step
-/// would have had to be found in all of them, which is the drift shape
-/// this codebase is most prone to. Implemented for `bp_db`'s row types
-/// and for a bare triple, so every reader passes what it already has.
+/// this triple, built in one place so no call site assembles it by hand.
+/// Implemented for `bp_db`'s row types and for a bare triple, so every
+/// reader passes what it already has.
 pub trait SessionKey {
     fn address(&self) -> &str;
     fn worker(&self) -> &str;
@@ -107,8 +102,7 @@ pub fn client_live_key(address: &str, worker: &str, session_id: &str) -> String 
 pub const SCAN_PATTERN_ALL: &str = "client:live:*";
 
 /// `SCAN MATCH` pattern covering one address's live hashes. The address
-/// is glob-escaped: real Bitcoin addresses are alphanumeric, but this
-/// helper must not turn a hostile string into a wildcard.
+/// is glob-escaped so no input string can act as a wildcard.
 pub fn scan_pattern_for_address(address: &str) -> String {
     let mut pat = String::with_capacity(CLIENT_LIVE_PREFIX.len() + address.len() + 2);
     pat.push_str(CLIENT_LIVE_PREFIX);

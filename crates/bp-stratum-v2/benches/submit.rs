@@ -7,26 +7,18 @@
 //! steady-state work done once per submitted share.
 //!
 //! Two figures per case:
-//!   - **allocations per call** — the leanness metric. A validated share
-//!     now costs 1 alloc: the `Box<ShareAccept>`. The coinbase txid is
-//!     streamed straight into the hasher (`sha256d_from_parts`, no coinbase
-//!     `Vec`), the merkle walk and worker-name resolver are zero-alloc, and —
-//!     since C1 — `bp_share::calculate_difficulty` (now `f64`, was
-//!     `num-bigint`) is too. The separately-measured `ext_job clone` is the
-//!     per-share `ExtendedJob` copy the extended handler used to make to
-//!     release the channel-map borrow — since removed via disjoint-field
-//!     borrows (kept here as a baseline).
-//!   - **ns/op** (criterion) — wall-clock, dominated by the per-merkle-level
+//!   - **allocations per call**: a validated share costs 1 alloc, the
+//!     `Box<ShareAccept>`. The coinbase txid is streamed straight into the
+//!     hasher (`sha256d_from_parts`), and the merkle walk, worker-name
+//!     resolver and `bp_share::calculate_difficulty` (`f64`) are zero-alloc.
+//!     The `ext_job clone` cases measure a per-share `ExtendedJob` copy as a
+//!     baseline; the handler avoids it with disjoint-field borrows.
+//!   - **ns/op** (criterion): wall-clock, dominated by the per-merkle-level
 //!     SHA-256d (so it scales with merkle depth) plus the coinbase + header
 //!     double-hashes.
 //!
-//! Findings: the SV2 share path is hash-bound, not parse-bound (unlike
-//! SV1). Three allocation sources were removed: the ext_job clone (B,
-//! 3 allocs/share, disjoint-field borrows), the num-bigint difficulty
-//! calc (C1, ~6 allocs/share, now f64 in `bp_share`), and the coinbase
-//! buffer (streamed via `sha256d_from_parts`, no per-share `Vec`). A
-//! validated share is down to 1 alloc (`Box<ShareAccept>`); the hashing
-//! itself is irreducible verifier work.
+//! The SV2 share path is hash-bound, not parse-bound; the hashing is
+//! irreducible verifier work.
 //!
 //! Run: `cargo bench -p bp-stratum-v2 --bench submit`
 
@@ -43,10 +35,9 @@ use bp_stratum_v2::mining::submit::{
 };
 use criterion::{BatchSize, Criterion, Throughput};
 
-// ── Counting allocator: tallies every `alloc`/`realloc` so we can read
-//    the allocation count across a single isolated call. Wraps System;
-//    criterion's own allocations are not measured — we only read the
-//    counter delta around one call. ──
+// ── Counting allocator: tallies every `alloc`/`realloc`. Only the counter
+//    delta around one isolated call is read, so criterion's own
+//    allocations do not count. ──
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 struct Counting;
@@ -135,8 +126,8 @@ fn ext_submission(nonce: u32) -> SubmitSharesExtendedInput {
 
 /// One `validate_submit_extended` call (Accept path). Projects the
 /// channel into the `ExtendedChannelView` + `&mut submission_cache` the
-/// validator takes — the same projection the handler does inline to avoid
-/// the per-share `ExtendedJob` clone.
+/// validator takes, the same projection the handler does inline so it
+/// needs no per-share `ExtendedJob` clone.
 fn run_validate(channel: &mut ChannelState, sub: &SubmitSharesExtendedInput, job: &ExtendedJob) {
     let job_target = channel.target_for(job.difficulty);
     let view = ExtendedChannelView {
@@ -158,10 +149,9 @@ fn run_validate(channel: &mut ChannelState, sub: &SubmitSharesExtendedInput, job
     black_box(&v);
 }
 
-/// Pre-B per-share work: the old handler cloned the whole `ExtendedJob`
-/// out of the channel map, then validated against that clone. The
-/// validation work is identical to `run_validate`; the only difference is
-/// the clone. Used for the before/after comparison.
+/// Baseline: clone the whole `ExtendedJob`, then validate against the
+/// clone. Identical to `run_validate` except for the clone, so the
+/// difference is its cost.
 fn run_validate_with_clone(
     channel: &mut ChannelState,
     sub: &SubmitSharesExtendedInput,
@@ -195,7 +185,7 @@ fn allocs_for_validate(depth: usize) -> usize {
     ALLOCS.load(Ordering::Relaxed) - before
 }
 
-/// Pre-B counterpart of [`allocs_for_validate`]: clone + validate.
+/// Baseline counterpart of [`allocs_for_validate`]: clone + validate.
 fn allocs_for_validate_with_clone(depth: usize) -> usize {
     let job = ext_job(depth);
     let mut channel = warmed_channel_n(&job, 512);
@@ -205,10 +195,8 @@ fn allocs_for_validate_with_clone(depth: usize) -> usize {
     ALLOCS.load(Ordering::Relaxed) - before
 }
 
-/// Allocations of one `bp_share::calculate_difficulty` call — the
-/// num-bigint target→difficulty conversion done once per share inside the
-/// validator. Isolated here because it dominates the validator's
-/// allocation count.
+/// Allocations of one `bp_share::calculate_difficulty` call, the
+/// hash→difficulty conversion done once per share inside the validator.
 fn allocs_for_difficulty_calc() -> usize {
     let header = [0xABu8; 80];
     let _ = black_box(calculate_difficulty(&header)); // warm lazy statics
@@ -248,7 +236,7 @@ fn report_allocs() {
 fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("sv2_submit_extended");
 
-    // B before/after at mainnet merkle depth: the only per-share-path
+    // Clone baseline vs validate-only at mainnet merkle depth: the only
     // difference is the ext_job clone. `iter_batched_ref` rebuilds a
     // freshly-warmed channel per iteration (untimed setup) so every timed
     // submit is unique — avoiding the duplicate-share short-circuit while
@@ -273,7 +261,7 @@ fn bench(c: &mut Criterion) {
         });
     }
 
-    // The necessary work across merkle depths (post-B): build coinbase +
+    // The necessary work across merkle depths: build coinbase +
     // walk merkle + double-hash header. Scales with merkle depth.
     for depth in [MERKLE_DEPTH_SHALLOW, MERKLE_DEPTH_MAINNET] {
         let job = ext_job(depth);
@@ -288,8 +276,7 @@ fn bench(c: &mut Criterion) {
         });
     }
 
-    // The difficulty conversion inside the validator, isolated. C1 made
-    // this f64 (was num-bigint, ~6 allocs + ~300ns/share).
+    // The difficulty conversion inside the validator, isolated.
     {
         let header = [0xABu8; 80];
         g.bench_function("calculate_difficulty (f64, post-C1)", |b| {
@@ -297,8 +284,8 @@ fn bench(c: &mut Criterion) {
         });
     }
 
-    // The per-share cost the disjoint-borrow refactor removed from the
-    // handler (kept here as a documented baseline of what was eliminated).
+    // Cost of a per-share job clone, which the handler avoids through
+    // disjoint-field borrows (baseline).
     for depth in [MERKLE_DEPTH_SHALLOW, MERKLE_DEPTH_MAINNET] {
         let job = ext_job(depth);
         g.bench_function(format!("ext_job clone (merkle depth {depth})"), |b| {

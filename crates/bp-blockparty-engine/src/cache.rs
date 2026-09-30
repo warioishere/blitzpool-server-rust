@@ -114,8 +114,8 @@ impl BlockpartyCache {
             guard
                 .admin
                 .insert(admin_address.clone(), AdminCacheEntry { group_id, status });
-            // First-time createGroup populates the admin's own member
-            // entry too (admin role).
+            // The admin is also a member (admin role), so its member
+            // entry is populated here too.
             guard.member.insert(admin_address.clone(), group_id);
         }
     }
@@ -129,7 +129,7 @@ impl BlockpartyCache {
             .insert(address.clone(), group_id);
     }
 
-    /// Remove a member entry (single removeMember call).
+    /// Remove a member entry (a single `remove_member`).
     pub async fn remove_member(&self, address: &AddressId) {
         self.inner.write().await.member.remove(address);
     }

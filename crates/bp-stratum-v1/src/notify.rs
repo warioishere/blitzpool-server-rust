@@ -13,9 +13,8 @@
 //! - [`build_notify_frame`] takes an active template, a per-miner
 //!   [`bp_mining_job::MiningJob`], a jobId, and the clean-jobs flag, and
 //!   emits the line-terminated `mining.notify` bytes. Numeric fields
-//!   (version/bits/ntime) are emitted as 8-hex-padded lowercase — a
-//!   deliberate ckpool-style choice (see the
-//!   `feedback-sv1-notify-hex-padded` memory).
+//!   (version/bits/ntime) are emitted as 8-hex-padded lowercase, the
+//!   ckpool convention.
 //!
 //! The Tokio plumbing that drives the assembler from a
 //! `TdpHandle::subscribe()` receiver lives in `server.rs`.
@@ -36,16 +35,14 @@ use serde::Serialize;
 pub struct ActiveSV1Template {
     pub template: ActiveTemplate,
     /// Pre-encoded hex form of `merkle_path`, computed once per template
-    /// activation/refresh. `mining.notify` would otherwise hex-encode the
-    /// path on every per-client broadcast — at ~600 clients × ~10
-    /// templates/min × ~12 branch entries that's a measurable per-second
-    /// allocation rate this cache removes.
+    /// activation/refresh, so the per-client `mining.notify` broadcast does
+    /// not hex-encode the path once per connection.
     pub merkle_branch_hex: Vec<String>,
     /// Pre-encoded hex of the notify **header-constant** fields — prev_hash
     /// (word-swapped), version, n_bits, header_timestamp — cached once per
     /// template alongside `merkle_branch_hex`. These are identical for every
     /// connection on a template, so `mining.notify` borrows them instead of
-    /// re-hex-encoding for each of ~600 per-client broadcasts. Kept in sync by
+    /// re-hex-encoding for each per-client broadcast. Kept in sync by
     /// `ActiveSV1Template::recompute_notify_header_hex` (construction +
     /// mempool refresh — the only paths that change the source fields).
     pub prev_hash_hex: String,
@@ -170,11 +167,8 @@ type MiningNotifyParams<'a> = (
 /// miner; it's the same id miners echo back in `mining.submit[1]`.
 ///
 /// Numeric fields version / n_bits / header_timestamp are emitted as
-/// **8-hex-padded lowercase** (ckpool convention, see
-/// `feedback-sv1-notify-hex-padded` memory). This differs from the old
-/// unpadded `Number.toString(16)` — the chosen form because it's
-/// observably interchangeable with every real miner and easier to
-/// reason about in pcaps/logs.
+/// **8-hex-padded lowercase** (ckpool convention): every real miner
+/// accepts it, and fixed-width fields are easier to read in pcaps/logs.
 pub fn build_notify_frame(
     state: &ActiveSV1Template,
     job: &MiningJob,
@@ -450,8 +444,7 @@ mod tests {
         assert_eq!(branch[0].as_str().unwrap(), &"11".repeat(32));
         assert_eq!(branch[1].as_str().unwrap(), &"22".repeat(32));
 
-        // params[5..8] = 8-hex-padded version/bits/ntime (ckpool form,
-        // per the feedback-sv1-notify-hex-padded memory).
+        // params[5..8] = 8-hex-padded version/bits/ntime (ckpool form).
         assert_eq!(params[5].as_str().unwrap(), "20000000");
         assert_eq!(params[6].as_str().unwrap(), "1d00ffff");
         assert_eq!(params[7].as_str().unwrap(), "65a1b2c3");
@@ -576,7 +569,7 @@ mod tests {
     fn build_notify_frame_field_order_is_id_method_params() {
         // Pin the field order at the byte level. JSON serialization order
         // `{id, method, params}` emits `id` first, then `method`, then
-        // `params`. Our Serialize-derived struct must do the same.
+        // `params`. The Serialize-derived struct must do the same.
         let active = assembled_active();
         let job = job_from_active(&active);
         let bytes = build_notify_frame(&active, &job, "1", false);

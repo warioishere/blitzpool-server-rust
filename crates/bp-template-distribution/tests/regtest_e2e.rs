@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! End-to-end test: spawn a regtest `bitcoin-node`, plug `TdpHandle`
-//! against its IPC socket, mine blocks and verify we observe at least one
-//! `NewTemplate` + `SetNewPrevHash` update on the outbound broadcast.
+//! against its IPC socket, mine blocks and verify at least one
+//! `NewTemplate` + `SetNewPrevHash` update arrives on the outbound broadcast.
 //!
 //! Skipped (with a printed warning) when `bitcoin-node` is not installed
 //! at the host's default location or via `BITCOIN_NODE_PATH`.
@@ -49,8 +49,8 @@ async fn tdp_emits_new_template_after_block() {
         .expect("mine 1 more to force new template");
     assert_eq!(new_tip, 102, "tip should advance to 102");
 
-    // Drain updates until we see both NewTemplate and SetNewPrevHash, or
-    // hit a 20 s budget.
+    // Drain updates until both NewTemplate and SetNewPrevHash arrived, or
+    // a 20 s budget runs out.
     let mut saw_new_template = false;
     let mut saw_set_new_prev_hash = false;
     let _ = tokio::time::timeout(Duration::from_secs(20), async {
@@ -89,10 +89,9 @@ async fn tdp_emits_new_template_after_block() {
 
     // The snapshot tap (a separate broadcast subscriber) must have stamped
     // `last_update_at` once it absorbed the same template/prev-hash pair.
-    // This is what `/api/health` reads for TDP staleness — verify it gets
-    // populated against real bitcoin-core, not just by the unit test of the
-    // staleness decision. Poll briefly: the tap is a distinct subscriber so
-    // it may lag our drain loop by a scheduler tick.
+    // This is what `/api/health` reads for TDP staleness, so it must get
+    // populated against real bitcoin-core. Poll briefly: the tap is a
+    // distinct subscriber and may lag the drain loop by a scheduler tick.
     let stamped = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if tdp.current_snapshot().last_update_at.is_some() {

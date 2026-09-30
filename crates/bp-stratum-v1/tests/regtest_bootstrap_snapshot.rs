@@ -1,31 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Regression test: SV1 translator must bootstrap from the
+//! Regtest: the SV1 translator bootstraps from
 //! [`bp_template_distribution::TdpHandle::current_snapshot`] when its
-//! broadcast subscription installed AFTER bitcoin-core's startup
+//! broadcast subscription is installed AFTER bitcoin-core's startup
 //! `NewTemplate + SetNewPrevHash` pair was already emitted.
 //!
-//! `tokio::sync::broadcast` does not replay messages to subscribers
-//! that attach after the corresponding `send` — so production's
-//! `spawn_tdp() → … boot init … → tdp.subscribe()` sequence drops the
-//! startup pair on the floor. The TdpHandle has an internal tap that
-//! subscribes BEFORE the worker thread starts, capturing the pair
-//! into [`TemplateSnapshot`]; the SV1 translator's `spawn` now takes
-//! that snapshot and replays it through the assembler so
-//! `current_template` is populated immediately — without waiting for
-//! another on-chain block.
+//! `tokio::sync::broadcast` does not replay messages to late
+//! subscribers, and the production boot subscribes after `spawn_tdp()`.
+//! The TdpHandle's internal tap subscribes BEFORE the worker thread
+//! starts and captures the pair into [`TemplateSnapshot`]; the SV1
+//! translator's `spawn` replays that snapshot through the assembler so
+//! `current_template` is populated without waiting for another block.
 //!
-//! This test simulates the production race: spawn TDP, sleep long
-//! enough for the worker thread to deliver the bootstrap pair to
-//! `bridge_out`, THEN subscribe + snapshot, THEN spawn the SV1
-//! server. Assert that `current_template()` is `Some` shortly after
-//! — proving the snapshot path kicked in (no on-chain block needed).
-//!
-//! Without the snapshot path the test fails: `current_template`
-//! stays `None` (no further TDP traffic until a real block, and on
-//! regtest with `min_interval = 1` second the mempool monitor only
-//! emits `NewTemplate(future=false)`, which alone never produces a
-//! pairing in the assembler).
+//! The test reproduces that ordering (spawn TDP, wait for the bootstrap
+//! pair, THEN subscribe + snapshot + spawn the server) and asserts
+//! `current_template()` becomes `Some` with no on-chain block. Without
+//! the replay it stays `None`: on regtest the mempool monitor only emits
+//! `NewTemplate(future=false)`, which alone never pairs in the assembler.
 //!
 //! Skipped (with a printed warning) when `bitcoin-node` is not
 //! installed at the host's default location or via `BITCOIN_NODE_PATH`.

@@ -28,7 +28,7 @@ use super::device_gate::{DeviceAggregate, DeviceNotice, DevicePartial};
 
 // Canonical stored `subscriptionType` values (lowercase, as written by
 // the `/api/push/*` register endpoints). Comparisons below are
-// case-insensitive so any historical casing still routes.
+// case-insensitive so a row stored in any casing still routes.
 const PUSH_TYPE_UNIFIED: &str = "unified_push";
 const PUSH_TYPE_FCM: &str = "fcm";
 
@@ -284,9 +284,9 @@ impl NotificationDispatcher {
 
         // The two push transports do NOT share a payload: FCM turns
         // `tag` into `data.status` and merges `extras`, while UnifiedPush
-        // flattens to `title|body|tag`. The single-event path builds them
-        // separately for exactly that reason, so the aggregate does too —
-        // one payload for both would change the UnifiedPush wire shape.
+        // flattens to `title|body|tag`. One payload for both would change
+        // the UnifiedPush wire shape, so each is built separately, as in
+        // the single-event path.
         let fcm_dev: Vec<_> = push_subs
             .iter()
             .filter(|s| {
@@ -436,7 +436,7 @@ struct PushHandles {
 
 type TaskFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
-// ── Send-funkctions per (transport, event-kind) ─────────────────────
+// ── Send functions per (transport, event-kind) ──────────────────────
 //
 // Each one resolves to `Future<Output = ()>` so the dispatcher can
 // `join_all` them. Errors are logged and absorbed — failed subscribers

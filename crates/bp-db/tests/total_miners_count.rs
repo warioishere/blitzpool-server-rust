@@ -4,8 +4,7 @@
 
 //! Verifies that the `totalMiners` COUNT query includes soft-deleted
 //! client rows. The `/api/pool` response must count all clients, not
-//! only active sessions — matching the behaviour of getUserAgents()
-//! in the original service, which has no deletedAt filter.
+//! only active sessions, so the query carries no deletedAt filter.
 
 use bp_db::{upsert_client, ClientUpsert};
 use sqlx::{postgres::PgPoolOptions, PgPool};

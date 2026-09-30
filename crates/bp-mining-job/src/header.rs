@@ -21,12 +21,11 @@
 /// reach has it, so 4 is the operative floor.
 ///
 /// ⚠️ **This is a property of the resulting version, not of which bits a
-/// miner rolled.** Measured against core v31 with a template version of
-/// `0x20000000`: rolling bit 29 lands on `0x00000000` (rejected), bit 31 on
-/// `0xA0000000` (rejected, negative as `i32`), bit 30 on `0x60000000`
-/// (**accepted**). Against a template of `0x30000000` the same bit 29 gives
-/// `0x10000000` and is accepted. No function of the rolled delta alone can
-/// tell those apart.
+/// miner rolled.** From a template version of `0x20000000`, rolling bit 29
+/// gives `0x00000000` (rejected), bit 31 `0xA0000000` (rejected, negative as
+/// `i32`), bit 30 `0x60000000` (accepted); from `0x30000000` the same bit 29
+/// gives `0x10000000` (accepted). The rolled delta alone cannot tell those
+/// apart.
 pub const MIN_CONSENSUS_BLOCK_VERSION: i32 = 4;
 
 /// Whether a block carrying this header version can be submitted at all.
@@ -49,12 +48,9 @@ pub fn version_meets_consensus_floor(version: u32) -> bool {
 /// | 76..80 | nonce        | UInt32LE  |
 ///
 /// ⚠️ **`version` is used verbatim — no version-rolling arithmetic happens
-/// here, deliberately.** This function used to take a `version_mask` and
-/// XOR it in, which is not what BIP-310 specifies
-/// (`nVersion = (job_version & ~mask) | (version_bits & mask)`) and agreed
-/// with it only while the job version set no bit inside the mask.
-///
-/// The two protocols reach a finished version differently and neither
+/// here, deliberately.** BIP-310 specifies
+/// `nVersion = (job_version & ~mask) | (version_bits & mask)`, not an XOR,
+/// and the two protocols reach a finished version differently, so neither
 /// needs a mask here:
 ///
 /// - **SV1** submits `version_bits`, a masked subset, so
@@ -63,8 +59,8 @@ pub fn version_meets_consensus_floor(version: u32) -> bool {
 /// - **SV2** submits the *full* nVersion (spec: `SubmitSharesStandard.version`
 ///   is the "Full nVersion field"), so there is nothing to reconstruct.
 ///
-/// Keeping a mask parameter would let either caller reintroduce XOR
-/// semantics silently. There is nothing to pass, so there is no parameter.
+/// A mask parameter would invite XOR semantics back in silently; there is
+/// nothing to pass, so there is no parameter.
 pub fn build_block_header(
     version: i32,
     prev_hash: &[u8; 32],
@@ -88,9 +84,8 @@ pub fn build_block_header(
 ///
 /// Exact: `n_bits` decodes through `bitcoin::Target::from_compact`, the
 /// consensus decoding, and the hash is compared as a little-endian U256, so
-/// the verdict is the one bitcoin-core will reach. The difficulty-vs-difficulty
-/// comparison it replaces went through `f64` and called a hash just above the
-/// target a block.
+/// the verdict is the one bitcoin-core will reach. A difficulty comparison in
+/// `f64` would call a hash just above the target a block.
 ///
 /// `hash_le` is the header's sha256d as it comes out of the hasher (internal,
 /// little-endian order). Reversing it to display order does not bring the
@@ -106,8 +101,7 @@ mod tests {
     use super::*;
 
     /// The boundary is inclusive and exact: the target itself is a block,
-    /// one above it is not. The `f64` gate this replaces called
-    /// `target + 1` a block on every `n_bits` tried.
+    /// one above it is not, for every `n_bits` tried.
     #[test]
     fn the_network_target_boundary_is_exact() {
         for n_bits in [0x1d00_ffff_u32, 0x1703_4e33, 0x207f_ffff] {

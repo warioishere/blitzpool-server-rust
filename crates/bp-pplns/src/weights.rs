@@ -2,43 +2,28 @@
 
 //! Weight-native payout distribution (SV2 ext 0x0003).
 //!
-//! The distribution is the pool's payout state expressed the way the
-//! extension speaks it (§3.1): relative integer weights per output plus
-//! per-output dust limits, with every concrete satoshi amount derived
-//! later as `floor(weight·T/W)` (§4) — by the pool for its own
-//! templates, by a JDC for its declared jobs, and by the validator.
+//! The distribution is the pool's payout state in the extension's terms
+//! (§3.1): relative integer weights per output plus per-output dust limits.
+//! Every satoshi amount is derived later as `floor(weight·T/W)` (§4), by the
+//! pool, by a JDC and by the validator alike.
 //!
-//! Exactly ONE satoshi-denominated quantity is left in the pool's
-//! ledger that cannot be a weight by nature: a **balance repayment** —
-//! a signed sats debt, projected into weight space at build time
-//! against the current reference revenue, and self-correcting at
-//! settlement (which books `earned(T_actual) − actually_paid` from the
-//! raw inputs, not from that projection).
+//! The only satoshi quantity in the ledger is a **balance repayment**: a
+//! signed debt, projected into weight space against the reference revenue at
+//! build time and booked exactly at settlement from the raw inputs. The
+//! Group-Solo finder bonus is a proportion (`b = S·f/(1−f)` on the finder's
+//! score weight), so it is exact at every revenue and has no entry in `X`.
 //!
-//! The Group-Solo finder bonus used to be the second. It is a
-//! PROPORTION now (`b = S·f/(1−f)` on the finder's score weight), so it
-//! is exact at every revenue and has nothing to project, nothing to cap
-//! for solvency, and no entry in `X`.
+//! A repayment comes out of the pot it is paid from, so the score split runs
+//! over `pot(T) − X` on both sides: the published weights and the settlement
+//! claims. One shared [`bp_share::project_extras`] resolves `X` for both;
+//! two sides splitting two different pots would mint money.
 //!
-//! A repayment comes out of the same pot it is paid from, so the score split
-//! runs over `pot(T) − X` (with `X` the signed sum of all of them) on
-//! BOTH sides — the published weights and the settlement claims. One
-//! shared [`bp_share::project_extras`] resolves `X` for both, because
-//! two sides splitting two different pots is how a ledger mints money.
-//!
-//! The pool gets its fee and not one satoshi more. `weight_P` is the
-//! fee over the PUBLISHED weights and nothing else, because §4 makes
-//! the pool output the residual (`pay_P = T − Σpay`): anything routed
-//! through `weight_P` is cash the pool keeps, and every satoshi it
-//! keeps on a miner's behalf is one the other miners repay out of a
-//! later block's cut. So the two things this build withholds — an
-//! entry below the operational `min_payout`, and an entry the coinbase
-//! blockspace budget has no room for — are withheld by dropping them
-//! from the published set, never by moving their weight to the pool.
-//! The §4 split then hands their share to the miners who ARE published,
-//! the withheld entry settles its claim as credit, and the published
-//! miners carry the matching debt: `Σ deltas = 0` and the ledger is
-//! pool-neutral. The wire `dust_limit` is therefore the consensus
+//! The pool takes its fee and nothing more. `weight_P` is the fee over the
+//! published weights only, because §4 pays the pool output the residual
+//! (`pay_P = T − Σpay`). Under PPLNS an entry below `min_payout` or without
+//! blockspace is withheld by dropping it from the published set, never by
+//! moving its weight to the pool: the published miners carry the matching
+//! debt and `Σ deltas = 0`. The wire `dust_limit` is therefore the consensus
 //! floor ([`DUST_LIMIT_SATS`]), not the pool's operational threshold.
 
 use std::collections::HashMap;
@@ -54,32 +39,30 @@ use crate::weight::{
 use crate::BudgetTelemetry;
 
 /// Integer score precision: share fractions are projected onto this
-/// many parts. 10^12 keeps every miner above a 10^-12 pool fraction
-/// exactly representable — below that a whole block pays < 0.001 sat,
-/// genuinely nothing to account — while `Σ weights · T` stays far
+/// many parts. 10^12 represents every miner above a 10^-12 pool fraction
+/// (below that a block pays < 0.001 sat) while `Σ weights · T` stays far
 /// inside u128 (§4's 128-bit intermediate bound).
 pub const SCORE_PRECISION: u64 = 1_000_000_000_000;
 
 /// One address in the distribution.
 ///
-/// `score_weight` and `balance_sats` are the SETTLEMENT INPUTS — the
+/// `score_weight` and `balance_sats` are the settlement inputs: the
 /// snapshot stores them and `earned(T_actual)` is recomputed from them
-/// when a block is booked. `wire_weight` is the PUBLISHED weight
-/// (score + the projected balance boost); `0` means the address has
-/// no coinbase output this distribution (below `min_payout`, folded by
-/// the blockspace cut, zero score with no positive balance, or a debt
-/// that swallowed the score) but still settles.
+/// when a block is booked. `wire_weight` is the published weight
+/// (score + projected balance boost); `0` means no coinbase output this
+/// distribution (below `min_payout`, cut for blockspace, zero score with
+/// no positive balance, or a debt that swallowed the score), but the
+/// address still settles.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WeightEntry {
     pub address: AddressId,
     pub score_weight: u64,
     pub balance_sats: i64,
     pub wire_weight: u64,
-    /// §3.1 per-output dust limit: the CONSENSUS floor
-    /// ([`DUST_LIMIT_SATS`]), the same for every entry. The pool's
-    /// `min_payout` is not this field — it decides whether an entry is
-    /// published at all (see the module docs), because a §4 prune pays
-    /// the withheld value to the pool rather than to the other miners.
+    /// §3.1 per-output dust limit: the consensus floor
+    /// ([`DUST_LIMIT_SATS`]) for every entry. The pool's `min_payout`
+    /// decides whether an entry is published at all instead, because a
+    /// §4 prune would pay the pruned value to the pool output.
     pub dust_limit: u32,
 }
 
@@ -94,9 +77,8 @@ pub struct WeightDistribution {
     /// address (this one moves with the reference revenue).
     pub entries: Vec<WeightEntry>,
     /// `weight_P` (§3.1): the pool output's weight. Always carries the
-    /// fee, never a repayment (that moves between miners, since it is
-    /// the other miners the debt is owed to). Whether it also carries
-    /// what this build WITHHELD depends on
+    /// fee, never a repayment (a debt is owed to the other miners).
+    /// Whether it also carries what this build withheld depends on
     /// [`WeightDistributionInput::withheld_value`]. Always ≥ 1 (the §4
     /// residual needs a live pool output).
     pub weight_p: u64,
@@ -108,12 +90,11 @@ pub struct WeightDistribution {
     pub reference_revenue_sats: u64,
     /// `S = Σ score_weight` — denominator of every settlement claim.
     pub score_total: u64,
-    /// `X` — the satoshi promises (ledger balances; the finder bonus is
-    /// a proportion and is NOT in here) this distribution pays on top of
-    /// the score split, after solvency capping. The
-    /// score share is taken over `pot(T) − X`, never over the whole
-    /// pot, both here and at settlement. Not part of the fingerprint:
-    /// settlement recomputes it from the stored inputs.
+    /// `X`: the satoshi promises (ledger balances; not the finder bonus,
+    /// which is a proportion) paid on top of the score split, after
+    /// solvency capping. The score share is taken over `pot(T) − X`, here
+    /// and at settlement. Not part of the fingerprint: settlement
+    /// recomputes it from the stored inputs.
     pub extras_total: i64,
     /// Settlement identity (see `bp_share::weights_fingerprint_from_parts`).
     pub fingerprint: [u8; 32],
@@ -242,44 +223,31 @@ pub enum WeightBuildError {
     #[error("reference revenue is zero")]
     ZeroReferenceRevenue,
     /// The configured pool-output recipient is not a usable payout
-    /// address. Fail here rather than publish a distribution whose pool
-    /// output cannot be scripted: `pay_P` is structural (§4), so the
-    /// failure would otherwise surface as an aborted coinbase build,
-    /// taking down jobs for every miner on the pool instead of one
-    /// output.
+    /// address. `pay_P` is structural (§4), so this fails the build
+    /// rather than the coinbase assembly, which would stop jobs for every
+    /// miner instead of one output.
     #[error("fee address is not a valid payout address: {0}")]
     InvalidFeeAddress(String),
-    /// `Σ score_weight == 0` — not one address holds a share of this
-    /// window/round, so there is no proportion to split the block by.
+    /// `Σ score_weight == 0`: nobody holds a share of this window/round,
+    /// so there is no proportion to split the block by.
     ///
-    /// This is refused rather than answered, because the answer the
-    /// weight model would otherwise give is the worst one available.
-    /// With nothing scored nothing is published, `pool_weight_for`
-    /// floors `weight_P` at 1, and §4 makes the pool output the residual
-    /// — so `payout_entries_at` yields a SINGLE output paying the whole
-    /// block to `fee_address`. That list is not empty, so
-    /// `ResolvedPayouts::is_none()` is false and a job goes out on it;
-    /// settlement then books nothing (every claim is 0 at
-    /// `score_total == 0`) while the coinbase has already paid the pool
-    /// 100 %. It is the same outcome
-    /// [`crate::weight::MIN_COINBASE_WEIGHT_BUDGET`] exists to make
-    /// unreachable — "not a degraded pool, a pool that keeps the
-    /// miners' money" — reached from the other side.
+    /// Refused because the alternative pays the whole block to
+    /// `fee_address`: nothing is published, `weight_P` floors at 1 and §4
+    /// makes the pool output the residual, while settlement books nothing
+    /// (every claim is 0). The same outcome
+    /// [`crate::weight::MIN_COINBASE_WEIGHT_BUDGET`] rules out.
     ///
-    /// Deliberately NOT the same condition as "nothing published".
-    /// A 100 % fee and a `min_payout` above the whole block both publish
-    /// nothing too, and for both that IS the intended coinbase; they
-    /// keep `score_total > 0` and are unaffected. This fires only when
-    /// the share source itself is empty — a brand-new Group-Solo group,
-    /// a group whose members reconnect after a calendar reset, or a
-    /// fresh PPLNS window.
+    /// Not the same condition as "nothing published": a 100 % fee or a
+    /// `min_payout` above the whole block publish nothing on purpose and
+    /// keep `score_total > 0`. This fires only for an empty share source
+    /// (a new Group-Solo group, a group after a calendar reset, a fresh
+    /// PPLNS window).
     ///
-    /// A caller that knows which miner is asking should retry with that
-    /// miner as the sole claimant (see
-    /// `bp_coinbase_snapshot::BuildRequest::bootstrap_claimant`): with
-    /// nobody scored, nobody is robbed by paying the one miner who is
-    /// actually working. A caller that does not know (the pool-wide JDP
-    /// publisher) must publish nothing.
+    /// A caller that knows which miner is asking retries with that miner
+    /// as the sole claimant (see
+    /// `bp_coinbase_snapshot::BuildRequest::bootstrap_claimant`); with
+    /// nobody scored, nobody else is owed anything. A caller that does
+    /// not know (the pool-wide JDP publisher) publishes nothing.
     #[error("no address holds a share — nothing to split the block by")]
     NoScoredMiners,
 }
@@ -327,11 +295,9 @@ pub fn build_weight_distribution(
     }
     let t_ref = input.reference_revenue_sats;
 
-    // The pool's operational threshold, in satoshis — a build-time
-    // decision about who gets an output, so it is NOT narrowed to the
-    // u32 of the wire `dust_limit` field. Narrowing was where a
-    // min_payout entered in the wrong unit could wrap below the very
-    // floor the `.max()` guarantees (2^32 sats truncating to 0).
+    // The pool's operational threshold in satoshis. Kept as u64, not
+    // narrowed to the u32 wire `dust_limit`, so an oversized min_payout
+    // cannot wrap below the floor the `.max()` guarantees.
     let min_payout: u64 = input
         .min_payout_sats
         .map(|s| s.0.max(DUST_LIMIT_SATS as i64) as u64)
@@ -344,19 +310,12 @@ pub fn build_weight_distribution(
     // u_i = round(share_i / Σshares · SCORE_PRECISION). Scale-invariant
     // in the window's own units; miners below 1/SCORE_PRECISION of the
     // pool project to 0 and settle (to 0) without an output.
-    // Summed in ADDRESS order, not `HashMap` order: f64 addition is not
-    // associative and every map instance iterates differently, so a
-    // HashMap-order sum makes the total — and with it a rounded score,
-    // and with it the fingerprint — depend on which map object happened
-    // to carry the shares. Unchanged pool state would then mint a new
-    // settlement identity and age the live distribution out of the
-    // acceptance window.
-    // The fee address is NEVER a miner entry. It already receives the
-    // pool output via `weight_P`, and settlement refuses to book a row
-    // for it (its payment is inseparable from the pool output). Paying
-    // it a second, miner-shaped output would hand out satoshis nothing
-    // ever debits — a balance on that address would be paid out again
-    // on every single block, forever.
+    // Summed in address order, not `HashMap` order: f64 addition is not
+    // associative, so a map-order sum would let identical pool state
+    // produce different scores and a new settlement fingerprint.
+    // The fee address is never a miner entry: it is paid via `weight_P`
+    // and settlement books no row for it, so a miner-shaped output to it
+    // would pay satoshis that nothing debits.
     let is_fee = |a: &AddressId| a.as_str() == input.fee_address.as_str();
 
     let mut scored: Vec<(&AddressId, f64)> = input
@@ -374,10 +333,8 @@ pub fn build_weight_distribution(
         address: AddressId,
         score_weight: u64,
         balance_sats: i64,
-        /// What this block owes AND pays the address: its score share
-        /// of what the promises leave, plus its own promise. The only
-        /// weight ever withheld from a miner is the one the blockspace
-        /// cut folds away — see `weight_p` below.
+        /// What this block pays the address: its score share of what the
+        /// promises leave, plus its own promise.
         wire_weight: u64,
     }
     let mut candidates: HashMap<&AddressId, Candidate> = HashMap::new();
@@ -409,16 +366,11 @@ pub fn build_weight_distribution(
     }
 
     let score_total: u64 = candidates.values().map(|c| c.score_weight).sum();
-    // Nobody holds a share, so there is no proportion to split by — and
-    // the distribution this would otherwise produce pays the whole block
-    // to the pool output. Refuse it; see
-    // [`WeightBuildError::NoScoredMiners`] for why this is checked on the
-    // SCORE total and not on "did anything get published".
-    //
-    // Checked before the finder bonus on purpose: the bonus is
-    // `S·f/(1−f)` and is applied only `if score_total > 0`, so it can
-    // never lift a zero total. Reading it here keeps the one condition in
-    // one place instead of leaving a second, equivalent one behind it.
+    // Nobody holds a share: refuse rather than pay the whole block to the
+    // pool output. See `WeightBuildError::NoScoredMiners` for why this is
+    // the score total and not "nothing published". The finder bonus
+    // (`S·f/(1−f)`) cannot lift a zero total, so checking before it is
+    // equivalent.
     if score_total == 0 {
         return Err(WeightBuildError::NoScoredMiners);
     }
@@ -426,28 +378,20 @@ pub fn build_weight_distribution(
 
     // ── Finder bonus ────────────────────────────────────────────────
     //
-    // A PROPORTION of the miner cut, never a fixed satoshi amount.
-    //
-    // §4 pays every weight `w·T/W`, so a weight IS a proportion of the
-    // block. Expressing a fixed sats bonus as one means projecting it
-    // against a chosen revenue — and then any party paying at a
-    // different revenue (a job-declaring client uses its OWN template)
-    // delivers a different bonus, which only a signed ledger could
-    // correct afterwards. A proportion has nothing to correct: it is
-    // exact at every revenue, for every payer.
+    // A proportion of the miner cut, never a fixed satoshi amount: §4
+    // pays every weight `w·T/W`, so a proportion is exact at every
+    // revenue, including a job-declaring client's own template, while a
+    // fixed amount would need a ledger to correct the difference.
     //
     // Solving `(u_f + b)/(S + b) = f + (1−f)·u_f/S` for the weight that
-    // actually delivers the fraction `f` on top of the score split:
+    // delivers the fraction `f` on top of the score split:
     //
     //     b = S · f / (1 − f)
     //
-    // — the same closed form [`pool_weight_for`] uses for the fee, and
-    // for the same reason: a share has to survive its own dilution.
-    //
-    // It lands on the SCORE weight, not the wire weight, so it is part
-    // of the settlement claim by construction — no `+ bonus` term at
-    // settlement, no entry in `extras`, no reference revenue, no
-    // solvency cap. The finder simply counts as if they had mined more.
+    // the same closed form `pool_weight_for` uses for the fee, because a
+    // share has to survive its own dilution. It lands on the SCORE weight,
+    // so it is part of the settlement claim by construction: no extra
+    // term at settlement, no entry in `extras`, no solvency cap.
     let bonus_ppm = input.finder_bonus_ppm.min(MAX_FINDER_BONUS_PPM);
     if bonus_ppm > 0 && score_total > 0 {
         if let Some(finder) = input.finder_address {
@@ -477,18 +421,16 @@ pub fn build_weight_distribution(
 
     // ── Sats → weight projection ────────────────────────────────────
     //
-    // Two quantities here are denominated in satoshis rather than in
-    // shares: a miner's ledger balance and the finder bonus. Both are
-    // promises to pay a FIXED amount on top of the score split, and the
-    // weight model has exactly one way to say that — a boost on that
+    // A ledger balance is a promise to pay a fixed amount on top of the
+    // score split; the weight model expresses it as a boost on that
     // entry's weight.
     //
-    // The scale is NOT `sats · S / pot`, because a boost lands in the
+    // The scale is not `sats · S / pot`, because a boost lands in the
     // denominator as well: with `e_i = u_i + boost_i` and
     // `E = Σ e_i = S + Σ boost`, each entry is paid `e_i · pot / E`, so
     // raising one entry dilutes every entry including itself. Solving
-    // for the boost that actually delivers `extra_i` on top of the
-    // score split gives
+    // for the boost that delivers `extra_i` on top of the score split
+    // gives
     //
     //     boost_i = extra_i · S / (pot(t_ref) − X),   X = Σ extra_i
     //
@@ -496,12 +438,10 @@ pub fn build_weight_distribution(
     //
     //     paid_i = e_i · pot / E = (u_i/S)·(pot − X) + extra_i
     //
-    // — the score share of what is LEFT after the promises, plus this
-    // entry's own promise. Signs carry through unchanged, so a debt
-    // shrinks the payout by exactly what is owed, and the settlement
-    // claim (`bp_share::claim_sats`, same `X`) is the first term alone.
-    // Scaling by `S/pot` instead delivers only `extra_i · (1 − u_i/S)`
-    // — for a 50 % miner, half of what was promised.
+    // the score share of what is left after the promises, plus this
+    // entry's own promise. Signs carry through, so a debt shrinks the
+    // payout by exactly what is owed, and the settlement claim
+    // (`bp_share::claim_sats`, same `X`) is the first term alone.
     let extras = bp_share::extras_from_ledger(
         entries
             .iter()
@@ -529,15 +469,14 @@ pub fn build_weight_distribution(
 
     // ── Operational payout threshold ────────────────────────────────
     //
-    // `min_payout` decides who is PUBLISHED; it is deliberately not the
-    // §3.1 `dust_limit` it used to be. A dust limit makes the JDC (and
-    // our own §4 build) prune the output *after* the split is fixed,
-    // which is a different decision with a different recipient — see
-    // [`WithheldValue`] for where the value goes in each mode.
+    // `min_payout` decides who is published; it is not the §3.1
+    // `dust_limit`, which makes every §4 evaluator prune an output after
+    // the split is fixed and so sends the value to the pool output. See
+    // `WithheldValue` for where the value goes in each mode.
     //
-    // Smallest first, in both modes: what an entry is paid is
-    // monotonic in its wire weight, so the first entry that clears the
-    // threshold clears it for every larger one behind it.
+    // Smallest first: an entry's payout is monotonic in its wire weight,
+    // so the first entry that clears the threshold clears it for every
+    // larger one behind it.
     let full_total: u128 = entries.iter().map(|c| c.wire_weight as u128).sum();
     let mut published_total = full_total;
     for c in entries.iter_mut().rev() {
@@ -545,16 +484,11 @@ pub fn build_weight_distribution(
             continue;
         }
         // The denominator this entry's payout is measured against.
-        //
-        // `ToOtherMiners` shrinks it as entries drop: `W` follows the
-        // published set, so withholding one entry raises what every
-        // remaining one is paid.
-        //
-        // `ToPool` holds it at the full total: withheld weight stays in
-        // `W` (it is added to `weight_P` below), so what a published
-        // entry is paid does not move when another drops out. Measuring
-        // against the shrinking total here would withhold a miner whose
-        // real payout clears the threshold.
+        // `ToOtherMiners`: `W` follows the published set, so withholding
+        // one entry raises what every remaining one is paid.
+        // `ToPool`: withheld weight stays in `W` (added to `weight_P`
+        // below), so a published entry's payout does not move when
+        // another drops out; the shrinking total would understate it.
         let basis = match input.withheld_value {
             WithheldValue::ToOtherMiners => published_total,
             WithheldValue::ToPool => full_total,
@@ -568,8 +502,8 @@ pub fn build_weight_distribution(
 
     // ── Blockspace cut ──────────────────────────────────────────────
     // Greedy keep in published order while the real serialized weight
-    // fits the budget; folded entries move their wire weight into
-    // weight_P and settle off-chain (§3.1).
+    // fits the budget; trimmed entries leave the published set and settle
+    // off-chain (§3.1). Where their value goes is decided at `weight_p`.
     let budget = if input.coinbase_weight_budget == 0 {
         DEFAULT_COINBASE_WEIGHT_BUDGET
     } else {
@@ -597,30 +531,24 @@ pub fn build_weight_distribution(
 
     // ── Pool weight ─────────────────────────────────────────────────
     //
-    // In both modes this carries the FEE: `W = P + weight_P` resolves
-    // to `P/(1 − f)`, so the §4 residual pays the pool exactly `f·T` —
-    // however large the credits being repaid are. A repayment is a
-    // movement WITHIN the miners' cut, never a discount or a premium on
-    // the pool's fee.
+    // In both modes this carries the fee: `W = P + weight_P` resolves to
+    // `P/(1 − f)`, so the §4 residual pays the pool exactly `f·T` however
+    // large the credits being repaid are. A repayment moves value within
+    // the miners' cut, never into or out of the pool's fee.
     //
-    // Whether the WITHHELD weight is added on top is the whole
-    // difference between the two modes.
+    // Whether the withheld weight is added on top is the difference
+    // between the two modes.
     //
-    // `ToOtherMiners` leaves it out. §4 pays the pool output whatever
-    // the miner outputs leave, so weight parked in `weight_P` would be
-    // cash the pool keeps against a claim it still owes — and that claim
-    // comes back out of the miners' cut on a later block, so the other
-    // miners would fund it while the pool kept the money. Left out
-    // instead, the withheld entry's share spreads over the published
-    // miners now, and settlement books that overpayment as the matching
-    // debt.
+    // `ToOtherMiners` leaves it out: weight in `weight_P` would be cash
+    // the pool keeps against a claim the other miners later repay. The
+    // withheld share spreads over the published miners instead, and
+    // settlement books that overpayment as the matching debt.
     //
-    // `ToPool` adds it, plus takes the fee over the FULL total rather
-    // than the published one. Together those give `W = P_all/(1−f)`, so
-    // every published miner is paid `w_i·(1−f)·T/P_all` — exactly what
-    // they would have been paid had nobody dropped out — and the whole
-    // withheld share falls into the §4 residual. Nobody is over- or
-    // underpaid, so there is nothing for a ledger to remember.
+    // `ToPool` adds it and takes the fee over the full total. That gives
+    // `W = P_all/(1−f)`, so every published miner is paid exactly what
+    // they would have been paid had nobody dropped out, and the withheld
+    // share falls into the §4 residual. Nobody is over- or underpaid, so
+    // there is nothing for a ledger to remember.
     let published_total: u128 = entries.iter().map(|c| c.wire_weight as u128).sum();
     let weight_p = match input.withheld_value {
         WithheldValue::ToOtherMiners => pool_weight_for(published_total, fee_ppm),
@@ -635,11 +563,10 @@ pub fn build_weight_distribution(
     // keeps the relative order of both groups).
     entries.sort_by_key(|c| c.wire_weight == 0);
 
-    // Hashed over an ADDRESS-ordered view, not the coinbase order above:
-    // that order sorts by wire weight, and wire weights carry `t_ref`
-    // through the balance boosts. Hashing it would smuggle the reference
-    // revenue back into an identity that exists precisely so builds at
-    // different revenues can share one settlement snapshot.
+    // Hashed over an address-ordered view, not the coinbase order: that
+    // order follows wire weights, which carry `t_ref` through the balance
+    // boosts, and builds at different revenues must share one settlement
+    // identity.
     let mut identity: Vec<&Candidate> = entries.iter().collect();
     identity.sort_by(|a, b| a.address.as_str().cmp(b.address.as_str()));
     let fingerprint = weights_fingerprint_from_parts(
@@ -663,11 +590,10 @@ pub fn build_weight_distribution(
                 score_weight: c.score_weight,
                 balance_sats: c.balance_sats,
                 wire_weight: c.wire_weight,
-                // The consensus floor, not `min_payout`: the pool's own
-                // threshold was already applied by withholding above,
-                // and publishing it here would send the very value that
-                // withholding kept inside the miners' cut back into the
-                // §4 residual — i.e. into the pool output.
+                // The consensus floor, not `min_payout`: the threshold
+                // was applied by withholding above, and publishing it here
+                // would send withheld value into the §4 residual (the
+                // pool output).
                 dust_limit: DUST_LIMIT_SATS as u32,
             })
             .collect(),
@@ -734,15 +660,11 @@ mod tests {
     /// MONEY / Group-Solo's ledger-free invariant: `max_coinbase_outputs`
     /// is what `GroupService` refuses a join against, so it MUST equal what
     /// the blockspace cut can actually publish. One too many and a member is
-    /// admitted whose output the cut then folds away — and under
-    /// `WithheldValue::ToPool` their entire share goes to the pool, with no
-    /// ledger to remember it.
+    /// admitted whose output the cut drops, and under `WithheldValue::ToPool`
+    /// their share goes to the pool with no ledger to remember it.
     ///
-    /// Cross-checked against the builder rather than against the formula.
-    /// The test this replaces compared the old `has_fee_output` flag with
-    /// itself and so could not see that at `fee_percent = 0` the ceiling was
-    /// one too high — the pool output is structural under §4 and is emitted
-    /// at every fee.
+    /// Checked against the builder, not the formula, at 0 % fee too: the
+    /// pool output is structural under §4 and exists at every fee.
     #[test]
     fn the_member_ceiling_is_what_the_blockspace_cut_publishes() {
         for budget in [
@@ -753,9 +675,8 @@ mod tests {
             10_000,
         ] {
             let ceiling = crate::weight::max_coinbase_outputs(budget) as usize;
-            // A 0 % fee is the case the old flag got wrong; 1.5 % is the
-            // ordinary one. Both must land on the same ceiling, because the
-            // pool output exists either way.
+            // Both fees must land on the same ceiling, because the pool
+            // output exists either way.
             for fee_percent in [0.0, 1.5] {
                 let fee = addr(FEE);
                 // Exactly `ceiling` miners must ALL be published.
@@ -996,15 +917,10 @@ mod tests {
         ));
     }
 
-    /// A configured bonus can no longer swallow the block. As a
-    /// PROPORTION it is bounded by construction — the operator cannot
-    /// express "more than the pot" at all — and the ppm cap keeps even
-    /// a typo inside [`MAX_FINDER_BONUS_PPM`].
-    ///
-    /// The old fixed-sats form needed a 95 %-of-the-pot solvency cap for
-    /// exactly this: a bonus set before a halving, or against a low-fee
-    /// template, took nearly the whole coinbase and pruned every other
-    /// member to nothing. There is nothing left to cap.
+    /// A configured bonus cannot swallow the block. As a PROPORTION it is
+    /// bounded by construction (the operator cannot express "more than the
+    /// pot"), and the ppm cap keeps even a typo inside
+    /// [`MAX_FINDER_BONUS_PPM`].
     #[test]
     fn a_bonus_beyond_the_cap_is_clamped_and_leaves_the_others_paid() {
         let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
@@ -1039,14 +955,9 @@ mod tests {
         );
     }
 
-    /// The whole point of a proportional bonus: it is EXACT at every
-    /// revenue, so a job-declaring client paying from its own template
-    /// delivers the same bonus the pool would have.
-    ///
-    /// The fixed-sats form could not do this. It had to be projected
-    /// against one chosen revenue, and §4 then paid `bonus · T/t_ref` —
-    /// measured at 25 % over the reference, the finder was overpaid by a
-    /// quarter of the bonus and the ledger had to claw it back.
+    /// A proportional bonus is EXACT at every revenue, so a job-declaring
+    /// client paying from its own template delivers the same bonus the
+    /// pool would have.
     #[test]
     fn the_bonus_is_the_same_fraction_at_every_revenue() {
         let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0), (addr(A3), 1.0)]);
@@ -1078,8 +989,8 @@ mod tests {
     }
 
     /// A disabled bonus must leave the distribution byte-identical —
-    /// including the settlement identity, which no longer has a bonus
-    /// slot of its own.
+    /// including the settlement identity, which has no bonus slot of its
+    /// own.
     #[test]
     fn a_disabled_bonus_changes_nothing() {
         let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
@@ -1095,14 +1006,10 @@ mod tests {
         assert_eq!(d.fingerprint, plain.fingerprint);
     }
 
-    /// A min_payout beyond the 32-bit wire field must never wrap — an
-    /// operator entering sats where BTC was meant would otherwise turn
-    /// the threshold off entirely and pay out everything.
-    ///
-    /// The threshold now decides who is PUBLISHED rather than what the
-    /// wire `dust_limit` says, so that is where a wrap would show:
-    /// a min_payout above the whole block leaves nobody publishable,
-    /// while a wrapped one would happily pay the miner.
+    /// A min_payout beyond the 32-bit wire field must never wrap, or an
+    /// operator entering sats where BTC was meant would turn the threshold
+    /// off. The threshold decides who is PUBLISHED, so a min_payout above
+    /// the whole block leaves nobody publishable.
     #[test]
     fn oversized_min_payout_withholds_instead_of_wrapping() {
         let shares = HashMap::from([(addr(A1), 1.0)]);
@@ -1150,12 +1057,10 @@ mod tests {
         }
     }
 
-    /// A debt is a claim the OTHER miners hold, not the pool's income.
-    /// It exists because an earlier coinbase paid this miner out of
-    /// their share, so collecting it has to reach them — and it does,
-    /// through `X`: a negative `X` enlarges the pot every score is
-    /// measured against, by exactly what is being repaid. The pool
-    /// keeps its fee and not one satoshi more.
+    /// A debt is a claim the OTHER miners hold, not the pool's income, so
+    /// collecting it has to reach them. It does through `X`: a negative
+    /// `X` enlarges the pot every score is measured against by exactly
+    /// what is repaid. The pool keeps its fee and nothing more.
     #[test]
     fn debt_recovery_reaches_the_other_miners_not_the_pool() {
         let shares = HashMap::from([(addr(A1), 1.0), (addr(A2), 1.0)]);
@@ -1316,13 +1221,8 @@ mod tests {
     }
 
     /// The bonus settles flat at EVERY revenue, not just at the one it
-    /// was built against — that is what makes a job-declaring client
-    /// paying from its own template harmless.
-    ///
-    /// Under the fixed-sats form this test could only pass at
-    /// `T == t_ref`: the claim carried a fixed `+ bonus` while §4 paid
-    /// `bonus · T/t_ref`, so every other revenue left a delta the ledger
-    /// had to carry.
+    /// was built against, so a job-declaring client paying from its own
+    /// template is harmless.
     #[test]
     fn the_bonus_settles_flat_at_every_revenue() {
         const T_REF: u64 = 312_500_000;
@@ -1348,12 +1248,9 @@ mod tests {
         }
     }
 
-    /// The pool's books close on every block. Every satoshi it holds
-    /// back from a claim is a satoshi it owes, and every satoshi it
-    /// pays beyond one is a satoshi it is owed — so `Σ balances` after
-    /// an exactly-paying block is zero, whatever the promises were and
-    /// whatever revenue the block came in at. A projection and a claim
-    /// formula computed from two different `X` would leave a residue
+    /// The books close on every block: `Σ balances` after an exactly-paying
+    /// block is zero, whatever the promises and the revenue. A projection
+    /// and a claim computed from two different `X` would leave a residue
     /// here that grows block after block.
     #[test]
     fn the_ledger_closes_on_every_block() {
@@ -1376,10 +1273,10 @@ mod tests {
             ),
             ("bonus", HashMap::new(), 160_000, 312_500_000),
             (
-                // Revenue 20 % above the projection. The BONUS no longer
-                // moves anyone — it is a proportion — but the held credit
-                // still is a fixed sats promise, so members move for that
-                // alone and the books still close.
+                // Revenue 20 % above the projection. The bonus is a
+                // proportion and moves nobody; the held credit is a fixed
+                // sats promise, so members move for that alone and the
+                // books still close.
                 "bonus + credit + rich block",
                 HashMap::from([(addr(A2), Sats(4_000_000))]),
                 160_000,
@@ -1407,13 +1304,9 @@ mod tests {
         }
     }
 
-    /// A held BALANCE is still a fixed sats promise — the one thing the
-    /// weight model must still project — so `pot − X` still has to stay
-    /// positive and the solvency scale still has to fire.
-    ///
-    /// The bonus used to be the promise that gave way here. It is a
-    /// proportion now and cannot outgrow the block at all, so this only
-    /// exercises the ledger side.
+    /// A held BALANCE is a fixed sats promise, the one thing the weight
+    /// model projects, so `pot − X` has to stay positive and the solvency
+    /// scale has to fire.
     #[test]
     fn a_balance_beyond_the_block_is_scaled_to_a_payable_distribution() {
         const T: u64 = 312_500_000;
@@ -1447,18 +1340,13 @@ mod tests {
 
     // ── The pool is paid its fee, and only its fee ──────────────────
     //
-    // A miner too small to be worth an output is where that used to
-    // fail. Publishing `min_payout` as the §3.1 dust limit made §4
-    // prune the output, and `pay_P = T − Σpay` handed the pruned value
-    // to the POOL while settlement credited the miner — so the pool
-    // held the cash and the OTHER miners repaid the credit out of a
-    // later block's cut. A slow transfer from the miners to the pool.
-    //
-    // Withholding the entry at build time instead keeps that value
-    // inside the miners' cut: the §4 split gives it to the miners who
-    // are published, in proportion to their weights, and settlement
-    // books the overpayment as debt against the withheld miner's
-    // credit. The four tests below pin the four halves of that.
+    // A miner too small to be worth an output is withheld at build time,
+    // not pruned by a §3.1 dust limit: a §4 prune hands the value to the
+    // pool output (`pay_P = T − Σpay`) while settlement credits the miner,
+    // and the other miners would repay that credit. Withholding keeps the
+    // value inside the miners' cut: §4 gives it to the published miners
+    // and settlement books the overpayment as debt against the withheld
+    // miner's credit. The tests below pin each part of that.
 
     /// Shares that leave A3 just under the harness's 5 000-sat
     /// `min_payout` (~4 600 sats of a 312.5 M block), with A1 and A2 at
@@ -1479,9 +1367,8 @@ mod tests {
         (a3.score_weight as u128 * bp_share::miner_pot_sats(d.fee_ppm, t) as u128 / total) as i64
     }
 
-    /// The pool output is the fee. Not the fee plus a small miner's
-    /// payout — that satoshi is owed to a miner, and the pool holding
-    /// it while the ledger promises it away is how the transfer starts.
+    /// The pool output is the fee, not the fee plus a small miner's
+    /// payout: that satoshi is owed to a miner.
     #[test]
     fn a_withheld_miner_never_lands_in_the_pool_output() {
         const T: u64 = 312_500_000;
@@ -1650,18 +1537,14 @@ mod tests {
         );
     }
 
-    // ── The same four tests, for a pool that keeps the overflow ──────
+    // ── The same tests, for a pool that keeps the overflow ───────────
     //
     // Group-Solo makes the opposite choice: a member the coinbase cannot
-    // pay forfeits this block, and their share falls into the §4 residual
-    // — i.e. to the pool. Nobody is overpaid and nobody is owed, so there
-    // is nothing left for a ledger to remember between blocks, which is
-    // the entire reason Group-Solo can run without one.
-    //
-    // The property that has to hold for that claim to be true: the
-    // published members must be paid EXACTLY what they would have been
-    // paid had nobody dropped out. If withholding moved their payouts at
-    // all, the difference would be a debt again.
+    // pay forfeits this block, and their share falls into the §4 residual,
+    // i.e. to the pool. Nobody is overpaid or owed, which is why Group-Solo
+    // runs without a ledger. That holds only if the published members are
+    // paid EXACTLY what they would have been paid had nobody dropped out;
+    // any difference would be a debt again.
 
     fn pool_keeps_overflow<'a>(
         shares: &'a HashMap<AddressId, f64>,
@@ -1810,8 +1693,7 @@ mod tests {
         let w2 = d.entries.iter().find(|e| e.address.as_str() == A2).unwrap();
         // The scale is the SCORE space over what the promises leave of
         // the miner cut — the boost has to cover its own dilution, so
-        // the divisor is `pot − X`, not the pot and not `weight_p`
-        // (which also carries whatever the blockspace cut folded).
+        // the divisor is `pot − X`, not the pot and not `weight_p`.
         let boost = w1.wire_weight - w1.score_weight;
         let pot = bp_share::miner_pot_sats(d.fee_ppm, d.reference_revenue_sats) as u128;
         let expected =
@@ -1883,15 +1765,11 @@ mod tests {
     }
 
     /// The blockspace cut drops the smallest entries from the PUBLISHED
-    /// set — it does not move their weight into `weight_P`.
-    ///
-    /// Folding into `weight_P` used to be how a weight with no room in
-    /// the coinbase was accounted for, and it is exactly the leak: §4
-    /// pays `pay_P = T − Σpay`, so weight parked there is cash the pool
-    /// keeps while the ledger credits the folded miner — a credit the
-    /// other miners then repay out of a later block's cut. Kept inside
-    /// the miners' cut instead, the folded share goes to the miners who
-    /// still have an output, who carry the matching debt.
+    /// set; it does not move their weight into `weight_P`. §4 pays
+    /// `pay_P = T − Σpay`, so weight parked there would be cash the pool
+    /// keeps while the ledger credits the cut miner. Kept inside the
+    /// miners' cut, the share goes to the miners who still have an output,
+    /// who carry the matching debt.
     #[test]
     fn blockspace_cut_drops_from_the_published_set_not_into_weight_p() {
         let mut shares = HashMap::new();
@@ -1961,10 +1839,8 @@ mod tests {
     ///
     /// One weight unit below it the cut publishes nothing, and §4 makes
     /// the pool output the residual: the pool takes the entire block
-    /// while every miner books their full claim as credit against coins
-    /// it already holds. That state is what the floor exists to make
-    /// unreachable, and for a long time it did not — the floor was
-    /// `base + margin` = 528, half of what the cut reserves.
+    /// while every miner books their full claim as credit. The floor
+    /// exists to make that state unreachable.
     #[test]
     fn the_smallest_accepted_budget_still_publishes_a_worst_case_output() {
         use crate::weight::{validate_fee_payout_budget, MIN_COINBASE_WEIGHT_BUDGET};
@@ -2035,20 +1911,15 @@ mod tests {
 
     /// MONEY: an empty share source must be REFUSED, not answered.
     ///
-    /// This used to return a distribution with no entries, and that is
-    /// not a harmless empty answer — `pool_weight_for` floors `weight_P`
-    /// at 1 and §4 makes the pool output the residual, so
-    /// `payout_entries_at` yielded ONE output paying the entire block to
-    /// `fee_address`. Measured at T = 312 500 000: 312 500 000 sats to
-    /// the pool, 0 to everyone else, and settlement books nothing
-    /// because every claim is 0 at `score_total == 0`. The list is not
-    /// empty either, so `ResolvedPayouts::is_none()` was false and a job
-    /// went out on it.
+    /// A distribution with no entries is not a harmless empty answer:
+    /// `pool_weight_for` floors `weight_P` at 1 and §4 makes the pool
+    /// output the residual, so the whole block would go to `fee_address`
+    /// while settlement books nothing (every claim is 0 at
+    /// `score_total == 0`).
     ///
     /// Reachable without any fault: a brand-new Group-Solo group, a
-    /// group whose members reconnect after a calendar reset (the reset
-    /// DELs the round's by-address hash and Group-Solo's reader has no
-    /// bucket fallback), or a fresh PPLNS window.
+    /// group whose members reconnect after a calendar reset, or a fresh
+    /// PPLNS window.
     #[test]
     fn an_empty_share_source_is_refused_instead_of_paying_the_pool() {
         let shares = HashMap::new();
@@ -2062,13 +1933,9 @@ mod tests {
 
     /// The same refusal when the ledger has entries but the WINDOW is
     /// empty — a standing credit is not a share and cannot carry the
-    /// split.
-    ///
-    /// This is the case that made the old behaviour worst: the credit
-    /// holder was a candidate, so `entries` was non-empty and the build
-    /// looked healthy, but its boost is `extra · score_total / divisor`
-    /// = 0 at `score_total == 0`. Wire weight 0, no output, claim 0 —
-    /// the pool took the block AND the credit stayed on the ledger.
+    /// split: its boost is `extra · score_total / divisor` = 0 at
+    /// `score_total == 0`, so it would get no output and the pool would
+    /// take the block while the credit stays on the ledger.
     #[test]
     fn a_standing_credit_alone_does_not_carry_the_split() {
         let shares = HashMap::new();
@@ -2080,17 +1947,10 @@ mod tests {
         );
     }
 
-    /// The guard is on the SCORE total, not on "nothing published" — and
-    /// this is the difference that keeps it from switching off two
-    /// legitimate configurations.
-    ///
-    /// A 100 % fee and a `min_payout` above the whole block both publish
-    /// nothing, and for both the pool-only coinbase is the INTENDED
-    /// output. Both keep `score_total > 0`, so both must still build.
-    /// (`full_fee_publishes_nothing` and
-    /// `oversized_min_payout_withholds_instead_of_wrapping` pin their
-    /// payout shapes; this pins that the new refusal does not reach
-    /// them.)
+    /// The guard is on the SCORE total, not on "nothing published", so
+    /// it does not switch off two legitimate configurations: a 100 % fee
+    /// and a `min_payout` above the whole block both publish nothing on
+    /// purpose, keep `score_total > 0`, and must still build.
     #[test]
     fn withholding_on_purpose_is_not_an_empty_source() {
         let shares = HashMap::from([(addr(A1), 1.0)]);
@@ -2188,10 +2048,10 @@ mod tests {
         );
     }
 
-    /// The single-entry case above cannot reorder. With two miners whose
-    /// wire weights CROSS as the reference revenue moves, the coinbase
-    /// order flips — and the identity must not move with it, or every
-    /// rebuild against a fresh template mints a new snapshot.
+    /// With two miners whose wire weights CROSS as the reference revenue
+    /// moves, the coinbase order flips, and the identity must not move
+    /// with it, or every rebuild against a fresh template mints a new
+    /// snapshot.
     #[test]
     fn fingerprint_survives_a_boost_driven_reorder() {
         let shares = HashMap::from([(addr(A1), 51.0), (addr(A2), 49.0)]);

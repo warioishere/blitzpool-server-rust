@@ -15,7 +15,7 @@
 //!   4. A share on the current-tip job keeps working regardless.
 //!   5. Retired entries age out of the registry after retention — the
 //!      maps stay bounded across block changes instead of growing
-//!      monotonically (the memory leak this wiring fixes).
+//!      monotonically.
 //!
 //! Grace/retention are shortened (1.5s / 3s) so the test observes the
 //! transitions without production-scale waits.

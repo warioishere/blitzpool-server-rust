@@ -61,10 +61,9 @@ impl TelegramAdapter {
         Ok(Self { client, api_root })
     }
 
-    /// Plain-text `sendMessage`. We deliberately don't use Markdown /
-    /// HTML parse_mode on the notification path — every notification
-    /// renderer in `format::*` already produces plain text with emoji
-    /// (`📶`, `🏆`, `📴`) that Telegram displays without parsing.
+    /// Plain-text `sendMessage`, no Markdown / HTML parse_mode: every
+    /// renderer in `format::*` produces plain text with emoji that
+    /// Telegram displays without parsing.
     pub async fn send_text(&self, chat_id: i64, text: &str) -> AdapterResult<()> {
         #[derive(Serialize)]
         struct SendMessageBody<'a> {

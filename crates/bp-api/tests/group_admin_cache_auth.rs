@@ -3,9 +3,9 @@
 #![allow(clippy::print_stderr)]
 
 //! A Group-Solo admin read must check the token before its response cache.
-//! The cache key only says "admin"; a check inside the cached computation
-//! runs on a miss only, so once the real admin warmed the entry any token
-//! read the admin body (the open-invite token, the join-request roster).
+//! The cache key only says "admin", and a check inside the cached
+//! computation runs on a miss only, so a warmed entry must still refuse a
+//! wrong token (the body holds the open-invite token and join-request roster).
 
 use std::sync::Arc;
 

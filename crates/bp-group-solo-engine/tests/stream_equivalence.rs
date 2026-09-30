@@ -2,8 +2,8 @@
 
 #![allow(clippy::print_stderr)]
 
-//! T1 — accounting equivalence for Group-Solo between the in-process sink
-//! path and the Core→stream→Satellite path. Mirror of the PPLNS T1.
+//! Accounting equivalence for Group-Solo between the in-process sink path
+//! and the Core→stream→Satellite path. Mirror of the PPLNS equivalent.
 //!
 //! The same Group-Solo share sequence (deterministic `share_id`s, one
 //! group) driven (a) directly through `GroupSoloAcceptedShareSink` vs
@@ -52,9 +52,8 @@ fn share_seq(group_id: Uuid) -> Vec<SharedAcceptedShareOwned> {
 
 async fn spawn_engine(conn: ConnectionManager, pool: PgPool) -> GroupSoloEngine {
     let config = GroupSoloEngineConfig {
-        // Structural under §4 — the engine refuses to construct without a
-        // usable pool-output recipient, because a pool that starts without
-        // one pays every block to a single miner.
+        // Structural under §4: the engine refuses to construct without a
+        // usable pool-output recipient.
         fee_address: Some(
             bp_common::AddressId::new("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").expect("valid"),
         ),

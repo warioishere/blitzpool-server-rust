@@ -5,45 +5,25 @@
 //! `pplns:window:total` float string + `pplns:window:by-address` aggregate,
 //! plus the `pplns:snapshot` hash.
 //!
-//! Direct `redis::aio::ConnectionManager` (no trait abstraction —
-//! decision 2026-05-16). Tests run against docker-Redis. State mutation runs
-//! in atomic Lua scripts (append + per-bucket trim) so the by-address
-//! aggregate can't desync from the buckets.
-//!
-//! Storage is O(buckets × miners), not O(shares): shares aggregate per-address
-//! into fixed-size count buckets and the window trims whole oldest buckets.
-//! Bucket ids derive from the never-reset `pplns:counter`, which is what makes
-//! `bucket_shares` a boot-time-only value rather than a live knob — see the
-//! field of that name on [`WindowStore`].
+//! State mutation runs in atomic Lua scripts (append + per-bucket trim) so
+//! the by-address aggregate cannot desync from the buckets. Storage is
+//! O(buckets × miners), not O(shares): shares aggregate per address into
+//! fixed-size count buckets and the window trims whole oldest buckets.
+//! Bucket ids derive from the never-reset `pplns:counter`, which makes
+//! `bucket_shares` a boot-time value rather than a live knob — see the field
+//! of that name on [`WindowStore`].
 //!
 //! ## Why this is not shaped like the Group-Solo window
 //!
-//! `bp-group-solo-engine`'s `RoundStore` solves a window that looks like the
-//! same problem and deliberately does it differently: there the bucket id IS
-//! the time slice (`timestamp_ms.div_euclid(WINDOW_BUCKET_MS)`), and the trim
-//! is `drop ids ≤ now_bucket - window_buckets`. No second dimension, because
-//! it needs none.
+//! Group-Solo's `RoundStore` window is sized purely in **time**, so its
+//! bucket id is the time slice and time is its only axis. This window is
+//! sized in **weight** (`window_factor × network_difficulty`), so the id
+//! carries the share count that rule measures against, and quantising by
+//! count bounds the overshoot to one bucket. Age is a second, independent
+//! axis here and lives in the index score.
 //!
-//! The reason the two diverge is what each window is SIZED by:
-//!
-//! - Group-Solo's is defined purely in **time**. Time is therefore its only
-//!   axis, and the natural thing to encode in the id. It has no weight rule
-//!   at all.
-//! - This one is defined in **weight** — `window_factor × network_difficulty`
-//!   — so the id already carries the share count that rule measures against,
-//!   and quantising by count is what bounds the overshoot to a single bucket.
-//!   Age is a SECOND, independent axis here, and it has to live somewhere
-//!   else: the index score.
-//!
-//! Adopting time-derived ids here would not be a fix, it would swap the
-//! storage model — `bucket_shares` loses its meaning, the counter loses its
-//! role, and the 4362-bucket live window would have to be renumbered rather
-//! than restamped. That is a separate change, not this one.
-//!
-//! **If you touch the ageing rule in either window, read the other.** The two
-//! answer the same question ("when is a miner's work too old to count?") with
-//! different machinery, which is exactly the shape this repo has been bitten
-//! by before.
+//! **If you touch the ageing rule in either window, read the other.** Both
+//! answer "when is a miner's work too old to count?" with different machinery.
 
 pub mod snapshot;
 
@@ -75,24 +55,17 @@ pub const KEY_WINDOW_REBUILD: &str = "pplns:window:by-address:rebuild";
 /// hash `pplns:bucket:<id>` of address → Σdiff. Storage is O(buckets ×
 /// miners) instead of O(shares).
 ///
-/// **Score = epoch-ms of the bucket's FIRST share**, not the id it used to
-/// be. The `ZADD` carries `NX`, so the value is written when the bucket opens
-/// and never moves: it says when the bucket started filling, not when it
-/// stopped. FIFO order is unchanged by the switch — bucket ids and wall-clock
-/// both only ever increase, so the same member comes back as "oldest" either
-/// way.
+/// **Score = epoch-ms of the bucket's FIRST share.** The `ZADD` carries `NX`,
+/// so the value is written when the bucket opens and never moves. Bucket ids
+/// and wall-clock both only increase, so score order is FIFO order.
 ///
 /// Opening time is the conservative end to age on: a bucket qualifies as soon
-/// as it has EXISTED longer than the cutoff, even when its newest share is
-/// recent. That would bite on a pool slow enough for one bucket to take longer
-/// than `abandoned_balance_days` to fill, which is why the trim refuses to
-/// touch the bucket the counter is currently writing into.
+/// as it has existed longer than the cutoff, even when its newest share is
+/// recent. That is why the trim never touches the bucket the counter is
+/// currently writing into.
 ///
-/// A window populated before the switch carries ids as scores. They are
-/// below [`LEGACY_SCORE_CEILING`] by many orders of magnitude, and
-/// [`WindowStore::restamp_legacy_bucket_scores`] converts them at startup —
-/// without it the age rule would read them as 1970 and drop the whole
-/// window on its first run.
+/// Scores below [`LEGACY_SCORE_CEILING`] are bucket ids, not timestamps;
+/// [`WindowStore::restamp_legacy_bucket_scores`] converts them at startup.
 pub const KEY_BUCKETS: &str = "pplns:buckets";
 /// Coinbase distribution snapshot. See [`mod@snapshot`].
 pub const KEY_SNAPSHOT: &str = "pplns:snapshot";
@@ -109,31 +82,23 @@ pub fn bucket_key(bucket_id: &str) -> String {
 /// Default shares-per-bucket when `[pplns] bucket_shares` is not configured.
 pub const DEFAULT_BUCKET_SHARES: u64 = 10_000;
 
-/// Below this, a [`KEY_BUCKETS`] score is a bucket id from before the index
-/// carried timestamps, not an epoch-ms. 1e12 ms is 2001-09-09; a real id
-/// would need 1e16 shares at the default bucket size to reach it, so the two
-/// ranges cannot meet. See [`WindowStore::restamp_legacy_bucket_scores`].
+/// Below this, a [`KEY_BUCKETS`] score is a bucket id, not an epoch-ms.
+/// 1e12 ms is 2001-09-09; an id would need 1e16 shares at the default bucket
+/// size to reach it, so the two ranges cannot meet. See
+/// [`WindowStore::restamp_legacy_bucket_scores`].
 pub const LEGACY_SCORE_CEILING: i64 = 1_000_000_000_000;
 
-/// Buckets one [`WindowStore::trim_window`] call may drop before handing back
-/// control. The trim runs on the share-append path, and the backlog it has to
-/// clear is not always small: the boot-time score conversion stamps the whole
-/// pre-existing window into a band milliseconds wide, so every one of those
-/// buckets becomes eligible in the same instant. Uncapped, one unlucky share
-/// would pay for thousands of sequential Redis round-trips.
+/// Buckets one `WindowStore::trim_window` call may drop before handing back
+/// control. The trim runs on the share-append path and a backlog can be large
+/// (e.g. the restamped legacy set becoming eligible in one instant), so the
+/// cap keeps one share from paying for thousands of Redis round-trips. The
+/// next share resumes where this call left off.
 ///
-/// Nothing is lost by stopping early — the next share resumes where this call
-/// left off, so a backlog drains over many appends instead of one.
-///
-/// ⚠️ It does relax an invariant. The uncapped loop restored `total ≤
-/// windowSize` on EVERY append; with a cap the window can sit over target
-/// across several. It matters only when hundreds of buckets go over at once
-/// (network difficulty dropping sharply, `window_factor` lowered and the
-/// process restarted, or the converted legacy set becoming eligible together)
-/// — and a block found during that stretch settles against a window carrying
-/// more weight than the size rule intends, because the read path does not
-/// trim. The trade is deliberate: an unbounded loop on the share hot path is
-/// the worse of the two, and the drift is bounded by how fast shares arrive.
+/// ⚠️ With the cap the window can sit over `windowSize` across several
+/// appends, and a block found in that stretch settles against more weight
+/// than the size rule intends (the read path does not trim). Deliberate: an
+/// unbounded loop on the share hot path is worse, and the drift is bounded
+/// by how fast shares arrive.
 const MAX_DROPS_PER_TRIM: usize = 64;
 
 /// How many recent `share_id`s the dedup set retains. Only un-acked
@@ -152,55 +117,27 @@ const DEDUP_KEEP: i64 = 100_000;
 /// is built inside the script (`pplns:bucket:<id>`) — single-instance Valkey,
 /// not cluster.
 ///
-/// The age rule exists because the size rule cannot fire on a pool whose
-/// window sits far below `window_factor × network_difficulty`: it is over
-/// target on its first iteration, forever, and a miner who stops mining keeps
-/// its weight for good. Both rules drop through the same body, so the
-/// aggregate/bucket bookkeeping has exactly one implementation.
+/// The age rule exists because the size rule never fires on a pool whose
+/// window sits far below `window_factor × network_difficulty`, so a miner who
+/// stops would keep its weight for good. Both rules drop through the same
+/// body, so the aggregate/bucket bookkeeping has one implementation.
 ///
-/// ## Why the age rule reads a score RANGE and not the head
+/// The age rule selects by score RANGE (`ZRANGEBYSCORE floor (cutoff`), not
+/// by the head: an entry below the score floor, or a young bucket opened by a
+/// replayed share, can sit at rank 0 without being droppable, and must not
+/// hide the aged entries behind it.
 ///
-/// It used to inspect `ZRANGE 0,1` and give up when that entry was not
-/// droppable — which wedged the whole rule behind any entry that can sit at
-/// rank 0 and never be dropped. Two of those are reachable:
-///
-/// - an entry below the score floor, deliberately inert (a `RESTORE` of a
-///   pre-timestamp index, a caller passing a bogus share time)
-/// - a bucket opened by a REPLAYED share, whose accept time is older than
-///   everything already in the index and which is nonetheless young
-///
-/// Either one parks itself first and answers "not too old", the script
-/// returns `{0, 0}`, and everything behind it becomes unreachable — for the
-/// whole `abandoned_balance_days`. `ZRANGEBYSCORE floor (cutoff` steps over
-/// both instead of stopping at them.
-///
-/// ## The currently-filling bucket is never dropped
-///
-/// Identified from the counter (`floor(counter / bucket_shares)`), not by
-/// "stop when one bucket is left", which was a proxy for the same thing.
-/// Being exact matters here: with `NX` scoring the index holds a bucket's
-/// OPENING time, so a bucket that takes longer than the cutoff to fill would
-/// otherwise be eligible while shares are still going into it.
+/// The currently-filling bucket (`floor(counter / bucket_shares)`) is never
+/// dropped: its score is its OPENING time, so a bucket that takes longer than
+/// the cutoff to fill would otherwise be eligible while shares still go in.
 ///
 /// Returns `{dropped, underflowed}` — `dropped` is 1 when a bucket went and
 /// 0 when nothing qualified, so the caller loops until it sees 0.
 /// `underflowed` counts the addresses the decrement would have driven BELOW
-/// zero.
-///
-/// The second number exists because an underflow is not a rounding artefact
-/// and must not be cleaned up silently. The aggregate is a sum of
-/// non-negative difficulties, so a decrement can only exceed it if the
-/// bucket holds a share the aggregate never received — which the
-/// `DUMP`-per-key backup can produce: it captures `window:by-address` and
-/// the `bucket:*` hashes at different instants, so a restore can hand the
-/// trim a bucket that is ahead of the aggregate (see
-/// `blitzpool::redis_backup`).
-///
-/// Both the near-zero and the negative case `HDEL` the field, and that is
-/// the point: `read_window_by_address` filters `diff > 0`, so a field left
-/// sitting at a negative value drops the address out of the window
-/// ENTIRELY — silently unpaid until it earns its way back. Removing it is
-/// the same outcome, but the count makes it visible.
+/// zero. That is not rounding: the bucket holds more than the aggregate ever
+/// received, which a per-key backup restore can produce (see
+/// `blitzpool::redis_backup`). The field is `HDEL`ed either way, since
+/// `read_window_by_address` filters `diff > 0`; the count makes it visible.
 const TRIM_BATCH_LUA: &str = r#"
 local total = tonumber(redis.call('GET', KEYS[1]) or '0') or 0
 local max_size = tonumber(ARGV[1]) or 0
@@ -270,24 +207,17 @@ return {1, underflowed}
 /// dedup), `ARGV[4]` = dedup keep-count, `ARGV[5]` = bucket_shares,
 /// `ARGV[6]` = the SHARE's epoch-ms, which becomes the bucket's index score.
 ///
-/// The `ZADD` carries `NX`, so the score is written once, when the bucket is
-/// first seen, and never moved afterwards. Two consequences, both wanted:
-/// the score means "when this bucket opened" rather than "when it was last
-/// written", and an id that gets re-used — a raised `bucket_shares`, or a
-/// counter rewound by a Redis state restore — cannot hand a months-old bucket
-/// a fresh lease on life.
+/// The `ZADD` carries `NX`, so the score means "when this bucket opened", and
+/// a re-used id (raised `bucket_shares`, counter rewound by a restore) cannot
+/// give an old bucket a fresh lease on life. It is the share's own timestamp,
+/// not `now()`, because this sink can replay a backlog and re-stamping would
+/// file hours-old work as new.
 ///
-/// It is the share's own timestamp and not `now()` for the reason
-/// `bp-pplns-engine::hooks` states where it threads the value down: under the
-/// Core/Satellite split this sink can replay a backlog, and re-stamping would
-/// file hours-old work as brand new.
-///
-/// Computes the bucket id from the post-INCR counter (`floor(counter /
-/// bucket_shares)`), aggregates the share into `pplns:bucket:<id>` per
-/// address, registers the bucket in the index zset, and bumps window:total +
-/// by-address — all indivisibly. With a non-empty `share_id` a redelivered
-/// share is a deduped no-op (`return 0`), the marker recorded in the same
-/// script so a consumer crash can't double-count. Returns 1 on append.
+/// Computes the bucket id from the post-INCR counter, aggregates the share
+/// into `pplns:bucket:<id>`, registers the bucket in the index and bumps
+/// window:total + by-address, all indivisibly. With a non-empty `share_id` a
+/// redelivered share is a no-op (`return 0`), the marker recorded in the same
+/// script so a consumer crash cannot double-count. Returns 1 on append.
 const RECORD_SHARE_LUA: &str = r#"
 local has_dedup = ARGV[3] ~= ''
 if has_dedup and redis.call('ZSCORE', KEYS[4], ARGV[3]) then
@@ -327,25 +257,14 @@ pub enum WindowError {
 /// Backed by `Arc<AtomicU64>` over `f64::to_bits`/`f64::from_bits`,
 /// so reads + writes are lock-free across worker threads.
 ///
-/// **Who writes it, and why it is not the TDP stream.** This value is read
-/// by exactly one thing: [`WindowStore::window_size`], which only
-/// `WindowStore::trim_window` calls, which only
-/// [`WindowStore::record_share`] calls. That path runs on the process that
-/// consumes the accepted-share stream — the `payout` role — and that
-/// process has no TDP feed at all. So it is seeded from `getmininginfo` at
-/// boot and refreshed from the same RPC on a timer by the binary (see
-/// `blitzpool::network_difficulty`).
-///
-/// The doc here used to say "as published by the TDP template stream", and
-/// [`Self::set`] was never called from anywhere: the window was sized to
-/// the difficulty at process start and frozen there for the process's whole
-/// life. `window_factor` then meant "x times the difficulty at the last
-/// restart" rather than the current one, so a long-running payout process
-/// trimmed to a window that spanned steadily fewer blocks than configured.
+/// Read only by [`WindowStore::window_size`] on the `payout` role, which has
+/// no TDP feed. So it is seeded from `getmininginfo` at boot and refreshed
+/// from the same RPC on a timer (see `blitzpool::network_difficulty`); without
+/// the refresh `window_factor` would be relative to the difficulty at the
+/// last restart.
 ///
 /// A zero or negative value makes `window_size` return 0, which disables
-/// trimming entirely — so a failed reading must never be written. The
-/// refresher's guard is what keeps that from happening.
+/// trimming entirely — so a failed reading must never be written.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkDifficulty {
     bits: Arc<AtomicU64>,
@@ -378,49 +297,23 @@ pub struct WindowStore {
     conn: ConnectionManager,
     window_factor: f64,
     /// Shares per count-bucket. The id is `floor(counter / bucket_shares)`
-    /// over [`KEY_COUNTER`], which is only ever `INCR`'d — nothing in the tree
-    /// resets or deletes it.
+    /// over [`KEY_COUNTER`], which is only ever `INCR`'d.
     ///
-    /// **Raising it lowers every future id.** With the counter at 1 000 000
-    /// and 10 000 shares per bucket the live ids sit just under 100; doubling
-    /// the divisor puts the next share in bucket 50, below the whole live set.
-    ///
-    /// ⛔ **Still change it only downwards, or against an empty window.** The
-    /// reason moved, it did not go away.
-    ///
-    /// It used to be FIFO position: while [`KEY_BUCKETS`] was scored by id, a
-    /// lower id meant the head, so [`TRIM_BATCH_LUA`] took the fresh bucket
-    /// ahead of ones months older. Timestamp scores ended that, and
-    /// `raising_bucket_shares_no_longer_strands_new_work` pins it — but only
-    /// for the case that test builds, where the recomputed id lands BELOW every
-    /// live bucket.
-    ///
-    /// On a window that has never trimmed, ids are dense from the bottom and
-    /// the recomputed id lands INSIDE the live set instead. The share then
-    /// `HINCRBYFLOAT`s into an existing bucket, and `NX` leaves that bucket's
-    /// opening time alone — correctly, it did open then. New work inherits an
-    /// old bucket's age and is aged out with it. Measured on the live pool
-    /// 2026-09-10: ids 2035..6396, every one of them live, so any raise
-    /// collides.
-    ///
-    /// Lowering stays safe: the new ids land above every existing bucket.
-    ///
-    /// This used to be pinned to the TS pool's `PPLNS_BUCKET_SHARES` because
-    /// both pools shared one Redis across the cutover. That pool is retired,
-    /// and nothing here reads a key it does not also write — a cold start
-    /// rebuilds [`KEY_WINDOW_BY_ADDRESS`] from the buckets — so the counter is
-    /// the only constraint left.
+    /// ⛔ **Change it only downwards, or against an empty window.** Raising it
+    /// lowers every future id; on a window whose ids are dense from the bottom
+    /// the recomputed id lands inside the live set, the share goes into an
+    /// existing bucket, and `NX` keeps that bucket's opening time — new work
+    /// inherits an old bucket's age and is aged out with it. Lowering is safe:
+    /// the new ids land above every existing bucket.
     bucket_shares: u64,
     net_diff: NetworkDifficulty,
-    /// Age rule for [`TRIM_BATCH_LUA`], in days. Always at least one:
-    /// `PplnsEngineConfig::validate` rejects `abandoned_balance_days == 0`
-    /// outright, and the constructor floors it, so there is no "age rule off"
-    /// state to guard against and no branch pretending otherwise.
+    /// Age rule for [`TRIM_BATCH_LUA`], in days. Always at least one: the
+    /// config rejects 0 and the constructor floors it, so there is no "age
+    /// rule off" state.
     ///
-    /// Fed from `[pplns] abandoned_balance_days`, deliberately the same knob
-    /// the dust sweep uses: both answer "how long until a miner counts as
-    /// gone", one for its share weight and one for its ledger claim. Split
-    /// them only if a reason to tune them apart actually turns up.
+    /// Fed from `[pplns] abandoned_balance_days`, the same knob the dust sweep
+    /// uses: both answer "how long until a miner counts as gone", one for its
+    /// share weight and one for its ledger claim.
     max_age_days: u32,
 }
 
@@ -443,9 +336,8 @@ impl WindowStore {
                 bucket_shares
             },
             net_diff,
-            // Floored, not validated-and-rejected, because the engine config
-            // already refuses 0 — this only keeps a direct constructor (the
-            // tests) from producing a cutoff that would age out everything.
+            // The engine config already refuses 0; this keeps a direct
+            // constructor from producing a cutoff that ages out everything.
             max_age_days: max_age_days.max(1),
         }
     }
@@ -454,52 +346,31 @@ impl WindowStore {
     /// trim so a long-running process ages against the current clock, not
     /// against its start time.
     ///
-    /// `now_ms()` answers 0 if the system clock predates the epoch (a board
-    /// with a dead RTC), which makes this negative. The trim then finds
-    /// nothing at or above the score floor that is also below a negative
-    /// cutoff, so the age rule stops firing instead of declaring the whole
-    /// window ancient. That is the safe direction to fail in, and it is why
-    /// the floor is a `>=` test rather than a plain comparison.
+    /// A clock before the epoch makes this negative; the trim then finds
+    /// nothing between the score floor and the cutoff, so the age rule stops
+    /// firing instead of declaring the whole window ancient.
     fn age_cutoff_ms(&self) -> i64 {
         crate::config::abandoned_cutoff_ms(bp_common::now_ms(), self.max_age_days)
     }
 
-    /// One-shot conversion of a window written before [`KEY_BUCKETS`] carried
-    /// timestamps: every score below [`LEGACY_SCORE_CEILING`] is a bucket id,
-    /// not an epoch-ms. Idempotent — a converted window has no legacy score
-    /// left and the call is a no-op.
+    /// Converts every [`KEY_BUCKETS`] score below [`LEGACY_SCORE_CEILING`]
+    /// (a bucket id, not an epoch-ms) to a timestamp. Idempotent.
     ///
-    /// This is NOT what keeps the age rule off those entries; the score floor
-    /// inside the trim script does that, and it holds whether or not this ever
-    /// ran. What the conversion buys is the opposite: an unconverted entry is
-    /// inert **forever**, so without this the pre-existing window could never
-    /// age out at all. The two split the work — the floor is the safety net,
-    /// this is what starts the clock.
+    /// The score floor in the trim script keeps the age rule off such entries
+    /// regardless; this is what lets them age out at all, since an unconverted
+    /// entry is inert forever. The true creation times are unknown, so every
+    /// converted bucket is stamped just under "now" and nothing is evicted
+    /// retroactively.
     ///
-    /// The true creation times are not recoverable (nothing recorded them), so
-    /// every converted bucket is stamped just under "now". The age clock
-    /// therefore starts at the first boot after this ships, and nothing is
-    /// evicted retroactively.
-    ///
-    /// Stamps are staggered by one ms in existing FIFO order rather than
-    /// sharing one value: equal scores in a zset order by member string, and
-    /// the members are ids as text, where `"1000"` sorts before `"999"`. One
-    /// shared timestamp would scramble the drop order.
-    ///
-    /// The band is therefore only `legacy.len()` ms wide, so a bucket opened
-    /// afterwards by a REPLAYED share — accept time older than the conversion
-    /// instant — sorts below the whole converted set. That is untidy but
-    /// harmless: the age rule selects by score range, not by rank, so a young
-    /// entry sitting first cannot hide the aged ones behind it. It would have
-    /// wedged the rule for a full `abandoned_balance_days` back when the trim
-    /// only ever inspected the head.
+    /// Stamps are staggered by one ms in FIFO order: equal scores order by
+    /// member string, where `"1000"` sorts before `"999"`, which would
+    /// scramble the drop order.
     ///
     /// Returns how many buckets it converted.
     pub async fn restamp_legacy_bucket_scores(&self) -> Result<u64, WindowError> {
         let mut conn = self.conn.clone();
-        // Ask Redis for the score range instead of pulling the whole index and
-        // filtering here: after the first boot the answer is empty, and this
-        // runs on the startup path at every start, forever.
+        // Ask Redis for the score range instead of pulling the whole index:
+        // this runs at every start and the answer is usually empty.
         let legacy: Vec<String> = conn
             .zrangebyscore(KEY_BUCKETS, "-inf", format!("({LEGACY_SCORE_CEILING}"))
             .await?;
@@ -523,11 +394,9 @@ impl WindowStore {
         Ok(legacy.len() as u64)
     }
 
-    /// `windowSize = factor × networkDifficulty`. Returns 0 while the
-    /// network-difficulty source holds no usable reading — see
-    /// [`NetworkDifficulty`] for who writes it, which is `getmininginfo`
-    /// on the payout role and never the TDP stream. A 0 makes
-    /// `record_share` a no-op trim-wise, so the window only grows.
+    /// `windowSize = factor × networkDifficulty`. Returns 0 while
+    /// [`NetworkDifficulty`] holds no usable reading, which disables the size
+    /// rule, so the window only grows until a reading arrives.
     pub fn window_size(&self) -> f64 {
         let nd = self.net_diff.get();
         if !nd.is_finite() || nd <= 0.0 {
@@ -540,24 +409,18 @@ impl WindowStore {
 
     /// Append one accepted share to the window, optionally exactly-once.
     ///
-    /// The append (counter INCR + zset ZADD + both aggregate increments)
-    /// runs as one indivisible Lua script (`RECORD_SHARE_LUA`) — same
-    /// atomicity the old `MULTI/EXEC` gave, so a snapshot taken mid-write
-    /// can't see a partial update. When `share_id` is `Some`, the script
-    /// also makes the write **idempotent**: a redelivered share whose id is
-    /// still in the dedup set is a no-op, and the marker is recorded in the
-    /// same script so a consumer crash between apply and ack can't
-    /// double-count. `None` keeps the plain non-idempotent append for direct
-    /// window tests / admin tooling.
+    /// The append runs as one Lua script (`RECORD_SHARE_LUA`), so a snapshot
+    /// taken mid-write cannot see a partial update. With `share_id` set the
+    /// write is **idempotent**: a redelivered share whose id is still in the
+    /// dedup set is a no-op, and the marker is recorded in the same script so
+    /// a crash between apply and ack cannot double-count. `None` is the plain
+    /// append for direct window tests and admin tooling.
     ///
     /// Returns `true` when the share was appended, `false` when it was a
-    /// deduped no-op (so the caller can skip follow-up side effects).
-    /// `trim_window` runs only on a real append.
+    /// deduped no-op. `trim_window` runs only on a real append.
     ///
-    /// `address` is normalized before this call (the stratum layer
-    /// lowercase-normalizes at authorize-time); we don't re-normalize
-    /// to keep the hot path branch-free. Callers from outside the
-    /// stratum path (tests, admin tools) must normalize themselves.
+    /// `address` is not re-normalized here; the stratum layer normalizes at
+    /// authorize time, and other callers must normalize themselves.
     pub async fn record_share(
         &self,
         share_id: Option<&str>,
@@ -591,19 +454,14 @@ impl WindowStore {
     // ── Trim — bound the window ─────────────────────────────────────
 
     /// Drop oldest entries until `total ≤ windowSize` and no bucket is older
-    /// than the age cutoff. Idempotent if
-    /// the window is already below threshold.
+    /// than the age cutoff, at most `MAX_DROPS_PER_TRIM` buckets per call.
     async fn trim_window(&self, conn: &mut ConnectionManager) -> Result<(), WindowError> {
         let window_size = self.window_size();
         let age_cutoff = self.age_cutoff_ms();
 
-        // Drop whole oldest buckets while over the window (see [`TRIM_BATCH_LUA`]).
-        // Each call atomically removes one bucket and decrements window:total +
-        // by-address by exactly its per-address contribution. Looping in Rust
-        // (one bucket per script) keeps any single script's Redis-blocking
-        // small while preserving per-bucket atomicity. The script returns 1
-        // while it drops a bucket and 0 once nothing qualifies under either
-        // rule → done.
+        // One bucket per script call keeps each Redis-blocking script small
+        // while every drop stays atomic. The script returns 0 once nothing
+        // qualifies under either rule.
         let trim = redis::Script::new(TRIM_BATCH_LUA);
         for _ in 0..MAX_DROPS_PER_TRIM {
             let (dropped, underflowed): (i64, i64) = trim
@@ -621,12 +479,9 @@ impl WindowStore {
                 .invoke_async(conn)
                 .await?;
             if underflowed > 0 {
-                // Not a rounding artefact: the bucket held more for an
-                // address than the aggregate ever received. The addresses
-                // are dropped (a negative field is unpayable anyway — the
-                // read filters `> 0`), but somebody has to hear about it,
-                // because the likely cause is a restored backup whose
-                // aggregate and buckets were captured at different instants.
+                // The bucket held more for an address than the aggregate ever
+                // received, e.g. after a per-key backup restore. The addresses
+                // are dropped either way; this makes it visible.
                 warn!(
                     underflowed,
                     "pplns window trim: the aggregate went negative for {underflowed} \
@@ -640,12 +495,9 @@ impl WindowStore {
             }
         }
 
-        // No periodic full-window recalc. `record_share` + the trim above are
-        // atomic Lua, so the aggregate can't desync from the buckets — it only
-        // accumulates f64 rounding drift, sub-satoshi on the payout proportions.
-        // The only genuine rebuild need — a cold start where the hash is empty
-        // but buckets exist — is handled once at startup by
-        // `bootstrap_window_if_needed`.
+        // No periodic full-window recalc: append and trim are atomic Lua, so
+        // the aggregate only accumulates sub-satoshi f64 drift. A cold start
+        // with an empty hash is handled by `bootstrap_window_if_needed`.
         Ok(())
     }
 
@@ -655,20 +507,15 @@ impl WindowStore {
     /// from the live buckets — but ONLY when the hash is empty while buckets
     /// exist.
     ///
-    /// That's the single case where the incremental aggregate genuinely needs
-    /// rebuilding: a cold start / lost key where the buckets survived but the
-    /// hash didn't. (At a normal cutover the hash is populated by the previous
-    /// pool version, so this is a no-op.) Once non-empty, the hash is
-    /// maintained atomically by `record_share`/`trim_window`.
-    ///
-    /// Best-effort and safe: if the hash is already populated it returns
-    /// immediately; the rebuild builds into a temp key and atomic-`RENAME`s it
-    /// over the live hash so the aggregate is never observed empty/partial.
+    /// That is the one case the incremental aggregate needs rebuilding: a lost
+    /// key where the buckets survived. The rebuild builds into a temp key and
+    /// atomic-`RENAME`s it over the live hash so the aggregate is never
+    /// observed empty or partial.
     pub async fn bootstrap_window_if_needed(&self) -> Result<(), WindowError> {
         let mut conn = self.conn.clone();
         let hash_len: usize = conn.hlen(KEY_WINDOW_BY_ADDRESS).await?;
         if hash_len > 0 {
-            return Ok(()); // already populated (normal cutover) — leave it
+            return Ok(()); // already populated — leave it
         }
         let card: isize = conn.zcard(KEY_BUCKETS).await?;
         if card <= 0 {
@@ -722,8 +569,8 @@ impl WindowStore {
 
     /// Hot-read of the current window aggregate: address → diff-1 sum.
     /// Tries `HGETALL` first (O(distinct miners), KB-scale). Falls back to
-    /// summing the live buckets if the hash is empty — a cold-start after a
-    /// pool restart where the hash hasn't been repopulated yet.
+    /// summing the live buckets if the hash is empty (cold start before the
+    /// bootstrap rebuild).
     pub async fn read_window_by_address(&self) -> Result<HashMap<String, f64>, WindowError> {
         let mut conn = self.conn.clone();
         let hash: HashMap<String, String> = conn.hgetall(KEY_WINDOW_BY_ADDRESS).await?;
@@ -768,10 +615,8 @@ impl WindowStore {
     }
 
     /// Per-address contribution lookup (one Redis `HGET`). Returns
-    /// 0.0 when the address has no entry in the current window. Used
-    /// by the per-address reader path where a full `HGETALL` would
-    /// drag the entire window hash across the wire just to read one
-    /// field.
+    /// 0.0 when the address has no entry in the current window. Avoids
+    /// pulling the whole window hash to read one field.
     pub async fn read_window_share_for_address(&self, address: &str) -> Result<f64, WindowError> {
         let mut conn = self.conn.clone();
         let diff_str: Option<String> = conn.hget(KEY_WINDOW_BY_ADDRESS, address).await?;
@@ -844,16 +689,10 @@ mod tests {
 
     #[test]
     fn window_size_zero_when_no_difficulty() {
-        // No real Redis required for this test — `window_size` only
-        // touches the NetworkDifficulty view, not Redis.
+        // A `ConnectionManager` cannot be faked, so this checks the math
+        // directly; the integration tests cover `window_size` against Redis.
         let nd = NetworkDifficulty::new(0.0);
-        // We construct WindowStore via the public new, but the manager
-        // isn't actually used by window_size() — we can't easily fake
-        // a ConnectionManager, so this test exercises the math
-        // separately. Cross-checked by integration tests against real
-        // Redis.
         let factor = 4.0;
-        // Direct math: factor * 0.0 = 0.0
         assert_eq!(factor * nd.get(), 0.0);
         nd.set(1_000_000.0);
         assert_eq!(factor * nd.get(), 4_000_000.0);

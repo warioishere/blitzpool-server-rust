@@ -5,20 +5,12 @@
 //!
 //! One place, because the answer is a property of the POOL and not of a
 //! sub-protocol: the mining listener and the JDP listener must not be able to
-//! speak different SV2 versions. Both used to declare their own
-//! `MIN_PROTOCOL_VERSION`/`MAX_PROTOCOL_VERSION` and write out the same range
-//! check and the same `used_version` computation, so a version bump had four
-//! places to reach and nothing would have complained about missing one.
+//! speak different SV2 versions. `stratum_core` ships no constant for this,
+//! so the pool holds the numbers.
 //!
-//! `stratum_core` ships no constant for this — checked across
-//! `common_messages_sv2`, `extensions_sv2`, `mining_sv2`,
-//! `job_declaration_sv2` and `template_distribution_sv2` — so the numbers are
-//! ours to hold.
-//!
-//! What stays per sub-protocol is the REFUSAL: the two handlers answer a
-//! version mismatch with different `SetupConnection.Error` codes. That
-//! difference is deliberate-or-not on its own merits and is not settled here;
-//! this module only decides whether the ranges intersect.
+//! What stays per sub-protocol is the REFUSAL (the `SetupConnection.Error`
+//! each handler sends); this module only decides whether the ranges
+//! intersect.
 
 /// Minimum SV2 protocol version served. SV2 Overview/SetupConnection pins
 /// `min_version`/`max_version` at 2 for the current specification.
@@ -48,12 +40,9 @@ pub fn negotiate_version(min_version: u16, max_version: u16) -> Option<u16> {
 ///
 /// Split from [`negotiate_version`] so it can be exercised against a range
 /// WIDER than one version. With `MIN_PROTOCOL_VERSION == MAX_PROTOCOL_VERSION`
-/// the two bounds are interchangeable, so a test that only ever passes the
-/// real constants cannot tell this implementation from one that compares
-/// against the wrong bound or clamps to the wrong end — it stays green
-/// through both. Those are precisely the mistakes a future `MAX = 3` would
-/// turn into a live version-negotiation bug, i.e. they matter exactly when
-/// the vacuous test stops being vacuous.
+/// the two bounds are interchangeable, so a test that only passes the real
+/// constants cannot tell a wrong-bound comparison or clamp from a correct
+/// one; those mistakes would surface only once `MAX` is raised.
 fn negotiate_against(
     client_min: u16,
     client_max: u16,
@@ -63,9 +52,7 @@ fn negotiate_against(
     // A client that names a minimum above its own maximum has named no range
     // at all. Without this the two comparisons below can both pass — take
     // `client 4–2` against `serve 2–4` — and the result is `2`, a version the
-    // client said was beneath it. The old inline `if` had the same hole; it
-    // only became worth naming once the rule got a name and a sweep test that
-    // claims `used >= client_min`.
+    // client said was beneath it.
     if client_min > client_max {
         return None;
     }
@@ -122,11 +109,8 @@ mod tests {
         assert_eq!(negotiate(SERVE_MAX, 9), Some(SERVE_MAX));
     }
 
-    /// Whatever comes back is a version BOTH sides named. Swept over every
-    /// client range in and around the served one.
-    /// A range whose minimum sits above its maximum is no range. It used to
-    /// negotiate: `4–2` against `2–4` passed both comparisons and answered
-    /// `2`, under the client's own minimum.
+    /// A range whose minimum sits above its maximum is no range and
+    /// negotiates nothing.
     #[test]
     fn an_inverted_range_negotiates_nothing() {
         assert_eq!(negotiate_against(4, 2, SERVE_MIN, SERVE_MAX), None);
@@ -134,11 +118,12 @@ mod tests {
         assert_eq!(negotiate_version(4, 2), None);
     }
 
+    /// Whatever comes back is a version BOTH sides named. Swept over every
+    /// client range in and around the served one.
     #[test]
     fn a_negotiated_version_is_one_both_sides_named() {
-        // Every ordered pair, INVERTED ONES INCLUDED — the sweep used to start
-        // `client_max` at `client_min`, so the `used >= client_min` assertion
-        // below never met the case that breaks it.
+        // Every ordered pair, INVERTED ONES INCLUDED, so the
+        // `used >= client_min` assertion meets the case that can break it.
         for client_min in 0u16..8 {
             for client_max in 0u16..8 {
                 let got = negotiate(client_min, client_max);

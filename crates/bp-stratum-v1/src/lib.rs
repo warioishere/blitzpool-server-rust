@@ -4,9 +4,6 @@
 //! TDP→mining.notify translator, vardiff, share validator, per-connection
 //! statemachine.
 //!
-//! The crate is built up module-by-module per `MIGRATION_PLAN.md`. See
-//! `CHECKLIST.md` for the live status.
-//!
 //! Architecture notes:
 //!
 //! - **Multi-thread by default.** Per-connection task on the tokio
@@ -17,11 +14,8 @@
 //!   `SetNewPrevHash` updates and translates them to SV1 `mining.notify`
 //!   frames. There is no `getblocktemplate` polling.
 //! - **Behavioural spec.** Frame shape, edge cases, vardiff cadence, and
-//!   reject-strings follow the documented SV1 protocol behaviour.
-//!   Internal performance improvements are allowed where they don't
-//!   change observable behaviour. The single deliberate divergence is
-//!   the 8-hex-padded form for `mining.notify[5..8]` (ckpool convention)
-//!   — see `feedback-sv1-notify-hex-padded` memory.
+//!   reject-strings follow the documented SV1 protocol behaviour, with
+//!   `mining.notify[5..8]` in the 8-hex-padded ckpool form.
 
 mod client;
 mod config;

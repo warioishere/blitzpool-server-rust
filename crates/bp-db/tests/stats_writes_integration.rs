@@ -60,8 +60,7 @@ async fn connect_or_skip() -> Option<PgPool> {
 /// parallel tests in the same TX-isolation suite. Use the test name's
 /// hash as a deterministic offset.
 fn unique_slot(seed: i64) -> i64 {
-    // Year-3000 epoch — far enough from any real data we might fixture
-    // load that there's no chance of collision.
+    // Year-3000 epoch, far from any real or fixture data.
     32_503_680_000_000 + seed
 }
 
@@ -327,9 +326,8 @@ async fn client_stats_insert_then_increment_every_field() {
     // on one of the others' values instead.
     assert_eq!(vr, 5);
     assert!((vr_diff - 3.75).abs() < 0.001, "got {vr_diff}");
-    // Same guard for Stale: 4 + 6 at its own multiplier. Stale used to be
-    // folded into job-not-found, so a regression there would show up as
-    // `jnf` moving instead of this staying put.
+    // Same guard for Stale: 4 + 6 at its own multiplier, kept separate
+    // from job-not-found.
     assert_eq!(stale, 10);
     assert!((stale_diff - 2.0_f32).abs() < 0.001, "got {stale_diff}");
     // The maximum of 700 and 350: neither their sum nor the last write.
@@ -518,8 +516,7 @@ async fn address_settings_shares_increment_and_create_missing_rows() {
     // Seed one address with a known updatedAt so the follow-up assertion
     // can prove a pure share-accumulation upsert (best_difficulty = 0)
     // leaves the timestamp alone. The second address has NO row — the
-    // merged upsert must CREATE it (the old UPDATE-only path dropped a
-    // brand-new address's first flush window of shares).
+    // upsert must CREATE it so its first flush window of shares counts.
     let seeded_updated_at = 1_700_000_000_000_i64;
     sqlx::query(
         r#"INSERT INTO address_settings_entity (address, shares, "bestDifficulty", "createdAt", "updatedAt")
@@ -575,7 +572,7 @@ async fn address_settings_shares_increment_and_create_missing_rows() {
     tx.rollback().await.expect("rollback");
 }
 
-/// The merge's whole point: one upsert lands BOTH the share increment and
+/// One upsert lands BOTH the share increment and
 /// the best-difficulty GREATEST, and `"updatedAt"` moves only when the best
 /// actually grows.
 #[tokio::test]
@@ -678,8 +675,8 @@ async fn read_all_time(
     )
 }
 
-/// The whole point of migration 0014: `/bestdiff_reset` clears what the
-/// miner sees, and leaves the pool's public record standing.
+/// `/bestdiff_reset` clears what the miner sees and leaves the pool's
+/// public record standing.
 ///
 /// Asserts BOTH directions in one test, so it cannot pass on a
 /// precondition that silently did not hold: the reset must actually
@@ -807,12 +804,9 @@ async fn best_difficulty_upsert_inserts_then_climbs_via_greatest() {
     tx.rollback().await.expect("rollback");
 }
 
-/// Regression: after a best-difficulty RESET zeroes the row (out of band,
-/// via the UI/Telegram reset), the very next accepted-share flush must
-/// re-establish the best via GREATEST — even a share LOWER than the old
-/// all-time high. This is exactly the divergence the old write-through
-/// cache caused (stale cached high blocked every re-write → the row stuck
-/// at 0 for days); the batched GREATEST upsert cannot get stuck.
+/// After a best-difficulty reset zeroes the row (out of band, via the
+/// UI/Telegram reset), the very next accepted-share flush re-establishes
+/// the best via GREATEST — even with a share LOWER than the old high.
 #[tokio::test]
 async fn best_difficulty_recovers_after_a_reset() {
     let Some(pool) = connect_or_skip().await else {

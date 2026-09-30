@@ -2,14 +2,9 @@
 
 //! Production coinbase payout resolver.
 //!
-//! Cross-cutting wiring that gives BOTH SV1 + SV2 the correct
-//! per-mode coinbase output distribution at every template-broadcast
-//! moment. Pre-7.4d both protocols hardcoded "100% to authorized
-//! miner" regardless of port mode (PPLNS / Group-Solo crediting was
-//! still correct via the accept-hook fan-out — only the on-chain
-//! coinbase shape was wrong, which means PPLNS members received
-//! 0 sats when a block landed even though their shares were
-//! windowed in PG).
+//! Gives BOTH SV1 + SV2 the per-mode coinbase output distribution at every
+//! template broadcast, so the on-chain coinbase pays what the address's
+//! payout mode owes.
 //!
 //! ## Resolution dispatch
 //!
@@ -27,21 +22,16 @@
 //! ## Adapter strategy
 //!
 //! Both SV1 (`bp_stratum_v1::PayoutResolver`) + SV2
-//! (`bp_stratum_v2::PayoutResolver`) traits land on
-//! [`ProductionPayoutResolver`] directly — the trait shapes are
-//! identical aside from the address-shape (`&str` vs `&AddressId`).
-//! No adapter shim crate needed; we impl both traits on the same
-//! struct.
+//! (`bp_stratum_v2::PayoutResolver`) traits are implemented directly on
+//! [`ProductionPayoutResolver`]; the trait shapes differ only in the
+//! address type (`&str` vs `&AddressId`).
 //!
 //! ## Performance notes
 //!
-//! `build_distribution` calls return `Arc<DistributionResult>` and
-//! the engines short-circuit duplicate reward-sats lookups via an
-//! `InflightResultCache`. The resolver is called at most once per
-//! `(template-broadcast × connection)` event, so per-connection
-//! per-template cadence is ~30 s. The cache compresses concurrent
-//! lookups across connections so total throughput is bounded by the
-//! cache's TTL.
+//! `build_distribution` calls return `Arc<DistributionResult>` and the
+//! engines collapse concurrent lookups for the same reward via an
+//! `InflightResultCache`. The resolver runs at most once per
+//! `(template-broadcast × connection)` event.
 
 use std::sync::Arc;
 
@@ -62,18 +52,15 @@ use uuid::Uuid;
 use crate::engines::BlitzpoolModeGate;
 
 /// The single production `PayoutResolver` impl. Holds clones of the
-/// engines + the mode gate; cheap to clone (each field is internally
-/// `Arc` or already-clone-friendly).
+/// engines + the mode gate; cheap to clone.
 #[derive(Clone)]
 pub(crate) struct ProductionPayoutResolver {
     mode_gate: Arc<BlitzpoolModeGate>,
     pplns: Option<PplnsEngine>,
     group_solo: GroupSoloEngine,
     solo_fee: SoloFeeConfig,
-    /// Optional Blockparty service handle. When `None` the Blockparty
-    /// arm + the Solo pending-fee guard short-circuit to standard Solo
-    /// payouts — i.e. a deployment without the Blockparty feature wired
-    /// behaves exactly as before.
+    /// Optional Blockparty service handle. When `None` the Blockparty arm
+    /// and the Solo pending-fee guard fall back to standard Solo payouts.
     blockparty: Option<Arc<dyn BlockpartyApi>>,
 }
 
@@ -98,12 +85,9 @@ impl ProductionPayoutResolver {
     ///
     /// The second half of the pair says whether a block found on this list could
     /// be booked: for the two modes that resolve a snapshot, that means the list
-    /// came from the engine AND the engine's snapshot landed. It is returned
-    /// from the same call that produced the list on purpose. Measuring it with a
-    /// second, independent `build_distribution` let the two disagree — the probe
-    /// could succeed and the real build then fall back to a solo split while the
-    /// flag still said "engine-backed", promising a booking against a snapshot
-    /// that names a 100 %-to-one-address list nobody stored.
+    /// came from the engine AND the engine's snapshot landed. It comes from the
+    /// same call that produced the list, so the flag and the list cannot
+    /// disagree.
     async fn resolve_internal(
         &self,
         miner_address: &str,
@@ -117,9 +101,8 @@ impl ProductionPayoutResolver {
                 // DRAFT / CONFIRMING falls through to Solo for routing,
                 // but the on-chain coinbase routes 100% to the pool-fee
                 // address (BlockpartyService surfaces this as
-                // `pending_party_fee_route`). Without the guard the
-                // admin would pocket the full block reward before the
-                // members confirm the splits.
+                // `pending_party_fee_route`), so the admin cannot take the
+                // full block reward before the members confirm the splits.
                 if let Some(route) = self
                     .blockparty_pending_fee_route(miner_address, reward_sats)
                     .await
@@ -211,33 +194,25 @@ enum JdpDistributionFor {
 
 /// What the pool serves a mode over JDP, decided before anything is built.
 ///
-/// Pure and total on purpose. It is the one place the money question
-/// "which distribution does this miner get?" is answered, so a mode added
-/// later cannot reach a builder it was never classified for — and because
-/// it takes only a [`MiningMode`], the answer is testable without engines,
-/// Redis or a template feed.
+/// Pure and total on purpose: it is the one place the money question
+/// "which distribution does this miner get?" is answered, so a new mode
+/// cannot reach a builder it was never classified for, and the answer is
+/// testable without engines, Redis or a template feed.
 ///
 /// **Blockparty gets nothing.** A Blockparty group is a rental: the
 /// hashrate is pointed straight at an address and the pool splits the
 /// coinbase by fixed per-member percentages read from Postgres. A
 /// job-declaring client exists so a miner can pick its own transaction
-/// set, which a rental customer neither does nor wants — so there is
-/// nothing for JDP to add, and the pool does not offer it.
-///
-/// That is a REFUSAL, not an omission. `build_for_miner` used to build a
-/// tailored distribution for it out of the Blockparty allocator, so the
-/// whole path existed and any Blockparty admin pointing a JDC at the pool
-/// would have exercised it — untested money surface for a feature that is
-/// not offered. [`JdpDistributionFor::Nothing`] denies the session the
-/// pool-wide distribution too (see [`TailoredDistribution`]), so it can
-/// declare nothing at all rather than declare something the pool cannot
-/// account for.
+/// set, which a rental customer neither does nor wants, so JDP is not
+/// offered. That is a deliberate REFUSAL: [`JdpDistributionFor::Nothing`]
+/// denies the session the pool-wide distribution too (see
+/// [`TailoredDistribution`]), so it declares nothing rather than something
+/// the pool cannot account for.
 fn jdp_distribution_for(mode: Option<MiningMode>) -> JdpDistributionFor {
     match mode {
         // No mining session for this address, so no port has declared its
-        // mode. Taking the gate's Solo default here published a Solo plan for
-        // whoever allocated first — and a JDC allocates ~8 s before its
-        // channel opens, so that was every JDC, every start.
+        // mode. A JDC allocates before its channel opens, so the gate's Solo
+        // default would be a guess at every JDC start.
         None => JdpDistributionFor::ModeUnknown,
         Some(MiningMode::Pplns) => JdpDistributionFor::PoolWide,
         Some(MiningMode::Solo) => JdpDistributionFor::Tailored(TailoredMode::Solo),
@@ -252,11 +227,10 @@ fn jdp_distribution_for(mode: Option<MiningMode>) -> JdpDistributionFor {
 /// Solo and Group-Solo produce different payout vectors for the same one
 /// address, so an owner address alone cannot tell the two apart later.
 ///
-/// A named function and not an inline `match`, because it is the second half
-/// of the mode→answer table [`jdp_distribution_for`] starts, and the JDP loop
+/// A named function, not an inline `match`: it is the second half of the
+/// mode→answer table [`jdp_distribution_for`] starts, and the JDP loop
 /// compares its result against `StreamKind::for_mode` to decide whether an
-/// address's mode moved. A test that restates this mapping instead of calling
-/// it proves nothing about the pair actually agreeing.
+/// address's mode moved, so a test can call it rather than restate it.
 fn accounting_for(tailored: TailoredMode, miner: &AddressId) -> DistributionAccounting {
     match tailored {
         TailoredMode::Solo => DistributionAccounting::Solo(miner.clone()),
@@ -270,9 +244,9 @@ fn accounting_for(tailored: TailoredMode, miner: &AddressId) -> DistributionAcco
 /// must not become "serve no job": the window fills only from accepted
 /// shares and shares come only from jobs, so refusing would leave a fresh
 /// window unable to ever start. Every OTHER failure keeps the no-job
-/// answer — a window that cannot be read may be full of miners whose
-/// claims are simply invisible right now, and handing the block to one
-/// connecting miner would rob all of them.
+/// answer: a window that cannot be read may be full of miners whose claims
+/// are invisible right now, and handing the block to one connecting miner
+/// would rob all of them.
 ///
 /// Group-Solo needs no equivalent here: its builder always carries the
 /// prospective finder as the claimant (its cache is keyed per-finder), so
@@ -298,9 +272,8 @@ impl ProductionPayoutResolver {
         reward_sats: u64,
     ) -> (ResolvedPayouts, bool) {
         let Some(pplns) = self.pplns.as_ref() else {
-            // PPLNS mode was published into the gate but the engine
-            // is disabled at this deployment — config inconsistency.
-            // Fall back to solo + warn.
+            // PPLNS mode in the gate but no engine on this deployment: a
+            // config inconsistency, so serve no job.
             error!(
                 miner_address,
                 "PPLNS mode in gate but `[pplns]` is absent from config; serving NO JOB"
@@ -308,18 +281,17 @@ impl ProductionPayoutResolver {
             return (ResolvedPayouts::none(), false);
         };
         // The pool-wide build first. It is shared by every PPLNS
-        // connection, so it cannot name a claimant — an empty window comes
+        // connection, so it cannot name a claimant; an empty window comes
         // back as `NoScoredMiners` and is answered per-miner below.
         let built = match pplns.build_distribution(reward_sats).await {
             Ok(result) => Some(result),
             Err(err) if is_empty_share_window(&err) => {
-                // Nobody in the window holds a share. The distribution the
-                // weight model would otherwise produce pays the WHOLE
-                // block to the pool output, and serving no job at all
-                // would deadlock a fresh window: the window only fills
-                // from accepted shares, and shares only come from jobs.
-                // So this miner claims the block — nobody else has a claim
-                // to lose, and the pool still takes exactly its fee.
+                // Nobody in the window holds a share. The weight model would
+                // pay the WHOLE block to the pool output, and serving no job
+                // would deadlock a fresh window (it fills only from shares,
+                // which come only from jobs). So this miner claims the block:
+                // nobody else has a claim to lose, and the pool still takes
+                // exactly its fee.
                 match AddressId::new(miner_address.to_string()) {
                     Ok(claimant) => {
                         match pplns
@@ -361,9 +333,9 @@ impl ProductionPayoutResolver {
             }
         };
         match built {
-            // The build can succeed while its snapshot write does not — the
-            // engine keeps the distribution on purpose, because failing it would
-            // hand this miner the whole block. But the fingerprint then names a
+            // The build can succeed while its snapshot write does not: the
+            // engine keeps the distribution, because failing it would hand
+            // this miner the whole block. But the fingerprint then names a
             // key that does not exist, so there is nothing to vouch for.
             Some(result) => {
                 if !result.snapshot_written {
@@ -479,9 +451,7 @@ impl ProductionPayoutResolver {
         group_id: Uuid,
     ) -> (ResolvedPayouts, bool) {
         // The finder is the miner connecting on this share path; the
-        // Group-Solo engine bumps the finder's payout via the
-        // `finder_bonus_sats` config knob when emitting the
-        // distribution.
+        // Group-Solo engine applies the group's `finder_bonus_ppm` to it.
         let finder = match AddressId::new(miner_address.to_string()) {
             Ok(a) => a,
             Err(_) => {
@@ -559,10 +529,9 @@ impl bp_stratum_v1::PayoutResolver for ProductionPayoutResolver {
     }
 
     fn resolve_stream(&self, miner_address: &str) -> bp_common::StreamKind {
-        // Single source of truth: same mode lookup the payout resolution uses,
-        // mapped to a stream. A Solo address (incl. a Blockparty admin whose
-        // party is still DRAFT and falls through to a 1-output fee coinbase)
-        // routes to the Solo stream; everything else to Default.
+        // The same mode lookup the payout resolution uses, mapped to a
+        // stream. A Solo address (incl. a Blockparty admin whose party is
+        // still DRAFT) routes to the Solo stream; everything else to Default.
         bp_common::StreamKind::for_mode(self.mode_gate.lookup_mode(miner_address).mode)
     }
 }
@@ -607,9 +576,7 @@ pub(crate) struct ProductionDistributionSource {
     /// What the pool's current template pays out. The same seam the other two
     /// production JDP hooks take (`ProductionJdpAllocateResolver`,
     /// `ProductionJdpBlockSink`), so all three resolve their reward against
-    /// one implementation — this one used to re-derive it from a raw
-    /// `TdpHandle`, and `ChainView::reference_revenue`'s own doc says the two
-    /// must be the same number.
+    /// one implementation.
     pub(crate) chain: std::sync::Arc<dyn crate::jdp_hooks::ChainView>,
     pub(crate) redis: Option<redis::aio::ConnectionManager>,
     pub(crate) network: bitcoin::Network,
@@ -726,17 +693,13 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
     }
 
     async fn build_for_miner(&self, miner_address: &AddressId) -> TailoredDistribution {
-        // Once, by mode, before anything is built — see
-        // [`jdp_distribution_for`]. Everything that is not PPLNS is a mode
-        // whose shares do NOT enter the PPLNS window, so every failure
-        // path below returns `Unavailable`, never `PoolWide`: serving the
-        // pool-wide distribution to such a miner pays its block to the
-        // PPLNS window and books it under the PPLNS fingerprint.
+        // Decided once, by mode, before anything is built (see
+        // `jdp_distribution_for`). A non-PPLNS mode's shares do NOT enter the
+        // PPLNS window, so every failure path below returns `Unavailable`,
+        // never `PoolWide`, which would pay its block to the PPLNS window.
         // ⚠️ `lookup_known`, not `lookup_mode`: this runs at ALLOCATE time,
-        // before the miner's mining session exists, and `lookup_mode` answers
-        // Solo for an address it has never seen. Publishing off that guess is
-        // how a PPLNS miner came to be handed a Solo distribution — and a
-        // Group-Solo finder one that pays him instead of his group.
+        // before the miner's mining session exists, and `lookup_mode` guesses
+        // Solo for an address it has never seen.
         let known = self.resolver.mode_gate.lookup_known(miner_address.as_str());
         let mode = known.as_ref().map(|r| r.mode);
         let tailored = match jdp_distribution_for(mode) {
@@ -770,10 +733,9 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
         };
         let built = match tailored {
             TailoredMode::GroupSolo => {
-                // Total rather than an unwrap: `ModeUnknown` already
-                // returned above, so `known` is Some here — but expressing
-                // that with `expect` would put a panic on the money path for
-                // an invariant the compiler cannot see.
+                // `known` is Some here (`ModeUnknown` returned above), but an
+                // `expect` would put a panic on the money path for an
+                // invariant the compiler cannot see.
                 let Some(group_id) = known
                     .as_ref()
                     .and_then(|r| r.group_id.as_deref())
@@ -843,19 +805,17 @@ impl bp_stratum_v2::jdp_server::PayoutDistributionSource for ProductionDistribut
                 accounting: accounting_for(tailored, miner_address),
                 built: Box::new(b),
             },
-            // `lower_*` failed (unusable address / weight overflow).
-            // Still not the pool-wide distribution's problem.
+            // `lower_*` failed (unusable address / weight overflow); still
+            // never the pool-wide distribution.
             None => TailoredDistribution::Unavailable,
         }
     }
 
     async fn current_mode(&self, miner_address: &AddressId) -> Option<bp_common::StreamKind> {
-        // The same `lookup_known` [`Self::build_for_miner`] decides from, so
-        // the JDP loop cannot conclude "the mode moved" from a gate reading
-        // the builder would disagree with. `lookup_known` and not
-        // `lookup_mode`: an address with no mining session is undecided, not
-        // Solo, and here that difference is the difference between leaving a
-        // session's plan alone and tearing it up every time a rig blips.
+        // The same `lookup_known` `build_for_miner` decides from, so the JDP
+        // loop cannot conclude "the mode moved" from a gate reading the
+        // builder would disagree with. An address with no mining session is
+        // undecided, not Solo, so a rig blip does not tear up a session's plan.
         bp_stratum_v2::hooks::PayoutResolver::resolve_stream_known(
             self.resolver.as_ref(),
             miner_address,
@@ -915,10 +875,9 @@ fn entries_to_payouts(entries: &[CoinbaseDistributionEntry]) -> Vec<PayoutEntry>
         .iter()
         .map(|e| PayoutEntry {
             address: e.address.as_str().to_string(),
-            // `Sats` is a signed i64; a coinbase output can only ever be a
-            // non-negative amount. Clamp defensively so a (should-be-impossible)
-            // negative distributor value can't wrap to ~1.8e19 via `as u64` and
-            // blow up the coinbase as bad-cb-amount.
+            // `Sats` is a signed i64 and a coinbase output is non-negative;
+            // clamp so a negative value cannot wrap via `as u64` into an
+            // invalid coinbase amount.
             sats: e.sats.0.max(0) as u64,
         })
         .collect()
@@ -934,11 +893,8 @@ mod tests {
     /// just a snapshot lookup: without it nothing is emitted, so the durable
     /// `blocks_entity` row, the notification and the Blockparty history row all
     /// go missing for a block the pool served. Solo and Blockparty resolve no
-    /// snapshot at all, so withholding it from them buys nothing and costs that.
-    ///
-    /// Only the mode→answer decision is pinned here. That the emission really
-    /// follows from it is a property of the block-found fan-out and needs the
-    /// full-stack regtest that is still missing.
+    /// snapshot at all, so they always get it. Only the mode→answer decision is
+    /// pinned here, not the emission itself.
     #[test]
     fn the_modes_that_resolve_no_snapshot_can_always_be_booked() {
         assert!(
@@ -957,9 +913,8 @@ mod tests {
 
     /// What JDP serves each mode, pinned as the full mode→answer map.
     ///
-    /// Every mode is named individually rather than looped, because the
-    /// three answers are not interchangeable and getting one wrong is a
-    /// money bug, not a routing bug:
+    /// Every mode is named individually, because the answers are not
+    /// interchangeable and getting one wrong is a money bug:
     ///
     /// - `PoolWide` for a non-PPLNS mode would have its block pay the
     ///   PPLNS window and book under the PPLNS fingerprint.
@@ -967,11 +922,7 @@ mod tests {
     ///   miner whose accounting is the shared window.
     /// - `Nothing` for a served mode silently stops JDP working for it.
     ///
-    /// Blockparty is the deliberate refusal: a rental points its hashrate
-    /// at an address and the pool splits the coinbase from Postgres, so a
-    /// job-declaring client adds nothing. `build_for_miner` used to build
-    /// it one anyway, out of the Blockparty allocator — a reachable,
-    /// untested money path for a feature the pool does not offer.
+    /// Blockparty is the deliberate refusal (see `jdp_distribution_for`).
     #[test]
     fn jdp_answers_every_mode_with_exactly_one_distribution() {
         assert_eq!(
@@ -993,16 +944,10 @@ mod tests {
             "a rental is not served over JDP, and must not fall back to pool-wide"
         );
 
-        // The fifth answer, and the one that used to be missing: no mining
-        // session for this address, so no port has said which mode it is.
-        //
-        // This is not an edge case but the state at every JDC start — a JDC
-        // allocates ~8 s before it opens its mining channel, and the gate only
-        // learns an address when a session registers. Answering anything here
-        // is a guess, and both guesses cost money in opposite directions: a
-        // tailored plan pays one miner out of a shared window, the pool-wide
-        // one pays a Solo miner's block into the PPLNS window. So the answer
-        // is "not yet", and the caller retries.
+        // No mining session for this address, so no port has said which mode
+        // it is: the state at every JDC start, since a JDC allocates before it
+        // opens its mining channel. Any answer would be a guess that costs
+        // money either way, so the answer is "not yet" and the caller retries.
         assert_eq!(
             jdp_distribution_for(None),
             JdpDistributionFor::ModeUnknown,
@@ -1023,12 +968,9 @@ mod tests {
     /// comes from [`jdp_distribution_for`], the probe answer from
     /// `StreamKind::for_mode` (via `resolve_stream_known`), and the loop
     /// compares them through `accounting_matches_stream` to decide whether the
-    /// mode moved. Let those two disagree for any mode and a session correctly
-    /// served would conclude "moved" on every single frame — rebuilding its
-    /// plan, burning a distribution id and pushing a frame, per frame, forever.
-    ///
-    /// So it is pinned here rather than left to the fact that today they
-    /// happen to line up.
+    /// mode moved. If they disagree for any mode, a correctly served session
+    /// concludes "moved" on every frame and rebuilds its plan, burning a
+    /// distribution id and pushing a frame each time.
     #[test]
     fn what_a_mode_is_built_and_what_it_probes_as_are_the_same_answer() {
         use bp_stratum_v2::bridge::{accounting_matches_stream, DistributionAccounting as Acct};
@@ -1042,10 +984,8 @@ mod tests {
         ] {
             let probed = bp_common::StreamKind::for_mode(mode);
             // The accounting `build_for_miner` stamps onto the entry for this
-            // mode, by calling the same two functions it calls — not by
-            // restating them. Swap the arms inside `accounting_for` and this
-            // test goes red; a restated copy would stay green while every
-            // Group-Solo JDP session got a plan the mining side then refuses.
+            // mode, via the same two functions it calls rather than a
+            // restated copy, so swapped arms in `accounting_for` fail here.
             let built = match jdp_distribution_for(Some(mode)) {
                 JdpDistributionFor::PoolWide => Some(Acct::PoolWide),
                 JdpDistributionFor::Tailored(kind) => Some(accounting_for(kind, &miner)),
@@ -1150,9 +1090,8 @@ mod tests {
 
     #[test]
     fn solo_payouts_zero_percent_dev_fee_pays_miner_only() {
-        // Dev address set but percent left at the production default of 0.0
-        // (operator forgot `dev_fee_percent`). Must NOT emit a zero-value dev
-        // output — collapse to a single 100 %-to-miner payout.
+        // Dev address set but percent left at the default of 0.0: no
+        // zero-value dev output, a single 100 %-to-miner payout.
         let r = solo_payouts(
             "bc1qminer",
             &SoloFeeConfig {
@@ -1166,11 +1105,9 @@ mod tests {
         assert_eq!(r[0].sats, TEST_REWARD);
     }
 
-    /// The route used to carry a `percent` that was always 100 and ran the
-    /// reward through `floor(100 / 100 · reward)` in f64. Paying the reward
-    /// directly must give the same satoshis for every reward that occurs —
-    /// every subsidy era plus fees, up to the whole money supply, where f64
-    /// is still exact.
+    /// Paying the reward directly gives the same satoshis as the 100 %
+    /// percent formula for every reward that occurs: every subsidy era plus
+    /// fees, up to the whole money supply.
     #[test]
     fn pending_fee_route_pays_what_the_percent_formula_paid() {
         let fee = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Service-layer error types. Wire-codes (`as_str()`) match the
-//! strings surfaced in API error envelopes so the UI doesn't need
-//! a translation table during cut-over.
+//! strings surfaced in API error envelopes, which the UI maps
+//! directly without a translation table.
 
 use bp_db::DbError;
 
 /// Errors thrown by [`crate::service::GroupService`]. Wire-codes are
-/// stable so the existing UI error mapping keeps working.
+/// stable because the UI maps them to messages.
 #[derive(Debug, thiserror::Error)]
 pub enum GroupServiceError {
     #[error("admin token required")]
@@ -93,7 +93,7 @@ impl GroupServiceError {
 }
 
 /// Errors thrown by [`crate::invitation::InvitationService`]. Wire-codes
-/// are stable so the existing UI error mapping keeps working.
+/// are stable because the UI maps them to messages.
 #[derive(Debug, thiserror::Error)]
 pub enum InvitationServiceError {
     #[error("invitation not found")]
@@ -156,7 +156,7 @@ impl InvitationServiceError {
 }
 
 /// Errors thrown by [`crate::join_request::JoinRequestService`].
-/// Wire-codes are stable so the existing UI error mapping keeps working.
+/// Wire-codes are stable because the UI maps them to messages.
 #[derive(Debug, thiserror::Error)]
 pub enum JoinRequestServiceError {
     #[error("group not found")]

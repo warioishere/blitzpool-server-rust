@@ -15,7 +15,7 @@ pub(crate) fn normalize_address(raw: &str) -> Result<AddressId, GroupServiceErro
 
 /// Apply a closure to the `Set` variant of a [`PatchField`], leaving
 /// `Untouched` + `Clear` alone. The default `Iterator::map` shadows this
-/// when called inline, so we expose it through an explicit extension
+/// when called inline, so it is exposed through an explicit extension
 /// trait that callers `use` in scope when they need it.
 pub(crate) trait PatchFieldExt<T> {
     fn map_set<U>(self, f: impl FnOnce(T) -> U) -> PatchField<U>;

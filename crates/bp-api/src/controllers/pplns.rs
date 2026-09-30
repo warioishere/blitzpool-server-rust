@@ -130,7 +130,7 @@ struct StatusResponse {
 #[serde(rename_all = "camelCase")]
 struct UserAgentEntry {
     user_agent: Option<String>,
-    /// String-as-number so existing UI can parse with parseInt.
+    /// String-as-number; the UI parses it with parseInt.
     count: String,
     best_difficulty: Option<u64>,
     #[serde(serialize_with = "crate::time_range::ser_opt_f64_jsnum")]
@@ -364,8 +364,8 @@ where
 /// The PPLNS coinbase weight budget in force. With the autoscaler on, that is
 /// the live value it persists in Redis — the process that runs it is not this
 /// one, so the engine config here only knows the floor. Falls back to the
-/// config budget when the autoscaler is off (a key left from an earlier run
-/// would be stale), the key is missing, or Redis cannot answer.
+/// config budget when the autoscaler is off (a leftover key would be stale),
+/// the key is missing, or Redis cannot answer.
 async fn live_pplns_budget<H, M>(state: &AppState<H, M>, config_budget: u32) -> u32
 where
     H: GroupServiceHooks + 'static,
@@ -642,7 +642,7 @@ mod tests {
 
     /// The fees endpoint reports the live autoscaled budget only while the
     /// autoscaler is on. Both directions against the same stored value: with
-    /// the flag off a key left over from an earlier run must NOT leak into
+    /// the flag off a leftover key must NOT leak into
     /// the answer, with it on the key wins, and without a key the config
     /// budget stands.
     #[tokio::test]
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn history_entry_has_correct_shape() {
-        // Regression: old code selected non-existent txid column; was missing rowType, id, address, percent.
+        // Pins the wire shape: no txid; rowType, id, address, percent present.
         let entry = HistoryEntry {
             id: 1,
             block_height: 800000,

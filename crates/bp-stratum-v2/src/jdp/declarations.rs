@@ -1,37 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-connection storage for JDP-declared mining jobs. FIFO-bounded
-//! store with automatic eviction after 3 entries.
+//! Per-connection storage for JDP-declared mining jobs, FIFO-bounded at
+//! [`MAX_DECLARED_JOBS`] entries (each job holds ~1–2 MB of raw tx data).
 //!
-//! When a JDC calls `DeclareMiningJob` and the JDS validates it
-//! successfully, the JDS:
+//! An accepted `DeclareMiningJob` is stored under the fresh
+//! `new_mining_job_token` together with the current template's `prev_hash`.
+//! A later `PushSolution` finds its job via `match_for_solution(prev_hash)`.
 //!
-//! 1. Issues a fresh token in `DeclareMiningJobSuccess.new_mining_job_token`.
-//! 2. Stores the declared job + raw-tx map + the current template's
-//!    `prev_hash` keyed by the new token.
-//! 3. Caps the store at 3 entries (~5 s of declarations; each job is
-//!    ~1–2 MB of raw tx data — bounded memory).
+//! The prev_hash-first order is stricter than the spec: SV2 JDP/PushSolution
+//! says the JDS "MUST attempt to reconstruct and propagate the block using the
+//! template data associated with its most recently sent
+//! `DeclareMiningJob.Success`". Preferring a `prev_hash` match and falling back
+//! to most-recent never picks a job the spec would reject.
 //!
-//! Later, when the JDC submits a `PushSolution`, the JDS uses
-//! `match_for_solution(prev_hash)` to find which declared job the solution
-//! belongs to.
-//!
-//! **The prev_hash-first order is ours, and it is stricter than the spec.**
-//! SV2 JDP/PushSolution carries a `prev hash` field but does not make it the
-//! matching key: it says JDS "MUST attempt to reconstruct and propagate the
-//! block using the template data associated with its most recently sent
-//! `DeclareMiningJob.Success`", and MAY try other recent ones. So the spec's
-//! rule is most-recent-first. We prefer a `prev_hash` match and fall back to
-//! most-recent, which cannot pick a job the spec would have rejected — it only
-//! declines to reconstruct against a declaration the solution demonstrably
-//! does not belong to.
-//!
-//! ## FIFO eviction
-//!
-//! Rust `HashMap` doesn't preserve insertion order, so we keep a parallel
-//! `VecDeque<Token>` for FIFO bookkeeping. Cost: a 16-byte Token push
-//! / pop per declaration — negligible vs the MB-sized raw-tx-map
-//! moves.
+//! `HashMap` does not keep insertion order, so a parallel `VecDeque<Token>`
+//! does the FIFO bookkeeping.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -52,19 +35,14 @@ pub const MAX_DECLARED_JOBS: usize = 3;
 /// the raw transactions covering each wtxid.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclaredJob {
-    /// Token the JDS issued in `DeclareMiningJobSuccess`. Becomes
-    /// the JDC's reference for `PushSolution` and (via the SV2
-    /// mining-protocol bridge) `SetCustomMiningJob`.
+    /// Token the JDS issued in `DeclareMiningJobSuccess`; the JDC's
+    /// reference for `PushSolution` and (via the bridge) `SetCustomMiningJob`.
     pub new_token: Token,
     /// Whose declaration this is, resolved when the token was allocated.
     ///
-    /// Stamped here rather than looked up again at `PushSolution` time:
-    /// the block-found path books against this address, and a second
-    /// lookup can answer differently from the job it belongs to. It used
-    /// to read the connection's `TokenStore`, which drops a token the
-    /// moment an expired one is presented — a miss there fabricated the
-    /// address `"unknown"`, which the mode gate resolves to Solo, so the
-    /// block was recorded and never settled.
+    /// Stamped here rather than looked up again at `PushSolution` time: the
+    /// block-found path books against this address, and a later lookup (the
+    /// allocate token is already consumed) could miss or answer differently.
     pub miner_address: AddressId,
     /// Block-header `version` field the JDC declared.
     pub version: u32,
@@ -78,9 +56,8 @@ pub struct DeclaredJob {
     /// from prefix + extranonce + suffix).
     pub wtxid_list: Vec<[u8; 32]>,
     /// Raw witness-serialised transactions, keyed by position in
-    /// `wtxid_list`. Resolved by the JDS from its template-tx cache
-    /// plus the `ProvideMissingTransactions` round-trip (see
-    /// `jdp::tx_validation` — landing in a follow-up commit).
+    /// `wtxid_list`. Resolved by the JDS from its template-tx cache plus
+    /// the `ProvideMissingTransactions` round-trip.
     pub raw_transactions: HashMap<u32, Vec<u8>>,
     /// `prev_hash` of the pool's current template at declaration time — the
     /// tip every `SetCustomMiningJob` on this declaration is held to, and the
@@ -89,26 +66,22 @@ pub struct DeclaredJob {
     pub prev_hash: [u8; 32],
     /// Wall-clock ms when this declaration was stored.
     pub declared_at_ms: u64,
-    /// How a block found on this job is booked, carried from the ext-0x0003
+    /// How a block found on this job is booked, carried from the ext 0x0003
     /// declare-time check that proved this coinbase pays the pool's issued
-    /// payout set. `None` when nothing proved it — a base-protocol
-    /// declaration, or a connection that never negotiated 0x0003 — and then
-    /// a found block is reported but not booked.
+    /// payout set. `None` when nothing proved it (base-protocol declaration,
+    /// or 0x0003 not negotiated): a found block is then reported, not booked.
     pub booking: Option<PayoutBooking>,
     /// ext 0x0003/distribution_id TLV Field: the `distribution_id` this
     /// declaration was accepted against, whether or not a block found on it
     /// can be booked.
     ///
-    /// Deliberately NOT read off [`Self::booking`], which is the narrower
-    /// claim: `booking` additionally requires the distribution's settlement
-    /// snapshot to have landed (`bookable`). A declaration against a
-    /// non-bookable distribution is still fully validated and still served —
-    /// only a found block is reported instead of booked. Deriving the
-    /// reference from `booking` would turn that degraded-but-working state
-    /// into a hard `custom-jobs-require-solo` refusal on the mining side.
+    /// Not derived from [`Self::booking`], which additionally requires the
+    /// distribution's settlement snapshot: a declaration against a
+    /// non-bookable distribution is still valid and served, and must not hit
+    /// the mining side's `custom-jobs-require-solo` refusal.
     ///
-    /// `None` for a base-protocol declaration, which is what the mining-side
-    /// Solo gate is meant to catch.
+    /// `None` for a base-protocol declaration, which is what that Solo gate
+    /// catches.
     pub distribution_id: Option<u64>,
 }
 
@@ -149,11 +122,9 @@ impl DeclaredJobStore {
     /// Insert a declared job. If the store holds [`MAX_DECLARED_JOBS`]
     /// already, the oldest entry is evicted.
     ///
-    /// Inserting a job with a `new_token` that's already in the
-    /// store replaces the existing entry (its FIFO position is
-    /// preserved). This is defensive — JDS-generated tokens are
-    /// random 16-byte values so collisions are astronomically
-    /// unlikely; the replace path keeps the API total.
+    /// A `new_token` already in the store replaces the existing entry and
+    /// keeps its FIFO position (tokens are random, so this only keeps the
+    /// API total).
     pub fn insert(&mut self, job: DeclaredJob) {
         let token = job.new_token;
         if self.jobs.insert(token, job).is_some() {
@@ -179,8 +150,8 @@ impl DeclaredJobStore {
     ///    solution's `prev_hash`. Among matches, pick the most
     ///    recently declared.
     /// 2. Fall back to the most-recently-declared job overall when
-    ///    no `prev_hash` match exists. This fallback IS the spec's rule
-    ///    (SV2 JDP/PushSolution); step 1 is our narrowing of it.
+    ///    no `prev_hash` match exists. This fallback is the spec's rule
+    ///    (SV2 JDP/PushSolution); step 1 narrows it.
     ///
     /// Returns `None` only when the store is empty.
     pub fn match_for_solution(&self, solution_prev_hash: &[u8; 32]) -> Option<&DeclaredJob> {
@@ -204,12 +175,8 @@ impl DeclaredJobStore {
 
     /// Iterate stored jobs in **insertion order** (oldest first).
     ///
-    /// No production caller: a JDP session's store is dropped with the
-    /// session, and the disconnect path clears the BRIDGE by session id
-    /// (`evict_for_jdp_session`) rather than walking this one. What needs it
-    /// is the handler tests — `accept_declaration` keys a job under a token
-    /// the JDS mints itself, so a caller that did not see the outbound
-    /// `DeclareMiningJobSuccess` has no key to `get` by.
+    /// For handler tests: `accept_declaration` keys a job under a token the
+    /// JDS mints itself, so a test has no key to `get` by.
     pub fn iter(&self) -> impl Iterator<Item = &DeclaredJob> {
         self.order.iter().filter_map(|t| self.jobs.get(t))
     }
@@ -283,9 +250,7 @@ mod tests {
         assert!(s.get(&tok(0x04)).is_some());
     }
 
-    /// Replacing an existing token (same `new_token`) does NOT
-    /// rotate the FIFO and does NOT evict — the new entry takes
-    /// over the old slot, insertion order is preserved.
+    /// Replacing an existing token neither rotates the FIFO nor evicts.
     #[test]
     fn replace_existing_token_preserves_fifo_position() {
         let mut s = DeclaredJobStore::new();

@@ -8,29 +8,26 @@
 //! have). The bulk insert lives in `bp-db`; this module wraps it in the
 //! per-block transaction the block-found path needs.
 //!
-//! There is no balance table here. Group-Solo pays what the coinbase
-//! pays and owes nothing afterwards — see the crate docs — so these rows
-//! are a record of what happened, never an obligation. That is also why
-//! the writer can be plainly idempotent instead of accumulating: a
-//! redelivered block-found must leave the history exactly as the first
-//! delivery did, and the UNIQUE index is enough to guarantee it.
+//! There is no balance table: Group-Solo owes nothing after the coinbase
+//! (see the crate docs), so these rows are a record, never an obligation.
+//! That lets the writer be plainly idempotent: a redelivered block-found
+//! leaves the history as the first delivery wrote it, guaranteed by the
+//! UNIQUE index.
 
 use bp_common::{AddressId, Sats};
 use bp_db::{bulk_insert_pplns_group_block_history, GroupPayoutHistoryInsert};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-// Shared with PPLNS — one source of truth for the rowType wire strings
-// + apply result / error shapes. Group-Solo's audit rows add
-// `sharesInRound` fields (see [`AuditRow`]) but the discriminator
-// itself is identical, so we alias the shared enum.
+// Shared with PPLNS: one source of truth for the rowType wire strings and
+// the apply result / error shapes. Group-Solo's rows add `sharesInRound`
+// fields (see `AuditRow`) but the discriminator is identical.
 pub use bp_coinbase_snapshot::{
     ApplyDistributionResult, LedgerError, PayoutRowType as GroupPayoutRowType,
 };
 
-/// One row in the payout history. Group-Solo's `sharesInRound` +
-/// `totalSharesInRound` slots are preserved here so the log reflects the
-/// PROP-round split the coinbase was built from.
+/// One row in the payout history. `sharesInRound` + `totalSharesInRound`
+/// record the round split the coinbase was built from.
 #[derive(Clone, Debug)]
 pub struct AuditRow {
     pub address: AddressId,

@@ -17,8 +17,8 @@
 //!   the prospective finder's address.
 //! - `on_block_found` — called when a Group-Solo finder wins a block.
 //!   Writes the payout history from the block's OWN coinbase, resets
-//!   the round (Variant A — preserves `lastAcceptedShareAt`), drops
-//!   the group's snapshots, invalidates the distribution cache.
+//!   the round (keeping `lastAcceptedShareAt`), drops the consumed
+//!   snapshots, invalidates the distribution cache.
 //! - `manual_reset` — admin-triggerable wrapper.
 //! - `shutdown` — flips the cancel watch so background tasks exit.
 
@@ -100,18 +100,14 @@ pub enum EngineError {
 impl EngineError {
     /// Would retrying this ever succeed?
     ///
-    /// The confirmation watcher re-applies a pending block on every
-    /// tick and only drops it once the apply returns `Ok`. That is
-    /// right for a database blip and wrong for a verdict: a snapshot
-    /// that expired, a coinbase that burned its own subsidy or an
-    /// address that will not parse produce the SAME failure forever,
-    /// so retrying them is an infinite loop that hides the block
-    /// behind a repeating warning instead of surfacing it once.
+    /// The confirmation watcher re-applies a pending block on every tick
+    /// until the apply returns `Ok`. An expired snapshot, a coinbase below
+    /// its own subsidy or an unparseable address fail the same way forever,
+    /// so they are terminal: surfaced once instead of retried endlessly.
     ///
-    /// Terminal here does not mean the block is lost — it means no
-    /// automatic path can book it, and the operator reprocess reads
-    /// the block's own coinbase off the chain rather than the parked
-    /// blob.
+    /// Terminal does not mean the block is lost, only that no automatic
+    /// path can book it; the operator reprocess reads the block's own
+    /// coinbase off the chain.
     pub fn is_terminal(&self) -> bool {
         match self {
             EngineError::Config(_)
@@ -160,11 +156,9 @@ struct Inner {
     mode_cache: StdMutex<HashMap<Uuid, CachedGroupMode>>,
     /// Per-group highest time-bucket for which a windowed `record_share`
     /// already triggered a trim. The window only sheds whole buckets at hour
-    /// boundaries, so trimming on every share would spend a Redis round-trip
-    /// that is a no-op ~99% of the time. We trim only when a share opens a
-    /// *new* bucket (≈ once/hour/group); the payout read path still trims with
-    /// real wall-clock, so this only bounds Redis between reads, never affects
-    /// correctness. (An out-of-order older share never lowers the watermark.)
+    /// boundaries, so the record path trims only when a share opens a *new*
+    /// bucket. The payout read path still trims with wall-clock time, so this
+    /// only bounds Redis between reads and never affects correctness.
     window_trim_watermark: StdMutex<HashMap<Uuid, i64>>,
 }
 
@@ -195,12 +189,10 @@ fn should_trim_on_bucket(watermark: Option<i64>, bucket_id: i64) -> bool {
 }
 
 /// `(PayoutMode, window_ms)` to use when the per-share mode lookup hits a DB
-/// error. The mode is immutable, so a cached entry — even an expired one —
+/// error. The mode is immutable, so a cached entry, even an expired one,
 /// still carries the correct mode; reusing it keeps a `Window` group's shares
-/// flowing into the window aggregate during a transient DB blip instead of
-/// silently misrouting them to the PROP keys (where the window read never sees
-/// them). `Prop` is only the cold fallback for a group never resolved. Pure so
-/// the "never misroute on a transient error" rule is unit-testable.
+/// out of the PROP keys, where the window read never sees them. `Prop` is only
+/// the cold fallback for a group never resolved.
 fn mode_on_lookup_error(cached: Option<CachedGroupMode>) -> (PayoutMode, i64) {
     match cached {
         Some(c) => (c.mode, c.window_ms),
@@ -286,8 +278,7 @@ impl GroupSoloEngine {
 
         // Core mode (`background_tasks == false`) skips the cron: the
         // per-group round-reset mutates rounds, which is the Satellite's
-        // job. `reset_tasks` stays empty so `reschedule_group` remains a
-        // safe no-op-add.
+        // job. `reset_tasks` then starts empty.
         let mut reset_tasks: HashMap<Uuid, ResetTask> = HashMap::new();
         if background_tasks {
             // Spawn a per-group reset cron for every active group with a
@@ -387,13 +378,11 @@ impl GroupSoloEngine {
 
     /// Resolve a group's `(PayoutMode, window_ms)`, caching the result for the
     /// hot share path. A cache miss reads the `pplns_group` row once. On a DB
-    /// error we fall back to the last cached entry **even if expired** — the
-    /// mode is immutable so its mode is still correct, and a stale `window_ms`
-    /// only over-/under-trims on the record path (the read path always re-trims
-    /// with a fresh `window_ms`, so payouts are unaffected). Routing a Window
-    /// group's shares to the PROP keys during a DB blip would instead drop them
-    /// from the window aggregate for good, so PROP is only the cold fallback for
-    /// a group we have never resolved. Neither error fallback is cached.
+    /// error the last cached entry is reused **even if expired**: the mode is
+    /// immutable, and a stale `window_ms` only mis-trims the record path (the
+    /// read path re-trims with a fresh one). Routing a Window group's shares to
+    /// the PROP keys would drop them from the window for good, so PROP is only
+    /// the cold fallback for a never-resolved group. Neither fallback is cached.
     async fn resolve_group_mode(&self, group_id: Uuid) -> (PayoutMode, i64) {
         let cached = {
             let cache = self.inner.mode_cache.lock().expect("mode_cache poisoned");
@@ -439,11 +428,8 @@ impl GroupSoloEngine {
     /// Drop the cached `(PayoutMode, window_ms)` for a group so the next share
     /// re-reads it from Postgres. Call this after a settings edit that changes
     /// the round-reset cadence: the cadence is reinterpreted as the window
-    /// length, so a stale cache would keep the record-path trim using the OLD
-    /// length for up to `MODE_CACHE_TTL`. On a window *grow* that stale-small
-    /// length would over-trim and permanently drop a bucket the new (larger)
-    /// window should keep, so we invalidate eagerly. (The mode itself is
-    /// immutable; only the window length can move.)
+    /// length, and on a window *grow* a stale shorter length would make the
+    /// record-path trim permanently drop a bucket the larger window must keep.
     pub fn invalidate_mode_cache(&self, group_id: Uuid) {
         self.inner
             .mode_cache
@@ -454,9 +440,8 @@ impl GroupSoloEngine {
 
     /// Record-path trim gate for a windowed share: returns `true` (and bumps
     /// the watermark) only when `timestamp_ms` falls in a strictly-newer
-    /// hour-bucket than the last one we trimmed for this group — see
-    /// [`should_trim_on_bucket`]. A short `StdMutex`-guarded map lookup, far
-    /// cheaper than the Redis round-trip it gates.
+    /// hour-bucket than the last one trimmed for this group (see
+    /// [`should_trim_on_bucket`]).
     fn advance_trim_watermark(&self, group_id: Uuid, timestamp_ms: i64) -> bool {
         let bucket_id = timestamp_ms.div_euclid(WINDOW_BUCKET_MS);
         let mut marks = self
@@ -474,10 +459,8 @@ impl GroupSoloEngine {
 
     /// After a windowed append at `now_ms`: trim the group's window once per
     /// hour-bucket (gated by [`Self::advance_trim_watermark`]), for both
-    /// lanes. The window sheds whole buckets at hour boundaries, so a trim
-    /// per append would be a no-op Redis round-trip ~99% of the time. The
-    /// payout read path trims with real wall-clock regardless, so this only
-    /// bounds Redis between reads.
+    /// lanes. The payout read path trims with wall-clock time regardless, so
+    /// this only bounds Redis between reads.
     async fn trim_window_at_bucket_boundary(
         &self,
         group_id: Uuid,
@@ -548,10 +531,8 @@ impl GroupSoloEngine {
                 "best-share update failed (cosmetic; round wipes on block-found)"
             );
         }
-        // Distribution depends on (round + balances); a new share
-        // changes the round. Drop the whole cache (keyed by triple),
-        // safer than invalidating only one (group, reward, finder)
-        // tuple — the round has changed for all of them.
+        // A new share changes the round for every cached (group, reward,
+        // finder) triple, so drop the whole distribution cache.
         self.inner.distribution_builder.invalidate_all();
         Ok(())
     }
@@ -561,11 +542,9 @@ impl GroupSoloEngine {
     /// sliding window and self-trims like [`Self::record_share`], so the
     /// round-stats rate divides rejects by accepted work of the same period.
     ///
-    /// Bucketed on wall-clock, not on a share timestamp: a rejected share
-    /// carries none (`SharedRejectedShare` has no accept time to report), and
-    /// the lane feeds only the stats view, so stream lag of a few seconds
-    /// moving a reject into the neighbouring hour-bucket changes nothing a
-    /// payout depends on.
+    /// Bucketed on wall-clock time: a rejected share carries no accept time,
+    /// and the lane feeds only the stats view, so stream lag moving a reject
+    /// into the neighbouring hour-bucket changes nothing a payout depends on.
     pub async fn record_reject(
         &self,
         group_id: Uuid,
@@ -630,13 +609,10 @@ impl GroupSoloEngine {
     /// produced that list stored its snapshot under it, and nothing else
     /// writes that key.
     ///
-    /// It must NOT rebuild the distribution here. `record_share`
-    /// invalidates the in-flight cache, so a single share landing between
-    /// job issue and block-found makes a rebuild run against a moved
-    /// round — measured on a two-member group as 187.5 M/125 M at job
-    /// time versus 31.25 M/281.25 M at block-found. The coinbase pays the
-    /// first pair. Missing snapshot → typed error, so the block is booked
-    /// by an operator rather than booked wrong.
+    /// It must NOT rebuild the distribution: a single share landing between
+    /// job issue and block-found moves the round, and a rebuild would book a
+    /// split the coinbase did not pay. Missing snapshot → typed error, so
+    /// the block is booked by an operator rather than booked wrong.
     pub async fn weight_snapshot_for_block_found(
         &self,
         group_id: Uuid,
@@ -750,9 +726,8 @@ impl GroupSoloEngine {
         };
 
         // The one hard gate: a coinbase that pays less than its own
-        // subsidy destroyed money it was entitled to. Nothing healthy
-        // produces that — not mempool drift, not a stale projection
-        // base, not a job-declaring client's own template.
+        // subsidy destroyed money it was entitled to, which no healthy
+        // template produces.
         let subsidy =
             bp_share::block_subsidy_sats(block_height, self.inner.config.subsidy_halving_interval);
         if actual.total_value_sats < subsidy {
@@ -952,8 +927,7 @@ impl GroupSoloEngine {
     }
 
     /// Signal background tasks to exit. Best-effort. Flips the global cancel
-    /// (dust-sweep + others) and signals each per-group reset cron's own
-    /// cancel channel.
+    /// and signals each per-group reset cron's own cancel channel.
     pub fn shutdown(&self) {
         let _ = self.inner.cancel_tx.send(true);
         if let Ok(tasks) = self.inner.reset_tasks.lock() {
@@ -1020,11 +994,8 @@ async fn load_active_schedules(pool: &PgPool) -> Result<Vec<ResetSchedule>, Engi
     Ok(out)
 }
 
-// In a future iteration we can give `shutdown` proper join-handle
-// tracking via a `Vec<JoinHandle<()>>` field on `Inner`. For now,
-// background tasks self-terminate on cancel and the engine drops
-// their handles immediately (`std::mem::drop` after `spawn_*`).
-// Time-out on shutdown is the caller's concern.
+// Background tasks exit on cancel; `shutdown` does not join them, so a
+// shutdown time-out is the caller's concern.
 const _SHUTDOWN_HOOK_DOC: Duration = Duration::from_secs(0);
 
 #[cfg(test)]
@@ -1061,7 +1032,7 @@ mod tests {
 
     #[test]
     fn lookup_error_reuses_cached_mode_never_misroutes_window() {
-        // No cached entry → cold fallback is PROP (legacy default).
+        // No cached entry → cold fallback is PROP (the default mode).
         assert_eq!(mode_on_lookup_error(None), (PayoutMode::Prop, 0));
         // A cached Window entry (even expired) is reused on a DB error, so the
         // group's shares keep flowing into the window — NOT the PROP keys.

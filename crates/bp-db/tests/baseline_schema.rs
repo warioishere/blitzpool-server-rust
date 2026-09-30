@@ -102,7 +102,7 @@ async fn an_empty_database_boots_to_the_full_schema() {
     };
 
     // Negative control: the same migrations without the baseline fail on an
-    // empty database, which is how every fresh deploy failed before it.
+    // empty database, so the baseline is what makes a fresh deploy boot.
     let without_baseline =
         std::env::temp_dir().join(format!("bp-baseline-without-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&without_baseline);
@@ -151,7 +151,7 @@ async fn an_empty_database_boots_to_the_full_schema() {
         assert!(tables.iter().any(|x| x == t), "{t} missing: {tables:?}");
     }
     // A column only a later migration adds (0009), and 0016's partial index:
-    // the baseline is the state after 0016, not the TS pool's.
+    // the full migration set must land on top of the baseline.
     let fp = schema_fingerprint(pool.pool()).await;
     assert!(fp
         .iter()
@@ -168,7 +168,7 @@ async fn an_empty_database_boots_to_the_full_schema() {
     drop_db(&admin, &db).await;
 }
 
-/// Prod's shape: every base table exists (built long before the baseline) and
+/// Prod's shape: every base table already exists and
 /// `_sqlx_migrations` has no version 0. The baseline must record itself and
 /// change nothing.
 #[tokio::test]

@@ -2,25 +2,20 @@
 
 //! Cross-process routing-cache sync.
 //!
-//! Group-Solo + Blockparty membership lives in per-process in-memory routing
-//! caches that the Stratum mode-gate reads. In the Core/Satellite split the
-//! API writers and the Stratum Front are SEPARATE processes, so a membership
-//! change made via the API doesn't reach the Front's cache (it's hydrated at
-//! boot + on in-process changes only).
+//! Group-Solo and Blockparty membership live in per-process routing caches
+//! the Stratum mode gate reads, but the API writers and the Front are
+//! separate processes.
 //!
-//! This module closes that gap two ways:
-//! - **Publish** ([`StreamCacheNotifier`]): the writer process `XADD`s a
-//!   [`CacheInvalidation`] to the `cache:invalidate` stream after every
-//!   membership mutation (wired via [`bp_group_mgmt_engine::MembershipChangeNotifier`]).
-//! - **Consume + backstop** ([`spawn`]): the Front drains the stream (tail-start
-//!   — it warmed from the DB at boot) and rebuilds the matching cache, AND
-//!   rebuilds both on a periodic timer so a missed event self-heals.
+//! - **Publish** ([`StreamCacheNotifier`]): the writer `XADD`s a
+//!   [`CacheInvalidation`] to `cache:invalidate` after every membership
+//!   mutation (via [`bp_group_mgmt_engine::MembershipChangeNotifier`]).
+//! - **Consume + backstop** ([`spawn`]): the Front drains the stream from
+//!   the tail (it warmed from the DB at boot) and rebuilds the matching
+//!   cache, and rebuilds both on a timer so a missed event self-heals.
 //!
-//! The same stream carries [`cache_kind::SETTLEMENT`], for the same
-//! reason and in the opposite direction: the SV2 ext-0x0003 payout
-//! registry lives on the Front, and the process that BOOKS a block
-//! (`payout`) is a different one. See [`crate::settlement`] — including
-//! why that kind is deliberately absent from the periodic backstop.
+//! The same stream carries [`cache_kind::SETTLEMENT`]: the ext 0x0003
+//! payout registry lives on the Front, and `payout` books blocks. See
+//! [`crate::settlement`], including why that kind has no backstop.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,43 +39,25 @@ use crate::group_service::SharedGroupService;
 
 /// Consumer group for the Front's invalidation drain.
 ///
-/// **One group, shared by every front — so exactly ONE front may consume
-/// it.** A Redis consumer group hands each entry to exactly one consumer,
-/// so with two fronts running this code each invalidation reaches whichever
-/// asked first and the other never sees it. That is survivable for the
-/// membership kinds (the 60 s [`BACKSTOP_INTERVAL`] rebuild covers a miss)
-/// and a real, if bounded, window for [`cache_kind::SETTLEMENT`], which
-/// deliberately has no backstop — see [`crate::settlement`].
-///
-/// Making a settlement reach EVERY front means a group per front, not a
-/// consumer name per front: distinct consumer names inside one group still
-/// split the entries between them. It would need a stable per-instance
-/// identifier (a fresh group per boot leaks a group and a growing PEL each
-/// restart), or dropping the group entirely in favour of a plain tail
-/// `XREAD`, which is the natural primitive for a broadcast and needs no
-/// acks — the Front warms both caches from the DB at boot, so entries
-/// missed while it was down are not needed.
-///
-/// Left as-is on an OPERATOR DECISION, not by omission: this pool runs one
-/// front and is not going to run more (stated 2026-08-03). So the shared
-/// group is correct for the deployment it has, and rebuilding it would
-/// change shared stream infrastructure to serve a topology nobody wants.
-///
-/// What that decision buys, and therefore what it costs to reverse: the
-/// settlement fan-out ([`crate::settlement`]) is allowed to assume the one
-/// front hears every invalidation. A second front would silently keep a
+/// ⚠️ **One group shared by every front, so exactly ONE front may consume
+/// it** (operator decision: the pool runs one front). A consumer group
+/// hands each entry to one consumer, so a second front would miss entries:
+/// the 60 s [`BACKSTOP_INTERVAL`] covers membership, but
+/// [`cache_kind::SETTLEMENT`] has no backstop, and a missed one keeps a
 /// pre-settlement payout distribution current for up to one publish
-/// interval. `two_consumers_in_one_group_split_the_entries` pins the
-/// underlying semantics so that consequence cannot be re-discovered the
-/// hard way.
+/// interval.
+///
+/// Reaching every front needs a group per front (distinct consumer names
+/// in one group still split entries) or a plain tail `XREAD`.
+/// `two_consumers_in_one_group_split_the_entries` pins the semantics.
 const GROUP: &str = "cache-sync-front";
 const CONSUMER: &str = "c1";
 const BATCH: usize = 32;
 const BLOCK_MS: usize = 1000;
 const ERROR_BACKOFF: Duration = Duration::from_millis(500);
-/// Full-rebuild safety net for any invalidation the stream consumer missed
-/// (e.g. a brief Redis blip). Membership changes aren't latency-critical, so a
-/// minute is plenty; the stream path handles the common case instantly.
+/// Full-rebuild safety net for any invalidation the consumer missed.
+/// Membership changes are not latency-critical; the stream handles the
+/// common case instantly.
 const BACKSTOP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Publishes membership-change invalidations onto the `cache:invalidate` stream.
@@ -208,14 +185,11 @@ pub(crate) fn spawn(
     CacheSyncHandle { task, cancel }
 }
 
-/// §10: a block settled on another process. Every payout distribution
-/// this Front published encodes pre-settlement ledger balances, so the
-/// acceptance window has to close on them now — a job-declaring client
-/// still declaring against them would pay those balances a second time.
-///
-/// Unlike the membership rebuilds this reads no database: the registry
-/// simply bumps its settlement epoch and the JDP publisher pushes a
-/// fresh distribution built from the post-settlement ledger.
+/// §10: a block settled on another process. Every distribution this Front
+/// published encodes pre-settlement balances, so their acceptance window
+/// closes now; declaring against them would pay those balances twice.
+/// Reads no database: the registry bumps its settlement epoch and the JDP
+/// publisher pushes a fresh distribution.
 fn invalidate_payout_distributions(
     registry: &Arc<std::sync::OnceLock<bp_stratum_v2::jdp_server::DistributionInvalidationHandle>>,
 ) {
@@ -240,18 +214,16 @@ async fn rebuild_group(group: &SharedGroupService, gate: &Arc<BlitzpoolModeGate>
     reconcile_gate_modes(group, gate).await;
 }
 
-/// After the address cache reflects a membership change, flip the **live** mode
-/// gate for already-connected miners so their running connection's shares route
-/// correctly without a reconnect:
+/// After a membership change, flip the **live** mode gate for connected
+/// miners so their shares route correctly without a reconnect:
 ///
-/// - a `Solo`-gated miner now in an active group → `GroupSolo` (the join case:
-///   a miner that solo-mined before joining keeps a self-refreshing Solo marker,
-///   so its authorize-time resolution stuck on Solo — this is what makes an
-///   approved join take effect from the next share),
-/// - a `GroupSolo`-gated miner no longer in an active group → `Solo` (left /
+/// - `Solo` miner now in an active group → `GroupSolo` (its authorize-time
+///   mode stays Solo otherwise; this makes an approved join take effect
+///   from the next share),
+/// - `GroupSolo` miner no longer in an active group → `Solo` (left /
 ///   kicked / dissolved).
 ///
-/// Runs on every group invalidation (instant on approve) + the 60s backstop.
+/// Runs on every group invalidation and on the backstop.
 async fn reconcile_gate_modes(group: &SharedGroupService, gate: &Arc<BlitzpoolModeGate>) {
     let cache = group.service.address_cache();
     let (mut upgraded, mut downgraded) = (0u32, 0u32);
@@ -333,16 +305,8 @@ mod tests {
     /// The constraint behind [`GROUP`]: two consumers in ONE group SPLIT the
     /// entries — they do not each get a copy.
     ///
-    /// Every front runs this module with the same group and the same
-    /// consumer name, so a second front does not receive an invalidation the
-    /// first one took. For the membership kinds the 60 s backstop rebuild
-    /// covers that; [`cache_kind::SETTLEMENT`] has no backstop by design, so
-    /// there the miss is a real (bounded) window in which a JDC can keep
-    /// declaring against pre-settlement weights.
-    ///
-    /// Asserted on the TOTAL number of deliveries rather than on who got
-    /// what: which consumer wins a race is not the property, "each entry is
-    /// delivered once, not once per front" is.
+    /// Asserted on the TOTAL number of deliveries: the property is "each
+    /// entry is delivered once, not once per front", not who wins a race.
     #[tokio::test]
     async fn two_consumers_in_one_group_split_the_entries() {
         let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 1).await else {
@@ -383,16 +347,9 @@ mod tests {
         );
     }
 
-    /// MONEY / ext 0x0003 §10: a settlement must cross the process
-    /// boundary. Under the role split `payout` books the block and `front`
-    /// holds the payout registry, so the settling process has no local
-    /// handle — `.get()` returns `None` and the invalidation was silently
-    /// dropped. Every Stratum block in the production topology took that
-    /// path, and a job-declaring client would have kept declaring against
-    /// pre-settlement weights, paying those ledger balances twice.
-    ///
-    /// Both halves are real here: a settling process with NO registry
-    /// publishes, and a second process with one receives and invalidates.
+    /// MONEY / ext 0x0003 §10: a settlement crosses the process boundary.
+    /// `payout` books the block with no local registry and publishes; the
+    /// `front`, which holds the registry, receives and invalidates.
     #[tokio::test]
     async fn a_settlement_on_one_process_invalidates_the_registry_on_another() {
         use bp_stratum_v2::bridge::{JdpDeclaredJobRegistry, PayoutDistributionEntry};
@@ -400,13 +357,9 @@ mod tests {
         use bp_stratum_v2::jdp_server::{JdpServerHooks, StratumV2JdpServer};
         use bp_stratum_v2::noise::NoiseConfig;
 
-        // DB 16, and it has to be its own: DB 9 was shared with
-        // `redis_backup`'s test in this same binary, which FLUSHDBs it. The
-        // comment here used to blame "other crates" for the resulting
-        // flakiness — per-binary ranges (`bp_test_support::redis_db`) rule
-        // those out; the collision was a sibling. The publish+read below
-        // still RETRIES, which costs a round on a wipe rather than a red
-        // test while a broken mechanism never produces an entry.
+        // DB 16 is this test's own; siblings in this binary FLUSHDB theirs.
+        // The publish+read below retries, so a wipe costs a round while a
+        // broken mechanism never produces an entry.
         let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 16).await else {
             eprintln!("redis unreachable — skipping settlement cross-process test");
             return;

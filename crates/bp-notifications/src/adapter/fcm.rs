@@ -61,8 +61,8 @@ pub struct FcmAdapter {
     service_account: FcmServiceAccount,
     cached_token: Arc<Mutex<Option<CachedToken>>>,
     send_url: String,
-    /// Pre-built encoding key — RSA PEM parsing is non-trivial so we
-    /// do it once at construction.
+    /// Pre-built encoding key: RSA PEM parsing is non-trivial, so it
+    /// happens once at construction.
     encoding_key: EncodingKey,
 }
 
@@ -180,10 +180,9 @@ impl FcmAdapter {
     ) -> AdapterResult<FcmOutcome> {
         let access_token = self.access_token().await?;
 
-        // Build the v1 API JSON envelope. We avoid building a strongly
-        // typed Message struct because `data{}` is open-ended and the
-        // android/apns blocks have a lot of optional fields we don't
-        // use — direct json! macro stays readable.
+        // v1 API JSON envelope, built with json! rather than a typed
+        // Message struct: `data{}` is open-ended and the android/apns
+        // blocks carry many optional fields that are not used.
         let mut data = serde_json::Map::new();
         data.insert(
             "type".into(),
@@ -277,9 +276,8 @@ fn current_millis_string() -> String {
 }
 
 /// FCM v1 signals permanent token failure with either HTTP 404 +
-/// `UNREGISTERED` or HTTP 400 + `INVALID_ARGUMENT`. We string-match
-/// the `errorCode` field — robust enough for the two known shapes
-/// and trivial to extend.
+/// `UNREGISTERED` or HTTP 400 + `INVALID_ARGUMENT`, matched on the
+/// `errorCode` string.
 fn is_invalid_token_error(status: u16, body: &str) -> bool {
     if status == 404 {
         return true;

@@ -29,10 +29,8 @@ pub fn merkle_root_from_coinbase(coinbase_hash: &[u8; 32], merkle_branch: &[[u8;
 /// `merkle_path` carry. Odd levels duplicate their last entry, as consensus
 /// does.
 ///
-/// It lives HERE, beside the fold, deliberately: the two have to agree on the
-/// duplicate-last rule, and the cross-check in this module's tests is what
-/// establishes that they do. A second copy elsewhere would be free to drift
-/// from this one with nothing failing.
+/// It lives beside the fold deliberately: the two must agree on the
+/// duplicate-last rule, and this module's cross-check test pins that they do.
 pub fn coinbase_merkle_branch(leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
     let mut level = leaves.to_vec();
     let mut branch = Vec::new();
@@ -132,11 +130,9 @@ mod tests {
         level[0]
     }
 
-    /// The cross-check runs against the PRODUCTION branch builder, not a
-    /// test-local copy of it. `reference_root` stays hand-rolled on purpose —
-    /// it is the independent second opinion the builder is measured against,
-    /// and it reaches the root by a different route (pair the whole level,
-    /// repeat) than the branch does (siblings on the way up).
+    /// The cross-check runs against the production branch builder.
+    /// `reference_root` is hand-rolled on purpose: an independent route to the
+    /// root (pair the whole level, repeat) rather than siblings on the way up.
     #[test]
     fn fold_matches_full_tree_root_for_various_tx_counts() {
         // 1 (coinbase-only), 2, 3, 4, 5, 7, 9 transactions. Odd counts force

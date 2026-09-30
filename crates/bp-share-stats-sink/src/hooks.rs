@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `bp_share_hook` trait impls — fan a single share into the six
-//! accumulators that back the 7 PG tables.
+//! `bp_share_hook` trait impls: fan a single share into the accumulators
+//! that back the stats tables.
 //!
-//! Engines used to impl `bp_stratum_v1::hooks::AcceptedShareSink` +
-//! `RejectedShareSink` directly. Both
-//! per-share hooks are decoupled from the wire protocol via
-//! `bp-share-hook` so this single impl serves both SV1 + SV2 servers.
+//! Both per-share hooks come from `bp-share-hook`, decoupled from the wire
+//! protocol, so this single impl serves both the SV1 and SV2 servers.
 //!
 //! **Mode-blind**: every accepted / rejected share lands here regardless
 //! of solo / PPLNS / group-solo. `bin/blitzpool` composes this sink
@@ -34,7 +32,7 @@ use bp_stats::{
 
 use crate::flush::Accumulators;
 
-/// `SharedAcceptedShareSink` impl that mutates the six accumulators on
+/// `SharedAcceptedShareSink` impl that mutates the accumulators on
 /// every accepted share. Cheap to clone (single `Arc`).
 pub struct ShareStatsAcceptedSink {
     accumulators: Arc<Accumulators>,
@@ -83,7 +81,7 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
         // All-time best difficulty tracks the SOLVED difficulty (can exceed
         // the credited/clamped one), stamped with the miner's firmware. Folded
         // into `address_settings_entity."bestDifficulty"` at flush time via
-        // GREATEST — no per-share PG write, no write-through cache to diverge.
+        // GREATEST, so there is no per-share PG write.
         self.accumulators.best_difficulty.add(
             &address_id,
             share.submission_difficulty,
@@ -96,8 +94,8 @@ impl SharedAcceptedShareSink for ShareStatsAcceptedSink {
 }
 
 /// `SharedRejectedShareSink` impl. Address is `Option` because some
-/// reject reasons fire before authorize completes; in that case we
-/// still bump the pool-wide counters but skip per-address ones.
+/// reject reasons fire before authorize completes; such a reject still
+/// bumps the pool-wide counters but skips the per-address ones.
 pub struct ShareStatsRejectedSink {
     accumulators: Arc<Accumulators>,
 }
@@ -158,8 +156,7 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
         // One column pair per reason, no folds — every arm below writes a
         // different pair, so the five counters sum to `rejected_count`. Adding
         // a `RejectedReason` variant without a pair to put it in would break
-        // that sum silently; give it its own, the way migrations 0010 and 0011
-        // did for version rolling and Stale.
+        // that sum silently; a new variant gets its own column pair.
         match reason {
             RejectedReason::JobNotFound => {
                 delta.rejected_job_not_found_count = 1.0;
@@ -182,8 +179,8 @@ impl SharedRejectedShareSink for ShareStatsRejectedSink {
             }
             // Not folded into job-not-found: this is the ordinary tail of a
             // block transition and needs no action, that one is work the pool
-            // never had. Folded together, every block change read as a fleet
-            // of broken miners.
+            // never had. Folded together, every block change would read as a
+            // fleet of broken miners.
             RejectedReason::Stale => {
                 delta.rejected_stale_count = 1.0;
                 delta.rejected_stale_diff1 = difficulty;

@@ -2,10 +2,8 @@
 
 //! ckpool-style job / template lifecycle registry.
 //!
-//! Job and template lifecycle registry:
-//!
-//! 1. **Two maps** keyed by lowercase-hex strings: `jobs` (per-miner
-//!    `MiningJob` + the template-id it belongs to) and `templates`
+//! 1. **Two maps** keyed by integer ids (lowercase hex on the wire):
+//!    `jobs` (per-miner `MiningJob` + the template-id it belongs to) and `templates`
 //!    (the assembled [`ActiveSV1Template`] each batch of jobs was built
 //!    against).
 //!
@@ -26,7 +24,7 @@
 //!    - `Active` — the job has not been retired.
 //!    - `StaleCreditable` — retired ≤
 //!      [`bp_jobs_lifecycle::LifecycleConfig::grace_ms`] ago. The work
-//!      was valid at the moment it was issued; we credit it as if
+//!      was valid at the moment it was issued, so it is credited as if
 //!      current (network-jitter absorption).
 //!    - `StaleRejected` — retired beyond the grace window. Reject with
 //!      a distinct internal counter (wire code 21, same as JobNotFound,
@@ -35,7 +33,7 @@
 //! The lifecycle math itself (`classify`, `age_entries`) lives in
 //! [`bp_jobs_lifecycle`] so it stays in lock-step with the per-channel
 //! Extended-job lifecycle in `bp-stratum-v2::mining::jobs`. This module
-//! keeps the SV1-specific storage shape (hex-string ids,
+//! keeps the SV1-specific storage shape (integer ids shown as hex,
 //! template-indirection, single `Mutex<Inner>` for the global registry)
 //! and delegates the math.
 //!
@@ -134,10 +132,9 @@ impl JobRegistry {
         self.config
     }
 
-    /// Peek the next job-id WITHOUT bumping the counter. Used by the
-    /// vardiff race-clamp snapshot in `StratumV1Client::checkDifficulty`,
-    /// where we record the boundary id and the next `add_job` call
-    /// commits it.
+    /// Peek the next job-id WITHOUT bumping the counter. The vardiff
+    /// race-clamp in the client records it as the ratchet boundary; the
+    /// next `add_job` call commits it.
     pub fn peek_next_job_id(&self) -> u64 {
         self.inner
             .lock()
@@ -232,10 +229,8 @@ impl JobRegistry {
         // caller already handled for an unknown id (`JobNotFound`).
         //
         // The digit check is not redundant: `from_str_radix` accepts a
-        // leading `+`, so a bare parse would let `"+1"` alias job `1`. The
-        // previous string-keyed map never did that (the key was literally
-        // `"1"`), so requiring pure hex digits keeps the wire id canonical
-        // and preserves the old behaviour exactly.
+        // leading `+`, so a bare parse would let `"+1"` alias job `1`.
+        // Requiring pure hex digits keeps the wire id canonical.
         if job_id_hex.is_empty() || !job_id_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
@@ -247,8 +242,8 @@ impl JobRegistry {
         let template_entry = match inner.templates.get(&job_entry.template_id) {
             Some(t) => t.clone(),
             None => {
-                // Orphan job — its template aged out. Self-prune so we
-                // don't keep classifying the same dead reference.
+                // Orphan job — its template aged out. Self-prune so the
+                // same dead reference is not classified again.
                 inner.jobs.remove(&job_id);
                 return None;
             }
@@ -525,8 +520,8 @@ mod tests {
     }
 
     /// A miner echoing a non-hex job id must resolve to `None` (the caller
-    /// emits `JobNotFound`) rather than panicking — this path is new since
-    /// the id is parsed before the registry lock is taken.
+    /// emits `JobNotFound`) rather than panicking; the id is parsed before
+    /// the registry lock is taken.
     #[test]
     fn classify_rejects_malformed_job_id() {
         let reg = JobRegistry::new(cfg());
@@ -537,8 +532,7 @@ mod tests {
         assert!(reg.classify("", 1_500).is_none());
         assert!(reg.classify("zzzz", 1_500).is_none());
         // Discriminating case: `from_str_radix` accepts a leading `+`, so a
-        // bare parse would resolve `"+1"` to job 1. The string-keyed map it
-        // replaced never aliased like that, and neither may this.
+        // bare parse would resolve `"+1"` to job 1, which must not happen.
         assert!(
             reg.classify("1", 1_500).is_some(),
             "sanity: job 1 exists, so the +1 assertion below is meaningful"
@@ -833,9 +827,8 @@ mod tests {
     #[test]
     fn aging_does_not_drop_retired_entries_still_within_retention() {
         let reg = JobRegistry::new(cfg());
-        // 4 entries — 2 retired far in the past, 2 fresh.
-        // Note: cleanup(true, …) stamps retired_at at the call-time,
-        // so we directly construct the registry state.
+        // 4 entries — 2 retired far in the past, 2 fresh. cleanup(true, …)
+        // stamps retired_at at call time, so the fresh two are added after.
         for i in 0..2 {
             reg.add_template(dummy_active_template(), 1_000 + i * 1_000);
         }
@@ -911,7 +904,7 @@ mod tests {
         assert_eq!(reg.job_count(), 1);
 
         // Phase 5: add 3 newer entries so the MIN_RETAINED floor doesn't
-        // protect our original.
+        // protect the original.
         for i in 0..3 {
             let later = reg.add_template(dummy_active_template(), t0 + 100 + i);
             reg.add_job(dummy_mining_job(), later, t0 + 100 + i);

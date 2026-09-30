@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Email-binding confirmation template — sent by `AddressEmailService`
-//! when a new address↔email registration starts.
+//! Email-binding confirmation template — sent by the API's email
+//! controller when a new address↔email registration starts.
 
 use chrono::{DateTime, Utc};
 

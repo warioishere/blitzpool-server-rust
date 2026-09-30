@@ -5,30 +5,22 @@
 //!
 //! ## What happens on `DeclareMiningJob`
 //!
-//! The JDC sends a wtxid list as part of `DeclareMiningJob`. The JDS
-//! needs raw transaction bytes for every wtxid so it can later
-//! reconstruct the block on `PushSolution` (SV2 JDP/PushSolution). What drives
-//! the response is which of them the JDS already holds: the wtxids it
-//! has raw bytes for in its current template are covered, and the
-//! missing positions are requested from the JDC via
-//! `ProvideMissingTransactions`. Computed by
-//! [`partition_against_template`].
+//! The JDS needs raw bytes for every declared wtxid to reconstruct the block
+//! on `PushSolution` (SV2 JDP/PushSolution). Wtxids in the current template
+//! are covered; the missing positions are requested from the JDC via
+//! `ProvideMissingTransactions` ([`partition_against_template`]).
 //!
 //! ## Round-trip state
 //!
-//! Between sending `ProvideMissingTransactions` and receiving
-//! `ProvideMissingTransactions.Success`, the JDS holds a
-//! [`PendingDeclaration`] that tracks the request-id, the positions
-//! we asked for, and the raw txs we already had locally. When the
-//! Success frame arrives, [`merge_provided_with_known`] folds the
-//! provided list into the complete `position → raw_tx` map.
+//! Until `ProvideMissingTransactions.Success` arrives, the JDS holds a
+//! [`PendingDeclaration`] (request id, requested positions, locally known
+//! raw txs); [`merge_provided_with_known`] then builds the complete
+//! `position → raw_tx` map.
 //!
-//! ## Byte-order convention
+//! ## Byte order
 //!
-//! All wtxids in this module are 32-byte arrays in **wire byte
-//! order** (the order SV2 sends them on the wire — i.e. the natural
-//! output of SHA256d). Callers are responsible for keying their
-//! template-tx and mempool-wtxid maps in the same byte order.
+//! All wtxids here are in **wire byte order** (the natural SHA256d output);
+//! callers key their template-tx maps the same way.
 
 use std::collections::HashMap;
 
@@ -46,9 +38,8 @@ pub struct PartitionResult {
 }
 
 impl PartitionResult {
-    /// `true` when no transactions are missing — the JDS can skip
-    /// the `ProvideMissingTransactions` step and call
-    /// `acceptDeclaration` directly.
+    /// `true` when no transactions are missing, so the
+    /// `ProvideMissingTransactions` step is skipped.
     pub fn fully_covered(&self) -> bool {
         self.missing_positions.is_empty()
     }
@@ -56,13 +47,9 @@ impl PartitionResult {
 
 // ── partition_against_template ──────────────────────────────────────
 
-/// Partition `wtxid_list` against the JDS's local
-/// `template_txs` (a `wtxid → raw_tx` map keyed in the same byte
-/// order as the wtxid_list entries).
-///
-/// Pure function — no I/O. The result drives the
-/// `ProvideMissingTransactions` request: positions whose wtxids
-/// aren't in the template need to be filled by the JDC.
+/// Partition `wtxid_list` against the JDS's local `template_txs`
+/// (`wtxid → raw_tx`, same byte order). Positions not in the template go
+/// into the `ProvideMissingTransactions` request.
 pub fn partition_against_template(
     wtxid_list: &[[u8; 32]],
     template_txs: &HashMap<[u8; 32], Vec<u8>>,
@@ -86,36 +73,29 @@ pub fn partition_against_template(
 
 // ── PendingDeclaration ──────────────────────────────────────────────
 
-/// In-flight declaration state. Stored on the JDP-session between
-/// emitting `ProvideMissingTransactions` and receiving
-/// `ProvideMissingTransactions.Success`. The handler-layer holds at
-/// most one of these per connection: a second `DeclareMiningJob`
-/// arriving while one is in flight REPLACES it, so the first
-/// declaration is abandoned and its `request_id` never answered.
+/// In-flight declaration state, held on the JDP session between
+/// `ProvideMissingTransactions` and its `.Success`. At most one per
+/// connection: a second `DeclareMiningJob` in the meantime REPLACES it, and
+/// the first `request_id` is never answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingDeclaration {
-    /// `DeclareMiningJob.request_id` — echoed on the Success frame.
+    /// `DeclareMiningJob.request_id`, echoed on the Success frame.
     pub request_id: u32,
-    /// Positions we asked the JDC for (matches the
-    /// `unknown_tx_position_list` field in
+    /// Positions requested from the JDC (`unknown_tx_position_list` in
     /// `ProvideMissingTransactions`).
     pub missing_positions: Vec<u32>,
-    /// Raw txs we already had locally. Caller folds the provided
-    /// list in via [`merge_provided_with_known`] when the Success
-    /// frame arrives.
+    /// Raw txs already held locally; [`merge_provided_with_known`] folds the
+    /// provided list in.
     pub known_raw_txs: HashMap<u32, Vec<u8>>,
 }
 
 // ── merge_provided_with_known ──────────────────────────────────────
 
 /// Error from [`merge_provided_with_known`].
-/// SV2 JDP/ProvideMissingTransactions.Success defines `transaction_list` as
-/// the full transactions "as requested by `ProvideMissingTransactions`, in the
-/// order they were requested" — it fixes the order, and one-entry-per-
-/// requested-position follows from that but is not spelled out as a MUST. We
-/// enforce the count, because a shorter list would silently shift every later
-/// position onto the wrong transaction. A mismatch is a JDC protocol error;
-/// the handler answers it `missing-txs`.
+/// SV2 JDP/ProvideMissingTransactions.Success fixes `transaction_list` to the
+/// requested transactions "in the order they were requested". The count is
+/// enforced too, because a shorter list would shift every later position onto
+/// the wrong transaction. The handler answers a mismatch with `missing-txs`.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MergeError {
     #[error("expected {expected} transactions, got {got}")]
@@ -123,12 +103,10 @@ pub enum MergeError {
 }
 
 /// Fold a `ProvideMissingTransactions.Success` payload into the
-/// known-raw-txs map collected during partition. Returns the
-/// complete `position → raw_tx` map ready for the `acceptDeclaration`
-/// path.
+/// known-raw-txs map and return the complete `position → raw_tx` map.
 ///
-/// The provided list MUST have the same length as
-/// `pending.missing_positions` — order matches index-for-index.
+/// The provided list must match `pending.missing_positions` in length and,
+/// index for index, in order.
 pub fn merge_provided_with_known(
     pending: PendingDeclaration,
     provided: Vec<Vec<u8>>,
@@ -255,9 +233,7 @@ mod tests {
         );
     }
 
-    /// Zero missing positions + zero provided → empty merge (the
-    /// caller would normally skip the ProvideMissingTransactions
-    /// round-trip entirely, but the function is total).
+    /// Zero missing positions + zero provided → the known map unchanged.
     #[test]
     fn merge_provided_zero_positions_is_a_noop() {
         let pending = PendingDeclaration {

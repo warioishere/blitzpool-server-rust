@@ -216,8 +216,8 @@ impl<H: GroupServiceHooks> InvitationService<H> {
 
     /// Public claim of an open invite by an address. Multi-use: the
     /// invitation row stays `pending` so others can also claim. The
-    /// trust anchor is the verified-email binding on the claiming
-    /// address.
+    /// trust anchor is the claiming address's verification (email or
+    /// signature ownership proof).
     pub async fn accept_open_invite(
         &self,
         token: &str,

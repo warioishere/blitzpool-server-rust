@@ -51,8 +51,8 @@ impl NtfyAdapter {
     }
 
     /// Publish a plain-text message to the address-topic. `Tags: bot`
-    /// is set so the SSE-listener in the follow-up Phase can ignore
-    /// echoes of its own outbound traffic.
+    /// is set so the SSE listener can ignore echoes of its own outbound
+    /// traffic.
     pub async fn publish(&self, address: &str, message: &str) -> AdapterResult<()> {
         let url = self.topic_url(address);
         let mut request = self

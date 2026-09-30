@@ -80,19 +80,14 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Ha
             return None;
         }
     };
-    // Deliberately NO FLUSHDB. Every key this harness touches is
-    // namespaced by the per-test `group_id` below, so flushing buys no
-    // isolation — and several tests here share a Redis database index
-    // (there are only 16 and more tests than that), so one flushing on
-    // entry wiped the state a sibling was mid-way through asserting on.
-    // That was the flake.
+    // Deliberately NO FLUSHDB: every key is namespaced by the per-test
+    // `group_id`, and several tests share a Redis database index, so a
+    // flush would wipe state a sibling is still asserting on.
 
     let group_id = Uuid::new_v4();
     seed_group(&pool, group_id, finder_bonus_ppm).await;
 
-    // dust_sweep + per-group reset crons run in background — we
-    // disable dust_sweep to avoid interference; per-group reset
-    // crons load none (no preset on seeded group).
+    // No per-group reset cron is armed: the seeded group has no preset.
     let config = GroupSoloEngineConfig {
         fee_address: Some(AddressId::new(FEE_ADDR).unwrap()),
         ..GroupSoloEngineConfig::default()
@@ -113,14 +108,12 @@ async fn spawn_or_skip(redis_db: u8, finder_bonus_ppm: Option<i32>) -> Option<Ha
 }
 
 async fn seed_group(pool: &PgPool, group_id: Uuid, finder_bonus_ppm: Option<i32>) {
-    // Seed with resetRoundOnBlock = true so the existing tests that assert the
-    // round wipes after a block keep exercising that path. The default-false
-    // (no-reset) behavior has its own dedicated test.
+    // resetRoundOnBlock = true so the tests asserting a post-block round wipe
+    // exercise that path; the default-false behavior has its own test.
     //
-    // The bonus column MUST be the one the engine reads (`finderBonusPpm`, see
-    // distribution.rs). Seeding the retired `finderBonusSats` leaves the engine
-    // reading NULL → zero bonus, which silently turns every bonus test in this
-    // file into a no-bonus test that still passes.
+    // The bonus column MUST be the one the engine reads (`finderBonusPpm`);
+    // any other leaves the engine reading NULL, and every bonus test here
+    // would silently pass as a no-bonus test.
     sqlx::query(
         r#"INSERT INTO pplns_group
              (id, name, "creatorAddress", "adminTokenHash", active,
@@ -138,12 +131,10 @@ async fn seed_group(pool: &PgPool, group_id: Uuid, finder_bonus_ppm: Option<i32>
 
 /// Guard the PREMISE of a bonus test.
 ///
-/// The drift tests below assert that the ledger settles flat — which a
-/// distribution carrying NO bonus does just as happily. That makes them
-/// blind to the one mistake that actually disables the feature: seeding
-/// the wrong bonus column, so the engine reads NULL. Asserting the
-/// finder's share of the score space first means those tests fail loudly
-/// when their own fixture stops carrying a bonus.
+/// The drift tests assert that settlement comes out flat, which a
+/// distribution with NO bonus satisfies too. Asserting the finder's share
+/// of the score space first makes them fail when the fixture stops
+/// carrying a bonus.
 ///
 /// On an even split with a bonus of fraction `f`, the finder ends up
 /// holding `f + (1 − f)/2` of the score space.
@@ -295,9 +286,8 @@ async fn on_block_found_applies_distribution_and_resets_round() {
         .await
         .expect("ok");
 
-    // The build only writes schema-2 (weight) snapshots now, so the
-    // block settles via the scaled path: `claim − paid` from the real
-    // §4 coinbase, resolved by the job's weights fingerprint.
+    // The block settles from the real §4 coinbase, resolved by the job's
+    // weights fingerprint.
     let block_height = 9_995_001;
     let actual = actual_paying_exactly(&result, 312_500_000);
     let outcome = h
@@ -334,22 +324,15 @@ async fn on_block_found_applies_distribution_and_resets_round() {
     drop_harness(h).await;
 }
 
-// ── Overpayment must be recorded as debt, not forgiven ─────────────
+// ── A block richer than the reference revenue settles flat ──────────
 //
 // A JD-client computes its coinbase amounts against ITS OWN template
-// revenue. That used to matter: the finder bonus was a fixed satoshi
-// promise carried as a weight, so §4 paid `bonus · T/t_ref` and a
-// richer block overpaid the finder by the difference — real satoshis,
-// recoverable only by booking a debt and clawing it back next block.
-//
-// The bonus is a PROPORTION now. A weight is exact at every revenue,
-// for every payer, so there is nothing left to overpay and nothing to
-// claw back. These two tests pin that: the same fixtures that used to
-// produce a 5M and a 15M debt now settle flat.
+// revenue. The finder bonus is a PROPORTION, so every weight is exact at
+// every revenue and nothing can be overpaid or owed afterwards.
 
 #[tokio::test]
 async fn a_richer_block_leaves_nobody_owing() {
-    // 16 % finder bonus — what the old 50M-sat carve-out came to.
+    // 16 % finder bonus.
     let h = match spawn_or_skip(12, Some(160_000)).await {
         Some(h) => h,
         None => return,
@@ -388,9 +371,6 @@ async fn a_richer_block_leaves_nobody_owing() {
         .expect("apply");
 
     // Both members are paid their exact §4 share of the RICHER block.
-    // Under the fixed-sats bonus the finder was overpaid ~5M here and
-    // the other member underpaid the mirror amount, and only a ledger
-    // could have put that right afterwards.
     let paid = actual_paying_exactly(&result, T_ACTUAL);
     let history = read_block_history(&h.pool, h.group_id, 9_995_401).await;
     for who in [&finder, &other] {
@@ -446,13 +426,10 @@ async fn count_group_balance_rows(pool: &PgPool, group_id: Uuid) -> i64 {
 
 // ── Test 3b — snapshot-carried apply survives a Redis snapshot overwrite ──
 //
-// The Core/Satellite split race: the per-(group, finder) Redis snapshot is
-// overwritten by continuous template rebuilds before the async apply runs. The
-// fix carries the exact weight snapshot in the block-found event and applies it
-// via `on_block_found_scaled(…, Some(snapshot), …)`, never re-reading Redis.
-// This test freezes a snapshot, then simulates the churn (more shares + a later
-// `build_distribution` overwrite the per-finder Redis key) — the
-// snapshot-carried apply still settles the frozen job-time inputs.
+// Template rebuilds overwrite the per-(group, finder) Redis snapshot before
+// the async apply runs, so the block-found event carries the exact weight
+// snapshot and the apply never re-reads Redis. Pins that the carried snapshot
+// still settles the frozen job-time inputs after that churn.
 #[tokio::test]
 async fn snapshot_carried_apply_survives_redis_overwrite() {
     let h = match spawn_or_skip(11, None).await {
@@ -483,11 +460,9 @@ async fn snapshot_carried_apply_survives_redis_overwrite() {
         .expect("freeze snapshot ok");
     assert_eq!(frozen.reference_revenue_sats, reward);
 
-    // Template churn: more shares + a DIFFERENT reward rebuild overwrites the
-    // per-(group, finder) Redis snapshot key with a moved round (under the
-    // weight model the moved SCORES are the poison — the settlement identity
-    // hashes inputs, so the churned build lands under a different fingerprint
-    // and the per-finder key no longer matches this block's job).
+    // Template churn: more shares + a DIFFERENT reward rebuild overwrite the
+    // per-(group, finder) Redis snapshot key with a moved round, whose
+    // fingerprint no longer matches this block's job.
     h.engine
         .record_share(None, h.group_id, finder.as_str(), 50.0, 1_700_000_000_002)
         .await
@@ -497,8 +472,8 @@ async fn snapshot_carried_apply_survives_redis_overwrite() {
         .await
         .expect("churn rebuild ok");
 
-    // The snapshot-carried scaled apply ignores Redis and settles the frozen
-    // inputs against the block's real §4 coinbase.
+    // The snapshot-carried apply ignores Redis and settles the frozen inputs
+    // against the block's real §4 coinbase.
     let block_height = 9_995_010;
     let actual = actual_paying_exactly(&job, reward);
     let outcome = h
@@ -535,16 +510,11 @@ async fn snapshot_carried_apply_survives_redis_overwrite() {
 
 // ── Test 3b2 — block-found resolves the job's distribution, never a rebuild ──
 //
-// `record_share` invalidates the in-flight cache, so rebuilding the
-// distribution at block-found runs against a round that has moved since the
-// job was issued: the coinbase pays one split and the ledger would book
-// another. Nothing catches it — a fresh build carries the correct reward by
-// construction, so the reward check passes on wrong numbers. The lookup by the
-// winning job's payout-list identity has to answer with the job-time
-// distribution.
-//
-// Shares Redis db 11 with the test above; the suite runs serially
-// (`--test-threads=1`), which the shared PG/Redis already requires.
+// A rebuild at block-found runs against a round that has moved since the job
+// was issued, so the coinbase would pay one split and the history book
+// another, and a fresh build passes the reward check by construction. The
+// lookup by the winning job's payout-list identity must answer with the
+// job-time distribution.
 #[tokio::test]
 async fn block_found_resolves_the_job_time_distribution_not_a_rebuild() {
     let h = match spawn_or_skip(13, None).await {
@@ -576,10 +546,8 @@ async fn block_found_resolves_the_job_time_distribution_not_a_rebuild() {
         .await
         .unwrap();
 
-    // What a rebuild answers with now. If this matched the job-time split the
-    // test would prove nothing, so pin that the round really moved. Under the
-    // weight model the settlement identity hashes the INPUTS (scores,
-    // balances, …), so a moved round means a different fingerprint.
+    // Precondition: the round really moved. The settlement identity hashes
+    // the inputs, so a moved round means a different fingerprint.
     let rebuilt = h
         .engine
         .build_distribution(h.group_id, reward, &a)
@@ -609,11 +577,8 @@ async fn block_found_resolves_the_job_time_distribution_not_a_rebuild() {
 //
 // The lookup must fail rather than substitute something: the per-(group,
 // finder) key and a fresh build both answer with a split the block's coinbase
-// did not pay, and Group-Solo has no reward check that would notice. The caller
-// turns this into "not booked, needs an operator" — wrong numbers on-chain
-// cannot be undone, a missing booking can.
-//
-// Shares Redis db 11; the suite runs serially (`--test-threads=1`).
+// did not pay. The caller turns this into "not booked, needs an operator": a
+// wrong booking cannot be undone, a missing one can.
 #[tokio::test]
 async fn an_unknown_payout_list_resolves_to_nothing() {
     let h = match spawn_or_skip(16, None).await {
@@ -652,8 +617,6 @@ async fn an_unknown_payout_list_resolves_to_nothing() {
 // lives under its own key. Booking one block must not strip the others: a
 // second block found before the next template rebuild has to resolve too, and
 // under the confirmation gate this cleanup runs hours after the fact.
-//
-// Shares Redis db 11; the suite runs serially (`--test-threads=1`).
 #[tokio::test]
 async fn apply_deletes_only_the_payout_list_it_booked() {
     let h = match spawn_or_skip(17, None).await {
@@ -787,12 +750,11 @@ async fn on_block_found_keeps_round_when_reset_flag_false() {
     drop_harness(h).await;
 }
 
-// ── Test 3d — duplicate block-found does not double-count the balance ──
+// ── Test 3d — duplicate block-found does not double the history ──────
 //
 // A replayed / duplicate block-found for the same height (stream redelivery or
-// a stale candidate at the same height) must not inflate `totalPaidSats`. The
-// history dedupes via its UNIQUE; the balance apply is gated on a non-zero
-// history insert so the second apply is a no-op on the balance.
+// a stale candidate at the same height) leaves the payout history exactly as
+// the first delivery wrote it; the history dedupes via its UNIQUE.
 #[tokio::test]
 async fn duplicate_block_found_does_not_double_the_history() {
     let h = match spawn_or_skip(15, None).await {
@@ -918,10 +880,9 @@ async fn on_block_found_re_entrancy_guard_per_group() {
         .iter()
         .filter(|r| matches!(r, Err(EngineError::BlockFoundInProgress { .. })))
         .count();
-    // Either: one succeeded + one in-flight, OR one succeeded + one
-    // got SnapshotMissing (the first call deleted the snapshot
-    // before the second's lock-check raced). Both are acceptable
-    // outcomes of "only one succeeds per (group_id, block_height)".
+    // Exactly one succeeds per (group_id, block_height); the other is either
+    // blocked in-flight or sees SnapshotMissing because the first call
+    // already consumed the snapshot.
     assert_eq!(succeeded, 1, "exactly one call succeeds");
     let other_handled = in_flight == 1
         || matches!(&r1, Err(EngineError::SnapshotMissing { .. }))
@@ -984,14 +945,11 @@ async fn record_reject_updates_round_rejected_total() {
 //
 // When a group has `finderBonusPpm` set AND the finder also has shares
 // this round, the §4 weight model folds the bonus into the finder's
-// single weight — one coinbase output, one ledger upsert per address by
-// construction. (The old model emitted a dedicated bonus output plus a
-// proportional output and had to MERGE them, or Postgres aborted the
-// apply TX on the duplicate `(address, groupId)` key.) This pins the
-// new invariant: single bonus-inclusive output, correctly booked.
+// single weight: one bonus-inclusive coinbase output and one history row
+// per address, correctly booked.
 #[tokio::test]
 async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
-    // 1.6 % of the miner cut — what the old 5M-sat bonus came to.
+    // 1.6 % of the miner cut.
     const BONUS_PPM: i32 = 16_000;
     let h = match spawn_or_skip(8, Some(BONUS_PPM)).await {
         Some(h) => h,
@@ -1000,7 +958,7 @@ async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
     let finder = AddressId::new("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
     let other = AddressId::new("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
     // Finder + a second miner both contribute, so the finder earns a
-    // proportional share ON TOP OF the bonus — the duplicate-emit case.
+    // proportional share ON TOP OF the bonus.
     h.engine
         .record_share(None, h.group_id, finder.as_str(), 70.0, 1_700_000_000_001)
         .await
@@ -1017,11 +975,8 @@ async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
         .await
         .expect("build_distribution ok");
 
-    // §4 folds the finder bonus into the finder's SINGLE weight — one
-    // output per address by construction, so the duplicate-output merge
-    // the old model needed has nothing left to merge. What remains to
-    // pin: exactly one finder output, sitting visibly ABOVE pro-rata
-    // (the folded bonus), and the ledger crediting exactly that.
+    // Exactly one finder output, sitting visibly ABOVE pro-rata (the folded
+    // bonus), and the history booking exactly that.
     let entries = result
         .distribution
         .payout_entries_at(reward)
@@ -1042,10 +997,8 @@ async fn on_block_found_with_finder_bonus_merges_duplicate_outputs() {
         .find(|(a, _)| *a == other)
         .map(|(_, s)| *s)
         .expect("peer must be paid");
-    // Pin the ARITHMETIC, not just the direction. `finder > other · 7/3`
-    // is satisfied by two satoshis of integer-division rounding, so it
-    // passes just as happily with no bonus at all — which is exactly the
-    // failure a mis-seeded harness produces.
+    // Pin the ARITHMETIC, not just the direction: `finder > other · 7/3`
+    // holds from integer-division rounding alone, even with no bonus.
     //
     // The bonus is a share of the miner cut taken off the top; the rest
     // splits 70/30. The two miner outputs ARE the miner cut, so deriving
@@ -1177,14 +1130,10 @@ async fn reschedule_group_arms_and_tears_down_reset_cron() {
     };
     let id = h.group_id;
 
-    // The startup scan reads EVERY group in `pplns_group`, and this
-    // suite shares one database across concurrently-running tests —
-    // `spawn_core_skips_startup_reset_crons` seeds a group carrying a
-    // daily preset. Asserting an absolute count therefore races that
-    // seed and fails depending on thread interleaving. Measure this
-    // test's own effect as a delta from whatever the engine armed at
-    // startup; `reschedule_group` is the only thing that moves it
-    // afterwards, so the baseline is stable for the rest of the test.
+    // The startup scan reads EVERY group in `pplns_group`, and concurrent
+    // tests in this suite seed groups with presets, so an absolute count
+    // races them. Measure this test's own effect as a delta from what the
+    // engine armed at startup; only `reschedule_group` moves it afterwards.
     let base = h.engine.reset_task_count();
 
     // A valid preset arms exactly one cron.
@@ -1241,13 +1190,11 @@ async fn reschedule_group_arms_and_tears_down_reset_cron() {
 
 // ── Core-mode spawn — no startup reset crons, read path intact ─────
 //
-// Contract B slice 1: `spawn_core` wires the same round-store +
-// distribution builder but skips the dust-sweep + per-group reset
-// crons (both mutate the ledger / round, which is the Satellite's
-// job). Proven as a differential: a group seeded with a valid `daily`
-// reset preset makes the *full* engine arm one reset cron at startup,
-// while the *core* engine arms none. `build_distribution` (the Core's
-// actual job) still works on the core engine.
+// `spawn_core` wires the same round-store + distribution builder but skips
+// the per-group reset crons (mutating the round is the Satellite's job).
+// Proven as a differential: a group with a valid `daily` preset makes the
+// *full* engine arm one reset cron at startup, the *core* engine none, and
+// `build_distribution` (the Core's job) still works on the core engine.
 #[tokio::test]
 async fn spawn_core_skips_startup_reset_crons() {
     let pool = match connect_pg_or_skip().await {
@@ -1381,21 +1328,20 @@ async fn seed_group_with_daily_reset(pool: &PgPool, group_id: Uuid) {
 
 // ── Window mode — engine record path trims aged-out buckets ─────────
 //
-// Drives the real `GroupSoloEngine::record_share` entry point for a
-// window-mode group: a 30h-old share and a fresh share, with a 1-day window.
-// The watermark guard lets the fresh share's bucket-boundary crossing fire the
-// trim, and the mode-aware round-stats read (which trims with real wall-clock)
-// confirms the old share has aged out while the fresh one remains. Uses
-// now-relative timestamps so the record-path and read-path trims agree.
+// A 30h-old share and a fresh share into a window-mode group with a 1-day
+// window, via the real `GroupSoloEngine::record_share`. The fresh share's
+// bucket-boundary crossing fires the trim, and round-stats (which trims with
+// wall-clock time) shows the old share gone and the fresh one kept.
+// Now-relative timestamps keep the record-path and read-path trims in step.
 #[tokio::test]
 async fn window_mode_record_path_trims_aged_buckets() {
     let h = match spawn_or_skip(18, None).await {
         Some(h) => h,
         None => return,
     };
-    // Flip the seeded group to window mode. The mode is immutable in prod (no
-    // edit path), but the engine resolves it fresh on the first record, so this
-    // test-only UPDATE before any share takes effect. No preset → 1-day window.
+    // Flip the seeded group to window mode. The mode has no edit path, but the
+    // engine resolves it on the first record, so this test-only UPDATE before
+    // any share takes effect. No preset → 1-day window.
     sqlx::query(r#"UPDATE pplns_group SET "payoutMode" = 'window' WHERE id = $1"#)
         .bind(h.group_id)
         .execute(&h.pool)
@@ -1443,8 +1389,8 @@ async fn window_mode_record_path_trims_aged_buckets() {
 // Drives the real `GroupSoloEngine::record_reject` entry point for a
 // window-mode group. The reject must reach round-stats through the trimmed
 // reject lane, and the PROP running tally (`rejected-shares`) must stay
-// empty: that tally never shrinks, so reading it against a windowed share
-// total is what produced a 75 % "reject rate" for a miner rejecting 0.4 %.
+// empty: that tally never shrinks, so against a windowed share total it
+// would not be a rate of anything.
 #[tokio::test]
 async fn window_mode_reject_is_windowed_not_tallied() {
     let h = match spawn_or_skip(20, None).await {
@@ -1550,14 +1496,11 @@ async fn window_mode_kick_drops_the_member_from_the_payout_source() {
 
 // ── Window mode — growing the window invalidates the stale mode cache ──
 //
-// Regression for the record-path trim using a STALE cached window length after
-// a window-length GROW. With a 1-day window the engine caches window_ms=1d on
-// the first share. If the operator then grows the window (preset → monthly =
-// 30d), the cached 1d length would make the next share's record-path trim
-// (which DELETES buckets) drop a 25h-old bucket that the 30d window must keep —
-// and the read path can't resurrect a deleted bucket. `invalidate_mode_cache`
-// (called by the API on every settings edit) drops the stale entry so the next
-// share re-reads 30d and keeps the bucket. This test drives that fix path.
+// The engine caches window_ms on the first share. After the operator grows
+// the window (1 day → monthly = 30d), a stale 1d length would make the next
+// record-path trim DELETE a 25h-old bucket the 30d window must keep, and no
+// read can bring it back. `invalidate_mode_cache` (called by the API on every
+// settings edit) drops the stale entry, so the next share re-reads 30d.
 #[tokio::test]
 async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
     let h = match spawn_or_skip(10, None).await {
@@ -1592,8 +1535,8 @@ async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
         .execute(&h.pool)
         .await
         .expect("grow window to monthly");
-    // The API fires this on every settings edit; here we call it directly. With
-    // it, the next share re-reads 30d; WITHOUT it, the stale 1d would over-trim.
+    // The API fires this on every settings edit. With it, the next share
+    // re-reads 30d; WITHOUT it, the stale 1d would over-trim.
     h.engine.invalidate_mode_cache(h.group_id);
 
     // Fresh share crosses a bucket boundary → its record-path trim fires. With
@@ -1623,20 +1566,15 @@ async fn window_grow_invalidates_mode_cache_keeps_in_window_bucket() {
 
 // ── The settlement gate: subsidy, not the reference revenue ────────
 //
-// `overpayment_is_booked_as_debt_and_recovered_next_block` above pins
-// the +20 % case. Anything past ±25 % used to be refused outright, and
-// refusing meant the block's balances stayed exactly as they were —
-// so the credits its coinbase had already paid were paid a second time
-// out of the next block's miner cut. The claims come from the block's
-// own coinbase and are right at any revenue; only a coinbase paying
-// less than the block's own subsidy is still refused.
+// What gets booked comes from the block's own coinbase and is right at any
+// revenue, so revenue far off the reference still books; only a coinbase
+// paying less than the block's own subsidy is refused.
 //
 // Heights sit in the current subsidy epoch (4 halvings → 312 500 000
 // sats) so the gate is genuinely exercised.
 
-/// A Group-Solo block paying far outside the band must still book, and
-/// the finder's bonus overshoot must land as debt just as it does
-/// inside the band — the arithmetic does not change at the boundary.
+/// A Group-Solo block paying far off the reference revenue still books,
+/// each member at their exact share of the real coinbase.
 #[tokio::test]
 async fn a_group_block_far_off_the_reference_is_still_booked() {
     let h = match spawn_or_skip(19, Some(160_000)).await {
@@ -1651,9 +1589,8 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
     // being measured.
     const T_ACTUAL: u64 = 500_000_000;
     let height: i32 = 840_801;
-    // The fixture's own statement, now that no production constant defines
-    // a band: T_ACTUAL must be FAR off the projection base, or the test
-    // would pass on a block that never exercised the drift.
+    // T_ACTUAL must be FAR off the projection base, or the test would pass
+    // on a block that never exercised the drift.
     const _: () = assert!(
         T_ACTUAL > T_REF + T_REF / 4,
         "the fixture must pay far off the revenue it was built against"
@@ -1675,8 +1612,6 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
     // 16 % bonus on an even two-way split → finder holds 0.16 + 0.42.
     assert_finder_score_fraction(&result.distribution, &finder, 0.58);
 
-    // THE REGRESSION: this returned `SnapshotRewardMismatch` and booked
-    // nothing at all.
     h.engine
         .on_block_found(
             h.group_id,
@@ -1690,9 +1625,8 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
         .expect("a block off the reference revenue must still book");
 
     // Both members are paid their exact share even 1.6× off the
-    // reference. Every weight is a proportion, so there is no
-    // satoshi-denominated promise left to project wrong — and nothing
-    // is owed afterwards at any revenue.
+    // reference: every weight is a proportion, so nothing is owed
+    // afterwards at any revenue.
     let paid = actual_paying_exactly(&result, T_ACTUAL);
     let history = read_block_history(&h.pool, h.group_id, height).await;
     for who in [&finder, &other] {
@@ -1713,9 +1647,9 @@ async fn a_group_block_far_off_the_reference_is_still_booked() {
     drop_harness(h).await;
 }
 
-/// The one thing Group-Solo settlement still refuses: a coinbase paying
-/// less than the block's own subsidy destroyed money it was entitled
-/// to — and it must not be retried forever by the confirmation watcher.
+/// Group-Solo settlement refuses a coinbase paying less than the block's
+/// own subsidy (money the block was entitled to is gone), and the error is
+/// terminal so the confirmation watcher does not retry it forever.
 #[tokio::test]
 async fn a_group_coinbase_below_the_block_subsidy_is_refused() {
     let h = match spawn_or_skip(4, None).await {

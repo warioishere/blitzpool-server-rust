@@ -2,18 +2,14 @@
 
 //! In-process debouncer for live-marker writes.
 //!
-//! The stratum layer wants to write the active mining-mode marker after
-//! every accepted share, but the marker's Redis TTL is 5 min — refreshing
-//! it once a minute is plenty. This debouncer is the small in-memory
-//! gate that the stratum layer consults before doing the Redis round-trip:
+//! The stratum layer marks the active mining mode on every accepted share,
+//! but the marker's Redis TTL is 5 min, so refreshing it once a minute is
+//! plenty. The stratum layer consults this gate before the Redis write:
 //!
 //! - **Same mode within the refresh interval** → debounced (no write).
 //! - **Mode change** → always allowed (port-switch detection is the
 //!   whole point of the marker).
 //! - **Refresh interval elapsed** → allowed.
-//!
-//! Matches `MinerActiveModeService::mark`'s `REFRESH_INTERVAL_MS` and
-//! `lastMark` map.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -80,7 +76,7 @@ impl MarkDebouncer {
     }
 
     /// Forget the last-mark record for `address` (e.g. when a session
-    /// disconnects and we want the next reconnect's first share to write).
+    /// disconnects, so the next reconnect's first share writes).
     pub fn forget(&self, address: &AddressId) {
         let mut last = self.last_mark.lock().expect("debouncer mutex poisoned");
         last.remove(address);

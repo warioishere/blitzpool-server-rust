@@ -155,17 +155,14 @@ pub struct HighScoreRow {
 /// Top-10 by `allTimeBestDifficulty DESC` from `address_settings_entity`.
 ///
 /// Deliberately NOT `"bestDifficulty"`: that column is the miner's own,
-/// resettable value, and reading the public leaderboard off it meant a
-/// `/bestdiff_reset` silently deleted the miner's entry from the pool's
-/// hall of fame — permanently, since the flush's `GREATEST` only ever
-/// re-offers the current window's max. The all-time column is written by
-/// the same upsert (see [`crate::bulk_upsert_address_settings`]) and is
-/// never lowered by any reset or delete path.
+/// resettable value, and a reset must not remove the miner's public entry.
+/// The all-time column is written by the same upsert (see
+/// [`crate::bulk_upsert_address_settings`]) and is never lowered by any
+/// reset or delete path.
 pub async fn find_high_scores(pool: &PgPool) -> Result<Vec<HighScoreRow>, DbError> {
     #[derive(FromRow)]
     struct Raw {
-        // Nullable: pre-0014 rows that never set a best carry NULL here,
-        // and the backfill only stamps rows that had one.
+        // Nullable: rows that never set an all-time best carry NULL here.
         #[sqlx(rename = "allTimeBestDifficultyAt")]
         updated_at: Option<i64>,
         #[sqlx(rename = "allTimeBestDifficulty")]
@@ -209,15 +206,13 @@ fn epoch_ms_to_iso(ms: i64) -> Option<String> {
 ///
 /// `"allTimeBestDifficulty"` is deliberately NOT touched — that is the
 /// pool's public record (`/api/info` → `highScores`), and it survives
-/// every reset by design. See migration 0014.
+/// every reset by design.
 ///
-/// The tracker delete lives HERE rather than at the call site because it
-/// did not, and the two callers drifted: the API endpoint deleted the
-/// tracker row, the `/bestdiff_reset` bot command did not, so the same
-/// user action left different state behind depending on which door it
-/// came through. Callers must also clear the live session bests
-/// (`bp_client_live::clear_address_best_difficulty`) — that one cannot
-/// move in here without giving this crate a Redis dependency.
+/// The tracker delete lives here so the API endpoint and the
+/// `/bestdiff_reset` bot command leave the same state behind. Callers must
+/// also clear the live session bests
+/// (`bp_client_live::clear_address_best_difficulty`), which stays outside
+/// because it needs Redis.
 pub async fn reset_address_settings_best_difficulty(
     pool: &PgPool,
     address: &AddressId,

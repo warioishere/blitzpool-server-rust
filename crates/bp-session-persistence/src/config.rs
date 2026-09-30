@@ -23,9 +23,9 @@ pub struct SessionPersistenceConfig {
     /// a per-slot max is not more urgent than a session touch.
     pub diff_stat_flush_interval: Duration,
     /// How long a session must survive before its `client_entity` row is
-    /// written. Probe connections (measured on prod: 95 % gone within
-    /// 1 s) never outlive this, so they cost no statement and leave no
-    /// row. Must stay well below the device-status gate's `online_dwell`
+    /// written. Probe connections that hang up within seconds never
+    /// outlive this, so they cost no statement and leave no row. Must
+    /// stay well below the device-status gate's `online_dwell`
     /// (90 s): the gate drops (address, worker) keys with no row yet, so
     /// a later birth would make it treat a connected device as absent.
     /// `ZERO` is legal — "born at the next flush tick" — and is what the

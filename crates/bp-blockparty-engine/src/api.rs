@@ -2,12 +2,11 @@
 
 //! Trait-object surface for the bp-api crate.
 //!
-//! `BlockpartyService<H>` is generic over its hook trait, which makes it
-//! awkward to store in the generic `bp_api::AppState<H, M>` without forcing
-//! every existing handler to gain a third generic param. We hide the generic
-//! behind an object-safe `#[async_trait]` trait — the api crate stores
-//! `Option<Arc<dyn BlockpartyApi>>` and the dynamic dispatch cost is
-//! invisible next to the JSON / SQL roundtrips per request.
+//! `BlockpartyService<H>` is generic over its hook trait; storing it in
+//! `bp_api::AppState<H, M>` directly would give every handler a third
+//! generic param. The object-safe `#[async_trait]` trait hides it: the api
+//! crate stores `Option<Arc<dyn BlockpartyApi>>`, and the dynamic dispatch
+//! cost is invisible next to the JSON / SQL roundtrips per request.
 
 use std::sync::Arc;
 

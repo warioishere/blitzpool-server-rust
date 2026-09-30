@@ -127,16 +127,11 @@ impl BitcoinRpc {
     ///   `"duplicate"`, etc. — see Bitcoin Core's
     ///   `validation::BlockValidationState` for the catalogue).
     ///
-    /// This RPC is the **only** non-TDP block-submission path the pool
-    /// uses, and it lives here as a deliberate exception to the
-    /// TDP-direct architecture (`project-tdp-direct-architecture`).
-    /// Used for the JDP-PushSolution orphan-protection path: when a JDC
-    /// reports a block-found, the pool reconstructs
-    /// the full block and submits it in parallel to the JDC's own
-    /// submission. JDP-declared templates have no pool-side `template_id`,
-    /// so `TdpHandle::submit_solution` (which requires one) is not
-    /// usable for this path; the raw RPC is the only option short of
-    /// re-architecting Bitcoin Core's IPC surface.
+    /// This RPC is the **only** non-TDP block-submission path, a deliberate
+    /// exception for JDP PushSolution: the pool reconstructs the JDC's
+    /// found block and submits it in parallel to the JDC's own submission.
+    /// JDP-declared templates have no pool-side `template_id`, so
+    /// `TdpHandle::submit_solution` (which requires one) cannot be used.
     pub async fn submit_block(&self, block_hex: String) -> Result<Option<String>, RpcError> {
         let raw: serde_json::Value = self
             .call_raw("submitblock", serde_json::json!([block_hex]))
@@ -234,7 +229,7 @@ impl BitcoinRpc {
         // surfaces as `BitcoinCore` instead of being buried as an opaque
         // HTTP error; only fall back to the transport error when the body
         // isn't a JSON-RPC envelope. (`error_for_status_ref` borrows, so it
-        // doesn't consume the response before we read the body.)
+        // doesn't consume the response before the body is read.)
         let status_err = resp.error_for_status_ref().err();
         let body = resp.bytes().await?;
         match serde_json::from_slice::<RpcResponse<T>>(&body) {
@@ -393,10 +388,7 @@ mod tests {
     // Tiny helpers — keep tests independent of `tempfile` crate.
     //
     // The path is returned alongside the handle rather than recovered from
-    // the fd. It used to come back via `read_link("/proc/self/fd/<fd>")`,
-    // which does not exist on macOS — so both callers failed there, on a
-    // helper, with nothing wrong in the code under test. The path was known
-    // at create time all along; carrying it is shorter as well as portable.
+    // the fd: `/proc/self/fd` does not exist on macOS.
     fn tempfile_in_default() -> (std::fs::File, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("bp-bitcoin-test-cookie-{}", rand_suffix()));
         let file = std::fs::File::create(&path).unwrap();
@@ -405,14 +397,9 @@ mod tests {
     /// Unique per call, even between two `#[test]` threads in the same
     /// microsecond.
     ///
-    /// A bare nanosecond timestamp is NOT unique on macOS: measured
-    /// 2026-08-10, 200 successive `SystemTime::now()` reads yielded 8
-    /// distinct values, because the clock advances in 1µs steps and simply
-    /// pads three zero digits. Two threads racing collided on 89/2000 runs,
-    /// which is what made `cookie_auth_reads_well_formed_file` read the
-    /// *other* test's `no-colon-anywhere` and fail — only under the full
-    /// suite, never when run alone. An atomic counter breaks the tie
-    /// regardless of clock resolution.
+    /// A bare nanosecond timestamp is NOT unique on macOS, whose clock
+    /// advances in 1µs steps; the atomic counter breaks the tie regardless
+    /// of clock resolution.
     fn rand_suffix() -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -428,12 +415,8 @@ mod tests {
     }
 
     /// The suffix must be unique across threads, or the two cookie tests
-    /// above silently overwrite each other's file.
-    ///
-    /// Pinned as its own test because the failure it guards against is
-    /// timing-dependent: the collision showed up only in a full-suite run
-    /// and passed 8/8 when the cookie tests ran alone, so nothing else here
-    /// would catch a regression to a bare timestamp.
+    /// above silently overwrite each other's file. A collision is
+    /// timing-dependent, so nothing else here would catch it.
     #[test]
     fn rand_suffix_is_unique_under_thread_contention() {
         let handles: Vec<_> = (0..8)

@@ -5,14 +5,12 @@
 //! `bitcoin-node v31` when submitted via the SV2 TDP `SubmitSolution` IPC
 //! path.
 //!
-//! This is the **block-acceptance guarantee**: an SV1-translator pool
-//! built on top of `bp-mining-job` is only useful if bitcoin-core
-//! accepts the blocks it produces. The unit tests in `coinbase.rs`
-//! prove the bytes parse as a valid `bitcoin::Transaction`; this test
-//! proves they pass full consensus validation against an unmodified
-//! bitcoin-core regtest node.
+//! This is the **block-acceptance guarantee**: the unit tests in
+//! `coinbase.rs` show the bytes parse as a valid `bitcoin::Transaction`;
+//! this test shows they pass full consensus validation against an
+//! unmodified bitcoin-core regtest node.
 //!
-//! Two cases:
+//! Three cases:
 //!
 //! 1. **Single-output coinbase (no-fee)** — 100% to the miner. The
 //!    coinbase ends up with 2 outputs total (miner + the TDP-provided
@@ -20,10 +18,9 @@
 //! 2. **Fee-split coinbase (1.5% pool + 98.5% miner)** — three outputs,
 //!    with the floor-rounding remainder lumped on `outs[0]` per
 //!    [`bp_mining_job`]'s convention.
-//!
 //! 3. **All 5 address types** — P2PKH, P2SH, P2WPKH, P2TR and P2WSH in one
 //!    coinbase, so the per-type script derivation is validated by core
-//!    rather than by our own encoder.
+//!    rather than by the pool's own encoder.
 //!
 //! The prefix/suffix round-trip is covered at unit level by
 //! `coinbase_with_extranonce_parses_as_valid_bitcoin_tx`.
@@ -45,14 +42,9 @@ use bp_test_support::{
     brute_force_nonce, deterministic_p2wpkh_regtest, poll_for_height, wait_for_paired_template,
 };
 
-/// Two real regtest bech32 P2WPKH addresses. The block-validation path
-/// doesn't care whether bitcoind's wallet knows the corresponding keys —
-/// only that each output script is well-formed for the network.
-///
-/// `MINER_ADDR` is the BIP-173 test-vector address (P2WPKH of all-zero
-/// pubkey hash); `FEE_ADDR` is its variant with an all-one pubkey hash —
-/// constructed via `bitcoin::Address::p2wpkh` from a known
-/// secp256k1::PublicKey to guarantee a valid bech32 checksum.
+/// The BIP-173 test-vector regtest P2WPKH address. Block validation does
+/// not care whether bitcoind's wallet knows the key, only that the output
+/// script is well-formed for the network.
 const MINER_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -80,7 +72,7 @@ async fn fee_split_two_output_coinbase_accepted_by_core() {
         return;
     }
 
-    // `DEV_FEE_PERCENT` default in the production pool.
+    // Any non-zero dev-fee split.
     let fee_percent = 1.5;
     let fee_addr = deterministic_p2wpkh_regtest([0x42; 32]);
     let payouts = vec![
@@ -107,10 +99,9 @@ async fn run_block_acceptance_case(payouts: Vec<PayoutEntry>, pool_identifier: &
     // fresh template at the post-mining tip ──────────────────────────
     //
     // TDP emits a `NewTemplate` + `SetNewPrevHash` pair for the CURRENT
-    // tip immediately on attach. If we keep that pair we'd submit a
-    // block for an already-mined height — bitcoin-core silently rejects.
-    // We deliberately consume the startup pair, then mine 1, then take
-    // the next fresh pair.
+    // tip immediately on attach; a block on that pair would be for an
+    // already-mined height, which bitcoin-core silently rejects. So the
+    // startup pair is consumed, one block mined, and the next pair taken.
     let tdp = TdpHandle::spawn(
         TdpConfig::new(node.ipc_socket_path())
             .with_fee_threshold(1)
@@ -133,7 +124,7 @@ async fn run_block_acceptance_case(payouts: Vec<PayoutEntry>, pool_identifier: &
 
     let (template, prev_hash) = wait_for_paired_template(&mut rx).await;
 
-    // ── Build MiningJob with our payouts ──────────────────────────────
+    // ── Build MiningJob with the test payouts ─────────────────────────
     let coinbase_template = TdpCoinbaseTemplate {
         coinbase_prefix: &template.coinbase_prefix,
         coinbase_tx_version: template.coinbase_tx_version,
@@ -157,7 +148,7 @@ async fn run_block_acceptance_case(payouts: Vec<PayoutEntry>, pool_identifier: &
     //
     // Regtest `n_bits = 0x207fffff` → target ≈ `0x7fffff << 232` ≈ 2^254.
     // Chance any random hash meets it is ~25 % → first or second nonce
-    // typically hits. We allow up to 1 M tries as a safety bound.
+    // typically hits; 1 M tries is the safety bound.
     let en1 = [0u8; 4];
     let en2 = [0u8; 8];
     let coinbase_hash = job.coinbase_txid_with_extranonce(&en1, &en2);
@@ -191,8 +182,8 @@ async fn run_block_acceptance_case(payouts: Vec<PayoutEntry>, pool_identifier: &
     // ── Poll until height advances (or fail) ──────────────────────────
     //
     // submit_solution is fire-and-forget at the IPC layer — bitcoin-core
-    // processes it asynchronously. Poll the chain tip with a generous
-    // 5 s budget; on regtest acceptance is sub-second.
+    // processes it asynchronously, so poll the chain tip with a generous
+    // budget.
     let after_height = poll_for_height(&node, before_height + 1, Duration::from_secs(20))
         .await
         .expect("bitcoin-core must accept the block");
@@ -205,8 +196,8 @@ async fn run_block_acceptance_case(payouts: Vec<PayoutEntry>, pool_identifier: &
 
     // ── Verify the coinbase shape via rust-bitcoin parser ─────────────
     //
-    // Sanity-check that the bytes we submitted decode as a valid
-    // SegWit transaction with the expected number of outputs.
+    // The submitted bytes decode as a valid transaction with the expected
+    // number of outputs.
     {
         use bitcoin::consensus::Decodable;
         let non_witness = decode_non_witness_with_extranonce(&job, &en1, &en2);
@@ -241,14 +232,13 @@ fn decode_non_witness_with_extranonce(job: &MiningJob, en1: &[u8; 4], en2: &[u8;
     out
 }
 
-// ─── Test #4: 5-address-type coverage (P2PKH/P2SH/P2WPKH/P2WSH/P2TR) ───
+// ─── 5-address-type coverage (P2PKH/P2SH/P2WPKH/P2WSH/P2TR) ───
 //
 // Exercises every branch of the address→script conversion in `bp-mining-job`
 // against a real bitcoin-core regtest validator. 5 outputs × 20% each;
-// bitcoind picks the address types natively for the first 4, P2WSH is
-// wallet-side derived: get a real P2WPKH pubkey via `getaddressinfo`,
-// wrap as the inner script of a P2WSH — the script doesn't need to be
-// spendable, only well-formed.
+// bitcoind generates the first 4 address types, P2WSH wraps a P2WPKH
+// script around a wallet pubkey (well-formed is enough, it need not be
+// spendable).
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
@@ -285,10 +275,8 @@ async fn coinbase_with_all_5_address_types_accepted_by_core() {
         .await
         .expect("getnewaddress bech32m");
 
-    // P2WSH: wrap an inner P2WPKH script around a real on-chain pubkey
-    // (P2WSH wrapping P2WPKH). The inner script doesn't need to be
-    // spendable by anyone — coinbase outputs validate purely on script
-    // well-formedness.
+    // P2WSH wrapping a P2WPKH script for a real wallet pubkey. Coinbase
+    // outputs validate on script well-formedness only.
     let seed_addr = node
         .new_address("bech32")
         .await
@@ -365,9 +353,8 @@ async fn coinbase_with_all_5_address_types_accepted_by_core() {
 
     // ── Sanity-check each output script decodes back to its source ────
     //
-    // Catches a buggy `MiningJob` address→script branch (e.g. p2tr
-    // branch emitting p2wpkh bytes). Parse the non-witness coinbase
-    // bytes via rust-bitcoin + walk outputs.
+    // Each address type gets its own script (e.g. a P2TR payout is not
+    // emitted as P2WPKH bytes).
     let en1 = [0u8; 4];
     let en2 = [0u8; 8];
     {

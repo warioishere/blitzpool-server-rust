@@ -6,10 +6,9 @@
 //! recorder helpers, scrape `/metrics`, verify the
 //! Prometheus-text-format output contains the expected lines.
 //!
-//! **Single test only**: `metrics::set_global_recorder` is
-//! install-once-per-process. Multiple tests inside one binary that
-//! both call `MetricsService::spawn` would conflict. We bundle every
-//! end-to-end assertion in this one test.
+//! **Single test only**: the global recorder is install-once per
+//! process, so two tests in this binary calling `MetricsService::spawn`
+//! would conflict. Every end-to-end assertion lives in this one test.
 
 use std::sync::atomic::{AtomicU16, Ordering};
 

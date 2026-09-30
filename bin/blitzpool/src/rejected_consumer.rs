@@ -10,9 +10,9 @@
 //!
 //! Reject counters are pool-fairness/observability stats, not money; the
 //! transport is at-least-once and the counters tolerate the rare double-count a
-//! crash-before-ack redelivery would cause. The loop skeleton (ensure → pending
-//! backlog → drain new + ack) lives in [`bp_share_stream::StreamConsumer::run`];
-//! this file only supplies the per-entry sink fan-out.
+//! crash-before-ack redelivery would cause. The loop is
+//! [`bp_share_stream::StreamConsumer::run`]; this file supplies only the
+//! per-entry sink fan-out.
 
 use std::sync::Arc;
 

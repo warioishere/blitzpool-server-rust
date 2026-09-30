@@ -20,7 +20,7 @@
 //!   when the node is a local build outside those prefixes.
 //!
 //!   The version floor is [`MIN_BITCOIN_NODE_MAJOR`] and it is enforced,
-//!   not advisory: v31 moved `Init.makeMining` from `@2` to `@3`, and our
+//!   not advisory: v31 moved `Init.makeMining` from `@2` to `@3`, and the
 //!   capnp bindings call `@3`. So a v30 node spawns, serves RPC, creates
 //!   `node.sock` — and then answers TDP startup with a capnp
 //!   `Unimplemented`. Discovery reads `-version` and skips such a node with

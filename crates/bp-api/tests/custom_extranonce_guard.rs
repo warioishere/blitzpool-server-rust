@@ -270,10 +270,9 @@ async fn prefixes_of(pool: &PgPool, addr: &str) -> Vec<(String, i64)> {
     .unwrap_or_default()
 }
 
-/// THE case that motivated the deferrable constraint: swapping two workers'
-/// prefixes inside one batch. With a plain `UNIQUE (address, prefix)` the
-/// first row would collide with the second's still-unchanged row and abort
-/// the whole request, even though the END state is perfectly valid.
+/// Swapping two workers' prefixes inside one batch succeeds. This is why the
+/// uniqueness constraint is deferrable: a plain `UNIQUE (address, prefix)`
+/// would collide on the intermediate state although the END state is valid.
 #[tokio::test]
 async fn set_batch_can_swap_two_workers_prefixes() {
     let Some(pool) = connect_or_skip().await else {
@@ -383,9 +382,9 @@ async fn set_batch_rejects_duplicate_prefix_within_the_request() {
     assert_eq!(js["code"], "duplicate-extranonce-in-batch");
 }
 
-/// The token now travels in `Authorization: Bearer`, not the body. A
-/// request without the header must be rejected — and a token placed in the
-/// body (the old shape) must NOT be honoured.
+/// The token travels in `Authorization: Bearer`, not the body. A request
+/// without the header is rejected, and a token placed in the body is NOT
+/// honoured.
 #[tokio::test]
 async fn set_requires_the_bearer_header() {
     let Some(pool) = connect_or_skip().await else {

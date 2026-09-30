@@ -16,10 +16,9 @@
 //!   `LowDifficulty`).
 //!
 //! This module is pure logic: no I/O, no broadcasting, no DB. The
-//! per-share share-stats fan-out (PPLNS / group-solo recordShare, share-
-//! totals cache, address-settings best-diff update) is the caller's job
-//! and lives in `client.rs` (Task #8) on top of the trait boundaries
-//! in `hooks.rs` (Task #9).
+//! per-share stats fan-out (PPLNS / group-solo share recording, share-totals
+//! cache, best-diff update) is the caller's job in `client.rs`, on top of
+//! the trait boundaries in `hooks.rs`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -96,15 +95,15 @@ pub struct ShareAccept {
     /// `Active` or `StaleCreditable`. Both credit the share; the caller
     /// may want to bookkeep them separately for diagnostics.
     pub classification: JobClassification,
-    /// Difficulty the share is **credited at**: post-ckpool-clamp value.
-    /// Used by both PPLNS / group-solo accounting and the
-    /// `addAcceptedShare` accumulators. May be lower than the session's
-    /// current diff when the share was issued before a vardiff ratchet.
+    /// Difficulty the share is **credited at**: post-ckpool-clamp value,
+    /// used by PPLNS / group-solo accounting and the accepted-share
+    /// accumulators. May be lower than the session's current diff when
+    /// the share was issued before a vardiff ratchet.
     pub effective_difficulty: f64,
     /// Difficulty the **share actually solved for**, derived from the
     /// hash via `bp_share::calculate_difficulty`. Drives the best-diff
-    /// tracker (`addressSettings.bestDifficulty`); the block-found gate
-    /// compares the hash itself against the network target.
+    /// tracker; the block-found gate compares the hash itself against the
+    /// network target.
     pub submission_difficulty: f64,
     /// 80-byte block header that produced the hash. The block-submit path
     /// assembles a found block from it.
@@ -194,15 +193,9 @@ pub(crate) struct SessionContext<'a> {
 
 // ── Duplicate-share cache (per session) ──────────────────────────────
 
-/// Per-session dedup cache for accepted-share inputs.
-/// `miningSubmissionHashes: Set<string>` exactly: same set of fields
-/// (`versionMask`, `nonce`, `extraNonce2`, `ntime`, `jobId`),
-/// per-session, cleared on every `clean_jobs=true` notify.
-///
-/// Uses a sha256d-base64 hash as the set key; semantically a tuple-
-/// keyed `HashSet` is identical (any new combo means "not yet seen"),
-/// ~10× cheaper, and we don't expose the dedup key on the wire so the
-/// choice has no observable side-effects.
+/// Per-session dedup cache for share inputs, keyed on (`versionMask`,
+/// `nonce`, `extraNonce2`, `ntime`, `jobId`) and cleared on every
+/// `clean_jobs=true` notify.
 #[derive(Default)]
 pub(crate) struct SessionShareCache {
     seen: HashSet<DedupKey>,
@@ -212,11 +205,9 @@ pub(crate) struct SessionShareCache {
     target_memo: TargetMemo,
 }
 
-/// Parsed-integer dedup key — zero heap allocations per share (mirrors
-/// the SV2 fixed-size key). Two submits with the same numeric values are
-/// the same share regardless of hex formatting, which is the correct
-/// identity; real miners echo our canonical fixed-width hex so this is
-/// not observably different from the old 5-`String` key.
+/// Parsed-integer dedup key: no heap allocation per share. Two submits
+/// with the same numeric values are the same share regardless of hex
+/// formatting, which is the correct identity.
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 struct DedupKey {
     job_id: u64,
@@ -260,9 +251,9 @@ impl SessionShareCache {
     }
 
     /// Drop all accumulated keys. Called when a `clean_jobs=true` notify
-    /// goes out — old shares can no longer collide with anything we'd
-    /// accept now anyway, and the set otherwise grows unbounded across a
-    /// long-lived session.
+    /// goes out: old shares can no longer collide with anything acceptable
+    /// now, and the set would otherwise grow unbounded across a long-lived
+    /// session.
     pub(crate) fn clear(&mut self) {
         self.seen.clear();
     }
@@ -326,8 +317,8 @@ pub(crate) fn validate_submit(
         return ShareValidation::Rejected(RejectReason::Stale.into());
     }
 
-    // 4. Parse the wire-hex fields. We've already validated string-ness
-    // at the frame layer; here we check semantic well-formedness.
+    // 4. Parse the wire-hex fields. The frame layer checked string-ness;
+    // this checks semantic well-formedness.
     let Some((version_bits, nonce, ntime, extranonce2)) = parse_submit_fields(submit) else {
         tracing::warn!(
             worker = %submit.worker,
@@ -364,27 +355,15 @@ pub(crate) fn validate_submit(
 
     // 5. Assemble header.
     //
-    // ⚠️ This is deliberately NOT BIP-310's reconstruction. The BIP defines
-    //
-    //     nVersion = (job_version & ~last_mask) | (version_bits & last_mask)
-    //
-    // and that is correct only if the miner echoes back the template's
-    // in-mask bits it kept. It does not survive the common case otherwise:
-    // a non-rolling miner sends `version_bits = 0`, and against a template
-    // that signals inside the mask — core's regtest sets bit 28, any future
-    // mainnet deployment on bits 13-28 does too — the masked OR CLEARS that
-    // bit, so the pool hashes a different header than the one it put in
-    // `mining.notify` and every share from that miner rejects.
-    //
-    // ckpool, which effectively every SV1 firmware is tested against, does
-    // `job_version | version_bits`, which is robust to both conventions but
-    // cannot express clearing a bit. XOR below is robust to `version_bits = 0`
-    // the same way and additionally lets a miner clear a bit it was granted.
-    //
-    // All three agree while the template sets no bit inside the mask, which
-    // is mainnet today. Moving to the BIP formula needs to know what real
-    // firmware puts in `version_bits` first — measuring that is its own job,
-    // and guessing wrong costs every share of whoever guessed differently.
+    // ⚠️ Deliberately NOT BIP-310's reconstruction
+    // `(job_version & ~last_mask) | (version_bits & last_mask)`: with a
+    // non-rolling miner (`version_bits = 0`) and a template that signals
+    // inside the mask (regtest bit 28, any deployment on bits 13-28), it
+    // clears that bit, so the pool would hash a header it never published
+    // and reject every share. XOR keeps the template's bits at
+    // `version_bits = 0` (as ckpool's `job_version | version_bits` does)
+    // and also lets a miner clear a bit it was granted. The formulas agree
+    // while the template sets no bit inside the mask.
     let n_version = lookup.template.version ^ version_bits;
     let coinbase_hash = lookup
         .mining_job
@@ -412,9 +391,9 @@ pub(crate) fn validate_submit(
     );
     let effective_target = dedup.target_memo.target_for(Difficulty(effective_diff));
 
-    // Per-share diff trace, gated by the `stratum_share_logs` config
-    // flag (still DEBUG, so it also needs `RUST_LOG=...,bp_stratum_v1=debug`).
-    // Format `🎯 Share difficulty: X (target: Y)` mirrors the SV2 trace.
+    // Per-share diff trace, gated by `stratum_share_logs` (still DEBUG, so
+    // it also needs `RUST_LOG=...,bp_stratum_v1=debug`). Same format as
+    // the SV2 trace.
     if session.share_logs {
         tracing::debug!(
             worker = %submit.worker,
@@ -426,15 +405,10 @@ pub(crate) fn validate_submit(
     }
 
     if !effective_target.is_met_by_le(&hash) {
-        // Share dedup:
-        //   `❌ Share rejected: difficulty-too-low (submitted=X < effective=Y)`
-        // Plus hash_prefix_be for cross-checking against the miner's
-        // own debug trace when validator vs miner disagree on the hash.
-        //
-        // Both hex fields are lazy `as_hex()` views rendered *inside* the
-        // macro, so they cost nothing unless the line is actually emitted.
-        // This path runs on every rejected share, so an eager hex build here
-        // is paid even when the log level discards it.
+        // `hash_prefix_be` is for cross-checking against the miner's own
+        // debug trace when both disagree on the hash. The hex fields are
+        // lazy `as_hex()` views, so this per-reject path pays nothing when
+        // the log level discards the line.
         tracing::warn!(
             worker = %submit.worker,
             job_id = %submit.job_id,
@@ -453,9 +427,8 @@ pub(crate) fn validate_submit(
     // difficulty — a stale-creditable hit during a reorg can still find a
     // valid alternative tip.
     let is_block_candidate = meets_network_target(&hash, lookup.template.n_bits);
-    // Block found marker at
-    // INFO when the share also meets the network target. Always-on, no
-    // debug flag — block events are too important to gate.
+    // Block-found marker at INFO, always on: block events are too
+    // important to gate.
     if is_block_candidate {
         tracing::info!(
             worker = %submit.worker,
@@ -496,9 +469,8 @@ fn parse_submit_fields(submit: &SubmitRequest) -> Option<(u32, u32, u32, [u8; 8]
     let version_mask = u32::from_str_radix(submit.version_mask_hex, 16).ok()?;
     let nonce = u32::from_str_radix(submit.nonce_hex, 16).ok()?;
     let ntime = u32::from_str_radix(submit.ntime_hex, 16).ok()?;
-    // extranonce2 is fixed at 8 bytes (16 hex chars) per SV1 spec; use
-    // faster-hex's SIMD-accelerated fixed-size decode into a stack buffer
-    // to avoid the per-share Vec allocation that `hex::decode` does.
+    // extranonce2 is fixed at 8 bytes (16 hex chars); decode into a stack
+    // buffer to avoid a per-share Vec allocation.
     let hex_bytes = submit.extranonce2_hex.as_bytes();
     if hex_bytes.len() != 16 {
         return None;
@@ -511,9 +483,9 @@ fn parse_submit_fields(submit: &SubmitRequest) -> Option<(u32, u32, u32, [u8; 8]
 #[cfg(test)]
 mod tests {
     /// The reject-path log renders `hash_prefix_be` / `extranonce2` with
-    /// `as_hex()`. The field is cross-checked against miner debug traces,
-    /// so it must stay byte-identical to the `format!("{b:02x}")` encoding
-    /// it replaced: lowercase, leading-zero nibbles kept.
+    /// `as_hex()`. It is cross-checked against miner debug traces, so it
+    /// must be lowercase with leading-zero nibbles kept, as per-byte
+    /// `{b:02x}` formatting gives.
     #[test]
     fn reject_log_hex_matches_the_per_byte_format() {
         use bitcoin::hex::DisplayHex;
@@ -819,8 +791,8 @@ mod tests {
         assert!(matches!(inside, ShareValidation::Accepted(_)));
 
         // Inside the POOL's mask but outside the one this session was
-        // answered with. ckpool would take it; BIP-310 says the miner may
-        // only set bits from the mask it received, and we told it 0x00c00000.
+        // answered with. BIP-310: the miner may only set bits from the mask
+        // it received, here 0x00c00000.
         let outside = validate_submit(
             &submit_rolling(&jid, "00002000"),
             &session,
@@ -841,12 +813,9 @@ mod tests {
     /// `mining.notify` when it rolls nothing — including on a template that
     /// signals inside the advertised mask.
     ///
-    /// This is the case BIP-310's masked OR gets wrong: with
-    /// `version_bits = 0` it clears the template's in-mask bit, the pool
-    /// hashes a header the miner never saw, and every share rejects. The
-    /// production code therefore does not use that formula; see the comment
-    /// at the reconstruction. This test drives `validate_submit`, so
-    /// swapping the reconstruction back makes it fail.
+    /// BIP-310's masked OR would clear the template's in-mask bit at
+    /// `version_bits = 0`; see the comment at the reconstruction. The test
+    /// drives `validate_submit`, so switching to that formula fails it.
     #[test]
     fn a_non_rolling_miner_keeps_the_templates_in_mask_bits() {
         // Template signalling on bit 28, as core's regtest does once

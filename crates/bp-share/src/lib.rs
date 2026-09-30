@@ -227,7 +227,7 @@ pub struct PayoutAmounts {
 /// pay_P     = t − Σ pay[i]
 /// ```
 ///
-/// This single implementation serves every party we control: the
+/// This single implementation serves every party the pool controls: the
 /// pool's own coinbase build (with the pool's template revenue), the
 /// job-declaration validator (with the declared coinbase's total), and
 /// tests standing in for a JDC.
@@ -279,24 +279,17 @@ pub const REGTEST_SUBSIDY_HALVING_INTERVAL: u32 = 150;
 /// 50 BTC halved once per `halving_interval` blocks, and 0 once the
 /// shift would exhaust a 64-bit value.
 ///
-/// This is the floor settlement gates on. A coinbase may always pay
-/// LESS than subsidy + fees — the difference is simply destroyed — so
-/// a total below the subsidy alone means the block forfeited money it
-/// was entitled to. Nothing about mempool drift, a stale projection
-/// base or a job-declaring client's own template can produce that,
-/// which is what makes it the honest gate: it never fires on a healthy
-/// block, and it is the one condition worth refusing to book on.
+/// This is the floor settlement gates on. A coinbase may pay less than
+/// subsidy + fees, but a total below the subsidy alone means the block
+/// forfeited money it was entitled to; mempool drift or a declared
+/// template cannot cause that, so the gate never fires on a healthy block.
 ///
-/// The interval is a PARAMETER rather than the mainnet constant
-/// because regtest halves every 150 blocks. Hard-coding 210 000 would
-/// make every regtest block past height 150 look like it had burned
-/// part of its own subsidy — and the pool's own regtests mine well
-/// past it.
+/// The interval is a parameter because regtest halves every 150 blocks;
+/// the mainnet constant would make every regtest block past 150 look short.
 ///
-/// Fails OPEN (returns 0, so no block is ever gated) on inputs that
-/// cannot describe a real block: a negative height — the dust sweep
-/// mints synthetic negative heights for its audit rows — and a zero
-/// interval.
+/// Fails OPEN (returns 0, so nothing is gated) on inputs that cannot
+/// describe a real block: a negative height (the dust sweep's synthetic
+/// audit rows) and a zero interval.
 pub fn block_subsidy_sats(height: i32, halving_interval: u32) -> u64 {
     if height < 0 || halving_interval == 0 {
         return 0;
@@ -349,10 +342,9 @@ pub struct ExtraProjection {
 /// candidates and settlement off a stored snapshot, and the two must
 /// agree to the satoshi.
 ///
-/// The Group-Solo finder bonus used to be folded in here as a second
-/// satoshi promise. It is a PROPORTION now — plain score weight — so
-/// it never reaches this projection: a weight is exact at every
-/// revenue, and only amounts denominated in satoshis need projecting.
+/// The Group-Solo finder bonus is not folded in: it is a proportion
+/// carried as plain score weight, exact at every revenue, and only
+/// amounts denominated in satoshis need projecting.
 pub fn extras_from_ledger<'a>(
     entries: impl IntoIterator<Item = (&'a str, u64, i64)>,
 ) -> Vec<(u64, i64)> {
@@ -367,10 +359,9 @@ pub fn extras_from_ledger<'a>(
 ///
 /// `entries` is `(score_weight, extra_sats)` per address, where
 /// `extra_sats` is the SIGNED sum of everything that address is to
-/// receive beyond its score share. Today that is exactly one thing: its
-/// ledger balance (negative when it owes the pool). The Group-Solo
-/// finder bonus is a proportion carried as score weight and never
-/// reaches this.
+/// receive beyond its score share: its ledger balance (negative when it
+/// owes the pool). The Group-Solo finder bonus is a proportion carried as
+/// score weight and never reaches this.
 ///
 /// Two things are enforced, in this order:
 ///
@@ -559,14 +550,11 @@ pub fn claim_sats(
 /// Identity of a weight distribution: the settlement INPUTS, not any
 /// concrete satoshi outcome.
 ///
-/// The identity this replaced hashed `(reward, sats)` — one that only
-/// works when the coinbase pays those exact sats. Under the weight
-/// model the same distribution legitimately
-/// yields different satoshi vectors for different template revenues
-/// (`floor(weight·T/W)`), so the identity must be the thing every
-/// outcome is derived FROM: per address its integer score weight, its
-/// ledger balance at build time, and its dust limit, plus the fee (in
-/// parts-per-million) and an optional finder bonus. Settlement re-reads
+/// The same distribution legitimately yields different satoshi vectors
+/// for different template revenues (`floor(weight·T/W)`), so the
+/// identity is the thing every outcome is derived FROM: per address its
+/// integer score weight, its ledger balance at build time, and its dust
+/// limit, plus the fee (in parts-per-million) and an optional finder bonus. Settlement re-reads
 /// exactly these inputs from the snapshot stored under this hash and
 /// books `earned(T_actual) − actually_paid` per address.
 ///
@@ -671,9 +659,8 @@ fn biguint_to_le_bytes_32(n: &BigUint) -> [u8; 32] {
 /// fits comfortably in `f64`'s ~15–16 significant digits, so no big-integer
 /// arithmetic is needed — keeping this **allocation-free** on the
 /// per-share validation hot path (it runs once per submitted share via
-/// [`calculate_difficulty`]). Accuracy is pinned to the pre-existing
-/// big-integer result within `1e-9` relative by
-/// `prop_target_to_difficulty_matches_bigint_reference`.
+/// [`calculate_difficulty`]). Accuracy against a big-integer reference is
+/// pinned by `prop_target_to_difficulty_matches_bigint_reference`.
 pub fn target_to_difficulty(target: &Target) -> Difficulty {
     let divisor = le_bytes_to_f64(&target.0);
     if divisor == 0.0 {
@@ -810,9 +797,8 @@ mod tests {
         Target(biguint_to_le_bytes_32(&big))
     }
 
-    /// The pre-C1 difficulty algorithm: scaled big-integer division then
-    /// `to_f64`. Kept here as the reference the allocation-free `f64`
-    /// [`target_to_difficulty`] is proven against
+    /// Scaled big-integer division then `to_f64`: the reference the
+    /// allocation-free `f64` [`target_to_difficulty`] is checked against
     /// (`prop_target_to_difficulty_matches_bigint_reference`).
     fn target_to_difficulty_bigint_reference(target: &Target) -> f64 {
         let divisor = BigUint::from_bytes_le(&target.0);
@@ -904,12 +890,10 @@ mod tests {
 
     #[test]
     fn meets_target_closes_float_precision_gap() {
-        // Regression: a hash exactly at the target must be accepted by the
-        // byte-exact is_met_by_le — that's the real acceptance rule, and it
-        // closes any float round-trip gap. target_to_difficulty now rounds
-        // to nearest (not floor), so the recomputed difficulty round-trips
-        // to within tolerance of D in either direction rather than strictly
-        // below it.
+        // A hash exactly at the target is accepted by the byte-exact
+        // is_met_by_le, the real acceptance rule, so no float round-trip
+        // gap applies. target_to_difficulty rounds to nearest, so the
+        // recomputed difficulty lands within tolerance of D either way.
         for diff in [931.31, 1024.0, 65536.5, 1_000_000.0] {
             let target = difficulty_to_target(Difficulty(diff));
             assert!(target.is_met_by_le(&target.to_le_bytes()));
@@ -968,8 +952,8 @@ mod tests {
     #[test]
     fn difficulty_to_target_then_back_round_trips() {
         // Covers production range (sub-unit CPU miners up to high-diff
-        // ASIC rentals at ~1e14) plus the regression target where the
-        // u64-cast path used to wrap.
+        // ASIC rentals at ~1e14), where a u64 cast of the scaled value
+        // would wrap.
         for diff in [0.06, 1.0, 10.0, 1000.0, 65537.0, 1_000_000.0, 1e10, 1e14] {
             let target = difficulty_to_target(Difficulty(diff));
             let back = target_to_difficulty(&target).0;
@@ -1158,9 +1142,8 @@ mod tests {
 
         #[test]
         fn prop_target_to_difficulty_matches_bigint_reference(target_le: [u8; 32]) {
-            // Proves the f64 target_to_difficulty agrees with the pre-C1
-            // scaled-big-integer algorithm within the module's 1e-9
-            // tolerance, over arbitrary targets.
+            // The f64 target_to_difficulty agrees with the scaled
+            // big-integer reference over arbitrary targets.
             let target = Target(target_le);
             let got = target_to_difficulty(&target).0;
             let want = target_to_difficulty_bigint_reference(&target);
@@ -1168,11 +1151,9 @@ mod tests {
             if want == f64::MAX || got == f64::MAX {
                 prop_assert_eq!(want, got);
             } else {
-                // The two agree to ~1e-5. The residual is the OLD method's
-                // scaled-integer *truncation* (its error reaches ~4e-6 for
-                // the smallest difficulties); the f64 method is in fact more
-                // accurate — it matches the true frozen-reference values to
-                // 1e-9 (`target_to_difficulty_frozen_reference_values`).
+                // The residual is the reference's scaled-integer
+                // truncation; the f64 method matches the frozen reference
+                // values to 1e-9 (`target_to_difficulty_frozen_reference_values`).
                 let rel = (got - want).abs() / want;
                 prop_assert!(rel < 1e-5, "target={:?} got={} want={} rel={}", target_le, got, want, rel);
             }
@@ -1426,9 +1407,8 @@ mod tests {
 
     /// `identical inputs agree, any input change disagrees`
     ///
-    /// The finder bonus is no longer a preimage field of its own: it is
-    /// a proportion, carried as plain score weight, so a change to it
-    /// shows up as a changed `score_weight` — covered by `weight` below.
+    /// The finder bonus is carried as plain score weight, so a change to
+    /// it is a changed `score_weight`, covered by `weight` below.
     #[test]
     fn weights_fingerprint_binds_every_input() {
         let base = || {
@@ -1526,9 +1506,9 @@ mod tests {
     }
 
     /// The gate must fail OPEN on anything that cannot describe a real
-    /// block — a floor computed from nonsense would refuse to book a
-    /// perfectly good one. The dust sweep mints synthetic negative
-    /// heights for its audit rows, so that case is not hypothetical.
+    /// block, since a floor computed from nonsense would refuse to book a
+    /// good one. The dust sweep mints synthetic negative heights for its
+    /// audit rows.
     #[test]
     fn subsidy_fails_open_on_impossible_inputs() {
         assert_eq!(block_subsidy_sats(-1, SUBSIDY_HALVING_INTERVAL), 0);

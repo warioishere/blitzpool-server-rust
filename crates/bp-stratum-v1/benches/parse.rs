@@ -6,9 +6,8 @@
 //! ([`bp_stratum_v1::parse_request`]).
 //!
 //! Reports two numbers per message shape:
-//!   - **allocations per parse** — the ckpool-relevant figure (ckpool's
-//!     submit path is ~zero-alloc; ours currently builds a `serde_json::Value`
-//!     DOM + owns each field as a `String`).
+//!   - **allocations per parse** — the figure that matters on the submit hot
+//!     path, which is meant to borrow from the input rather than allocate.
 //!   - **ns/op** (criterion) — wall-clock per parse with warmup + outlier
 //!     detection.
 //!
@@ -21,10 +20,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bp_stratum_v1::parse_request;
 use criterion::{Criterion, Throughput};
 
-// ── Counting allocator: tallies every `alloc` call so we can read the
+// ── Counting allocator: tallies every `alloc` call to read the
 //    allocation count around a single isolated parse. Wraps the System
-//    allocator (criterion's own allocations are not measured — we only
-//    read the counter delta across one parse_request call). ──
+//    allocator (criterion's own allocations are not measured — only the
+//    counter delta across one parse_request call is read). ──
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 struct Counting;
@@ -63,7 +62,7 @@ const CASES: &[(&str, &str)] = &[
 
 /// Allocations during exactly one `parse_request` of `line`. The result is
 /// dropped AFTER the second read so its destructor's deallocs don't matter
-/// (we count allocs, not net).
+/// (allocs are counted, not net).
 fn allocs_for(line: &str) -> usize {
     let before = ALLOCS.load(Ordering::Relaxed);
     let parsed = parse_request(black_box(line));

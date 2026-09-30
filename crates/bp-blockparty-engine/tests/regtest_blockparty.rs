@@ -81,7 +81,7 @@ async fn blockparty_ready_party_pays_members_and_history_is_idempotent() {
 
     let svc = service(&pg, &addr_fee);
 
-    // ── Lifecycle: create → addMember → confirm → READY ─────────
+    // ── Lifecycle: create → add_member → confirm → READY ────────
     let create = svc
         .create_group(&name, &addr_admin, 6_000)
         .await

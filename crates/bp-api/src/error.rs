@@ -106,11 +106,10 @@ impl ApiError {
 /// Serve the durable half of a response when the live store is merely
 /// unreachable.
 ///
-/// A Redis blip used to degrade only the mining path; since the live
-/// session fields moved there, every one of these endpoints reads it,
-/// and failing the whole document over one unavailable field would turn
-/// a blip into a full read-API outage. So a transient fault falls back
-/// to "no live data" — the same state an evicted key already produces —
+/// The live session fields live in Redis and every one of these endpoints
+/// reads them; failing the whole document over one unavailable field would
+/// turn a Redis blip into a full read-API outage. So a transient fault
+/// falls back to "no live data" — the same state an evicted key produces —
 /// while the rest of the document is served.
 ///
 /// [`bp_client_live::LiveReadError::NotConfigured`] is deliberately NOT
@@ -158,7 +157,7 @@ impl IntoResponse for ApiError {
 }
 
 /// Map `bp_group_mgmt_engine::GroupServiceError` to an `ApiError`. The
-/// service errors carry their own code; we additionally pick the right
+/// service errors carry their own code; this additionally picks the right
 /// HTTP status so the UI sees 403/404/409 instead of always 500.
 impl From<bp_group_mgmt_engine::GroupServiceError> for ApiError {
     fn from(e: bp_group_mgmt_engine::GroupServiceError) -> Self {

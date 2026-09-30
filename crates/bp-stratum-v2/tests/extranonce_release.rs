@@ -46,9 +46,7 @@ const SRI_TEST_PUB: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
 const SRI_TEST_PRV: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
 
 /// An Extended channel whose connection dies without `CloseChannel` gives its
-/// prefix back. Regression pin: the teardown release used to be missing
-/// entirely, so an ungracefully-dropped miner stranded its prefix for the
-/// lifetime of the process.
+/// prefix back on connection teardown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ungraceful_disconnect_releases_extranonce_prefix() {
     let (server, _updates_tx) = spawn_server(sv2_extranonce());
@@ -94,8 +92,7 @@ async fn ungraceful_disconnect_releases_extranonce_prefix() {
 /// The binary builds one SV2 server per port, all on one allocator. Their
 /// first channels must get distinct prefixes: two PPLNS ports hash the same
 /// coinbase, so a shared prefix there means two miners searching the same
-/// space. Each server used to build its own allocator, and both handed out
-/// `00 00 00 01`.
+/// space.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_ports_hand_out_distinct_prefixes() {
     let extranonce = sv2_extranonce();
@@ -218,5 +215,3 @@ async fn open_extended_channel(
     }
     panic!("OpenExtendedMiningChannelSuccess within 16 frames");
 }
-
-// ── Helpers (mirrors of the ones in regtest_extended.rs) ─────────────

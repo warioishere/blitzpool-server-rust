@@ -10,7 +10,7 @@ pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(600);
 /// 2-second HTTP timeout.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// `http://ip-api.com`. NOT configurable today — `boot.rs` builds
+/// `http://ip-api.com`. NOT configurable: `boot.rs` builds
 /// `GeoIpConfig::default()`; a self-hosted mirror needs a TOML key first.
 pub const DEFAULT_BASE_URL: &str = "http://ip-api.com";
 

@@ -127,9 +127,9 @@ pub(crate) async fn spawn(
 }
 
 /// Resolve the shared group-fee config (Group-Solo + Blockparty).
-/// `cfg.group_fees.address` / `.percent` win when set; otherwise we
-/// fall back to `cfg.pplns.fee_address` / `.fee_percent` so PPLNS-only
-/// deployments keep working without a config change. Returns
+/// `cfg.group_fees.address` / `.percent` win when set; otherwise
+/// `cfg.pplns.fee_address` / `.fee_percent` apply, so a config with only
+/// a `[pplns]` fee needs no separate group-fee section. Returns
 /// `(parsed_address, percent)` — `Err((raw, parse_error))` when the
 /// resolved address string fails `AddressId::new`.
 pub(crate) fn resolve_group_fees(
@@ -169,9 +169,8 @@ pub(crate) fn resolve_group_fees(
 /// the admin's address; subsequent shares refresh `lastShareAt` (the
 /// dissolve-cooldown gate).
 ///
-/// Reads the producer-stamped `share.mode` (the Core composite resolved it
-/// from the mode gate at fan-out), so it holds no gate and runs unchanged on
-/// the Satellite off the accepted stream.
+/// Reads the producer-stamped `share.mode`, so it holds no mode gate and
+/// runs unchanged on the Satellite off the accepted stream.
 pub(crate) struct BlockpartyAcceptedShareSink {
     service: Arc<dyn BlockpartyApi>,
 }

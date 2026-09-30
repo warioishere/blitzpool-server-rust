@@ -7,26 +7,13 @@
 //! and the owned shapes the pure handlers take. The per-message mapping is
 //! specific to each sub-protocol; the primitives underneath it are not — a
 //! fixed-width byte field, a UTF-8 string, a token, a `Str0255` behave the same
-//! whichever frame carries them.
+//! whichever frame carries them, so they have one implementation here.
 //!
-//! They used to be written out per codec, and the copies had already drifted:
-//! `str0255` reached the same `CodecError::Conversion(format!("{e:?}"))` through
-//! `CodecError::from_conv` on one side and through a locally re-declared
-//! `conv` on the other, because `from_conv` was private to the mining codec and
-//! the JDP codec could not see it. Counting the write paths, that one function
-//! existed in four spellings.
-//!
-//! The messages both sub-protocols carry — `SetupConnection` and ext 0x0001
-//! `RequestExtensions`, with their `.Success` / `.Error` replies — are decoded
-//! and encoded here too, for the same reason: they are not mining's or JDP's,
-//! and the per-codec copies were identical down to the owned input struct,
-//! which each client module used to declare for itself.
-//!
-//! [`CodecError`] lives here for the same reason: both codecs return it. It is
-//! not the mining codec's type — it only used to be declared there. The same
-//! goes for the write side: both server tasks put a message into its frame
-//! and hand it to the Noise writer, and [`WriteError`] is what that fails
-//! with, so `write_message` and `write_raw_frame` live here too.
+//! The same holds for the messages both sub-protocols carry
+//! (`SetupConnection` and ext 0x0001 `RequestExtensions`, with their
+//! `.Success` / `.Error` replies), for [`CodecError`], which both codecs
+//! return, and for the write side: [`WriteError`], `write_message` and
+//! `write_raw_frame` serve both server tasks.
 
 use stratum_core::codec_sv2::MessageFrame;
 use stratum_core::common_messages_sv2::{
@@ -55,11 +42,7 @@ pub enum CodecError {
     /// Inbound message arrived on the wrong sub-protocol port —
     /// e.g. a JDP frame on the mining listener. Caller logs +
     /// ignores (the per-connection task already routed by port).
-    ///
-    /// Name and message are protocol-neutral because both codecs raise it:
-    /// the JDP codec has done so all along, and while this variant lived in
-    /// the mining codec it told an operator a JDP frame was "not relevant to
-    /// mining server" — naming the listener that did not reject it.
+    /// Name and message are protocol-neutral because both codecs raise it.
     #[error("message type not served on this sub-protocol port: {0:?}")]
     NotForThisSubProtocol(&'static str),
     /// Sv2 wire type → owned-data conversion failure. Typically a
@@ -67,18 +50,14 @@ pub enum CodecError {
     #[error("conversion: {0}")]
     Conversion(String),
     /// A miner-supplied string failed UTF-8 validation. Caller
-    /// reports + drops (a malicious miner can otherwise corrupt
-    /// downstream string handling).
+    /// reports + drops, so downstream string handling only sees valid UTF-8.
     #[error("invalid UTF-8: {0}")]
     InvalidUtf8(String),
 }
 
 impl CodecError {
     /// Wrap any `Debug` conversion failure as [`CodecError::Conversion`].
-    ///
-    /// `pub(crate)` and not private: both codecs and both write paths need it,
-    /// and being unreachable from three of the four is exactly how it came to
-    /// be written out three more times.
+    /// `pub(crate)` because both codecs and both write paths use it.
     pub(crate) fn from_conv<E: core::fmt::Debug>(e: E) -> Self {
         CodecError::Conversion(format!("{e:?}"))
     }
@@ -182,9 +161,7 @@ pub(crate) fn str0255(s: String) -> Result<stratum_core::binary_sv2::Str0255Owne
 /// does not include [`crate::protocol_version::MIN_PROTOCOL_VERSION`].
 ///
 /// One constant for both sub-protocols: it answers the same message for the
-/// same reason on either port. The JDP side used to say
-/// `unsupported-version` instead — the same condition under a second name,
-/// and not the one the reference JD-server sends.
+/// same reason on either port.
 pub const ERR_PROTOCOL_VERSION_MISMATCH: &str = "protocol-version-mismatch";
 
 /// Inputs from a deserialized `SetupConnection` frame, narrowed to what the

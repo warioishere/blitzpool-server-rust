@@ -54,8 +54,8 @@ impl AddressCache {
     /// membership changes are rare.
     pub async fn rebuild(&self, pool: &PgPool) -> Result<(), GroupServiceError> {
         // Lenient reads (raw address strings, no `AddressId` decode): one
-        // malformed legacy address must NOT fail the whole boot-time rebuild
-        // and crash the pool. We parse + skip invalid ones below instead.
+        // malformed address must NOT fail the whole boot-time rebuild and
+        // crash the pool, so invalid ones are parsed + skipped below.
         let members = bp_db::find_all_pplns_group_member_addresses(pool).await?;
         let active_by_id: HashMap<Uuid, bool> = bp_db::list_active_pplns_group_flags(pool)
             .await?

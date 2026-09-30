@@ -90,11 +90,8 @@ impl ShareTotalsAccumulator {
     pub fn forget_address(&self, address: &AddressId) {
         let mut addr = self.address.lock();
         addr.forget(address);
-        // Worker keys aren't directly forget-able by prefix; the next flush
-        // will naturally clear residuals as they reach zero, but actively
-        // dropping them here avoids stale buckets sticking in memory if
-        // the address never sees another share. Cost is a single iteration
-        // of the worker map.
+        // Worker keys cannot be forgotten by prefix; dropping them here keeps
+        // stale buckets from lingering if the address never shares again.
         drop(addr);
         let mut workers = self.worker.lock();
         let to_remove: Vec<WorkerKey> = workers
@@ -103,8 +100,7 @@ impl ShareTotalsAccumulator {
             .filter(|k| &k.address == address)
             .cloned()
             .collect();
-        // drain() above is a *snapshot* — it didn't clear the live map.
-        // Use the keys to forget them individually.
+        // drain() is a snapshot and does not clear the live map.
         for key in to_remove {
             workers.forget(&key);
         }

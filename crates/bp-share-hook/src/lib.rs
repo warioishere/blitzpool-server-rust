@@ -4,19 +4,18 @@
 //!
 //! # Why this crate exists
 //!
-//! The Rust port has **two** Stratum servers in a single process:
+//! The pool runs **two** Stratum servers in a single process:
 //!
 //! - `bp-stratum-v1` (JSON-RPC over TCP) for legacy SV1 miners
 //! - `bp-stratum-v2` (Noise + binary frames) for SV2 miners
 //!
-//! Both servers fire per-accepted-share hooks that **must** drive the
-//! same business logic — PPLNS credit, group-solo credit, stats
-//! accumulation, best-difficulty tracking, session bookkeeping. Without
-//! a shared surface, every engine would need duplicate `AcceptedShareSink`
-//! impls (one for each Stratum-server crate's protocol-specific trait).
+//! Both fire per-accepted-share hooks that **must** drive the same business
+//! logic (PPLNS credit, group-solo credit, stats, best-difficulty tracking,
+//! session bookkeeping), so every engine implements one sink, not one per
+//! protocol.
 //!
-//! `bp-share-hook` introduces a **protocol-agnostic view** —
-//! [`SharedAcceptedShare`] — and the trait engines implement against it,
+//! `bp-share-hook` holds that **protocol-agnostic view**,
+//! [`SharedAcceptedShare`], and the trait engines implement against it,
 //! [`SharedAcceptedShareSink`]. Each Stratum server projects its native
 //! `ShareAccept` into the shared view at the call site (its
 //! `shared_adapter` module) and calls the shared sink directly — the
@@ -32,11 +31,8 @@
 //!                                  ... all impl SharedAcceptedShareSink
 //! ```
 //!
-//! # Lifecycle outlook
-//!
-//! When SV1 is eventually retired (SV2 is the future protocol), the
-//! `bp-stratum-v1` crate + its projection just go away. Engines stay
-//! unchanged.
+//! Retiring SV1 means removing `bp-stratum-v1` and its projection; the
+//! engines stay unchanged.
 //!
 //! # Scope
 //!
@@ -49,10 +45,9 @@
 //!
 //! **`BlockSubmissionSink` stays per-protocol** because it carries the
 //! full native `ShareAccept` (header / hash / mining-job snapshot)
-//! needed for the TDP `submit_solution` call. The block-submission
-//! wiring is also concentrated in `bin/blitzpool` (one impl), so the
-//! per-protocol cost is one trait impl per Stratum server, not 4
-//! engines × 2 protocols.
+//! needed for the TDP `submit_solution` call. Its wiring lives in
+//! `bin/blitzpool` (one impl), so the per-protocol cost is one trait impl
+//! per Stratum server.
 
 use async_trait::async_trait;
 
@@ -103,51 +98,41 @@ pub struct SharedAcceptedShare<'a> {
     /// same accumulators as regular ones.
     pub is_block_candidate: bool,
 
-    /// Session-wide hashrate snapshot taken right after the vardiff
-    /// engine consumed this share — H/s computed from the per-slot
-    /// share-difficulty sum over the elapsed window. Carried on the share
-    /// record for downstream observers; note the persisted
-    /// `client_entity.hashRate` is **not** this value — that column is
-    /// owned by the session-persistence hashrate sampler, which computes a
-    /// self-zeroing 2-min moving average from accumulated credited
-    /// difficulty rather than a single per-share snapshot.
+    /// Session-wide hashrate snapshot (H/s) taken right after the vardiff
+    /// engine consumed this share. The live per-session `hash_rate` is
+    /// **not** this value: it belongs to the session-persistence hashrate
+    /// sampler, a self-zeroing 2-min average of credited difficulty.
     pub hash_rate: f64,
 
     /// Number of mining channels open on this session's downstream
     /// connection. `1` for a direct miner (one device → one channel);
     /// `> 1` when a rental proxy bundles several same-rig devices onto a
-    /// single connection. Persisted onto `client_entity.channelCount` so
-    /// the UI can render the per-session difficulty as "aggregated"
+    /// single connection. Written to the session's live hash so the UI
+    /// can render the per-session difficulty as "aggregated"
     /// instead of one channel's flapping vardiff target.
     pub channel_count: u32,
 
     /// Core wall-clock time (epoch milliseconds) at which this share was
-    /// accepted, stamped **once** at the protocol-agnostic projection
-    /// boundary (the SV1/SV2 `shared_adapter` projections) via [`bp_common::now_ms`]. Every
-    /// downstream sink MUST window / time-bucket on this value and never
-    /// re-stamp
-    /// `now()` at the sink. In a single process the two are microseconds
-    /// apart, but once the share path and the accounting sinks can live in
-    /// separate processes (Core/Satellite), a sink that re-stamps `now()`
-    /// would mis-time replayed or backlogged shares.
+    /// accepted, stamped **once** in the SV1/SV2 `shared_adapter` projections
+    /// via [`bp_common::now_ms`]. Every downstream sink MUST window /
+    /// time-bucket on this value and never re-stamp `now()`: the sinks can run
+    /// in another process (Core/Satellite) and would mis-time replayed or
+    /// backlogged shares.
     pub ts_ms: i64,
 
     /// Producer-assigned share id, format `{core_epoch}:{seq}` (see
     /// [`ShareSequencer`]). The **dedup key** for exactly-once accounting:
     /// a sink that mutates a non-idempotent store (the Redis PPLNS /
     /// Group-Solo windows) keys its dedup marker on this so a redelivered
-    /// share is a no-op. Assigned once at the single fan-out point (the
-    /// in-process composite today, the stream producer under the split);
-    /// **empty (`""`) until the producer stamps it** — the protocol side
-    /// leaves it blank because they have no global sequence.
+    /// share is a no-op. Assigned once at the single fan-out point;
+    /// **empty (`""`) until the producer stamps it**, since the protocol side
+    /// has no global sequence.
     pub share_id: &'a str,
 
     /// Resolved payout mode for this share's address, stamped by the
-    /// producer at the single fan-out point. Sinks read this instead of
-    /// querying a mode-gate per share: under the split the producer (Core)
-    /// resolves it once from the authoritative gate, so the consumer sinks
-    /// need no gate. `Solo` until the producer stamps it (the protocol side has
-    /// no gate).
+    /// producer (Core) at the single fan-out point from the authoritative
+    /// mode gate, so the consumer sinks need no gate of their own. `Solo`
+    /// until the producer stamps it (the protocol side has no gate).
     pub mode: MiningMode,
     /// Group id (UUID string) for `GroupSolo` / `Blockparty` modes, else
     /// `None`. Carried next to `mode` so the group sinks don't re-query the
@@ -204,16 +189,12 @@ pub trait SharedAcceptedShareSink: Send + Sync {
 /// Owned counterpart of [`SharedAcceptedShare`] — the canonical *record*
 /// of an accepted share.
 ///
-/// The borrowed [`SharedAcceptedShare`] is zero-copy and lifetime-tied to
-/// the originating `ShareAccept`: ideal for the in-process fan-out, but it
-/// cannot outlive the share or cross a serialization boundary. This owned
-/// form is what a producer materializes ([`SharedAcceptedShare::to_owned_record`])
-/// and what a consumer reconstructs and borrows a view back from
-/// ([`Self::as_view`]) to drive the **exact same** [`SharedAcceptedShareSink`]
-/// code. The front's producer materializes this owned record and `XADD`s it;
-/// the Satellite reconstructs it and borrows a view to drive the accounting
-/// sinks. One sink entrypoint for both sides is the producer/consumer
-/// equivalence seam.
+/// The borrowed [`SharedAcceptedShare`] is lifetime-tied to the originating
+/// `ShareAccept` and cannot cross a serialization boundary. The front's
+/// producer materializes this owned form
+/// ([`SharedAcceptedShare::to_owned_record`]) and `XADD`s it; the Satellite
+/// reconstructs it and borrows a view back ([`Self::as_view`]) to drive the
+/// **exact same** [`SharedAcceptedShareSink`] code.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SharedAcceptedShareOwned {
     pub address: String,
@@ -224,9 +205,9 @@ pub struct SharedAcceptedShareOwned {
     pub user_agent: Option<String>,
     pub is_block_candidate: bool,
     pub hash_rate: f64,
-    /// See [`SharedAcceptedShare::channel_count`]. `serde(default)` keeps
-    /// any already-enqueued record without this field decoding to a
-    /// single-channel (non-aggregated) session.
+    /// See [`SharedAcceptedShare::channel_count`]. `serde(default)` decodes
+    /// a record without this field as a single-channel (non-aggregated)
+    /// session.
     #[serde(default = "one_channel")]
     pub channel_count: u32,
     pub ts_ms: i64,
@@ -236,7 +217,7 @@ pub struct SharedAcceptedShareOwned {
 }
 
 /// Serde default for [`SharedAcceptedShareOwned::channel_count`] — a record
-/// without the field is a pre-bundling single-channel session.
+/// without the field is a single-channel session.
 fn one_channel() -> u32 {
     1
 }
@@ -296,13 +277,11 @@ impl SharedAcceptedShare<'_> {
 /// layer). The pool-wide counters still bump; per-address ones gated
 /// on `address.is_some()`.
 ///
-/// `reason` is the canonical 3-variant [`bp_stats::RejectedReason`]
-/// (JobNotFound / DuplicateShare / LowDifficulty). Both Stratum
-/// servers map their richer per-protocol reject enums into this
-/// stable shape in their `shared_adapter` projections (SV1's `Stale` collapses into
-/// `JobNotFound`; SV2's `BadExtranonceSize` doesn't surface to this
-/// trait — it's pre-share-validation so the share never reaches a
-/// counter).
+/// `reason` is the canonical [`bp_stats::RejectedReason`]. Both Stratum
+/// servers map their per-protocol reject enums into it in their
+/// `shared_adapter` projections; SV2's protocol-validity rejects
+/// (channel id, extranonce size) are not share rejects and never reach
+/// a counter.
 #[derive(Debug, Clone, Copy)]
 pub struct SharedRejectedShare<'a> {
     pub address: Option<&'a str>,
@@ -328,7 +307,7 @@ pub trait SharedRejectedShareSink: Send + Sync {
 /// Owned counterpart of [`SharedRejectedShare`]. Same role as
 /// [`SharedAcceptedShareOwned`]: the canonical record a producer materializes
 /// and a consumer borrows a view back from, so the rejected-share fan-out runs
-/// identical sink code in-process and (later) across the Core/Satellite split.
+/// identical sink code in-process and across the Core/Satellite split.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SharedRejectedShareOwned {
     pub address: Option<String>,

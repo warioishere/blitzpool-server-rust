@@ -2,33 +2,21 @@
 
 //! Per-channel state for SV2 Standard + Extended mining channels.
 //!
-//! Single `ChannelState` struct (not an enum); the [`ChannelKind`] discriminant
-//! tells callers which subset of fields is meaningful for a given
-//! channel:
+//! One `ChannelState` struct; the [`ChannelKind`] discriminant tells callers
+//! which fields are meaningful:
 //!
-//! - **Standard**: `extranonce_size = 0` (the entire 12-byte coinbase
-//!   slot is `[extranonce_prefix(4) | zero(8)]` — the miner can't
-//!   roll). [`StandardJobMaps`] (`job_id_to_difficulty` +
-//!   `job_id_to_merkle_root`) is the source of truth for share
-//!   validation; `extended_jobs` stays empty.
+//! - **Standard**: `extranonce_size = 0` (the miner cannot roll).
+//!   [`StandardJobMaps`] drives share validation; `extended_jobs` stays empty.
+//! - **Extended**: `extranonce_size > 0` after the pool-assigned prefix.
+//!   [`ExtendedJob`] entries in `extended_jobs` carry everything needed to
+//!   rebuild the coinbase and walk the merkle path on submit, including the
+//!   job's difficulty.
 //!
-//! - **Extended**: `extranonce_size > 0` (miner-controlled bytes after
-//!   the pool-assigned prefix; total ≤ 12). [`ExtendedJob`] storage in
-//!   `extended_jobs` carries everything needed to reconstruct the
-//!   coinbase + walk the merkle path on share submit;
-//!   `standard_jobs` stays empty (Extended share validation reads
-//!   `extended_jobs[jobId].sessionDifficulty` from the job record
-//!   itself).
+//! `declared_max_target` is the channel's SV2 ceiling: vardiff clamps against
+//! it before sending `SetTarget`.
 //!
-//! `declared_max_target` is the channel's SV2-spec ceiling on
-//! difficulty: the pool MUST NOT assign a target lower (= harder) than
-//! this. Vardiff retargeting clamps against it before sending
-//! `SetTarget`.
-//!
-//! [`SubmissionCache`] is the per-channel dedup set. A tuple-keyed
-//! `HashSet` tracks submitted shares for duplicate detection. Cleared on
-//! `SetNewPrevHash` (block change), the same point that retires the
-//! extended-jobs map.
+//! [`SubmissionCache`] is the per-channel dedup set, cleared on
+//! `SetNewPrevHash`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -58,30 +46,22 @@ pub struct ChannelState {
     /// by [`crate::extranonce::ConnectionExtranonce`]).
     pub extranonce_prefix: Vec<u8>,
     /// Miner-controlled bytes after the prefix. `0` for Standard;
-    /// `(12 - prefix.len)`-clamped for Extended (BitAxe/NerdQAxe quirk
-    /// — some firmware ignores larger sizes and corrupts the coinbase
-    /// varint).
+    /// clamped to `12 - prefix.len` for Extended, because some BitAxe /
+    /// NerdQAxe firmware ignores larger sizes and corrupts the coinbase varint.
     pub extranonce_size: u8,
 
     pub session_difficulty: Difficulty,
 
-    /// SV2 spec: the client's declared maximum target. Pool MUST NOT
-    /// assign easier targets (`difficulty > declared_max_difficulty`
-    /// equivalently `target < declared_max_target`). Vardiff clamps
-    /// against this before sending `SetTarget`. Stored as raw 32-byte
-    /// little-endian U256 so we don't lose precision converting
-    /// to/from `Difficulty` during the clamp check.
+    /// SV2: the client's declared maximum target; vardiff clamps against it
+    /// before sending `SetTarget`. Kept as raw 32-byte little-endian U256 so
+    /// the clamp check loses no precision.
     pub declared_max_target: [u8; 32],
 
     /// The `nominal_hash_rate` this channel last declared, if any.
     ///
-    /// Only the silence-easing path reads it, to tell a NEW declaration
-    /// apart from the same one being re-sent. Silence is evidence about
-    /// what the channel did in the past; a changed declaration is
-    /// information about what it is now, and the two do not contradict
-    /// each other — a proxy whose workers just attached is not lying, it
-    /// has news. An unchanged value re-sent on a timer carries no news,
-    /// so there the observation still rules.
+    /// The silence-easing path uses it to tell a NEW declaration (news about
+    /// the channel now, e.g. a proxy whose workers just attached) from the
+    /// same value re-sent on a timer, where observed silence still rules.
     pub last_declared_hash_rate: Option<f32>,
 
     /// Standard-channel job bookkeeping
@@ -89,29 +69,25 @@ pub struct ChannelState {
     /// Extended channels.
     pub standard_jobs: StandardJobMaps,
 
-    /// Extended-channel job storage with retire-not-clear lifecycle
-    /// (sv2-ui#143). Empty for Standard channels.
+    /// Extended-channel job storage with retire-not-clear lifecycle.
+    /// Empty for Standard channels.
     pub extended_jobs: HashMap<u32, ExtendedJob>,
 
-    /// Block context stored at `SetNewPrevHash` time so future
-    /// `NewExtendedMiningJob` frames don't need to re-derive it.
-    /// `None` until the first `SetNewPrevHash` arrives. Standard
-    /// channels don't need this — `NewMiningJob` carries an absolute
-    /// merkle root.
+    /// Block context stored at `SetNewPrevHash` time for later
+    /// `NewExtendedMiningJob` frames. `None` until the first
+    /// `SetNewPrevHash`. Standard channels do not need it: `NewMiningJob`
+    /// carries an absolute merkle root.
     pub latest_extended_prev_hash: Option<[u8; 32]>,
     pub latest_extended_n_bits: Option<u32>,
     pub latest_extended_min_ntime: Option<u32>,
 
     pub accepted_share_count: u64,
-    /// Sum of accepted-share difficulties. f64 because PPLNS-on-low-
-    /// diff ports can have sub-1 entries; an integer accumulator
-    /// would lose them.
+    /// Sum of accepted-share difficulties. f64 because low-diff ports can
+    /// have sub-1 entries.
     pub accepted_share_difficulty_sum: f64,
 
-    /// Channel-local job-id counter. Each `NewMiningJob` /
-    /// `NewExtendedMiningJob` send bumps it. SV2 `job_id` is a `u32`
-    /// per the mining-protocol spec; the pool uses per-channel monotonic
-    /// allocation.
+    /// Channel-local, monotonic job-id counter, bumped on each
+    /// `NewMiningJob` / `NewExtendedMiningJob`.
     pub next_job_id: u32,
 
     /// Per-channel submission dedup set. Cleared on block change.
@@ -127,10 +103,9 @@ pub struct ChannelState {
     /// change (`SetNewPrevHash`) is always sent. `None` until the first job.
     pub last_sent_job_signature: Option<u64>,
 
-    /// One-shot diagnostic flag — pool logs the actual extranonce length
-    /// of the first share per channel so operators can spot firmware
-    /// that ignores the advertised `extranonce_size`. The flag stays
-    /// `false` until the first share is processed.
+    /// One-shot diagnostic flag: the first share per channel logs its actual
+    /// extranonce length, to spot firmware that ignores the advertised
+    /// `extranonce_size`.
     pub first_share_logged: bool,
 
     /// Target memo for the per-share accept check. Per-job difficulty
@@ -202,9 +177,8 @@ impl ChannelState {
         }
     }
 
-    /// Record an accepted share. Bumps the per-channel counters; the
-    /// dedup-cache write happens via `SubmissionCache::insert_*` at
-    /// the call site (the validator already produced the dedup key).
+    /// Record an accepted share in the per-channel counters. The dedup-cache
+    /// write happens at the call site via `SubmissionCache::insert_*`.
     pub fn record_accepted_share(&mut self, share_difficulty: Difficulty) {
         self.accepted_share_count = self.accepted_share_count.saturating_add(1);
         self.accepted_share_difficulty_sum += share_difficulty.as_f64();
@@ -216,11 +190,9 @@ impl ChannelState {
         self.target_memo.target_for(job_difficulty)
     }
 
-    /// Reset the submission-dedup cache. Called on `SetNewPrevHash`
-    /// (block change). The retire-not-clear pattern only applies to the
-    /// **job storage** (so in-flight shares can still resolve a
-    /// jobId to `stale-share` instead of `invalid-job-id`); the
-    /// dedup cache is rebuilt naturally as new shares arrive.
+    /// Reset the submission-dedup cache on `SetNewPrevHash`. Only the job
+    /// storage is retired rather than cleared (so in-flight shares resolve
+    /// to `stale-share`, not `invalid-job-id`).
     pub fn clear_submission_cache(&mut self) {
         match &mut self.submission_cache {
             SubmissionCache::Standard(s) => s.clear(),
@@ -238,11 +210,8 @@ impl ChannelState {
 
 // ── SubmissionCache ──────────────────────────────────────────────────
 
-/// Per-channel duplicate-share guard. Standard and Extended share-submit
-/// frames carry different field sets, so the dedup key is a different
-/// tuple shape per kind. Wrapping in an enum keeps the
-/// non-applicable variant zero-cost (the empty `HashSet<...>` for the
-/// other kind never gets touched).
+/// Per-channel duplicate-share guard. Standard and Extended submit frames
+/// carry different fields, so each kind has its own key type.
 #[derive(Clone, Debug)]
 pub enum SubmissionCache {
     Standard(HashSet<StandardDedupKey>),
@@ -270,20 +239,15 @@ pub struct ExtendedDedupKey {
 }
 
 /// Upper bound on the per-channel submission dedup set. The set is only
-/// cleared on a block change; between blocks a fast miner accumulates
-/// entries indefinitely (more so now that byte-identical refreshes are
-/// suppressed and a channel keeps one `job_id` for the whole block). An
-/// unbounded set both leaks memory and, after a firmware nonce-range
-/// replay, starts flagging legitimate resubmissions as duplicates. Cap
-/// the window: when it fills, drop the oldest generation wholesale.
+/// cleared on a block change, and a channel may keep one `job_id` for the
+/// whole block, so without a cap a fast miner grows it without end (and a
+/// firmware nonce-range replay gets flagged as duplicates). When it fills,
+/// the whole generation is dropped.
 const MAX_SUBMISSION_CACHE: usize = 10_000;
 
 impl SubmissionCache {
-    /// Try to record a Standard-channel submission. Returns `true` if
-    /// it was newly inserted (= not a duplicate), `false` if the key
-    /// was already present. Panics in debug builds if called on an
-    /// Extended-cache variant — the caller should be asserting the
-    /// channel kind anyway.
+    /// Record a Standard-channel submission. `true` if new, `false` if a
+    /// duplicate. Debug-asserts on an Extended cache.
     pub fn insert_standard(&mut self, key: StandardDedupKey) -> bool {
         match self {
             SubmissionCache::Standard(set) => {
@@ -477,9 +441,7 @@ mod tests {
         assert!(ch.submission_cache.is_empty());
     }
 
-    /// Dedup-cache kind matches the channel kind — clearing on a
-    /// Standard channel doesn't accidentally turn it into an Extended
-    /// cache.
+    /// Clearing keeps the dedup-cache kind matching the channel kind.
     #[test]
     fn cache_kind_is_preserved_after_clear() {
         let mut ch = ChannelState::new_standard(
@@ -524,10 +486,8 @@ mod tests {
     // ── full_extranonce_size invariant ─────────────────────────────
 
     /// `full_extranonce_size = prefix.len + extranonce_size`. The SV2 cap is
-    /// **32** (`extranonce_prefix` is `B0_32`); 12 is only this pool's
-    /// layout — Standard always 4+0, Extended typically 4+8. Neither bound is
-    /// enforced here; the 32-byte one is enforced at channel-open in
-    /// `handle_open_extended_mining_channel`.
+    /// **32** (`extranonce_prefix` is `B0_32`, enforced at channel open);
+    /// 12 is only this pool's layout.
     #[test]
     fn full_extranonce_size_is_sum_of_prefix_and_rollable() {
         let ch = ChannelState::new_standard(

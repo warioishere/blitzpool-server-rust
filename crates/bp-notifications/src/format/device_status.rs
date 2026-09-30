@@ -2,10 +2,8 @@
 
 //! Per-language device-status message builder + timezone formatter.
 //!
-//! Consolidates the duplicated de/en formatting for Telegram, ntfy,
-//! and push-notification paths into a single helper. The dispatcher
-//! calls this and pipes the result into whichever adapter is being
-//! used.
+//! One de/en formatter shared by the Telegram, ntfy and push paths; the
+//! dispatcher pipes the result into whichever adapter is used.
 
 use chrono::{DateTime, Utc};
 

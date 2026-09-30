@@ -15,7 +15,7 @@
 //!
 //! Cancellation: a single `CancellationToken` is observed by both the TDP
 //! and both bridge tasks. Dropping the public `TdpHandle` triggers cancel,
-//! which makes `BitcoinCoreSv2TDP::run` return; we then join the thread.
+//! which makes `BitcoinCoreSv2TDP::run` return; the thread is then joined.
 
 use std::path::PathBuf;
 
@@ -112,7 +112,7 @@ fn run_thread(
             }
 
             // Per-connection child token: cancelled either by pool
-            // shutdown (cascades from `cancel`) or by us after the TDP
+            // shutdown (cascades from `cancel`) or explicitly after the TDP
             // run-loop returns, so the bridges for THIS connection exit
             // without tearing down the shared channels.
             let conn_cancel = cancel.child_token();
@@ -276,7 +276,7 @@ async fn bridge_out(
                 Ok(msg) => {
                     if let Some(update) = TemplateUpdate::from_upstream(&msg) {
                         // It is fine if no subscribers exist yet — bitcoin-core
-                        // keeps producing templates and we just drop them.
+                        // keeps producing templates and they are just dropped.
                         let _ = templates_tx.send(update);
                     } else {
                         debug!("bridge_out: dropping non-outbound payload variant");

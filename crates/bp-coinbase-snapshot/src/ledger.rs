@@ -63,11 +63,9 @@ pub enum LedgerError {
     ///
     /// `pplns_payout_history` has no `blockHash` column and is UNIQUE on
     /// `(blockHeight, address)`, so the ledger cannot hold both. This apply
-    /// therefore books nothing, and saying so as an error is the whole
-    /// point: the previous shape returned `Ok` with zero counts, which the
-    /// confirmation watcher read as success — it fired the settlement,
-    /// logged "payout history applied" and dropped the parked block. A
-    /// block whose coinbase paid miners on-chain vanished with it.
+    /// books nothing, and it must be an error: an `Ok` with zero counts
+    /// reads as success to the confirmation watcher, which would then drop
+    /// the parked block.
     ///
     /// Terminal by nature: the recorded rows will not change on a retry.
     /// The caller parks the block in the unbookable store instead, where

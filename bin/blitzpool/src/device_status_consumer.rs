@@ -13,8 +13,8 @@
 //! Notify-only (no ledger), so at-least-once delivery is harmless: a redelivery
 //! after a crash-before-`XACK` just re-sends one online/offline push, which is
 //! cosmetic. Tail-start ($) so a first run doesn't re-fire buffered history. The
-//! loop skeleton lives in [`bp_share_stream::StreamConsumer::run`]; this file
-//! only supplies the per-event dispatcher fan-out.
+//! loop is [`bp_share_stream::StreamConsumer::run`]; this file supplies only
+//! the per-event handler.
 
 use std::sync::Arc;
 
@@ -81,22 +81,19 @@ mod tests {
 
     const ADDR: &str = "bcrt1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
 
-    /// End-to-end over real Redis: the split front's producing sink
-    /// publishes online + offline events, and a consumer drains them back with
-    /// the wire format intact and acks them. This exercises the exact produce →
-    /// XREADGROUP → reconstruct → XACK path that [`spawn`] runs (its loop
-    /// mirrors `block_found_consumer`, covered by `regtest_split_e2e`).
+    /// Over real Redis: online + offline events from the split front's
+    /// producing sink round-trip through XREADGROUP with the wire format
+    /// intact and are acked, the same path [`spawn`] runs.
     #[tokio::test]
     async fn producing_sink_events_round_trip_and_ack() {
-        // DB 11: every test target in this binary runs as a thread in one
-        // process and FLUSHDBs its index on entry, so two sharing an index
-        // wipe each other's stream. `redis_backup` already owns 9.
+        // Tests in this binary run in parallel and FLUSHDB their index on
+        // entry, so each needs its own DB number.
         let Some(redis) = connect_redis_in_range_or_skip(redis_db::BLITZPOOL_BIN, 11).await else {
             eprintln!("redis unreachable — skipping device-status round-trip test");
             return;
         };
         // Split front (no dispatcher) → publishes to DEVICE_STATUS_STREAM_KEY.
-        // No Postgres: building the event no longer touches it.
+        // Building the event needs no Postgres.
         let sink = ProducingDeviceStatusSink::new(redis.clone());
         sink.on_device_event(ADDR, "rig1", "sid-online", Some("cpuminer/2.5"), true)
             .await;

@@ -32,9 +32,8 @@ const MARKER_TTL_SECONDS: u64 = 5 * 60;
 /// every accepted share, debounced to ≤ one write per minute per
 /// (address, mode) pair.
 pub(crate) struct LiveModeMarkerSink {
-    /// `ConnectionManager` is already `Clone` + internally multiplexed
-    /// (Arc-backed), so we clone it per write like the window stores do —
-    /// no external `Mutex` serializing every marker write on the hot path.
+    /// Cloned per write: `ConnectionManager` is internally multiplexed, so
+    /// no `Mutex` serializes marker writes on the hot path.
     redis: ConnectionManager,
     debouncer: Arc<MarkDebouncer>,
 }

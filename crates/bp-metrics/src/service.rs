@@ -6,10 +6,8 @@
 //! # Lifecycle
 //!
 //! Exactly **one** `MetricsService::spawn` per process — the `metrics`
-//! crate uses a single global recorder. The handle holds the listener
-//! task; dropping it shuts down the HTTP listener via the exporter's
-//! own cancellation mechanism. Tests that need a per-test recorder
-//! must use a different port each time and clean up explicitly.
+//! crate uses a single global recorder, and the HTTP listener lives for
+//! the rest of the process.
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tracing::{info, warn};
@@ -36,9 +34,9 @@ impl MetricsService {
     }
 }
 
-/// Handle. Cheap; holds nothing the caller needs to drop manually.
-/// The exporter's HTTP listener task is detached + lives for the
-/// process lifetime (the global recorder is install-once anyway).
+/// Handle to the running exporter. The HTTP listener task is detached
+/// and lives for the process lifetime (the global recorder is
+/// install-once anyway), so nothing needs dropping manually.
 #[derive(Clone, Debug)]
 pub struct MetricsServiceHandle {
     pub bind_addr: String,
@@ -46,11 +44,8 @@ pub struct MetricsServiceHandle {
 
 impl Drop for MetricsServiceHandle {
     fn drop(&mut self) {
-        // The metrics-exporter-prometheus listener doesn't expose a
-        // clean shutdown handle in the install-on-runtime mode; once
-        // installed the recorder lives for the process. Log so
-        // operators can correlate handle-drops with the listener
-        // outliving the holder if it ever becomes a problem.
+        // The exporter has no shutdown handle in this mode, so the
+        // listener outlives the handle; the log line makes that visible.
         warn!(
             bind_addr = %self.bind_addr,
             "MetricsServiceHandle dropped; Prometheus listener continues on global recorder"

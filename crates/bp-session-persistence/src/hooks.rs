@@ -2,11 +2,9 @@
 
 //! `bp_share_hook` trait implementations.
 //!
-//! Engines used to impl `bp_stratum_v1::hooks::{SessionPersistence,
-//! AcceptedShareSink}` directly. The
-//! session + per-share hook surfaces are decoupled from the wire
-//! protocol via `bp-share-hook` so this single impl serves both
-//! SV1 + SV2 servers.
+//! The session and per-share hook surfaces come from `bp-share-hook`,
+//! decoupled from the wire protocol, so this single impl serves both the
+//! SV1 and SV2 servers.
 //!
 //! ## [`SessionPersistenceHook`]
 //!
@@ -57,8 +55,7 @@ impl SharedSessionPersistence for SessionPersistenceHook {
         user_agent: Option<&str>,
     ) {
         // The authorize timestamp becomes the row's startTime/firstSeen
-        // when (and if) the row is born — same value the synchronous
-        // upsert used to stamp.
+        // when (and if) the row is born.
         self.debounce.register(
             address,
             worker,
@@ -95,9 +92,8 @@ impl SharedSessionPersistence for SessionPersistenceHook {
 ///
 /// Buffered: writes land in a shared `TouchBuffer` keyed by
 /// `(address, clientName, sessionId)` and are flushed every 30s by the
-/// engine's background task in one batched script. At ~250 shares/s on
-/// a busy pool this collapses ~250 individual writes/s to
-/// ≈ N_active_sessions per 30 s.
+/// engine's background task in one batched script, so the write load is
+/// one entry per active session per flush, not one per share.
 ///
 /// The same share also feeds the `HashrateSampler`, which owns the
 /// `hash_rate` field: it accumulates the share's credited difficulty and
@@ -122,10 +118,8 @@ impl SharedAcceptedShareSink for ClientRowTouchSink {
         // Worker can be empty in some SV2 paths (no `.<name>` suffix in
         // user_identity); the SV2 session row was registered under the
         // same "default", so the fallback preserves the PK match. SV1
-        // never sends an empty worker any more — its authorize parse
-        // defaults a trailing dot to "worker" (letting "" through birthed
-        // a row no touch could ever hit, and kill_dead_clients swept the
-        // live session).
+        // never sends an empty worker: its authorize parse defaults a
+        // trailing dot to "worker", so its touches hit the born row.
         let worker = if share.worker.is_empty() {
             "default"
         } else {
@@ -173,13 +167,9 @@ const DIFF_STAT_SLOT_MS: i64 = 60 * 60 * 1000;
 ///
 /// Coalesces in memory and writes in BATCHES: the share hot path merges the
 /// per-slot max into `DiffStatBuffer`, and one flush loop upserts the whole
-/// window in a single statement.
-///
-/// It used to upsert inline on every new max, which is cheap mid-slot and a
-/// burst at the edges — after a restart and at every hour rollover, every
-/// miner's first share is a new max and the next ones keep raising it. Measured
-/// on prod 2026-08-05: 4.88 s for one of those single-row upserts, 2.5 minutes
-/// after a payout restart.
+/// window in a single statement. An inline upsert per new max would burst
+/// after a restart and at every hour rollover, where every miner's first
+/// shares keep raising the max.
 #[derive(Clone)]
 pub struct ClientDifficultyStatisticsSink {
     buffer: Arc<DiffStatBuffer>,

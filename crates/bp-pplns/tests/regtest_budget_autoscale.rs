@@ -62,8 +62,8 @@ const REGTEST_BLOCK_REWARD_SATS: u64 = 5_000_000_000;
 
 /// SMALL initial reservation — the coinbase below exceeds it by MORE than one
 /// filler-tx weight, so the granularity gap left below core's tx-selection cap
-/// can't absorb the overflow (that gap was why an earlier, smaller overflow
-/// still fit). Mirrors a pool whose budget lags its payout count.
+/// can't absorb the overflow. Mirrors a pool whose budget lags its payout
+/// count.
 const B0_BUDGET: u32 = 50_000;
 /// LARGER reservation the autoscaler steps up to — big enough for the coinbase.
 const B1_BUDGET: u32 = 280_000;
@@ -195,8 +195,8 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
     .expect("TdpHandle::spawn");
 
     // Capture the bootstrap prev-hash (current tip). `SetNewPrevHash` is only
-    // emitted on a tip change, not on mempool deltas — and we never mine here,
-    // so this prev-hash stays valid for every template we build below.
+    // emitted on a tip change, not on mempool deltas, and nothing is mined
+    // here, so this prev-hash stays valid for every template built below.
     let mut rx = tdp.subscribe();
     let (_boot, prev) = wait_for_paired_template(&mut rx).await;
 
@@ -205,7 +205,7 @@ async fn autoscale_reservation_raise_turns_rejected_block_into_accepted() {
 
     // ── Template under B0 (mempool full) → coinbase → expect REJECT ─────
     // Subscribe fresh AFTER the fill, then nudge: the emission triggered by the
-    // nudge happens *after* we're listening, so the captured template reflects
+    // nudge happens *after* the subscription, so the captured template reflects
     // the now-full mempool (an earlier template would carry too few txs).
     let mut rx0 = tdp.subscribe();
     nudge_template(&node).await;
@@ -404,9 +404,9 @@ async fn fill_mempool(node: &RegtestNode, target_vbytes: u64) {
         match node.wallet_call("sendmany", json!(["", amounts])).await {
             Ok(_) => {}
             Err(e) => {
-                // Out of funds / chain-limit: mine a block to confirm + free
-                // UTXOs would empty the mempool, so instead just stop and let
-                // the assertion report if we under-filled.
+                // Out of funds / chain-limit: mining a block to free UTXOs
+                // would empty the mempool, so stop and let the assertion
+                // report an under-fill.
                 eprintln!("[autoscale] sendmany stopped after {iterations} txs: {e}");
                 break;
             }
@@ -432,9 +432,9 @@ async fn nudge_template(node: &RegtestNode) {
 /// Wait for the first `NewTemplate` emitted on a freshly-subscribed receiver.
 /// Used after a mempool nudge / reservation change: on a fresh subscription the
 /// first template the worker emits reflects the current mempool + reservation
-/// (mempool-driven updates carry no fresh `SetNewPrevHash`, so we don't pair by
-/// id here — the caller reuses the bootstrap prev-hash, valid until a block is
-/// mined). Tolerates one broadcast lag.
+/// (mempool-driven updates carry no fresh `SetNewPrevHash`, so there is no
+/// pairing by id here; the caller reuses the bootstrap prev-hash, valid until
+/// a block is mined). Tolerates one broadcast lag.
 async fn wait_for_new_template(rx: &mut broadcast::Receiver<TemplateUpdate>) -> NewTemplate {
     let deadline = std::time::Instant::now() + Duration::from_secs(12);
     while std::time::Instant::now() < deadline {

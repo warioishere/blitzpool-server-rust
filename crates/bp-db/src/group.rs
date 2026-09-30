@@ -40,8 +40,8 @@ pub struct PplnsGroupRow {
     pub round_reset_timezone: Option<String>,
     #[sqlx(rename = "lastRoundResetAt")]
     pub last_round_reset_at: Option<i64>,
-    /// RETIRED: the fixed-satoshi finder bonus. Kept one release so the
-    /// ppm conversion (migration 0009) stays auditable; nothing reads it.
+    /// Fixed-satoshi finder bonus. Nothing reads it; the finder bonus is
+    /// `finder_bonus_ppm`.
     #[sqlx(rename = "finderBonusSats")]
     pub finder_bonus_sats: Option<Sats>,
     /// Finder bonus as a fraction of the miner cut, in parts-per-million.
@@ -53,8 +53,8 @@ pub struct PplnsGroupRow {
     pub round_reset_preset: Option<String>,
     #[sqlx(rename = "isPublic")]
     pub is_public: bool,
-    /// When true, the Group-Solo round is wiped on every block-found (legacy
-    /// behavior). Default false: shares accumulate across blocks until a
+    /// When true, the Group-Solo round is wiped on every block-found.
+    /// Default false: shares accumulate across blocks until a
     /// calendar preset or manual reset fires.
     #[sqlx(rename = "resetRoundOnBlock")]
     pub reset_round_on_block: bool,
@@ -522,7 +522,7 @@ where
     .map_err(DbError::from)
 }
 
-/// Lookup a group row by its `name` — used by `createGroup` to enforce
+/// Lookup a group row by its `name`, used at group creation to enforce
 /// the human-friendly uniqueness rule (dissolved groups don't count, so
 /// a name can be re-used once the original is gone). Returns `Some` only
 /// for non-dissolved groups.
@@ -596,9 +596,8 @@ pub async fn list_active_pplns_groups(pool: &PgPool) -> Result<Vec<PplnsGroupRow
     .map_err(DbError::from)
 }
 
-/// Count rows in `pplns_group_member` for one group. Drives the
-/// `recomputeActive` path: a group is active once `count >=
-/// MIN_MEMBERS_ACTIVE` (= 1 today — active as soon as the creator joins).
+/// Count rows in `pplns_group_member` for one group. A group is active once
+/// `count >= MIN_MEMBERS_ACTIVE` (= 1: active as soon as the creator joins).
 pub async fn count_pplns_group_members_for_group<'e, E>(
     executor: E,
     group_id: Uuid,
@@ -671,15 +670,14 @@ where
     Ok(result.rows_affected())
 }
 
-/// Partial-update DTO for `updateRoundResetConfig`.
+/// Partial-update DTO for `update_round_reset_config`.
 ///
 /// - `Untouched` — column stays as is (field absent from request)
 /// - `Clear` — column is set to NULL or zero (field explicitly null)
 /// - `Set(value)` — column is overwritten (field set to a value)
 ///
-/// `hour_local` is forced to 0 because calendar resets always fire at
-/// midnight local time; we still allow the field as `PatchField::Set(0)`
-/// so a future change is easy.
+/// `hour_local` is always `Set(0)`: calendar resets fire at midnight local
+/// time.
 #[derive(Clone, Debug, Default)]
 pub struct RoundResetConfigPatch {
     pub preset: PatchField<String>,
@@ -700,11 +698,9 @@ pub enum PatchField<T> {
     Set(T),
 }
 
-/// Apply the per-field round-reset config patch + `isPublic` toggle.
-/// Builds a single UPDATE — fields tagged `Untouched` are skipped, the
-/// other two states map to `column = NULL` / `column = value` via
-/// `CASE WHEN $flag THEN $value ELSE column END` chains so we still
-/// emit one SQL statement.
+/// Apply the per-field round-reset config patch + `isPublic` toggle as one
+/// UPDATE: `Untouched` fields keep their column, the other two states map
+/// to `column = NULL` / `column = value` via `CASE WHEN $flag` chains.
 ///
 /// Returns the freshly-read row so callers can attach it directly
 /// to the API response.
@@ -894,8 +890,8 @@ where
     Ok(result.rows_affected())
 }
 
-/// DELETE all member rows for one group. Used by `dissolveInternal`
-/// before flipping the group's `dissolvedAt` stamp.
+/// DELETE all member rows for one group. Used on dissolve, before the
+/// group's `dissolvedAt` stamp is set.
 pub async fn delete_pplns_group_members_for_group<'e, E>(
     executor: E,
     group_id: Uuid,
@@ -913,9 +909,8 @@ where
     Ok(result.rows_affected())
 }
 
-/// UPDATE a member's `role` ("creator" / "member"). Used by
-/// `transferCreator` to demote the outgoing creator + promote the
-/// incoming one as two separate calls.
+/// UPDATE a member's `role` ("creator" / "member"). A creator transfer
+/// demotes the outgoing creator + promotes the incoming one as two calls.
 pub async fn update_pplns_group_member_role<'e, E>(
     executor: E,
     group_id: Uuid,
@@ -940,8 +935,8 @@ where
 }
 
 /// Lookup one (`groupId`, `address`) member row. Same shape as
-/// [`find_group_member_by_address`] but filtered by group too — needed
-/// for `transferCreator` / `removeMember` / `addMember` flows.
+/// [`find_group_member_by_address`] but filtered by group too, for the
+/// creator-transfer / remove-member / add-member flows.
 pub async fn find_pplns_group_member_in_group(
     pool: &PgPool,
     group_id: Uuid,
@@ -966,7 +961,7 @@ pub async fn find_pplns_group_member_in_group(
     .map_err(DbError::from)
 }
 
-/// Lookup the creator member-row for a group. `transferCreator` reads
+/// Lookup the creator member-row for a group; a creator transfer reads
 /// this to know whom to demote.
 pub async fn find_pplns_group_creator_member(
     pool: &PgPool,
@@ -1012,8 +1007,8 @@ pub async fn find_all_pplns_group_members(
 }
 
 /// Lenient member list for the boot-time routing-cache rebuild: returns raw
-/// address STRINGS (not `AddressId`), so one malformed legacy address can't
-/// fail the whole decode and crash boot. The caller parses each + skips the
+/// address STRINGS (not `AddressId`), so one malformed address can't fail
+/// the whole decode and stop boot. The caller parses each + skips the
 /// invalid ones. Pairs with [`list_active_pplns_group_flags`].
 pub async fn find_all_pplns_group_member_addresses(
     pool: &PgPool,
@@ -1120,10 +1115,9 @@ where
     Ok(result.rows_affected())
 }
 
-/// Hard-DELETE one invitation by token. Used by
-/// `cancelInvitationByAddress` — admin removes a directed invitation
-/// before the recipient acts on it (the cancellation isn't an audit
-/// event worth keeping).
+/// Hard-DELETE one invitation by token, for an admin cancelling a directed
+/// invitation before the recipient acts on it (not an audit event worth
+/// keeping).
 pub async fn delete_pplns_group_invitation_by_token<'e, E>(
     executor: E,
     token: &str,
@@ -1141,9 +1135,8 @@ where
     Ok(result.rows_affected())
 }
 
-/// Find one pending directed invitation for (`groupId`, `address`).
-/// Used by `createInvitation` to enforce the "no double invite while
-/// pending" rule + by `cancelInvitationByAddress` to locate the row.
+/// Find one pending directed invitation for (`groupId`, `address`):
+/// enforces "no double invite while pending" and locates the row to cancel.
 pub async fn find_pplns_group_invitation_pending_directed(
     pool: &PgPool,
     group_id: Uuid,
@@ -1273,8 +1266,8 @@ pub async fn find_pplns_group_active_open_invite_for_group(
 }
 
 /// Mark every pending open invite for `groupId` as `revoked` (single
-/// statement). Used as the first half of `createOpenInvite`'s atomic
-/// replace. Returns the affected-row count for logging.
+/// statement): the first half of `create_open_invite`'s atomic replace.
+/// Returns the affected-row count for logging.
 pub async fn revoke_pending_open_invites_for_group<'e, E>(
     executor: E,
     group_id: Uuid,
@@ -1362,9 +1355,8 @@ where
     .map_err(DbError::from)
 }
 
-/// Find the pending join-request row by (`id`, `groupId`). Used by
-/// approve/reject — the admin clicks a button keyed to the request ID
-/// and we double-check the row still belongs to the group + is still
+/// Find the pending join-request row by (`id`, `groupId`). Approve/reject
+/// use it to confirm the row still belongs to the group and is still
 /// pending before mutating.
 pub async fn find_pplns_group_join_request_pending_in_group(
     pool: &PgPool,
@@ -1395,7 +1387,7 @@ pub async fn find_pplns_group_join_request_pending_in_group(
 }
 
 /// Most recently-decided rejected request for (`groupId`, `address`).
-/// Drives the 24h reject-cooldown check in `createJoinRequest`.
+/// Drives the 24h reject-cooldown check in `create_join_request`.
 pub async fn find_pplns_group_join_request_most_recent_rejected(
     pool: &PgPool,
     group_id: Uuid,

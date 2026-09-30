@@ -3,8 +3,8 @@
 //! Load test — measures **Segment 2** of the stratum-race latency: from a new
 //! block (`SetNewPrevHash`) to `mining.notify` delivered to N connected miners.
 //!
-//! Not a pass/fail correctness test — it prints a latency distribution so we can
-//! see whether the fan-out serialises (last miner much later than the first) or
+//! Not a pass/fail correctness test — it prints a latency distribution showing
+//! whether the fan-out serialises (last miner much later than the first) or
 //! stays flat as N grows. Run it directly:
 //!
 //! ```text
@@ -14,7 +14,7 @@
 //!
 //! The absolute numbers include the block-mine RPC + Core→TDP IPC hop (shared
 //! across all miners); the **spread** (max − min) isolates the per-connection
-//! broadcast cost, which is what a lean C connector (ckpool) would beat us on.
+//! broadcast cost.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

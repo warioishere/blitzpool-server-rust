@@ -2,15 +2,14 @@
 
 //! Runtime driver for the coinbase-budget autoscaler.
 //!
-//! Glues three pieces the pure control core ([`bp_pplns_engine::autoscale`])
-//! cannot reach on its own:
+//! Connects the pure control core ([`bp_pplns_engine::autoscale`]) to:
 //!
 //! - the **live budget handle** the PPLNS distribution builder reads per
 //!   template (pressure samples flow out, new budgets flow in);
-//! - **bitcoin-core's reservation** via the TDP handle — coupled to the
+//! - **bitcoin-core's reservation** via the TDP handle, coupled to the
 //!   trimmer budget in the race-safe order so a found block is never rejected;
-//! - **Redis persistence** so the live value survives a restart (otherwise a
-//!   reboot resets to the floor and the autoscaler re-climbs — itself hopping).
+//! - **Redis persistence** so the live value survives a restart instead of
+//!   resetting to the floor and climbing again.
 //!
 //! ## Race-safe coupling
 //!
@@ -111,9 +110,9 @@ async fn apply_budget(
         {
             Ok(()) => true,
             Err(e) => {
-                // Trimmer already lowered; core still reserves the larger amount
-                // — SAFE (just wastes a little block space) until the next boot
-                // reconcile re-advertises. Persist the new (binding) value.
+                // Core over-reserving is safe (a little wasted block space)
+                // until the next boot reconcile re-advertises. Persist the
+                // lowered value, which is the binding one.
                 warn!(error = %e, current, new_budget,
                     "autoscale: lowering bitcoin-core reservation failed; trimmer lowered anyway (core over-reserves, safe)");
                 true
@@ -156,8 +155,8 @@ async fn reconcile_at_boot(
                 );
                 apply_budget(clamped, live, engine, tdp, redis).await;
             } else if persisted != clamped {
-                // Persisted value was out of the current [floor,ceiling] band
-                // (operator narrowed it across a restart); rewrite the clamped.
+                // Persisted value lies outside the configured band; store the
+                // clamped one.
                 let _ = write_coinbase_budget(redis, BUDGET_KEY, clamped).await;
             }
             live.get()
@@ -179,11 +178,10 @@ async fn reconcile_at_boot(
     }
 }
 
-/// Gate + spawn the autoscaler. Returns `None` (autoscaling off, budget stays
-/// fixed at `coinbase_weight_budget`) when the feature isn't configured, is
-/// disabled, has no TDP handle to couple to, or is misconfigured. A misconfig
-/// is logged loudly but **never fatal** — a typo in a threshold must not stop
-/// the pool from mining; it just falls back to the fixed (safe) budget.
+/// Gate + spawn the autoscaler. Returns `None` (budget stays fixed at
+/// `coinbase_weight_budget`) when the feature is off, has no TDP handle to
+/// couple to, or is misconfigured. A misconfig is logged but **never fatal**:
+/// a bad threshold must not stop mining; the fixed budget is the safe fallback.
 pub(crate) async fn maybe_spawn(
     pplns_cfg: Option<&bp_config::PplnsConfig>,
     engine: Option<&PplnsEngine>,
@@ -274,9 +272,9 @@ pub(crate) async fn spawn(
                         autoscaler.observe(sample.utilization(), now_secs)
                     {
                         apply_budget(n, &live, &engine, &tdp, &mut redis).await;
-                        // Resync the control core to whatever actually took
-                        // effect — apply_budget may have aborted on an IPC error,
-                        // leaving the real budget below what observe() assumed.
+                        // Resync the control core to what actually took effect:
+                        // an aborted raise leaves the budget below what
+                        // observe() assumed.
                         autoscaler.set_current_budget(live.get());
                     }
                 }

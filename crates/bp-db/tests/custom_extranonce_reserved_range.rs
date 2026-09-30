@@ -10,16 +10,13 @@
 //! both Solo, i.e. one customer running several rigs of which one has an
 //! override — they search one space and one of them mines for nothing.
 //!
-//! `parse_prefix` in the API has always rejected these and is the only writer
-//! in the code, so this test is not about the handler. It is about the table
-//! being hand-writable while `bin/blitzpool/src/custom_extranonce.rs` loads
-//! every row without re-checking. Migration 0012 closes that with
-//! `pplns_custom_extranonce_prefix_unreserved`; this pins it so a schema
-//! rebuild cannot drop it back out.
+//! `parse_prefix` in the API rejects these too, but the table is
+//! hand-writable and `bin/blitzpool/src/custom_extranonce.rs` loads every row
+//! without re-checking, so the CHECK `pplns_custom_extranonce_prefix_unreserved`
+//! enforces the rule in the schema. This pins that constraint.
 //!
-//! Both directions are asserted in one test on purpose: the rejection alone
-//! would also pass against a constraint that rejects *everything*, which is a
-//! way this could silently stop testing what it claims.
+//! Both directions are asserted in one test: the rejection alone would also
+//! pass against a constraint that rejects *everything*.
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
 

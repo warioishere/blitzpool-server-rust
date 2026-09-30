@@ -2,14 +2,11 @@
 
 //! Core-side consumer-lag monitor for the Core→Satellite streams.
 //!
-//! The Core is always-on, so it's the right place to notice the
-//! restartable Satellite falling behind (or being down): the Core keeps
-//! producing, the stream grows, and each consumer group's `lag` (entries
-//! added but not yet delivered to that group) climbs. When the lag crosses
-//! a budget we warn — an operator's cue to act before the stream's `MAXLEN`
-//! trims oldest entries (a fairness delle). Runs only on the producing front;
-//! the satellite can't reliably self-monitor when it's the thing falling
-//! behind.
+//! Runs on the always-on producing front, because a Satellite that is behind
+//! or down cannot reliably monitor itself. Each consumer group's `lag`
+//! (entries added but not yet delivered) is sampled; over budget it warns,
+//! so an operator can act before the stream's `MAXLEN` trims entries that
+//! were never consumed.
 
 use std::time::Duration;
 
@@ -36,8 +33,7 @@ pub(crate) struct LagReport {
     pub(crate) pending: usize,
 }
 
-/// Classification of one lag sample against the budget. Split out as a pure
-/// function so the "is this alarming?" decision is unit-testable without Redis.
+/// Classification of one lag sample against the budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LagStatus {
     /// Lag known and within budget.
@@ -150,10 +146,9 @@ pub(crate) async fn collect_lag(redis: &ConnectionManager, keys: &[&str]) -> Vec
             out.push(LagReport {
                 stream: (*key).to_string(),
                 group: g.name,
-                // `lag` is `None` if Redis can't compute it (the stream was
-                // XADD-trimmed below the group's last-read id). Kept as-is
-                // (NOT coerced to 0) so the monitor can flag it as the
-                // entry-loss signal it is — see [`classify`].
+                // `None` when the stream was trimmed below the group's
+                // last-read id. Not coerced to 0: it is the entry-loss
+                // signal, see [`classify`].
                 lag: g.lag,
                 pending: g.pending,
             });
@@ -197,9 +192,8 @@ mod tests {
         assert_eq!(reports[0].lag, Some(4), "all 4 entries are undelivered");
     }
 
-    /// The alarming case is `lag = None` (Redis can't compute lag → stream
-    /// trimmed below the group offset → probable entry loss). It must NOT be
-    /// treated as `0`/ok — the whole point of the ② hardening.
+    /// `lag = None` (stream trimmed below the group offset, probable entry
+    /// loss) classifies as `Unknown`, never as ok.
     #[test]
     fn classify_treats_none_as_unknown_not_ok() {
         assert_eq!(classify(None, 100), LagStatus::Unknown);

@@ -70,11 +70,9 @@ where
 ///   in Rust, and nowhere else — this query does not pre-filter by
 ///   `lastAcceptedShareAt`, so that test has exactly one implementation.
 ///
-/// A row the dust sweep cancelled to zero is therefore inert here — it is
-/// excluded by the predicate, and the builder would skip a zero balance
-/// anyway. That matters since the sweep stopped deleting such rows: they stay
-/// behind to keep `totalPaidSats`, and this is the read that must not trip
-/// over them.
+/// A row the dust sweep cancelled to zero is inert here: it is excluded by
+/// the predicate. The sweep keeps such rows (they carry `totalPaidSats`),
+/// so this read must not trip over them.
 pub async fn find_pplns_balances_with_open_balance(
     pool: &PgPool,
 ) -> Result<Vec<PplnsBalanceRow>, DbError> {
@@ -184,10 +182,7 @@ pub async fn find_pplns_balances_for_addresses(
 
 /// Aggregate roll-up of the `pplns_balance` table — credits, debits,
 /// row counts, abandoned-bucket subtotals and lifetime payout — all
-/// in one PG round-trip. Replaces the previous pattern of fetching
-/// every non-zero balance row into Rust and aggregating client-side
-/// (which moved ~5-15 MB across the wire per call on a pool with
-/// accumulated historical addresses).
+/// in one PG round-trip, so no balance rows cross the wire.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PplnsBalanceAggregate {
     pub credit_sats: i64,
@@ -267,10 +262,8 @@ pub struct PplnsPayoutHistoryRow {
     pub percent: f32,
     #[sqlx(rename = "createdAt")]
     pub created_at: i64,
-    /// Discriminator for the row-source: `"coinbase"`, `"fee"`, `"bonus"`,
-    /// `"trim"`, `"sub-dust"`, …  (kept as raw `String` because the value
-    /// set evolves with PPLNS distribution phases — not worth a typed enum
-    /// at the data layer).
+    /// Row-source discriminator, kept as a raw `String` at the data layer;
+    /// the typed wire values live in `bp_coinbase_snapshot::PayoutRowType`.
     #[sqlx(rename = "rowType")]
     pub row_type: String,
 }
@@ -403,8 +396,8 @@ where
 /// This is what tells a harmless replay apart from a second, DIFFERENT
 /// block at the same height. `pplns_payout_history` has no `blockHash`
 /// column and is UNIQUE on `(blockHeight, address)`, so height is the only
-/// identity a booked block has, so a plain `EXISTS` on the height cannot
-/// say WHICH block it saw. That is what this replaces.
+/// identity a booked block has, and a plain `EXISTS` on the height cannot
+/// say WHICH block it saw.
 ///
 /// Rows with `paidSats = 0` are excluded on purpose: those are the
 /// "late arriver" rows the apply writes for addresses live in the window

@@ -3,7 +3,7 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::needless_return)]
 
-//! Spec-vector ports of statistics-coordinator scenarios not already covered
+//! Statistics-coordinator scenarios not already covered
 //! by the generic `stats_writes_integration` / `flush_integration` /
 //! `engine_integration` suites:
 //!

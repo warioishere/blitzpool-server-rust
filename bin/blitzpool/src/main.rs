@@ -1,37 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The workspace clippy lints deny `print_stderr` / `print_stdout` to
-// keep library code from sneaking diagnostics around `tracing`. The
-// binary is the legitimate exception: operator-facing startup errors
-// + actionable hints go to stderr alongside the tracing line so the
-// operator sees them even with a stricter `RUST_LOG` filter.
+// Workspace lints deny `print_stderr` to keep library diagnostics in
+// `tracing`. The binary is the exception: startup errors and hints go to
+// stderr too, so the operator sees them under any `RUST_LOG` filter.
 #![allow(clippy::print_stderr)]
 
 //! `blitzpool` binary entry-point.
 //!
-//! Phase 7.3 scope: extends the 7.2 engine spawn with production
-//! hook impls. Order of operations: load `AppConfig` (7.0) → spawn
-//! foundation handles via [`boot::boot`] (7.1) → spawn engines via
-//! [`engines::spawn`] (7.2) → spawn production hooks via
-//! [`hooks::spawn`] (7.3). After hooks are live the binary exits —
-//! the actual `run(cfg, handles, engines, hooks)` loop lands in
-//! Phase 7.4 alongside Stratum binding.
-//!
-//! Phase plan: 7.4 (Stratum servers + BlockSubmissionSink wiring),
-//! 7.5 (cron wiring), 7.6 (listeners), 7.7 (NotificationDispatcher
-//! engine hookup), 7.8 (metric instrumentation sweep), 7.9
-//! (cut-over staging on `172.16.0.21`).
-//!
-//! The single user-facing knob is `--config <PATH>` (default
-//! `./blitzpool.toml`). On a Phase-7-staging machine the operator
-//! typically points it at `.local/blitzpool.toml`.
+//! Loads `AppConfig`, spawns the foundation handles via [`boot::boot`], the
+//! engines via [`engines::spawn`] and the production hooks via
+//! [`hooks::spawn`], then wires each subsystem according to the process's
+//! roles. The one user-facing knob is `--config <PATH>` (default
+//! `./blitzpool.toml`).
 
-// Process-wide allocator. jemalloc bounds RSS under the pool's
-// small-alloc / free pattern (per-connection Stratum buffers +
-// sqlx / redis query results across 600+ concurrent clients).
-// glibc malloc fragments under sustained load, so we adopt jemalloc
-// preemptively rather than re-discover the problem in production.
-// Linux only — tikv-jemallocator doesn't support Windows MSVC.
+// Process-wide allocator: glibc malloc fragments under the pool's
+// small-alloc / free pattern (per-connection buffers, query results), and
+// jemalloc bounds RSS. Linux only; tikv-jemallocator lacks Windows MSVC.
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -91,9 +75,7 @@ use crate::jdp::{JdpHandles, JdpSpawnError};
 use crate::listeners::{ListenerHandles, ListenerSpawnError};
 use crate::stratum::{StratumHandles, StratumSpawnError};
 
-/// CLI surface — kept deliberately small in 7.0. Additions in later
-/// sub-phases (e.g. `--migrate-only`, `--dry-run`) extend this
-/// struct; the operator-visible flags grow with the bin's scope.
+/// CLI surface, kept deliberately small.
 #[derive(Debug, Parser)]
 #[command(
     name = "blitzpool",
@@ -115,28 +97,21 @@ struct Cli {
     check_config: bool,
 
     /// Parse config, spawn the foundation handles (Postgres, Redis,
-    /// BitcoinRpc, TDP, GeoIP, Metrics), then exit cleanly. Used to
-    /// validate a deployment can actually reach its external
-    /// dependencies before flipping the production-traffic switch.
-    /// `--check-config` short-circuits this — pass `--check-boot`
-    /// without `--check-config` to actually try connecting.
+    /// BitcoinRpc, TDP, GeoIP, Metrics), then exit cleanly. Validates that
+    /// a deployment can reach its external dependencies. `--check-config`
+    /// short-circuits this.
     #[arg(long)]
     check_boot: bool,
 
     /// Like `--check-boot` but extends through engine spawning
-    /// (PPLNS / Group-Solo / ShareStats / SessionPersistence). The
-    /// background tasks each engine spawns are torn down via the
-    /// process exit. Use to verify a deployment can construct the
-    /// service layer on top of its foundation.
+    /// (PPLNS / Group-Solo / ShareStats / SessionPersistence).
     #[arg(long)]
     check_engines: bool,
 
     /// Like `--check-engines` but extends through production hook
     /// construction (SMTP / FCM / Web-Push adapter init,
-    /// GroupServiceHooks wiring). Validates that all configured
-    /// `[smtp]` / `[notifications.*]` blocks parse + that any
-    /// referenced files (FCM service-account JSON, VAPID PEM) load
-    /// without error before flipping a deployment live.
+    /// GroupServiceHooks wiring), so any referenced files (FCM
+    /// service-account JSON, VAPID PEM) must load.
     #[arg(long)]
     check_hooks: bool,
 
@@ -147,32 +122,25 @@ struct Cli {
     check_api: bool,
 
     /// Like `--check-api` but extends through binding the unified
-    /// SV1+SV2 Stratum listeners (solo + solo-high-diff + optionally
-    /// pplns + pplns-high-diff). Exits cleanly once all listeners
-    /// are up. Each port multiplexes SV1 + SV2 via
-    /// first-byte detection in `stratum.rs`; JDP runs on its own `[sv2].jdp_port`
-    /// and is verified together with the stratum stack.
+    /// SV1+SV2 Stratum listeners and the JDP port. Exits once all
+    /// listeners are up.
     #[arg(long)]
     check_stratum: bool,
 
     /// Skip the bitcoin-rpc `getnetworkinfo` liveness ping during
-    /// boot. The RPC client still gets built but its reachability /
-    /// auth aren't verified. Production should never set this; the
-    /// flag exists so staging boxes can validate the rest of the
-    /// stack (PG / Redis / HTTP) before the bitcoin node is online.
+    /// boot, so the rest of the stack can be validated before the node
+    /// is online. Never set in production.
     #[arg(long)]
     skip_bitcoin_rpc_liveness: bool,
 
-    /// Skip the TDP worker spawn entirely. Useful when bitcoind isn't
-    /// running locally but we still want to verify the api / engines
-    /// layer. PPLNS network-difficulty bootstrap falls back to 1.0.
+    /// Skip the TDP worker spawn entirely, to verify the api / engines
+    /// layer without bitcoind. PPLNS network difficulty falls back to 1.0.
     #[arg(long)]
     skip_tdp: bool,
 
     /// Override the config's deployment roles (comma-separated:
-    /// `front,api,payout,stats,notify`). When set, takes precedence over the
-    /// `roles` list in the config — so every container can mount the same
-    /// config and differ only by `--roles` or the `BLITZPOOL_ROLES` env var.
+    /// `front,api,payout,stats,notify`), so every container can mount the
+    /// same config and differ only by `--roles` / `BLITZPOOL_ROLES`.
     #[arg(long, env = "BLITZPOOL_ROLES", value_delimiter = ',')]
     roles: Vec<Role>,
 
@@ -215,9 +183,8 @@ async fn main() -> ExitCode {
         Ok(cfg) => cfg,
         Err(err) => {
             tracing::error!(%err, "config load failed");
-            // Plain stderr too: tracing's formatter may suppress
-            // colourised output under non-TTY conditions and the
-            // operator still wants the path.
+            // Plain stderr too, so the operator sees the error under any
+            // tracing filter or terminal.
             eprintln!("blitzpool: {err}");
             print_config_error_help(&err);
             return ExitCode::from(2);
@@ -237,9 +204,8 @@ async fn main() -> ExitCode {
     }
 
     // Operator one-shot tools for the Redis-state backup: list / restore, then
-    // exit. No roles required and no full boot (TDP / bitcoin) — just PG (+
-    // Redis for the restore) — so they work during recovery when the rest of
-    // the stack is down. Restore never runs automatically.
+    // exit. They need only PG (+ Redis for the restore), no roles and no full
+    // boot, so they work during recovery while the rest of the stack is down.
     if cli.list_redis_backups || cli.restore_redis_state {
         let db = match boot::spawn_pg(&cfg.database).await {
             Ok(db) => db,
@@ -292,13 +258,9 @@ async fn main() -> ExitCode {
         };
     }
 
-    // Boot-time role validation — after the config-parse check, since roles
-    // commonly arrive via BLITZPOOL_ROLES at deploy time rather than the
-    // config file (so `--check-config` validates parsing without requiring them).
-    //
-    // Roles are the only topology input — a process with no role can't do
-    // anything useful. Require one (config `roles` or BLITZPOOL_ROLES) and fail
-    // fast with a pointed message rather than booting an inert process.
+    // Role validation runs after `--check-config`, since roles usually arrive
+    // via BLITZPOOL_ROLES at deploy time. A process with no role does nothing
+    // useful, so fail fast instead of booting an inert process.
     if cfg.effective_roles().is_empty() {
         tracing::error!(
             "no roles configured: set BLITZPOOL_ROLES (e.g. =front) or a `roles` \
@@ -312,10 +274,9 @@ async fn main() -> ExitCode {
     }
 
     // The front always produces shares onto the Redis stream and a separate
-    // payout Satellite consumes them. A single process holding both `front`
-    // and `payout` would produce shares no one consumes — fail fast rather
-    // than silently drop the money path. Run the front (core) and the payout
-    // back (satellite) as separate processes (see full-setup/DEPLOYMENT.md).
+    // payout Satellite consumes them. A process holding both `front` and
+    // `payout` would produce shares no one consumes, so fail fast rather than
+    // silently drop the money path.
     if cfg.has_role(Role::Front) && cfg.has_role(Role::Payout) {
         tracing::error!(
             "invalid roles: a single process cannot run both `front` and `payout` \
@@ -403,10 +364,8 @@ async fn main() -> ExitCode {
     // (block-found notify + device-status). A front never carries the notify
     // role, so it produces those events for the notify process to consume.
     let consumes_notify_streams = is_notify && !is_front;
-    // Loud, not silent: an accounting process without the notify role means the
-    // notifications live in a separate `notify` process — warn so an operator
-    // who forgot to run one notices immediately (rather than wondering why no
-    // pushes fire).
+    // An accounting process without the notify role means notifications live
+    // in a separate `notify` process; warn so a missing one is noticed.
     if is_accounting && !is_notify {
         tracing::warn!(
             "roles: this process runs accounting WITHOUT notify — notifications \
@@ -435,17 +394,13 @@ async fn main() -> ExitCode {
     };
     listeners.log_summary(is_notify);
 
-    // Phase 7.7: build NotificationDispatcher from the four adapter
-    // singletons (FCM + Web-Push from hooks; Telegram + ntfy from
-    // listeners). `None` when no transport is wired — the block-found
-    // sink and best-diff cron then collapse their `notify_*` calls
-    // into no-ops rather than building pointless event payloads.
+    // NotificationDispatcher from the four adapters (FCM + Web-Push from
+    // hooks; Telegram + ntfy from listeners). `None` when no transport is
+    // wired, so the `notify_*` calls become no-ops.
     //
-    // Notify-only: the dispatcher's drivers (best-diff/hourly/network crons,
-    // the block-found notify consumer, and the device-status consumer) all live
-    // where `notify` runs. Off the notify role it is `None`, so a front produces
-    // the block-found + device-status events to streams instead, for the notify
-    // process to fan out.
+    // Notify-only: all of the dispatcher's drivers run where `notify` runs.
+    // Off that role a front produces the block-found + device-status events
+    // to streams instead, for the notify process to fan out.
     let dispatcher = if is_notify {
         dispatcher::build(&handles, &production_hooks, &listeners)
     } else {
@@ -503,8 +458,8 @@ async fn main() -> ExitCode {
                 crate::blockparty_service::BlockpartyAcceptedShareSink::new(bp.service.clone()),
             ));
         }
-        // Bidirectional mode-collision: PPLNS-group adds now refuse
-        // addresses already in a Blockparty.
+        // Bidirectional mode-collision: PPLNS-group adds refuse addresses
+        // already in a Blockparty.
         group_service
             .service
             .set_blockparty_reader(bp.membership_reader.clone());
@@ -556,28 +511,20 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // §10 settlement fan-out: every path that books a block tells the
-    // published payout distributions about it — the local JDP registry if
-    // this process has one, and the `cache:invalidate` stream so a registry
-    // on ANOTHER process hears it too. The second half is what the role
-    // split needs: `payout` books, `front` holds the registry. Created here,
-    // ahead of the Stratum listeners, because their block sinks settle on
-    // the immediate (ungated) apply and need the same signal the
-    // confirmation watcher and the JDP sink get. See `crate::settlement`.
+    // ext 0x0003/Implementation Notes settlement fan-out: every path that
+    // books a block tells the local JDP registry (if any) and the
+    // `cache:invalidate` stream, since `payout` books while `front` holds the
+    // registry. Created ahead of the Stratum listeners, whose block sinks
+    // settle on the immediate apply and need the same signal. See
+    // `crate::settlement`.
     let settle_signal = crate::settlement::SettlementSignal::new(handles.redis.clone());
 
     // ONE JDP bridge for the whole process, built here because BOTH servers
     // that use it are spawned below and neither may build its own. It is the
     // only channel between them: the JDP server registers declared jobs and
     // base-protocol allocations, the SV2 mining server resolves a
-    // `SetCustomMiningJob` against them.
-    //
-    // It used to be built twice — once inside `stratum::spawn`, once for
-    // `jdp::spawn` — so the mining side read a registry nobody wrote to and
-    // answered `invalid-mining-job-token` to every custom job any JDC ever
-    // built. Nothing caught it: every test hands ONE bridge to both sides, so
-    // the defect lived entirely in this wiring. Found by pointing the
-    // reference jd-client at a live pool (2026-08-09).
+    // `SetCustomMiningJob` against them. A second bridge would leave the
+    // mining side reading a registry nobody writes to.
     let jdp_bridge = stratum_v2::build_bridge();
 
     // Stratum listeners + share producer are the always-on front — front-only.
@@ -616,12 +563,10 @@ async fn main() -> ExitCode {
     }
 
     // Background crons split by role: maintenance (kill-dead, cleanups,
-    // invitation/join expiry) on the accounting role; the
-    // notification crons (network-difficulty, best-difficulty, hourly stats) on
-    // the notify role. The best_difficulty + hourly crons additionally need
-    // their fan-out (`dispatcher` / listeners) wired, and seed from
-    // address_settings to avoid cold-start notification spam. A process running
-    // both roles spawns both groups.
+    // invitation/join expiry) on the accounting role; the notification crons
+    // (network-difficulty, best-difficulty, hourly stats) on the notify role.
+    // The best_difficulty + hourly crons seed from address_settings to avoid
+    // cold-start notification spam.
     let crons = if is_accounting || is_notify {
         let crons = crons::spawn(
             &handles,
@@ -639,15 +584,12 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Confirmation watcher: PPLNS + Group-Solo block-founds freeze their
-    // distribution and park it (Redis) instead of writing the ledger
-    // immediately; this task applies it once the block reaches
-    // `confirmation_depth` and discards it on orphan / non-chain-extending
-    // candidate, so a reorg never drifts the internal ledger. It is accounting
-    // → back-only, and runs whenever there's an engine to reconcile. The TDP
-    // feed (a fast new-tip trigger) is optional: the Satellite has none and runs
-    // on the fallback timer alone. (Blockparty is exempt — fixed-percentage
-    // payouts recomputed from the DB, idempotent, nothing to drift.)
+    // Confirmation watcher: PPLNS + Group-Solo block-founds park their frozen
+    // distribution in Redis; this task applies it once the block reaches
+    // `confirmation_depth` and discards it on orphan, so a reorg never drifts
+    // the internal ledger. Accounting role only; without a TDP feed it runs on
+    // the fallback timer alone. Blockparty is exempt: its fixed-percentage
+    // payouts are recomputed from the DB, so there is nothing to drift.
 
     let block_confirmation = if is_accounting {
         let depth = cfg
@@ -668,17 +610,10 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Periodic best-effort backup of the live PPLNS + Group-Solo Redis state
-    // (the per-address share weights) to Postgres, so an operator can MANUALLY
-    // reconstruct it after a Redis wipe / corruption. Runs on the payout
-    // process (single owner of the money window) with its own Redis connection
-    // so the SCAN/DUMP burst never touches the share hot-path. Restore is never
-    // automatic — see `--restore-redis-state`.
     // Keep the PPLNS window's trim size on the CURRENT network difficulty.
     // Payout role only: the window is trimmed inside `record_share`, which
-    // only that process runs, and it is the only reader of the value. The
-    // RPC (not the TDP stream) is the source because this process has no
-    // TDP feed — see `crate::network_difficulty`.
+    // only that process runs. The source is the RPC because this process has
+    // no TDP feed; see `crate::network_difficulty`.
     let _net_diff_refresh = match (cfg.has_role(Role::Payout), engines.pplns.as_ref()) {
         (true, Some(pplns)) => Some(crate::network_difficulty::spawn_refresh_task(
             handles.bitcoin_rpc.clone(),
@@ -689,6 +624,10 @@ async fn main() -> ExitCode {
         _ => None,
     };
 
+    // Periodic best-effort backup of the live PPLNS + Group-Solo Redis state
+    // to Postgres, for a MANUAL restore after a Redis wipe
+    // (`--restore-redis-state`). Payout process only, on its own Redis
+    // connection so the SCAN/DUMP burst never touches the share hot-path.
     let _redis_state_backup = if cfg.has_role(Role::Payout) {
         let backup_redis = handles
             .dedicated_redis(&cfg.redis, "redis-state-backup")
@@ -703,12 +642,10 @@ async fn main() -> ExitCode {
         None
     };
 
-    // Chain → ledger check. Every other block-found path starts from something
-    // the pool was told; this one reads the coinbase of every block that
-    // actually landed and reports the ones the ledger has no record of. Payout
-    // role, because that is where the ledger it checks is written. Reports
-    // only — the chain does not carry the distribution behind a coinbase, so
-    // it cannot book, and the operator's list is the point.
+    // Chain → ledger check: reads the coinbase of every block that landed and
+    // reports the ones the ledger has no record of. Payout role, where that
+    // ledger is written. Reports only: the chain does not carry the
+    // distribution behind a coinbase, so it cannot book.
     let _block_reconcile = if cfg.has_role(Role::Payout) {
         let markers = crate::block_reconcile::PoolMarkers::new([
             cfg.pplns
@@ -767,9 +704,9 @@ async fn main() -> ExitCode {
     };
 
     // Payout: drain the block-found stream for the engine ledger-write only (the
-    // Core submits + records the durable blocks_entity row). Dispatcher is
-    // `None` here by construction — the notify fan-out is a separate consumer on
-    // the `notify` role (below), so a notification change never restarts payout.
+    // Core submits + records the durable blocks_entity row). No dispatcher:
+    // the notify fan-out is a separate consumer on the `notify` role, so a
+    // notification change never restarts payout.
     let block_found_consumer = if consumes_streams {
         let applier = crate::block_sink::BlockFoundApplier::new(
             engines.pplns.clone(),
@@ -847,8 +784,7 @@ async fn main() -> ExitCode {
     };
 
     // The gate only sends from its sweeper, so a process holding the gate
-    // must run one — otherwise every debounced transition would be
-    // recorded and never released.
+    // must run one or debounced transitions are never released.
     let device_status_sweeper = match (device_status_gate.clone(), dispatcher.clone()) {
         (Some((g, subs)), Some(d)) => Some(crate::device_status_gate::spawn(
             g,
@@ -881,8 +817,7 @@ async fn main() -> ExitCode {
     // Latency diagnostics (front producer, gated by debug.submit_latency):
     // a runtime-stall watchdog + a Redis PING probe on the shared
     // ConnectionManager, to split a slow per-share XADD into "executor
-    // starved" vs "ConnectionManager slow". Tasks run for the process
-    // lifetime; the binding only makes ownership explicit.
+    // starved" vs "ConnectionManager slow".
     let _runtime_diag = if produces_streams && cfg.debug.submit_latency {
         Some(crate::runtime_diag::spawn(handles.redis.clone()))
     } else {
@@ -894,14 +829,9 @@ async fn main() -> ExitCode {
     // `cache:invalidate` stream + rebuilds on a periodic backstop. Only the
     // Front routes shares, so only it needs this.
     let cache_sync = if is_front {
-        // Dedicated Redis connection. cache-sync does a blocking
-        // `XREAD BLOCK 1000` for cache invalidations; on a *shared*
-        // multiplexed `ConnectionManager` that 1s block head-of-line-stalls
-        // every other command on the same connection — including the
-        // per-share accepted-share `XADD` — which surfaces as multi-hundred-
-        // ms share-ack spikes. A blocking command MUST get its own
-        // connection. Fall back to the shared handle only if a fresh
-        // connection can't be opened.
+        // Dedicated Redis connection: the blocking `XREAD BLOCK 1000` would
+        // head-of-line-stall every other command on a shared multiplexed
+        // `ConnectionManager`, including the per-share `XADD`.
         let cache_conn = handles.dedicated_redis(&cfg.redis, "cache-sync").await;
         Some(crate::cache_sync::spawn(
             cache_conn,
@@ -914,10 +844,9 @@ async fn main() -> ExitCode {
         None
     };
 
-    // One role-aware line for the Core→Satellite stream topology so an operator
-    // reading any container's log knows its relationship to the Redis streams
-    // without grepping for each consumer's `: live`. A process can consume the
-    // engine streams (accounting) and/or the notify streams (notify).
+    // One role-aware line stating this process's relationship to the Redis
+    // streams. A process can consume the engine streams (accounting) and/or
+    // the notify streams (notify).
     let any_consume = consumes_streams || consumes_notify_streams;
     match (produces_streams, any_consume) {
         (false, true) => tracing::info!(
@@ -936,18 +865,13 @@ async fn main() -> ExitCode {
         (true, true) => tracing::info!("stream summary: producing + consuming"),
     }
 
-    // JDP + the coinbase-budget autoscaler are front-only (mining / block
-    // submit + coinbase-budget tuning). Both need the TDP feed; without it
-    // (e.g. `--skip-tdp`) JDP binds nothing and the autoscaler can't couple
-    // to bitcoin-core. `jdp` stays a (disabled) handle either way so the
-    // shutdown sequence is uniform.
+    // JDP + the coinbase-budget autoscaler are front-only and need the TDP
+    // feed; without it (e.g. `--skip-tdp`) JDP binds nothing. `jdp` stays a
+    // (disabled) handle either way so the shutdown sequence is uniform.
     //
-    // The JDP bridge is spawned fresh here — real shared-bridge cross-routing
-    // between JDP-declared jobs and the SV2 mining-server `SetCustomMiningJob`
-    // happens once an actual JDC is in the loop; the topology supports it via
-    // a single `Arc` clone. The autoscaler self-tunes `coinbase_weight_budget`
-    // within [floor, ceiling], coupling the trimmer budget to bitcoin-core's
-    // reservation; `None` unless `[pplns.coinbase_autoscale]` is enabled.
+    // The autoscaler tunes `coinbase_weight_budget` within [floor, ceiling]
+    // against bitcoin-core's reservation; `None` unless
+    // `[pplns.coinbase_autoscale]` is enabled.
     let (jdp, autoscaler) = if is_front {
         match handles.tdp.clone() {
             Some(tdp_handle) => {
@@ -972,12 +896,10 @@ async fn main() -> ExitCode {
                         },
                         engines.blockparty.clone(),
                     ));
-                // Spawn the JDP template-tx cache when the pool needs the txs
+                // The JDP template-tx cache, when the pool needs the txs
                 // (`jdp_orphan_submitblock` → reconstruct the full block +
-                // `submitblock`); on by default, so this normally runs. Spawn
-                // it BEFORE jdp::spawn so its
-                // broadcast subscription registers before the first NewTemplate
-                // (see `feedback-tdp-initial-template-drain`).
+                // `submitblock`). Spawned BEFORE jdp::spawn so its broadcast
+                // subscription registers before the first NewTemplate.
                 let template_tx_cache: Option<
                     std::sync::Arc<bp_template_distribution::TemplateTxCache>,
                 > = if cfg.sv2.jdp_orphan_submitblock {
@@ -992,10 +914,9 @@ async fn main() -> ExitCode {
                     );
                     None
                 };
-                // Ledger fan-out for JDC-found blocks. Its own sink instance
-                // (all cheap handle clones), built by the same constructor as
-                // the Stratum ones, so a declared block books through the same
-                // path a pool-built one does.
+                // Ledger fan-out for JDC-found blocks, built by the same
+                // constructor as the Stratum sinks so a declared block books
+                // through the same path a pool-built one does.
                 let jdp_ledger_booker =
                     std::sync::Arc::new(crate::block_sink::TdpBlockSubmissionSink::wired(
                         tdp_handle.clone(),
@@ -1075,14 +996,8 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Block until a shutdown signal arrives or the API server task
-/// exits on its own. On signal we shut down stratum + JDP cleanly,
-/// then drop the api task — axum's serve loop exits cleanly when the
-/// listener is dropped.
-/// Shutdown-relevant engine handles, bundled so the shutdown sequence stays
-/// explicit. `stats` consumes its handle (final drain on `shutdown(mut self)`);
-/// `pplns` + `group_solo` are clone-able and signal via `cancel_tx`;
-/// `session_persistence` drains its buffered touch updates.
+/// Shutdown-relevant engine handles. `stats` consumes its handle for the
+/// final drain; `session_persistence` drains its buffered touch updates.
 struct EngineShutdownHandles {
     stats: bp_share_stats_sink::ShareStatsEngineHandle,
     pplns: Option<bp_pplns_engine::engine::PplnsEngine>,
@@ -1090,10 +1005,10 @@ struct EngineShutdownHandles {
     session_persistence: bp_session_persistence::SessionPersistenceEngineHandle,
 }
 
-// Shutdown orchestration legitimately threads one handle per subsystem;
-// bundling them into a struct would just move the list, not shorten it.
-// Front-/back-only handles are `Option` — a process shuts down only what it
-// actually spawned.
+/// Block until a shutdown signal arrives or the API server task exits on its
+/// own, then shut every subsystem down in order.
+// One handle per subsystem; a struct would only move the list. Role-specific
+// handles are `Option`, so a process shuts down only what it spawned.
 #[allow(clippy::too_many_arguments)]
 async fn wait_for_shutdown(
     api: Option<ApiServerHandle>,
@@ -1196,10 +1111,8 @@ async fn wait_for_shutdown(
     engine_shutdown.session_persistence.shutdown().await;
 }
 
-/// One-line-per-subsystem summary so an operator can sanity-check
-/// what the config file resolved to before any sockets bind in
-/// Phase 7.1+. We deliberately log values that are operationally
-/// useful (ports, hostnames, feature toggles) and explicitly redact
+/// One-line-per-subsystem summary of what the config resolved to, before any
+/// socket binds. Logs operational values (ports, hosts, toggles) and never
 /// anything secret-shaped (passwords, tokens, keys).
 fn log_startup_summary(cfg: &AppConfig) {
     tracing::info!(
@@ -1259,9 +1172,8 @@ fn log_startup_summary(cfg: &AppConfig) {
     );
 }
 
-/// One-line summary after the bp-api HTTP listener is bound. The API is a
-/// back-office surface (`api` role), so on the front it's not run — say so
-/// rather than logging nothing.
+/// One-line summary after the bp-api HTTP listener is bound, or why it is not
+/// run on this process.
 fn log_api_summary(api: Option<&ApiServerHandle>, is_api: bool) {
     match api {
         Some(a) => tracing::info!(addr = %a.addr, "bp-api summary: listening"),
@@ -1272,11 +1184,9 @@ fn log_api_summary(api: Option<&ApiServerHandle>, is_api: bool) {
     }
 }
 
-/// One-line summary after the unified SV1+SV2 listeners are bound. Stratum is
-/// the always-on front (`front` role), so on the api/payout processes it's not
-/// run — say so rather than logging nothing. Empty `ports` on the front means
-/// TDP was skipped (`--skip-tdp`) — stratum spawn is a no-op in that case to
-/// avoid binding listeners that would reject every connection.
+/// One-line summary after the unified SV1+SV2 listeners are bound, or why
+/// none are. Empty `ports` on the front means TDP was skipped
+/// (`--skip-tdp`): listeners without templates would reject every connection.
 fn log_stratum_summary(stratum: Option<&StratumHandles>, is_front: bool) {
     match stratum {
         Some(h) if h.ports.is_empty() => {
@@ -1292,10 +1202,9 @@ fn log_stratum_summary(stratum: Option<&StratumHandles>, is_front: bool) {
     }
 }
 
-/// One-line summary after JDP spawn returns. JDP is front-only, so on the
-/// `api`/`payout` processes it's never bound — say *why* (wrong role) rather
-/// than a bare "disabled", which reads like a misconfiguration when the
-/// operator did set `jdp_enabled = true`.
+/// One-line summary after JDP spawn returns. Off the front it says *why*
+/// (wrong role), since a bare "disabled" reads like a misconfiguration when
+/// `jdp_enabled = true`.
 fn log_jdp_summary(handles: &JdpHandles, is_front: bool, jdp_enabled: bool) {
     match handles.port {
         Some(p) => tracing::info!(port = p, "jdp summary: listening"),
@@ -1425,10 +1334,9 @@ fn print_api_error_help(err: &ApiServerError) {
 
 /// One-line-per-hook summary after [`hooks::spawn`] returns.
 fn log_hooks_summary(_h: &ProductionHooks) {
-    // The aggregate is Arc<dyn _>-typed so we can't introspect
-    // which concrete impl landed. The boot path already logs
-    // `smtp_ready` / `fcm_ready` / `web_push_ready` from inside
-    // `hooks::spawn`; this line just anchors the phase boundary.
+    // The aggregate is `Arc<dyn _>`-typed, so the concrete impls are not
+    // visible here; `hooks::spawn` logs their readiness. This line anchors
+    // the phase boundary.
     tracing::info!(
         email_verification_ready = true,
         invitation_email_ready = true,
@@ -1541,15 +1449,11 @@ fn print_engine_error_help(err: &EngineError) {
     }
 }
 
-/// One-line-per-handle summary after [`boot::boot`] returns. Mirrors
-/// [`log_startup_summary`] but for the live handles — gives the
-/// operator a single grep-friendly anchor for "did the foundation
-/// come up cleanly?".
+/// One-line-per-handle summary after [`boot::boot`] returns: the live-handle
+/// counterpart of [`log_startup_summary`].
 fn log_handles_summary(h: &FoundationHandles) {
-    // db/redis/bitcoin_rpc are non-optional — boot::boot returns Err if any
-    // fail, so reaching here means they're live. `tdp` is optional (front-only;
-    // skipped on api/payout and under --skip-tdp), so report its real state
-    // rather than a hardcoded `true` that misleads on the satellites.
+    // db/redis/bitcoin_rpc are live here, since boot::boot returns Err if any
+    // fails. `tdp` is optional (front-only, and absent under --skip-tdp).
     tracing::info!(
         db_ready = true,
         redis_ready = true,
@@ -1626,11 +1530,8 @@ fn print_config_error_help(err: &ConfigError) {
     }
 }
 
-/// Standard tracing setup — `RUST_LOG` env-filter, line-oriented
-/// formatter to stdout. The `EnvFilter::try_from_default_env()` call
-/// falls back to the supplied default when `RUST_LOG` isn't set,
-/// matching the convention used by every other Rust binary in the
-/// ecosystem (tracing's own docs, axum examples, sqlx-cli, etc.).
+/// Standard tracing setup: `RUST_LOG` env-filter (default `info`),
+/// line-oriented formatter to stdout.
 fn init_tracing() {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));

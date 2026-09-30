@@ -4,33 +4,26 @@
 //! `(job_id_to_difficulty, job_id_to_merkle_root)` maps for SV2 mining
 //! channels.
 //!
-//! The retire-not-clear lifecycle math (sv2-ui#143 — `retired_at`
-//! stamping, `JobClassification`, two-tier aging with `MIN_RETAINED`
-//! floor) is shared with `bp-stratum-v1::jobs` via the
-//! [`bp_jobs_lifecycle`] crate; only the SV2-specific storage shape
-//! lives here.
+//! The retire-not-clear lifecycle math (`retired_at` stamping,
+//! `JobClassification`, two-tier aging with a minimum-retained floor) is
+//! shared with SV1 via the [`bp_jobs_lifecycle`] crate; only the
+//! SV2-specific storage shape lives here.
 //!
 //! ## Two pieces
 //!
 //! - [`ExtendedJob`] + [`retire_extended_jobs`] +
 //!   [`cleanup_retired_extended_jobs`] cover the **Extended** channel
-//!   side. Each `NewExtendedMiningJob` we send out gets stored
-//!   per-channel so we can reconstruct the coinbase + merkle path on
-//!   share submission. On block change (`SetNewPrevHash`) we **retire**
-//!   the existing entries instead of clearing them, then aging GCs
-//!   retired entries past
+//!   side. Each sent `NewExtendedMiningJob` is stored per-channel so the
+//!   coinbase and merkle path can be reconstructed on share submission.
+//!   On block change (`SetNewPrevHash`) entries are **retired** instead
+//!   of cleared, and aging drops retired entries past
 //!   [`bp_jobs_lifecycle::LifecycleConfig::retention_ms`].
 //!
-//! - [`StandardJobMaps`] covers the **Standard** channel side: per-jobId
-//!   we record the session difficulty at send time
-//!   (`job_id_to_difficulty`, SV2 Mining/SubmitShares.Error — share validated
-//!   against the target the job was issued at, not the current session
-//!   target) AND the exact 32-byte merkle root the miner received in
-//!   `NewMiningJob` (`job_id_to_merkle_root` — store-on-send, NOT
-//!   recompute-on-validate; the previous design mutated the MiningJob's
-//!   coinbase script buffer in place via
-//!   `applyExtranonceAndGetCoinbaseHash` and broke for BraiinsOS
-//!   Standard channels under message-ordering edge cases).
+//! - [`StandardJobMaps`] covers the **Standard** channel side: per job id
+//!   it records the difficulty at send time (SV2 Mining/SubmitShares.Error:
+//!   a share is validated against the target its job was issued at) and
+//!   the exact merkle root the miner received in `NewMiningJob`, stored on
+//!   send rather than recomputed on validate.
 //!
 //! ## Lifecycle constants
 //!
@@ -55,19 +48,17 @@ pub use bp_jobs_lifecycle::JobClassification;
 /// reconstruct the coinbase, walk the merkle path, and assemble the
 /// 80-byte header.
 ///
-/// `retired_at` timestamps when the job was superseded (sv2-ui#143).
-/// `created_at` is used by the [`bp_jobs_lifecycle::age_entries`]
-/// defense-in-depth fallback when a non-retired entry somehow piles up
-/// past `2 ×` retention (clock jump or missed retire signal).
+/// `retired_at` timestamps when the job was superseded. `created_at` feeds
+/// the [`bp_jobs_lifecycle::age_entries`] fallback that drops a non-retired
+/// entry past `2 ×` retention (clock jump or missed retire signal).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExtendedJob {
     pub coinbase_prefix: Vec<u8>,
     pub coinbase_suffix: Vec<u8>,
-    /// Identity of the payout list this job's coinbase pays — copied off
-    /// the `MiningJob` it was built from. Lets a block found on this job
-    /// look up the exact distribution the pool must book, instead of the
-    /// shared snapshot key whichever later build overwrote. Zeroed for
-    /// jobs the pool did not build the coinbase for (`SetCustomMiningJob`).
+    /// Identity of the payout list this job's coinbase pays, copied off the
+    /// `MiningJob`, so a block found on this job books exactly that
+    /// distribution rather than a later build's snapshot. Zeroed for jobs
+    /// the pool did not build the coinbase for (`SetCustomMiningJob`).
     pub payouts_fingerprint: [u8; 32],
     pub merkle_path: Vec<[u8; 32]>,
     pub version: u32,
@@ -78,38 +69,28 @@ pub struct ExtendedJob {
     /// retroactively reclassify an in-flight share's block-candidacy.
     pub n_bits: u32,
     pub min_ntime: u32,
-    /// The channel's extranonce prefix **as of send-time**. Extended jobs
-    /// do NOT bake the prefix into `coinbase_prefix` — the miner appends it
-    /// itself at share-build time — so the validator has to splice it back
-    /// in to reproduce the miner's coinbase byte-for-byte.
+    /// The channel's extranonce prefix **as of send-time**. It is not part
+    /// of `coinbase_prefix` because the miner appends it itself, so the
+    /// validator splices it back in to reproduce the miner's coinbase.
     ///
-    /// It is pinned per-job rather than read live off the channel because
-    /// SV2 Mining/SetExtranoncePrefix lets a new prefix take effect only
-    /// from the **next** job onward: a miner still working the current job
-    /// keeps using the old one. Validating those in-flight shares against
-    /// the channel's new prefix would diverge the reconstructed coinbase
-    /// and reject every one of them as diff-too-low. Same send-time-pinning
-    /// rationale as [`Self::difficulty`] and [`Self::n_bits`], applied to
-    /// the one input those two don't cover.
+    /// Pinned per job because SV2 Mining/SetExtranoncePrefix takes effect
+    /// only from the **next** job: a miner still on the current job keeps
+    /// the old prefix, and validating against the channel's new one would
+    /// reject those shares.
     pub extranonce_prefix: Vec<u8>,
-    /// Per-job session difficulty stored at send-time.
-    /// SV2 Mining/SubmitShares.Error requires share validation against the
-    /// target the job was issued at, NOT the current `session_difficulty` —
-    /// without this a vardiff ratchet between job-send and share-submit would
-    /// falsely accept / reject in-flight shares. The Standard side stores the
-    /// same field on [`StandardJobEntry::difficulty`]; mirroring it here lets
-    /// the Extended submit-handler read directly from the job record instead
-    /// of cross-referencing the Standard-side map.
+    /// Difficulty at send-time. SV2 Mining/SubmitShares.Error validates a
+    /// share against the target its job was issued at, not the current
+    /// session difficulty, so a vardiff change in between does not
+    /// misjudge in-flight shares. Same field as
+    /// [`StandardJobEntry::difficulty`] on the Standard side.
     pub difficulty: Difficulty,
-    /// Block-reward portion the coinbase claims (= the template's
-    /// `coinbase_tx_value_remaining` at send-time). Threaded onto
-    /// [`crate::mining::submit::ShareAccept`] so the block-found fan-out can
-    /// write the per-mode engine ledger with the correct reward.
+    /// Block-reward portion the coinbase claims (the template's
+    /// `coinbase_tx_value_remaining` at send-time), carried onto
+    /// [`crate::mining::submit::ShareAccept`] for the block-found ledger.
     pub coinbase_tx_value_remaining: u64,
-    /// `None` for jobs declared via `SetCustomMiningJob` (the JDC built
-    /// the template; pool has no template-side context). For pool-built
-    /// jobs the caller stores the template id (or another opaque
-    /// reference) so the block-found path can produce a `SubmitSolution`.
+    /// TDP template id for pool-built jobs, so a found block can be sent
+    /// as `SubmitSolution`. `None` for `SetCustomMiningJob` jobs, whose
+    /// template the JDC built.
     pub template_id: Option<u64>,
     /// `true` when a block found on this custom job will be recorded by the
     /// JDP `PushSolution` path, so the mining side must NOT record it too
@@ -130,22 +111,14 @@ pub struct ExtendedJob {
     /// | Coinbase-only + ext 0x0003 | **no** — SV2 JDP/Coinbase-only Mode, that mode never declares | mining side |
     /// | Coinbase-only, base protocol | no — never declares | mining side |
     ///
-    /// Reading it as "distribution-backed" put row three on the JDP side,
-    /// which never hears about it: the block was credited as a share and then
-    /// recorded nowhere — no `blocks_entity` row, no notification, and (worse)
-    /// no ext 0x0003/Implementation Notes settle, so the published weights
-    /// kept encoding balances the block had already paid out.
-    ///
-    /// Reading it as "did the ext 0x0003/Output Verification gate resolve a
-    /// distribution for this job?" — i.e. `distribution_ref` in
-    /// `crate::mining::client::handle_set_custom_mining_job` — broke row ONE
-    /// on a Solo stream, in the other direction:
-    /// `resolve_distribution_reference` deliberately declines to inherit a
-    /// declaration's reference there, while the JDP side stamps one on every
-    /// accepted 0x0003 declaration, Solo included. Both sides then recorded
-    /// the block: two `blocks_entity` rows and two notifications. The two
-    /// questions look identical and are not; this field answers only the JDP
-    /// one.
+    /// ⚠️ This is not "is the job distribution-backed?": row three would then
+    /// be recorded nowhere, with no ext 0x0003/Implementation Notes settle.
+    /// Nor is it "did the ext 0x0003/Output Verification gate resolve a
+    /// distribution?" (`distribution_ref` in
+    /// `crate::mining::client::handle_set_custom_mining_job`):
+    /// `resolve_distribution_reference` declines to inherit a declaration's
+    /// reference on a Solo stream while the JDP side stamps one on every
+    /// accepted 0x0003 declaration, so row one would be recorded twice.
     ///
     /// Always `false` for pool-built jobs, which carry a `template_id` and
     /// take the ordinary submit path instead.
@@ -172,11 +145,7 @@ pub fn classify_extended_job(
 /// Stamp `retired_at = Some(now_ms)` on every entry that doesn't
 /// already have one — the **block-change path** run on `SetNewPrevHash`.
 /// Idempotent: a second call at a later timestamp keeps the original
-/// `retired_at` so the grace-window math doesn't slide backwards.
-///
-/// Lives here (not in [`bp_jobs_lifecycle`]) because the field-name
-/// choice is consumer-specific and a generic two-closure wrapper is
-/// more boilerplate than the 3-line loop saves.
+/// `retired_at` so the grace window does not slide.
 pub fn retire_extended_jobs<K>(map: &mut HashMap<K, ExtendedJob>, now_ms: u64) {
     for ej in map.values_mut() {
         if ej.retired_at.is_none() {
@@ -201,57 +170,42 @@ pub fn cleanup_retired_extended_jobs<K>(
 
 // ── StandardTemplateSnapshot ─────────────────────────────────────────
 
-/// Per-job template context — stored on [`StandardJobEntry`] at send-time so
-/// share validation uses the *same* template the miner hashed against, not the
-/// most-recent one (SV2 Mining/SubmitShares.Error strict).
-///
-/// Lives in `mining/jobs.rs` (not `mining/client.rs`) because the
-/// storage owns the lifecycle. The handler re-exports it via
-/// [`crate::mining::client::StandardTemplateSnapshot`] for callers.
+/// Per-job template context, stored on [`StandardJobEntry`] at send-time so
+/// share validation uses the template the miner hashed against, not the
+/// latest one (SV2 Mining/SubmitShares.Error). Re-exported as
+/// [`crate::mining::client::StandardTemplateSnapshot`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StandardTemplateSnapshot {
     pub version: u32,
     pub prev_hash: [u8; 32],
     pub n_bits: u32,
-    /// Block-reward portion the coinbase claims (= the template's
-    /// `coinbase_tx_value_remaining` at send-time). Threaded onto
-    /// [`crate::mining::submit::ShareAccept`] so the block-found fan-out can
-    /// write the per-mode engine ledger with the correct reward.
+    /// Block-reward portion the coinbase claims (the template's
+    /// `coinbase_tx_value_remaining` at send-time), carried onto
+    /// [`crate::mining::submit::ShareAccept`] for the block-found ledger.
     pub coinbase_tx_value_remaining: u64,
 }
 
 // ── StandardJobMaps ──────────────────────────────────────────────────
 
-/// One Standard `NewMiningJob` we've sent, with everything the share
-/// validator + retire-not-clear lifecycle need.
+/// One sent Standard `NewMiningJob`, with everything the share validator
+/// and the retire-not-clear lifecycle need.
 ///
-/// `difficulty` + `merkle_root` are stored at send time
-/// (SV2 Mining/SubmitShares.Error — job-specific target; store-on-send merkle
-/// root avoids the `applyExtranonceAndGetCoinbaseHash` mutation bug that
-/// caused ~19% reject on BraiinsOS).
+/// `difficulty` and `merkle_root` are stored at send time
+/// (SV2 Mining/SubmitShares.Error: job-specific target; the merkle root is
+/// the one the miner received, not a recomputation).
 ///
-/// `template_snapshot` is the **template the miner is hashing
-/// against**. On block change retired entries keep their snapshot —
-/// in-flight shares for the retired job validate against the snapshot
-/// they were issued under, not the current template. This is the
-/// strict SV2 Mining/SubmitShares.Error per-job-template-pinning fix.
+/// `template_snapshot` is the template the miner hashes against; retired
+/// entries keep it, so in-flight shares validate against the template they
+/// were issued under.
 ///
 /// `created_at_ms` / `retired_at_ms` drive the same retire-not-clear
 /// algorithm the Extended side uses, via [`bp_jobs_lifecycle`].
 ///
-/// `coinbase_stratum` is stored at send-time so the
-/// submit-validator can convert it to the witness-form coinbase for
-/// `submit_solution` without holding the `MiningJob`. Standard
-/// channels have **no miner-rolling extranonce** (the entire 12-byte
-/// slot is pool-controlled: 4-byte `channel.extranonce_prefix` +
-/// 8 zero bytes), so the full non-witness coinbase is deterministic
-/// at job-send time and can be pre-assembled here. Empty when the
-/// job was declared via `SetCustomMiningJob` (the JDC built the
-/// coinbase; pool has no template-side bytes).
-///
-/// **No `Copy`** — the `Vec<u8>` field forces heap storage; the
-/// `Clone` derive is still cheap (single allocator move per clone)
-/// and consumers historically only `cloned()` for ownership.
+/// `coinbase_stratum` lets the validator build the witness-form coinbase
+/// for `submit_solution` without holding the `MiningJob`. Standard channels
+/// have no miner-rolled extranonce (the whole slot is pool-controlled), so
+/// the full coinbase is known at send time. Empty for a
+/// `SetCustomMiningJob`-declared job.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StandardJobEntry {
     pub difficulty: Difficulty,
@@ -263,11 +217,10 @@ pub struct StandardJobEntry {
     /// witness-form by [`bp_mining_job::assemble_witness_coinbase`]
     /// at submit time. Empty for `SetCustomMiningJob`-derived jobs.
     pub coinbase_stratum: Vec<u8>,
-    /// Identity of the payout list this job's coinbase pays — copied off
-    /// the `MiningJob` it was built from. Lets a block found on this job
-    /// look up the exact distribution the pool must book, instead of the
-    /// shared snapshot key whichever later build overwrote. Zeroed for
-    /// jobs the pool did not build the coinbase for (`SetCustomMiningJob`).
+    /// Identity of the payout list this job's coinbase pays, copied off the
+    /// `MiningJob`, so a block found on this job books exactly that
+    /// distribution rather than a later build's snapshot. Zeroed for jobs
+    /// the pool did not build the coinbase for (`SetCustomMiningJob`).
     pub payouts_fingerprint: [u8; 32],
     /// TDP template id the job was built against. `None` for
     /// `SetCustomMiningJob`-derived jobs (no pool template).
@@ -278,28 +231,18 @@ pub struct StandardJobEntry {
 
 /// Per-channel job-bookkeeping for **Standard** mining channels.
 ///
-/// Single entry table keyed by SV2 `job_id` (channel-local `u32`).
-/// Each entry carries the send-time difficulty + 32-byte merkle root
-/// the miner received in `NewMiningJob`, plus lifecycle timestamps for
-/// the retire-not-clear algorithm shared with the Extended side via
-/// [`bp_jobs_lifecycle`].
+/// Entry table keyed by the channel-local SV2 `job_id`.
 ///
-/// **Retire-not-clear (SV2 Mining/SubmitShares.Error)**: on block change the IO layer
-/// calls [`Self::retire`] (stamps `retired_at_ms` on every entry, idempotent)
-/// — it does **not** delete entries. In-flight shares for the retired jobs
-/// then classify as `StaleCreditable` (within grace — still credited) or
-/// `StaleRejected` (past grace — emits wire-code `stale-share`, NOT the
-/// spec-incorrect `invalid-job-id`). Older retired entries get GC'd by
-/// [`Self::cleanup_expired`] using the shared two-tier aging algorithm.
+/// **Retire-not-clear (SV2 Mining/SubmitShares.Error)**: on block change the
+/// IO layer calls [`Self::retire`], which stamps entries instead of deleting
+/// them. In-flight shares for retired jobs then classify as
+/// `StaleCreditable` (within grace, still credited) or `StaleRejected`
+/// (wire code `stale-share`, not `invalid-job-id`). [`Self::cleanup_expired`]
+/// ages old entries out; a missing entry resolves to `invalid-job-id` via
+/// [`Self::classify`] returning `None`.
 ///
-/// Genuinely missing entries (past retention GC, or never sent) still
-/// resolve to `invalid-job-id` via [`Self::classify`] returning `None`.
-///
-/// Extended channels reconstruct the merkle root on submit from
-/// [`ExtendedJob`] + miner-supplied extranonce — they don't store a
-/// merkle root here. Extended *difficulty* lookup for the per-job
-/// target rule reads [`Self::difficulty_of`] (until per-job difficulty
-/// migrates onto `ExtendedJob` itself).
+/// Extended channels reconstruct the merkle root from [`ExtendedJob`] and
+/// store no entry here.
 #[derive(Clone, Debug)]
 pub struct StandardJobMaps {
     entries: HashMap<u32, StandardJobEntry>,
@@ -322,16 +265,11 @@ impl StandardJobMaps {
         &self.config
     }
 
-    /// Record a fresh `NewMiningJob` send. `now_ms` stamps
-    /// `created_at_ms` for the aging algorithm. `template_snapshot`
-    /// freezes the template context (version / prev_hash / n_bits) at
-    /// send-time so submit-validation can
-    /// reconstruct the exact 80-byte header the miner hashed against
-    /// — SV2 Mining/SubmitShares.Error strict-conform.
+    /// Record a `NewMiningJob` send. `template_snapshot` freezes the
+    /// template context so validation rebuilds the exact header the miner
+    /// hashed (SV2 Mining/SubmitShares.Error).
     ///
-    /// Re-sending the same `job_id` (shouldn't happen —
-    /// channel-local ids are `next_job_id`-allocated) overwrites the
-    /// prior entry, including resetting `retired_at_ms` to `None`.
+    /// Re-sending a `job_id` overwrites the entry and clears `retired_at_ms`.
     #[allow(clippy::too_many_arguments)]
     pub fn record_send(
         &mut self,
@@ -359,9 +297,8 @@ impl StandardJobMaps {
         );
     }
 
-    /// Test-only convenience that mirrors the pre-7.4d.3 5-argument
-    /// shape (no coinbase / template_id). Lets fixtures that don't
-    /// exercise block-submit stay terse.
+    /// Test-only shorthand without coinbase, fingerprint or template id,
+    /// for fixtures that don't exercise block submission.
     #[cfg(test)]
     pub(crate) fn record_send_for_test(
         &mut self,
@@ -386,8 +323,7 @@ impl StandardJobMaps {
     /// Stamp `retired_at_ms = Some(now_ms)` on every entry that doesn't
     /// already have one — the block-change path (SV2 `SetNewPrevHash`
     /// fan-out). Idempotent: a second call at a later timestamp keeps
-    /// the original `retired_at_ms` so the grace-window math doesn't
-    /// slide backwards.
+    /// the original `retired_at_ms` so the grace window does not slide.
     pub fn retire(&mut self, now_ms: u64) {
         for e in self.entries.values_mut() {
             if e.retired_at_ms.is_none() {
@@ -432,17 +368,12 @@ impl StandardJobMaps {
             .map(|e| (e.difficulty, e.merkle_root))
     }
 
-    /// Full-entry accessor — exposes the per-job
-    /// [`StandardTemplateSnapshot`] alongside the difficulty + merkle
-    /// root. Preferred over [`Self::lookup`] when the caller needs the
-    /// snapshot (= every submit-validation call in production).
+    /// Full entry, including the per-job [`StandardTemplateSnapshot`].
     pub fn entry_of(&self, job_id: u32) -> Option<&StandardJobEntry> {
         self.entries.get(&job_id)
     }
 
-    /// Stand-alone per-job difficulty lookup. Used by the Extended
-    /// submit handler to look up per-job difficulty for target
-    /// validation.
+    /// Per-job difficulty lookup.
     pub fn difficulty_of(&self, job_id: u32) -> Option<Difficulty> {
         self.entries.get(&job_id).map(|e| e.difficulty)
     }
@@ -497,9 +428,8 @@ mod tests {
         }
     }
 
-    /// `classify_extended_job` defers to the shared lifecycle config
-    /// — verify the wiring rather than re-test the math (that's done
-    /// in `bp-jobs-lifecycle::tests`).
+    /// `classify_extended_job` defers to the shared lifecycle; these pin
+    /// the wiring, the math is tested in `bp-jobs-lifecycle`.
     #[test]
     fn classify_active_for_fresh_job() {
         assert_eq!(
@@ -635,11 +565,9 @@ mod tests {
         assert_eq!(maps.difficulty_of(99), None);
     }
 
-    /// SV2 Mining/SubmitShares.Error: per-job template-snapshot pinning. Two
-    /// record_send calls with different snapshots produce entries
-    /// whose snapshots survive retire (in-flight shares for the old
-    /// job hash against the OLD prev_hash + n_bits + version, not
-    /// the current template's).
+    /// SV2 Mining/SubmitShares.Error: a retired entry keeps its send-time
+    /// snapshot, so in-flight shares for the old job hash against the OLD
+    /// prev_hash, n_bits and version.
     #[test]
     fn standard_per_job_snapshot_pins_template_context_at_send_time() {
         let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
@@ -690,8 +618,7 @@ mod tests {
         let mut maps = StandardJobMaps::new(LifecycleConfig::DEFAULT);
         maps.record_send_for_test(1, Difficulty(1.0), [0u8; 32], snap(), 1_000);
         maps.retire(2_000);
-        // Re-send same id (shouldn't happen with next_job_id but pin
-        // the overwrite semantics anyway).
+        // Re-send the same id to pin the overwrite semantics.
         maps.record_send_for_test(1, Difficulty(2.0), [0x11; 32], snap(), 3_000);
         assert_eq!(
             maps.classify(1, 3_000),
@@ -700,7 +627,7 @@ mod tests {
         );
     }
 
-    // ── retire-not-clear classification (the Item-B fix) ─────────────
+    // ── retire-not-clear classification ─────────────────────────────
 
     #[test]
     fn standard_classify_unknown_job_returns_none() {
@@ -806,8 +733,7 @@ mod tests {
         );
     }
 
-    /// Custom-config knob exercised: tighter retention window aging
-    /// kicks in earlier.
+    /// A tighter custom retention window ages entries out earlier.
     #[test]
     fn standard_with_config_honours_custom_retention() {
         let mut maps = StandardJobMaps::new(LifecycleConfig {

@@ -93,8 +93,8 @@ impl WebPushAdapter {
     }
 
     /// Send `payload` (rendered as pipe-joined text) to a UnifiedPush
-    /// `endpoint`. VAPID JWT is attached when configured; on VAPID
-    /// failure we transparently fall back to a plain POST.
+    /// `endpoint`. VAPID JWT is attached when configured; a VAPID
+    /// failure falls back to a plain POST.
     pub async fn send(
         &self,
         endpoint: &str,

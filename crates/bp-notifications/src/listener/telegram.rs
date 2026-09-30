@@ -21,8 +21,7 @@ use crate::command::{parse_command, CommandHandler, Transport};
 #[derive(Debug, Clone)]
 pub struct TelegramListenerConfig {
     /// Bot token — same token as the [`crate::adapter::TelegramAdapter`]
-    /// uses for outbound. Could be pulled into a shared `TelegramConfig`
-    /// later if both consumers grow.
+    /// uses for outbound.
     pub bot_token: String,
     /// Long-poll timeout in seconds (Telegram caps at 50; default 30).
     pub long_poll_timeout_seconds: u32,
@@ -48,8 +47,8 @@ pub fn spawn_telegram_listener(
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         let client = match Client::builder()
-            // `timeout` must outlast the long-poll timeout or we'll
-            // cancel the poll prematurely; pad by 10 s.
+            // `timeout` must outlast the long-poll timeout or the poll is
+            // cancelled prematurely; pad by 10 s.
             .timeout(Duration::from_secs(
                 (config.long_poll_timeout_seconds as u64) + 10,
             ))
@@ -106,10 +105,8 @@ async fn poll_once(
     let mut req = client
         .get(&url)
         .query(&[("timeout", timeout_secs as i64), ("offset", offset)]);
-    // `callback_query` is in the allow-list so we acknowledge each
-    // one and stop the spinner client-side. The actual per-button
-    // flows (group-select keyboards, etc.) still need their own
-    // dispatch path and are deferred.
+    // `callback_query` is in the allow-list so inline-button taps reach
+    // the handler.
     req = req.query(&[("allowed_updates", "[\"message\",\"callback_query\"]")]);
 
     let resp = req

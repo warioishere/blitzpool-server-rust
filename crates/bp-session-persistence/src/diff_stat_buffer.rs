@@ -3,25 +3,13 @@
 //! Buffered per-slot max-difficulty writes.
 //!
 //! `client_difficulty_statistics_entity` holds one row per `(address, worker,
-//! hour-slot)` with the highest share difficulty seen in that slot. The sink
-//! used to upsert **inline** whenever a share set a new max, which is cheap in
-//! the middle of a slot and a burst at its edges: after a process restart, and
-//! at every hour rollover, every miner's first share is a new max and the next
-//! ones keep raising it. Measured on prod 2026-08-05: 2.5 minutes after a
-//! payout restart, one of those single-row upserts took **4.88 s**.
+//! hour-slot)` with the highest share difficulty seen in that slot. Shares
+//! merge into an in-memory map and one bulk upsert per tick drains it, because
+//! an inline upsert per new max bursts after a restart and at every hour
+//! rollover, where every miner's first shares keep raising the max.
 //!
-//! So it batches now, like the session-row touch path next door: shares merge
-//! into an in-memory map, one bulk upsert per tick drains it. Same shape on
-//! purpose — [`crate::touch_buffer`] is the reference for record/drain/rebuffer.
-//!
-//! Two things this fixes beyond the burst:
-//!
-//! - The old inline path kept a `(address, worker) -> (slot, max)` cache to
-//!   decide whether a share was a new max. On an upsert FAILURE the cache
-//!   already said "persisted", so that slot's max was lost until a higher share
-//!   arrived. This buffer rebuffers instead, so a failed flush is retried.
-//! - The cache and the buffer coalesce the same thing, so keeping both would
-//!   be two maps and two hot-path locks for one concept. The cache is gone.
+//! Same shape as [`crate::touch_buffer`] (record/drain/rebuffer). A failed
+//! flush is rebuffered, so a slot's max is never lost to a write error.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -226,11 +214,10 @@ pub(crate) async fn run_flush_loop(
     interval: Duration,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
-    // `interval_at`, not `interval`: the latter fires its FIRST tick
-    // immediately, which flushes an empty buffer at startup for nothing — and
-    // makes "the share path never writes, the loop does" untestable, because
-    // that first tick lands on whatever the caller buffered before the spawned
-    // task was first polled. Same choice as `touch_buffer::run_flush_loop`.
+    // `interval_at`, not `interval`: the latter fires its first tick
+    // immediately, flushing whatever was buffered before the task was first
+    // polled, which also makes "the loop writes, not the share path"
+    // untestable. Same choice as `touch_buffer::run_flush_loop`.
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     // Skip missed ticks rather than burst-firing them: after a stall, catching
     // up would just drain an already-empty buffer several times over.

@@ -9,38 +9,19 @@
 //! therefore requires the acceptance window to close on a settlement rather
 //! than expire on its own.
 //!
-//! The registry that has to hear it is
-//! [`bp_stratum_v2::jdp_server::StratumV2JdpServer`]'s, and it lives on
-//! the process holding the `front` role. **The booking does not.** Under
-//! the role split the `payout` process drains the block-found stream and
-//! applies the ledger, so the settlement happens on one process and the
-//! registry sits on another.
+//! The registry that has to hear it
+//! ([`bp_stratum_v2::jdp_server::StratumV2JdpServer`]'s) lives on the
+//! `front`; **the booking does not**: the `payout` process applies the
+//! ledger. So a settlement goes two ways, like the membership caches
+//! ([`crate::cache_sync`]): to the local registry if this process has one,
+//! and onto the `cache:invalidate` stream for a registry elsewhere. A
+//! process that is both settles twice, which is harmless: the second epoch
+//! bump invalidates an already-invalid set and the republish coalesces.
 //!
-//! That is what this type exists to make un-forgettable. It used to be a
-//! bare `Arc<OnceLock<DistributionInvalidationHandle>>` threaded to the
-//! Stratum sinks, the confirmation watcher and the JDP sink — a handle
-//! that is only ever filled by `jdp::spawn`, i.e. only on a `front`. On
-//! every other process `.get()` returned `None` and the settlement was
-//! silently dropped, which in the production topology is *every* Stratum
-//! block: the front publishes the block-found event, the payout process
-//! books it, and nothing told the front.
-//!
-//! So a settlement now goes two ways at once, the same shape the
-//! membership caches already use ([`crate::cache_sync`]): apply to the
-//! local registry if this process has one, and publish onto the
-//! `cache:invalidate` stream so a registry in another process hears it.
-//! A process that is both front and payout does both and settles twice —
-//! harmless, the second epoch bump invalidates an already-invalid set and
-//! the publisher's `Notify` coalesces the forced republish.
-//!
-//! There is deliberately NO periodic backstop, unlike the membership rebuilds
-//! on the same stream: "settle again just in case" would bump the epoch and
-//! force a republish on a timer forever. A missed event instead self-heals
-//! within one `[sv2].jdp_payout_distribution_interval_secs` (60 s by default),
-//! because the next scheduled publish rebuilds from the post-settlement ledger
-//! anyway. ext 0x0003/Implementation Notes is about closing the window
-//! immediately; the interval bounds how long it can stay open if the signal is
-//! lost.
+//! Deliberately NO periodic backstop: "settle again just in case" would
+//! force a republish on a timer forever. A missed event self-heals within
+//! one `[sv2].jdp_payout_distribution_interval_secs` (60 s by default),
+//! since the next publish rebuilds from the post-settlement ledger.
 
 use std::sync::{Arc, OnceLock};
 
@@ -57,25 +38,16 @@ use tracing::{debug, warn};
 /// itself `Arc`-backed.
 #[derive(Clone)]
 pub(crate) struct SettlementSignal {
-    /// Filled by `jdp::spawn` on the process that runs the JDP server —
-    /// i.e. only on a `front`. `OnceLock` because the Stratum sinks and
-    /// the confirmation watcher are built BEFORE the JDP server exists.
+    /// Filled by `jdp::spawn`, so only on a `front`. `OnceLock` because the
+    /// Stratum sinks and the confirmation watcher are built BEFORE the JDP
+    /// server exists.
     local: Arc<OnceLock<DistributionInvalidationHandle>>,
-    /// `None` on a process with no Redis handle (tests). Present
-    /// otherwise, including on a front — a front that books in-process
-    /// settles locally AND publishes, which is harmless (the second epoch
-    /// bump invalidates an already-invalid set).
+    /// `None` only without Redis (tests).
     ///
-    /// It does NOT reach a second front. Every front's consumer shares one
-    /// group and one consumer name ([`crate::cache_sync`]), and a Redis
-    /// consumer group hands each entry to exactly one consumer — so with
-    /// two fronts a settlement reaches whichever asked first. The other
-    /// keeps its published distribution current until its own publisher's
-    /// next tick (`[sv2].jdp_payout_distribution_interval_secs`, 60 s by
-    /// default), which rebuilds from the post-settlement ledger. Bounded
-    /// and self-healing, but it is a real window and this comment used to
-    /// claim the opposite. Making a settlement reach every front needs a
-    /// group PER front, not a shared one — see `cache_sync::GROUP`.
+    /// ⚠️ It does NOT reach a second front: all fronts share one consumer
+    /// group ([`crate::cache_sync`]), which hands each entry to one
+    /// consumer. The other front keeps its distribution until its next
+    /// publish tick. See `cache_sync::GROUP`.
     remote: Option<StreamProducer<CacheInvalidation>>,
 }
 
@@ -119,10 +91,8 @@ impl SettlementSignal {
         let event = CacheInvalidation {
             kind: cache_kind::SETTLEMENT.to_string(),
         };
-        // Best-effort, like every other publisher on this stream: a
-        // settlement that cannot be broadcast must not fail the booking
-        // that already committed. The bound on the damage is the
-        // publisher's own republish interval.
+        // Best-effort: a failed broadcast must not fail the committed
+        // booking; the republish interval bounds the damage.
         if let Err(err) = producer.publish(&event).await {
             warn!(
                 %err,

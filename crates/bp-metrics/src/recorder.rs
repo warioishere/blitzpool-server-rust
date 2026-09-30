@@ -13,10 +13,9 @@ use crate::constants::*;
 
 /// Update the Core→Satellite stream-consumer lag gauges for one consumer
 /// group. `lag` is `None` when Redis can't compute it (the stream was trimmed
-/// below the group's read offset — the probable-entry-loss case); the
-/// `_computable` gauge then drops to `0` so alerting catches the blind spot the
-/// plain lag gauge would otherwise mask as "0 / ok". `pending` (PEL size) is
-/// always known and always emitted.
+/// below the group's read offset, probable entry loss); the `_computable`
+/// gauge then drops to `0` so alerting sees what a lag of "0" would hide.
+/// `pending` (PEL size) is always known and always emitted.
 pub fn set_stream_consumer_lag(stream: &str, group: &str, lag: Option<u64>, pending: u64) {
     let stream = stream.to_string();
     let group = group.to_string();

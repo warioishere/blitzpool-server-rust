@@ -44,10 +44,9 @@ impl TdpHandle {
         let (submit_tx, submit_rx) = mpsc::channel::<TdpRequest>(config.submit_capacity);
         let (templates_tx, _) = broadcast::channel::<TemplateUpdate>(config.broadcast_capacity);
 
-        // Snapshot tap — subscribe BEFORE spawning the worker so we don't
-        // miss the startup NewTemplate+SetNewPrevHash pair (the same
-        // race that `feedback-tdp-initial-template-drain` flagged for
-        // regtests). The tap task lives on the multi-thread tokio
+        // Snapshot tap — subscribe BEFORE spawning the worker so the
+        // startup NewTemplate+SetNewPrevHash pair is not missed (broadcast
+        // does not replay). The tap task lives on the multi-thread tokio
         // runtime, not the LocalSet, and exits when `templates_tx` is
         // dropped (i.e. when the worker thread terminates).
         let snapshot: Arc<Mutex<TemplateSnapshot>> =
@@ -62,7 +61,7 @@ impl TdpHandle {
                             apply_to_snapshot(&mut guard, &update);
                             // Stamp freshness only on the two state-bearing
                             // variants — the RequestTransactionData responses
-                            // are replies to our own calls, not core pushing
+                            // are replies to the pool's own calls, not core pushing
                             // new work, so they don't reset the staleness clock.
                             if matches!(
                                 update,

@@ -4,9 +4,7 @@
 //!
 //! One rule: the first four characters, `...`, the last five. The pool API
 //! (group member labels), the notification bot and the UI all show an identity
-//! this way, and it used to be written out three times in this workspace plus
-//! once in the UI. Copies of a display rule drift apart while every one of them
-//! still compiles, so the Rust side now has this one.
+//! this way; on the Rust side this is the only implementation.
 //!
 //! The UI's twin is `formatBtcAddress` in blitzpool-ui
 //! (`src/app/shared/address-format.ts`). TypeScript cannot call this, so the

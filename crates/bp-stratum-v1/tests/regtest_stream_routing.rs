@@ -26,13 +26,9 @@
 //!   * **Blockparty** does the same at 40 members / 8 000 WU — but for a
 //!     different reason: Blockparty has no member cap at all.
 //!
-//! One driver is the point, not a convenience. These were three files with
-//! three copies of the same miner loop, and `e1d3614` fixed two of them:
-//! Solo and Blockparty learned to classify each submit's own response and to
-//! follow a `mining.notify` arriving mid-run, Group-Solo did not — so a
-//! Group-Solo run slow enough to cross a template change kept mining a job the
-//! pool had already replaced, and the failure surfaced only as "height did not
-//! rise". Sharing the loop is what keeps the three from drifting again.
+//! One driver is the point, not a convenience: a shared miner loop keeps the
+//! three modes from drifting apart in how they classify submit responses and
+//! follow a mid-run `mining.notify`.
 //!
 //! The SV2 counterpart is `bp-stratum-v2/tests/regtest_stream_routing.rs`:
 //! same scenario, but the swap is triggered by `OpenStandardMiningChannel` in
@@ -490,15 +486,13 @@ async fn run_scenario(node: &RegtestNode, case: ModeCase, addresses: Vec<String>
     let mut ntime_hex = params[7].as_str().expect("ntime").to_string();
 
     // Submit nonces until the chain advances (a block landed via the mode's
-    // handle) or we exhaust the budget. ~50% of nonces are block candidates on
+    // handle) or the budget runs out. ~50% of nonces are block candidates on
     // regtest, so this lands within a few iterations.
     //
     // The submit responses are classified rather than dropped, and a
-    // `mining.notify` arriving mid-run replaces the job being mined. Both matter
-    // under load: a run that takes long enough to cross a template change was
-    // otherwise still submitting against the first job, every submit came back
-    // `job not found`, and the failure surfaced only as "height did not rise"
-    // with no indication why.
+    // `mining.notify` arriving mid-run replaces the job being mined: a run that
+    // crosses a template change must not keep submitting against a replaced job,
+    // and a failure must say why no block landed.
     let before = node.current_height().await.expect("height");
     let mut landed = None;
     let mut accepted = 0usize;

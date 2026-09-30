@@ -7,10 +7,10 @@
 //! /send_hourly, /bestdiff_reset, /deutsch, /english.
 //!
 //! Read commands (/stats, /show_workers, /poolhashrate, /difficulty,
-//! /next_difficulty, /pplns_status, /group_status) require engine
-//! readers — the parser recognises them and emits the
-//! [`Command::ReadDeferred`] variant so the handler can return a polite
-//! "noch nicht verfügbar" reply instead of "unbekannter Befehl".
+//! /next_difficulty, /pplns_status, /group_status, ...) are emitted as
+//! [`Command::ReadDeferred`] carrying the command name; the handler
+//! answers them from the read builders or with a not-configured reply
+//! when the engine they need is not wired in.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -40,8 +40,8 @@ pub enum Command {
     LanguageSwitch(LanguageSwitch),
     /// `/help` or any unknown command — handler replies with usage.
     Help,
-    /// Recognised read command that needs engine readers. Carries the
-    /// command name for a "noch nicht verfügbar" diagnostic.
+    /// Recognised read command, carrying its name for the handler's
+    /// read dispatch.
     ReadDeferred(&'static str),
     Unknown,
 }

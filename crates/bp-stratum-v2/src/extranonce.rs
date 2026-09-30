@@ -14,8 +14,8 @@ pub use bp_common::extranonce::{SharedExtranonceAllocator, SV2_WORKER_ID};
 /// live connection's.
 ///
 /// That number comes from the allocator's own counter, not from the random
-/// `session_id`: two connections that drew the same session id used to
-/// build the same keys and be handed the same prefix. It is truncated to
+/// `session_id`, because two connections can draw the same session id and
+/// must still get distinct prefixes. It is truncated to
 /// 32 bits to leave the low half of the key for the channel id, so it
 /// repeats after 2^32 connections — a collision then needs a connection
 /// that stayed open across all of them.

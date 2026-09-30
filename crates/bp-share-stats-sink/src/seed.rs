@@ -8,9 +8,8 @@
 //! Only when `worker_shares_entity` is empty. The check + the seed
 //! INSERT run in the same transaction so two simultaneous engine
 //! spawns can't both populate (the second sees the row count and bails).
-//! After cut-over against prod-DB this never fires (the original migration
-//! already ran). On fresh staging / regtest-DB setups
-//! it bootstraps the table so per-worker chart endpoints aren't blank.
+//! On a populated database it never fires; on a fresh one it bootstraps
+//! the table so per-worker chart endpoints aren't blank.
 
 use bp_db::{count_worker_shares, seed_worker_shares_from_client_statistics};
 use sqlx::{PgConnection, PgPool};

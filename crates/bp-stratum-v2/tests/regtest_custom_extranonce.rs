@@ -6,8 +6,9 @@
 //!   - one whose `(address, worker)` has an override;
 //!   - one whose worker has none.
 //!
-//! Stage 1 (channel-open): the override miner receives `SetExtranoncePrefix`
-//! before its first job; the other receives none.
+//! Stage 1 (channel-open): the override miner's
+//! `OpenExtendedMiningChannelSuccess` carries the override prefix; the other
+//! keeps its allocated prefix. Neither receives `SetExtranoncePrefix`.
 //!
 //! Stage 2 (live change, no reconnect): the override value is changed and a new
 //! template is triggered (mining a block). The override miner receives a
@@ -178,10 +179,9 @@ async fn sv2_custom_extranonce_applies_at_open_and_live_and_leaves_others_untouc
         "[custom-en] open normal: open={:02x?} set={:02x?}",
         n_open.open_prefix, n_open.set_prefix
     );
-    // The override travels in the channel-open success. That is the whole point
-    // of doing this before the handler answers: a miner that never implements
-    // SetExtranoncePrefix (NerdQAxe firmware does not) reads its prefix here or
-    // nowhere, and mines a coinbase the pool cannot rebuild.
+    // The override travels in the channel-open success: a miner that never
+    // implements SetExtranoncePrefix (NerdQAxe firmware does not) reads its
+    // prefix here or nowhere, and would mine a coinbase the pool cannot rebuild.
     assert_eq!(
         c_open.open_prefix.as_deref(),
         Some(PREFIX_1.as_slice()),
@@ -257,7 +257,7 @@ struct OpenObs {
     /// `SetExtranoncePrefix`, learns it.
     open_prefix: Option<Vec<u8>>,
     /// Any `SetExtranoncePrefix` seen before the first job. Expected to be
-    /// `None` at open now that the override rides in the success itself.
+    /// `None`: the override rides in the success itself.
     set_prefix: Option<Vec<u8>>,
 }
 
@@ -326,8 +326,8 @@ async fn connect_and_open(server_addr: std::net::SocketAddr, worker: &str) -> (R
     (reader, writer)
 }
 
-/// Drain until the first `NewExtendedMiningJob`, recording any
-/// `SetExtranoncePrefix` seen before it (the channel-open apply).
+/// Drain until the first `NewExtendedMiningJob`, recording the open-success
+/// prefix and any `SetExtranoncePrefix` seen before it.
 async fn drain_until_first_job(reader: &mut Reader) -> OpenObs {
     let mut set_prefix = None;
     let mut open_prefix = None;

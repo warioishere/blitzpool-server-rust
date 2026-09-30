@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Crate-level error type. Grows as modules land.
+//! Crate-level error type.
 //!
-//! Per Design Principle 9 (`feedback-design-principles`): narrow
-//! per-module errors live with the module that produces them (e.g.
+//! Narrow per-module errors live with the module that produces them (e.g.
 //! `config::ConfigError`); the crate-level `PplnsEngineError` here only
 //! captures failures that callers need to handle at the engine
 //! boundary (engine startup, distribution build, share-record, block-

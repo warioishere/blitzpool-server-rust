@@ -3,31 +3,22 @@
 //! Periodic best-effort backup of the live PPLNS + Group-Solo Redis state to
 //! Postgres, plus a MANUAL operator-triggered restore.
 //!
-//! The PPLNS sliding window + the per-group Group-Solo round (the per-address
-//! share weights that determine each block's payout split) live only in Redis.
-//! AOF survives a normal crash, but a logical wipe (FLUSHDB / corruption / a bad
-//! deploy) loses them with no PG reconstruction path. This task takes a `DUMP`
-//! of every `pplns:*` + `groupsolo:*` key every 10 min and stores it in
-//! `redis_state_backup`, so an operator can rebuild the state by hand.
+//! The PPLNS window and the Group-Solo rounds (the share weights behind each
+//! block's payout split) live only in Redis. AOF survives a crash, not a
+//! logical wipe, and Postgres cannot reconstruct them. Every 10 min this task
+//! `DUMP`s every `pplns:*` + `groupsolo:*` key into `redis_state_backup`.
 //!
-//! Restore is **never automatic** — there is no fail-state detection. An
-//! operator runs `blitzpool --restore-redis-state [--restore-force]` after
-//! deciding the live state is bad. `DUMP`/`RESTORE` is verbatim per key (zset
-//! scores, hash fields, bucket structure preserved).
+//! Restore is **never automatic**: an operator runs
+//! `blitzpool --restore-redis-state [--restore-force]` after deciding the
+//! live state is bad. `DUMP`/`RESTORE` is verbatim per key.
 //!
-//! **It is not a point-in-time snapshot, and a restore is therefore an
-//! APPROXIMATION.** The keys are `DUMP`ed one after another, so
-//! `pplns:window:by-address` and the `pplns:bucket:*` hashes are captured at
-//! different instants and shares land in between. A restored state can hold a
-//! bucket that is ahead of the aggregate, and the trim then decrements the
-//! aggregate by value it never received. The skew is bounded by the duration
-//! of one SCAN+DUMP pass, i.e. a second or two of shares.
-//!
-//! That is acceptable because the alternative on this path is no state at
-//! all — but it is not invisible: the PPLNS trim counts the addresses such a
-//! decrement drives below zero and warns, rather than leaving a negative
-//! field that the payout read (`diff > 0`) would silently treat as absent.
-//! See `bp_pplns_engine::window`'s `TRIM_BATCH_LUA`.
+//! **A restore is an APPROXIMATION**, not a point-in-time snapshot: keys are
+//! dumped one after another, so the window aggregate and the bucket hashes
+//! can differ by the shares of one SCAN+DUMP pass, and the trim may then
+//! decrement value the aggregate never received. The PPLNS trim counts and
+//! warns about fields driven below zero (`bp_pplns_engine::window`'s
+//! `TRIM_BATCH_LUA`) rather than leaving them for the payout read to treat
+//! as absent.
 
 use std::time::Duration;
 
@@ -42,7 +33,7 @@ pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(600);
 /// Default retention — older snapshots are pruned each run.
 pub(crate) const DEFAULT_RETENTION: Duration = Duration::from_secs(48 * 3600);
 
-/// `(scope, SCAN MATCH pattern)` for every state we back up.
+/// `(scope, SCAN MATCH pattern)` for every backed-up state.
 const SCOPES: &[(&str, &str)] = &[("pplns", "pplns:*"), ("groupsolo", "groupsolo:*")];
 
 /// Transient temp key the PPLNS cold-start rebuild fills before an atomic
@@ -52,16 +43,10 @@ const SKIP_SUFFIX: &str = ":by-address:rebuild";
 /// Per-job coinbase-distribution snapshots: `pplns:snapshot:{hex}` and
 /// `groupsolo:{group}:jobsnapshot:{hex}`.
 ///
-/// Skipped because they are neither restorable nor few. Each belongs to one
-/// issued mining job, and jobs live in the pool's memory — a Redis loss takes
-/// them with it, so a restored snapshot is one nothing can ever look up again.
-/// And there is one per distinct payout list for its whole TTL, not one per
-/// miner: a busy pool holds orders of magnitude more of these than it does
-/// window or round state, and every one of them would be `DUMP`ed into Postgres
-/// on every backup run and kept for the retention window.
-///
-/// What the backup is actually for — `pplns:window:*`, the group round state,
-/// pending blocks — is untouched by this.
+/// Skipped as neither restorable nor few: each belongs to one issued job,
+/// and jobs live in process memory, so after a Redis loss nothing looks a
+/// restored one up. There is one per distinct payout list for its TTL, far
+/// more than window or round state.
 fn is_per_job_snapshot(key: &str) -> bool {
     key.starts_with("pplns:snapshot:") || key.contains(":jobsnapshot:")
 }
@@ -303,9 +288,8 @@ mod tests {
     const PG_URL: &str = "postgres://postgres:postgres@localhost:15433/public_pool";
     const RETENTION_MS: i64 = 48 * 3600 * 1000;
 
-    /// The classification the backup filter turns on — pure, so it is checked
-    /// without Redis. What must NOT be skipped matters as much as what must:
-    /// the window and round state are the whole point of the backup.
+    /// The backup filter's classification: per-job snapshots are skipped,
+    /// window and round state are not.
     #[test]
     fn per_job_snapshots_are_classified_apart_from_restorable_state() {
         let fp = "ab".repeat(32);
@@ -320,7 +304,7 @@ mod tests {
         assert!(!is_per_job_snapshot("groupsolo:g1:shares"));
         assert!(!is_per_job_snapshot("groupsolo:g1:by-address"));
         // The per-finder Group-Solo snapshot is one row per member, not per
-        // job — small, and left in the backup as it was.
+        // job, small, and stays in the backup.
         assert!(!is_per_job_snapshot("groupsolo:g1:snapshot:bc1qfoo"));
     }
 

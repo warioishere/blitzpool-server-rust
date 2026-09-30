@@ -39,7 +39,7 @@ pub trait GroupServiceHooks: Send + Sync {
     async fn on_group_dissolved(&self, group_id: Uuid);
 
     /// (Re-)apply the group's round-reset cron config. Idempotent —
-    /// callers may invoke after every `updateRoundResetConfig` PATCH.
+    /// callers may invoke after every round-reset config PATCH.
     /// Receives the row as it sits in PG after the PATCH commits.
     async fn apply_round_reset_config(&self, group: &PplnsGroupRow);
 }

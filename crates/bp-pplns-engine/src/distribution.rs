@@ -18,12 +18,10 @@
 //!   *different* rewards still share the Redis window read and the
 //!   Postgres ledger query, since neither depends on the reward.
 //!
-//! The second layer is what keeps a burst of unrelated callers cheap.
-//! The per-reward layer alone never dedups them: SV1/SV2 job builds
-//! arrive with whatever template revenue their stream currently holds,
-//! so N simultaneous callers at a chain-tip change can mean N distinct
-//! keys and, without the inputs layer, N window reads plus N ledger
-//! queries in the same few milliseconds.
+//! The second layer keeps a burst of callers cheap: job builds arrive with
+//! whatever template revenue their stream holds, so a chain-tip change can
+//! mean N distinct reward keys, which would otherwise cost N window reads
+//! plus N ledger queries.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,12 +78,10 @@ pub enum DistributionError {
 /// `block_reward_sats`: the current payout window and the open-balance
 /// ledger, both already sanitized to parseable payout addresses.
 ///
-/// Every concurrent build shares these — the weights are a property of
-/// the window, not of the reward. Only the scaling to a concrete reward
-/// (and the dust/trim decisions that follow from it) is per-build, which
-/// is why this is cached separately: N concurrent builds for N distinct
-/// rewards cost one Redis window read and one Postgres ledger query, not
-/// N of each.
+/// Every concurrent build shares these: the weights are a property of the
+/// window, not of the reward. Only the scaling to a concrete reward (and
+/// the dust/trim decisions that follow) is per-build, so this is cached
+/// separately and N builds for N rewards cost one read of each store.
 #[derive(Clone, Debug, Default)]
 pub struct DistributionInputs {
     pub address_shares: HashMap<AddressId, f64>,
@@ -201,9 +197,7 @@ impl DistributionBuilder {
     /// `reference_revenue_sats` (the pool's current template value —
     /// the projection base for balance boosts). Concurrent callers for
     /// the same reference share one compute; callers for *different*
-    /// references still share the window+ledger read. Under the weight
-    /// model there is normally exactly ONE live reference at a time —
-    /// the reward-keyed cache is simply correct, not load-bearing.
+    /// references still share the window+ledger read.
     pub async fn build(
         &self,
         reference_revenue_sats: u64,
@@ -278,14 +272,11 @@ impl DistributionBuilder {
         .map_err(Arc::new)
     }
 
-    /// Invalidate the cache for a specific reward. Called by the
-    /// engine on hot-path state changes: a new accepted share landed, or a
-    /// block was found. (A network-difficulty change is NOT one of them —
-    /// it moves the window's trim size, and the trim already runs inside
-    /// `record_share`, whose invalidation covers it.)
-    ///
-    /// Common pattern: `invalidate_all` (drops every cached reward)
-    /// because the window changed for *any* reward, not just one.
+    /// Invalidate the cache for a specific reward. State changes (a new
+    /// accepted share, a found block) use `invalidate_all` instead, since
+    /// the window changed for every reward. A network-difficulty change
+    /// needs neither: it moves the trim size, and the trim runs inside
+    /// `record_share`, whose invalidation covers it.
     pub fn invalidate(&self, block_reward_sats: u64) {
         self.cache.invalidate(&block_reward_sats);
     }
@@ -319,22 +310,17 @@ impl DistributionBuilder {
 /// (`bp_mining_job::ResolvedPayouts::none`) — so a window error
 /// propagates.
 ///
-/// The ledger is a set of PROMISES on top of that split, and a promise
-/// that cannot be read this second is not a promise that is lost. It
-/// still sits in `pplns_balance`, and a build without it is not
-/// approximate: every entry carries `balance_sats = 0`, so `X = 0`, no
-/// wire weight is boosted, and settlement recomputes the same zeros from
-/// the snapshot and books `delta ≈ 0`. The standing balances are not
-/// touched and are paid out of the next block instead. A block found
-/// during the outage pays correctly by score and is fully bookable.
+/// The ledger is a set of PROMISES on top of that split; one that cannot be
+/// read right now still sits in `pplns_balance`. A build without it is
+/// exact, not approximate: every entry carries `balance_sats = 0`, no wire
+/// weight is boosted, and settlement recomputes the same zeros and books
+/// `delta ≈ 0`. Standing balances are repaid from a later block, and a block
+/// found meanwhile pays by score and is fully bookable.
 ///
-/// That is worth the degradation because the alternative is severe and
-/// pool-wide: `record_share` writes only to Redis, so during a Postgres
-/// outage the share accounting is intact and every miner keeps earning —
-/// failing the build would blank the whole pool's jobs over a fault that
-/// costs nothing but a one-block delay in repayments. It is also not a
-/// new code path in the math: Group-Solo passes an empty balance map on
-/// every single build.
+/// `record_share` writes only to Redis, so during a Postgres outage share
+/// accounting stays intact; failing the build would blank every PPLNS job
+/// over a fault that only delays repayments. The math path is the one
+/// Group-Solo uses on every build (an empty balance map).
 async fn load_inputs(
     pool: &PgPool,
     window: &WindowStore,
@@ -358,8 +344,7 @@ async fn load_inputs(
 
     // 3. Convert to bp_pplns inputs. Window addresses are raw strings —
     //    ones that fail `AddressId` validation are skipped with a warn
-    //    (an upstream bug could have pushed an invalid address into
-    //    Redis; better to skip its share than fail the distribution).
+    //    (skipping one share beats failing the whole distribution).
     //    Dropping addresses that parse but are not usable payout scripts
     //    happens in the shared build.
     Ok(DistributionInputs {

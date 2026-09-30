@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Crate-level error type. Grows as modules land.
+//! Crate-level error type.
 
 /// Errors returned across the `bp-stratum-v1` public surface.
 ///

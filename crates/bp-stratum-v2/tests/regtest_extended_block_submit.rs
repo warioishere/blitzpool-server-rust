@@ -1,46 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Regression test: SV2 Extended-channel block-submit must produce a
-//! coinbase that bitcoin-core accepts.
+//! SV2 Extended-channel block submit must produce a coinbase that
+//! bitcoin-core accepts.
 //!
-//! Until 2026-05-17, [`validate_submit_extended`] reconstructed the
-//! coinbase as `ext_job.coinbase_prefix + channel.extranonce_prefix +
-//! miner_extranonce + ext_job.coinbase_suffix` — but `ext_job.coinbase_prefix`
-//! already bakes in `channel.extranonce_prefix` (see
-//! `mining::client::apply_template_to_channel`, the Extended branch).
-//! Result: 4 bytes of `extranonce_prefix` ended up duplicated in the
-//! tx, and bitcoin-core's TDP `SubmitSolution` IPC rejected it with
-//! `InvalidCoinbaseTx(OversizedVarInt)` — silently in production
-//! because `TdpHandle::submit_solution` is fire-and-forget.
+//! `validate_submit_extended` builds the submitted coinbase itself, a
+//! different path from `MiningJob::witness_coinbase_with_extranonce`, and
+//! `TdpHandle::submit_solution` is fire-and-forget, so only a real node shows
+//! whether the bytes are valid. End to end:
 //!
-//! Earlier `bp-stratum-v2/tests/regtest_extended.rs` validated the
-//! Open / NewExtendedMiningJob handshake but explicitly skipped the
-//! submit-shares path on a "transitivity via
-//! `bp-mining-job/tests/regtest_e2e.rs`" argument. That argument was
-//! wrong: `bp-mining-job`'s regtest uses
-//! `MiningJob::witness_coinbase_with_extranonce` directly, which is a
-//! different code path than `validate_submit_extended`. The SV2-Extended
-//! submit-bytes were effectively never exercised against a real
-//! bitcoin-core. This test closes that gap.
-//!
-//! The test goes end-to-end:
-//!
-//! 1. Boot a real `bitcoin-node v31` regtest instance.
-//! 2. Wire up the actual `TdpHandle` against its IPC socket.
-//! 3. Build a `MiningJob` from a fresh TDP template and stash it in an
-//!    `ExtendedJob` exactly how `apply_template_to_channel` does in
-//!    production (with `extranonce_prefix` baked into `coinbase_prefix`).
-//! 4. Brute-force a nonce that beats the regtest target against the
-//!    coinbase the miner would reconstruct from the wire frame.
-//! 5. Call `validate_submit_extended` — the same function the IO layer
-//!    calls when a real `SubmitSharesExtended` arrives.
-//! 6. Take the resulting `ShareAccept.witness_coinbase` and submit it
-//!    to bitcoin-core via `TdpHandle::submit_solution`.
-//! 7. Assert that the chain tip actually advances by one block.
-//!
-//! With the bug, step 7 fails: bitcoin-core silently rejects the
-//! malformed coinbase and the tip stays put. With the fix, the block
-//! is accepted and the test passes.
+//! 1. Boot a `bitcoin-node v31` regtest instance and attach `TdpHandle`.
+//! 2. Build a `MiningJob` from a fresh TDP template and wrap it in an
+//!    `ExtendedJob` the way the channel code does.
+//! 3. Brute-force a nonce against the coinbase the miner reconstructs.
+//! 4. Run `validate_submit_extended` and submit its `witness_coinbase` via
+//!    `TdpHandle::submit_solution`.
+//! 5. Assert the chain tip advances by one block (or, for the rejection
+//!    cases, that it does not and why).
 
 use std::time::Duration;
 
@@ -62,9 +37,8 @@ use bp_test_support::{brute_force_nonce, poll_for_height, wait_for_paired_templa
 use serde_json::{json, Value};
 use smallvec::SmallVec;
 
-/// Regtest bech32 P2WPKH (BIP-173 zero-pubkey-hash test vector). The
-/// block-submit path doesn't care if bitcoind's wallet knows the key —
-/// it only needs a well-formed output script for the network.
+/// Regtest bech32 P2WPKH (BIP-173 test vector); only a well-formed output
+/// script is needed.
 const MINER_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
 /// nVersion bits 5–12 — the eight bits BIP-323 adds on top of BIP-320's
@@ -72,9 +46,8 @@ const MINER_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 /// separates "needs BIP-323" from "already legal under BIP-320".
 const BIP323_ONLY_VERSION_BITS: u32 = 0x0000_1fe0;
 
-/// How long core gets to act on a submitted block. Both the accept and the
-/// reject path use it: a shorter budget on the reject side would turn a
-/// merely slow acceptance into a passing "it was rejected".
+/// How long core gets to act on a submitted block. The reject path uses the
+/// same budget so a slow acceptance cannot pass as "rejected".
 const CORE_ACCEPT_BUDGET: Duration = Duration::from_secs(20);
 
 /// Default case — 8-byte miner extranonce → total 4+8=12 matches
@@ -86,39 +59,24 @@ async fn sv2_extended_8byte_miner_extranonce_block_is_accepted_by_bitcoin_core()
 }
 
 /// BitAxe case — 6-byte miner extranonce → total 4+6=10 ≠ 12. The
-/// per-channel `MiningJob` is built with a 10-byte slot directly so
-/// the scriptsig_len varint matches the wire bytes. Real miners
-/// expect a correct varint and would compute a different share-hash
-/// than ours otherwise — and the
-/// block-submit-to-bitcoin-core path would also fail the consensus
-/// parse with `OversizedVarInt`.
+/// per-channel `MiningJob` is built with a 10-byte slot so the scriptSig
+/// length varint matches the wire bytes; otherwise share hashes diverge and
+/// core fails the parse with `OversizedVarInt`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn sv2_extended_6byte_miner_extranonce_block_is_accepted_by_bitcoin_core() {
     run_block_submit_case(6, 0, true).await;
 }
 
-/// A miner rolls the eight nVersion bits BIP-323 adds and BIP-320 never
-/// granted; the resulting block must still be accepted by **bitcoin-core
-/// v31** — the version the pool runs in production, released before the
-/// BIP-323 masking landed (that is milestone 32.0).
+/// A block rolling the eight nVersion bits BIP-323 adds over BIP-320 is
+/// accepted by **bitcoin-core v31** (which predates BIP-323 masking), the
+/// tip advances and the bits survive into the stored header. This gates
+/// widening the advertised `version-rolling.mask`; the pool does not
+/// validate rolled bits, so such shares already reach Core.
 ///
-/// This is the gate on widening the advertised `version-rolling.mask`
-/// ahead of the Core upgrade. The pool does not validate rolled version
-/// bits in either protocol today, so such a share is already accepted and
-/// already reaches Core; what was never checked is what Core does with it.
-///
-/// **What this proves:** bits 5–12 are not consensus-relevant — the block
-/// is accepted, the tip advances, and the bits survive into the stored
-/// header. No block is lost by rolling them.
-///
-/// **What this does NOT prove:** that Core never emits an unknown-soft-fork
-/// warning. That warning is threshold-based over a retarget window, and one
-/// block cannot reach any threshold. The assertion below therefore only
-/// establishes that a *single* such block raises nothing on its own — which
-/// is the production shape, since the pool's blocks are a negligible share
-/// of any mainnet window. A node's warning state depends on the whole
-/// network, not on us, so no regtest can answer that half.
+/// It does NOT prove Core never warns about unknown soft forks: that warning
+/// is threshold-based over a retarget window, so one block only shows that
+/// a single such block raises nothing on its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn sv2_block_rolling_bip323_version_bits_is_accepted_by_bitcoin_core() {
@@ -132,36 +90,22 @@ async fn sv2_block_rolling_bip323_version_bits_is_accepted_by_bitcoin_core() {
 /// yields `0xA0000000` — negative as an `i32`, so below
 /// `bp_mining_job::MIN_CONSENSUS_BLOCK_VERSION`.
 ///
-/// This is the measurement behind the `scope="unsubmittable"` metric
-/// bucket, and the reason that case is not merely "the miner's problem":
-///
-/// - the share is valid proof-of-work, and the pool **accepts** it
-///   (asserted below) — the miner is credited and sees nothing wrong;
-/// - `TdpHandle::submit_solution` is fire-and-forget, so the pool sees
-///   nothing wrong either;
-/// - the block is silently gone, and the loss lands only on the day such a
-///   share happens to solve one.
+/// Backs the `scope="unsubmittable"` metric bucket: the share is valid
+/// proof-of-work and the pool **accepts** it (asserted below), while
+/// `TdpHandle::submit_solution` is fire-and-forget, so such a block is lost
+/// without anything reporting it.
 ///
 /// ⚠️ The rule is about the **resulting version**, not about which bits
-/// were rolled. An earlier version of this test claimed bits 29–31 were
-/// structurally block-killing, from two measurements that both happened to
-/// fit this one template. `sv2_block_rolling_bit_30_stays_submittable`
-/// below is the case that refutes it and exists to keep it refuted.
+/// were rolled; see `sv2_block_rolling_bit_30_stays_submittable`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn sv2_block_below_consensus_version_floor_is_rejected_by_bitcoin_core() {
     run_block_submit_case(8, 1 << 31, false).await;
 }
 
-/// The refutation case. Rolling bit 30 against this template yields
-/// `0x60000000` — a large positive version — and bitcoin-core **accepts**
-/// the block.
-///
-/// It is here because a plausible-looking rule ("the top three version
-/// bits are structural, rolling any of them kills the block") survived two
-/// measurements and a written rationale before this case was ever tried.
-/// Any future attempt to classify submittability from the rolled delta
-/// alone fails here.
+/// Rolling bit 30 against this template yields `0x60000000`, a positive
+/// version, and bitcoin-core **accepts** the block. Pins that
+/// submittability cannot be classified from the rolled bits alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::print_stderr)]
 async fn sv2_block_rolling_bit_30_stays_submittable() {
@@ -182,10 +126,7 @@ async fn run_block_submit_case(
 ) {
     let cfg = RegtestConfig::default();
     if !cfg.is_available() {
-        // Use `tracing::warn!` instead of a stdout print so this skip
-        // is visible in test logs without tripping clippy's
-        // `print_stdout` / `print_stderr` lints (enforced by CI's
-        // `-D warnings`).
+        // `tracing::warn!` rather than a print, to satisfy clippy's print lints.
         tracing::warn!(
             reason = %cfg.unavailable_reason(),
             "skipping SV2 Extended block-submit regtest"
@@ -223,18 +164,14 @@ async fn run_block_submit_case(
 
     // ── Build the per-channel MiningJob the pool would issue ────────
     //
-    // The Extended channel negotiates a total extranonce of
-    // `extranonce_prefix.len + miner_extranonce_size`, so we build the
-    // mining-job with that exact slot size baked into the scriptsig.
-    // This mirrors what `apply_template_broadcast` does in production
-    // (no post-hoc varint patching).
+    // The Extended channel's total extranonce is
+    // `extranonce_prefix.len + miner_extranonce_size`, and the mining job is
+    // built with exactly that slot size in the scriptSig.
     let extranonce_prefix: Vec<u8> = vec![0xC0, 0xDE, 0xBA, 0xBE];
     let channel_id: u32 = 1;
     let job_id: u32 = 1;
-    // Job-target must be trivial so the validator's per-share difficulty
-    // gate passes — what we actually want to assert is the WIRE-bytes
-    // bitcoin-core sees, not whether the brute-forced hash meets some
-    // arbitrary pool diff. `1e-18` matches `regtest_extended.rs`.
+    // Trivial job target, so the share gate passes and the test is about
+    // the bytes bitcoin-core sees.
     let job_difficulty = Difficulty(1.0e-18);
     let full_extranonce_size = extranonce_prefix.len() + miner_extranonce_size as usize;
 
@@ -261,11 +198,9 @@ async fn run_block_submit_case(
     )
     .expect("build_mining_job_from_tdp");
 
-    // ── Build the Extended channel + ExtendedJob exactly how
-    //    `apply_template_to_channel` does — coinbase_prefix is the
-    //    bytes BEFORE the extranonce slot (no extranonce_prefix
-    //    baked in; SV2 spec says the miner appends
-    //    channel.extranonce_prefix + own extranonce itself).
+    // ── Build the Extended channel + ExtendedJob: coinbase_prefix is the
+    //    bytes BEFORE the extranonce slot; the miner appends
+    //    channel.extranonce_prefix + its own extranonce.
     let tx_prefix = mining_job.coinbase_prefix().to_vec();
     let tx_suffix = mining_job.coinbase_suffix().to_vec();
 
@@ -274,9 +209,8 @@ async fn run_block_submit_case(
         coinbase_prefix: tx_prefix.clone(),
         coinbase_suffix: tx_suffix.clone(),
         merkle_path: template.merkle_path.clone(),
-        // Same prefix the channel below is opened with — the validator
-        // splices the JOB's copy in, so a mismatch here would break the
-        // coinbase reconstruction and the block submit with it.
+        // Same prefix as the channel below: the validator splices the JOB's
+        // copy into the coinbase.
         extranonce_prefix: extranonce_prefix.clone(),
         version: template.version,
         prev_hash: prev_hash.prev_hash,
@@ -304,9 +238,8 @@ async fn run_block_submit_case(
     //
     // The miner reconstructs the coinbase as
     //   tx_prefix + channel.extranonce_prefix + miner_extranonce + tx_suffix
-    // (per SRI's client/extended.rs::validate_share). We mirror that
-    // here so the hash we brute-force matches what
-    // `validate_submit_extended` computes.
+    // so the brute-forced hash matches what `validate_submit_extended`
+    // computes.
     let miner_extranonce: SmallVec<[u8; 16]> =
         SmallVec::from_iter(std::iter::repeat_n(0u8, miner_extranonce_size as usize));
     let mut miner_coinbase = Vec::with_capacity(
@@ -321,21 +254,14 @@ async fn run_block_submit_case(
     let merkle_root = merkle_root_from_coinbase(&coinbase_txid, &template.merkle_path);
     let target = Target::from_le_bytes(prev_hash.target);
 
-    // The version the miner actually hashes. `ext_job.version` stays the
-    // template's, so the validator derives `version_mask = header_version
-    // ^ template.version` — the production algebra, not a test shortcut.
+    // The version the miner actually hashes; `ext_job.version` stays the
+    // template's.
     let header_version = template.version ^ rolled_version_bits;
 
     // Pin which side of the consensus floor this case is on, so the
-    // expectation below is stated in terms of the rule core enforces rather
-    // than in terms of which bit happened to be rolled.
-    //
-    // Nothing here asserts `header_version ^ ext_job.version == rolled_bits`:
-    // `ext_job.version` IS `template.version`, so that would be
-    // `(a ^ b) ^ b == a` and pin nothing. The validator no longer derives a
-    // mask at all — it takes `submission.version` verbatim — so the value
-    // that matters is the one core ends up storing, which the accept branch
-    // reads back out of the chain.
+    // expectation is stated in terms of the rule core enforces. The
+    // validator takes `submission.version` verbatim; the accept branch reads
+    // the stored version back out of the chain.
     assert_eq!(
         version_meets_consensus_floor(header_version),
         expect_block_accepted,
@@ -411,16 +337,12 @@ async fn run_block_submit_case(
 
     // ── What bitcoin-core did with it ────────────────────────────────
     //
-    // submit_solution is fire-and-forget, so the tip is the only signal it
-    // gives. That is enough to prove acceptance, but NOT enough to prove a
-    // rejection *reason* — this very file documents another silent cause of
-    // a stuck tip (the 2026-05-17 OversizedVarInt coinbase). The reject
-    // branch therefore re-submits the identical block over `submitblock`,
-    // which answers synchronously with core's own reason string.
+    // submit_solution is fire-and-forget, so the tip is its only signal.
+    // That proves acceptance but not a rejection *reason*, so the reject
+    // branch re-submits the identical block over `submitblock`, which
+    // answers with core's reason string.
     if !expect_block_accepted {
-        // Same budget as the accept path below. A shorter one here would
-        // be a false-pass window: on a loaded box core taking longer than
-        // the budget to accept would read as "rejected".
+        // Same budget as the accept path, see `CORE_ACCEPT_BUDGET`.
         let reached = poll_for_height(&node, before_height + 1, CORE_ACCEPT_BUDGET).await;
         assert!(
             reached.is_none(),
@@ -430,10 +352,8 @@ async fn run_block_submit_case(
             header_version as i32
         );
 
-        // Now get the reason on the record. The template carries no
-        // transactions on this harness, so the block is header + one
-        // coinbase; assert that rather than assume it, since a non-empty
-        // merkle path would make the bytes below a different block.
+        // Get the reason. The block is header + one coinbase only if the
+        // template carries no transactions, so assert that.
         assert!(
             template.merkle_path.is_empty(),
             "this reconstruction assumes a coinbase-only template"
@@ -467,10 +387,8 @@ async fn run_block_submit_case(
             "tip moved despite the block being rejected"
         );
 
-        // Negative control, in the same test: prove the node was alive and
-        // willing the whole time. Without it, a node that died right after
-        // `submit_solution` would produce the same "tip did not move"
-        // reading and this test would pass for the wrong reason.
+        // Negative control: the node still accepts an ordinary block, so a
+        // dead node cannot pass as "tip did not move".
         node.generate_to_self(1)
             .await
             .expect("node must still accept an ordinary block");
@@ -490,10 +408,9 @@ async fn run_block_submit_case(
 
         // ── The version bits must have survived into the chain ───────
         //
-        // Without this, a rolled-bits case could pass while proving
-        // nothing: if anything on the path (validator, TDP IPC, core's own
-        // assembly) replaced the header version with the template's, the
-        // block would still be accepted and the tip would still rise.
+        // If anything on the path replaced the header version with the
+        // template's, the block would still be accepted; this pins that the
+        // rolled bits reached the chain.
         let block_hash = node
             .rpc_call("getblockhash", json!([after]))
             .await
@@ -518,11 +435,8 @@ async fn run_block_submit_case(
         // ── ...and core must not have flagged them ───────────────────
         //
         // One block cannot trip a threshold-based versionbits warning, so a
-        // clean result here means "a single such block raises nothing on
-        // its own", nothing stronger. It is still worth having: that IS the
-        // production shape, and if core v31 ever did flag a lone
-        // unknown-signalling block, this is where we would find out rather
-        // than on prod after a found block.
+        // clean result means only that a single such block raises nothing
+        // on its own.
         let warnings = node
             .rpc_call("getblockchaininfo", json!([]))
             .await
@@ -530,9 +444,8 @@ async fn run_block_submit_case(
             .get("warnings")
             .cloned()
             .unwrap_or(Value::Null);
-        // `warnings` is a string on older cores and an array from v25 on.
-        // Normalise rather than assume, so a shape change surfaces as a
-        // failed assertion and not as a silently-skipped check.
+        // `warnings` is a string on older cores and an array from v25 on;
+        // any other shape fails rather than skipping the check.
         let warning_text = match &warnings {
             Value::String(s) => s.clone(),
             Value::Array(items) => items
@@ -553,5 +466,3 @@ async fn run_block_submit_case(
     tdp.shutdown().expect("TDP clean shutdown");
     node.shutdown().await.expect("regtest clean shutdown");
 }
-
-// ── Helpers (copy-of-the-helpers from bp-mining-job/tests/regtest_e2e.rs) ─

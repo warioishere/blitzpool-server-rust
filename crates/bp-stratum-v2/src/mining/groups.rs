@@ -16,18 +16,16 @@
 //! Every channel in a group MUST share the EXACT SAME full extranonce size
 //! (SV2 Mining/Group Channel / SV2 Mining/Extended Extranonce): the group's
 //! single `coinbase_tx_prefix` carries a fixed scriptSig-length varint, so the
-//! coinbase slot size must be identical for every member. We therefore key one
-//! group per `(connection, full_extranonce_size)`: a channel only ever joins
-//! the group of its own size ([`GroupChannelRegistry::join_group_for_size`]),
-//! so a mismatched member cannot be built.
+//! coinbase slot size must be identical for every member. So there is one
+//! group per `(connection, full_extranonce_size)`, and a channel only joins
+//! the group of its own size ([`GroupChannelRegistry::join_group_for_size`]).
 //!
 //! ## Shared job id
 //!
-//! A group broadcast carries ONE `job_id`, so the group owns its own
-//! monotonic `job_id` counter ([`GroupChannel::alloc_job_id`]). The caller
-//! stores the resulting job record on every member channel under that same
-//! shared id, so per-channel `SubmitShares*` validation (keyed by job id)
-//! keeps working unchanged.
+//! A group broadcast carries ONE `job_id`, so the group owns a monotonic
+//! counter ([`GroupChannel::alloc_job_id`]). The caller stores the job on
+//! every member channel under that id, so per-channel `SubmitShares*`
+//! validation (keyed by job id) works unchanged.
 //!
 //! ## Scope: per-connection, group id from the channel-id namespace
 //!
@@ -61,16 +59,14 @@ pub struct GroupChannel {
     /// Starts at 1.
     next_job_id: u32,
     /// The `job_id` of the most recently broadcast group job, or `None`
-    /// before the first broadcast. Lets the broadcast ONBOARD a newly-opened
-    /// member with the group's CURRENT job (same id) instead of issuing a
-    /// fresh job + spurious new-block to the existing members.
+    /// before the first broadcast. Lets a newly-opened member be onboarded
+    /// onto the CURRENT job (same id) instead of sending the existing members
+    /// a fresh job and a spurious new block.
     current_job_id: Option<u32>,
     /// The coinbase TEMPLATE of the group's current broadcast job, or `None`
-    /// before the first broadcast. Stored at broadcast time so the onboard
-    /// path can hand a freshly-opened member the current job WITHOUT scanning
-    /// existing members — which would find nothing in an emptied-then-refilled
-    /// group. The `difficulty` field is a placeholder; the onboard path
-    /// overrides it with the new member's own session difficulty.
+    /// before the first broadcast. Stored on the group because an
+    /// emptied-then-refilled group has no member to copy it from. Its
+    /// `difficulty` is a placeholder; onboarding uses the new member's own.
     current_job: Option<ExtendedJob>,
 }
 

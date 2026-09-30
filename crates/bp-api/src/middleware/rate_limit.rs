@@ -2,7 +2,7 @@
 
 //! Per-route per-IP rate-limiting middleware.
 //!
-//! Applied on the 8 endpoints that are rate-limited (email register
+//! Applied per route on the rate-limited endpoints (email register
 //! 5/min, invitation accept/decline 20/min each, etc.). Each call to
 //! [`per_minute`] allocates its own `GovernorConfig`, so a 5/min
 //! limit on `/api/email/register` and a 5/min limit on

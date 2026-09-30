@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared `GroupService` owner — Phase 7.4b.
+//! Shared `GroupService` owner.
 //!
-//! Both the bp-api HTTP layer (`api_server.rs`) and the SV1 Stratum
-//! layer (`stratum_v1.rs`) need access to the same
-//! [`GroupService<ProductionGroupServiceHooks>`]: the API performs
-//! group lifecycle operations, while Stratum reads the
+//! The bp-api HTTP layer performs group lifecycle operations and the
+//! Stratum layer reads the
 //! [`AddressCache`](bp_group_mgmt_engine::AddressCache) on each
-//! authorize to resolve `address → group_id` for mode-gate
-//! population. Sharing one instance means one source of truth for
-//! membership state and a single cache that both layers see.
+//! authorize to resolve `address → group_id`; both use one
+//! [`GroupService<ProductionGroupServiceHooks>`] so they see a single
+//! membership cache.
 //!
 //! The cache is warmed at boot via `GroupService::rebuild_cache()`
-//! so the first share doesn't pay a PG round-trip for an empty
-//! cache.
+//! so the first share doesn't pay a PG round-trip.
 
 use std::sync::Arc;
 
@@ -26,8 +23,7 @@ use tracing::info;
 use crate::boot::FoundationHandles;
 use crate::hooks::{ProductionGroupServiceHooks, ProductionHooks};
 
-/// Default kick-inactivity cutoff (days) handed to `GroupService::new`.
-/// Can become configurable later.
+/// Kick-inactivity cutoff (days) handed to `GroupService::new`.
 pub(crate) const KICK_INACTIVITY_DAYS: u32 = 14;
 
 #[derive(Debug, Error)]

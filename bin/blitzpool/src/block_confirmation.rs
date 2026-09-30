@@ -3,23 +3,16 @@
 //! Confirmation watcher for confirmation-gated block-founds (PPLNS + Group-Solo).
 //!
 //! A found block parks its frozen payout in the Redis pending-store
-//! ([`crate::pending_blocks`] — one shape for both modes) instead of writing
-//! the ledger immediately. This task waits
-//! for each parked block to reach `confirmation_depth` confirmations, then
-//! applies it; a block that orphaned (or a non-chain-extending candidate, which
-//! never confirms) is discarded so the internal ledger never drifts. The
-//! on-chain coinbase payment is unaffected — only the internal accounting is
-//! gated. Blockparty is exempt: its payouts are fixed per-member percentages
-//! recomputed from the DB, so a replay/orphan can't drift anything.
+//! ([`crate::pending_blocks`], one shape for both modes). This task applies
+//! each parked block once it is `confirmation_depth` deep and discards one
+//! that orphaned, so the internal ledger never books a block the chain
+//! dropped. The on-chain coinbase payment is unaffected; only the internal
+//! accounting is gated. Blockparty is exempt: its payouts are fixed
+//! per-member percentages recomputed from the DB, so an orphan drifts nothing.
 //!
-//! The per-block confirmation decision ([`classify_block`]) + the
-//! load/classify/discard pass ([`collect_confirmed`]) run once for both
-//! modes; only the thin engine-specific apply loop differs.
-//!
-//! Trigger: the TDP `SetNewPrevHash` broadcast (a new chain tip → time to
-//! re-check confirmations) plus a slow fallback timer in case the TDP stream
-//! is quiet. The authoritative per-block status comes from a single
-//! `getblockheader <hash>` RPC.
+//! [`classify_block`] and [`collect_confirmed`] are shared by both modes.
+//! Triggered by the TDP `SetNewPrevHash` broadcast plus a slow fallback
+//! timer; the per-block status comes from `getblockheader <hash>`.
 
 use std::time::Duration;
 
@@ -40,9 +33,7 @@ use crate::pending_blocks::{
     PendingBlock, SettlementMode, PENDING_KEY, UNBOOKABLE_KEY,
 };
 
-/// Fallback re-check cadence when the TDP stream is quiet. New blocks normally
-/// drive the watcher via `SetNewPrevHash`; this just bounds the worst-case
-/// latency if that stream stalls.
+/// Fallback re-check cadence; bounds the latency when the TDP stream stalls.
 const FALLBACK_POLL: Duration = Duration::from_secs(120);
 
 /// Live confirmation-watcher task + its cancel token. [`Self::shutdown`]
@@ -61,14 +52,11 @@ impl BlockConfirmationHandle {
     }
 }
 
-/// Spawn the confirmation watcher. Owns clones of every handle it needs (all
-/// cheap / `Arc`-backed). Reconciles whichever engines are present (PPLNS
-/// and/or Group-Solo).
+/// Spawn the confirmation watcher for whichever engines are present.
 ///
-/// `tdp` is optional: with a TDP feed (the front's template source) the
-/// `SetNewPrevHash` broadcast wakes the watcher promptly on a new tip. The
-/// Satellite has none, so it passes `None` and relies solely on the fallback
-/// timer + `getblockheader` RPC — correct, just coarser-grained.
+/// With a TDP feed, `SetNewPrevHash` wakes the watcher on a new tip. A
+/// Satellite passes `None` and relies on the fallback timer alone, which is
+/// correct, just coarser-grained.
 pub(crate) fn spawn(
     tdp: Option<TdpHandle>,
     bitcoin_rpc: BitcoinRpc,
@@ -76,11 +64,10 @@ pub(crate) fn spawn(
     pplns: Option<PplnsEngine>,
     group_solo: Option<GroupSoloEngine>,
     confirmation_depth: u32,
-    // ext 0x0003 §10 settlement fan-out — a gated apply IS a settlement,
-    // so the published payout distributions must be invalidated with it
-    // or a JDC keeps mining pre-settlement weights. This watcher runs on
-    // the `payout` role and the registry lives on `front`, which is
-    // exactly why it takes the signal and not a bare in-process handle.
+    // ext 0x0003/Implementation Notes settlement: a gated apply IS a
+    // settlement, so the published distributions must be invalidated with it
+    // or a JDC keeps mining pre-settlement weights. The watcher runs on the
+    // `payout` role and the registry on `front`, hence a signal, not a handle.
     settle: Option<crate::settlement::SettlementSignal>,
 ) -> BlockConfirmationHandle {
     let cancel = CancellationToken::new();
@@ -119,10 +106,8 @@ pub(crate) fn spawn(
                     // NewTemplate / tx-data responses aren't new-block ticks.
                     Ok(_) => {}
                     Err(RecvError::Lagged(_)) => continue,
-                    // Sender gone (the watcher's own TdpHandle clone normally
-                    // outlives it, so this is rare). Drop the stream and keep
-                    // running on the fallback timer rather than stopping — parked
-                    // blocks must still reconcile.
+                    // Sender gone: keep running on the fallback timer, since
+                    // parked blocks must still reconcile.
                     Err(RecvError::Closed) => {
                         rx = None;
                     }
@@ -173,9 +158,8 @@ async fn classify_block(bitcoin_rpc: &BitcoinRpc, block_hash: &str, depth: i64) 
 }
 
 /// Load every entry in the pending store, prune unparsable ones, discard
-/// orphaned/gone ones, and return the CONFIRMED entries ready to apply (left in
-/// the store — the caller removes each after a successful apply, so a failed
-/// apply is retried next tick). The engine-agnostic half of the pass.
+/// orphaned ones, and return the CONFIRMED entries. They stay in the store
+/// until the caller applies them, so a failed apply is retried next tick.
 async fn collect_confirmed(
     bitcoin_rpc: &BitcoinRpc,
     conn: &mut ConnectionManager,
@@ -216,18 +200,12 @@ async fn collect_confirmed(
     confirmed
 }
 
-/// One reconciliation pass over the pending store.
+/// Publish how deep the two parking stores are, and log when the unbookable
+/// one CHANGES.
 ///
-/// One loop for both modes: the parked blob carries the settlement
-/// inputs either way, and `group` decides which engine settles them.
-/// Publish how deep the two parking stores are, and say so in the log when
-/// the unbookable one CHANGES.
-///
-/// The gauge is the standing signal — `pool:unbookable_blocks` had no
-/// reader of any kind, so a block whose miners are owed a ledger entry left
-/// exactly one log line behind and then nothing. Logging only on a change
-/// keeps a standing non-zero count from becoming a line every pass, which
-/// is how a real one gets ignored.
+/// The gauge is the standing signal for blocks whose miners are owed a ledger
+/// entry. Logging only on a change keeps a standing non-zero count from
+/// becoming a line every pass, which is how a real one gets ignored.
 async fn report_parked_depths(conn: &mut ConnectionManager, last_unbookable: &mut Option<u64>) {
     let pending = count_pending_at(conn, PENDING_KEY).await;
     let unbookable = count_pending_at(conn, UNBOOKABLE_KEY).await;
@@ -254,13 +232,16 @@ async fn report_parked_depths(conn: &mut ConnectionManager, last_unbookable: &mu
     }
 }
 
+/// One reconciliation pass over the pending store, one loop for both modes:
+/// the parked blob carries the settlement inputs either way, and `group`
+/// decides which engine settles them.
 async fn reconcile(
     bitcoin_rpc: &BitcoinRpc,
     redis: &ConnectionManager,
     pplns: Option<&PplnsEngine>,
     group_solo: Option<&GroupSoloEngine>,
     confirmation_depth: u32,
-    // See `spawn`: a gated apply IS a §10 settlement event.
+    // See `spawn`: a gated apply IS a settlement event.
     settle: Option<&crate::settlement::SettlementSignal>,
     last_unbookable: &mut Option<u64>,
 ) {
@@ -269,13 +250,10 @@ async fn reconcile(
     let confirmed = collect_confirmed(bitcoin_rpc, &mut conn, depth).await;
 
     for pb in confirmed {
-        // Settlement is `claim − paid` against the block's OWN coinbase,
-        // so its payments are not optional: without them there is
-        // nothing to settle against and the block is an operator
-        // reprocess.
+        // Settlement is `claim − paid` against the block's OWN coinbase;
+        // without its payments there is nothing to settle against.
         let Some(actual) = pb.actual_coinbase.clone() else {
-            // Park, don't destroy: same rule as a terminal settle failure
-            // below. The blob is still the only record of this block.
+            // Park, don't destroy: the blob is the only record of this block.
             let parked = park_unbookable_block(&mut conn, &pb).await.is_ok();
             error!(
                 block_hash = %pb.block_hash,
@@ -316,8 +294,7 @@ async fn reconcile(
                 );
                 let _ = remove_pending_block(&mut conn, &pb.block_hash).await;
             }
-            // The engine this block belongs to is not wired on this
-            // process. Leave it parked — another process may own it.
+            // No engine for this block's mode here; another process may own it.
             Err(SettleFailure::NoEngine) => continue,
             Err(err) if err.is_terminal() => {
                 // Park, don't destroy: the frozen blob is the only record
@@ -350,11 +327,10 @@ async fn reconcile(
     report_parked_depths(&mut conn, last_unbookable).await;
 }
 
-/// Book one block into its mode's engine — the one settlement both the
-/// watcher and the immediate apply ([`crate::block_sink`]) run, so they
-/// cannot drift apart. Returns the engine's `history_inserted`. What to do
-/// with a failure (retry, park, give up) is the caller's call: only the
-/// watcher has a parked entry to leave in place.
+/// Book one block into its mode's engine. Both the watcher and the immediate
+/// apply ([`crate::block_sink`]) run this one settlement. Returns the
+/// engine's `history_inserted`; handling a failure is the caller's call,
+/// since only the watcher has a parked entry to leave in place.
 pub(crate) async fn settle_block(
     pplns: Option<&PplnsEngine>,
     group_solo: Option<&GroupSoloEngine>,
@@ -441,25 +417,14 @@ impl SettleError {
 
 // ── Regtest: a declared block books what its coinbase actually paid ──
 //
-// The one seam nothing covered. Two halves were each tested and never met:
+// The JDP sink, the engines and the confirmation watcher only meet inside
+// this binary (the hook traits keep `bp-stratum-v2` and the engines apart),
+// so this is where `book_declared_block_found`, the `emit_block_found`
+// fan-out and `reconcile` are driven together.
 //
-// - `bp-stratum-v2`'s `jdp_push_distribution_e2e` drives the real 0x0003 wire
-//   to a `PayoutBooking` — but hands it to a recording fake, no ledger.
-// - `bp-pplns-engine`'s `ledger_books_exactly_what_the_accepted_coinbase_paid`
-//   books a real accepted coinbase into the ledger — but calls
-//   `PplnsEngine::on_block_found` directly, bypassing this file entirely.
-//
-// Neither crate can see the other (no dependency either way — the hook traits
-// are the seam on purpose), so the join is only reachable inside this binary,
-// where the JDP sink, the engines and the confirmation watcher meet.
-// `book_declared_block_found`, the `emit_block_found` fan-out below it and
-// `reconcile` had NO caller in any test.
-//
-// It drives the PRODUCTION path, not the fallback: with Redis wired a
-// block-found FREEZES the distribution and parks it — the ledger stays empty
-// until the block is `confirmation_depth` deep and `reconcile` applies it. An
-// earlier draft asserted rows right after booking and failed, which is what the
-// log said all along ("distribution frozen, awaiting confirmations").
+// It drives the PRODUCTION path: with Redis wired a block-found FREEZES the
+// distribution and parks it, and the ledger stays empty until the block is
+// `confirmation_depth` deep and `reconcile` applies it.
 #[cfg(test)]
 mod declared_block_booking_regtest {
     use crate::block_sink::TdpBlockSubmissionSink;
@@ -502,9 +467,8 @@ mod declared_block_booking_regtest {
     /// The production default of `[pplns] confirmation_depth`.
     const DEPTH: u32 = 3;
     /// Sats moved between two miners so the mined coinbase DIVERGES from what
-    /// the distribution intended. Without a divergence the central assertion
-    /// cannot fail: booking derives from the actual coinbase, so comparing the
-    /// ledger against that same coinbase would be a tautology.
+    /// the distribution intended; without a divergence, comparing the ledger
+    /// against the coinbase could not tell the two sources apart.
     const SHIFT_SATS: u64 = 1_000;
 
     fn engine_config(fee_addr: &str) -> PplnsEngineConfig {
@@ -514,14 +478,9 @@ mod declared_block_booking_regtest {
             fee_address: Some(AddressId::new(fee_addr.to_string()).expect("fee addr")),
             fee_percent: 1.5,
             min_payout_sats: Sats(DEFAULT_MIN_PAYOUT_SATS as i64),
-            // The chain these tests run on halves every 150 blocks. Left at the
-            // mainnet default the engine expects 50 BTC where regtest already
-            // pays 25, and its "coinbase pays less than the subsidy" guard
-            // refuses to book — correctly, on a block that is fine.
-            //
-            // The four PPLNS tests sit at heights ~102-135 and never noticed;
-            // the fifth fixture to be added crossed 150 and did. Set here so
-            // the next one cannot inherit the trap.
+            // Regtest halves every 150 blocks. At the mainnet default the
+            // engine expects 50 BTC past height 150 where regtest pays 25, and
+            // its "coinbase pays less than the subsidy" guard refuses to book.
             subsidy_halving_interval: bp_share::REGTEST_SUBSIDY_HALVING_INTERVAL,
             ..PplnsEngineConfig::default()
         }
@@ -571,12 +530,8 @@ mod declared_block_booking_regtest {
             let regtest_cfg = RegtestConfig::default();
             if !regtest_cfg.is_available() {
                 // Keep in step with `GroupChain::setup` below: the skip
-                // reason has to come from `unavailable_reason()`, never a
-                // hard-coded "not found". A v30 node, a non-executable
-                // path and a `-version` that would not run are all
-                // "available == false" for different reasons, and naming
-                // the wrong one sends the reader after a missing file.
-                // The two copies drifted apart within a day once before.
+                // reason comes from `unavailable_reason()`, since a node can
+                // be unavailable for several reasons besides a missing file.
                 eprintln!(
                     "skipping declared-block booking regtest — {}",
                     regtest_cfg.unavailable_reason()
@@ -597,10 +552,8 @@ mod declared_block_booking_regtest {
             let fee_addr =
                 bp_test_support::deterministic_p2wpkh_regtest([tag.wrapping_add(0xC0); 32]);
 
-            // A run that panics before its own cleanup leaves rows behind, and
-            // the regtest chain restarts at the same height every time — the next
-            // run would then trip on "the ledger must still be empty". Clear by
-            // ADDRESS so nothing outside this test is touched.
+            // A panicked run leaves rows behind at the same height the next run
+            // reaches. Clear by ADDRESS so nothing outside this test is touched.
             Self::purge(&pg, &miners, &fee_addr).await;
 
             let pplns = PplnsEngine::spawn(
@@ -623,9 +576,8 @@ mod declared_block_booking_regtest {
                     .expect("seed share");
             }
 
-            // The fan-out needs a Group-Solo engine too (not optional), even
-            // though this block is a PPLNS one — it is the dispatch target for
-            // the OTHER mode and must exist for the sink to be constructible.
+            // The sink is not constructible without a Group-Solo engine, even
+            // for a PPLNS block: it is the dispatch target for the other mode.
             let group_solo = bp_group_solo_engine::engine::GroupSoloEngine::spawn(
                 bp_group_solo_engine::config::GroupSoloEngineConfig {
                     fee_address: Some(AddressId::new(fee_addr.clone()).expect("fee addr")),
@@ -641,25 +593,18 @@ mod declared_block_booking_regtest {
             .await
             .expect("GroupSoloEngine::spawn");
 
-            // The gate decides which engine books. Its default for an unknown
-            // address is SOLO, which books nothing — so forgetting this line
-            // makes the assertions fail rather than pass silently.
+            // The gate decides which engine books; its default for an unknown
+            // address is SOLO, which books nothing.
             let gate = Arc::new(crate::engines::BlitzpoolModeGate::new());
             gate.set_mode(&miners[0], bp_mining_mode::MiningModeResult::pplns());
 
             let node = RegtestNode::start_with(regtest_cfg)
                 .await
                 .expect("regtest start");
-            // Each test needs its own HEIGHT, not just its own addresses. The
-            // ledger keys payout history by height alone — `apply_distribution`
-            // asks `pplns_booked_value_rows_at_height`, with no address filter —
-            // so two tests whose blocks land at the same height in this shared PG
-            // make each other's apply fail with `HeightBookedByAnotherBlock`.
-            // That is the production code behaving correctly; the collision is
-            // the test's fault. Spread them 10 apart so it cannot happen, in
-            // parallel runs either.
-            // DB 0 is the one free index below the rest; give it a height
-            // slot none of them uses.
+            // Each test needs its own HEIGHT: the ledger keys payout history by
+            // height alone, so two tests booking the same height in this shared
+            // PG fail each other with `HeightBookedByAnotherBlock`. Spread them
+            // 10 apart; DB 0 gets a slot none of the others uses.
             let slot = match redis_db {
                 DB_LOST_SUBMIT => 16,
                 n => n - DB_BOOKS_THE_COINBASE,
@@ -702,11 +647,9 @@ mod declared_block_booking_regtest {
                 })
                 .collect();
 
-            // Precondition against the trap in the repo's CLAUDE.md: an address
-            // `bitcoin::Address` cannot parse is DROPPED, leaving an empty
-            // distribution whose miners then surface as 0-sat "late arriver"
-            // rows — every assertion downstream would hold while proving
-            // nothing.
+            // Precondition: an address `bitcoin::Address` cannot parse is
+            // DROPPED, leaving an empty distribution whose miners surface as
+            // 0-sat rows, and every assertion downstream would hold vacuously.
             assert!(
                 intended.len() >= 4,
                 "expected the three seeded miners plus the pool output, got {intended:?}"
@@ -888,11 +831,8 @@ mod declared_block_booking_regtest {
             .await;
         }
 
-        /// Scoped to THIS test's miners, not just the height. All four tests
-        /// start their own regtest chain, so they all find their block at the
-        /// same height — a height-only query reads a sibling's leftovers after a
-        /// panic, and the sibling's rows are not ours to purge. Cost me three
-        /// phantom failures before I looked.
+        /// Scoped to THIS test's miners, not just the height: a height-only
+        /// query can read a sibling test's leftovers after a panic.
         async fn coinbase_rows(&self) -> Vec<(String, i64)> {
             sqlx::query_as(
                 r#"SELECT address, "paidSats" FROM pplns_payout_history
@@ -942,11 +882,9 @@ mod declared_block_booking_regtest {
                     .bind(m)
                     .execute(pg)
                     .await;
-                // `blocks_entity` too, and this one is not cosmetic: `/api/pool`
-                // renders the found-block log inline and `bp-api`'s smoke test
-                // caps the body at 1024 bytes, so leaking a row per run grows
-                // that list until an UNRELATED test fails. It did, after eight
-                // runs.
+                // `blocks_entity` too: `/api/pool` renders the found-block log
+                // inline and `bp-api`'s smoke test caps the body at 1024 bytes,
+                // so a leaked row per run eventually fails an unrelated test.
                 let _ = sqlx::query(r#"DELETE FROM blocks_entity WHERE "minerAddress" = $1"#)
                     .bind(m)
                     .execute(pg)
@@ -962,9 +900,8 @@ mod declared_block_booking_regtest {
         }
     }
 
-    /// The chain's own coinbase decides the booking — not the list the pool
-    /// intended to pay. Mutation-checked: booking from `intended` instead of the
-    /// mined coinbase flips both amounts and fails with the exact 1000-sat delta.
+    /// The chain's own coinbase decides the booking, not the list the pool
+    /// intended to pay; booking from `intended` fails with the SHIFT_SATS delta.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_declared_block_books_exactly_what_its_coinbase_paid() {
         let Some(c) = Chain::setup(DB_BOOKS_THE_COINBASE).await else {
@@ -979,8 +916,7 @@ mod declared_block_booking_regtest {
         );
 
         // Gated, not immediate: with Redis wired the block is PARKED and the
-        // ledger stays empty until it is confirmation-deep. An earlier draft
-        // asserted rows here and failed, which the log had said all along.
+        // ledger stays empty until it is confirmation-deep.
         assert!(
             c.coinbase_rows().await.is_empty(),
             "with Redis wired the apply MUST wait for confirmations"
@@ -993,9 +929,8 @@ mod declared_block_booking_regtest {
         c.reconcile_once().await;
 
         let rows = c.coinbase_rows().await;
-        // Exactly the three seeded miners. The pool output is paid on-chain but
-        // books no audit row, so 3 (not 4) is the correct shape — pinning it
-        // stops a silently-empty or doubled booking sliding through the loop.
+        // Exactly the three seeded miners: the pool output is paid on-chain but
+        // books no audit row. Pinning 3 catches an empty or doubled booking.
         assert_eq!(
             rows.len(),
             3,
@@ -1032,11 +967,10 @@ mod declared_block_booking_regtest {
         c.teardown().await;
     }
 
-    /// A re-parked block must not be booked twice. The confirmation watcher
-    /// produces exactly this: its post-apply `remove_pending_block` error is
-    /// deliberately ignored, so a failure there leaves the block parked and the
-    /// next tick applies it again. The balance write is ABSOLUTE, so a second
-    /// apply doubles a credit — measured once at 2999 → 5998 sat.
+    /// A re-parked block must not be booked twice. The watcher ignores a
+    /// post-apply `remove_pending_block` error, so a failure there leaves the
+    /// block parked for the next tick; the balance write is ABSOLUTE, so a
+    /// second apply would double a credit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_second_apply_of_the_same_block_books_nothing_more() {
         let Some(c) = Chain::setup(DB_NO_DOUBLE_BOOK).await else {
@@ -1085,8 +1019,7 @@ mod declared_block_booking_regtest {
     }
 
     /// A block whose coinbase could not be parsed must be REFUSED, never booked
-    /// from the list the pool intended to pay. This is the case that makes the
-    /// byte-for-byte assertion in the first test load-bearing.
+    /// from the list the pool intended to pay.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_block_without_a_parsed_coinbase_is_refused_not_booked_from_intent() {
         let Some(c) = Chain::setup(DB_REFUSES_WITHOUT_COINBASE).await else {
@@ -1127,13 +1060,10 @@ mod declared_block_booking_regtest {
         assert_eq!(booked.len(), 3, "precondition: the first block booked");
         let unbookable_before = c.unbookable_count().await;
 
-        // Same height, DIFFERENT payments. The hash cannot be fabricated —
-        // `reconcile` asks the node via `classify_block`, so an unknown hash
-        // would be dropped as orphaned and the test would pass for the wrong
-        // reason. Model the other block the way the gate actually sees one: it
-        // has no `blockHash` column to compare, it compares the value-bearing
-        // ROWS. So re-park the same hash carrying a coinbase that pays
-        // differently — here the shift reversed, i.e. what the pool intended.
+        // Same height, DIFFERENT payments. The hash cannot be fabricated,
+        // since `classify_block` would drop an unknown hash as orphaned. The
+        // gate compares value-bearing ROWS, not hashes, so re-park the same
+        // hash with a coinbase that pays differently (the shift reversed).
         let mut other_tx = c.coinbase_tx.clone();
         let script_of =
             |m: &str| bp_mining_job::address_to_script(Network::Regtest, m).expect("payable");
@@ -1174,10 +1104,9 @@ mod declared_block_booking_regtest {
         c.teardown().await;
     }
 
-    /// A parked Group-Solo block whose group id does not parse can be
-    /// booked by nothing — but its blob is still the only record of what
-    /// the coinbase paid, so it must move to the unbookable store, not be
-    /// deleted. Leaving the pending store holds either way; only the
+    /// A parked Group-Solo block whose group id does not parse can be booked
+    /// by nothing, but its blob is the only record of what the coinbase paid,
+    /// so it moves to the unbookable store instead of being deleted. Only the
     /// unbookable count tells a park from a discard.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_group_block_with_an_unusable_group_id_parks_as_unbookable() {
@@ -1227,10 +1156,9 @@ mod declared_block_booking_regtest {
         c.teardown().await;
     }
 
-    /// A parked block without a parsed coinbase (a blob written before every
-    /// park carried one) can be settled by nothing either. Same rule as the
-    /// unusable group id above: its blob is the only record of the block, so
-    /// it moves to the unbookable store instead of being deleted.
+    /// A parked block without a parsed coinbase can be settled by nothing
+    /// either. Same rule as the unusable group id above: it moves to the
+    /// unbookable store instead of being deleted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_block_without_a_parsed_coinbase_parks_as_unbookable() {
         let Some(c) = Chain::setup(DB_NO_PARSED_COINBASE).await else {
@@ -1277,11 +1205,9 @@ mod declared_block_booking_regtest {
 
     /// A solution the pool could not hand to bitcoin-core never reached the
     /// chain, so it must not be reported as a found block: no pending park,
-    /// no found-block row, no push. `submit_solution` only fails when the TDP
-    /// worker is gone, which is exactly that case.
-    ///
-    /// Negative control first, on the same fixture: with the worker alive the
-    /// same call DOES park the block, so the assertion below can see a park.
+    /// no found-block row, no push. `submit_solution` fails when the TDP
+    /// worker is gone. Negative control first: with the worker alive the same
+    /// call DOES park the block.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_solution_that_never_reached_core_is_not_reported_found() {
         let Some(c) = Chain::setup(DB_LOST_SUBMIT).await else {
@@ -1346,18 +1272,15 @@ mod declared_block_booking_regtest {
     // ── Group-Solo: the same door, a different ledger ────────────────
     //
     // Group-Solo goes through the SAME `book_declared_block_found`, but
-    // diverges exactly where the PPLNS tests above put their assertions, so
-    // this is its own fixture rather than a parameter over both modes:
+    // diverges where the PPLNS tests put their assertions, so it has its own
+    // fixture:
     //
-    // - it needs a group + members in PG, which nothing else in this file does
+    // - it needs a group + members in PG
     // - the mode gate must answer `group_solo(group_id)`, not `pplns()`
     // - the builder takes `(group_id, reward, finder)` instead of `(reward)`
-    // - it writes `pplns_group_block_history` and **no ledger, no balances** —
-    //   Group-Solo pays what the coinbase pays and owes nothing afterwards
-    //
-    // That last one is why the replay test below had to be re-invented rather
-    // than copied: PPLNS's absolute balance write makes a double-apply visible
-    // as a moved number, and there is no such number here.
+    // - it writes `pplns_group_block_history` and **no ledger, no balances**:
+    //   Group-Solo pays what the coinbase pays and owes nothing afterwards,
+    //   so a double-apply has no balance to move.
 
     /// A real regtest chain with an accepted block whose coinbase pays a real
     /// Group-Solo distribution — everything up to, but not including, the
@@ -1416,8 +1339,7 @@ mod declared_block_booking_regtest {
             Self::purge(&pg, group_id, &members).await;
 
             // `pplns_group_member.address` is UNIQUE across the whole table, so
-            // the purge above must run before the seed or a leftover row from a
-            // panicked run makes the insert fail instead of the test.
+            // the purge above must run before the seed.
             sqlx::query(
                 r#"INSERT INTO pplns_group
                      (id, name, "creatorAddress", "adminTokenHash", active,
@@ -1471,10 +1393,8 @@ mod declared_block_booking_regtest {
 
             // ⚠️ Membership alone earns NOTHING. Group-Solo splits by shares in
             // the round, so a group seeded with members but no shares produces a
-            // two-entry distribution — the pool output and one address holding
-            // the entire subsidy — and every assertion below would then be about
-            // a payout nobody made. That is not hypothetical: it is what this
-            // fixture did on its first run.
+            // two-entry distribution (the pool output and one address holding
+            // the entire subsidy), and the assertions below would test nothing.
             let now_ms = chrono::Utc::now().timestamp_millis();
             for (addr, difficulty) in [
                 (&members[0], 100.0),
@@ -1487,8 +1407,7 @@ mod declared_block_booking_regtest {
                     .expect("seed group share");
             }
 
-            // Forgetting this makes the gate answer Solo, which books nothing —
-            // the assertions then fail rather than pass silently.
+            // Without this the gate answers Solo, which books nothing.
             let gate = Arc::new(crate::engines::BlitzpoolModeGate::new());
             gate.set_mode(
                 &members[0],
@@ -1541,9 +1460,8 @@ mod declared_block_booking_regtest {
                 })
                 .collect();
 
-            // Same precondition as the PPLNS fixture, for the same reason: an
-            // unparsable address is DROPPED from the distribution, and every
-            // assertion downstream would then hold while proving nothing.
+            // Same precondition as the PPLNS fixture: an unparsable address is
+            // DROPPED from the distribution.
             assert!(
                 intended.len() >= 4,
                 "expected the three seeded members plus the pool output, got {intended:?}"
@@ -1684,9 +1602,7 @@ mod declared_block_booking_regtest {
                 .expect("member in the distribution")
         }
 
-        /// Group-Solo keeps NO ledger — that is the invariant, not an accident.
-        /// Asserted in every test so a future change that starts writing
-        /// balances has to come past it.
+        /// Group-Solo keeps NO ledger; asserted in every Group-Solo test.
         async fn assert_no_ledger_rows(&self) {
             for m in &self.members {
                 let balances: i64 =
@@ -1785,10 +1701,8 @@ mod declared_block_booking_regtest {
             );
         }
 
-        // The pool's own output is paid ON-CHAIN but books no history row —
-        // that is what makes 3 the right count and not 4. Asserted from both
-        // sides so a booking that started crediting the fee address, or one
-        // that stopped paying it, is caught here rather than by the bare count.
+        // The pool's own output is paid ON-CHAIN but books no history row,
+        // which is why 3 is the right count. Asserted from both sides.
         let fee_script = bp_mining_job::address_to_script(Network::Regtest, &c.fee_addr)
             .expect("fee address must be payable");
         assert!(
@@ -1807,30 +1721,14 @@ mod declared_block_booking_regtest {
         c.teardown().await;
     }
 
-    /// Replay safety — and it is NOT the guard it looks like.
+    /// Replay safety: a second apply never adds, removes or moves a booked row.
     ///
-    /// PPLNS proves this with an absolute balance write: a second apply would
-    /// move a number, so an unchanged balance is evidence. Group-Solo writes no
-    /// balance at all, so the assertion had to be re-invented, and doing that
-    /// honestly meant finding out what actually holds the line.
-    ///
-    /// The obvious candidate is `bulk_insert_pplns_group_block_history`'s
-    /// `ON CONFLICT ("groupId", "blockHeight", address) DO NOTHING`. **It is
-    /// not what protects this path.** Turning that clause into an upsert (tried,
-    /// 2026-08-10) leaves this test passing, because the replay never reaches
-    /// the insert.
-    ///
-    /// What stops it is the SNAPSHOT LIFECYCLE: Group-Solo consumes its weight
-    /// snapshot at apply, where PPLNS explicitly does not ("The weight snapshot
-    /// is NOT consumed" — settlement there is a delta from the real coinbase
-    /// and legitimately serves every block of its distribution). So the second
-    /// attempt finds no settlement inputs and is refused with "needs an
-    /// operator reprocess" before any row is written.
-    ///
-    /// This test therefore guards the OUTCOME — a replay never moves a booked
-    /// row — and not one named mechanism. It carries a genuinely different
-    /// coinbase so that an overwrite would be visible if one ever happened; two
-    /// independent things would have to break at once for it to stay silent.
+    /// What stops the replay is the SNAPSHOT LIFECYCLE, not the
+    /// `ON CONFLICT ... DO NOTHING` on the history insert: Group-Solo consumes
+    /// its weight snapshot at apply (PPLNS does not), so the second attempt
+    /// finds no settlement inputs and is refused before any row is written.
+    /// The test pins the OUTCOME rather than one mechanism, and carries a
+    /// genuinely different coinbase so an overwrite would be visible.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_second_apply_of_the_same_group_block_cannot_overwrite_it() {
         let Some(c) = GroupChain::setup(DB_GROUP_NO_OVERWRITE).await else {
@@ -1848,8 +1746,7 @@ mod declared_block_booking_regtest {
         assert_eq!(first.len(), 3, "precondition: the first apply booked");
 
         // A second coinbase for the same block, shifted the OTHER way, so a
-        // missing replay guard shows up as moved amounts and not merely as
-        // extra rows.
+        // missing replay guard shows up as moved amounts, not just extra rows.
         let mut divergent = c.actual.clone();
         let m1 = c.members[1].clone();
         let m2 = c.members[2].clone();
@@ -1879,9 +1776,8 @@ mod declared_block_booking_regtest {
     }
 
     /// Without a parsed coinbase there is nothing to settle against, and the
-    /// booking must REFUSE rather than fall back to what the pool intended —
-    /// the same rule as PPLNS, on the mode that keeps no ledger to correct it
-    /// later.
+    /// booking must REFUSE rather than fall back to what the pool intended.
+    /// Same rule as PPLNS, on the mode that keeps no ledger to correct it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_group_block_without_a_parsed_coinbase_is_refused_not_booked_from_intent() {
         let Some(c) = GroupChain::setup(DB_GROUP_REFUSES_WITHOUT_COINBASE).await else {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Public join-request approval / rejection template — sent by
-//! `PplnsGroupJoinRequestService.{approveRequest,rejectRequest}`.
+//! Public join-request approval / rejection template — sent when
+//! `JoinRequestService` approves or rejects a request.
 
 use super::content::EmailContent;
 use super::helpers::{

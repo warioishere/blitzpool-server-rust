@@ -15,18 +15,15 @@
 //! server projects its own types into them at the call site
 //! (`crate::shared_adapter`).
 //!
-//! Trait-object dispatch is deliberate: each hook fires once per
-//! event (subscribe / authorize / share / block-change) — single-digit
-//! per-second on a production pool, sub-microsecond vtable cost. The
-//! production wiring is genuinely heterogeneous (DB impls, notification
-//! adapters, stat sinks), so per-trait `dyn` is the natural fit. See
-//! `feedback-design-principles`: *"dyn nur wenn echte Heterogenität
-//! nötig"*.
+//! Trait-object dispatch is deliberate: each hook fires once per event
+//! (subscribe / authorize / share / block-change), so the vtable cost is
+//! negligible, and the production wiring is genuinely heterogeneous (DB
+//! impls, notification adapters, stat sinks).
 //!
 //! [`ServerHooks::no_op`] fills every slot with a no-op ([`NoOpHooks`] for
 //! the SV1 traits, `bp_share_hook::NoOpSink` for the shared ones) so the
-//! crate is usable end-to-end without full production wiring. Tests inject recording impls to assert
-//! the fan-out triggers correctly.
+//! crate is usable end-to-end without full production wiring. Tests inject
+//! recording impls to assert the fan-out triggers correctly.
 
 use std::sync::Arc;
 
@@ -59,10 +56,7 @@ use crate::submit::ShareAccept;
 /// coinbase (= TDP template's `coinbase_tx_value_remaining`).
 ///
 /// The default impl on `NoOpHooks` returns a single 100%-to-miner
-/// entry — matches the pre-7.4d behaviour where every mode emitted
-/// solo-output coinbase regardless of port (share crediting was
-/// correct via the accept-hook fan-out, only the on-chain payout
-/// shape was wrong).
+/// entry.
 #[async_trait]
 pub trait PayoutResolver: Send + Sync {
     /// Resolve the payout list plus the fingerprint of the
@@ -71,9 +65,9 @@ pub trait PayoutResolver: Send + Sync {
 
     /// Which TDP template stream a connection with this address mines on —
     /// resolved once at `mining.authorize` and fixed for the session. The
-    /// default is `Default` (single-stream behaviour); the production resolver
-    /// overrides it to route Solo addresses to the Solo stream. Sync because
-    /// the mode lookup is an in-memory cache hit.
+    /// default is `StreamKind::Pplns` (single-stream behaviour); the
+    /// production resolver overrides it to route each mode to its own stream.
+    /// Sync because the mode lookup is an in-memory cache hit.
     fn resolve_stream(&self, _miner_address: &str) -> StreamKind {
         StreamKind::Pplns
     }
@@ -89,10 +83,9 @@ pub trait PayoutResolver: Send + Sync {
 /// The hook gets the full [`ShareAccept`] (carries the template,
 /// MiningJob, and assembled header) plus the authorized identity so the
 /// adapter can stamp `blocks_entity` rows with `address` / `worker` /
-/// `session_id`.
-/// `stream` is the template stream this job was built on — it routes the
-/// solution to the matching TDP handle (the one whose `template_id` the
-/// coinbase references). See [`bp_common::StreamKind`].
+/// `session_id`. `stream` is the template stream this job was built on — it
+/// routes the solution to the matching TDP handle (the one whose
+/// `template_id` the coinbase references). See [`bp_common::StreamKind`].
 #[async_trait]
 pub trait BlockSubmissionSink: Send + Sync {
     async fn submit_block(

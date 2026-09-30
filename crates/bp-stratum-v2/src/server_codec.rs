@@ -7,32 +7,19 @@
 //! and the typed `Input` / `OutboundFrame` shapes defined in
 //! [`crate::mining::client`] + [`crate::extensions`].
 //!
-//! ## Why a dedicated module
+//! The handlers in [`crate::mining::client`] take owned data so they can be
+//! tested without lifetimes; the `stratum_core` wire types borrow from the
+//! codec buffer (`Str0255<'decoder>`, `U256<'decoder>`, ...). This module is
+//! the boundary between the two:
 //!
-//! The pure-handler layer in [`crate::mining::client`] uses owned-data
-//! input/output structs (`Vec<u8>`, `String`, `[u8; 32]`, ...) so the
-//! handlers can be tested without lifetimes leaking through. The
-//! wire-shape types in `stratum_core::*` are lifetime-bound
-//! (`Str0255<'decoder>`, `U256<'decoder>`, `B032<'decoder>`, ...) because
-//! they borrow from the codec buffer at deserialization time. This
-//! module is the boundary that converts the borrowed wire types to
-//! owned representations on the inbound path, and builds the `*Owned`
-//! wire types from owned data on the outbound path.
-//!
-//! ## Shape
-//!
-//! - [`InboundMiningFrame`] enum wrapping every typed `Input` the
-//!   per-connection task can dispatch on. The variants mirror
-//!   [`crate::mining::client`]'s `handle_*` signatures.
-//! - [`decode_mining_inbound`] takes an `AnyMessage` borrowing the frame
-//!   payload (straight from the wire decoder) and returns an
-//!   [`InboundMiningFrame`]. Returns `Ok(None)` for messages that
-//!   aren't relevant to the mining server (e.g. JDP messages on the
-//!   wrong port) so the per-connection task can log + ignore.
-//! - [`encode_mining_outbound`] takes an
-//!   [`crate::mining::client::OutboundFrame`] and returns an
-//!   `AnyMessageOwned` ready to wrap in a `MessageFrame` for the
-//!   noise writer.
+//! - [`InboundMiningFrame`] wraps every typed `Input` the per-connection task
+//!   dispatches on, one variant per `handle_*` in [`crate::mining::client`].
+//! - [`decode_mining_inbound`] turns a borrowed `AnyMessage` into an
+//!   [`InboundMiningFrame`], or `Ok(None)` for messages the mining server
+//!   does not handle (logged and ignored).
+//! - [`encode_mining_outbound`] turns a
+//!   [`crate::mining::client::OutboundFrame`] into an `AnyMessageOwned` for
+//!   the Noise writer.
 //!
 //! The JDP sub-protocol has its own codec of the same shape,
 //! [`crate::jdp_server_codec`].
@@ -91,16 +78,12 @@ pub enum InboundMiningFrame {
 
 // ── decode_mining_inbound ───────────────────────────────────────────
 
-/// Translate one wire-shape SV2 message into an
-/// [`InboundMiningFrame`]. Caller wraps this in the per-connection
-/// task: read a frame, parse to `AnyMessage`, hand off here,
-/// dispatch the result to the
-/// matching `handle_*` in [`crate::mining::client`].
+/// Translate one wire-shape SV2 message into an [`InboundMiningFrame`] for
+/// the matching `handle_*` in [`crate::mining::client`].
 ///
 /// `Ok(None)` means "not a mining-server message" (log + ignore).
-/// `Err(...)` means the wire frame was malformed or the conversion
-/// failed; caller logs + drops the frame (the connection survives —
-/// SV2 spec is forgiving here).
+/// `Err(...)` means the frame was malformed; the caller logs and drops the
+/// frame, and the connection survives.
 pub fn decode_mining_inbound(
     msg: AnyMessage<'_>,
 ) -> Result<Option<InboundMiningFrame>, CodecError> {
@@ -243,12 +226,9 @@ fn decode_submit_shares_extended(
         ntime: m.ntime,
         version: m.version,
         extranonce: m.extranonce.as_bytes().into(),
-        // Tail TLVs (ext 0x0002 Worker-ID etc.) live in the frame
-        // payload AFTER the SubmitSharesExtended base fields. The
-        // upstream `AnyMessage` parser doesn't carry them — the IO
-        // layer extracts the TLV-tail via `parse_message_frame_with_tlvs`
-        // and attaches it post-decode (`server.rs` sets this field
-        // before passing to `handle_submit_shares_extended`).
+        // Trailing TLVs (ext 0x0002 Worker-ID etc.) are not in the
+        // `AnyMessage`; the IO layer extracts them via
+        // `parse_message_frame_with_tlvs` and fills this field.
         tlvs: Vec::new(),
     })
 }
@@ -278,10 +258,9 @@ fn decode_set_custom_mining_job(
 
 // ── encode_mining_outbound ──────────────────────────────────────────
 
-/// Translate an [`OutboundFrame`] into a wire-shape
-/// `AnyMessageOwned` ready for `MessageFrame` wrapping. The
-/// per-connection task wraps this via `MessageFrame::try_from(any_message)`
-/// and writes to the noise stream.
+/// Translate an [`OutboundFrame`] into a wire-shape `AnyMessageOwned`,
+/// which the per-connection task wraps in a `MessageFrame` for the Noise
+/// stream.
 pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessageOwned, CodecError> {
     match frame {
         OutboundFrame::SetupConnectionSuccess {
@@ -333,11 +312,9 @@ pub fn encode_mining_outbound(frame: OutboundFrame) -> Result<AnyMessageOwned, C
                 extranonce_prefix: extranonce_prefix
                     .try_into()
                     .map_err(CodecError::from_conv)?,
-                // Group this channel belongs to
-                // (SV2 Mining/Group Channel), or 0 when un-grouped. Set by
-                // the Extended-open handler's eager group assignment for
-                // non-REQUIRES_STANDARD_JOBS connections; the downstream
-                // infers membership from it.
+                // Group this channel belongs to (SV2 Mining/Group Channel),
+                // or 0 when un-grouped; the downstream infers membership
+                // from it.
                 group_channel_id,
             }),
         )),
@@ -923,10 +900,9 @@ mod tests {
         else {
             panic!("expected SetupConnectionSuccess");
         };
-        // SetupConnectionSuccess isn't part of InboundMiningFrame (it
-        // flows server→client) — confirm decode_mining_inbound returns
-        // None for it (not a server-inbound message). The message has no
-        // borrowed fields, so the owned value IS the wire-shape value.
+        // SetupConnectionSuccess flows server→client, so decoding it yields
+        // None. It has no borrowed fields, so the owned value is also the
+        // wire-shape value.
         let msg = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(s));
         assert!(decode_mining_inbound(msg).unwrap().is_none());
     }

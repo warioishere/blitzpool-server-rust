@@ -3,12 +3,9 @@
 //! Stratum V2 — Noise handshake, binary frames, Standard + Extended channels,
 //! Job-Declaration server, TDP-translator, group channels.
 //!
-//! Module-by-module per `MIGRATION_PLAN.md`. See
-//! `CHECKLIST.md` for the live status. Architecture sketch agreed
-//! 2026-05-16: single crate covers both the mining-side server and the
-//! miner-facing JDP server, with an internal cross-server bridge for
-//! routing JDP-declared jobs to the correct mining channel via
-//! `SetCustomMiningJob`.
+//! One crate covers both the mining-side server and the miner-facing JDP
+//! server, with an internal cross-server bridge that routes JDP-declared
+//! jobs to the correct mining channel via `SetCustomMiningJob`.
 //!
 //! Architecture notes:
 //!
@@ -18,19 +15,11 @@
 //!   to all subscribed channel-tasks; one global bridge consumes
 //!   `DeclaredJobEvent`s from JDP-sessions and dispatches
 //!   `SetCustomMiningJob` to the corresponding mining channel.
-//! - **Generic SV2 protocol via runtime-deps.** `stratum_core` (binary,
+//! - **Generic SV2 protocol via dependencies.** `stratum_core` (binary,
 //!   codec, framing, noise, mining-wire, parsers, JDP/TDP messages) and
 //!   `stratum_apps` (Noise-wrapped tokio TcpStream, task manager, key
-//!   utils) are git+rev-pinned runtime-deps per the 2026-05-16 strategy
-//!   decision. Eigen-Code only for pool-side state machine + Blitzpool
-//!   behaviour.
-//! - **Functional reactions** (frame shape, vendor quirks, retire-not-clear
-//!   job lifecycle from sv2-ui#143, jobIdToDifficulty for
-//!   SV2 Mining/SubmitShares.Error, stored-merkle-root to avoid mutation
-//!   bugs,
-//!   dust-suppression in JDP ext 0x0003) are implemented as specified.
-//!   Internal performance improvements are allowed where they don't change
-//!   observable behaviour.
+//!   utils) provide the protocol; this crate holds only the pool-side state
+//!   machine and pool behaviour.
 //! - **Hooks for I/O.** All side-effects (DB upserts, Redis writes,
 //!   notifications, block-submit) flow through `ServerHooks` so that
 //!   `bin/blitzpool` can wire production adapters and tests can use

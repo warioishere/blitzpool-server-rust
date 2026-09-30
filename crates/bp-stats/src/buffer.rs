@@ -2,7 +2,7 @@
 
 //! Generic "hot-path writes, periodic bulk-flush" primitives.
 //!
-//! Three buffer flavours, each with the same conceptual API:
+//! Every buffer flavour has the same conceptual API:
 //!
 //! ```text
 //! buf.add*  /  buf.set  — hot path, synchronous, non-throwing
@@ -35,10 +35,6 @@ use std::hash::Hash;
 /// hot-path increment, `sub_assign_clamped` is the confirm-time
 /// subtraction that clamps each field at zero so under-flow from
 /// concurrent residuals can't surface as negative numbers.
-///
-/// All consumers of `RecordDeltaBuffer` derive this trait with a small
-/// hand-written impl — there is no proc-macro because the shapes are
-/// few and tailored.
 pub trait BufferRecord: Default + Clone {
     /// True iff every field is zero (or negative). Used to skip empty
     /// buckets in `drain` snapshots.
@@ -319,8 +315,7 @@ where
         self.map.entry(key).or_default().add_assign(delta);
     }
 
-    /// Snapshot every non-zero bucket. Cloning by value (`R: Clone` is
-    /// implied via `BufferRecord: Default + Clone`).
+    /// Snapshot every non-zero bucket. Does **not** clear the buffer.
     pub fn drain(&self) -> HashMap<K, R> {
         let mut out = HashMap::with_capacity(self.map.len());
         for (k, r) in &self.map {

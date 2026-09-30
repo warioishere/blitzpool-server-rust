@@ -29,11 +29,10 @@ pub fn key(group_id: &str, finder_address: &str) -> String {
 /// round that has moved since.
 ///
 /// Deliberately NOT under the `…:snapshot:` prefix. These keys belong to
-/// individual live jobs, and every group-wide wipe ([`delete_all_for_group`],
-/// the round-reset cron, a kick) would otherwise strip the distribution out
-/// from under jobs that are still being mined — a block found on one of those
-/// afterwards could not be booked at all. They are consumed one at a time by
-/// the apply and otherwise bounded by their TTL.
+/// individual live jobs, and a group-wide wipe ([`delete_all_for_group`],
+/// the round-reset cron, a kick) must not strip the distribution from jobs
+/// still being mined, or a block found on one could not be booked. They are
+/// consumed one at a time by the apply and otherwise bounded by their TTL.
 pub fn key_for_fingerprint(group_id: &str, payouts_fingerprint: &[u8; 32]) -> String {
     format!(
         "groupsolo:{group_id}:jobsnapshot:{}",
@@ -55,7 +54,7 @@ pub fn key_match_everything(group_id: &str) -> String {
     format!("groupsolo:{group_id}:*snapshot*")
 }
 
-/// Persist a schema-2 WEIGHT snapshot under the (group, finder) key.
+/// Persist a WEIGHT snapshot under the (group, finder) key.
 pub async fn write_weight_snapshot(
     conn: &mut ConnectionManager,
     group_id: &str,
@@ -72,7 +71,7 @@ pub async fn write_weight_snapshot(
     .await
 }
 
-/// Load the schema-2 WEIGHT snapshot for one weights fingerprint.
+/// Load the WEIGHT snapshot for one weights fingerprint.
 pub async fn read_weight_snapshot_for(
     conn: &mut ConnectionManager,
     group_id: &str,
@@ -85,7 +84,7 @@ pub async fn read_weight_snapshot_for(
     .await
 }
 
-/// Load the schema-2 WEIGHT snapshot from the (group, finder) key.
+/// Load the WEIGHT snapshot from the (group, finder) key.
 pub async fn read_weight_snapshot(
     conn: &mut ConnectionManager,
     group_id: &str,
@@ -94,8 +93,7 @@ pub async fn read_weight_snapshot(
     bp_coinbase_snapshot::snapshot::read_weight_snapshot(conn, &key(group_id, finder_address)).await
 }
 
-/// Delete one (group, finder) snapshot. Called by `on_block_found`
-/// after the apply-distribution TX commits.
+/// Delete one (group, finder) snapshot.
 pub async fn delete_snapshot(
     conn: &mut ConnectionManager,
     group_id: &str,

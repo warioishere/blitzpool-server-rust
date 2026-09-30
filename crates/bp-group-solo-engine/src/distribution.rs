@@ -13,11 +13,9 @@
 //!
 //! Concurrent callers for the same `(group_id, block_reward_sats,
 //! finder_address)` triple share one compute via the in-flight cache
-//! (30s TTL by default).
-//! Different finders within the same group still compute
-//! independently because every miner's session calls
-//! `build_distribution` with their own address as the prospective
-//! finder.
+//! (30s TTL by default). Different finders within the same group
+//! compute independently, since every miner's session builds with its
+//! own address as the prospective finder.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -78,7 +76,7 @@ pub struct DistributionResult {
     /// [`WeightDistribution::payout_entries_at`] at the caller's
     /// revenue.
     pub distribution: WeightDistribution,
-    /// Did the schema-2 snapshot under the fingerprint actually get
+    /// Did the weight snapshot under the fingerprint actually get
     /// written (after retries)? `false` → the distribution still
     /// becomes a coinbase, but a block found on it cannot be booked
     /// automatically — never promise a booking on `false`.
@@ -193,9 +191,9 @@ async fn compute_distribution(
     block_reward_sats: u64,
     finder_address: &AddressId,
 ) -> Result<DistributionResult, DistributionError> {
-    // 1. Per-group config: the finder bonus lives in the DB row, as a
-    //    FRACTION of the miner cut (ppm) rather than a sats amount —
-    //    a proportion is what §4 can pay exactly at any revenue.
+    // 1. Per-group config: the finder bonus lives in the DB row as a
+    //    FRACTION of the miner cut (ppm), because a proportion is what §4
+    //    can pay exactly at any revenue.
     let group_row = find_group(pool, group_id)
         .await?
         .ok_or(DistributionError::GroupNotFound { group_id })?;
@@ -203,7 +201,7 @@ async fn compute_distribution(
 
     // 2. Round state from Redis. Mode-aware: a PROP group reads its per-round
     //    aggregate; a Window group trims to the sliding window first, so the
-    //    built distribution is always fenster-current (even for an idle group).
+    //    built distribution is always current (even for an idle group).
     let (mode, window_ms) = crate::engine::group_mode_from_row(&group_row);
     let now_ms = chrono::Utc::now().timestamp_millis();
     let round_raw = round
@@ -215,10 +213,9 @@ async fn compute_distribution(
     );
 
     // 3-5. No ledger to read: Group-Solo carries no balances (see the
-    //      crate docs), so the empty map is what the shared builder
-    //      expects from a mode that promises nothing across blocks.
-    //      Sanitize, project onto weights and persist the snapshot are
-    //      the one path both payout engines share.
+    //      crate docs), so the balance map is empty. Sanitize, project
+    //      onto weights and persist the snapshot is the path both payout
+    //      engines share.
     let fee_address = config
         .fee_address
         .as_ref()
@@ -235,23 +232,17 @@ async fn compute_distribution(
             coinbase_weight_budget: config.coinbase_weight_budget,
             finder_bonus_ppm,
             finder_address: Some(finder_address),
-            // The prospective finder claims the block if the round turns
-            // out to be empty. Every caller of `build_distribution`
-            // already supplies them (the job path and the JDP tailored
-            // push both build per-finder), and the in-flight cache is
-            // keyed per-finder too, so a bootstrap distribution can never
-            // be served to a different member.
-            //
-            // This is the mode where the empty round is ROUTINE rather
-            // than exotic: `reset_for_block_found` / `reset_full` /
-            // `manual_reset` all DEL the round's by-address hash, and
-            // `read_by_address` has no bucket fallback to soften it.
+            // The prospective finder claims the block if the round is
+            // empty, which is routine here since every reset path DELs
+            // the by-address hash. Builds and the in-flight cache are
+            // per-finder, so a bootstrap distribution is never served to
+            // a different member.
             bootstrap_claimant: Some(finder_address),
             reference_revenue_sats: block_reward_sats,
             // Group-Solo: a member the coinbase cannot pay forfeits this
-            // block and their share falls to the pool output. Nobody is
-            // overpaid, so nothing has to be remembered until the next
-            // block — which is what lets this mode run without a ledger.
+            // block and their share falls to the pool output. Nothing has
+            // to be remembered until the next block, which is what lets
+            // this mode run without a ledger.
             withheld_value: WithheldValue::ToPool,
             scope: "group-solo",
         },

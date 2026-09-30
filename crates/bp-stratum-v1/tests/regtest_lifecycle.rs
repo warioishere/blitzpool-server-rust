@@ -64,10 +64,9 @@ async fn sv1_server_end_to_end_against_regtest() {
     //
     // `tokio::sync::broadcast` does not replay messages sent before
     // any receiver existed. Subscribe BEFORE mining the template-forcing
-    // block, otherwise the `TemplateUpdate` can be dropped on the floor
-    // before our `subscribe()` call wires a receiver, leaving the server
-    // with no template and the test hanging until timeout. Mirror the
-    // ordering used in `bp-mining-job/tests/regtest_e2e.rs`.
+    // block, otherwise the `TemplateUpdate` can be dropped before the
+    // `subscribe()` call wires a receiver, leaving the server with no
+    // template and the test hanging until timeout.
     //
     // Low fee threshold + 1s interval makes regtest's empty mempool emit
     // a fresh NewTemplate roughly every block change.
@@ -125,16 +124,16 @@ async fn sv1_server_end_to_end_against_regtest() {
 
     // Deliberately-trivial port: initial_difficulty = 1e-18 → vardiff
     // target saturates to all-FFs in `bp_share::difficulty_to_target`, so
-    // any submission hash trivially meets it. Lets us submit a fixed
-    // nonce and assert acceptance without brute-forcing.
+    // any submission hash trivially meets it: a fixed nonce is accepted
+    // without brute-forcing.
     let port_config = PortConfig {
         target_shares_per_minute: 6.0,
         ..PortConfig::new(addr.port(), 1.0e-18)
     };
 
     // Accept exactly one connection then return. The SV1 server's
-    // accept_connection consumes the socket; we discard the resulting
-    // JoinHandle (the cancel token attached to the server cleans it up
+    // accept_connection consumes the socket; the resulting JoinHandle is
+    // discarded (the cancel token attached to the server cleans it up
     // on shutdown).
     let server_clone = server.clone();
     let port_config_clone = port_config.clone();
@@ -168,10 +167,10 @@ async fn sv1_server_end_to_end_against_regtest() {
     let extranonce1_hex = result[1].as_str().expect("extranonce1 hex").to_string();
     assert_eq!(result[2].as_u64(), Some(8), "extranonce2_size must be 8");
 
-    // Step 2: authorize. Since we connected AFTER mining-1, the server
-    // already has a template; this authorize MAY also produce an
-    // immediate fresh notify per the "send fresh notify after authorize
-    // if stratum is initialized" path. We read frames opportunistically.
+    // Step 2: authorize. The miner connected after the template-forcing
+    // block, so the server already has a template and this authorize MAY
+    // also produce an immediate fresh notify; frames are read
+    // opportunistically.
     write
         .write_all(
             format!(
@@ -182,8 +181,8 @@ async fn sv1_server_end_to_end_against_regtest() {
         .await
         .expect("write authorize");
 
-    // Step 3: drain frames until we have both the authorize response AND
-    // a mining.notify in hand. The order isn't fixed: the server may
+    // Step 3: drain frames until both the authorize response AND a
+    // mining.notify are in hand. The order isn't fixed: the server may
     // emit set_difficulty + mining.notify (init-flush after subscribe)
     // BEFORE the authorize response. Budget 5 s.
     let mut notify_frame: Option<Value> = None;
@@ -238,8 +237,8 @@ async fn sv1_server_end_to_end_against_regtest() {
         .await
         .expect("write submit");
 
-    // Step 5: read frames until we see the submit response (id=3) OR a
-    // mining.notify that interleaves. Budget 5 s.
+    // Step 5: read frames until the submit response (id=3) arrives,
+    // skipping any interleaved frames. Budget 5 s.
     let mut submit_resp: Option<Value> = None;
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

@@ -98,9 +98,8 @@ async fn flush_once_drains_all_seven_tables_to_pg() {
     let prefix = "test_flush_e2e_";
     cleanup(&pool, slot.as_millis(), prefix).await;
 
-    // Seed an address_settings row for the address — `address_settings`
-    // bulk-update only touches existing rows (silent no-op for missing
-    // ones), and we want to assert the increment landed.
+    // Seed an address_settings row so the assertion below sees an
+    // increment on an existing total, not a fresh insert.
     sqlx::query(
         r#"INSERT INTO address_settings_entity (address, shares, "bestDifficulty")
            VALUES ($1, $2, 0)"#,

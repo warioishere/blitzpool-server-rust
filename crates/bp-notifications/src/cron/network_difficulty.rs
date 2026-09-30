@@ -2,9 +2,9 @@
 
 //! Mempool-space network-difficulty poller.
 //!
-//! Every 10 min we hit `https://mempool.space/api/v1/mining/hashrate/3d`,
-//! compare the `currentDifficulty` field to the persisted singleton row,
-//! and on a relative change exceeding 0.01% persist + emit a
+//! Every 10 min it polls `https://mempool.space/api/v1/mining/hashrate/3d`,
+//! compares the `currentDifficulty` field to the persisted singleton row,
+//! and on a relative change exceeding 0.01% persists it and emits a
 //! network-difficulty push to all FCM and UnifiedPush subscribers.
 
 use std::sync::Arc;
@@ -50,10 +50,9 @@ impl Default for NetworkDifficultyCronConfig {
 }
 
 /// Spawn the cron loop. Returns a shutdown handle (drop or send `true`
-/// to stop the loop after the next tick). The cron is gated on at
-/// least one of `fcm` or `web_push` being present: without any push
-/// adapter we still keep the tracker row fresh so other dashboards have
-/// up-to-date data but emit no push notifications.
+/// to stop the loop after the next tick). Without any push adapter the
+/// tracker row is still kept fresh for other readers; only the pushes
+/// are skipped.
 pub fn spawn_network_difficulty_cron(
     config: NetworkDifficultyCronConfig,
     pool: PgPool,
@@ -105,8 +104,8 @@ async fn run_once(
     if let Err(e) = upsert_network_difficulty_tracker(pool, new_diff, now_ms).await {
         return Err(format!("tracker upsert: {e}"));
     }
-    // Relative change must exceed 0.01% before we fan out.
-    // On first boot (no previous value) or zero-difficulty we skip.
+    // Fan out only on a relative change above 0.01%; never without a
+    // previous value or from a zero difficulty.
     let should_fan_out = match previous {
         Some(prev) if prev != 0.0 => (new_diff - prev).abs() / prev > DIFF_CHANGE_THRESHOLD,
         _ => false,

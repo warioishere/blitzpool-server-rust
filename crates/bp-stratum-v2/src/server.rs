@@ -1,81 +1,35 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Mining-port server: handle + translator task + per-connection task
-//! topology.
+//! Mining-port server: clone-able handle, translator tasks and one task per
+//! connection, in the shape of `bp_stratum_v1::server`.
 //!
-//! Mirrors `bp_stratum_v1::server`'s shape (clone-able handle wrapping
-//! an `Arc<Inner>`, translator-task fanning TDP updates to per-connection
-//! `broadcast::Receiver<TemplateBroadcast>`s, per-connection task driven
-//! by `tokio::select!` over four sources). What's different:
+//! - A translator task drives a [`bp_template_distribution::TemplateAssembler`]
+//!   off the TDP updates and re-broadcasts `TemplateBroadcast` to the
+//!   connections, keeping a current-template snapshot so a fresh connection
+//!   boots without waiting for the next update.
+//! - Each connection runs the Noise-XK handshake
+//!   ([`crate::noise::accept_pool_noise`]), then a `tokio::select!` loop over
+//!   cancel, socket reads, template broadcasts and the vardiff tick. Every arm
+//!   calls the pure handlers in [`crate::mining::client`] and writes the
+//!   outcome's frames via [`crate::server_codec::encode_mining_outbound`];
+//!   session events fan out to [`crate::hooks::MiningServerHooks`].
+//! - `SetCustomMiningJob` is checked against the JDP bridge
+//!   (`JdpDeclaredJobRegistry`).
+//! - The extranonce allocator is shared by every port (see
+//!   [`crate::extranonce`]).
 //!
-//! - **Noise wrap**: every accepted [`TcpStream`] passes through
-//!   [`crate::noise::accept_pool_noise`] before the protocol-level
-//!   handler runs. The per-connection task owns the resulting
-//!   [`crate::noise::NoiseTcpStream`].
-//! - **Pure-handler dispatch**: the SV2 handler layer lives in
-//!   [`crate::mining::client`] (`handle_*` + `apply_*` functions); this
-//!   module's per-connection task drives them.
-//! - **Async payout-resolver**: the template-broadcast arm calls
-//!   [`crate::hooks::PayoutResolver::resolve_payouts`] to produce a
-//!   `Vec<PayoutEntry>` per template, then builds a `MiningJob` via
-//!   [`bp_mining_job::build_mining_job_from_tdp`], then calls
-//!   [`crate::mining::client::apply_template_broadcast`].
-//! - **Bridge access**: the per-connection task carries an
-//!   `Arc<RwLock<JdpDeclaredJobRegistry>>` and consults it on
-//!   `SetCustomMiningJob` (Item E) for the security cross-check.
+//! ## Per-job template pinning
 //!
-//! ## What's wired
+//! Standard and Extended share validation use the template the miner hashed
+//! against, pinned on the job record at send-time (`StandardJobEntry`'s
+//! `template_snapshot`, `ExtendedJob`'s `n_bits`), so a block change between
+//! job-send and share-submit cannot reclassify an in-flight share.
 //!
-//! - [`StratumV2MiningServer`] public handle with `spawn` /
-//!   `accept_connection` / `shutdown` / `current_template` (mirrors SV1).
-//! - Translator task: consumes
-//!   [`bp_template_distribution::TemplateUpdate`] via the
-//!   `broadcast::Receiver` returned by `TdpHandle::subscribe()`, drives
-//!   a [`bp_template_distribution::TemplateAssembler`], re-broadcasts
-//!   `TemplateBroadcast` to per-connection tasks. Maintains
-//!   `Arc<Mutex<Option<Arc<ActiveTemplate>>>>` snapshot so freshly-accepted
-//!   connections can boot from the current state without waiting for
-//!   the next TDP update.
-//! - Per-connection-task: Noise-XK handshake on accept, then a
-//!   `tokio::select!` loop over `{cancel, noise-read,
-//!   template-broadcast, vardiff-tick}`. Each arm calls into
-//!   [`crate::mining::client`]'s pure handlers, then serialises the
-//!   outcome's outbound frames via [`crate::server_codec::encode_mining_outbound`]
-//!   and writes them through the Noise stream. Inbound frames flow
-//!   `read_frame → parse_message_frame_with_tlvs → decode_mining_inbound
-//!   → dispatch_inbound_frame → handle_*`.
-//! - Hook fan-out for [`crate::mining::client::SessionEvent`] →
-//!   [`crate::hooks::MiningServerHooks`] (block-submit / accepted /
-//!   rejected / session-register / session-deregister).
-//! - The SV2 extranonce allocator, one instance shared by every port
-//!   (see [`crate::extranonce`]), feeds `OpenStandardMiningChannel` /
-//!   `OpenExtendedMiningChannel` handler calls; `CloseChannel` releases back.
-//! - Bridge cross-check on `SetCustomMiningJob`: `bridge.lookup(token)`'s
-//!   `miner_address` (cloned alone, not the whole entry) is passed to the
-//!   handler as `Option<&AddressId>`.
+//! "Strict" in this crate is the pool's rule, not a spec mandate:
+//! SV2 Mining/SubmitShares.Error acknowledges the race but does not say which
+//! template a share is judged against.
 //!
-//! ## Per-job template pinning (SV2 Mining/SubmitShares.Error strict — implemented)
-//!
-//! Both Standard and Extended share validation use the template the miner
-//! actually hashed against, pinned on the job record at send-time — the
-//! `StandardJobEntry`'s `template_snapshot` and the `ExtendedJob`'s
-//! `n_bits` respectively. Neither consults the current template,
-//! so a block-change between job-send and share-submit can't reclassify an
-//! in-flight share's block-candidacy.
-//!
-//! **"strict" throughout this crate means our reading, not a spec mandate.**
-//! SV2 Mining/SubmitShares.Error is where the spec acknowledges the race —
-//! "this delayed validation can occur when a miner gets faster updates about a
-//! new prevhash than the server does" — but it defines an error message, not a
-//! pinning rule; nothing there says which template a share is judged against.
-//! The citations on the pinning code point at that acknowledgement, and the
-//! rule built on it is the pool's.
-//!
-//! ## Tests
-//!
-//! Real-TCP/Noise-handshake e2e tests live in `tests/regtest_*.rs`. Unit
-//! tests in this module exercise `dispatch_inbound_frame` with synthetic
-//! `InboundMiningFrame` inputs.
+//! E2E tests over real TCP/Noise live in `tests/regtest_*.rs`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -197,18 +151,14 @@ struct Inner {
     // StreamKind — a connection switches onto one when its OpenChannel address
     // resolves to that mode. Each fed by its own translator off its TDP handle.
     alt_streams: HashMap<StreamKind, AltStream>,
-    // POOL-WIDE extranonce-prefix allocator: the binary builds one and hands
-    // it to every port's server. It MUST be shared, not per-connection or
-    // per-port: Standard channels can't roll their own extranonce, so two
-    // miners on the same coinbase handed the same prefix mine byte-identical
-    // work. A separate allocator restarts at the same base prefix, which
-    // guarantees that collision — and two PPLNS ports hash one coinbase.
+    // POOL-WIDE extranonce-prefix allocator, shared by every port. Standard
+    // channels cannot roll their own extranonce, and ports share a coinbase,
+    // so a second allocator would hand out the same prefixes and two miners
+    // would mine byte-identical work.
     extranonce: SharedExtranonceAllocator,
-    // Pool-wide memoization of built MiningJobs — the binary creates
-    // ONE cache and passes it into every per-port SV2 server (and the
-    // SV1 servers): one PPLNS coinbase build per (template, payout
-    // set, slot size) for the whole pool instead of one per channel
-    // per broadcast.
+    // Pool-wide cache of built MiningJobs, shared with every SV2 and SV1
+    // server: one coinbase build per (template, payout set, slot size) for
+    // the whole pool rather than per channel per broadcast.
     job_cache: Arc<MiningJobCache>,
     cancel: CancellationToken,
     translator_join: Mutex<Option<JoinHandle<()>>>,
@@ -234,15 +184,12 @@ struct AltStreamHandle {
 
 impl StratumV2MiningServer {
     /// Spawn the mining server. `updates_rx` is typically
-    /// `tdp_handle.subscribe()`. `initial_snapshot` is
-    /// `tdp_handle.current_snapshot()` taken alongside the subscribe —
-    /// the translator applies it to its assembler before entering the
-    /// main loop so the very first OpenChannel sees a non-empty
-    /// current_template even when the bitcoin-core bootstrap pair was
-    /// broadcast before this subscriber existed (subscribe-after-send
-    /// race; cross-ref `feedback-tdp-initial-template-drain`). Returns
-    /// immediately — the translator runs on a tokio task tied to the
-    /// shared cancel token.
+    /// `tdp_handle.subscribe()`; `initial_snapshot` is
+    /// `tdp_handle.current_snapshot()` taken alongside it. The translator
+    /// applies the snapshot first, so the first OpenChannel sees a template
+    /// even when the bootstrap pair was broadcast before this subscriber
+    /// existed. Returns immediately; the translators run on tasks tied to
+    /// the shared cancel token.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         server_config: ServerConfig,
@@ -462,10 +409,9 @@ impl StratumV2MiningServer {
 /// `current_template` so freshly-accepted connections boot from the
 /// most recent state without waiting for the next TDP message.
 ///
-/// Exits on `cancel` OR when `updates_rx` closes (upstream `TdpHandle`
-/// dropped). Mirrors `bp_stratum_v1::server::run_translator`'s shape;
-/// only the assembler type differs (SV2 vs SV1 — both consume the
-/// same `TemplateUpdate` enum).
+/// Exits on `cancel` or when `updates_rx` closes (upstream `TdpHandle`
+/// dropped). Same shape as `bp_stratum_v1::server::run_translator`; only
+/// the assembler type differs.
 async fn run_translator(
     mut updates_rx: broadcast::Receiver<TemplateUpdate>,
     initial_snapshot: bp_template_distribution::TemplateSnapshot,
@@ -476,10 +422,9 @@ async fn run_translator(
 ) {
     let mut assembler = TemplateAssembler::<ActiveTemplate>::new();
 
-    // Bootstrap the assembler from the TdpHandle snapshot — same race
-    // as SV1: the bitcoin-core startup pair is broadcast by bridge_out
-    // BEFORE this per-server subscriber installs. The handle's internal
-    // tap captures the pair into the snapshot so we can replay it here.
+    // Bootstrap from the TdpHandle snapshot: the startup template pair can
+    // be broadcast before this subscriber exists, and the snapshot holds it
+    // for replay.
     if let Some((active, change)) = assembler.bootstrap_from_snapshot(initial_snapshot) {
         // Wrap once; the snapshot store and every broadcast subscriber
         // then share this allocation via Arc refcounting.
@@ -523,11 +468,9 @@ async fn run_translator(
                                 .expect("current_template mutex poisoned");
                             *guard = Some(active.clone());
                         }
-                        // Job-cache aging heartbeat: prune piggybacks
-                        // on lookups too, but the translator fires even
-                        // when NO channel is open — without this, the
-                        // last window's entries would sit in RAM until
-                        // the next lookup.
+                        // Job-cache aging heartbeat: lookups prune too, but
+                        // this also runs when no channel is open, so old
+                        // entries do not wait for the next lookup.
                         job_cache.prune_expired();
                         // Broadcast::send errors only when there are no
                         // subscribers — freshly-accepted connections
@@ -564,9 +507,8 @@ async fn run_mining_connection(
 ) -> std::io::Result<()> {
     let session_id_hex = format!("{session_id:08x}");
 
-    // Noise-XK handshake. On failure log + return; the IO-layer
-    // accept loop already increments its per-IP failure counter
-    // (fail-ban lives there).
+    // Noise-XK handshake. On failure log and return; the accept loop keeps
+    // the per-IP failure counter.
     let noise = match accept_pool_noise(socket, &noise_config).await {
         Ok(n) => n,
         Err(err) => {
@@ -589,17 +531,13 @@ async fn run_mining_connection(
     // `alt_streams` holds one receiver+snapshot per fixed-reservation stream;
     // at OpenChannel the connection `remove`s the entry for its resolved mode
     // (if any) and swaps `template_rx`/`current_template` onto it.
-    // Extranonce-prefix allocation uses the POOL-WIDE shared allocator
-    // (`extranonce`, passed in) — NOT a per-connection one. Standard
-    // channels can't roll their own extranonce, so two miners on the same
-    // coinbase must never receive the same prefix; only a shared allocator
-    // guarantees that. Locked briefly per channel open/close in
-    // `dispatch_inbound_frame` (never per-share).
+    // `extranonce` is the pool-wide shared allocator, locked only per channel
+    // open/close in `dispatch_inbound_frame`, never per share.
 
     let mut vardiff_tick = tokio::time::interval(Duration::from_millis(state.vardiff_interval_ms));
     vardiff_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Skip the first immediate tick — match the SV1 cadence (one full
-    // interval before the first check).
+    // Skip the first immediate tick: one full interval before the first
+    // check, as on SV1.
     vardiff_tick.tick().await;
 
     loop {
@@ -623,10 +561,10 @@ async fn run_mining_connection(
                 let payload_len = sv2_frame.payload().len();
                 let header_msg_type = header.msg_type();
                 // ext 0x0003/Negotiation: a 0x0003 reference from a session
-                // that never negotiated the extension MUST be rejected — so
-                // the TLV has to be SEEN, not silently filtered away with the
-                // rest of the un-negotiated tail. Widen the filter for the one
-                // message that carries it; the handler enforces the gate.
+                // that never negotiated the extension MUST be rejected, so the
+                // TLV has to be parsed rather than filtered out. Widen the
+                // filter for the one message that carries it; the handler
+                // enforces the gate.
                 let mut tlv_extensions = state.negotiated_extensions.clone();
                 if header_msg_type == MESSAGE_TYPE_SET_CUSTOM_MINING_JOB
                     && !tlv_extensions.contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
@@ -662,11 +600,9 @@ async fn run_mining_connection(
                         continue;
                     }
                 };
-                // ext 0x0002 Worker-ID TLV wiring: a SubmitSharesExtended
-                // carries its parsed TLVs into the validator, which resolves
-                // the worker name from them. When ext 0x0002 isn't in
-                // `state.negotiated_extensions`, the validator ignores any
-                // TLV (ext 0x0002/Behavior Based on Negotiation).
+                // ext 0x0002 Worker-ID: the validator resolves the worker
+                // name from these TLVs, and ignores them when ext 0x0002 is
+                // not negotiated (ext 0x0002/Behavior Based on Negotiation).
                 if let InboundMiningFrame::SubmitSharesExtended(ref mut submit) = inbound {
                     submit.tlvs = tlvs.take().unwrap_or_default();
                 }
@@ -678,25 +614,18 @@ async fn run_mining_connection(
                     custom.distribution_id = tlvs
                         .as_deref()
                         .and_then(crate::extensions::parse_distribution_id_tlv);
-                    // Re-ask the mode gate whose money this connection's
-                    // blocks pay, for THIS frame. The template stream cannot
-                    // be re-resolved (it names the `template_rx` being read
-                    // and the submit handle), but the accounting can and must
-                    // be: `cache_sync` flips a live solo miner to group-solo
-                    // when it joins a group, without a reconnect, and from
-                    // that moment the plan the JDP side publishes is a
-                    // Group-Solo one. Judged against the OpenChannel value the
-                    // pool would refuse its own correct plan — fatal for an
-                    // SRI jd-client. In-memory gate lookup; a custom job
-                    // arrives once per template, not per share.
+                    // Re-resolve the accounting for THIS frame: a live solo
+                    // miner that joins a group flips to Group-Solo without a
+                    // reconnect, and the JDP side then publishes a Group-Solo
+                    // plan. The template stream stays as routed at
+                    // OpenChannel. Cheap: in-memory lookup, once per template.
                     if let Some(address) = state.address.clone() {
                         state.accounting_stream =
                             hooks.payout_resolver.resolve_stream(&address);
                     }
                 }
-                // Per-share SubmitSharesExtended trace, gated by
-                // share_logs — would flood at production hashrate
-                // without the gate.
+                // Per-share trace, gated by `share_logs`: it would flood at
+                // production hashrate.
                 if server_config.share_logs {
                     if let InboundMiningFrame::SubmitSharesExtended(ref submit) = inbound {
                         let mut ext_hex = String::with_capacity(submit.extranonce.len() * 2);
@@ -759,24 +688,19 @@ async fn run_mining_connection(
                     } => Some((*channel_id, *kind)),
                     _ => None,
                 });
-                // One-time stream routing at OpenChannel: resolve the locked
-                // address's mode → stream. A non-PPLNS connection swaps onto its
-                // fixed-reservation template stream BEFORE the initial job is built
-                // below, so its first job rides the right template. `state.stream`
-                // is set ONLY when the swap succeeds, so the submit handle (driven
-                // by `state.stream`) can never route to a stream whose template_id
-                // the job doesn't carry.
+                // One-time stream routing at OpenChannel. A non-PPLNS
+                // connection swaps onto its fixed-reservation template stream
+                // BEFORE the initial job is built, so its first job rides the
+                // right template. `state.stream` is set ONLY when the swap
+                // succeeds, so the submit handle never routes to a stream whose
+                // template_id the job does not carry.
                 if newly_opened_channel.is_some() {
                     if let Some(addr) = state.address.as_ref() {
-                        // Publish the address's mode into the mode-gate
-                        // BEFORE the stream routing below. resolve_stream
-                        // reads the gate, so the publish MUST precede it —
-                        // otherwise the lookup misses and the connection
-                        // defaults to the Solo stream regardless of port /
-                        // group membership. (register_session was removed
-                        // from the ChannelOpened event handler to avoid a
-                        // double gate refcount; device-status still fires
-                        // there.)
+                        // Publish the address's mode into the mode gate
+                        // BEFORE the routing below: `resolve_stream` reads the
+                        // gate, and a miss defaults to the Solo stream. This
+                        // is the only `register_session` call per channel, so
+                        // the gate refcount is taken once.
                         let address = addr.clone();
                         let worker = state.worker_name.clone();
                         hooks
@@ -790,14 +714,10 @@ async fn run_mining_connection(
                             .await;
                         if state.stream.is_pplns() {
                             let resolved = hooks.payout_resolver.resolve_stream(&address);
-                            // The accounting follows the mode whether or not
-                            // the template swap below succeeds. It does not
-                            // always: an alt stream that is not wired leaves
-                            // the connection on the PPLNS template, and a
-                            // Group-Solo miner parked there is still
-                            // Group-Solo — reading the template stream for
-                            // accounting would let it reference the pool-wide
-                            // (PPLNS) distribution.
+                            // The accounting follows the mode even when the
+                            // swap below fails: a Group-Solo miner left on the
+                            // PPLNS template is still Group-Solo and must not
+                            // reference the pool-wide distribution.
                             state.accounting_stream = resolved;
                             if !resolved.is_pplns() {
                                 if let Some(alt) = alt_streams.remove(&resolved) {
@@ -816,9 +736,8 @@ async fn run_mining_connection(
                                     );
                                 }
                             } else {
-                                // PPLNS resolves to the boot stream → no swap.
-                                // Logged for symmetry with the alt-stream case
-                                // so PPLNS routing is visible too.
+                                // PPLNS is the boot stream: no swap, logged so
+                                // PPLNS routing is visible too.
                                 debug!(
                                     "sv2 connection {session_id_hex}: routed to {} template stream",
                                     resolved.as_label()
@@ -827,14 +746,10 @@ async fn run_mining_connection(
                         }
                     }
                 }
-                // Decide the customer extranonce override HERE, before the
-                // open response is written. The order is forced: the handler
-                // resolves the address, the routing above turns it into
-                // `state.stream`, and the override is Solo-only — so the
-                // earliest moment the gates can be answered is after routing,
-                // and the latest useful moment is before the OpenSuccess
-                // leaves. A miner that does not implement `SetExtranoncePrefix`
-                // reads its prefix from that frame or from nowhere.
+                // Decide the customer extranonce override after routing (it
+                // is Solo-only and needs `state.stream`) and before the open
+                // response is written: a miner without `SetExtranoncePrefix`
+                // reads its prefix only from the OpenSuccess frame.
                 if let Some((channel_id, _)) = newly_opened_channel {
                     if let Some(prefix) =
                         maybe_apply_custom_extranonce(&mut state, &hooks, channel_id)
@@ -882,14 +797,10 @@ async fn run_mining_connection(
                         "sv2 submit→ack pool-internal latency"
                     );
                 }
-                // If the dispatch opened a non-JDC mining channel, immediately
-                // follow OpenChannelSuccess with a `NewExtendedMiningJob` /
-                // `NewMiningJob` + matching `SetNewPrevHash` so the miner has
-                // both halves of a workable job from the current cached
-                // template. Without this the miner sits on "Waiting for jobs"
-                // until the next mempool refresh (which only emits the job half
-                // without a prev_hash, leaving the miner stuck — the BitAxe
-                // symptom we hit).
+                // A newly opened channel gets a job + matching `SetNewPrevHash`
+                // from the cached template right after OpenChannelSuccess.
+                // Otherwise the miner waits for the next template, and a
+                // mempool refresh carries no prev_hash.
                 if let (Some((channel_id, _kind)), Some(template)) =
                     (newly_opened_channel, current_template.clone())
                 {
@@ -929,9 +840,8 @@ async fn run_mining_connection(
                             }
                         }
                         Ok(None) => {
-                            // Address not locked yet — shouldn't happen
-                            // because OpenChannel resolved + stored the
-                            // address synchronously. Defensive log.
+                            // OpenChannel stores the address synchronously,
+                            // so this is not expected; log it.
                             warn!(
                                 "sv2 connection {session_id_hex}: no address after OpenChannel"
                             );
@@ -944,21 +854,15 @@ async fn run_mining_connection(
                         }
                     }
                 }
-                // Fire apply_vardiff_check after an accepted share — not
-                // just on the 60s timer tick.
                 let has_accepted_share = outcome.events.iter().any(|e| {
                     matches!(e, SessionEvent::ShareAccepted { .. })
                 });
                 let fanout_start = std::time::Instant::now();
                 apply_session_events(outcome.events, &session_id_hex, &state, &hooks).await;
                 let fanout_us = fanout_start.elapsed().as_micros();
-                // Inline vardiff after an accepted share: up-adjusts an active
-                // miner promptly instead of waiting for the next timer tick.
-                // Same shared path as the timer arm — see run_vardiff_check.
-                // Gated exactly like SV1's inline check: an accepted share
-                // may bring the retarget forward, but not more often than
-                // the configured interval. Ungated this swept every channel
-                // on the connection per share.
+                // Inline vardiff after an accepted share up-adjusts an active
+                // miner without waiting for the timer tick. Gated like SV1's
+                // inline check: never more often than the configured interval.
                 if has_accepted_share
                     && state.vardiff_cooldown_elapsed()
                     && run_vardiff_check(
@@ -973,13 +877,9 @@ async fn run_mining_connection(
                 {
                     break;
                 }
-                // diag: full frame-arm processing time. recv→ack
-                // (`latency_us` above) is only the early part — the share
-                // event fan-out (hooks / Redis) + any job send run AFTER
-                // the ack. If `iter_us` is large while `latency_us` is
-                // small, that post-ack work blocked the loop and delayed
-                // the NEXT share's read — the send→ack spike the recv→ack
-                // window can't see.
+                // Full frame-arm time. Event fan-out and job sends run after
+                // the ack, so a large `iter_us` with a small `latency_us`
+                // means post-ack work delayed the next share's read.
                 if server_config.log_submit_latency {
                     let iter_us = recv_at.elapsed().as_micros();
                     if iter_us >= 50_000 {
@@ -1000,9 +900,8 @@ async fn run_mining_connection(
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
                 current_template = Some(payload.template.clone());
-                // Resolve payouts + build MiningJob if the connection
-                // has an address locked. Pre-OpenChannel connections
-                // have nothing to broadcast to — skip cleanly.
+                // Build a MiningJob only once the connection has an address;
+                // before OpenChannel there is nothing to send.
                 let mining_job_inputs = match resolve_template_mining_job_inputs(
                     &state.address,
                     &server_config,
@@ -1021,10 +920,9 @@ async fn run_mining_connection(
                         continue;
                     }
                 };
-                // Live custom-extranonce change (stage 2): for a connection with
-                // an override, swap any channel whose value changed and collect
-                // the SetExtranoncePrefix frames. Empty (one bool test) for every
-                // other connection — its jobs below are byte-for-byte unchanged.
+                // Live custom-extranonce change: for a connection with an
+                // override, swap the prefix if it changed and collect the
+                // SetExtranoncePrefix frame (one bool test for all others).
                 // Runs BEFORE the job build so the new job pins the new prefix.
                 let mut en_frames = custom_extranonce_broadcast_frames(&mut state, &hooks);
                 let mut outcome = apply_template_broadcast(
@@ -1072,13 +970,10 @@ async fn run_mining_connection(
         }
     }
 
-    // Release every prefix this connection still holds. `CloseChannel`
-    // already releases on a graceful close, but a miner that drops its TCP
-    // connection (power-cut, crash, network blip) never sends one — without
-    // this the prefix stays in the allocator's `used` set until the process
-    // restarts. Every exit from the loop above lands here: the arms only
-    // `break`, none of them `?`. Releasing a key with no allocation is a
-    // no-op, so double-releasing an already-closed channel is harmless.
+    // Release every prefix this connection still holds: a dropped TCP
+    // connection never sends `CloseChannel`. Every loop exit lands here (the
+    // arms only `break`, never `?`), and releasing an unallocated key is a
+    // no-op.
     for channel_id in state.channels.keys() {
         extranonce.release(*channel_id);
     }
@@ -1143,22 +1038,19 @@ fn swap_channel_prefix(
 /// stream the prefix is the sole work-partitioner across miners sharing one
 /// coinbase, so a customer-picked value could overlap another miner's search.
 ///
-/// The caller sends the returned prefix BEFORE the channel's first job: per
-/// SV2 Mining/SetExtranoncePrefix a new prefix takes effect from the next job,
-/// and that first job is built (via the per-job prefix pin on
-/// [`crate::mining::jobs::ExtendedJob`]) with the value set here — so the miner
-/// never hashes a job under the old one.
+/// The prefix travels in the OpenSuccess, before the channel's first job, and
+/// that job is built with it (via the per-job prefix pin on
+/// [`crate::mining::jobs::ExtendedJob`]), so the miner never hashes a job
+/// under the old one.
 fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
     state: &mut MiningSessionState<C>,
     hooks: &MiningServerHooks,
     channel_id: u32,
 ) -> Option<[u8; 4]> {
-    // Look up the override BEFORE the Solo gate: a non-Solo connection that
-    // carries one is a misconfiguration (the API rejects the determinable
-    // non-Solo addresses, but a non-grouped address mining PPLNS by port still
-    // reaches here), and it must produce a loud log rather than a silent drop.
-    // Scope the immutable borrow of address/worker so the `&mut channels` below
-    // doesn't conflict; the prefix is `Copy`.
+    // Look up the override BEFORE the Solo gate, so a non-Solo connection
+    // carrying one (e.g. a non-grouped address mining PPLNS by port) is logged
+    // rather than silently dropped. The scoped borrow ends before
+    // `&mut channels`; the prefix is `Copy`.
     let prefix = {
         let address = state.address.as_ref()?;
         hooks
@@ -1176,11 +1068,10 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
         );
         return None;
     }
-    // Extended-only, and LOUD — checked BEFORE arming so a Solo Standard channel
-    // neither arms the broadcast watch (wasted per-template work) nor drops the
-    // override in silence. The per-job prefix pin + the miner's own coinbase
-    // splice are Extended-channel mechanics; a Standard channel bakes the prefix
-    // into the coinbase differently, so an override can't reconstruct there.
+    // Extended-only, checked BEFORE arming so a Solo Standard channel neither
+    // arms the broadcast watch nor drops the override silently. The per-job
+    // prefix pin and the miner's own coinbase splice exist only on Extended
+    // channels.
     let kind = match state.channels.get(&channel_id) {
         Some(c) => c.kind,
         None => return None,
@@ -1198,12 +1089,10 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
     // re-check on the broadcast path, so a later change (the customer setting a
     // new value) lands at the next template without a reconnect.
     state.uses_custom_extranonce = true;
-    // Custom EN targets ONE channel per connection — the primary. Every channel
-    // of a connection shares its (address, worker) and so resolves to the SAME
-    // override; in Solo the prefix is the sole work-partitioner (identical
-    // coinbase), so applying it to a second channel would collapse the two
-    // search spaces and roughly halve effective hashrate. The primary keeps the
-    // custom value; any additional channel keeps its distinct allocated prefix.
+    // Custom EN applies to the primary channel only. All channels of a
+    // connection resolve to the same override, and in Solo the prefix is the
+    // sole work-partitioner, so a second channel with it would duplicate the
+    // search space. Additional channels keep their allocated prefix.
     if Some(channel_id) != state.primary_channel {
         warn!(
             worker = %state.worker_name,
@@ -1214,10 +1103,9 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
         return None;
     }
     let channel = state.channels.get_mut(&channel_id)?;
-    // Swap the channel's prefix so its jobs pin the custom value, and hand the
-    // prefix back so the caller can put it in the OpenSuccess that has not been
-    // written yet. No `SetExtranoncePrefix` is emitted at open any more — see
-    // the doc comment above for why that message cannot be the delivery path.
+    // Swap the channel's prefix so its jobs pin the custom value, and hand it
+    // back for the not-yet-written OpenSuccess. No `SetExtranoncePrefix` at
+    // open: a miner that does not implement it reads its prefix only there.
     if channel.extranonce_prefix.as_slice() == prefix {
         return None;
     }
@@ -1228,24 +1116,17 @@ fn maybe_apply_custom_extranonce<C: bp_vardiff::Clock>(
 /// Per-template custom-extranonce re-check on the broadcast hot path — the
 /// live mid-session change without a reconnect.
 ///
-/// **Cheap gate first.** A connection without an override
-/// (`uses_custom_extranonce` false — every connection but the paying
-/// customer's) returns immediately: no cache lookup, no lock, no allocation.
-/// One bool test is the entire cost the feature adds to the shared broadcast
-/// path for other miners; the jobs they receive are byte-for-byte unchanged.
+/// A connection without an override (`uses_custom_extranonce` false) returns
+/// after one bool test, so other miners' jobs are unchanged.
 ///
-/// For a connection that DOES carry an override, look up its current value and,
-/// if the primary channel is Extended and on another prefix, swap it and emit a
-/// `SetExtranoncePrefix`. The caller writes it BEFORE the template's jobs, so
-/// the miner switches prefix and the job it then gets (via the per-job pin on
-/// [`crate::mining::jobs::ExtendedJob`]) is built with the new value. In-flight shares for the previous job
-/// stay valid: each job pins the prefix it went out under, so a block-change job
-/// keeps the old prefix and only the next template after a change switches.
+/// With an override, if the primary Extended channel is on another prefix,
+/// swap it and emit a `SetExtranoncePrefix`, which the caller writes BEFORE the
+/// template's jobs so the next job (via the per-job pin on
+/// [`crate::mining::jobs::ExtendedJob`]) carries the new value. In-flight
+/// shares stay valid: each job pins the prefix it went out under.
 ///
-/// A removed override (lookup now `None`) leaves the channel on its last value;
-/// reverting to a pool-allocated prefix needs a reconnect. The customer workflow
-/// only ever changes the value, never clears it — a documented edge, not a
-/// silent gap.
+/// A removed override leaves the channel on its last value; reverting to a
+/// pool-allocated prefix needs a reconnect.
 fn custom_extranonce_broadcast_frames<C: bp_vardiff::Clock>(
     state: &mut MiningSessionState<C>,
     hooks: &MiningServerHooks,
@@ -1253,8 +1134,7 @@ fn custom_extranonce_broadcast_frames<C: bp_vardiff::Clock>(
     if !state.uses_custom_extranonce {
         return Vec::new();
     }
-    // Armed only on the Solo stream, but re-assert the gate so it can't weaken
-    // if the arming rule ever changes.
+    // Armed only on the Solo stream; the gate is re-asserted here too.
     if state.stream != StreamKind::Solo {
         return Vec::new();
     }
@@ -1270,10 +1150,8 @@ fn custom_extranonce_broadcast_frames<C: bp_vardiff::Clock>(
             None => return Vec::new(),
         }
     };
-    // Only the primary channel carries the override — the same one-channel rule
-    // as channel-open (`maybe_apply_custom_extranonce`). Touching every channel
-    // here would collapse a multi-channel connection's distinct prefixes onto
-    // one and halve its hashrate.
+    // Only the primary channel carries the override, as at channel-open
+    // (`maybe_apply_custom_extranonce`).
     let Some(primary) = state.primary_channel else {
         return Vec::new();
     };
@@ -1287,36 +1165,23 @@ fn custom_extranonce_broadcast_frames<C: bp_vardiff::Clock>(
 }
 
 /// Translate an [`InboundMiningFrame`] into a call to the matching
-/// `handle_*` function. Returns the resulting [`HandlerOutcome`]
-/// (sync handlers — currently no async hooks needed at dispatch time).
+/// `handle_*` function and return its [`HandlerOutcome`].
 ///
-/// Per-handler context resolution:
-///
-/// - **OpenStandard/Extended-MiningChannel**: allocates a fresh
-///   extranonce-prefix via [`ConnectionExtranonce`] using
-///   `state.next_channel_id` (the about-to-be-allocated id). The
-///   pool-wide allocator mutex is locked ONLY inside the Open/Close
-///   arms — never across the submit arms — so per-share validation on
-///   one connection can't serialize behind channel churn on another.
-///   On handler error the prefix is leaked until connection close —
-///   acceptable since channel-open errors are rare.
-/// - **CloseChannel**: releases the extranonce-prefix of every channel the
-///   handler actually closed — one for a normal close, ALL members for a
-///   group-channel close (SV2 Mining/CloseChannel). Driven by the emitted
-///   `ChannelClosed` events so both paths share one release point.
-/// - **SubmitSharesStandard / SubmitSharesExtended**: both validate against
-///   the **per-job template snapshot** pinned on the job record at send-time
-///   (SV2 Mining/SubmitShares.Error strict) — the `StandardJobEntry`'s
-///   `template_snapshot` and the `ExtendedJob`'s `n_bits`
-///   respectively. Neither consults the current template, so a block-change
-///   between job-send and share-submit can't reclassify an in-flight share's
-///   block-candidacy.
-/// - **SetCustomMiningJob**: queries the bridge for the `mining_job_token` and
-///   resolves the job's `distribution_id` TLV against the distribution
-///   registry (`MinerAddress` scope); the cross-checks +
-///   ext 0x0003/Output Verification payout validation happen inside the
-///   handler. Distributions
-///   are multi-use — nothing is consumed on success.
+/// - **OpenStandard/Extended-MiningChannel**: allocates an extranonce prefix
+///   via [`ConnectionExtranonce`] for `state.next_channel_id`. The pool-wide
+///   allocator is locked only in the Open/Close arms, never on submit, so
+///   share validation does not serialize behind channel churn elsewhere. On
+///   handler error the prefix stays allocated until connection close.
+/// - **CloseChannel**: releases the prefix of every channel actually closed
+///   (all members for a group-channel close, SV2 Mining/CloseChannel), driven
+///   by the emitted `ChannelClosed` events.
+/// - **SubmitSharesStandard / SubmitSharesExtended**: validate against the
+///   per-job template pinned at send-time (SV2 Mining/SubmitShares.Error
+///   strict), never the current template.
+/// - **SetCustomMiningJob**: looks up the `mining_job_token` in the bridge
+///   and resolves the referenced distribution; the handler runs the
+///   cross-checks and ext 0x0003/Output Verification. Distributions are
+///   multi-use; only the token is consumed on success.
 pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
     state: &mut MiningSessionState<C>,
     inbound: InboundMiningFrame,
@@ -1338,10 +1203,9 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
         InboundMiningFrame::UpdateChannel(input) => handle_update_channel(state, &input),
         InboundMiningFrame::CloseChannel(input) => {
             let outcome = handle_close_channel(state, &input);
-            // Release the extranonce prefix of every channel the close
-            // actually removed — one for a normal close, all members for a
-            // group-channel close (SV2 Mining/CloseChannel). Releasing an id
-            // with no allocation is a harmless no-op.
+            // Release the prefix of every channel the close removed (all
+            // members for a group-channel close, SV2 Mining/CloseChannel).
+            // Releasing an unallocated id is a no-op.
             for ev in &outcome.events {
                 if let SessionEvent::ChannelClosed { channel_id, .. } = ev {
                     extranonce.release(*channel_id);
@@ -1350,27 +1214,21 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
             outcome
         }
         InboundMiningFrame::SubmitSharesStandard(input) => {
-            // SV2 Mining/SubmitShares.Error strict: the per-job snapshot is
-            // stored on the StandardJobEntry at send-time. Handler reads it
-            // out itself — no IO-layer template snapshot needed.
+            // SV2 Mining/SubmitShares.Error strict: the handler reads the
+            // per-job snapshot stored on the StandardJobEntry at send-time.
             handle_submit_shares_standard(state, &input, now_ms)
         }
         InboundMiningFrame::SubmitSharesExtended(input) => {
-            // SV2 Mining/SubmitShares.Error strict: the per-job
-            // `n_bits` is pinned on the ExtendedJob at send-time.
-            // Handler reads it from the job record — no IO-layer
-            // current-template lookup needed.
+            // SV2 Mining/SubmitShares.Error strict: the handler reads the
+            // per-job `n_bits` pinned on the ExtendedJob at send-time.
             handle_submit_shares_extended(state, &input, now_ms)
         }
         InboundMiningFrame::SetCustomMiningJob(input) => {
             let (bridge_job, allocation, distribution) = {
                 let guard = bridge.read().expect("bridge RwLock poisoned");
-                // Projection: address, declared tip, the declaration binding
-                // and the declaration's own distribution reference — all
-                // precomputed at register time, so this stays a map lookup and
-                // a clone rather than re-deriving the declaration's shape while
-                // the lock is held. The raw transactions the handler never
-                // needs.
+                // Projection precomputed at register time (address, declared
+                // tip, binding, distribution reference), so the lock covers
+                // only a map lookup and a clone.
                 let bridge_job = guard.job_ref(&input.mining_job_token);
                 // Coinbase-only mode never declares
                 // (SV2 JDP/Coinbase-only Mode), so the only record of its
@@ -1420,25 +1278,14 @@ pub(crate) fn dispatch_inbound_frame<C: bp_vardiff::Clock + Clone>(
                 now_ms,
             );
             // A token authorises exactly ONE custom job, whichever record
-            // answered for it. A conformant JDC never re-uses one: each send
-            // either pops a fresh allocate token or follows a fresh
-            // declaration.
+            // backs it; `classify_backing` answers that exhaustively (not
+            // `bridge_job.is_some()`, which misses allocate-backed tokens).
             //
-            // Through `classify_backing`, the same exhaustive question the
-            // handler asked a moment ago — not `bridge_job.is_some()`, which
-            // reads as that question and answers a narrower one. It answered
-            // it narrowly for real: a declaration's token was spent here
-            // while a Coinbase-only allocate token was only ever read, so
-            // that half of the rule did not hold at all.
+            // Consumed only on SUCCESS: a rejected job leaves the token usable
+            // so a stale-chain-tip retry still works.
             //
-            // Consumed only on SUCCESS — a rejected job must leave the token
-            // usable, or a stale-chain-tip retry, which a JDC treats as
-            // non-fatal and expects to be able to repeat, would answer
-            // `invalid-mining-job-token` instead.
-            //
-            // Only the BRIDGE entry goes. The JDP session's own
-            // `declared_jobs` store keeps the declaration, because that is
-            // what `PushSolution` reassembles the found block from.
+            // Only the bridge entry goes; the JDP session's `declared_jobs`
+            // keeps the declaration for `PushSolution` to reassemble from.
             if matches!(
                 outcome.outbound.first(),
                 Some(OutboundFrame::SetCustomMiningJobSuccess { .. })
@@ -1491,23 +1338,18 @@ async fn write_outbound_frames(
 
 /// Run a vardiff check and emit its result on the wire.
 ///
-/// Shared by BOTH vardiff trigger points — the 60 s `vardiff_tick` timer
-/// (down-adjusts a miner that went quiet, the only path that fires when no
-/// shares arrive) and the inline check after an accepted share (promptly
-/// up-adjusts an active miner without waiting for the next tick). Factoring
-/// it here means the two arms can never diverge — in particular neither can
-/// re-introduce a job re-broadcast on a difficulty change.
+/// Shared by both vardiff triggers: the timer (the only one that fires
+/// when no shares arrive, so it down-adjusts a quiet miner) and the inline
+/// check after an accepted share.
 ///
-/// SetTarget alone is the complete SV2 difficulty-change mechanism — it
-/// applies to future share submissions on the current job, no new job
-/// required. A synthetic `TemplateChange::NewBlock` re-broadcast must NOT run
-/// here: it emits a fake `SetNewPrevHash` (same prev_hash, frozen
-/// header_timestamp from the cached template, new job_id) and retires all
-/// jobs, making firmware reset and re-mine the identical header → session
-/// best-difficulty freezes. Mirrors `StratumV2Client.checkDifficultyAllChannels`.
+/// SetTarget alone is the complete SV2 difficulty change; it applies to
+/// future shares on the current job. ⚠️ No synthetic
+/// `TemplateChange::NewBlock` re-broadcast here: its fake `SetNewPrevHash`
+/// (same prev_hash, frozen header timestamp) retires all jobs and makes
+/// firmware re-mine the identical header.
 ///
 /// Returns `Err(())` if the wire write failed and the caller should drop the
-/// connection (mirrors the `break`-on-write-error in the other loop arms).
+/// connection.
 async fn run_vardiff_check(
     state: &mut MiningSessionState<SystemClock>,
     writer: &mut NoiseTcpWriteHalf,
@@ -1551,12 +1393,10 @@ async fn resolve_template_mining_job_inputs(
         .payout_resolver
         .resolve_payouts(addr, template.coinbase_tx_value_remaining)
         .await;
-    // An empty list is the resolver saying "serve no job" — its
-    // distribution could not be built, and the alternative it used to
-    // reach for was a coinbase paying this one miner the whole block.
-    // Same answer as an unlocked address: no job inputs, so no
-    // NewMiningJob goes out and the channel keeps hashing what it holds.
-    // SV1 reads an empty list the same way (`build_notify_for_template`).
+    // An empty list means "serve no job": the distribution could not be
+    // built, and a coinbase paying this one miner the whole block is never
+    // the fallback. No NewMiningJob goes out; the channel keeps hashing what
+    // it holds. SV1 does the same (`build_notify_for_template`).
     if resolved.is_none() {
         return Ok(None);
     }
@@ -1636,23 +1476,11 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                     session_diff,
                     "sv2 channel opened"
                 );
-                // BitAxe / NerdQAxe send their firmware string in the
-                // SetupConnection `vendor` field; we lift it into
-                // `client_entity.userAgent` with a `/sv2` suffix so the
-                // /api/info userAgents histogram surfaces hardware as
-                // e.g. `bitaxe/sv2`, `NerdQAxe++/sv2`. JDP clients
-                // typically send no vendor → fall back to
-                // `jd-client/sv2` so the downstream-report POST can
-                // later refine it to the actual primary vendor.
-                // `register_session` (mode-gate publish + the debounced
-                // client_entity row birth) already ran in the connection
-                // loop's channel-open block, BEFORE stream routing — doing it
-                // here would resolve the stream too late and double the gate
-                // refcount. We only emit the device-online event here. The
-                // register call carried the vendor-derived UA into the
-                // pending row for the /api/info histogram (`bitaxe/sv2`,
-                // etc.); it reaches client_entity.userAgent when the row is
-                // born.
+                // Only the device-online event here: `register_session`
+                // already ran in the connection loop's channel-open block,
+                // before stream routing, and carried the vendor-derived user
+                // agent (e.g. `bitaxe/sv2`; `jd-client/sv2` when no vendor
+                // is sent, refined later by the downstream report).
                 hooks
                     .device_status_sink
                     .on_device_event(
@@ -1685,28 +1513,19 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                 bp_metrics::record_stratum_difficulty_adjustment();
             }
             SessionEvent::ShareAccepted { channel_id, accept } => {
-                // ext 0x0002 Worker-ID TLV: when the per-share TLV resolves to
-                // a non-empty worker name, attribute the share to that worker
-                // rather than the channel-default
-                // (ext 0x0002/Behavior Based on Negotiation). When None, fall
-                // back to channel-default (no TLV present, or ext 0x0002 not
-                // negotiated).
+                // ext 0x0002 Worker-ID: a per-share worker name overrides the
+                // channel default (ext 0x0002/Behavior Based on Negotiation).
                 let effective_worker = accept
                     .effective_worker_name
                     .as_deref()
                     .unwrap_or(worker_str);
-                // Both Standard and Extended channels funnel through this
-                // shared handler, so label the banner / trace with the
-                // channel's actual kind instead of a fixed string.
                 let kind_label = match state.channels.get(&channel_id).map(|c| c.kind) {
                     Some(crate::mining::channel::ChannelKind::Standard) => "Standard",
                     Some(crate::mining::channel::ChannelKind::Extended) => "Extended",
                     None => "Unknown",
                 };
-                // Block-found banner — always at INFO so block events
-                // are visible without any debug flag. Height isn't on
-                // the ShareAccept payload — block_sink logs it again
-                // with template_id.
+                // Block-found banner, always at INFO. block_sink logs the
+                // height with the template_id.
                 if accept.is_block_candidate {
                     tracing::info!(
                         session_id_hex,
@@ -1767,10 +1586,8 @@ pub(crate) async fn apply_session_events_generic<C: bp_vardiff::Clock>(
                 }
             }
             SessionEvent::ShareRejected { channel_id, reject } => {
-                // validate_submit_extended already emits a
-                // `❌ Extended share rejected: <reason>` line at WARN
-                // for each rejection — no further log needed here.
-                // Keep the rejected_sink fan-out for metrics.
+                // The validator already logs each rejection at WARN; this
+                // only feeds the rejected_sink.
                 let address_opt = state.address.as_ref().map(|a| a.as_str());
                 let worker_opt = state.address.as_ref().map(|_| state.worker_name.as_str());
                 let _ = channel_id;
@@ -1931,8 +1748,7 @@ mod tests {
         );
     }
 
-    /// Already applied (channel holds the override) → no redundant frame. Lets
-    /// the broadcast path (stage 2) call this every job without re-announcing.
+    /// Already applied (channel holds the override) → no redundant frame.
     #[test]
     fn custom_extranonce_idempotent_when_already_applied() {
         const CUSTOM: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
@@ -1941,11 +1757,9 @@ mod tests {
         assert!(maybe_apply_custom_extranonce(&mut s, &hooks, 7).is_none());
     }
 
-    /// Standard channels are out of scope: the prefix is baked into the
-    /// coinbase differently there, so an override wouldn't reconstruct. It also
-    /// must NOT arm the broadcast flag — otherwise a Solo Standard connection
-    /// would run the per-template re-check forever for an override that can
-    /// never apply.
+    /// Standard channels are out of scope, and must NOT arm the broadcast
+    /// flag, which would run the per-template re-check for an override that
+    /// can never apply.
     #[test]
     fn custom_extranonce_skips_standard_channel_without_arming() {
         let mut s = fresh_session_with_address();
@@ -2045,7 +1859,7 @@ mod tests {
     }
 
     /// Armed but the override was removed (lookup None) → keep the last value.
-    /// Reverting to a pool prefix needs a reconnect; the customer never clears.
+    /// Reverting to a pool prefix needs a reconnect.
     #[test]
     fn broadcast_frames_keep_last_value_when_override_removed() {
         let mut s = solo_session_with_extended_channel(7, vec![0xC0, 0xDE, 0xBA, 0xBE]);
@@ -2058,7 +1872,7 @@ mod tests {
         );
     }
 
-    /// Defensive gate: armed but somehow non-Solo → no switch, prefix untouched.
+    /// Armed but non-Solo → no switch, prefix untouched.
     #[test]
     fn broadcast_frames_empty_on_non_solo_even_if_armed() {
         let mut s = solo_session_with_extended_channel(7, vec![0xC0, 0xDE, 0xBA, 0xBE]);
@@ -2092,7 +1906,7 @@ mod tests {
 
     /// Multi-channel connection: the override applies to the primary channel
     /// only. A second channel keeps its distinct allocated prefix, so the two
-    /// never collapse onto one search space (which in Solo would halve hashrate).
+    /// never share one search space.
     #[test]
     fn custom_extranonce_applies_only_to_primary_channel_at_open() {
         const CUSTOM: [u8; 4] = [0xC0, 0xDE, 0xBA, 0xBE];
@@ -2445,12 +2259,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn channel_opened_event_fans_out_to_device_status() {
-        // `register_session` (mode-gate publish) moved to the connection
-        // loop's channel-open block — it must run BEFORE stream routing,
-        // so it is no longer fired from `apply_session_events`. The
-        // ChannelOpened arm here now only emits the device-online event;
-        // registration is covered end-to-end by the connection-loop /
-        // regtest paths.
+        // `register_session` runs in the connection loop's channel-open
+        // block, before stream routing; the ChannelOpened arm only emits the
+        // device-online event.
         let recording = RecordingHooks::new();
         let hooks = recording.clone().into_server_hooks();
         let state = fresh_session_with_address();
@@ -2461,7 +2272,7 @@ mod tests {
             kind: crate::mining::channel::ChannelKind::Standard,
         }];
         apply_session_events_generic(events, "sess-1", &state, &hooks).await;
-        // No register from this layer anymore.
+        // No register from this layer.
         assert!(recording.registered.lock().unwrap().is_empty());
         // Device-online event fired (address is the session's locked one).
         let devices = recording.device_events.lock().unwrap();
@@ -2520,12 +2331,9 @@ mod tests {
         assert!(out.is_none(), "no address → no MiningJobInputs");
     }
 
-    /// MONEY: an empty payout list is the resolver saying "serve no job"
-    /// because its distribution could not be built. It used to answer that
-    /// with a solo coinbase paying the connecting miner the whole block,
-    /// so a transient Postgres or Redis fault cost every other miner in
-    /// the window the block. No job at all is the only safe answer, and
-    /// the channel simply keeps hashing what it already holds.
+    /// MONEY: an empty payout list means "serve no job" (the distribution
+    /// could not be built). No job is the only safe answer; a solo coinbase
+    /// would pay the connecting miner a block the whole window earned.
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_template_mining_job_inputs_returns_none_when_the_resolver_serves_no_job() {
         struct NoJobResolver;
@@ -2718,11 +2526,7 @@ mod tests {
     }
 
     /// Dispatching `SubmitSharesStandard` against an unknown channel
-    /// emits `invalid-channel-id`. (With per-job template snapshots
-    /// in `StandardJobMaps`, `current_template` no longer matters at
-    /// dispatch — the snapshot lives on the JobEntry. The pre-channel
-    /// race-defensive path now collapses into the standard channel-
-    /// lookup error.)
+    /// emits `invalid-channel-id`.
     #[test]
     fn dispatch_submit_standard_unknown_channel_emits_invalid_channel_id() {
         let mut s = fresh_test_session();
@@ -2845,7 +2649,7 @@ mod tests {
 
     /// A `CloseChannel` addressed to a group_channel_id releases the
     /// extranonce prefix of EVERY member (SV2 Mining/CloseChannel), driven by
-    /// the per- member `ChannelClosed` events. Two grouped Extended channels →
+    /// the per-member `ChannelClosed` events. Two grouped Extended channels →
     /// both prefixes freed on a single group close.
     #[test]
     fn dispatch_group_close_releases_all_member_prefixes() {
@@ -2898,9 +2702,8 @@ mod tests {
     }
 
     /// Two connections that drew the same random `session_id` still get
-    /// distinct prefixes for their first channel. The allocator key used to
-    /// be built from that `session_id`, so the second connection was handed
-    /// the first one's prefix back.
+    /// distinct prefixes for their first channel: the allocator key does not
+    /// depend on the `session_id`.
     #[test]
     fn same_session_id_on_two_connections_gets_distinct_prefixes() {
         let shared = fresh_allocator();
@@ -2953,12 +2756,9 @@ mod tests {
     /// passes too — until a ext 0x0003/Implementation Notes settlement
     /// invalidation turns the same reference into `stale-payout-distribution`.
     ///
-    /// TOKENS are not, and the two are asserted together on purpose: each job
-    /// below brings its own, and re-sending a spent one is refused
-    /// `invalid-mining-job-token`. An allocate token backing a Coinbase-only
-    /// job used to be read and never consumed, so it authorised jobs for its
-    /// whole hour while the declared-job token beside it was spent on first
-    /// use — the same rule, half applied.
+    /// TOKENS are single-use, asserted together on purpose: each job brings
+    /// its own, and re-sending a spent allocate token is refused
+    /// `invalid-mining-job-token`, as for a declared-job token.
     #[test]
     fn dispatch_set_custom_mining_job_resolves_distribution_multi_use() {
         use crate::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
@@ -3005,11 +2805,9 @@ mod tests {
         let _ = dispatch_inbound_frame(&mut s, open, &alloc, &bridge, 0);
         let cid = s.primary_channel.expect("extended channel opened");
         {
-            // The pool has served this channel work. In production the
-            // synthetic broadcast at channel open writes these; here the
-            // dispatch test opens the channel without a template, which
-            // is the cold-start state and refused since custom jobs must
-            // have something to pin their block-candidate threshold to.
+            // The pool has served this channel work (normally written by the
+            // broadcast at channel open). Without it custom jobs are refused:
+            // they need a block-candidate threshold to pin to.
             let ch = s.channels.get_mut(&cid).expect("channel just opened");
             ch.latest_extended_prev_hash = Some([0xAB; 32]);
             ch.latest_extended_n_bits = Some(0x1d00_ffff);
@@ -3051,15 +2849,11 @@ mod tests {
             .unwrap(),
         );
         bridge.write().unwrap().publish_pool_wide(entry);
-        // The allocate the JDC took this token from. ext 0x0003/Negotiation
-        // empties its outputs, so it carries no designated script — but it is
-        // still the pool's record that the token exists and whose it is,
-        // without which the handler refuses the job as
-        // `invalid-mining-job-token`.
-        //
-        // One per job: a token authorises exactly one `SetCustomMiningJob`,
-        // so the multi-use property under test is the DISTRIBUTION's, and
-        // reusing a token here would test the wrong thing.
+        // The allocates the JDC took its tokens from. ext 0x0003/Negotiation
+        // empties their outputs, but they are the pool's record that each
+        // token exists and whose it is. One per job: a token authorises
+        // exactly one `SetCustomMiningJob`; the multi-use property under test
+        // is the distribution's.
         for req in 1..=3u8 {
             bridge.write().unwrap().register_allocation(
                 Token([req; 16]),
@@ -3110,10 +2904,9 @@ mod tests {
             );
         }
 
-        // …but the TOKENS those two jobs rode on are spent. Re-sending the
-        // first is refused, and the distribution is not what refused it —
-        // it is still live, as the settlement step below proves by taking it
-        // away and getting a different code.
+        // …but their TOKENS are spent. Re-sending the first is refused with
+        // the token code; the distribution is still live, as the settlement
+        // step below shows by yielding a different code.
         let out = dispatch_inbound_frame(
             &mut s,
             InboundMiningFrame::SetCustomMiningJob(make_input(1)),
@@ -3157,31 +2950,13 @@ mod tests {
         }
     }
 
-    /// The IO-layer half of the ext-0x0003 twin, which nothing else covers: a
-    /// Full-Template `SetCustomMiningJob` carries no
-    /// ext 0x0003/distribution_id TLV Field, so the acceptance has to be
-    /// resolved from the reference its DECLARATION was accepted under — and
-    /// under the scope it was accepted in.
-    ///
-    /// The trap this pins: one payout address is one account, so it can own
-    /// several tailored slots (two jd-clients, or a ghost left by an
-    /// ungraceful drop). `DistributionScope::MinerAddress` answers with the
-    /// NEWEST slot for that address. Resolving the older session's declaration
-    /// through it finds a slot that never held its id → `Stale` → an SRI
-    /// jd-client takes the fatal solo fallback, forever, while the other
-    /// client on the same address mines normally.
-    ///
-    /// A declared job's token authorises exactly ONE `SetCustomMiningJob`,
-    /// matching the reference JDS (`token_manager.deactivate` plus
-    /// `take_declared_custom_job` on every custom job, sv2-apps v0.7.0).
+    /// A declared job's token authorises exactly ONE `SetCustomMiningJob`.
     ///
     /// Both directions, because each one alone would pass on the wrong code:
     ///
     /// - a SECOND job on an accepted token is `invalid-mining-job-token`;
-    /// - a REJECTED job leaves the token usable, so the retry that an SRI
-    ///   jd-client makes after the non-fatal `stale-chain-tip` still works.
-    ///   Consuming on rejection would turn a benign tip race into a dead
-    ///   token and send the client into its fatal fallback.
+    /// - a REJECTED job leaves the token usable, so a JD-client's retry after
+    ///   the non-fatal `stale-chain-tip` still works.
     #[test]
     fn a_declared_token_authorises_one_custom_job_and_survives_a_rejection() {
         use crate::mining::client::tests::{
@@ -3263,6 +3038,13 @@ mod tests {
         }
     }
 
+    /// A Full-Template `SetCustomMiningJob` carries no
+    /// ext 0x0003/distribution_id TLV Field, so its acceptance is resolved from
+    /// the reference its DECLARATION was accepted under, in that declaring JDP
+    /// session's scope. One address can own several tailored slots (two
+    /// clients, or a leftover session); `MinerAddress` scope would answer with
+    /// the newest slot, which never held the older session's id.
+    ///
     /// Both directions: the older session's job must be ACCEPTED, and a
     /// genuinely withdrawn distribution must still be refused — otherwise
     /// "resolves under the right scope" would read the same as "resolves
@@ -3325,21 +3107,15 @@ mod tests {
         );
         let cid = s.primary_channel.expect("extended channel opened");
         {
-            // The pool has served this channel work. In production the
-            // synthetic broadcast at channel open writes these; here the
-            // dispatch test opens the channel without a template, which
-            // is the cold-start state and refused since custom jobs must
-            // have something to pin their block-candidate threshold to.
+            // The pool has served this channel work (normally written by the
+            // broadcast at channel open). Without it custom jobs are refused:
+            // they need a block-candidate threshold to pin to.
             let ch = s.channels.get_mut(&cid).expect("channel just opened");
             ch.latest_extended_prev_hash = Some([0xAB; 32]);
             ch.latest_extended_n_bits = Some(0x1d00_ffff);
         }
-        // Group-Solo, because this test uses a TAILORED distribution and an
-        // INHERITED reference. Those two constrain the stream from opposite
-        // sides: a tailored entry is only built for Solo and Group-Solo, while
-        // `resolve_distribution_reference` refuses to inherit on Solo. Group-
-        // Solo is the one stream where both hold, so the scope resolution this
-        // test is about can be exercised at all.
+        // Group-Solo: tailored entries exist only for Solo and Group-Solo,
+        // and `resolve_distribution_reference` refuses to inherit on Solo.
         s.set_stream(bp_common::StreamKind::GroupSolo);
         let owner = bp_common::AddressId::new(ADDR.to_string()).unwrap();
 
@@ -3430,11 +3206,9 @@ mod tests {
                     jdp_session_id: OLD_SESSION,
                 },
             );
-            // A SECOND declaration, byte-identical but under its own token. A
-            // token authorises exactly one custom job now, so the two
-            // dispatches below cannot share one — and they must not: reusing
-            // it would test the consume rule, not the
-            // ext 0x0003/Implementation Notes refusal this test is about.
+            // A SECOND declaration, byte-identical but under its own token: a
+            // token authorises exactly one custom job, and this test is about
+            // the ext 0x0003/Implementation Notes refusal, not the consume rule.
             guard.register(
                 SECOND_TOKEN,
                 crate::bridge::RegisteredDeclaredJob {
@@ -3506,9 +3280,8 @@ mod tests {
         }
     }
 
-    /// dispatch_inbound_frame doesn't async-await anywhere internally
-    /// — invoking it from sync test code is intentional + ensures the
-    /// IO-layer doesn't accidentally introduce a hidden await.
+    /// `dispatch_inbound_frame` stays synchronous; calling it from a sync
+    /// test keeps a hidden await from creeping in.
     #[test]
     fn dispatch_is_synchronous_to_handlers() {
         let mut s = fresh_test_session();
@@ -3528,14 +3301,9 @@ mod tests {
         ));
     }
 
-    /// Empty outbound vec is a no-op write — write_outbound_frames
-    /// can short-circuit. Pin via building the call but with a
-    /// dummy writer? Not testable without a real noise stream — but
-    /// we can at least assert that encode_mining_outbound for an
-    /// arbitrary OutboundFrame produces an AnyMessageOwned that try_into
-    /// converts cleanly to a MessageFrame. That's the second
-    /// half of write_outbound_frames; the first half (write_frame
-    /// over noise) needs a regtest.
+    /// The encode half of `write_outbound_frames`: an `OutboundFrame` encodes
+    /// to an `AnyMessageOwned` that converts cleanly into a `MessageFrame`.
+    /// The Noise write half is covered by the regtests.
     #[test]
     fn outbound_frame_encodes_and_wraps_to_sv2_frame() {
         let outbound = crate::mining::client::OutboundFrame::SubmitSharesSuccess {

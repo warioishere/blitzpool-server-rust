@@ -44,10 +44,9 @@ pub fn designated_output_blob(script: &Script) -> Vec<u8> {
 /// The designation is positional in the ALLOCATE message *only* — see
 /// [`pays_designated_output`] for why the check side cannot index.
 ///
-/// Reading it back rather than carrying the script alongside keeps one
-/// source of truth: a second copy could name a script the pool never sent.
-/// `None` when the blob does not decode or holds no output — the caller
-/// then has nothing to hold a custom job to and must refuse it.
+/// Read back rather than carried alongside, so the blob the pool sent stays
+/// the one source of truth. `None` when the blob does not decode or holds no
+/// output; the caller then has nothing to hold a custom job to and refuses it.
 pub fn designated_payout_script(coinbase_outputs: &[u8]) -> Option<Vec<u8>> {
     let outputs: Vec<TxOut> = bitcoin::consensus::deserialize(coinbase_outputs).ok()?;
     outputs.first().map(|o| o.script_pubkey.as_bytes().to_vec())
@@ -61,30 +60,20 @@ pub fn designated_payout_script(coinbase_outputs: &[u8]) -> Option<Vec<u8>> {
 /// order to qualify for pooled mining rewards. JDS and Pool SHOULD reject
 /// custom jobs that fail to do so." The JDC MAY add further 0-value AND
 /// non-0-value outputs, and MAY "arbitrarily reorder the outputs" — so this
-/// searches for the script and requires a non-zero amount. It is
-/// deliberately NOT a positional or byte-for-byte comparison against what
-/// the pool sent: that would reject every conformant client, because the
-/// pool must send the amount as 0 and the JD-client then rewrites it to the
-/// template's revenue.
+/// searches for the script and requires a non-zero amount. A positional or
+/// byte-for-byte comparison would reject every conformant client, since the
+/// pool sends the amount as 0 and the JD-client rewrites it.
 ///
-/// How MUCH is not checked, and that is not a gap this function could close:
-/// SV2 JDP/AllocateMiningJobToken.Success names no threshold and answers a
-/// shortfall economically ("Pool MAY pay proportionally smaller rewards"), so
-/// any number here would be invented and would reject conformant clients.
+/// How MUCH is not checked: the spec names no threshold and answers a
+/// shortfall economically ("Pool MAY pay proportionally smaller rewards").
 ///
-/// What makes "some sats reached the script" a sufficient test is enforced
-/// elsewhere, and has to be: the ALLOCATE only designates a script when it
-/// is the asking miner's own
-/// (`ProductionJdpAllocateResolver::resolve_allocate_context`), so a JDC
-/// shorting the designated output shorts itself and nobody else. A pool
-/// payout routed to a third party — a Blockparty admin's pending-party fee
-/// route is the live example — is refused a base-protocol token instead,
-/// precisely because this check cannot enforce it: the JDC would satisfy
-/// it with one satoshi and keep the block.
-///
-/// So do not relax that allocate rule on the strength of this function,
-/// and do not add a threshold here on the strength of that rule. They are
-/// two halves of one guarantee.
+/// ⚠️ "Some sats reached the script" is sufficient only because the allocate
+/// designates a script solely when it is the asking miner's own
+/// (`ProductionJdpAllocateResolver::resolve_allocate_context`), so a short
+/// payment shorts only that miner. A payout routed to a third party (e.g. a
+/// Blockparty fee route) is refused a base-protocol token for that reason.
+/// The two rules are halves of one guarantee: relax neither on the strength
+/// of the other.
 pub fn pays_designated_output(outputs: &[TxOut], designated_script: &[u8]) -> bool {
     outputs
         .iter()
@@ -107,9 +96,8 @@ pub struct DeclaredCoinbase {
     /// Bytes of scriptSig the prefix left for the extranonce.
     pub extranonce_slot: usize,
     /// The scriptSig bytes the declaration committed to, i.e. everything
-    /// before the slot. Cut here rather than by the caller: this is the one
-    /// place that knows `slot <= script_sig.len()` holds, because it is the
-    /// same place that derived `slot` from that same length.
+    /// before the slot. Cut here because this is where `slot` was derived
+    /// from that length, so `slot <= script_sig.len()` is known to hold.
     pub script_sig_prefix: Vec<u8>,
 }
 
@@ -117,26 +105,20 @@ pub struct DeclaredCoinbase {
 ///
 /// A JDC declares its coinbase split around the extranonce slot it does not
 /// control: `coinbase_tx_prefix` ends where the slot begins,
-/// `coinbase_tx_suffix` resumes after it. To read the outputs we reassemble
-/// the whole transaction with the slot zero-filled and let
-/// `Transaction::consensus_decode` do the parsing — **the transaction's own
-/// framing tells us where the outputs are**, so nothing here assumes a byte
-/// layout for the suffix.
+/// `coinbase_tx_suffix` resumes after it. The whole transaction is
+/// reassembled with the slot zero-filled and decoded by consensus rules, so
+/// **the transaction's own framing locates the outputs** and nothing assumes
+/// a byte layout for the suffix.
 ///
 /// The slot width comes from the prefix itself: it carries the scriptSig
-/// length as a CompactSize, and it stops at the slot, so
+/// length as a CompactSize and stops at the slot, so
 /// `slot = declared_script_sig_len − script_sig_bytes_already_in_prefix`.
-/// This is the same derivation SRI's `jd-server` uses
-/// (`job_validation/bitcoin_core_ipc.rs::get_coinbase_tx`) — except they
-/// hardcode the header at 43 bytes, which assumes a segwit-serialised coinbase
-/// (marker+flag). Ours are serialised without it (41), so the header is parsed
-/// rather than assumed.
+/// The header is parsed rather than assumed, because it is 43 bytes when
+/// segwit-serialised and 41 without marker+flag.
 ///
-/// **Fail-closed**, and it stays that way for the case this cannot express: a
-/// JDC that puts its own scriptSig bytes AFTER the extranonce (T>0 — see
-/// `deferred-jds-coinbase-suffix-parse`). The derivation above yields `N + T`,
-/// so the rebuilt scriptSig comes out T bytes long and the decode fails. That
-/// is a rejection, never a wrong ACCEPT; SRI has the identical limitation.
+/// **Fail-closed** for a JDC that puts scriptSig bytes AFTER the extranonce
+/// (T>0): the derivation yields `N + T`, the rebuilt scriptSig runs T bytes
+/// long and the decode fails. A rejection, never a wrong accept.
 pub fn declared_coinbase_tx(
     coinbase_tx_prefix: &[u8],
     coinbase_tx_suffix: &[u8],
@@ -153,13 +135,11 @@ pub fn declared_coinbase_tx(
     // cannot squeeze through.
     let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw).ok()?;
 
-    // `input[0]` and the slice below are safe by construction, and only
-    // here: `extranonce_slot_width` refused the prefix unless its input
-    // count decoded to exactly 1, and it derived `slot` by subtracting from
-    // the same scriptSig length `deserialize` just read back — so the input
-    // exists and the scriptSig is at least `slot` long. Restating either as
-    // a runtime check would add a branch that cannot be taken, and teach the
-    // next reader a failure mode that does not exist.
+    // `input[0]` and the slice below are safe by construction:
+    // `extranonce_slot_width` refused the prefix unless its input count was
+    // exactly 1, and derived `slot` from the same scriptSig length
+    // `deserialize` just read back, so the input exists and the scriptSig is
+    // at least `slot` long.
     let script_sig = tx.input[0].script_sig.as_bytes();
     let script_sig_prefix = script_sig[..script_sig.len() - slot].to_vec();
 
@@ -171,10 +151,8 @@ pub fn declared_coinbase_tx(
 }
 
 /// Consensus bound on a coinbase's scriptSig: 2 to 100 bytes, else
-/// `bad-cb-length`. Only the upper end is enforced below, and it is enforced
-/// for one reason — the declared length decides how many bytes get allocated
-/// to rebuild the transaction, so an unchecked one turns a handful of wire
-/// bytes into an arbitrary allocation.
+/// `bad-cb-length`. Only the upper end is enforced below, because the
+/// declared length sizes the buffer the transaction is rebuilt in.
 const MAX_COINBASE_SCRIPT_SIG_LEN: usize = 100;
 
 /// How many bytes of scriptSig the prefix leaves for the extranonce slot.
@@ -184,17 +162,13 @@ const MAX_COINBASE_SCRIPT_SIG_LEN: usize = 100;
 /// the 36-byte outpoint, then the scriptSig length. Whatever that length
 /// exceeds the scriptSig bytes already present in the prefix is the slot.
 ///
-/// **This is where "the declaration is a coinbase" is decided**, and the only
-/// place. The input-count test below is not a formality on the way to a
-/// length: every later reader — the payout check reading `tx.output`, the
-/// binding reading `input[0]` — relies on it having run. Relax it and a
-/// multi-input transaction reaches those readers as if it were a coinbase.
+/// ⚠️ **This is the one place "the declaration is a coinbase" is decided.**
+/// Every later reader (the payout check on `tx.output`, the binding on
+/// `input[0]`) relies on the single-input test below.
 ///
-/// The scriptSig length arrives as a CompactSize with no inherent ceiling, and
-/// the caller turns it straight into `Vec::resize`. Refusing anything past the
-/// consensus maximum keeps the largest rebuildable coinbase small, and costs
-/// nothing real: a longer scriptSig is `bad-cb-length`, so such a declaration
-/// describes a block that can never be valid.
+/// A scriptSig length past the consensus maximum is refused: it keeps the
+/// rebuilt coinbase small, and such a declaration could never form a valid
+/// block anyway.
 fn extranonce_slot_width(coinbase_tx_prefix: &[u8]) -> Option<usize> {
     use bitcoin::consensus::Decodable;
 
@@ -231,8 +205,8 @@ fn extranonce_slot_width(coinbase_tx_prefix: &[u8]) -> Option<usize> {
 /// A JDC builds and owns its own coinbase; the pool only publishes a weight
 /// distribution (ext 0x0003/SetPayoutDistribution). A found block may only be
 /// booked once the declared coinbase was validated positionally against that
-/// distribution (ext 0x0003/Output Verification) — this rides along on that
-/// proof so the block-found path can settle exactly the distribution the
+/// distribution (ext 0x0003/Output Verification); this rides along on that
+/// proof so the block-found path settles exactly the distribution the
 /// coinbase pays (`claim(T_actual) − paid` from the settlement snapshot).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PayoutBooking {
@@ -250,9 +224,8 @@ pub struct PayoutBooking {
 
 /// What a `PushSolution`'s declaration was backed by.
 ///
-/// Three states, spelled out as one type because the block-found path has to
-/// answer two DIFFERENT questions about them and they do not have the same
-/// answer:
+/// Three states in one type because the block-found path asks two DIFFERENT
+/// questions about them, with different answers:
 ///
 /// | backing | book it? | ext 0x0003/Implementation Notes settle, and where |
 /// |---|---|---|
@@ -260,13 +233,9 @@ pub struct PayoutBooking {
 /// | [`Self::UnbookableDistribution`] | no — its snapshot never landed | **at block-found**, see [`Self::settles_here`] |
 /// | [`Self::Bookable`] | yes | after the booking, with every other block |
 ///
-/// The middle row is why this is a type and not an `Option<PayoutBooking>`.
-/// Deriving both answers from `booking.is_some()` collapsed it into the top
-/// row, so a block whose coinbase paid a published distribution on-chain left
-/// that distribution standing for good. `DeclaredJob` has carried `booking`
-/// and `distribution_id` as separate fields since #17 precisely so the two
-/// can be told apart; this is that distinction given a name, at the place
-/// that acts on it.
+/// The middle row is why this is not an `Option<PayoutBooking>`: collapsed
+/// into the top row, a block whose coinbase paid a published distribution
+/// would leave that distribution standing for good.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateBacking {
     /// Base-protocol declaration — no distribution was referenced.
@@ -283,9 +252,8 @@ pub enum CandidateBacking {
 impl CandidateBacking {
     /// Did this block's coinbase pay a distribution the pool PUBLISHED?
     ///
-    /// Not the same question as "can it be booked", and not the same as
-    /// [`Self::settles_here`] either: this one decides whether the block is
-    /// worth assembling and proving at all.
+    /// Not "can it be booked" and not [`Self::settles_here`]: this decides
+    /// whether the block is worth assembling and proving at all.
     pub fn paid_a_published_distribution(&self) -> bool {
         match self {
             Self::BaseProtocol => false,
@@ -296,27 +264,22 @@ impl CandidateBacking {
     /// Must the ext 0x0003/Implementation Notes settle fire at block-found, or
     /// does something later own it?
     ///
-    /// Only [`Self::UnbookableDistribution`], and the asymmetry is not a
-    /// preference. Settling invalidates every published distribution AND
-    /// forces an immediate republish, and that republish rebuilds from the
-    /// LIVE ledger. Fired before the ledger write it re-publishes the very
-    /// balances the block just paid — the standing distribution is swapped
-    /// for an equally stale one, and nothing is closed.
+    /// Only [`Self::UnbookableDistribution`]. Settling invalidates every
+    /// published distribution and forces a republish from the LIVE ledger;
+    /// before the ledger write that would republish the balances the block
+    /// just paid.
     ///
-    /// - [`Self::Bookable`]: its booking is confirmation-gated, and the
-    ///   confirmation watcher settles after the apply. That is the one moment
-    ///   the republish reads a ledger that has moved, so settling here as
-    ///   well would be churn at best.
-    /// - [`Self::UnbookableDistribution`]: no ledger write is ever coming, so
-    ///   no later settle is either. What this buys is not balance freshness —
-    ///   it cannot be — but fail-closed: fresh declarations stop binding to a
-    ///   distribution whose settlement snapshot is provably unresolvable.
+    /// - [`Self::Bookable`]: the confirmation watcher settles after the
+    ///   booking is applied, the moment the ledger has actually moved.
+    /// - [`Self::UnbookableDistribution`]: no ledger write is coming, so no
+    ///   later settle either. Settling here is fail-closed: new declarations
+    ///   stop binding to a distribution whose snapshot is unresolvable.
     /// - [`Self::BaseProtocol`]: nothing was published.
     ///
-    /// The window between a found block and its confirmation therefore stays
-    /// open, deliberately: closing it means the distribution builder has to
-    /// account for parked blocks, and two blocks inside one confirmation
-    /// window needs a pool share orders of magnitude past this one.
+    /// The window between a found block and its confirmation stays open
+    /// deliberately: closing it would make the distribution builder account
+    /// for parked blocks, and two blocks inside one confirmation window need
+    /// a far larger pool share.
     pub fn settles_here(&self) -> bool {
         match self {
             Self::BaseProtocol | Self::Bookable(_) => false,
@@ -343,15 +306,13 @@ mod tests {
         }
     }
 
-    /// The round trip the allocate path actually performs: build the blob
-    /// for the miner's script, then read the script back out. The script is
-    /// what the mining side holds a custom job to, so it has to be the
-    /// miner's, not merely non-empty.
+    /// The allocate path's round trip: build the blob for the miner's script,
+    /// then read the script back. It must be the miner's, since the mining
+    /// side holds a custom job to it.
     ///
-    /// Also pinned byte-for-byte: this is what a JDC receives, and it must
-    /// stay what the former general `(address, sats)` encoder produced —
-    /// output count 1, value 0, `OP_0 <20-byte program>` for the BIP-173
-    /// P2WPKH test vector.
+    /// Also pinned byte-for-byte, as the wire form a JDC receives: output
+    /// count 1, value 0, `OP_0 <20-byte program>` for the BIP-173 P2WPKH
+    /// test vector.
     #[test]
     fn the_designated_script_round_trips_through_the_allocate_blob() {
         let script = bp_mining_job::address_to_script(Network::Regtest, ADDR).unwrap();
@@ -370,9 +331,9 @@ mod tests {
     }
 
     /// An ext 0x0003 allocate sends `[0x00]` (ext 0x0003/Negotiation: outputs
-    /// MUST be empty), and a blob that does not decode is a bug. Both must
-    /// answer `None` so the caller refuses rather than holding a job to a
-    /// script the pool never designated.
+    /// MUST be empty), and a blob may fail to decode. Both answer `None` so
+    /// the caller refuses rather than holding a job to a script the pool
+    /// never designated.
     #[test]
     fn no_designated_script_without_outputs() {
         assert_eq!(designated_payout_script(&[0x00]), None);
@@ -381,9 +342,9 @@ mod tests {
     }
 
     /// The freedoms SV2 JDP/AllocateMiningJobToken.Success grants the JDC,
-    /// each one a case a byte-for-byte or positional check would have wrongly
-    /// rejected: it rewrites the amount (the pool must send 0), reorders, and
-    /// appends outputs of its own — including valued ones.
+    /// each of which a byte-for-byte or positional check would reject: it
+    /// rewrites the amount (the pool sends 0), reorders, and appends outputs
+    /// of its own, including valued ones.
     #[test]
     fn a_reordered_coinbase_with_extra_outputs_still_pays_the_designated_output() {
         let pool = vec![0x00, 0x14, 0xAA];
@@ -416,11 +377,8 @@ mod tests {
         assert!(!pays_designated_output(&[], &pool));
     }
 
-    /// The outputs of a rebuilt declaration — what the removed
-    /// `declared_coinbase_outputs` wrapper used to return. Kept as a test
-    /// helper only: production reads the whole [`DeclaredCoinbase`], so a
-    /// public wrapper would have been scaffolding for an API shape nothing
-    /// calls.
+    /// The outputs of a rebuilt declaration. Test-only: production reads the
+    /// whole [`DeclaredCoinbase`].
     fn declared_outputs(prefix: &[u8], suffix: &[u8]) -> Option<Vec<TxOut>> {
         Some(declared_coinbase_tx(prefix, suffix)?.tx.output)
     }
@@ -465,9 +423,8 @@ mod tests {
         assert_eq!(parsed[0].value.to_sat(), 42);
     }
 
-    // The whole point of rebuilding the transaction: the slot width is derived
-    // from the prefix, so it does not have to be a fixed size — anywhere up to
-    // the consensus ceiling on a coinbase scriptSig.
+    // The slot width is derived from the prefix, so any width up to the
+    // consensus ceiling on a coinbase scriptSig works.
     #[test]
     fn the_slot_width_is_read_from_the_prefix_not_assumed() {
         // 3-byte committed prefix, so slot 97 lands exactly on the 100-byte max.
@@ -480,15 +437,10 @@ mod tests {
         }
     }
 
-    /// "A coinbase has exactly one input" is decided in exactly one place —
-    /// the input-count test inside `extranonce_slot_width` — and every later
-    /// reader depends on it: the ext 0x0003/Output Verification payout check
-    /// takes `tx.output` on trust, and the declaration binding indexes
-    /// `input[0]` without a guard of its own, because a guard there could not
-    /// fire.
-    ///
-    /// So the check gets a test rather than a second copy. Relax it and this
-    /// fails, instead of a non-coinbase quietly reaching the payout path.
+    /// "A coinbase has exactly one input" is decided only in
+    /// `extranonce_slot_width`, and every later reader depends on it: the
+    /// ext 0x0003/Output Verification payout check takes `tx.output` on
+    /// trust, and the declaration binding indexes `input[0]` unguarded.
     #[test]
     fn a_prefix_declaring_more_than_one_input_is_refused() {
         let mut prefix = Vec::new();
@@ -506,14 +458,11 @@ mod tests {
         assert_eq!(extranonce_slot_width(&prefix), Some(0x0F - 3));
     }
 
-    /// The declared scriptSig length decides how many bytes get allocated to
-    /// rebuild the transaction, and it arrives as a CompactSize with no
-    /// inherent ceiling — so a few wire bytes could ask for an arbitrary
-    /// allocation. Anything past the consensus maximum is refused before the
-    /// buffer is sized.
+    /// A declared scriptSig length past the consensus maximum is refused
+    /// before the rebuild buffer is sized.
     ///
-    /// The pair matters: 97 (a 100-byte scriptSig) must still parse, or the
-    /// bound would be refusing coinbases that are perfectly valid.
+    /// The pair matters: 97 (a 100-byte scriptSig) must still parse, so the
+    /// bound refuses no valid coinbase.
     #[test]
     fn an_oversized_declared_script_sig_is_refused_before_allocating() {
         let outputs = suffix_with(&one_output_bytes(7));
@@ -525,8 +474,7 @@ mod tests {
             declared_outputs(&prefix_with(&[0x03, 0xC8, 0x00], 98, 0), &outputs).is_none(),
             "101 bytes is bad-cb-length and must be refused"
         );
-        // The shape that turns a small message into a huge allocation: a
-        // CompactSize claiming gigabytes, with almost nothing behind it.
+        // A CompactSize claiming gigabytes with almost nothing behind it.
         let mut prefix = Vec::new();
         prefix.extend_from_slice(&2u32.to_le_bytes());
         prefix.push(0x01);
@@ -542,19 +490,18 @@ mod tests {
 
     // ── the shape a real JDC actually sends ──────────────────────────
     //
-    // `channels-sv2`'s `JobFactory` (which every SRI jd-client builds its
-    // declaration with) slices a **segwit-serialised** coinbase:
+    // JD-clients typically slice a **segwit-serialised** coinbase:
     //
     //   index  = 4 version + 2 segwit + 1 inputs + 32 outpoint + 4 index
     //          + 1 scriptSig len + script_sig_head
     //   prefix = serialize(coinbase)[..index]
     //   suffix = serialize(coinbase)[index + full_extranonce_size..]
     //
-    // so the prefix carries marker+flag (SRI's hardcoded 43) and the suffix
-    // carries the **witness** as well as nSequence/outputs/nLockTime. Rebuilding
-    // prefix + zeroed slot + suffix therefore reproduces the serialised
-    // transaction byte for byte. This is the realistic path; the fixtures above
-    // use the witness-less form our own coinbase builder emits.
+    // so the prefix carries marker+flag and the suffix carries the
+    // **witness** as well as nSequence/outputs/nLockTime. Rebuilding prefix +
+    // zeroed slot + suffix reproduces the serialised transaction byte for
+    // byte. The fixtures above use the witness-less form the pool's own
+    // coinbase builder emits.
     #[test]
     fn a_declaration_shaped_like_channels_sv2_sends_it_roundtrips() {
         use bitcoin::absolute::LockTime;
@@ -608,11 +555,10 @@ mod tests {
         );
     }
 
-    // The header is WALKED, not assumed at a fixed offset — SRI hardcodes 43,
-    // which holds for the segwit-serialised coinbase a JDC declares but not for
-    // the witness-less one our own builder emits (41). Both must yield the same
-    // slot width, asserted on the derivation itself because the surrounding
-    // `deserialize` would fail for either reason and could not tell them apart.
+    // The header is WALKED, not assumed at a fixed offset: 43 bytes
+    // segwit-serialised, 41 without. Both must yield the same slot width,
+    // asserted on the derivation itself because the surrounding `deserialize`
+    // could not tell the failure causes apart.
     #[test]
     fn the_header_length_is_parsed_for_both_serialisations() {
         let plain = prefix_with(&[0x03, 0xC8, 0x00], /*slot=*/ 12, /*tail=*/ 0);
@@ -644,10 +590,9 @@ mod tests {
         .is_none());
     }
 
-    // The known interop limit, pinned so it is a decision and not a surprise:
-    // scriptSig bytes AFTER the extranonce make the derived width N+T, the
-    // rebuilt scriptSig runs long, and the decode fails. Rejection, never a
-    // wrong accept. SRI's jd-server behaves identically.
+    // The known interop limit, pinned as a decision: scriptSig bytes AFTER
+    // the extranonce make the derived width N+T, the rebuilt scriptSig runs
+    // long, and the decode fails. Rejection, never a wrong accept.
     #[test]
     fn a_declaration_with_scriptsig_bytes_after_the_extranonce_is_refused() {
         let mut suffix = vec![0xAB, 0xCD]; // T = 2 scriptSig bytes

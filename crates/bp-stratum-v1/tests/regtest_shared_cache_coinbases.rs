@@ -8,10 +8,9 @@
 //!
 //!   - miner A (address A) and miner B (address B) have DISTINCT payout
 //!     sets — each `mining.notify` coinbase MUST pay its own finder. A
-//!     cache-key regression (e.g. a field dropped from the job-key
-//!     tuple) would serve miner B the job built for miner A, paying the
-//!     wrong finder on a found block; this test is the end-to-end guard
-//!     the in-crate unit tests can't provide.
+//!     job-key that missed a payout field would serve miner B the job
+//!     built for miner A and pay the wrong finder on a found block; this
+//!     pins that end-to-end, which the in-crate unit tests cannot.
 //!   - miner C authorizes with miner A's address — its coinbase must be
 //!     BYTE-IDENTICAL to A's (the shared build), proving the memoization
 //!     actually engages through the full server path while job ids stay

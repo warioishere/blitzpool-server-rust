@@ -27,7 +27,7 @@ pub struct StatsSinkConfig {
     pub seed_on_spawn: bool,
     /// Phase offset applied to the first tick of the flush loop so
     /// it doesn't fire on the same boot-relative instant as other
-    /// 60 s loops (kill_dead_clients, best_difficulty cron, etc.).
+    /// 60 s loops (e.g. kill_dead_clients).
     /// Default zero — set in the bin to spread PG load.
     pub startup_offset: Duration,
 }

@@ -14,22 +14,16 @@
 //!   on `DeclareMiningJob` / `SetCustomMiningJob`.
 //!
 //! Frames for 0x0001 and 0x0003 messages set `extension_type` to the
-//! extension's identifier (NOT 0x0000), because both extensions
-//! introduce new messages. Worker-ID TLV piggy-backs on the existing
-//! `SubmitSharesExtended` payload, whose frame retains
+//! extension's identifier (NOT 0x0000), because both introduce new messages.
+//! The Worker-ID TLV rides on `SubmitSharesExtended`, whose frame keeps
 //! `extension_type = 0x0000`.
 //!
-//! Body fields use the standard SV2 little-endian encoding. **TLV headers are
-//! little-endian too**: SV2 Overview/Stratum V2 TLV Encoding Model types the
-//! header fields as U16/U8, and U16 is little-endian everywhere in SV2. The
-//! worked example in ext 0x0002/Extended SubmitSharesExtended Message Format
-//! shows the extension type as `00 02` — big-endian, contradicting that. We
-//! treat the example as the error and the data-type rule as binding. Note this
-//! is a spec-level contradiction, not a stray example in an extension: the
-//! SAME byte sequence appears in the core
-//! SV2 Overview/Stratum V2 TLV Encoding Model, in the section that defines the
-//! convention it breaks. Worth raising upstream rather than working around
-//! twice. Worker-ID has a 32-byte cap on `user_identity`
+//! Body fields are SV2 little-endian. **TLV headers are little-endian too**:
+//! SV2 Overview/Stratum V2 TLV Encoding Model types them as U16/U8, and U16
+//! is LE in SV2. The worked examples there and in ext 0x0002/Extended
+//! SubmitSharesExtended Message Format show `00 02` (big-endian); the
+//! data-type rule is treated as binding and the examples as the error.
+//! Worker-ID caps `user_identity` at 32 bytes
 //! (ext 0x0002/TLV Format for user_identity).
 
 // ── Spec constants ─────────────────────────────────────────────────
@@ -58,12 +52,9 @@ pub enum ExtensionsParseError {
 
 // ── Minimal LE/BE codec helpers (private) ──────────────────────────
 //
-// We keep these in-file rather than depend on `stratum_core::binary_sv2`
-// because the SV2 spec pins exact byte sequences and we want the Rust tests to
-// assert against the same fixtures with no abstraction drift. Everything is
-// straight-line LE — body fields and TLV headers alike
-// (SV2 Overview/Stratum V2 TLV Encoding Model types TLV headers as U16/U8, and
-// U16 is LE in SV2).
+// In-file rather than `stratum_core::binary_sv2`, so the tests assert exact
+// spec byte sequences with no abstraction in between. Everything is LE,
+// body fields and TLV headers alike.
 
 struct Reader<'a> {
     buf: &'a [u8],
@@ -221,8 +212,7 @@ impl SetPayoutDistribution {
         out
     }
 
-    /// Needed by our tests standing in for a JDC (and by any future
-    /// client-side use); the JDS itself only serializes.
+    /// For tests standing in for a JDC; the JDS itself only serializes.
     pub fn deserialize(buf: &[u8]) -> Result<Self, ExtensionsParseError> {
         let mut r = Reader::new(buf);
         let distribution_id = r.read_u64_le()?;
@@ -412,7 +402,7 @@ mod tests {
             parse_distribution_id_tlv(std::slice::from_ref(&parsed)),
             Some(0xDEADBEEF00C0FFEE)
         );
-        // And the reference encoder produces our exact bytes.
+        // And the upstream encoder produces the same bytes.
         assert_eq!(parsed.encode().unwrap(), wire);
     }
 
@@ -454,10 +444,8 @@ mod tests {
     #[test]
     fn worker_id_tlv_wire_layout_is_little_endian() {
         // SV2 Overview/Stratum V2 TLV Encoding Model types the header as
-        // U16|U8 + U16 — U16 is LE in SV2.
-        // (ext 0x0002/Extended SubmitSharesExtended Message Format example
-        // shows `00 02 …`, contradicting the base data-type convention; the
-        // example is wrong.)
+        // U16|U8 + U16, and U16 is LE in SV2 (the `00 02 …` example in
+        // ext 0x0002/Extended SubmitSharesExtended Message Format is wrong).
         let wire = hex::decode("0200010a00576f726b65725f303031").unwrap();
         let parsed = Tlv::decode(&wire).expect("reference decode");
         assert_eq!(

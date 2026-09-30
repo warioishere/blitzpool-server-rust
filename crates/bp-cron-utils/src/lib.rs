@@ -13,9 +13,6 @@
 //!   synthetic negative-unix-seconds blockHeight values for sweep /
 //!   audit rows whose `(blockHeight, …)` UNIQUE index must not
 //!   collide on sub-second re-triggers.
-//!
-//! Consumers: `bp-pplns-engine::sweep`, `bp-group-solo-engine::sweep`,
-//! and any future engine that needs daily-cron primitives.
 
 use std::sync::{Arc, Mutex};
 
