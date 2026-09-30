@@ -86,7 +86,9 @@ use bp_mining_job::assemble_witness_coinbase;
 use bp_stratum_v2::jdp::client::{
     parse_user_identifier_as_address, AllocateTokenContext, DeclarationRef, SolutionHeader,
 };
-use bp_stratum_v2::jdp::dynamic_outputs::{designated_output_blob, CandidateBacking};
+use bp_stratum_v2::jdp::dynamic_outputs::{
+    declared_coinbase_tx, designated_output_blob, CandidateBacking,
+};
 use bp_stratum_v2::jdp_server::{
     AllocateOutcome, CurrentPrevHashProvider, JdpAllocateResolver, JdpBlockSubmissionSink,
     JdpServerHooks, PayoutDistributionSource, TemplateTxProvider,
@@ -1228,6 +1230,29 @@ pub(crate) struct ProductionJobValidator {
     engine: Arc<BitcoinCoreIPCEngine>,
 }
 
+/// Whether upstream's engine can rebuild this declared coinbase safely.
+///
+/// The engine runs inside this process, and it rebuilds the coinbase BEFORE
+/// the pool's own [`declared_coinbase_tx`] ever sees it. Upstream reads the
+/// scriptSig length at a fixed byte 43 — the segwit layout: version (4),
+/// marker+flag (2), one input (1), outpoint (36) — and sizes the extranonce
+/// gap from it with no bound and no length check on the prefix. A shape it
+/// does not expect takes down the calling task or the whole process
+/// (`jdp_validation_regtest` has one per shape).
+///
+/// So only the shape upstream assumes is let through: the pool's own
+/// reconstruction must succeed (exactly one input, scriptSig at most 100
+/// bytes, the prefix ending inside the scriptSig) AND the segwit marker must
+/// sit at bytes 4..6. The marker is not optional here: without it, byte 43 is
+/// inside the scriptSig, the JDC writes it, and the pool's reconstruction
+/// passing says nothing about what upstream reads there.
+///
+/// Refusing a marker-less coinbase costs no honest JDC: upstream would parse
+/// one at the wrong offset anyway, so it never validated.
+fn upstream_can_rebuild_coinbase(prefix: &[u8], suffix: &[u8]) -> bool {
+    prefix.get(4..6) == Some(&[0x00, 0x01][..]) && declared_coinbase_tx(prefix, suffix).is_some()
+}
+
 impl ProductionJobValidator {
     /// The data directory upstream's engine needs to arrive at `socket_path`.
     ///
@@ -1326,6 +1351,17 @@ impl ProductionJobValidator {
 #[async_trait]
 impl DeclaredJobValidator for ProductionJobValidator {
     async fn validate_declaration(&self, job: DeclaredJobToValidate<'_>) -> JobVerdict {
+        // First, before anything reaches the engine: see
+        // `upstream_can_rebuild_coinbase`.
+        if !upstream_can_rebuild_coinbase(job.coinbase_tx_prefix, job.coinbase_tx_suffix) {
+            warn!(
+                session_id = job.session_id,
+                prefix_len = job.coinbase_tx_prefix.len(),
+                "jdp: declared coinbase is not a single-input segwit coinbase with a scriptSig \
+                 of at most 100 bytes — rejecting before it reaches the validation engine"
+            );
+            return JobVerdict::Rejected("invalid-coinbase-tx".to_string());
+        }
         // Rebuild the SV2 message the engine expects. Every field comes
         // straight from the frame the JDC sent; `mining_job_token` and
         // `excess_data` are not part of the consensus question, so a
@@ -1481,6 +1517,222 @@ mod jdp_validation_regtest {
 
         cancel.cancel();
         node.shutdown().await.expect("regtest shutdown");
+    }
+
+    /// Hand one declared coinbase to the validator wired to a real node, and
+    /// return its verdict — if the process is still there to return one.
+    async fn verdict_from_a_real_node(prefix: &[u8], suffix: &[u8]) -> Option<JobVerdict> {
+        let cfg = bp_regtest_harness::RegtestConfig::default();
+        if !cfg.is_available() {
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!(
+                    "skipping JDP-validation regtest — {}",
+                    cfg.unavailable_reason()
+                );
+            }
+            return None;
+        }
+        let node = bp_regtest_harness::RegtestNode::start_with(cfg)
+            .await
+            .expect("regtest start");
+        node.generate_to_self(101)
+            .await
+            .expect("mine 101 blocks for IBD-exit");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let validator = ProductionJobValidator::connect(
+            node.ipc_socket_path(),
+            bp_config::Network::Regtest,
+            cancel.clone(),
+        )
+        .await
+        .expect("connect")
+        .expect("regtest has a socket layout");
+
+        let verdict = validator
+            .validate_declaration(DeclaredJobToValidate {
+                session_id: 1,
+                version: 0x2000_0000,
+                coinbase_tx_prefix: prefix,
+                coinbase_tx_suffix: suffix,
+                wtxid_list: &[],
+                known_raw_txs: &[],
+            })
+            .await;
+
+        cancel.cancel();
+        node.shutdown().await.expect("regtest shutdown");
+        Some(verdict)
+    }
+
+    fn assert_refused_as_invalid_coinbase(verdict: Option<JobVerdict>, shape: &str) {
+        match verdict {
+            None => {} // skipped, reported above
+            Some(JobVerdict::Rejected(code)) => assert_eq!(code, "invalid-coinbase-tx", "{shape}"),
+            Some(JobVerdict::Accepted) => panic!("{shape}: accepted"),
+            Some(JobVerdict::NeedsTransactions) => panic!("{shape}: asked for transactions"),
+        }
+    }
+
+    // The three shapes upstream's coinbase rebuild cannot survive. Each one
+    // goes through the REAL engine: the point is what it does to this
+    // process, which a stub cannot show.
+
+    /// Without the guard this panics the calling task: upstream slices the
+    /// prefix from byte 43 on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prefix_too_short_for_upstream_is_refused() {
+        let verdict = verdict_from_a_real_node(&[0u8; 10], &[]).await;
+        assert_refused_as_invalid_coinbase(verdict, "10-byte prefix");
+    }
+
+    /// Without the guard this aborts the whole test process: upstream trusts
+    /// the scriptSig length and allocates it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scriptsig_length_upstream_would_allocate_is_refused() {
+        let prefix = super::coinbase_shapes::segwit_header_with_script_sig_len(1 << 42);
+        let verdict = verdict_from_a_real_node(&prefix, &[]).await;
+        assert_refused_as_invalid_coinbase(verdict, "segwit prefix, scriptSig length 2^42");
+    }
+
+    /// Without the guard this aborts too, and it is the shape a check of our
+    /// own alone lets through: without the segwit marker, upstream's fixed
+    /// offset 43 reads inside the scriptSig, which the JDC writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_coinbase_without_the_segwit_marker_is_refused() {
+        let (prefix, suffix) = super::coinbase_shapes::legacy_with_huge_length_at_offset_43();
+        assert!(
+            bp_stratum_v2::jdp::dynamic_outputs::declared_coinbase_tx(&prefix, &suffix).is_some(),
+            "precondition: the pool's own reconstruction accepts this coinbase"
+        );
+        let verdict = verdict_from_a_real_node(&prefix, &suffix).await;
+        assert_refused_as_invalid_coinbase(verdict, "non-segwit coinbase");
+    }
+}
+
+/// Coinbase byte shapes for the guard in front of upstream's engine, built
+/// through rust-bitcoin so an honest shape is a real transaction.
+#[cfg(test)]
+mod coinbase_shapes {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    /// Version, segwit marker+flag, one input, a null outpoint — the 43 bytes
+    /// upstream assumes — followed by a scriptSig length and nothing else.
+    pub(super) fn segwit_header_with_script_sig_len(len: u64) -> Vec<u8> {
+        let mut prefix = vec![2, 0, 0, 0, 0x00, 0x01, 0x01];
+        prefix.extend_from_slice(&[0u8; 32]);
+        prefix.extend_from_slice(&[0xff; 4]);
+        prefix.extend_from_slice(&bitcoin::consensus::serialize(&bitcoin::VarInt(len)));
+        prefix
+    }
+
+    /// `(prefix, suffix)` of `tx`, with the last `slot` scriptSig bytes cut
+    /// out as the extranonce slot.
+    fn split_at_slot(tx: &Transaction, slot: usize) -> (Vec<u8>, Vec<u8>) {
+        let raw = bitcoin::consensus::serialize(tx);
+        let script_sig = tx.input[0].script_sig.as_bytes();
+        let marker = if tx.input[0].witness.is_empty() { 0 } else { 2 };
+        // version + marker + input count + outpoint + scriptSig length byte
+        let script_start = 4 + marker + 1 + 36 + 1;
+        let slot_start = script_start + script_sig.len() - slot;
+        (
+            raw[..slot_start].to_vec(),
+            raw[slot_start + slot..].to_vec(),
+        )
+    }
+
+    fn coinbase(script_sig: Vec<u8>, witness: Witness) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(script_sig),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::new_op_return([]),
+            }],
+        }
+    }
+
+    /// What a JDC declares: BIP-34 height push, 8-byte extranonce slot, the
+    /// witness reserved value — so it serialises with the segwit marker.
+    pub(super) fn honest_segwit() -> (Vec<u8>, Vec<u8>) {
+        let mut script_sig = vec![0x03, 0x65, 0x00, 0x00];
+        script_sig.extend_from_slice(&[0u8; 8]);
+        let tx = coinbase(script_sig, Witness::from_slice(&[[0u8; 32]]));
+        split_at_slot(&tx, 8)
+    }
+
+    /// The same coinbase with no witness, so no marker: the scriptSig length
+    /// sits at byte 41 and upstream's byte 43 is scriptSig byte 1.
+    pub(super) fn honest_legacy() -> (Vec<u8>, Vec<u8>) {
+        let mut script_sig = vec![0x03, 0x65, 0x00, 0x00];
+        script_sig.extend_from_slice(&[0u8; 8]);
+        split_at_slot(&coinbase(script_sig, Witness::new()), 8)
+    }
+
+    /// A marker-less coinbase whose scriptSig bytes 1..10 read, at upstream's
+    /// offset 43, as the CompactSize `0xff` + 2^42 — a valid scriptSig of 10
+    /// bytes to anyone who parses the transaction properly.
+    pub(super) fn legacy_with_huge_length_at_offset_43() -> (Vec<u8>, Vec<u8>) {
+        let mut script_sig = vec![0x01, 0xff];
+        script_sig.extend_from_slice(&(1u64 << 42).to_le_bytes());
+        split_at_slot(&coinbase(script_sig, Witness::new()), 0)
+    }
+}
+
+#[cfg(test)]
+mod upstream_coinbase_guard_tests {
+    use super::coinbase_shapes::*;
+    use super::*;
+
+    /// The shape an SRI jd-client declares still reaches the node. A guard
+    /// that refused it would switch validation off for every honest JDC.
+    #[test]
+    fn an_honest_segwit_coinbase_passes() {
+        let (prefix, suffix) = honest_segwit();
+        assert!(upstream_can_rebuild_coinbase(&prefix, &suffix));
+    }
+
+    /// The marker clause is what refuses this, not the pool's own
+    /// reconstruction — which accepts it.
+    #[test]
+    fn a_coinbase_without_the_segwit_marker_is_refused() {
+        for (label, (prefix, suffix)) in [
+            ("honest legacy", honest_legacy()),
+            (
+                "legacy with 0xff at byte 43",
+                legacy_with_huge_length_at_offset_43(),
+            ),
+        ] {
+            assert!(
+                declared_coinbase_tx(&prefix, &suffix).is_some(),
+                "{label}: precondition — our own reconstruction accepts it"
+            );
+            assert!(!upstream_can_rebuild_coinbase(&prefix, &suffix), "{label}");
+        }
+    }
+
+    #[test]
+    fn a_prefix_shorter_than_the_segwit_header_is_refused() {
+        assert!(!upstream_can_rebuild_coinbase(&[0u8; 10], &[]));
+        assert!(!upstream_can_rebuild_coinbase(&[], &[]));
+    }
+
+    /// Over the consensus bound of 100 bytes — the bound that keeps
+    /// upstream's extranonce gap small.
+    #[test]
+    fn a_scriptsig_length_past_the_consensus_bound_is_refused() {
+        for len in [101, 1 << 42] {
+            let prefix = segwit_header_with_script_sig_len(len);
+            assert!(!upstream_can_rebuild_coinbase(&prefix, &[]), "len {len}");
+        }
     }
 }
 
