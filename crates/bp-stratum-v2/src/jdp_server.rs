@@ -302,6 +302,9 @@ fn ordered_raw_txs(by_position: &std::collections::HashMap<u32, Vec<u8>>) -> Vec
 pub trait DeclaredJobValidator: Send + Sync {
     /// Ask the node whether this declared job is valid.
     async fn validate_declaration(&self, job: DeclaredJobToValidate<'_>) -> JobVerdict;
+
+    /// The JDP session is gone; drop whatever the validator keeps for it.
+    fn session_closed(&self, session_id: u32);
 }
 
 /// One declared job, in the shape a node-side validator needs.
@@ -318,9 +321,13 @@ pub struct DeclaredJobToValidate<'a> {
     /// Raw transactions the pool can already supply. The node reports back
     /// whatever it still misses rather than guessing.
     pub known_raw_txs: &'a [Vec<u8>],
+    /// Which leg of the round-trip this is. A node-side validator that keeps
+    /// state between the two legs needs to know where a declaration starts.
+    pub leg: DeclarationLeg,
 }
 
 /// What the node said about a declared job.
+#[derive(Debug)]
 pub enum JobVerdict {
     /// Validated — the node accepts the job.
     Accepted,
@@ -1509,6 +1516,9 @@ async fn run_jdp_connection(
     if evicted > 0 {
         debug!("jdp {session_id_hex} disconnect evicted {evicted} declared jobs from bridge");
     }
+    if let Some(validator) = hooks.job_validator.as_ref() {
+        validator.session_closed(session_id);
+    }
     let _ = writer.shutdown().await;
     Ok(())
 }
@@ -1779,6 +1789,7 @@ async fn node_refuses_declaration(
             coinbase_tx_suffix: &declared.coinbase_tx_suffix,
             wtxid_list: &declared.wtxid_list,
             known_raw_txs,
+            leg,
         })
         .await;
     let (error_code, error_details): (String, &[u8]) = match (verdict, leg) {
@@ -1808,8 +1819,8 @@ async fn node_refuses_declaration(
 /// Which leg of the SV2 JDP/ProvideMissingTransactions round-trip a node
 /// verdict answers — it decides whether "the node lacks transactions" is a
 /// question still open or a refusal.
-#[derive(Clone, Copy, Debug)]
-enum DeclarationLeg {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclarationLeg {
     /// The `DeclareMiningJob` itself. Whatever the node lacks, the pool can
     /// still ask the JDC for.
     Declare,
@@ -2325,6 +2336,8 @@ mod tests {
                 .pop_front()
                 .unwrap_or(JobVerdict::Accepted)
         }
+
+        fn session_closed(&self, _session_id: u32) {}
     }
 
     /// Issue a real token to `ADDR` on this session. Declares have to name

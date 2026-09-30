@@ -65,8 +65,9 @@ use bp_stratum_v2::jdp::dynamic_outputs::{
 };
 use bp_stratum_v2::jdp::payout_distribution::{compute_payout_vector, WeightedOutput};
 use bp_stratum_v2::jdp_server::{
-    AllocateOutcome, CurrentPrevHashProvider, JdpAllocateResolver, JdpBlockSubmissionSink,
-    JdpServerHooks, PayoutDistributionSource, StratumV2JdpServer, TailoredDistribution,
+    AllocateOutcome, CurrentPrevHashProvider, DeclaredJobToValidate, DeclaredJobValidator,
+    JdpAllocateResolver, JdpBlockSubmissionSink, JdpServerHooks, JobVerdict,
+    PayoutDistributionSource, StratumV2JdpServer, TailoredDistribution,
 };
 use bp_stratum_v2::jdp_server_codec::EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION;
 use bp_stratum_v2::noise::NoiseConfig;
@@ -1929,6 +1930,67 @@ async fn a_tailored_session_that_becomes_pplns_drops_its_tailored_slot() {
     )
     .await;
     expect_declare_success(read_jdc(&mut reader).await, 10);
+
+    accept_handle.abort();
+    server.shutdown().await;
+}
+
+/// Records which sessions it was told are closed; accepts every declaration.
+#[derive(Default)]
+struct ClosedSessions {
+    closed: Mutex<Vec<u32>>,
+}
+
+#[async_trait]
+impl DeclaredJobValidator for ClosedSessions {
+    async fn validate_declaration(&self, _job: DeclaredJobToValidate<'_>) -> JobVerdict {
+        JobVerdict::Accepted
+    }
+
+    fn session_closed(&self, session_id: u32) {
+        self.closed.lock().unwrap().push(session_id);
+    }
+}
+
+/// A JDP connection that goes away releases what the node-side validator
+/// holds for it. Upstream's engine keeps a per-session entry and only drops it
+/// when told; session ids are never reused, so an entry nobody releases stays
+/// for the life of the process.
+///
+/// Both directions: nothing is released while the connection is still open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_connection_is_released_by_the_validator() {
+    let validator = Arc::new(ClosedSessions::default());
+    let noise_config = NoiseConfig::new(TEST_PUB.parse().unwrap(), TEST_PRV.parse().unwrap());
+    let mut hooks = JdpServerHooks::no_op();
+    hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+    let server = StratumV2JdpServer::spawn(
+        noise_config,
+        hooks,
+        Arc::new(RwLock::new(JdpDeclaredJobRegistry::new())),
+        Duration::from_secs(60),
+    );
+    let (addr, accept_handle) = accept_loop(server.clone()).await;
+
+    let (mut reader, mut writer) = connect_jdc(addr).await;
+    write_msg(&mut writer, setup_connection(addr.port())).await;
+    expect_setup_success(read_jdc(&mut reader).await);
+    assert!(
+        validator.closed.lock().unwrap().is_empty(),
+        "an open connection must not be released"
+    );
+
+    drop(reader);
+    drop(writer);
+    wait_until(Duration::from_secs(5), || {
+        !validator.closed.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(
+        validator.closed.lock().unwrap().len(),
+        1,
+        "the closed connection must be released exactly once"
+    );
 
     accept_handle.abort();
     server.shutdown().await;

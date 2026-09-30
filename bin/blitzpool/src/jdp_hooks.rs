@@ -1216,7 +1216,9 @@ fn log_booking_status(miner_address: &AddressId, backing: CandidateBacking) {
 // same `node.sock`. Nothing here replaces that path.
 
 use bitcoin_core_sv2::runtime_api::BitcoinCoreVersion;
-use bp_stratum_v2::jdp_server::{DeclaredJobToValidate, DeclaredJobValidator, JobVerdict};
+use bp_stratum_v2::jdp_server::{
+    DeclarationLeg, DeclaredJobToValidate, DeclaredJobValidator, JobVerdict,
+};
 use jd_server_sv2::job_declarator::job_validation::{
     bitcoin_core_ipc::BitcoinCoreIPCEngine, DeclareMiningJobResult, JobValidationEngine,
 };
@@ -1395,6 +1397,18 @@ impl DeclaredJobValidator for ProductionJobValidator {
             excess_data,
         };
 
+        // The engine keeps per-session state between the two legs of ONE
+        // declaration, keyed by the request id and token — both zero here, so
+        // one slot per session. A new declaration starts that slot fresh:
+        // otherwise its first leg is compared against the PREVIOUS
+        // declaration's chain context, and a tip change in between reads as
+        // `stale-chain-tip`. The second leg keeps the first leg's context,
+        // which is the drift the engine is meant to catch.
+        match job.leg {
+            DeclarationLeg::Declare => self.engine.cleanup_downstream(job.session_id as usize),
+            DeclarationLeg::Completed => {}
+        }
+
         // Hand over every raw transaction we already hold, so the node only
         // reports what is genuinely missing rather than everything.
         let provided: Vec<stratum_core::binary_sv2::B016MOwned> = job
@@ -1421,6 +1435,10 @@ impl DeclaredJobValidator for ProductionJobValidator {
             // from the JDC; the second leg asks again with the full set.
             DeclareMiningJobResult::MissingTransactions(_) => JobVerdict::NeedsTransactions,
         }
+    }
+
+    fn session_closed(&self, session_id: u32) {
+        self.engine.cleanup_downstream(session_id as usize);
     }
 }
 
@@ -1519,9 +1537,13 @@ mod jdp_validation_regtest {
         node.shutdown().await.expect("regtest shutdown");
     }
 
-    /// Hand one declared coinbase to the validator wired to a real node, and
-    /// return its verdict — if the process is still there to return one.
-    async fn verdict_from_a_real_node(prefix: &[u8], suffix: &[u8]) -> Option<JobVerdict> {
+    /// A validator wired to a fresh regtest node past IBD, or `None` (with a
+    /// skip line) when no `bitcoin-node` is available.
+    async fn real_validator() -> Option<(
+        bp_regtest_harness::RegtestNode,
+        Arc<dyn DeclaredJobValidator>,
+        tokio_util::sync::CancellationToken,
+    )> {
         let cfg = bp_regtest_harness::RegtestConfig::default();
         if !cfg.is_available() {
             #[allow(clippy::print_stderr)]
@@ -1548,18 +1570,41 @@ mod jdp_validation_regtest {
         .await
         .expect("connect")
         .expect("regtest has a socket layout");
+        Some((node, validator, cancel))
+    }
 
+    /// One declared coinbase, no transactions, declare leg.
+    fn declaration<'a>(
+        prefix: &'a [u8],
+        suffix: &'a [u8],
+        wtxid_list: &'a [[u8; 32]],
+        known_raw_txs: &'a [Vec<u8>],
+        leg: DeclarationLeg,
+    ) -> DeclaredJobToValidate<'a> {
+        DeclaredJobToValidate {
+            session_id: 1,
+            version: 0x2000_0000,
+            coinbase_tx_prefix: prefix,
+            coinbase_tx_suffix: suffix,
+            wtxid_list,
+            known_raw_txs,
+            leg,
+        }
+    }
+
+    /// Hand one declared coinbase to the validator wired to a real node, and
+    /// return its verdict — if the process is still there to return one.
+    async fn verdict_from_a_real_node(prefix: &[u8], suffix: &[u8]) -> Option<JobVerdict> {
+        let (node, validator, cancel) = real_validator().await?;
         let verdict = validator
-            .validate_declaration(DeclaredJobToValidate {
-                session_id: 1,
-                version: 0x2000_0000,
-                coinbase_tx_prefix: prefix,
-                coinbase_tx_suffix: suffix,
-                wtxid_list: &[],
-                known_raw_txs: &[],
-            })
+            .validate_declaration(declaration(
+                prefix,
+                suffix,
+                &[],
+                &[],
+                DeclarationLeg::Declare,
+            ))
             .await;
-
         cancel.cancel();
         node.shutdown().await.expect("regtest shutdown");
         Some(verdict)
@@ -1607,6 +1652,62 @@ mod jdp_validation_regtest {
         );
         let verdict = verdict_from_a_real_node(&prefix, &suffix).await;
         assert_refused_as_invalid_coinbase(verdict, "non-segwit coinbase");
+    }
+
+    /// Long enough for the engine's own template monitor to see a block just
+    /// mined — it waits on bitcoin-core's `waitNext`, which returns on a tip
+    /// change.
+    const ENGINE_SEES_NEW_TIP: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// A declaration's first leg is judged on its own, not against whatever
+    /// the session declared before it.
+    ///
+    /// The engine keeps state per session between the legs of one
+    /// declaration, keyed by a request id and token the pool always passes as
+    /// zero. So the previous declaration's context was still there when the
+    /// next one started, and a tip change in between turned a plain "missing
+    /// transactions" into `stale-chain-tip`.
+    ///
+    /// Both directions: a SECOND leg that straddles a tip change must stay
+    /// `stale-chain-tip`, so this cannot pass by switching the engine's drift
+    /// check off.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tip_change_between_two_declarations_is_not_a_stale_tip() {
+        let Some((node, validator, cancel)) = real_validator().await else {
+            return;
+        };
+        let (prefix, suffix) = super::coinbase_shapes::honest_segwit();
+        // A wtxid no node has seen: the engine stops at "missing" and never
+        // needs a block it would accept.
+        let unknown = [[0x5a; 32]];
+        let leg =
+            |leg| validator.validate_declaration(declaration(&prefix, &suffix, &unknown, &[], leg));
+
+        let first = leg(DeclarationLeg::Declare).await;
+        assert!(
+            matches!(first, JobVerdict::NeedsTransactions),
+            "precondition: the engine reports the unknown wtxid missing, got {first:?}"
+        );
+
+        node.generate_to_self(1).await.expect("mine a block");
+        tokio::time::sleep(ENGINE_SEES_NEW_TIP).await;
+        let next = leg(DeclarationLeg::Declare).await;
+        assert!(
+            matches!(next, JobVerdict::NeedsTransactions),
+            "a new declaration after a tip change is not stale, got {next:?}"
+        );
+
+        node.generate_to_self(1).await.expect("mine a block");
+        tokio::time::sleep(ENGINE_SEES_NEW_TIP).await;
+        let completed = leg(DeclarationLeg::Completed).await;
+        assert!(
+            matches!(&completed, JobVerdict::Rejected(code) if code == "stale-chain-tip"),
+            "negative control: the second leg of a declaration that straddles a tip change \
+             IS stale, got {completed:?}"
+        );
+
+        cancel.cancel();
+        node.shutdown().await.expect("regtest shutdown");
     }
 }
 
