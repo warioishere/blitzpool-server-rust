@@ -41,6 +41,11 @@ use bp_stratum_v2::mining::submit as mining_submit;
 const PAIRS: &[(&str, &str, &str)] = &[
     // ── SetupConnection (common) ────────────────────────────────────
     (
+        bp_stratum_v2::codec_common::ERR_PROTOCOL_VERSION_MISMATCH,
+        common::ERROR_CODE_SETUP_CONNECTION_PROTOCOL_VERSION_MISMATCH,
+        "SetupConnection.Error / protocol-version-mismatch (mining and JDP)",
+    ),
+    (
         jdp_client::ERR_UNSUPPORTED_PROTOCOL,
         common::ERROR_CODE_SETUP_CONNECTION_UNSUPPORTED_PROTOCOL,
         "JDP SetupConnection.Error / unsupported-protocol",
@@ -194,15 +199,6 @@ fn every_shared_error_code_still_matches_the_sv2_message_crates() {
 /// `stale-chain-tip` as a reason to leave the pool.
 #[test]
 fn the_codes_we_diverge_on_are_still_the_ones_we_chose() {
-    // A JDP version mismatch. The mining side answers
-    // `protocol-version-mismatch`, and so does the reference JD-server; this
-    // side says something else.
-    assert_eq!(jdp_client::ERR_UNSUPPORTED_VERSION, "unsupported-version");
-    assert_eq!(
-        mining_client::ERR_PROTOCOL_VERSION_MISMATCH,
-        "protocol-version-mismatch"
-    );
-
     // A coinbase that violates its referenced payout set. Upstream names
     // `invalid-coinbase-tx` for both messages; the pool is more specific
     // about which job parameter was at fault.

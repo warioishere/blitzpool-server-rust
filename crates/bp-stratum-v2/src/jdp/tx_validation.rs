@@ -114,9 +114,8 @@ pub struct PendingDeclaration {
 /// order they were requested" — it fixes the order, and one-entry-per-
 /// requested-position follows from that but is not spelled out as a MUST. We
 /// enforce the count, because a shorter list would silently shift every later
-/// position onto the wrong transaction. A mismatch is treated as a JDC
-/// protocol-error — the caller decides whether to silently drop or reset the
-/// connection.
+/// position onto the wrong transaction. A mismatch is a JDC protocol error;
+/// the handler answers it `missing-txs`.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MergeError {
     #[error("expected {expected} transactions, got {got}")]

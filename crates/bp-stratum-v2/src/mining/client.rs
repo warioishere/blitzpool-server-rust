@@ -155,10 +155,6 @@ pub const MAX_EXTENDED_ROLLABLE: usize = 16;
 
 // ── Wire error codes (SV2 spec setup/open-channel error strings) ────
 
-/// `protocol-version-mismatch` — miner's version range doesn't intersect
-/// `[MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION]`.
-pub const ERR_PROTOCOL_VERSION_MISMATCH: &str = "protocol-version-mismatch";
-
 /// `unsupported-protocol` — we don't accept this sub-protocol value.
 /// Used for `protocol = 2` (TDP-only) until that path is wired.
 pub const ERR_UNSUPPORTED_PROTOCOL: &str = "unsupported-protocol";
@@ -892,7 +888,7 @@ pub fn handle_setup_connection<C: Clock>(
 ) -> HandlerOutcome {
     let Some(used_version) = negotiate_version(input.min_version, input.max_version) else {
         return setup_rejected(
-            ERR_PROTOCOL_VERSION_MISMATCH,
+            crate::codec_common::ERR_PROTOCOL_VERSION_MISMATCH,
             format!(
                 "version range {}–{} does not include {MIN_PROTOCOL_VERSION}",
                 input.min_version, input.max_version
@@ -2871,12 +2867,10 @@ pub fn handle_set_custom_mining_job<C: Clock>(
             // Tip binding: the custom job MUST build on the tip its declaration
             // was accepted under. A mismatch is the stale-tip race (the chain
             // advanced between declare and submit) — classified retryable via
-            // `stale-chain-tip`, never as a parameter violation. Unknowable
-            // (`None`) when the pool had no tip at accept time.
-            if let Some(declared) = job.declared_prev_hash {
-                if input.prev_hash != declared {
-                    return reject(ERR_STALE_CHAIN_TIP);
-                }
+            // `stale-chain-tip`, never as a parameter violation. Always
+            // checkable: a declaration is only accepted under a known tip.
+            if input.prev_hash != job.declared_prev_hash {
+                return reject(ERR_STALE_CHAIN_TIP);
             }
 
             // Declaration binding: the job asked for here MUST be the job the
@@ -3426,7 +3420,10 @@ pub(crate) mod tests {
         let out = handle_setup_connection(&mut s, &input);
         match &out.outbound[0] {
             OutboundFrame::SetupConnectionError { error_code, .. } => {
-                assert_eq!(error_code, ERR_PROTOCOL_VERSION_MISMATCH);
+                assert_eq!(
+                    error_code,
+                    crate::codec_common::ERR_PROTOCOL_VERSION_MISMATCH
+                );
             }
             _ => panic!("expected error"),
         }
@@ -6481,7 +6478,7 @@ pub(crate) mod tests {
             request_id: 1,
             mining_job_token: entry.declared_job.new_token,
             version: b.version,
-            prev_hash: entry.declared_job.prev_hash.unwrap_or([0xAB; 32]),
+            prev_hash: entry.declared_job.prev_hash,
             min_ntime: 0x6500_0001,
             n_bits: 0x1d00_ffff,
             coinbase_tx_version: b.coinbase_tx_version,
@@ -6536,7 +6533,7 @@ pub(crate) mod tests {
                 coinbase_tx_suffix,
                 wtxid_list,
                 raw_transactions,
-                prev_hash: Some([0xAB; 32]),
+                prev_hash: [0xAB; 32],
                 declared_at_ms: 1_000,
                 booking: None,
                 distribution_id: None,
@@ -7163,7 +7160,7 @@ pub(crate) mod tests {
         let token = Token([1u8; 16]);
         let mut entry = bridge_entry_for(token, REGTEST_ADDR, 42);
         // Declared under a DIFFERENT tip than the job builds on (0xAB).
-        entry.declared_job.prev_hash = Some([0xCD; 32]);
+        entry.declared_job.prev_hash = [0xCD; 32];
         let input = custom_job_input(cid, token);
         let out = handle_set_custom_mining_job(
             &mut s,
@@ -7218,30 +7215,6 @@ pub(crate) mod tests {
         }
         let ch = s.channels.get(&cid).unwrap();
         assert!(ch.extended_jobs.is_empty(), "no job may be registered");
-    }
-
-    /// A declaration accepted while the pool had no tip (`None`) is not
-    /// checkable — the tip binding is skipped, not failed.
-    #[test]
-    fn set_custom_mining_job_unknowable_declared_tip_accepts() {
-        let mut s = solo_session_with_extended_channel();
-        let cid = s.primary_channel.unwrap();
-        let token = Token([1u8; 16]);
-        let mut entry = bridge_entry_for(token, REGTEST_ADDR, 42);
-        entry.declared_job.prev_hash = None;
-        let input = custom_job_input(cid, token);
-        let out = handle_set_custom_mining_job(
-            &mut s,
-            &input,
-            Some(&job_ref_for(&entry)),
-            None,
-            None,
-            1_000,
-        );
-        assert!(matches!(
-            out.outbound[0],
-            OutboundFrame::SetCustomMiningJobSuccess { .. }
-        ));
     }
 
     // ── ext 0x0003 distribution validation on SetCustomMiningJob ───
@@ -9046,7 +9019,7 @@ pub(crate) mod tests {
                 coinbase_tx_suffix: raw[index + FIXTURE_DECLARED_SLOT..].to_vec(),
                 wtxid_list,
                 raw_transactions,
-                prev_hash: Some([0xAB; 32]),
+                prev_hash: [0xAB; 32],
                 declared_at_ms: 1_000,
                 booking: None,
                 distribution_id: None,

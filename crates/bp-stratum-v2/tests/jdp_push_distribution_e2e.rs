@@ -442,8 +442,7 @@ async fn jdp_push_distribution_end_to_end() {
         .expect("an accepted declaration MUST be resolvable by the mining side");
     assert_eq!(job_ref.miner_address.as_str(), REGTEST_ADDR);
     assert_eq!(
-        job_ref.declared_prev_hash,
-        Some(PREV_HASH),
+        job_ref.declared_prev_hash, PREV_HASH,
         "the mining side rejects a custom job that does not build on this tip"
     );
     assert_eq!(

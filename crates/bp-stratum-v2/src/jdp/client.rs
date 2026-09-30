@@ -93,10 +93,6 @@ fn is_jdp_extension_supported(ext: u16) -> bool {
 /// other than JOB_DECLARATION (1).
 pub const ERR_UNSUPPORTED_PROTOCOL: &str = "unsupported-protocol";
 
-/// `unsupported-version` — `SetupConnection.min_version`/`max_version`
-/// didn't include 2.
-pub const ERR_UNSUPPORTED_VERSION: &str = "unsupported-version";
-
 /// `unsupported-feature-flags` — JDC sent `DeclareMiningJob` without
 /// negotiating `DECLARE_TX_DATA` (Full-Template mode).
 ///
@@ -156,6 +152,13 @@ pub const ERR_STALE_CHAIN_TIP: &str = "stale-chain-tip";
 /// its position stays missing — and a declaration the node never saw whole
 /// was never validated.
 pub const ERR_MISSING_TXS: &str = "missing-txs";
+
+/// How many declarations one connection may have waiting for their
+/// `ProvideMissingTransactions.Success` at once. A JDC declares per template,
+/// so a second one can be in flight before the first round-trip returns; the
+/// bound only stops a JDC that never answers from growing the session. Same
+/// size as the declared-job store (`MAX_DECLARED_JOBS`).
+pub const MAX_PENDING_DECLARATIONS: usize = 3;
 
 // ── Inputs (typed wrappers over deserialized SV2 frames) ────────────
 
@@ -479,11 +482,48 @@ pub struct JdpSessionState {
     /// Per-connection declared-jobs store (FIFO `MAX_DECLARED_JOBS`).
     pub declared_jobs: DeclaredJobStore,
 
-    /// In-flight `DeclareMiningJob` waiting for a
-    /// `ProvideMissingTransactions.Success` response. At most one per
-    /// connection; a second `DeclareMiningJob` arriving while a
-    /// pending one is in-flight overwrites it.
-    pub pending_declaration: Option<PendingState>,
+    /// In-flight `DeclareMiningJob`s waiting for their
+    /// `ProvideMissingTransactions.Success`, by `request_id`.
+    pub pending_declarations: PendingDeclarations,
+}
+
+/// The declarations waiting for their `ProvideMissingTransactions.Success`,
+/// oldest first, at most [`MAX_PENDING_DECLARATIONS`].
+#[derive(Debug, Default)]
+pub struct PendingDeclarations(std::collections::VecDeque<PendingState>);
+
+impl PendingDeclarations {
+    /// Hold `pending`, replacing one under the same `request_id`. Returns the
+    /// declaration it pushed out when the bound was already reached.
+    fn insert(&mut self, pending: PendingState) -> Option<PendingState> {
+        self.0
+            .retain(|held| held.pending.request_id != pending.pending.request_id);
+        let evicted = if self.0.len() >= MAX_PENDING_DECLARATIONS {
+            self.0.pop_front()
+        } else {
+            None
+        };
+        self.0.push_back(pending);
+        evicted
+    }
+
+    pub fn get(&self, request_id: u32) -> Option<&PendingState> {
+        self.0
+            .iter()
+            .find(|held| held.pending.request_id == request_id)
+    }
+
+    pub fn take(&mut self, request_id: u32) -> Option<PendingState> {
+        let position = self
+            .0
+            .iter()
+            .position(|held| held.pending.request_id == request_id)?;
+        self.0.remove(position)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// In-flight declaration state — wraps [`PendingDeclaration`] with
@@ -513,7 +553,7 @@ impl JdpSessionState {
             negotiated_extensions: HashSet::new(),
             tokens: TokenStore::new(),
             declared_jobs: DeclaredJobStore::new(),
-            pending_declaration: None,
+            pending_declarations: PendingDeclarations::default(),
         }
     }
 
@@ -532,7 +572,7 @@ impl JdpSessionState {
 /// - Protocol mismatch (`!= JOB_DECLARATION`) → `SetupConnectionError`
 ///   with `unsupported-protocol` + [`JdpSessionEvent::Disconnect`].
 /// - Version range outside `[MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION]`
-///   → `SetupConnectionError` with `unsupported-version` + Disconnect.
+///   → `SetupConnectionError` with `protocol-version-mismatch` + Disconnect.
 /// - Else → `SetupConnectionSuccess` echoing the negotiated
 ///   `DECLARE_TX_DATA` flag (bit 0). Other flag bits are masked off.
 pub fn handle_setup_connection(
@@ -552,7 +592,7 @@ pub fn handle_setup_connection(
     let Some(used_version) = negotiate_version(input.min_version, input.max_version) else {
         let mut outcome = JdpHandlerOutcome::with_frame(JdpOutboundFrame::SetupConnectionError {
             flags: input.flags,
-            error_code: ERR_UNSUPPORTED_VERSION.to_string(),
+            error_code: crate::codec_common::ERR_PROTOCOL_VERSION_MISMATCH.to_string(),
         });
         outcome.push_event(JdpSessionEvent::Disconnect {
             reason: format!(
@@ -860,21 +900,7 @@ pub fn handle_declare_mining_job(
         request_id: input.request_id,
         unknown_tx_position_list: partition.missing_positions.clone(),
     });
-    // Only one round-trip is tracked per connection, so a JDC that sends a
-    // second `DeclareMiningJob` before answering the first
-    // `ProvideMissingTransactions` loses the first one. Its `request_id` is
-    // then never answered — neither Success nor Error — and that JDC waits
-    // for a frame that will not come. Say so: the alternative is a
-    // declaration disappearing without a trace.
-    if let Some(abandoned) = state.pending_declaration.as_ref() {
-        tracing::warn!(
-            abandoned_request_id = abandoned.pending.request_id,
-            request_id = input.request_id,
-            "jdp: a second DeclareMiningJob arrived while one was in flight — the \
-             first is abandoned and its request_id will never be answered"
-        );
-    }
-    state.pending_declaration = Some(PendingState {
+    let evicted = state.pending_declarations.insert(PendingState {
         input: input.clone(),
         pending: PendingDeclaration {
             request_id: input.request_id,
@@ -884,6 +910,17 @@ pub fn handle_declare_mining_job(
         miner_address,
         prev_hash_at_declare: ctx.current_prev_hash,
     });
+    // Only past MAX_PENDING_DECLARATIONS round-trips nobody answered. The
+    // dropped one's `request_id` is never answered; say so rather than let a
+    // declaration disappear without a trace.
+    if let Some(dropped) = evicted {
+        tracing::warn!(
+            dropped_request_id = dropped.pending.request_id,
+            request_id = input.request_id,
+            "jdp: too many declarations waiting for ProvideMissingTransactions.Success — \
+             the oldest is dropped and its request_id will never be answered"
+        );
+    }
     // Epoch staleness is observed in `accept_declaration` (the path that
     // actually validates the payout set), reached here once the
     // `ProvideMissingTransactions.Success` round-trip completes.
@@ -894,10 +931,10 @@ pub fn handle_declare_mining_job(
 
 /// Handle `ProvideMissingTransactions.Success`.
 ///
-/// - No pending declaration → silently dropped (a spurious Success
-///   without a pending request indicates a JDC bug).
+/// - No pending declaration under its `request_id` → silently dropped (a
+///   spurious Success indicates a JDC bug).
 /// - Position-count mismatch ([`merge_provided_with_known`] errors
-///   with `MergeError::PositionCountMismatch`) → silently dropped.
+///   with `MergeError::PositionCountMismatch`) → `missing-txs`.
 /// - Successful merge → accept the declaration (same path as the
 ///   fully-covered case in [`handle_declare_mining_job`]).
 ///
@@ -910,16 +947,9 @@ pub fn handle_provide_missing_transactions_success(
     input: &ProvideMissingTransactionsSuccessInput,
     ctx: DeclarationContext,
 ) -> JdpHandlerOutcome {
-    let pending = match state.pending_declaration.take() {
-        Some(p) => p,
-        None => return JdpHandlerOutcome::default(),
-    };
-    if pending.pending.request_id != input.request_id {
-        // Mismatched request_id — restore the pending state so a
-        // later matching Success can resolve it.
-        state.pending_declaration = Some(pending);
+    let Some(pending) = state.pending_declarations.take(input.request_id) else {
         return JdpHandlerOutcome::default();
-    }
+    };
     // Tip-drift check: if the chain advanced during the missing-transactions
     // round-trip, the declared job references a superseded template. Reject
     // `stale-chain-tip` (retryable — the JDC re-declares against its new
@@ -934,7 +964,20 @@ pub fn handle_provide_missing_transactions_success(
     }
     let merged = match merge_provided_with_known(pending.pending, input.transaction_list.clone()) {
         Ok(m) => m,
-        Err(_) => return JdpHandlerOutcome::default(),
+        Err(err) => {
+            tracing::warn!(
+                request_id = input.request_id,
+                %err,
+                "jdp: ProvideMissingTransactions.Success does not fit the positions asked for — \
+                 rejecting the declaration"
+            );
+            return JdpHandlerOutcome::declare_error(
+                input.request_id,
+                ERR_MISSING_TXS,
+                b"ProvideMissingTransactions.Success does not carry one transaction per \
+                  requested position",
+            );
+        }
     };
     accept_declaration(state, &pending.input, merged, pending.miner_address, ctx)
 }
@@ -948,6 +991,22 @@ fn accept_declaration(
     miner_address: AddressId,
     ctx: DeclarationContext,
 ) -> JdpHandlerOutcome {
+    // A declaration is bound to the tip the pool is on: the mining side holds
+    // every `SetCustomMiningJob` built on it to that tip. Without one (the
+    // pool has not seen its first template yet) there is nothing to bind to,
+    // so it is refused with the one code a JD-client retries.
+    let Some(prev_hash) = ctx.current_prev_hash else {
+        tracing::warn!(
+            request_id = input.request_id,
+            "jdp: declaration arrived before the pool knows a chain tip — rejecting retryably"
+        );
+        return JdpHandlerOutcome::declare_error(
+            input.request_id,
+            ERR_STALE_CHAIN_TIP,
+            b"the pool has no chain tip yet",
+        );
+    };
+
     // The coinbase must rebuild, on EVERY connection — not just the 0x0003
     // ones whose payout check happens to need it.
     //
@@ -1173,7 +1232,7 @@ fn accept_declaration(
         coinbase_tx_suffix: input.coinbase_tx_suffix.clone(),
         wtxid_list: input.wtxid_list.clone(),
         raw_transactions,
-        prev_hash: ctx.current_prev_hash,
+        prev_hash,
         declared_at_ms: ctx.now_ms,
         booking: declared_booking,
         distribution_id: declared_distribution_id,
@@ -1601,7 +1660,10 @@ mod tests {
         let out = handle_setup_connection(&mut s, &input);
         match &out.outbound[0] {
             JdpOutboundFrame::SetupConnectionError { error_code, .. } => {
-                assert_eq!(error_code, ERR_UNSUPPORTED_VERSION);
+                assert_eq!(
+                    error_code,
+                    crate::codec_common::ERR_PROTOCOL_VERSION_MISMATCH
+                );
             }
             _ => panic!("expected SetupConnectionError"),
         }
@@ -1924,7 +1986,52 @@ mod tests {
         }
         assert!(matches!(out.events[0], JdpSessionEvent::JobDeclared { .. }));
         assert_eq!(s.declared_jobs.len(), 1);
-        assert!(s.pending_declaration.is_none());
+        assert!(s.pending_declarations.is_empty());
+    }
+
+    /// A declaration the pool cannot pin to a chain tip is not accepted: it
+    /// is answered `stale-chain-tip`, the one code a JD-client retries, and
+    /// the next template brings the tip.
+    ///
+    /// Accepting it stored a declaration with no tip, and the mining side
+    /// then had nothing to hold its `SetCustomMiningJob.prev_hash` to — the
+    /// tip binding was skipped for exactly that job.
+    ///
+    /// Both directions: the identical declaration with a tip is accepted.
+    #[test]
+    fn a_declaration_before_the_pool_knows_a_tip_is_refused_retryably() {
+        let wtxid = [0x01; 32];
+        let mut tpl = HashMap::new();
+        tpl.insert(wtxid, vec![0xCA; 16]);
+        let declare_on = |current_prev_hash: Option<[u8; 32]>| {
+            let mut s = fresh();
+            let token = complete_setup_and_allocate(&mut s);
+            let ctx = DeclarationContext {
+                current_prev_hash,
+                ..ctx(3_000)
+            };
+            let out = declared(&mut s, &declare(3, token, vec![wtxid]), &tpl, ctx);
+            (out, s.declared_jobs.len())
+        };
+
+        let (refused, stored) = declare_on(None);
+        match &refused.outbound[0] {
+            JdpOutboundFrame::DeclareMiningJobError { error_code, .. } => {
+                assert_eq!(error_code, ERR_STALE_CHAIN_TIP);
+            }
+            other => panic!("expected DeclareMiningJobError, got {other:?}"),
+        }
+        assert_eq!(stored, 0, "nothing may be stored without a tip");
+
+        let (accepted, stored) = declare_on(Some([0xAB; 32]));
+        assert!(
+            matches!(
+                accepted.outbound[0],
+                JdpOutboundFrame::DeclareMiningJobSuccess { .. }
+            ),
+            "negative control: with a tip the same declaration is accepted"
+        );
+        assert_eq!(stored, 1);
     }
 
     /// INTEROP: a declaration in the same second as an allocate must be
@@ -2566,67 +2673,98 @@ mod tests {
             }
             _ => panic!("expected ProvideMissingTransactions"),
         }
-        assert!(s.pending_declaration.is_some());
+        assert!(!s.pending_declarations.is_empty());
         assert_eq!(s.declared_jobs.len(), 0, "not accepted yet");
     }
 
-    /// A JDC that pipelines a second `DeclareMiningJob` before answering
-    /// the first `ProvideMissingTransactions` loses the first: one
-    /// round-trip is tracked per connection. Pinned in both directions —
-    /// the second declaration becomes the pending one, AND the first is
-    /// gone for good, so its `Success` is dropped rather than accepted
-    /// against the wrong declaration.
-    #[test]
-    fn a_second_declare_abandons_the_in_flight_one() {
-        let mut s = fresh();
-        let token = complete_setup_and_allocate(&mut s);
+    /// Declare one job that needs a round-trip, on a fresh token allocated at
+    /// `now_ms`, and assert the round-trip went out.
+    fn declare_pending(s: &mut JdpSessionState, request_id: u32, now_ms: u64) {
         let known = [0x01; 32];
         let missing = [0x02; 32];
         let mut tpl = HashMap::new();
         tpl.insert(known, vec![0xCA; 16]);
-
-        declared(
-            &mut s,
-            &declare(4, token, vec![known, missing]),
+        let token = allocate_another(s, 100 + request_id, now_ms);
+        let out = declared(
+            s,
+            &declare(request_id, token, vec![known, missing]),
             &tpl,
-            ctx(3_000),
+            ctx(now_ms),
         );
-        // The pipelining JDC's second declaration rides its next token — the
-        // first one went with the declaration it is about to abandon.
-        let token = allocate_another(&mut s, 2, 3_050);
-        assert_eq!(
-            s.pending_declaration.as_ref().unwrap().pending.request_id,
-            4
+        assert!(
+            matches!(
+                out.outbound.first(),
+                Some(JdpOutboundFrame::ProvideMissingTransactions { .. })
+            ),
+            "precondition: declaration {request_id} needs a round-trip"
         );
+    }
 
-        declared(
-            &mut s,
-            &declare(5, token, vec![known, missing]),
-            &tpl,
-            ctx(3_100),
-        );
-        assert_eq!(
-            s.pending_declaration.as_ref().unwrap().pending.request_id,
-            5,
-            "the second declaration takes the slot"
-        );
-
-        // The abandoned round-trip cannot be completed any more: its
-        // Success is silently dropped and nothing is declared.
-        let out = handle_provide_missing_transactions_success(
-            &mut s,
+    /// Complete the round-trip of `request_id` and return what it answered.
+    fn complete(s: &mut JdpSessionState, request_id: u32, now_ms: u64) -> Option<JdpOutboundFrame> {
+        handle_provide_missing_transactions_success(
+            s,
             &ProvideMissingTransactionsSuccessInput {
-                request_id: 4,
+                request_id,
                 transaction_list: vec![vec![0xBB; 16]],
             },
-            ctx(3_200),
-        );
-        assert!(out.outbound.is_empty(), "no frame for an abandoned request");
-        assert_eq!(s.declared_jobs.len(), 0, "nothing was declared");
+            ctx(now_ms),
+        )
+        .outbound
+        .into_iter()
+        .next()
+    }
+
+    fn accepted_as(frame: Option<JdpOutboundFrame>, expected: u32) -> bool {
+        matches!(
+            frame,
+            Some(JdpOutboundFrame::DeclareMiningJobSuccess { request_id, .. })
+                if request_id == expected
+        )
+    }
+
+    /// A JDC may declare again before it has answered the first
+    /// `ProvideMissingTransactions` — the reference JD-server keeps every
+    /// pending declaration by `request_id`. Both complete, in whichever
+    /// order the JDC answers.
+    ///
+    /// One pending slot per connection used to hand the second declaration
+    /// the first one's slot, and the first was never answered at all.
+    #[test]
+    fn two_declarations_in_flight_both_complete() {
+        let mut s = fresh();
+        let _ = handle_setup_connection(&mut s, &good_setup());
+        declare_pending(&mut s, 4, 1_000);
+        declare_pending(&mut s, 5, 2_000);
+
+        assert!(accepted_as(complete(&mut s, 5, 2_100), 5), "the later one");
         assert!(
-            s.pending_declaration.is_some(),
-            "the live round-trip #5 is untouched"
+            accepted_as(complete(&mut s, 4, 2_200), 4),
+            "and the earlier one"
         );
+        assert_eq!(s.declared_jobs.len(), 2);
+    }
+
+    /// Pending declarations are bounded: past [`MAX_PENDING_DECLARATIONS`]
+    /// the oldest is dropped, so a JDC that never answers cannot grow the
+    /// session. The ones still held complete normally.
+    #[test]
+    fn past_the_bound_the_oldest_pending_declaration_is_dropped() {
+        let mut s = fresh();
+        let _ = handle_setup_connection(&mut s, &good_setup());
+        let over = MAX_PENDING_DECLARATIONS as u32 + 1;
+        for request_id in 1..=over {
+            declare_pending(&mut s, request_id, u64::from(request_id) * 1_000);
+        }
+
+        let now = u64::from(over + 1) * 1_000;
+        assert_eq!(complete(&mut s, 1, now), None, "the oldest was dropped");
+        for request_id in 2..=over {
+            assert!(
+                accepted_as(complete(&mut s, request_id, now), request_id),
+                "pending declaration {request_id} must still complete"
+            );
+        }
     }
 
     // ── ProvideMissingTransactions.Success ────────────────────────
@@ -2653,7 +2791,7 @@ mod tests {
             _ => panic!("expected DeclareMiningJobSuccess"),
         }
         assert_eq!(s.declared_jobs.len(), 1);
-        assert!(s.pending_declaration.is_none());
+        assert!(s.pending_declarations.is_empty());
     }
 
     /// Chain tip advances during the missing-transactions round-trip →
@@ -2696,7 +2834,7 @@ mod tests {
         }
         assert_eq!(s.declared_jobs.len(), 0, "stale job must not be stored");
         assert!(
-            s.pending_declaration.is_none(),
+            s.pending_declarations.is_empty(),
             "pending state is consumed — the JDC re-declares fresh"
         );
     }
@@ -2729,7 +2867,7 @@ mod tests {
                 ..ctx(3_000)
             },
         );
-        assert!(s.pending_declaration.is_some());
+        assert!(!s.pending_declarations.is_empty());
         let success = ProvideMissingTransactionsSuccessInput {
             request_id: 5,
             transaction_list: vec![vec![0xFE; 16]],
@@ -2829,8 +2967,12 @@ mod tests {
         assert!(out.outbound.is_empty());
     }
 
+    /// A `ProvideMissingTransactions.Success` that does not carry one
+    /// transaction per requested position is answered `missing-txs`, as the
+    /// reference JD-server does — not left without any answer, which kept
+    /// the JDC waiting for a declaration that could no longer complete.
     #[test]
-    fn provide_missing_length_mismatch_is_silently_dropped() {
+    fn provide_missing_length_mismatch_is_refused_missing_txs() {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
         let wtxid_a = [0x01; 32];
@@ -2843,7 +2985,18 @@ mod tests {
             transaction_list: vec![vec![0xFE; 16]],
         };
         let out = handle_provide_missing_transactions_success(&mut s, &bad_success, ctx(4_000));
-        assert!(out.outbound.is_empty());
+        match out.outbound.first() {
+            Some(JdpOutboundFrame::DeclareMiningJobError {
+                request_id,
+                error_code,
+                ..
+            }) => {
+                assert_eq!(*request_id, 6);
+                assert_eq!(error_code, ERR_MISSING_TXS);
+            }
+            other => panic!("expected DeclareMiningJobError, got {other:?}"),
+        }
+        assert!(s.declared_jobs.is_empty());
     }
 
     // ── PushSolution ───────────────────────────────────────────────

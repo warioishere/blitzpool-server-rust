@@ -3408,7 +3408,7 @@ mod tests {
             coinbase_tx_suffix,
             wtxid_list: vec![],
             raw_transactions: Default::default(),
-            prev_hash: Some([0xAB; 32]),
+            prev_hash: [0xAB; 32],
             declared_at_ms: 1_000,
             booking: None,
             distribution_id: Some(5),

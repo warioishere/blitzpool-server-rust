@@ -178,6 +178,15 @@ pub(crate) fn str0255(s: String) -> Result<stratum_core::binary_sv2::Str0255Owne
 
 // ── Messages both sub-protocols carry ───────────────────────────────
 
+/// `protocol-version-mismatch` — the peer's `SetupConnection` version range
+/// does not include [`crate::protocol_version::MIN_PROTOCOL_VERSION`].
+///
+/// One constant for both sub-protocols: it answers the same message for the
+/// same reason on either port. The JDP side used to say
+/// `unsupported-version` instead — the same condition under a second name,
+/// and not the one the reference JD-server sends.
+pub const ERR_PROTOCOL_VERSION_MISMATCH: &str = "protocol-version-mismatch";
+
 /// Inputs from a deserialized `SetupConnection` frame, narrowed to what the
 /// handlers read. The mining and the JDP handler both take it.
 #[derive(Clone, Debug)]

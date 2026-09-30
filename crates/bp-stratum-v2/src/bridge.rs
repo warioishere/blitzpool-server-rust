@@ -172,10 +172,8 @@ pub struct BridgeJobRef {
     /// Miner address bound to the token (cross-checked against the mining
     /// channel's locked address).
     pub miner_address: AddressId,
-    /// Pool chain-tip the declaration was accepted under. `None` when the
-    /// pool had no tip at accept time (cold start) — then the mining-side
-    /// tip binding is not checkable.
-    pub declared_prev_hash: Option<[u8; 32]>,
+    /// Pool chain-tip the declaration was accepted under.
+    pub declared_prev_hash: [u8; 32],
     /// The declared job's coinbase and transaction set, projected down to
     /// what `SetCustomMiningJob` repeats
     /// ([`crate::jdp::custom_job_binding`]). `None` when the stored
@@ -1098,7 +1096,7 @@ mod tests {
             coinbase_tx_suffix: suffix,
             wtxid_list: vec![],
             raw_transactions: Map::new(),
-            prev_hash: Some([0xAB; 32]),
+            prev_hash: [0xAB; 32],
             declared_at_ms: 1_000,
             booking: None,
             distribution_id: None,
@@ -1133,7 +1131,7 @@ mod tests {
 
         let job_ref = reg.job_ref(&t).expect("registered token must resolve");
         assert_eq!(job_ref.miner_address, addr());
-        assert_eq!(job_ref.declared_prev_hash, Some([0xAB; 32]));
+        assert_eq!(job_ref.declared_prev_hash, [0xAB; 32]);
 
         let binding = job_ref
             .binding

@@ -1675,25 +1675,22 @@ async fn dispatch_jdp_inbound(
             // on every round-trip of the default configuration.
             //
             // `None` from any step means there is nothing to re-validate —
-            // no pending round-trip, a `request_id` that answers a different
-            // one, or a payload that does not fit the merge — and the handler
-            // refuses it on its own grounds a moment later.
+            // no round-trip pending under this `request_id`, or a payload
+            // that does not fit the merge — and the handler refuses it on its
+            // own grounds a moment later.
             //
-            // The `request_id` equality belongs HERE and not only in the
+            // The lookup by `request_id` belongs HERE and not only in the
             // handler, for the same reason the declare arm spends its token
             // before doing any of this: a `Success` naming a request the
-            // session never asked about is answered with no frame at all, and
-            // the handler puts the pending round-trip straight back. Left to
-            // the handler alone, one declaration bought an unbounded number
-            // of node round-trips and merge-sized clones off a single token —
-            // the position count is the only other gate, and the pool itself
+            // session never asked about is answered with no frame at all and
+            // leaves the pending round-trips as they were. Left to the handler
+            // alone, one declaration bought an unbounded number of node
+            // round-trips and merge-sized clones off a single token — the
+            // position count is the only other gate, and the pool itself
             // announced that number in the `ProvideMissingTransactions` it
             // sent.
             let completed = hooks.job_validator.as_ref().and_then(|validator| {
-                let pending = state.pending_declaration.as_ref()?;
-                if pending.pending.request_id != input.request_id {
-                    return None;
-                }
+                let pending = state.pending_declarations.get(input.request_id)?;
                 let merged = merge_provided_with_known(
                     pending.pending.clone(),
                     input.transaction_list.clone(),
@@ -1714,7 +1711,7 @@ async fn dispatch_jdp_inbound(
                 {
                     // Drop the pending declaration with it, otherwise the
                     // session keeps a half-finished round-trip.
-                    state.pending_declaration = None;
+                    state.pending_declarations.take(input.request_id);
                     return refusal;
                 }
             }
@@ -1724,8 +1721,8 @@ async fn dispatch_jdp_inbound(
             // declare's referenced id, so a supersession or settlement during
             // the round-trip is seen.
             let pending_distribution_id = state
-                .pending_declaration
-                .as_ref()
+                .pending_declarations
+                .get(input.request_id)
                 .and_then(|p| p.input.distribution_id);
             let distribution =
                 resolve_distribution_acceptance(bridge, session_id, pending_distribution_id);
@@ -1733,8 +1730,8 @@ async fn dispatch_jdp_inbound(
             // declaration was accepted for, which `accept_declaration` reads
             // back out of it.
             let pending_miner = state
-                .pending_declaration
-                .as_ref()
+                .pending_declarations
+                .get(input.request_id)
                 .map(|p| p.miner_address.clone());
             let current_mode = match pending_miner {
                 Some(miner) => hooks.distribution_source.current_mode(&miner).await,
@@ -2400,7 +2397,7 @@ mod tests {
             other => panic!("expected DeclareMiningJobError, got {other:?}"),
         }
         assert!(
-            state.pending_declaration.is_none(),
+            state.pending_declarations.is_empty(),
             "a refused declaration must leave no half-finished round-trip behind"
         );
     }
@@ -2611,7 +2608,7 @@ mod tests {
             "a Success for another request must not be handed to the node"
         );
         assert!(
-            state.pending_declaration.is_some(),
+            !state.pending_declarations.is_empty(),
             "precondition for the loop this guards: the round-trip survives"
         );
 
@@ -2696,7 +2693,7 @@ mod tests {
         );
         assert!(state.declared_jobs.is_empty());
         assert!(
-            state.pending_declaration.is_none(),
+            state.pending_declarations.is_empty(),
             "a refused declaration must leave no half-finished round-trip behind"
         );
 
@@ -3191,7 +3188,7 @@ mod tests {
             coinbase_tx_suffix: vec![],
             wtxid_list: vec![],
             raw_transactions: HashMap::new(),
-            prev_hash: Some([0xCC; 32]),
+            prev_hash: [0xCC; 32],
             declared_at_ms: 500,
             booking: None,
             distribution_id: None,
@@ -3204,7 +3201,7 @@ mod tests {
         let entry = r.job_ref(&token).expect("must be registered");
         assert_eq!(entry.jdp_session_id, 42);
         assert_eq!(entry.miner_address.as_str(), ADDR);
-        assert_eq!(entry.declared_prev_hash, Some([0xCC; 32]));
+        assert_eq!(entry.declared_prev_hash, [0xCC; 32]);
     }
 
     /// Both Coinbase-only allocates reach the mining side, each saying WHICH

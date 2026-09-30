@@ -24,9 +24,7 @@
 //! rule is most-recent-first. We prefer a `prev_hash` match and fall back to
 //! most-recent, which cannot pick a job the spec would have rejected — it only
 //! declines to reconstruct against a declaration the solution demonstrably
-//! does not belong to. Declarations that pre-date the JDS observing a current
-//! prev_hash store `prev_hash = None` and are reachable through the fallback
-//! alone.
+//! does not belong to.
 //!
 //! ## FIFO eviction
 //!
@@ -84,12 +82,11 @@ pub struct DeclaredJob {
     /// plus the `ProvideMissingTransactions` round-trip (see
     /// `jdp::tx_validation` — landing in a follow-up commit).
     pub raw_transactions: HashMap<u32, Vec<u8>>,
-    /// `prev_hash` of the JDS's current template at declaration
-    /// time. `None` if the JDS hadn't yet received its first
-    /// `SetNewPrevHash` — defensive, the field is used as a
-    /// preferred-match key by `match_for_solution` but solutions
-    /// without a hit fall back to the most-recent declaration.
-    pub prev_hash: Option<[u8; 32]>,
+    /// `prev_hash` of the pool's current template at declaration time — the
+    /// tip every `SetCustomMiningJob` on this declaration is held to, and the
+    /// preferred-match key of `match_for_solution`. Always known: a
+    /// declaration that arrives before the pool has a tip is refused.
+    pub prev_hash: [u8; 32],
     /// Wall-clock ms when this declaration was stored.
     pub declared_at_ms: u64,
     /// How a block found on this job is booked, carried from the ext-0x0003
@@ -182,10 +179,8 @@ impl DeclaredJobStore {
     ///    solution's `prev_hash`. Among matches, pick the most
     ///    recently declared.
     /// 2. Fall back to the most-recently-declared job overall when
-    ///    no `prev_hash` match exists — defensive for declarations
-    ///    that pre-date the JDS observing a current prev_hash. This
-    ///    fallback IS the spec's rule (SV2 JDP/PushSolution); step 1 is
-    ///    our narrowing of it.
+    ///    no `prev_hash` match exists. This fallback IS the spec's rule
+    ///    (SV2 JDP/PushSolution); step 1 is our narrowing of it.
     ///
     /// Returns `None` only when the store is empty.
     pub fn match_for_solution(&self, solution_prev_hash: &[u8; 32]) -> Option<&DeclaredJob> {
@@ -193,12 +188,10 @@ impl DeclaredJobStore {
         let mut overall_recent: Option<&DeclaredJob> = None;
 
         for job in self.jobs.values() {
-            if let Some(stored) = job.prev_hash {
-                if &stored == solution_prev_hash {
-                    match prev_hash_match {
-                        Some(current) if current.declared_at_ms >= job.declared_at_ms => {}
-                        _ => prev_hash_match = Some(job),
-                    }
+            if &job.prev_hash == solution_prev_hash {
+                match prev_hash_match {
+                    Some(current) if current.declared_at_ms >= job.declared_at_ms => {}
+                    _ => prev_hash_match = Some(job),
                 }
             }
             match overall_recent {
@@ -232,7 +225,7 @@ mod tests {
         Token(b)
     }
 
-    fn job(token_seed: u8, declared_at: u64, prev_hash: Option<[u8; 32]>) -> DeclaredJob {
+    fn job(token_seed: u8, declared_at: u64, prev_hash: [u8; 32]) -> DeclaredJob {
         DeclaredJob {
             new_token: tok(token_seed),
             miner_address: AddressId::new("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap(),
@@ -260,7 +253,7 @@ mod tests {
     #[test]
     fn insert_then_get_returns_same_job() {
         let mut s = DeclaredJobStore::new();
-        let j = job(0x01, 1_000, None);
+        let j = job(0x01, 1_000, ph(0x00));
         s.insert(j.clone());
         let stored = s.get(&tok(0x01)).expect("must be found");
         assert_eq!(stored, &j);
@@ -277,11 +270,11 @@ mod tests {
     #[test]
     fn cap_of_three_evicts_oldest_on_fourth_insert() {
         let mut s = DeclaredJobStore::new();
-        s.insert(job(0x01, 1_000, None));
-        s.insert(job(0x02, 2_000, None));
-        s.insert(job(0x03, 3_000, None));
+        s.insert(job(0x01, 1_000, ph(0x00)));
+        s.insert(job(0x02, 2_000, ph(0x00)));
+        s.insert(job(0x03, 3_000, ph(0x00)));
         assert_eq!(s.len(), 3);
-        s.insert(job(0x04, 4_000, None));
+        s.insert(job(0x04, 4_000, ph(0x00)));
         assert_eq!(s.len(), 3);
         // The oldest, 0x01, is gone; 0x02/0x03/0x04 remain.
         assert!(s.get(&tok(0x01)).is_none(), "oldest is evicted");
@@ -296,14 +289,14 @@ mod tests {
     #[test]
     fn replace_existing_token_preserves_fifo_position() {
         let mut s = DeclaredJobStore::new();
-        s.insert(job(0x01, 1_000, None));
-        s.insert(job(0x02, 2_000, None));
-        s.insert(job(0x03, 3_000, None));
-        s.insert(job(0x01, 9_999, None));
+        s.insert(job(0x01, 1_000, ph(0x00)));
+        s.insert(job(0x02, 2_000, ph(0x00)));
+        s.insert(job(0x03, 3_000, ph(0x00)));
+        s.insert(job(0x01, 9_999, ph(0x00)));
         assert_eq!(s.len(), 3, "a replace does not evict");
         assert_eq!(s.get(&tok(0x01)).unwrap().declared_at_ms, 9_999);
         // Next insert evicts 0x01 (still at the front), not 0x02.
-        s.insert(job(0x04, 4_000, None));
+        s.insert(job(0x04, 4_000, ph(0x00)));
         assert!(s.get(&tok(0x01)).is_none());
         assert!(s.get(&tok(0x02)).is_some());
     }
@@ -325,8 +318,8 @@ mod tests {
     #[test]
     fn match_for_solution_picks_prev_hash_match() {
         let mut s = DeclaredJobStore::new();
-        s.insert(job(0x01, 1_000, Some(ph(0xAA))));
-        s.insert(job(0x02, 2_000, Some(ph(0xBB))));
+        s.insert(job(0x01, 1_000, ph(0xAA)));
+        s.insert(job(0x02, 2_000, ph(0xBB)));
         let matched = s.match_for_solution(&ph(0xAA)).unwrap();
         assert_eq!(matched.new_token, tok(0x01));
     }
@@ -336,9 +329,9 @@ mod tests {
     #[test]
     fn match_for_solution_prefers_most_recent_prev_hash_match() {
         let mut s = DeclaredJobStore::new();
-        s.insert(job(0x01, 1_000, Some(ph(0xAA))));
-        s.insert(job(0x02, 5_000, Some(ph(0xAA)))); // newer same prev_hash
-        s.insert(job(0x03, 3_000, Some(ph(0xAA)))); // older same prev_hash
+        s.insert(job(0x01, 1_000, ph(0xAA)));
+        s.insert(job(0x02, 5_000, ph(0xAA))); // newer same prev_hash
+        s.insert(job(0x03, 3_000, ph(0xAA))); // older same prev_hash
         let matched = s.match_for_solution(&ph(0xAA)).unwrap();
         assert_eq!(matched.new_token, tok(0x02));
     }
@@ -347,25 +340,12 @@ mod tests {
     #[test]
     fn match_for_solution_falls_back_to_most_recent_when_no_prev_hash_match() {
         let mut s = DeclaredJobStore::new();
-        s.insert(job(0x01, 1_000, Some(ph(0xAA))));
-        s.insert(job(0x02, 5_000, Some(ph(0xBB))));
-        s.insert(job(0x03, 3_000, Some(ph(0xCC))));
+        s.insert(job(0x01, 1_000, ph(0xAA)));
+        s.insert(job(0x02, 5_000, ph(0xBB)));
+        s.insert(job(0x03, 3_000, ph(0xCC)));
         // Solution carries 0xFF — none stored.
         let matched = s.match_for_solution(&ph(0xFF)).unwrap();
         assert_eq!(matched.new_token, tok(0x02), "0x02 declared last");
-    }
-
-    /// Jobs with `prev_hash = None` participate in the most-recent
-    /// fallback but never in the prev_hash-match pool.
-    #[test]
-    fn match_for_solution_skips_none_prev_hash_for_match_path() {
-        let mut s = DeclaredJobStore::new();
-        s.insert(job(0x01, 1_000, None));
-        s.insert(job(0x02, 5_000, None));
-        // Solution carries any value — no prev_hash matches, fall
-        // through to most-recent.
-        let matched = s.match_for_solution(&ph(0xAA)).unwrap();
-        assert_eq!(matched.new_token, tok(0x02));
     }
 
     // ── iter ───────────────────────────────────────────────────────
@@ -374,9 +354,9 @@ mod tests {
     #[test]
     fn iter_yields_jobs_in_insertion_order() {
         let mut s = DeclaredJobStore::new();
-        s.insert(job(0x01, 1_000, None));
-        s.insert(job(0x02, 2_000, None));
-        s.insert(job(0x03, 3_000, None));
+        s.insert(job(0x01, 1_000, ph(0x00)));
+        s.insert(job(0x02, 2_000, ph(0x00)));
+        s.insert(job(0x03, 3_000, ph(0x00)));
         let tokens: Vec<Token> = s.iter().map(|j| j.new_token).collect();
         assert_eq!(tokens, vec![tok(0x01), tok(0x02), tok(0x03)]);
     }

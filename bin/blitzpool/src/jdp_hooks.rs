@@ -1403,7 +1403,10 @@ impl DeclaredJobValidator for ProductionJobValidator {
         // otherwise its first leg is compared against the PREVIOUS
         // declaration's chain context, and a tip change in between reads as
         // `stale-chain-tip`. The second leg keeps the first leg's context,
-        // which is the drift the engine is meant to catch.
+        // which is the drift the engine is meant to catch — unless another
+        // declaration started on this session in between, which resets the
+        // slot. A tip change is then still caught, by the pool's own check
+        // against `PendingState::prev_hash_at_declare`.
         match job.leg {
             DeclarationLeg::Declare => self.engine.cleanup_downstream(job.session_id as usize),
             DeclarationLeg::Completed => {}
