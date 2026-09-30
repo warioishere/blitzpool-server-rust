@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use bp_cron_utils::Clock;
 use bp_db::{find_group, update_pplns_group_last_reset_at, DbError};
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, TimeZone, Utc, Weekday};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 use sqlx::PgPool;
 use thiserror::Error;
@@ -154,7 +154,7 @@ pub fn compute_next_fire(
                 if candidate.timestamp_millis() >= earliest_ms {
                     break;
                 }
-                candidate += ChronoDuration::days(1);
+                candidate = next_day_midnight(candidate);
             }
         }
     }
@@ -179,21 +179,30 @@ fn next_midnight(now: DateTime<Tz>) -> DateTime<Tz> {
     }
 }
 
+/// Midnight of the next calendar date. Steps by date, not by 24 h: a
+/// 25-hour DST fall-back day would otherwise land on 23:00 of the same date.
 fn next_day_midnight(base: DateTime<Tz>) -> DateTime<Tz> {
-    local_midnight(base + ChronoDuration::days(1))
+    let next_date = base
+        .date_naive()
+        .succ_opt()
+        .expect("a date before chrono's maximum has a successor");
+    midnight_on(base.timezone(), next_date)
 }
 
-/// 00:00 local on `day`'s date. Where a DST jump skips midnight (Chile
-/// springs forward at 24:00), the first valid minute after it; where a
-/// fall-back repeats it, the earlier of the two.
 fn local_midnight(day: DateTime<Tz>) -> DateTime<Tz> {
-    let tz = day.timezone();
+    midnight_on(day.timezone(), day.date_naive())
+}
+
+/// 00:00 local on `date`. Where a DST jump skips midnight (Chile springs
+/// forward at 24:00), the first valid minute after it; where a fall-back
+/// repeats it, the earlier of the two.
+fn midnight_on(tz: Tz, date: NaiveDate) -> DateTime<Tz> {
     for minute in 0..=120 {
         if let Some(s) = tz
             .with_ymd_and_hms(
-                day.year(),
-                day.month(),
-                day.day(),
+                date.year(),
+                date.month(),
+                date.day(),
                 minute / 60,
                 minute % 60,
                 0,
@@ -203,8 +212,8 @@ fn local_midnight(day: DateTime<Tz>) -> DateTime<Tz> {
             return s;
         }
     }
-    // Theoretically unreachable for IANA TZs at 00:00. Best-effort.
-    day
+    // No IANA zone skips two hours at midnight; fall back to UTC midnight.
+    tz.from_utc_datetime(&date.and_time(NaiveTime::MIN))
 }
 
 fn next_monday_midnight(now: DateTime<Tz>) -> DateTime<Tz> {
@@ -378,7 +387,11 @@ async fn wait_or_cancel(wait: Duration, cancel_rx: &mut watch::Receiver<bool>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono_tz::{Europe::Zurich, UTC};
+    use chrono::Duration as ChronoDuration;
+    use chrono_tz::{
+        Europe::{Vienna, Zurich},
+        UTC,
+    };
 
     fn at_utc(year: i32, month: u32, day: u32, hour: u32, min: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, hour, min, 0)
@@ -392,6 +405,61 @@ mod tests {
             timezone: tz,
             interval_days,
         }
+    }
+
+    /// `compute_next_fire` on its own thread, failed after a second instead
+    /// of hanging the test run when it does not return.
+    fn next_fire_or_fail(
+        schedule: ResetSchedule,
+        last_reset_at_ms: Option<i64>,
+        now: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(compute_next_fire(&schedule, last_reset_at_ms, now));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(1))
+            .expect("compute_next_fire did not return")
+    }
+
+    fn at_utc_ms(s: &str) -> DateTime<Utc> {
+        s.parse().expect("valid RFC 3339 instant")
+    }
+
+    // 2026-10-25 is a 25-hour day in Central Europe (CEST → CET). Every
+    // preset has to step across it to the next calendar midnight.
+
+    #[test]
+    fn monthly_across_the_dst_fall_back_lands_on_the_first() {
+        let now = at_utc_ms("2026-09-30T22:00:00.060Z"); // 1 Oct 00:00 Vienna
+        let next = next_fire_or_fail(schedule(Preset::Monthly, Vienna, None), None, now);
+        assert_eq!(next, at_utc(2026, 10, 31, 23, 0)); // 1 Nov 00:00 CET
+    }
+
+    #[test]
+    fn weekly_across_the_dst_fall_back_lands_on_monday() {
+        let now = at_utc_ms("2026-10-18T22:00:00.060Z"); // Mon 19 Oct 00:00 Zurich
+        let next = next_fire_or_fail(schedule(Preset::Weekly, Zurich, None), None, now);
+        assert_eq!(next, at_utc(2026, 10, 25, 23, 0)); // Mon 26 Oct 00:00 CET
+    }
+
+    #[test]
+    fn daily_on_the_dst_fall_back_day_moves_to_the_next_day() {
+        let now = at_utc_ms("2026-10-24T22:00:00.060Z"); // 25 Oct 00:00 Zurich
+        let next = next_fire_or_fail(schedule(Preset::Daily, Zurich, None), None, now);
+        assert_eq!(next, at_utc(2026, 10, 25, 23, 0)); // 26 Oct 00:00 CET
+    }
+
+    #[test]
+    fn custom_across_the_dst_fall_back_fires_at_local_midnight() {
+        let last = at_utc_ms("2026-10-24T22:00:00Z"); // 25 Oct 00:00 Zurich
+        let now = at_utc_ms("2026-10-24T22:00:00.060Z");
+        let next = next_fire_or_fail(
+            schedule(Preset::Custom, Zurich, Some(1)),
+            Some(last.timestamp_millis()),
+            now,
+        );
+        assert_eq!(next, at_utc(2026, 10, 25, 23, 0)); // 26 Oct 00:00 CET
     }
 
     #[test]
