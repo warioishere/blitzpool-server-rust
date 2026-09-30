@@ -80,6 +80,11 @@ const PAIRS: &[(&str, &str, &str)] = &[
         jd::ERROR_CODE_DECLARE_MINING_JOB_STALE_CHAIN_TIP,
         "JDP DeclareMiningJob.Error / stale-chain-tip",
     ),
+    (
+        jdp_client::ERR_MISSING_TXS,
+        jd::ERROR_CODE_DECLARE_MINING_JOB_MISSING_TXS,
+        "JDP DeclareMiningJob.Error / missing-txs",
+    ),
     // ── SetCustomMiningJob (mining) ─────────────────────────────────
     (
         mining_client::ERR_INVALID_MINING_JOB_TOKEN,

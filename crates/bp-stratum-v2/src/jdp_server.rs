@@ -326,9 +326,11 @@ pub enum JobVerdict {
     Accepted,
     /// Rejected. Carries the SV2 error code for `DeclareMiningJob.Error`.
     Rejected(String),
-    /// The node is missing transactions the pool did not supply. NOT a
-    /// rejection: the pool's own `ProvideMissingTransactions` round-trip
-    /// fetches them from the JDC and the second leg asks again.
+    /// The node is missing transactions the pool did not supply. On the
+    /// declare leg NOT a rejection: the pool's own `ProvideMissingTransactions`
+    /// round-trip fetches them from the JDC and the second leg asks again. On
+    /// that second leg it IS one (`missing-txs`) — see
+    /// `node_refuses_declaration`.
     NeedsTransactions,
 }
 
@@ -1617,6 +1619,7 @@ async fn dispatch_jdp_inbound(
                     session_id,
                     &input,
                     &ordered_raw_txs(&partition.known_raw_txs),
+                    DeclarationLeg::Declare,
                     "jdp: node rejected the declared job — not accepting it",
                 )
                 .await
@@ -1694,6 +1697,7 @@ async fn dispatch_jdp_inbound(
                     session_id,
                     &declared,
                     &known,
+                    DeclarationLeg::Completed,
                     "jdp: node rejected the completed declaration — not accepting it",
                 )
                 .await
@@ -1754,18 +1758,20 @@ async fn dispatch_jdp_inbound(
 /// could otherwise hide an invalid transaction by declaring it as one the pool
 /// was missing.
 ///
-/// `None` means nothing objected: the node accepted, or it still wants
-/// transactions — the last is not a rejection, see
-/// [`JobVerdict::NeedsTransactions`]. Whether a validator is wired at all is
-/// the caller's gate, because both callers have expensive work to skip with it.
+/// `None` means nothing objected: the node accepted, or — on the declare leg
+/// only — it still wants transactions, which the pool's own round-trip then
+/// fetches (see [`JobVerdict::NeedsTransactions`]). Whether a validator is
+/// wired at all is the caller's gate, because both callers have expensive work
+/// to skip with it.
 async fn node_refuses_declaration(
     validator: &Arc<dyn DeclaredJobValidator>,
     session_id: u32,
     declared: &crate::jdp::client::DeclareMiningJobInput,
     known_raw_txs: &[Vec<u8>],
+    leg: DeclarationLeg,
     log_message: &'static str,
 ) -> Option<JdpHandlerOutcome> {
-    let JobVerdict::Rejected(error_code) = validator
+    let verdict = validator
         .validate_declaration(DeclaredJobToValidate {
             session_id,
             version: declared.version,
@@ -1774,16 +1780,42 @@ async fn node_refuses_declaration(
             wtxid_list: &declared.wtxid_list,
             known_raw_txs,
         })
-        .await
-    else {
-        return None;
+        .await;
+    let (error_code, error_details): (String, &[u8]) = match (verdict, leg) {
+        (JobVerdict::Rejected(code), _) => {
+            (code, b"declared job rejected by the pool's bitcoin node")
+        }
+        // Nothing is left to fetch: the JDC has answered the round-trip, and
+        // the node still cannot see the whole set. A transaction whose bytes
+        // do not hash to its declared wtxid is exactly this.
+        (JobVerdict::NeedsTransactions, DeclarationLeg::Completed) => (
+            crate::jdp::client::ERR_MISSING_TXS.to_string(),
+            b"the pool's bitcoin node still lacks declared transactions after \
+              ProvideMissingTransactions.Success",
+        ),
+        (JobVerdict::Accepted, _) | (JobVerdict::NeedsTransactions, DeclarationLeg::Declare) => {
+            return None
+        }
     };
     warn!(session_id, error_code, "{}", log_message);
     Some(JdpHandlerOutcome::declare_error(
         declared.request_id,
         &error_code,
-        b"declared job rejected by the pool's bitcoin node",
+        error_details,
     ))
+}
+
+/// Which leg of the SV2 JDP/ProvideMissingTransactions round-trip a node
+/// verdict answers — it decides whether "the node lacks transactions" is a
+/// question still open or a refusal.
+#[derive(Clone, Copy, Debug)]
+enum DeclarationLeg {
+    /// The `DeclareMiningJob` itself. Whatever the node lacks, the pool can
+    /// still ask the JDC for.
+    Declare,
+    /// `ProvideMissingTransactions.Success`: the JDC has supplied everything
+    /// it was asked for, so there is nothing left to fetch.
+    Completed,
 }
 
 /// Resolve an ext 0x0003/distribution_id TLV Field reference
@@ -2259,17 +2291,21 @@ mod tests {
         })
     }
 
-    /// Stands in for bitcoin-core: answers with whatever verdict the test
-    /// wants and records that it was actually consulted.
+    /// Stands in for bitcoin-core: answers with whatever verdicts the test
+    /// wants, one per call and `Accepted` once they run out, and records that
+    /// it was actually consulted.
     struct StubValidator {
-        verdict: std::sync::Mutex<Option<JobVerdict>>,
+        verdicts: std::sync::Mutex<std::collections::VecDeque<JobVerdict>>,
         calls: std::sync::atomic::AtomicUsize,
     }
 
     impl StubValidator {
         fn new(verdict: JobVerdict) -> Arc<Self> {
+            Self::answering(vec![verdict])
+        }
+        fn answering(verdicts: Vec<JobVerdict>) -> Arc<Self> {
             Arc::new(Self {
-                verdict: std::sync::Mutex::new(Some(verdict)),
+                verdicts: std::sync::Mutex::new(verdicts.into()),
                 calls: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -2283,11 +2319,11 @@ mod tests {
         async fn validate_declaration(&self, _job: DeclaredJobToValidate<'_>) -> JobVerdict {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            match self.verdict.lock().expect("verdict lock").take() {
-                Some(JobVerdict::Rejected(code)) => JobVerdict::Rejected(code),
-                Some(JobVerdict::NeedsTransactions) => JobVerdict::NeedsTransactions,
-                _ => JobVerdict::Accepted,
-            }
+            self.verdicts
+                .lock()
+                .expect("verdict lock")
+                .pop_front()
+                .unwrap_or(JobVerdict::Accepted)
         }
     }
 
@@ -2572,6 +2608,95 @@ mod tests {
             validator.calls(),
             2,
             "the matching Success must be re-validated"
+        );
+    }
+
+    /// On the second leg there is nothing left to fetch, so a node that still
+    /// lacks transactions has not validated the declaration — it must be
+    /// refused `missing-txs`, not accepted.
+    ///
+    /// The node resolves a supplied transaction only by the wtxid it hashes
+    /// to. Bytes that do not match their declared position therefore stay
+    /// "missing", and accepting that verdict let a JDC through the node check
+    /// with any transactions it liked: nothing else compares them to the
+    /// wtxids, and the custom-job binding builds its merkle path from these
+    /// same bytes.
+    ///
+    /// Both directions: the same round-trip with the node accepting on the
+    /// second leg is NOT refused, so this cannot pass on a refusal that comes
+    /// from somewhere else.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_completed_declaration_the_node_still_lacks_transactions_for_is_refused() {
+        let complete = |second_leg: JobVerdict| async move {
+            let mut state = fresh_session();
+            let _ = handle_setup_connection(&mut state, &jdp_setup());
+            state.full_template_mode = true;
+            let token = issue_token(&mut state, 1_000);
+            let validator =
+                StubValidator::answering(vec![JobVerdict::NeedsTransactions, second_leg]);
+            let mut hooks = JdpServerHooks::no_op();
+            hooks.job_validator = Some(validator.clone() as Arc<dyn DeclaredJobValidator>);
+            let bridge = fresh_bridge();
+
+            let first = declare_with(&mut state, &hooks, &bridge, token, 1_100).await;
+            assert!(
+                matches!(
+                    first.outbound.first(),
+                    Some(JdpOutboundFrame::ProvideMissingTransactions { .. })
+                ),
+                "precondition: a round-trip must be in flight, got {:?}",
+                first.outbound
+            );
+            let second = dispatch_jdp_inbound(
+                &mut state,
+                InboundJdpFrame::ProvideMissingTransactionsSuccess(
+                    crate::jdp::client::ProvideMissingTransactionsSuccessInput {
+                        request_id: 11,
+                        transaction_list: vec![vec![0xAB; 32]],
+                    },
+                ),
+                &hooks,
+                &bridge,
+                1,
+                1_200,
+            )
+            .await;
+            assert_eq!(
+                validator.calls(),
+                2,
+                "precondition: both legs reached the node"
+            );
+            (second, state)
+        };
+
+        let (refused, state) = complete(JobVerdict::NeedsTransactions).await;
+        assert_eq!(
+            declare_error_code(&refused),
+            crate::jdp::client::ERR_MISSING_TXS
+        );
+        assert!(
+            !refused
+                .events
+                .iter()
+                .any(|e| matches!(e, JdpSessionEvent::JobDeclared { .. })),
+            "a declaration the node never saw whole must not be declared"
+        );
+        assert!(state.declared_jobs.is_empty());
+        assert!(
+            state.pending_declaration.is_none(),
+            "a refused declaration must leave no half-finished round-trip behind"
+        );
+
+        let (accepted, _) = complete(JobVerdict::Accepted).await;
+        assert!(
+            !accepted.outbound.iter().any(|f| matches!(
+                f,
+                JdpOutboundFrame::DeclareMiningJobError { error_code, .. }
+                    if error_code == crate::jdp::client::ERR_MISSING_TXS
+            )),
+            "negative control: a node that accepts the complete set must not be refused \
+             missing-txs, got {:?}",
+            accepted.outbound
         );
     }
 

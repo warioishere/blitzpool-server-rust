@@ -149,6 +149,14 @@ pub const ERR_INVALID_PAYOUT_DISTRIBUTION: &str =
 /// `stale-chain-tip` as retryable and any other declaration error as fatal.
 pub const ERR_STALE_CHAIN_TIP: &str = "stale-chain-tip";
 
+/// `missing-txs` — the declaration is complete (its
+/// `ProvideMissingTransactions.Success` has arrived) and the pool's node still
+/// cannot resolve every declared wtxid. The node only resolves a transaction
+/// by the wtxid it hashes to, so a supplied transaction that does not match
+/// its position stays missing — and a declaration the node never saw whole
+/// was never validated.
+pub const ERR_MISSING_TXS: &str = "missing-txs";
+
 // ── Inputs (typed wrappers over deserialized SV2 frames) ────────────
 
 /// Inputs from a deserialized `AllocateMiningJobToken` frame.
