@@ -4,9 +4,10 @@
 //! JDS hands to a JDC on `AllocateMiningJobToken`. The JDC then references
 //! them in `DeclareMiningJob` and `SetCustomMiningJob`. Each token has a 1 h
 //! TTL — OUR policy, the spec sets no lifetime — and the pool rate-limits
-//! allocations to one per 1 s per connection, which is the spec's only
-//! constraint here (SV2 JDP/AllocateMiningJobToken — "rate limited to a rather
-//! slow rate", no number given).
+//! allocations to one per 1 s per connection, with a burst of
+//! [`ALLOCATE_BURST`], which is the spec's only constraint here
+//! (SV2 JDP/AllocateMiningJobToken — "rate limited to a rather slow rate", no
+//! number given).
 //!
 //! ## Format
 //!
@@ -69,6 +70,15 @@ pub const DEFAULT_TOKEN_TTL_MS: u64 = 3_600_000;
 /// — 1 second.
 pub const DEFAULT_RATE_LIMIT_MS: u64 = 1_000;
 
+/// How many allocations a connection may make at once before the rate limit
+/// applies. Two, because that is what the reference jd-client asks for when it
+/// connects (`allocate_tokens(2)`, sv2-apps `jdc_runtime.rs`) — back to back,
+/// never re-requesting one that goes unanswered. With a strict one-per-second
+/// limit its second token was dropped and it ran on a queue of one for the
+/// whole session. The sustained rate stays one per `rate_limit_ms`, so the
+/// store stays as bounded as before.
+pub const ALLOCATE_BURST: u64 = 2;
+
 // ── Token ────────────────────────────────────────────────────────────
 
 /// Opaque 16-byte JDP token. Hash/Eq compare full byte content;
@@ -116,12 +126,12 @@ impl AllocatedToken {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TokenAllocError {
-    /// Caller breached the per-connection allocation rate limit
-    /// (`now - last_alloc_ms < rate_limit_ms`). The caller should
+    /// Caller breached the per-connection allocation rate limit: the
+    /// [`ALLOCATE_BURST`] is spent and not yet refilled. The caller should
     /// silently drop the request — SV2 JDP/AllocateMiningJobToken says
     /// nothing about a wire response for rate limiting.
-    #[error("allocation rate limited: {elapsed_ms} ms since last (min {min_ms} ms)")]
-    RateLimited { elapsed_ms: u64, min_ms: u64 },
+    #[error("allocation rate limited: next allocation possible in {retry_in_ms} ms")]
+    RateLimited { retry_in_ms: u64 },
     /// `getrandom` returned an error. The OS RNG only fails in
     /// pathological cases (closed FDs in a hardened seccomp sandbox).
     /// On failure the caller should drop the request — never proceed
@@ -140,7 +150,11 @@ pub enum TokenAllocError {
 /// connection task — no internal locking.
 pub struct TokenStore {
     counter: u32,
-    last_alloc_ms: Option<u64>,
+    /// When the allocation budget is fully refilled: every allocation pushes
+    /// it one `rate_limit_ms` further, starting from now at the latest. An
+    /// allocation is allowed while it lies no more than
+    /// `ALLOCATE_BURST - 1` intervals ahead.
+    budget_refilled_at_ms: u64,
     allocated: HashMap<Token, AllocatedToken>,
     rate_limit_ms: u64,
     ttl_ms: u64,
@@ -154,7 +168,7 @@ impl std::fmt::Debug for TokenStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenStore")
             .field("counter", &self.counter)
-            .field("last_alloc_ms", &self.last_alloc_ms)
+            .field("budget_refilled_at_ms", &self.budget_refilled_at_ms)
             .field("allocated_count", &self.allocated.len())
             .field("rate_limit_ms", &self.rate_limit_ms)
             .field("ttl_ms", &self.ttl_ms)
@@ -176,7 +190,7 @@ impl TokenStore {
     pub fn with_config(rate_limit_ms: u64, ttl_ms: u64) -> Self {
         Self {
             counter: 0,
-            last_alloc_ms: None,
+            budget_refilled_at_ms: 0,
             allocated: HashMap::new(),
             rate_limit_ms,
             ttl_ms,
@@ -243,8 +257,8 @@ impl TokenStore {
     /// resolves — so what this sweep is for is the tokens NOBODY presents: a
     /// connection that allocates and never declares left every entry behind
     /// for as long as it stayed open, and nothing else would have touched
-    /// them. The rate limit caps inserts at one per second and the TTL caps
-    /// their lifetime, so the two together cap the map, but only once
+    /// them. The rate limit caps inserts at one per second (plus the
+    /// [`ALLOCATE_BURST`]) and the TTL caps their lifetime, so the two together cap the map, but only once
     /// something actually drops the expired ones. One sweep per insert is
     /// affordable for exactly the reason the map is bounded at all: inserts
     /// are rate-limited.
@@ -254,16 +268,15 @@ impl TokenStore {
         miner_address: AddressId,
         coinbase_outputs: Vec<u8>,
     ) -> Result<&AllocatedToken, TokenAllocError> {
-        if let Some(last) = self.last_alloc_ms {
-            let elapsed = now_ms.saturating_sub(last);
-            if elapsed < self.rate_limit_ms {
-                return Err(TokenAllocError::RateLimited {
-                    elapsed_ms: elapsed,
-                    min_ms: self.rate_limit_ms,
-                });
-            }
+        let allowed_from_ms = self
+            .budget_refilled_at_ms
+            .saturating_sub((ALLOCATE_BURST - 1) * self.rate_limit_ms);
+        if now_ms < allowed_from_ms {
+            return Err(TokenAllocError::RateLimited {
+                retry_in_ms: allowed_from_ms - now_ms,
+            });
         }
-        self.last_alloc_ms = Some(now_ms);
+        self.budget_refilled_at_ms = self.budget_refilled_at_ms.max(now_ms) + self.rate_limit_ms;
         self.cleanup_expired(now_ms);
         let token = self.next_token()?;
         let entry = AllocatedToken {
@@ -284,11 +297,11 @@ impl TokenStore {
     /// minting. Storage, TTL and the rate limit all live in the callers,
     /// because those are the three things that legitimately differ.
     ///
-    /// `last_alloc_ms` is deliberately NOT stamped here: it is the
-    /// SV2 JDP/AllocateMiningJobToken budget of the CLIENT's allocate message,
-    /// and `allocate` stamps it before calling in. Stamping here would make a
-    /// pool-minted declaration token block the miner's next allocate for a
-    /// second — the same interop bug mirrored.
+    /// The allocation budget (`budget_refilled_at_ms`) is deliberately NOT
+    /// charged here: it is the SV2 JDP/AllocateMiningJobToken budget of the
+    /// CLIENT's allocate message, and `allocate` charges it before calling in.
+    /// Charging here would make a pool-minted declaration token eat into the
+    /// miner's next allocates — the same interop bug mirrored.
     fn next_token(&mut self) -> Result<Token, TokenAllocError> {
         self.counter = self
             .counter
@@ -422,28 +435,42 @@ mod tests {
 
     // ── Rate limit ─────────────────────────────────────────────────
 
-    /// Two allocations within `rate_limit_ms` → second is rejected.
+    /// The burst goes out at once; the allocation after it waits for a
+    /// refill, and is told how long.
     #[test]
-    fn rate_limit_blocks_second_call_within_window() {
+    fn rate_limit_blocks_the_call_after_the_burst() {
         let mut s = fresh_store_with_rng(0x00);
-        s.allocate(0, addr(), vec![]).unwrap();
+        for _ in 0..ALLOCATE_BURST {
+            s.allocate(0, addr(), vec![]).unwrap();
+        }
         let err = s.allocate(999, addr(), vec![]).unwrap_err();
-        assert_eq!(
-            err,
-            TokenAllocError::RateLimited {
-                elapsed_ms: 999,
-                min_ms: 1_000,
-            }
-        );
+        assert_eq!(err, TokenAllocError::RateLimited { retry_in_ms: 1 });
     }
 
-    /// At exactly the rate-limit boundary the call goes through
-    /// (strict less-than check allows `elapsed == rate_limit`).
+    /// After the burst, exactly one allocation per interval: at the refill
+    /// boundary one goes through, a second one at the same instant does not.
     #[test]
-    fn rate_limit_allows_call_at_boundary() {
+    fn after_the_burst_the_sustained_rate_is_one_per_interval() {
+        let mut s = fresh_store_with_rng(0x00);
+        for _ in 0..ALLOCATE_BURST {
+            s.allocate(0, addr(), vec![]).unwrap();
+        }
+        assert!(s.allocate(1_000, addr(), vec![]).is_ok());
+        assert!(s.allocate(1_000, addr(), vec![]).is_err());
+        assert!(s.allocate(2_000, addr(), vec![]).is_ok());
+    }
+
+    /// A connection that stayed quiet gets its burst back, not more: idle
+    /// time does not bank allocations beyond it.
+    #[test]
+    fn idle_time_refills_the_burst_and_no_further() {
         let mut s = fresh_store_with_rng(0x00);
         s.allocate(0, addr(), vec![]).unwrap();
-        assert!(s.allocate(1_000, addr(), vec![]).is_ok());
+        let later = 60_000;
+        for _ in 0..ALLOCATE_BURST {
+            s.allocate(later, addr(), vec![]).unwrap();
+        }
+        assert!(s.allocate(later, addr(), vec![]).is_err());
     }
 
     /// Custom rate limit honoured.
@@ -451,7 +478,9 @@ mod tests {
     fn custom_rate_limit_honoured() {
         let mut s = TokenStore::with_config(500, DEFAULT_TOKEN_TTL_MS);
         s.set_rng(Some(const_rng(0x00)));
-        s.allocate(0, addr(), vec![]).unwrap();
+        for _ in 0..ALLOCATE_BURST {
+            s.allocate(0, addr(), vec![]).unwrap();
+        }
         assert!(s.allocate(499, addr(), vec![]).is_err());
         assert!(s.allocate(500, addr(), vec![]).is_ok());
     }

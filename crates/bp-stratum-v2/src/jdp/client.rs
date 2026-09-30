@@ -1794,9 +1794,30 @@ mod tests {
         let mut s = fresh();
         handle_setup_connection(&mut s, &good_setup());
         let _ = handle_allocate_token(&mut s, &good_alloc(1), alloc_ctx(), 1_000);
-        // 999ms later — below 1s rate-limit window.
-        let out = handle_allocate_token(&mut s, &good_alloc(2), alloc_ctx(), 1_999);
+        let _ = handle_allocate_token(&mut s, &good_alloc(2), alloc_ctx(), 1_000);
+        // 999ms later — the burst is spent and nothing has refilled yet.
+        let out = handle_allocate_token(&mut s, &good_alloc(3), alloc_ctx(), 1_999);
         assert!(out.outbound.is_empty(), "rate-limited alloc must drop");
+    }
+
+    /// The reference jd-client asks for two tokens back to back when it
+    /// connects (`allocate_tokens(2)`, sv2-apps `jdc_runtime.rs`). Both must
+    /// be answered: a dropped one is never re-requested, so the client would
+    /// run with one token in its queue instead of two for the whole session.
+    #[test]
+    fn the_reference_clients_two_token_start_is_answered_in_full() {
+        let mut s = fresh();
+        handle_setup_connection(&mut s, &good_setup());
+        for request_id in 1..=2 {
+            let out = handle_allocate_token(&mut s, &good_alloc(request_id), alloc_ctx(), 1_000);
+            assert!(
+                matches!(
+                    out.outbound.first(),
+                    Some(JdpOutboundFrame::AllocateMiningJobTokenSuccess { .. })
+                ),
+                "allocate {request_id} of the start burst must be answered"
+            );
+        }
     }
 
     /// An entropy failure drops the allocate too — same outcome as the rate
@@ -2059,18 +2080,20 @@ mod tests {
         let wtxid = [0x01; 32];
         let mut tpl = HashMap::new();
         tpl.insert(wtxid, vec![0xCA; 16]);
+        // The rest of the start burst, at the same instant.
+        let _ = handle_allocate_token(&mut s, &good_alloc(4), alloc_ctx(), 1_000);
         let _ = declared(&mut s, &declare(3, token, vec![wtxid]), &tpl, ctx(1_100));
 
-        // A second allocate still inside the second: refused, as
+        // The burst is spent and still inside the second: refused, as
         // SV2 JDP/AllocateMiningJobToken asks.
         let out = handle_allocate_token(&mut s, &good_alloc(2), alloc_ctx(), 1_500);
         assert!(
             out.outbound.is_empty(),
-            "a second allocate inside 1 s must still be rate-limited"
+            "an allocate past the burst inside 1 s must still be rate-limited"
         );
         // And past the second it is served again — measured from the
-        // ALLOCATE at 1_000, not from the declaration at 1_100.
-        let out = handle_allocate_token(&mut s, &good_alloc(3), alloc_ctx(), 2_050);
+        // ALLOCATES at 1_000, not from the declaration at 1_100.
+        let out = handle_allocate_token(&mut s, &good_alloc(5), alloc_ctx(), 2_050);
         assert!(
             matches!(
                 out.outbound[0],
