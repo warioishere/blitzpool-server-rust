@@ -311,6 +311,48 @@ async fn accept_loop(listener: TcpListener, dispatch: PortDispatch, cancel: Canc
     }
 }
 
+/// How long sent data may stay unacknowledged before the kernel drops the
+/// connection. Without it a miner that vanished without closing (power
+/// cut, unplugged) kept its session for ~18 min: the pool keeps sending
+/// jobs, so the keepalive never runs, and Linux retransmits for
+/// `tcp_retries2` rounds before it gives up.
+#[cfg(target_os = "linux")]
+const STRATUM_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// Socket options every accepted stratum connection gets, SV1 and SV2
+/// alike. Failures are logged and the connection is served anyway.
+fn tune_stratum_socket(socket: &TcpStream, peer: std::net::SocketAddr, port: u16) {
+    // Disable Nagle's algorithm: stratum is latency-sensitive small-frame
+    // request/response. With Nagle on, the Nagle + delayed-ACK interaction
+    // adds ~40 ms per round-trip (most visible on SV2 share acks). Set it
+    // once here so both SV1 and SV2 connections inherit it.
+    if let Err(err) = socket.set_nodelay(true) {
+        warn!(%err, ?peer, port, "stratum: set_nodelay(true) failed (continuing)");
+    }
+    // Enable TCP keepalive so long-lived but quiet miner connections (idle
+    // between shares / new templates) don't get silently evicted from an
+    // upstream NAT/firewall state table, and a dead peer on an idle
+    // connection is detected: start probing after 60 s idle, then every
+    // 20 s, drop after 4 missed probes (~140 s). Keepalive only probes a
+    // connection with nothing unacknowledged in flight; a dead peer the pool
+    // is still sending jobs to is caught by the user timeout below. The
+    // per-socket SO_KEEPALIVE opt-in is required — the
+    // net.ipv4.tcp_keepalive_* sysctls only tune the timing once it's on.
+    let keepalive = TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(20))
+        .with_retries(4);
+    if let Err(err) = SockRef::from(socket).set_tcp_keepalive(&keepalive) {
+        warn!(%err, ?peer, port, "stratum: set_tcp_keepalive(60s) failed (continuing)");
+    }
+    // Linux only (TCP_USER_TIMEOUT). With it set, the kernel also uses it
+    // to close a connection whose keepalive probes go unanswered.
+    #[cfg(target_os = "linux")]
+    if let Err(err) = SockRef::from(socket).set_tcp_user_timeout(Some(STRATUM_USER_TIMEOUT)) {
+        warn!(%err, ?peer, port, "stratum: set_tcp_user_timeout failed (continuing)");
+    }
+}
+
 /// Peek 1 byte from `socket` and dispatch to the right server. Closes
 /// the socket if no byte arrives within 30 s. The peek is non-consuming
 /// — the downstream server reads from byte 0 of the same socket (SV1
@@ -322,26 +364,7 @@ async fn dispatch_connection(
     dispatch: PortDispatch,
 ) {
     let port = dispatch.sv1_port_config.port;
-    // Disable Nagle's algorithm: stratum is latency-sensitive small-frame
-    // request/response. With Nagle on, the Nagle + delayed-ACK interaction
-    // adds ~40 ms per round-trip (most visible on SV2 share acks). Set it
-    // once here so both SV1 and SV2 connections inherit it.
-    if let Err(err) = socket.set_nodelay(true) {
-        warn!(%err, ?peer, port, "stratum: set_nodelay(true) failed (continuing)");
-    }
-    // Enable TCP keepalive so long-lived but quiet miner connections (idle
-    // between shares / new templates) don't get silently evicted from an
-    // upstream NAT/firewall state table, and dead peers are detected: start
-    // probing after 60 s idle, then every 20 s, drop after 4 missed probes
-    // (~140 s). The per-socket SO_KEEPALIVE opt-in is required — the
-    // net.ipv4.tcp_keepalive_* sysctls only tune the timing once it's on.
-    let keepalive = TcpKeepalive::new()
-        .with_time(std::time::Duration::from_secs(60))
-        .with_interval(std::time::Duration::from_secs(20))
-        .with_retries(4);
-    if let Err(err) = SockRef::from(&socket).set_tcp_keepalive(&keepalive) {
-        warn!(%err, ?peer, port, "stratum: set_tcp_keepalive(60s) failed (continuing)");
-    }
+    tune_stratum_socket(&socket, peer, port);
     let detected = match timeout(std::time::Duration::from_secs(30), peek_first_byte(&socket)).await
     {
         Err(_) => {
@@ -479,6 +502,36 @@ impl PortTemplates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── socket options ──────────────────────────────────────────────
+
+    /// An accepted stratum socket gives up on a peer that stops
+    /// acknowledging after 150 s, and keeps its keepalive and no-delay.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn accepted_sockets_get_the_user_timeout_keepalive_and_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (socket, peer) = listener.accept().await.unwrap();
+
+        let sock = SockRef::from(&socket);
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            None,
+            "precondition: unset by default"
+        );
+
+        tune_stratum_socket(&socket, peer, addr.port());
+        assert_eq!(sock.tcp_user_timeout().unwrap(), Some(STRATUM_USER_TIMEOUT));
+        assert_eq!(STRATUM_USER_TIMEOUT, std::time::Duration::from_secs(150));
+        assert!(sock.keepalive().unwrap());
+        assert_eq!(
+            sock.tcp_keepalive_time().unwrap(),
+            std::time::Duration::from_secs(60)
+        );
+        assert!(socket.nodelay().unwrap());
+    }
 
     // ── first-byte detection ─────────────────────────────────────────
 

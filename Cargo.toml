@@ -62,8 +62,9 @@ tikv-jemallocator = "0.6"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
-# Low-level socket options (TCP keepalive on accepted stratum sockets)
-socket2 = "0.6"
+# Low-level socket options (TCP keepalive and user timeout on accepted
+# stratum sockets; the user timeout needs the `all` feature)
+socket2 = { version = "0.6", features = ["all"] }
 futures = "0.3"
 async-trait = "0.1"
 # Lock-free copy-on-write for read-mostly shared state (the accepted-share
