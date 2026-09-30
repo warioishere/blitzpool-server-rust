@@ -1488,6 +1488,105 @@ mod jdp_validation_regtest {
         cancel.cancel();
         node.shutdown().await.expect("regtest shutdown");
     }
+
+    /// The shape `upstream_can_rebuild_coinbase` admits is one the engine
+    /// actually validates: a correct coinbase for the next block is accepted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_valid_segwit_coinbase_is_accepted_by_the_engine() {
+        let Some((node, validator, cancel)) = real_validator().await else {
+            return;
+        };
+        let height = node.current_height().await.expect("height") + 1;
+        let (prefix, suffix) = super::coinbase_shapes::valid_segwit_coinbase(height);
+        assert!(
+            upstream_can_rebuild_coinbase(&prefix, &suffix),
+            "precondition: the guard admits the coinbase"
+        );
+
+        let verdict = validator
+            .validate_declaration(declaration(
+                &prefix,
+                &suffix,
+                &[],
+                &[],
+                DeclarationLeg::Declare,
+            ))
+            .await;
+        assert!(matches!(verdict, JobVerdict::Accepted), "got {verdict:?}");
+
+        // Negative control: the same coinbase for the wrong height is judged
+        // and refused, so `Accepted` above is the node's verdict.
+        let (prefix, suffix) = super::coinbase_shapes::valid_segwit_coinbase(height + 1);
+        let verdict = validator
+            .validate_declaration(declaration(
+                &prefix,
+                &suffix,
+                &[],
+                &[],
+                DeclarationLeg::Declare,
+            ))
+            .await;
+        assert!(
+            matches!(verdict, JobVerdict::Rejected(_)),
+            "got {verdict:?}"
+        );
+
+        cancel.cancel();
+        node.shutdown().await.expect("regtest shutdown");
+    }
+
+    /// The engine resolves a supplied transaction by the wtxid it hashes to,
+    /// which the second leg's `missing-txs` refusal relies on: a transaction
+    /// that is not the declared one leaves the declared wtxid missing.
+    ///
+    /// Both directions: supplying the declared transaction itself gets past
+    /// the lookup, to a verdict on the block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_supplied_transaction_counts_only_under_its_own_wtxid() {
+        let Some((node, validator, cancel)) = real_validator().await else {
+            return;
+        };
+        let height = node.current_height().await.expect("height") + 1;
+        let (prefix, suffix) = super::coinbase_shapes::valid_segwit_coinbase(height);
+        let declared = super::coinbase_shapes::unrelated_transaction(1);
+        let other = super::coinbase_shapes::unrelated_transaction(2);
+        let wtxids = [declared.compute_wtxid().to_byte_array()];
+        let supply = |tx: &bitcoin::Transaction| vec![bitcoin::consensus::serialize(tx)];
+
+        let mismatched = supply(&other);
+        let verdict = validator
+            .validate_declaration(declaration(
+                &prefix,
+                &suffix,
+                &wtxids,
+                &mismatched,
+                DeclarationLeg::Completed,
+            ))
+            .await;
+        assert!(
+            matches!(verdict, JobVerdict::NeedsTransactions),
+            "a transaction under another wtxid must not fill the slot, got {verdict:?}"
+        );
+
+        let matching = supply(&declared);
+        let verdict = validator
+            .validate_declaration(declaration(
+                &prefix,
+                &suffix,
+                &wtxids,
+                &matching,
+                DeclarationLeg::Completed,
+            ))
+            .await;
+        assert!(
+            matches!(verdict, JobVerdict::Rejected(_)),
+            "negative control: the declared transaction is found, and the block with its \
+             unspendable input is judged, got {verdict:?}"
+        );
+
+        cancel.cancel();
+        node.shutdown().await.expect("regtest shutdown");
+    }
 }
 
 /// Coinbase byte shapes for the guard in front of upstream's engine, built
@@ -1495,6 +1594,7 @@ mod jdp_validation_regtest {
 #[cfg(test)]
 mod coinbase_shapes {
     use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::Hash;
     use bitcoin::transaction::Version;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
@@ -1535,6 +1635,58 @@ mod coinbase_shapes {
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::new_op_return([]),
+            }],
+        }
+    }
+
+    /// A coinbase a node accepts as the next block's at `height`: BIP-34
+    /// height push, 8-byte extranonce slot, one spendable-by-nobody output
+    /// well under the subsidy, and the witness commitment for a block with no
+    /// other transactions.
+    pub(super) fn valid_segwit_coinbase(height: u32) -> (Vec<u8>, Vec<u8>) {
+        use bitcoin::hashes::{sha256d, Hash};
+        let mut script_sig = bitcoin::script::Builder::new()
+            .push_int(i64::from(height))
+            .into_script()
+            .into_bytes();
+        script_sig.extend_from_slice(&[0u8; 8]);
+        // The only wtxid is the coinbase's, which counts as zero; the
+        // commitment is sha256d(witness root || reserved value).
+        let commitment = sha256d::Hash::hash(&[0u8; 64]);
+        let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commitment_script.extend_from_slice(commitment.as_byte_array());
+        let mut tx = coinbase(script_sig, Witness::from_slice(&[[0u8; 32]]));
+        tx.output = vec![
+            TxOut {
+                value: Amount::from_sat(100_000_000),
+                script_pubkey: ScriptBuf::new_op_return([]),
+            },
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(commitment_script),
+            },
+        ];
+        split_at_slot(&tx, 8)
+    }
+
+    /// A non-witness transaction spending an output nobody created; `tag`
+    /// makes each one distinct.
+    pub(super) fn unrelated_transaction(tag: u32) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x11; 32]),
+                    vout: tag,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
                 script_pubkey: ScriptBuf::new_op_return([]),
             }],
         }
