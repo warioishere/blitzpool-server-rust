@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use bp_bitcoin::BitcoinRpc;
 use bp_blockparty_engine::BlockpartyApi;
-use bp_geoip::GeoIpServiceHandle;
+use bp_geoip::GeoIpService;
 use bp_group_mgmt_engine::{
     EmailHooks, GroupService, GroupServiceHooks, InvitationService, JoinRequestService,
 };
@@ -48,7 +48,7 @@ pub struct AppState<H: GroupServiceHooks + 'static, M: EmailHooks + 'static> {
     /// Generous by default so a brief bitcoin-core restart does not flip health.
     pub tdp_staleness_threshold_ms: i64,
     pub bitcoin_rpc: Option<Arc<BitcoinRpc>>,
-    pub geoip: Option<Arc<GeoIpServiceHandle>>,
+    pub geoip: Option<Arc<GeoIpService>>,
     /// `Cargo.toml` package version — `/api/info/version` reads this.
     pub pool_version: &'static str,
     /// Email-verification flow hooks (`/api/email/register` + `/verify`).

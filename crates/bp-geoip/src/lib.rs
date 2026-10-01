@@ -6,11 +6,15 @@
 //! unresolvable IPs do not hammer the upstream.
 
 pub mod client;
-pub mod config;
 pub mod error;
 pub mod service;
 
+use std::time::Duration;
+
 pub use client::{GeoIpClient, ReqwestGeoIpClient};
-pub use config::GeoIpConfig;
 pub use error::GeoIpError;
-pub use service::{GeoIpService, GeoIpServiceHandle, GeoLocation};
+pub use service::{GeoIpService, GeoLocation};
+
+pub const BASE_URL: &str = "http://ip-api.com";
+pub const CACHE_TTL: Duration = Duration::from_secs(600);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);

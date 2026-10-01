@@ -4,16 +4,12 @@
 //! (not per entry) so cached failures eventually retry.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::client::GeoIpClient;
-use crate::config::GeoIpConfig;
-use crate::error::GeoIpError;
 
 /// Resolved location for one IP; a partial result keeps the known field.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,56 +28,32 @@ impl GeoLocation {
     }
 }
 
-pub struct GeoIpService<C: GeoIpClient> {
-    client: Arc<C>,
-    cache: Arc<Mutex<HashMap<String, Option<GeoLocation>>>>,
+type Cache = Arc<Mutex<HashMap<String, Option<GeoLocation>>>>;
+
+pub struct GeoIpService {
+    client: Arc<dyn GeoIpClient>,
+    cache: Cache,
 }
 
-impl<C: GeoIpClient> GeoIpService<C> {
-    /// Without the background cache-clear task; production uses
-    /// [`Self::spawn`].
-    pub fn new(_config: &GeoIpConfig, client: Arc<C>) -> Self {
-        Self {
-            client,
-            cache: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    pub fn spawn(config: GeoIpConfig, client: Arc<C>) -> Result<GeoIpServiceHandle, GeoIpError> {
-        config.validate()?;
-        let service = Self::new(&config, client);
-        let cache = service.cache.clone();
-        let ttl = config.cache_ttl;
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-
-        let join = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(ttl);
+impl GeoIpService {
+    /// Starts the task that wipes the cache every `cache_ttl`; it lives as
+    /// long as the process.
+    pub fn spawn(client: Arc<dyn GeoIpClient>, cache_ttl: Duration) -> Self {
+        let cache: Cache = Arc::default();
+        let wiped = cache.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(cache_ttl);
             // Skip the immediate first tick — first wipe is at t = ttl.
             interval.tick().await;
             loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let mut guard = cache.lock().expect("geoip cache poisoned");
-                        let n = guard.len();
-                        guard.clear();
-                        debug!(cleared = n, "geoip cache wiped (TTL fired)");
-                    }
-                    _ = &mut shutdown_rx => {
-                        debug!("geoip cache-clear task received shutdown");
-                        break;
-                    }
-                }
+                interval.tick().await;
+                let mut guard = wiped.lock().expect("geoip cache poisoned");
+                let n = guard.len();
+                guard.clear();
+                debug!(cleared = n, "geoip cache wiped (TTL fired)");
             }
         });
-
-        Ok(GeoIpServiceHandle {
-            inner: Arc::new(GeoIpServiceInner {
-                client: service.client,
-                cache: service.cache,
-            }),
-            shutdown_tx: Mutex::new(Some(shutdown_tx)),
-            join: Mutex::new(Some(join)),
-        })
+        Self { client, cache }
     }
 
     pub async fn get_location(&self, ip: &str) -> Option<GeoLocation> {
@@ -125,94 +97,9 @@ impl<C: GeoIpClient> GeoIpService<C> {
         result
     }
 
-    pub fn cache_len(&self) -> usize {
+    #[cfg(test)]
+    fn cache_len(&self) -> usize {
         self.cache.lock().expect("geoip cache poisoned").len()
-    }
-}
-
-pub struct GeoIpServiceHandle {
-    inner: Arc<GeoIpServiceInner>,
-    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
-    join: Mutex<Option<JoinHandle<()>>>,
-}
-
-struct GeoIpServiceInner {
-    client: Arc<dyn GeoIpClient>,
-    cache: Arc<Mutex<HashMap<String, Option<GeoLocation>>>>,
-}
-
-impl GeoIpServiceHandle {
-    pub async fn get_location(&self, ip: &str) -> Option<GeoLocation> {
-        if let Some(cached) = self
-            .inner
-            .cache
-            .lock()
-            .expect("geoip cache poisoned")
-            .get(ip)
-            .cloned()
-        {
-            return cached;
-        }
-
-        let result = match self.inner.client.lookup(ip).await {
-            Ok(resp) if resp.status == "success" => {
-                let loc = GeoLocation {
-                    city: resp.city,
-                    country: resp.country,
-                };
-                if loc.is_meaningful() {
-                    Some(loc)
-                } else {
-                    None
-                }
-            }
-            Ok(resp) => {
-                warn!(ip, status = %resp.status, "geoip non-success status");
-                None
-            }
-            Err(e) => {
-                warn!(ip, error = %e, "geoip lookup error");
-                None
-            }
-        };
-
-        self.inner
-            .cache
-            .lock()
-            .expect("geoip cache poisoned")
-            .insert(ip.to_string(), result.clone());
-        result
-    }
-
-    pub fn cache_len(&self) -> usize {
-        self.inner.cache.lock().expect("geoip cache poisoned").len()
-    }
-
-    pub fn clear_cache(&self) {
-        self.inner
-            .cache
-            .lock()
-            .expect("geoip cache poisoned")
-            .clear();
-    }
-
-    /// Signal shutdown and await the background task. Idempotent.
-    pub async fn shutdown(&self) {
-        if let Some(tx) = self
-            .shutdown_tx
-            .lock()
-            .expect("geoip shutdown_tx poisoned")
-            .take()
-        {
-            let _ = tx.send(());
-        }
-        // Take the JoinHandle out first so the guard is not held across the await.
-        let join = self.join.lock().expect("geoip join poisoned").take();
-        if let Some(join) = join {
-            if let Err(e) = join.await {
-                warn!(error = %e, "geoip cache-clear task panicked");
-            }
-        }
     }
 }
 
@@ -220,9 +107,10 @@ impl GeoIpServiceHandle {
 mod tests {
     use super::*;
     use crate::client::test_support::ScriptedClient;
+    use crate::error::GeoIpError;
 
-    fn service_no_spawn(client: Arc<ScriptedClient>) -> GeoIpService<ScriptedClient> {
-        GeoIpService::new(&GeoIpConfig::default(), client)
+    fn service_no_spawn(client: Arc<ScriptedClient>) -> GeoIpService {
+        GeoIpService::spawn(client, crate::CACHE_TTL)
     }
 
     #[test]
@@ -365,79 +253,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_handle_clears_cache_on_ttl_tick() {
+    async fn spawn_clears_cache_on_ttl_tick() {
         let client = Arc::new(ScriptedClient::new());
         client.enqueue_ok("success", Some("A"), Some("B"));
         client.enqueue_ok("success", Some("C"), Some("D"));
-        let handle = GeoIpService::spawn(
-            GeoIpConfig {
-                cache_ttl: std::time::Duration::from_millis(50),
-                ..GeoIpConfig::default()
-            },
-            client.clone(),
-        )
-        .expect("spawn");
+        let service = GeoIpService::spawn(client.clone(), Duration::from_millis(50));
 
-        let first = handle.get_location("1.1.1.1").await;
+        let first = service.get_location("1.1.1.1").await;
         assert_eq!(first.unwrap().city.as_deref(), Some("A"));
-        assert_eq!(handle.cache_len(), 1);
+        assert_eq!(service.cache_len(), 1);
 
         // Wait > TTL so the background tick wipes the cache.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert_eq!(handle.cache_len(), 0, "background task cleared cache");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(service.cache_len(), 0, "background task cleared cache");
 
         // Second call re-fetches from HTTP.
-        let second = handle.get_location("1.1.1.1").await;
+        let second = service.get_location("1.1.1.1").await;
         assert_eq!(second.unwrap().city.as_deref(), Some("C"));
         assert_eq!(client.calls().len(), 2);
-
-        handle.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn clear_cache_invalidates_immediately() {
-        let client = Arc::new(ScriptedClient::new());
-        client.enqueue_ok("success", Some("A"), Some("B"));
-        client.enqueue_ok("success", Some("C"), Some("D"));
-        let handle = GeoIpService::spawn(
-            GeoIpConfig {
-                cache_ttl: std::time::Duration::from_secs(3600),
-                ..GeoIpConfig::default()
-            },
-            client.clone(),
-        )
-        .expect("spawn");
-
-        let first = handle.get_location("9.9.9.9").await;
-        assert_eq!(first.unwrap().city.as_deref(), Some("A"));
-
-        handle.clear_cache();
-        assert_eq!(handle.cache_len(), 0);
-
-        // Next call re-fetches.
-        let second = handle.get_location("9.9.9.9").await;
-        assert_eq!(second.unwrap().city.as_deref(), Some("C"));
-
-        handle.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn shutdown_is_idempotent() {
-        let client = Arc::new(ScriptedClient::new());
-        let handle = GeoIpService::spawn(GeoIpConfig::default(), client).expect("spawn");
-        handle.shutdown().await;
-        // Second call is a no-op.
-        handle.shutdown().await;
-    }
-
-    #[test]
-    fn spawn_with_invalid_config_rejects() {
-        let client = Arc::new(ScriptedClient::new());
-        let bad = GeoIpConfig {
-            base_url: String::new(),
-            ..GeoIpConfig::default()
-        };
-        let result = GeoIpService::spawn(bad, client);
-        assert!(result.is_err());
     }
 }

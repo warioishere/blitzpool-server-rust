@@ -8,6 +8,4 @@ pub enum GeoIpError {
     Http(String),
     #[error("response parse error: {0}")]
     Parse(String),
-    #[error("invalid configuration: {0}")]
-    Config(String),
 }

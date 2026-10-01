@@ -13,7 +13,7 @@ use bp_bitcoin::{BitcoinRpc, BitcoinRpcConfig as BtcRpcConfig, RpcAuth};
 use bp_common::StreamKind;
 use bp_config::{AppConfig, BitcoinRpcConfig, DatabaseConfig, RedisConfig, Role, TdpConfig};
 use bp_db::{Db, DbConfig};
-use bp_geoip::{GeoIpConfig, GeoIpService, GeoIpServiceHandle, ReqwestGeoIpClient};
+use bp_geoip::{GeoIpService, ReqwestGeoIpClient};
 use bp_metrics::{MetricsService, MetricsServiceHandle, PrometheusConfig};
 use bp_template_distribution::{TdpCoinbaseConstraints, TdpConfig as TdpSpawnConfig, TdpHandle};
 use redis::aio::ConnectionManager;
@@ -21,9 +21,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 /// Long-lived runtime dependencies the engine wiring consumes.
-// Consumers borrow the aggregate and clone individual handles. The struct
-// itself is not `Clone`: `GeoIpServiceHandle` owns an exclusive shutdown
-// `oneshot`.
+// Consumers borrow the aggregate and clone individual handles.
 pub(crate) struct FoundationHandles {
     pub(crate) db: Db,
     pub(crate) redis: ConnectionManager,
@@ -37,7 +35,7 @@ pub(crate) struct FoundationHandles {
     /// space those modes would waste. Routed per connection by
     /// [`StreamKind::for_mode`].
     pub(crate) alt_tdp: HashMap<StreamKind, TdpHandle>,
-    pub(crate) geoip: Option<Arc<GeoIpServiceHandle>>,
+    pub(crate) geoip: Option<Arc<GeoIpService>>,
     pub(crate) metrics: Option<MetricsServiceHandle>,
 }
 
@@ -359,25 +357,17 @@ fn spawn_tdp_stream(
 
 // ─── GeoIP (optional) ─────────────────────────────────────────────
 
-/// Construct the GeoIP service handle (`http://ip-api.com`, 10-minute cache
-/// TTL). Failures come only from config validation, never from network
-/// I/O; an unreachable upstream just caches `None` for 10 min.
-fn spawn_geoip() -> Option<GeoIpServiceHandle> {
-    let cfg = GeoIpConfig::default();
-    let client = match ReqwestGeoIpClient::new(cfg.base_url.clone(), Duration::from_secs(5)) {
-        Ok(c) => Arc::new(c),
+/// The GeoIP service (`http://ip-api.com`, 10-minute cache). Fails only if
+/// the HTTP client cannot be built; an unreachable upstream just caches
+/// `None` for 10 min.
+fn spawn_geoip() -> Option<GeoIpService> {
+    match ReqwestGeoIpClient::new(bp_geoip::BASE_URL, bp_geoip::REQUEST_TIMEOUT) {
+        Ok(client) => {
+            info!("geoip: handle live");
+            Some(GeoIpService::spawn(Arc::new(client), bp_geoip::CACHE_TTL))
+        }
         Err(err) => {
             warn!(%err, "geoip: client init failed — continuing without geoip");
-            return None;
-        }
-    };
-    match GeoIpService::spawn(cfg, client) {
-        Ok(handle) => {
-            info!("geoip: handle live");
-            Some(handle)
-        }
-        Err(err) => {
-            warn!(%err, "geoip: spawn failed — continuing without geoip");
             None
         }
     }
