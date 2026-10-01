@@ -253,7 +253,7 @@ struct PortDispatch {
     sv2_port_config: bp_stratum_v2::mining::client::PortConfig,
 }
 
-/// TCP accept-loop with first-byte protocol-detect dispatch.
+/// TCP accept-loop with protocol-detect dispatch.
 async fn accept_loop(listener: TcpListener, dispatch: PortDispatch, cancel: CancellationToken) {
     let port = dispatch.sv1_port_config.port;
     loop {
@@ -314,11 +314,10 @@ fn tune_stratum_socket(socket: &TcpStream, peer: std::net::SocketAddr, port: u16
     }
 }
 
-/// Peek 1 byte from `socket` and dispatch to the right server. Closes
-/// the socket if no byte arrives within 30 s. The peek is non-consuming
-/// — the downstream server reads from byte 0 of the same socket (SV1
-/// starts JSON parsing, SV2 starts Noise handshake). Any read failure
-/// before dispatch closes the socket silently.
+/// Peek the opening bytes of `socket` and dispatch to the right server.
+/// Closes the socket if detection does not finish within 30 s. The peek is
+/// non-consuming: the server reads from byte 0 of the same socket. Any read
+/// failure before dispatch closes the socket.
 async fn dispatch_connection(
     socket: TcpStream,
     peer: std::net::SocketAddr,
@@ -326,13 +325,12 @@ async fn dispatch_connection(
 ) {
     let port = dispatch.sv1_port_config.port;
     tune_stratum_socket(&socket, peer, port);
-    let detected = match timeout(std::time::Duration::from_secs(30), peek_first_byte(&socket)).await
-    {
+    let detected = match timeout(std::time::Duration::from_secs(30), peek_protocol(&socket)).await {
         Err(_) => {
             debug!(?peer, port, "stratum: detection timeout; closing");
             return;
         }
-        Ok(Ok(Some(b))) => detect(b),
+        Ok(Ok(Some(detected))) => detected,
         Ok(Ok(None)) => {
             debug!(?peer, port, "stratum: empty first read; closing");
             return;
@@ -368,50 +366,112 @@ async fn dispatch_connection(
     }
 }
 
-/// What the first byte of an accepted connection says it speaks.
+/// What the opening bytes of an accepted connection say it speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Detected {
-    /// SV1 JSON-RPC: `'{'`, or one of the pre-JSON whitespace bytes
-    /// `' '` / `'\n'` / `'\r'` some SV1 implementations lead with.
+    /// SV1 JSON-RPC: a JSON object with string keys, optionally after
+    /// whitespace.
     Sv1,
-    /// SV2 binary protocol (Noise handshake). Every byte the other
-    /// variants don't claim lands here.
+    /// SV2 (Noise handshake): everything the other variants don't claim.
     Sv2,
-    /// HTTP request: `'G'` (GET) or `'P'` (POST/PUT/PATCH). Not served on
-    /// a stratum port — [`dispatch_connection`] logs a warning and closes.
+    /// HTTP request (`GET `, `POST`, `PUT `, `PATCH`). Not served on a
+    /// stratum port; [`dispatch_connection`] logs a warning and closes.
     Http,
-    /// TLS ClientHello (`0x16`). Closed right away, so a TLS probe never
-    /// reaches the SV2 handshake machinery.
+    /// TLS ClientHello (`0x16 0x03`). Closed right away.
     Tls,
 }
 
-/// Classify a connection by its first byte.
+/// Classify a connection by the first bytes it sent, or `None` while they
+/// do not decide it yet.
 ///
-/// Pre-JSON whitespace (`' '`, `'\n'`, `'\r'`) counts as SV1: the SV1
-/// spec opens with `{`, but some implementations lead with whitespace.
-/// The byte is only peeked, so the SV1 parser still sees it and trims it.
-fn detect(first_byte: u8) -> Detected {
-    match first_byte {
-        // HTTP — GET (0x47) or POST/PUT/PATCH (0x50).
-        b'G' | b'P' => Detected::Http,
-        // SV1 — '{' (0x7B) or leading whitespace before the JSON body.
-        b'{' | b' ' | b'\n' | b'\r' => Detected::Sv1,
-        // TLS ClientHello — not a stratum protocol.
-        0x16 => Detected::Tls,
-        // Anything else: assume SV2 binary (Noise handshake).
-        _ => Detected::Sv2,
+/// An SV2 connection opens with a pseudo-random 64-byte EllSwift key (SV2
+/// Protocol Security), so its first byte alone can look like SV1, HTTP or
+/// TLS. Each of those is therefore matched on a multi-byte opening, and
+/// anything else is SV2.
+fn detect(prefix: &[u8]) -> Option<Detected> {
+    match *prefix.first()? {
+        0x16 => Some(if *prefix.get(1)? == 0x03 {
+            Detected::Tls
+        } else {
+            Detected::Sv2
+        }),
+        b'G' | b'P' => Some(
+            if starts_with_any(prefix, &[b"GET ", b"POST", b"PUT ", b"PATCH"])? {
+                Detected::Http
+            } else {
+                Detected::Sv2
+            },
+        ),
+        b if is_json_whitespace(b) || b == b'{' => sv1_or_sv2(prefix),
+        _ => Some(Detected::Sv2),
     }
 }
 
-/// Peek the first byte from `socket` without consuming it. Returns
-/// `Ok(None)` when the peer closed the connection before sending
-/// anything; `Err(_)` for any I/O error.
-async fn peek_first_byte(socket: &TcpStream) -> std::io::Result<Option<u8>> {
-    // `peek` returns 0 on peer-close.
-    let mut buf = [0u8; 1];
-    match socket.peek(&mut buf).await? {
-        0 => Ok(None),
-        _ => Ok(Some(buf[0])),
+fn is_json_whitespace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// SV1 messages are JSON objects with string keys: optional whitespace,
+/// `{`, optional whitespace, `"`.
+fn sv1_or_sv2(prefix: &[u8]) -> Option<Detected> {
+    let mut bytes = prefix
+        .iter()
+        .copied()
+        .skip_while(|b| is_json_whitespace(*b));
+    if bytes.next()? != b'{' {
+        return Some(Detected::Sv2);
+    }
+    Some(if bytes.find(|b| !is_json_whitespace(*b))? == b'"' {
+        Detected::Sv1
+    } else {
+        Detected::Sv2
+    })
+}
+
+/// `Some(true)` when `prefix` starts with one of `openings`, `Some(false)`
+/// when it cannot, `None` while it is still a proper prefix of one.
+fn starts_with_any(prefix: &[u8], openings: &[&[u8]]) -> Option<bool> {
+    let mut undecided = false;
+    for opening in openings {
+        let n = prefix.len().min(opening.len());
+        if prefix[..n] == opening[..n] {
+            if prefix.len() >= opening.len() {
+                return Some(true);
+            }
+            undecided = true;
+        }
+    }
+    if undecided {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// How many bytes detection may look at: one SV2 handshake opening.
+const DETECT_PEEK_BYTES: usize = 64;
+
+/// Peek at the opening bytes of `socket` until [`detect`] decides, without
+/// consuming them. `Ok(None)` when the peer closed before sending anything.
+async fn peek_protocol(socket: &TcpStream) -> std::io::Result<Option<Detected>> {
+    let mut buf = [0u8; DETECT_PEEK_BYTES];
+    loop {
+        let n = socket.peek(&mut buf).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        if let Some(detected) = detect(&buf[..n]) {
+            return Ok(Some(detected));
+        }
+        if n == buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "opening bytes match no protocol",
+            ));
+        }
+        // `peek` returns at once while bytes are buffered, so wait before
+        // looking again for the rest of the opening.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
@@ -491,39 +551,147 @@ mod tests {
         assert!(socket.nodelay().unwrap());
     }
 
-    // ── first-byte detection ─────────────────────────────────────────
+    // ── protocol detection ───────────────────────────────────────────
 
     #[test]
-    fn http_method_initials_route_to_http() {
-        // GET (0x47); POST / PUT / PATCH all start with 0x50.
-        assert_eq!(detect(b'G'), Detected::Http);
-        assert_eq!(detect(b'P'), Detected::Http);
-    }
-
-    #[test]
-    fn open_brace_and_leading_whitespace_are_sv1() {
-        // Some non-strict SV1 implementations lead with whitespace.
-        for b in [b'{', b' ', b'\n', b'\r'] {
-            assert_eq!(detect(b), Detected::Sv1, "byte 0x{b:02x}");
+    fn sv1_openings_are_sv1() {
+        for line in [
+            &b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n"[..],
+            b"{ \"id\": 1}",
+            b"\n{\"id\":1}",
+            b"\r\n {\"method\":\"mining.configure\"}",
+        ] {
+            assert_eq!(detect(line), Some(Detected::Sv1), "{line:?}");
         }
     }
 
     #[test]
-    fn tls_client_hello_is_its_own_variant() {
-        // TLS ClientHello typically starts 0x16 0x03 0x01 (handshake, TLS 1.0).
-        assert_eq!(detect(0x16), Detected::Tls);
+    fn http_requests_are_http() {
+        for req in [
+            &b"GET / HTTP/1.1\r\n"[..],
+            b"POST /api HTTP/1.1",
+            b"PUT /x HTTP/1.1",
+            b"PATCH /x HTTP/1.1",
+        ] {
+            assert_eq!(detect(req), Some(Detected::Http), "{req:?}");
+        }
     }
 
     #[test]
-    fn unclaimed_bytes_fall_through_to_sv2() {
-        // A Noise XK first message starts with the ephemeral public key, so
-        // the leading byte is whatever the curve produced.
-        for b in [0x00, 0x01, 0x42, 0x80, 0xab, 0xfe, 0xff] {
-            assert_eq!(detect(b), Detected::Sv2, "byte 0x{b:02x}");
+    fn a_tls_client_hello_is_tls() {
+        assert_eq!(detect(&[0x16, 0x03, 0x01, 0x02, 0x00]), Some(Detected::Tls));
+    }
+
+    /// An SV2 connection opens with a 64-byte EllSwift key, which is
+    /// pseudo-random (SV2 Protocol Security), so its first byte can be any
+    /// value, including the ones SV1, HTTP and TLS start with. The bytes
+    /// after it decide.
+    #[test]
+    fn an_sv2_key_starting_like_another_protocol_is_sv2() {
+        for first in [b'{', b' ', b'\n', b'\r', b'G', b'P', 0x16] {
+            let mut key = [0xa5u8; 64];
+            key[0] = first;
+            assert_eq!(
+                detect(&key),
+                Some(Detected::Sv2),
+                "first byte 0x{first:02x}"
+            );
         }
-        // Letters other than the HTTP method initials are not HTTP.
-        for b in [b'A', b'B', b'H', b'O', b'T', b'X', b'Z'] {
-            assert_eq!(detect(b), Detected::Sv2, "letter '{}'", b as char);
+    }
+
+    #[test]
+    fn any_other_first_byte_is_sv2() {
+        for first in [
+            0x00, 0x01, 0x42, 0x80, 0xab, 0xfe, 0xff, b'A', b'H', b'T', b'Z',
+        ] {
+            let mut key = [0x5au8; 64];
+            key[0] = first;
+            assert_eq!(
+                detect(&key),
+                Some(Detected::Sv2),
+                "first byte 0x{first:02x}"
+            );
+        }
+    }
+
+    /// Accept one connection on a local listener and run `peek_protocol` on
+    /// it while `send` writes from the client side.
+    async fn peek_over_tcp<F, Fut>(send: F) -> std::io::Result<Option<Detected>>
+    where
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client =
+            tokio::spawn(async move { send(TcpStream::connect(addr).await.unwrap()).await });
+        let (server, _) = listener.accept().await.unwrap();
+        let detected =
+            tokio::time::timeout(std::time::Duration::from_secs(5), peek_protocol(&server))
+                .await
+                .expect("detection finishes");
+        client.await.unwrap();
+        detected
+    }
+
+    /// Detection waits for the rest of an opening that arrives in pieces,
+    /// and the peeked bytes stay unread for the server.
+    #[tokio::test]
+    async fn an_opening_split_across_writes_is_detected_once_complete() {
+        use tokio::io::AsyncWriteExt;
+        let detected = peek_over_tcp(|mut c| async move {
+            c.write_all(b"{").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            c.write_all(b"\"id\":1}\n").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        })
+        .await
+        .unwrap();
+        assert_eq!(detected, Some(Detected::Sv1));
+    }
+
+    #[tokio::test]
+    async fn peek_protocol_ends_on_every_kind_of_opening() {
+        use tokio::io::AsyncWriteExt;
+        let mut key = [0xa5u8; 64];
+        key[0] = b'{';
+        let sv2 = peek_over_tcp(move |mut c| async move {
+            c.write_all(&key).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        })
+        .await
+        .unwrap();
+        assert_eq!(sv2, Some(Detected::Sv2));
+
+        let closed = peek_over_tcp(|c| async move { drop(c) }).await.unwrap();
+        assert_eq!(closed, None);
+
+        let undecidable = peek_over_tcp(|mut c| async move {
+            c.write_all(&[b' '; DETECT_PEEK_BYTES]).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        })
+        .await;
+        assert!(undecidable.is_err(), "got {undecidable:?}");
+    }
+
+    /// A prefix that could still become SV1, HTTP or TLS waits for more bytes.
+    #[test]
+    fn an_undecided_prefix_asks_for_more() {
+        for prefix in [
+            &b""[..],
+            b"{",
+            b" ",
+            b"\r\n",
+            b"{ ",
+            b"G",
+            b"GE",
+            b"GET",
+            b"P",
+            b"PO",
+            b"PU",
+            &[0x16],
+        ] {
+            assert_eq!(detect(prefix), None, "{prefix:?}");
         }
     }
 }
