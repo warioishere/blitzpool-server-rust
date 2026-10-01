@@ -687,34 +687,6 @@ pub async fn set_telegram_hourly_flags(
     Ok(result.rows_affected())
 }
 
-/// Set both `hourlyStatsEnabled` and `hourlyWorkersEnabled` in one
-/// call — `/send_hourly on|off` always flips both together.
-pub async fn update_telegram_sub_hourly_flags(
-    pool: &PgPool,
-    telegram_chat_id: i64,
-    address: &AddressId,
-    value: bool,
-) -> Result<u64, DbError> {
-    let now_ms: i64 = chrono::Utc::now().timestamp_millis();
-    let result = sqlx::query!(
-        r#"UPDATE telegram_subscriptions_entity
-           SET "hourlyStatsEnabled" = $3,
-               "hourlyWorkersEnabled" = $3,
-               "updatedAt" = $4
-           WHERE "telegramChatId" = $1
-             AND address = $2
-             AND "deletedAt" IS NULL"#,
-        telegram_chat_id,
-        address.as_str(),
-        value,
-        now_ms,
-    )
-    .execute(pool)
-    .await
-    .map_err(DbError::from)?;
-    Ok(result.rows_affected())
-}
-
 // ── ntfy subscription writes (bot command path) ──────────────────────
 
 /// Upsert by `address` (the table has a UNIQUE on address). Existing

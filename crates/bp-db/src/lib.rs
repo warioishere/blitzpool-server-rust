@@ -117,10 +117,9 @@ pub use notification::{
     set_telegram_default_subscription, set_telegram_hourly_flags, update_ntfy_sub_best_diff_flag,
     update_ntfy_sub_device_flag, update_ntfy_sub_hourly_flags, update_ntfy_sub_language,
     update_push_subscription_last_notification, update_push_subscription_preferences,
-    update_telegram_sub_best_diff_flag, update_telegram_sub_device_flag,
-    update_telegram_sub_hourly_flags, upsert_ntfy_subscription, upsert_push_subscription,
-    upsert_telegram_subscription, NtfySubscriptionRow, PushSubscriptionRow,
-    TelegramSubscriptionRow,
+    update_telegram_sub_best_diff_flag, update_telegram_sub_device_flag, upsert_ntfy_subscription,
+    upsert_push_subscription, upsert_telegram_subscription, NtfySubscriptionRow,
+    PushSubscriptionRow, TelegramSubscriptionRow,
 };
 pub use pool_stats::{
     find_network_difficulty_tracker, find_pool_mode_hashrate_since,

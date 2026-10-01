@@ -15,9 +15,8 @@ use bp_db::{
     promote_telegram_default_if_none, reset_address_settings_best_difficulty,
     set_telegram_default_subscription, set_telegram_hourly_flags, update_ntfy_sub_best_diff_flag,
     update_ntfy_sub_device_flag, update_ntfy_sub_hourly_flags, update_ntfy_sub_language,
-    update_telegram_sub_best_diff_flag, update_telegram_sub_device_flag,
-    update_telegram_sub_hourly_flags, upsert_ntfy_subscription, upsert_telegram_subscription,
-    TelegramSubscriptionRow,
+    update_telegram_sub_best_diff_flag, update_telegram_sub_device_flag, upsert_ntfy_subscription,
+    upsert_telegram_subscription, TelegramSubscriptionRow,
 };
 use sqlx::PgPool;
 use tokio::sync::{Mutex, Notify};
@@ -892,10 +891,11 @@ impl CommandHandler {
                             .await
                         }
                         FlagKind::Hourly => {
-                            update_telegram_sub_hourly_flags(
+                            set_telegram_hourly_flags(
                                 &self.pool,
                                 *chat_id,
                                 &sub.address,
+                                value,
                                 value,
                             )
                             .await
