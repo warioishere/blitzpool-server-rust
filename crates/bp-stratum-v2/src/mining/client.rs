@@ -963,6 +963,40 @@ fn graced_validation_difficulty(job_frozen: Difficulty, session: Difficulty) -> 
     Difficulty(job_frozen.as_f64().min(session.as_f64()))
 }
 
+/// Feed the channel's vardiff with a validated share. Every accepted share
+/// counts as current, even on an older-difficulty job, or the samples starve
+/// after each retarget (Standard jobs keep their send-time difficulty).
+fn feed_vardiff<C: Clock>(
+    state: &mut MiningSessionState<C>,
+    channel_id: u32,
+    validation: &ShareValidation,
+) {
+    let Some(engine) = state.vardiff.get_mut(&channel_id) else {
+        return;
+    };
+    match validation {
+        ShareValidation::Accepted(accept) => {
+            engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
+        }
+        ShareValidation::Rejected(reject) => {
+            // Only a reject whose work met the target spends the silence
+            // evidence. `DifficultyTooLow` is the over-assignment the descent
+            // corrects; `BadExtranonceSize` is refused before anything is hashed.
+            let demonstrates_target = match reject.reason {
+                RejectReason::InvalidJobId
+                | RejectReason::StaleShare
+                | RejectReason::DuplicateShare => true,
+                RejectReason::DifficultyTooLow
+                | RejectReason::BadExtranonceSize
+                | RejectReason::InvalidChannelId => false,
+            };
+            if demonstrates_target {
+                engine.note_target_reached();
+            }
+        }
+    }
+}
+
 /// Stamp the channel's vardiff liveness heartbeat for any submission, whatever
 /// its outcome. Every submit path must call it before any early-return reject,
 /// so a reject burst from a hashing miner is never misread as silence.
@@ -1024,25 +1058,7 @@ pub fn handle_submit_shares_standard<C: Clock>(
     let graced = graced_validation_difficulty(entry.difficulty, channel.session_difficulty);
     let validation =
         validate_submit_standard(channel, submission, graced, &entry.merkle_root, &job_ctx);
-    // Feed vardiff EVERY accepted share, even on an older-difficulty job, or the
-    // samples starve after each retarget. Other rejects also spend the silence
-    // evidence, but `DifficultyTooLow` must not: it IS the over-assignment the
-    // descent has to correct.
-    match validation {
-        ShareValidation::Accepted(ref accept) => {
-            if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
-                engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
-            }
-        }
-        ShareValidation::Rejected(reject)
-            if !matches!(reject.reason, RejectReason::DifficultyTooLow) =>
-        {
-            if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
-                engine.note_target_reached();
-            }
-        }
-        ShareValidation::Rejected(_) => {}
-    }
+    feed_vardiff(state, submission.channel_id, &validation);
     finalize_submit(
         submission.channel_id,
         submission.sequence_number,
@@ -1117,22 +1133,7 @@ pub fn handle_submit_shares_extended<C: Clock>(
         ext_0x0002_negotiated,
         share_logs,
     );
-    // Same vardiff feed as the Standard path.
-    match validation {
-        ShareValidation::Accepted(ref accept) => {
-            if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
-                engine.update_hash_rate(accept.effective_difficulty.as_f64(), true);
-            }
-        }
-        ShareValidation::Rejected(reject)
-            if !matches!(reject.reason, RejectReason::DifficultyTooLow) =>
-        {
-            if let Some(engine) = state.vardiff.get_mut(&submission.channel_id) {
-                engine.note_target_reached();
-            }
-        }
-        ShareValidation::Rejected(_) => {}
-    }
+    feed_vardiff(state, submission.channel_id, &validation);
     finalize_submit(
         submission.channel_id,
         submission.sequence_number,
@@ -3833,6 +3834,78 @@ pub(crate) mod tests {
                 .iter()
                 .any(|f| matches!(f, OutboundFrame::SetTarget { .. })),
             "an invalid-job reject must stamp the heartbeat and hold, not ease"
+        );
+    }
+
+    /// A bad-extranonce-size reject is decided before anything is hashed, so
+    /// it stamps liveness but proves nothing about the target, as SV1's
+    /// pre-hash reject.
+    #[test]
+    fn a_bad_extranonce_size_reject_leaves_the_silence_evidence() {
+        let clock = Arc::new(TestClock::new(0));
+        let mut cfg = port_cfg();
+        cfg.vardiff_silence_easing = true;
+        let mut s = MiningSessionState::new(clock.clone(), 1, cfg);
+        handle_setup_connection(&mut s, &good_setup());
+        let _ = handle_open_extended_mining_channel(
+            &mut s,
+            &open_ext(1, &format!("{}.w", REGTEST_ADDR)),
+            vec![0; 4],
+        );
+        let cid = s.primary_channel.unwrap();
+        let job = ExtendedJob {
+            payouts_fingerprint: [0u8; 32],
+            coinbase_prefix: vec![0xAA; 8],
+            coinbase_suffix: vec![0xBB; 8],
+            merkle_path: vec![[0u8; 32]],
+            extranonce_prefix: vec![0; 4],
+            version: 0x2000_0000,
+            prev_hash: [0xCC; 32],
+            n_bits: 0x1d00_ffff,
+            min_ntime: 0,
+            difficulty: Difficulty(1024.0),
+            coinbase_tx_value_remaining: 5_000_000_000,
+            template_id: None,
+            jdp_claims_the_block: false,
+            created_at: 0,
+            retired_at: None,
+        };
+        s.channels
+            .get_mut(&cid)
+            .unwrap()
+            .extended_jobs
+            .insert(7, job);
+
+        clock.advance_ms(120_000);
+        let before = s.vardiff[&cid].silence_implied_max_difficulty();
+        assert!(
+            before.is_some(),
+            "precondition: two silent minutes are evidence"
+        );
+
+        let sub = SubmitSharesExtendedInput {
+            channel_id: cid,
+            sequence_number: 1,
+            job_id: 7,
+            nonce: 0x1234_5678,
+            version: 0x2000_0000,
+            ntime: 0x6500_0001,
+            extranonce: ExtranonceBytes::from_slice(&[0x11; 7]),
+            tlvs: Vec::new(),
+        };
+        let out = handle_submit_shares_extended(&mut s, &sub, clock.now_ms());
+        assert!(
+            matches!(
+                &out.outbound[0],
+                OutboundFrame::SubmitSharesError { error_code, .. }
+                    if error_code == crate::mining::submit::ERR_BAD_EXTRANONCE_SIZE
+            ),
+            "precondition: the submit must be a bad-extranonce-size reject"
+        );
+        assert_eq!(
+            s.vardiff[&cid].silence_implied_max_difficulty(),
+            before,
+            "a reject that hashed nothing must not spend the silence evidence"
         );
     }
 
