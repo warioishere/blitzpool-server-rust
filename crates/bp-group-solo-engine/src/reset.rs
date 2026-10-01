@@ -19,6 +19,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use bp_group_mgmt::group::RoundResetPreset;
+
 use crate::round::{GroupRoundStore, RoundError};
 
 /// A scheduled reset is skipped if `lastRoundResetAt` is this recent,
@@ -47,32 +49,12 @@ pub enum ResetError {
 
 // ── Preset + schedule config ───────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Preset {
-    Daily,
-    Weekly,
-    Monthly,
-    Custom,
-}
-
-impl Preset {
-    pub fn from_wire(s: &str) -> Result<Self, ResetError> {
-        match s {
-            "daily" => Ok(Self::Daily),
-            "weekly" => Ok(Self::Weekly),
-            "monthly" => Ok(Self::Monthly),
-            "custom" => Ok(Self::Custom),
-            other => Err(ResetError::InvalidPreset(other.to_string())),
-        }
-    }
-}
-
 /// Snapshot of one group's reset schedule, derived from its
 /// `pplns_group` row at the time the cron task is spawned.
 #[derive(Clone, Debug)]
 pub struct ResetSchedule {
     pub group_id: Uuid,
-    pub preset: Preset,
+    pub preset: RoundResetPreset,
     pub timezone: Tz,
     /// Only meaningful for `Custom`.
     pub interval_days: Option<u32>,
@@ -94,11 +76,12 @@ impl ResetSchedule {
         let Some(tz_str) = timezone else {
             return Ok(None);
         };
-        let preset = Preset::from_wire(preset_str)?;
+        let preset = RoundResetPreset::parse(preset_str)
+            .ok_or_else(|| ResetError::InvalidPreset(preset_str.to_string()))?;
         let tz: Tz = tz_str
             .parse()
             .map_err(|_| ResetError::InvalidTimezone(tz_str.to_string()))?;
-        if preset == Preset::Custom && interval_days.unwrap_or(0) < 1 {
+        if preset == RoundResetPreset::Custom && interval_days.unwrap_or(0) < 1 {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -122,7 +105,7 @@ pub fn compute_next_fire(
 ) -> DateTime<Utc> {
     let now_local = now.with_timezone(&schedule.timezone);
     let mut candidate = next_calendar_fire_local(&schedule.preset, now_local);
-    if schedule.preset == Preset::Custom {
+    if schedule.preset == RoundResetPreset::Custom {
         if let Some(last_ms) = last_reset_at_ms {
             let interval_ms = schedule.interval_days.unwrap_or(0) as i64 * 86_400_000;
             let earliest_ms = last_ms + interval_ms - DST_TOLERANCE_MS;
@@ -138,11 +121,11 @@ pub fn compute_next_fire(
 }
 
 /// Next 00:00 local time for the given preset, strictly after `now`.
-fn next_calendar_fire_local(preset: &Preset, now: DateTime<Tz>) -> DateTime<Tz> {
+fn next_calendar_fire_local(preset: &RoundResetPreset, now: DateTime<Tz>) -> DateTime<Tz> {
     match preset {
-        Preset::Daily | Preset::Custom => next_midnight(now),
-        Preset::Weekly => next_monday_midnight(now),
-        Preset::Monthly => next_month_first_midnight(now),
+        RoundResetPreset::Daily | RoundResetPreset::Custom => next_midnight(now),
+        RoundResetPreset::Weekly => next_monday_midnight(now),
+        RoundResetPreset::Monthly => next_month_first_midnight(now),
     }
 }
 
@@ -362,7 +345,7 @@ mod tests {
             .unwrap()
     }
 
-    fn schedule(preset: Preset, tz: Tz, interval_days: Option<u32>) -> ResetSchedule {
+    fn schedule(preset: RoundResetPreset, tz: Tz, interval_days: Option<u32>) -> ResetSchedule {
         ResetSchedule {
             group_id: Uuid::new_v4(),
             preset,
@@ -396,21 +379,21 @@ mod tests {
     #[test]
     fn monthly_across_the_dst_fall_back_lands_on_the_first() {
         let now = at_utc_ms("2026-09-30T22:00:00.060Z"); // 1 Oct 00:00 Vienna
-        let next = next_fire_or_fail(schedule(Preset::Monthly, Vienna, None), None, now);
+        let next = next_fire_or_fail(schedule(RoundResetPreset::Monthly, Vienna, None), None, now);
         assert_eq!(next, at_utc(2026, 10, 31, 23, 0)); // 1 Nov 00:00 CET
     }
 
     #[test]
     fn weekly_across_the_dst_fall_back_lands_on_monday() {
         let now = at_utc_ms("2026-10-18T22:00:00.060Z"); // Mon 19 Oct 00:00 Zurich
-        let next = next_fire_or_fail(schedule(Preset::Weekly, Zurich, None), None, now);
+        let next = next_fire_or_fail(schedule(RoundResetPreset::Weekly, Zurich, None), None, now);
         assert_eq!(next, at_utc(2026, 10, 25, 23, 0)); // Mon 26 Oct 00:00 CET
     }
 
     #[test]
     fn daily_on_the_dst_fall_back_day_moves_to_the_next_day() {
         let now = at_utc_ms("2026-10-24T22:00:00.060Z"); // 25 Oct 00:00 Zurich
-        let next = next_fire_or_fail(schedule(Preset::Daily, Zurich, None), None, now);
+        let next = next_fire_or_fail(schedule(RoundResetPreset::Daily, Zurich, None), None, now);
         assert_eq!(next, at_utc(2026, 10, 25, 23, 0)); // 26 Oct 00:00 CET
     }
 
@@ -419,7 +402,7 @@ mod tests {
         let last = at_utc_ms("2026-10-24T22:00:00Z"); // 25 Oct 00:00 Zurich
         let now = at_utc_ms("2026-10-24T22:00:00.060Z");
         let next = next_fire_or_fail(
-            schedule(Preset::Custom, Zurich, Some(1)),
+            schedule(RoundResetPreset::Custom, Zurich, Some(1)),
             Some(last.timestamp_millis()),
             now,
         );
@@ -428,11 +411,23 @@ mod tests {
 
     #[test]
     fn preset_from_wire_strings() {
-        assert_eq!(Preset::from_wire("daily").unwrap(), Preset::Daily);
-        assert_eq!(Preset::from_wire("weekly").unwrap(), Preset::Weekly);
-        assert_eq!(Preset::from_wire("monthly").unwrap(), Preset::Monthly);
-        assert_eq!(Preset::from_wire("custom").unwrap(), Preset::Custom);
-        assert!(Preset::from_wire("hourly").is_err());
+        assert_eq!(
+            RoundResetPreset::parse("daily").unwrap(),
+            RoundResetPreset::Daily
+        );
+        assert_eq!(
+            RoundResetPreset::parse("weekly").unwrap(),
+            RoundResetPreset::Weekly
+        );
+        assert_eq!(
+            RoundResetPreset::parse("monthly").unwrap(),
+            RoundResetPreset::Monthly
+        );
+        assert_eq!(
+            RoundResetPreset::parse("custom").unwrap(),
+            RoundResetPreset::Custom
+        );
+        assert!(RoundResetPreset::parse("hourly").is_none());
     }
 
     #[test]
@@ -452,12 +447,12 @@ mod tests {
         let sched = ResetSchedule::from_row_fields(g, Some("daily"), Some("UTC"), None)
             .unwrap()
             .unwrap();
-        assert_eq!(sched.preset, Preset::Daily);
+        assert_eq!(sched.preset, RoundResetPreset::Daily);
     }
 
     #[test]
     fn next_fire_daily_in_utc() {
-        let s = schedule(Preset::Daily, UTC, None);
+        let s = schedule(RoundResetPreset::Daily, UTC, None);
         // At 12:00 UTC → next 00:00 UTC (tomorrow).
         let now = at_utc(2026, 5, 16, 12, 0);
         let next = compute_next_fire(&s, None, now);
@@ -466,7 +461,7 @@ mod tests {
 
     #[test]
     fn next_fire_daily_in_zurich_tz() {
-        let s = schedule(Preset::Daily, Zurich, None);
+        let s = schedule(RoundResetPreset::Daily, Zurich, None);
         // CEST: 00:00 local is 22:00 UTC the day before.
         let now = at_utc(2026, 5, 16, 12, 0);
         let next = compute_next_fire(&s, None, now);
@@ -475,7 +470,7 @@ mod tests {
 
     #[test]
     fn next_fire_weekly_lands_on_monday() {
-        let s = schedule(Preset::Weekly, UTC, None);
+        let s = schedule(RoundResetPreset::Weekly, UTC, None);
         // 2026-05-16 = Saturday. Next Monday = 2026-05-18.
         let now = at_utc(2026, 5, 16, 12, 0);
         let next = compute_next_fire(&s, None, now);
@@ -486,7 +481,7 @@ mod tests {
 
     #[test]
     fn next_fire_monthly_lands_on_first() {
-        let s = schedule(Preset::Monthly, UTC, None);
+        let s = schedule(RoundResetPreset::Monthly, UTC, None);
         let now = at_utc(2026, 5, 16, 12, 0);
         let next = compute_next_fire(&s, None, now);
         assert_eq!(next, at_utc(2026, 6, 1, 0, 0));
@@ -494,7 +489,7 @@ mod tests {
 
     #[test]
     fn next_fire_custom_no_last_reset_fires_at_next_midnight() {
-        let s = schedule(Preset::Custom, UTC, Some(7));
+        let s = schedule(RoundResetPreset::Custom, UTC, Some(7));
         let now = at_utc(2026, 5, 16, 12, 0);
         let next = compute_next_fire(&s, None, now);
         assert_eq!(next, at_utc(2026, 5, 17, 0, 0));
@@ -502,7 +497,7 @@ mod tests {
 
     #[test]
     fn next_fire_custom_with_recent_last_reset_skips_until_interval_elapsed() {
-        let s = schedule(Preset::Custom, UTC, Some(7));
+        let s = schedule(RoundResetPreset::Custom, UTC, Some(7));
         let now = at_utc(2026, 5, 16, 12, 0);
         let last_ms = (now - ChronoDuration::days(2)).timestamp_millis();
         let next = compute_next_fire(&s, Some(last_ms), now);
@@ -526,7 +521,7 @@ mod tests {
                 .is_none(),
             "precondition: 2026-09-06 00:00 does not exist in America/Santiago"
         );
-        let s = schedule(Preset::Daily, Santiago, None);
+        let s = schedule(RoundResetPreset::Daily, Santiago, None);
         // 12:00 local on the gap day (UTC-3 after the jump).
         let now = at_utc(2026, 9, 6, 15, 0);
         let next = compute_next_fire(&s, None, now);
