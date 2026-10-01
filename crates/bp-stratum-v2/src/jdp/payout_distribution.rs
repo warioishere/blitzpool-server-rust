@@ -1,26 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Payout-distribution computation + declared-coinbase validation for
-//! SV2 ext 0x0003 (push model).
+//! ext 0x0003 payout-vector computation and declared-coinbase validation.
 //!
-//! One ext 0x0003/Payout Computation evaluation serves every consumer: the JDS
-//! builds the expected output vector from `(distribution, T)` and the
-//! validator compares a declared coinbase POSITIONALLY against it
-//! (ext 0x0003/Output Verification: the spec fixes the output order, so a
-//! coinbase cannot satisfy two distributions at once).
-//!
-//! `T` is the sum of the declared output values. A correct vector for revenue
-//! `T'` sums to exactly `T'` (the pool output absorbs the remainder), so any
-//! deviation either changes the sum, and with it every recomputed amount, or
-//! changes a position; the compare catches both.
+//! A declared coinbase is compared POSITIONALLY against the ext 0x0003/Payout
+//! Computation vector for `T = Σ declared values` (ext 0x0003/Output
+//! Verification). The vector sums to exactly `T`, so any deviation changes
+//! either the sum or a position, and the compare catches both.
 
 use bitcoin::consensus::{Decodable, Encodable};
 use bitcoin::{Amount, ScriptBuf, TxOut};
 use bp_share::{compute_payout_amounts, WeightPayoutError};
 
-/// One ext 0x0003/SetPayoutDistribution payout slot as the registry stores it:
-/// a locking script plus its relative weight (the TxOut amount field on the
-/// wire).
+/// One ext 0x0003/SetPayoutDistribution payout slot: a locking script and its
+/// relative weight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightedOutput {
     pub script_pubkey: Vec<u8>,
@@ -28,8 +20,8 @@ pub struct WeightedOutput {
 }
 
 impl WeightedOutput {
-    /// Consensus-serialize as the ext 0x0003/SetPayoutDistribution wire form:
-    /// a `TxOut` whose amount field carries the weight.
+    /// The ext 0x0003/SetPayoutDistribution wire form: a `TxOut` carrying the
+    /// weight as its amount.
     pub fn to_wire_txout(&self) -> Vec<u8> {
         let txout = TxOut {
             value: Amount::from_sat(self.weight),
@@ -57,11 +49,9 @@ pub enum PayoutComputeError {
     NonZeroAdditionalOutput { index: usize },
 }
 
-/// Build the ext 0x0003/Payout Computation expected coinbase output vector for
-/// revenue `t`: `pool_payout` (amount `pay_P`), kept `payouts` in distribution
-/// order (dust-pruned ones omitted), then `additional_outputs` (amounts 0).
-/// Trailing JDC/TP outputs are NOT part of this vector — the validator checks
-/// them separately (must be 0-value).
+/// The ext 0x0003/Payout Computation output vector for revenue `t`: pool
+/// output, kept `payouts` in order (dust-pruned omitted), then the 0-value
+/// `additional_outputs`. Trailing JDC outputs are checked separately.
 pub fn compute_payout_vector(
     pool_payout: &WeightedOutput,
     payouts: &[WeightedOutput],
@@ -99,31 +89,22 @@ pub fn compute_payout_vector(
 /// How a declared coinbase violates its referenced distribution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DistributionViolation {
-    /// Output at `position` differs (script or amount) from the
-    /// recomputed ext 0x0003/Payout Computation vector.
+    /// Output at `position` differs from the recomputed vector.
     WrongOutputAt { position: usize },
     /// The declared coinbase ends before the recomputed vector does.
     MissingExpectedOutput { position: usize },
-    /// A trailing (JDC/TP-appended) output carries a non-0 amount —
-    /// ext 0x0003/Payout Computation only permits 0-value outputs after the
-    /// distribution block.
+    /// A trailing output after the distribution block carries a non-0 amount.
     NonZeroTrailingOutput { position: usize },
-    /// The distribution itself cannot be evaluated (zero weight sum /
-    /// malformed additional output). Internal: a distribution this JDS
-    /// published should never trip this.
+    /// The distribution itself cannot be evaluated; a published one never should.
     Uncomputable,
-    /// The declared output values do not sum to a representable revenue:
-    /// a malformed declaration, since no coinbase exceeds the money supply.
+    /// The declared output values overflow a u64.
     RevenueOverflow,
-    /// The declared coinbase pays nothing. Self-consistent under the compare
-    /// (every amount is 0 at T = 0), but the block forfeits its subsidy.
+    /// The coinbase pays nothing: self-consistent at T = 0, but forfeits the subsidy.
     ZeroRevenue,
 }
 
-/// Recompute-and-compare (ext 0x0003/Output Verification) against POSITIONAL
-/// ext 0x0003/Payout Computation order. Returns the accepted revenue `T` (= Σ
-/// declared output values) so the caller can band-check it for booking and
-/// stamp it onto the job.
+/// Positional recompute-and-compare (ext 0x0003/Output Verification). Returns
+/// the accepted revenue `T` (= Σ declared output values).
 pub fn validate_coinbase_outputs_against_distribution(
     declared: &[TxOut],
     pool_payout: &WeightedOutput,
@@ -151,13 +132,8 @@ pub fn validate_coinbase_outputs_against_distribution(
             Some(_) => {}
         }
     }
-    // With `T := Σ declared` a matching prefix already forces every trailing
-    // output to 0; this check keeps that true if T is ever derived otherwise.
-    //
-    // Trailing outputs are checked for VALUE only. ext 0x0003/Output
-    // Verification defines the job as recompute-and-compare "allowing only
-    // JDC-appended 0-value outputs in position 4"; the witness-commitment-last
-    // rule is a JDC construction rule, and block validity is bitcoind's call.
+    // Already implied by `T := Σ declared`; kept in case T is derived otherwise.
+    // Value only: ext 0x0003/Output Verification allows any 0-value trailing output.
     for (offset, got) in declared[expected.len()..].iter().enumerate() {
         if got.value != Amount::ZERO {
             return Err(DistributionViolation::NonZeroTrailingOutput {
@@ -173,7 +149,6 @@ mod tests {
     use super::*;
 
     fn script(tag: u8) -> Vec<u8> {
-        // A plausible P2WPKH-shaped script, distinct per tag.
         let mut s = vec![0x00, 0x14];
         s.extend(std::iter::repeat_n(tag, 20));
         s
@@ -200,9 +175,7 @@ mod tests {
         buf
     }
 
-    /// A coinbase paying nothing is self-consistent under the compare (every
-    /// ext 0x0003/Payout Computation amount is 0 at T = 0) but forfeits the
-    /// block's subsidy and pays the pool and every miner nothing.
+    /// A coinbase paying nothing is refused although it is self-consistent at T = 0.
     #[test]
     fn declared_zero_revenue_is_rejected() {
         let declared = vec![txout(0, script(0xFF))];
@@ -218,8 +191,7 @@ mod tests {
         );
     }
 
-    /// A declared sum that does not fit in a u64 is rejected as
-    /// `RevenueOverflow`.
+    /// A declared sum past u64 is `RevenueOverflow`.
     #[test]
     fn declared_revenue_overflow_is_rejected() {
         let huge = u64::MAX / 2 + 1;
@@ -281,8 +253,7 @@ mod tests {
         );
     }
 
-    /// `an ext 0x0003/Payout Computation-correct coinbase validates and
-    /// returns its T`
+    /// `a correct coinbase validates and returns its T`
     #[test]
     fn validate_accepts_correct_coinbase() {
         let pool = wo(0xFF, 1);
@@ -374,9 +345,7 @@ mod tests {
         .is_ok());
     }
 
-    /// `a valued trailing output is rejected — via the pool-output
-    /// mismatch it necessarily causes (T := Σ declared makes a matching
-    /// prefix force all trailing outputs to 0)`
+    /// `a valued trailing output is rejected via the pool-output mismatch it causes`
     #[test]
     fn validate_rejects_valued_trailing_output() {
         let pool = wo(0xFF, 1);
@@ -398,8 +367,7 @@ mod tests {
         let pool = wo(0xFF, 1);
         assert_eq!(
             validate_coinbase_outputs_against_distribution(&[], &pool, &[], &[], &[]),
-            // No outputs pays nothing: the revenue check fires before the
-            // positional compare.
+            // The revenue check fires before the positional compare.
             Err(DistributionViolation::ZeroRevenue)
         );
     }

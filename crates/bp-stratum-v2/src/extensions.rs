@@ -1,60 +1,36 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Wire codecs for the SV2 extensions used by Blitzpool. Three
-//! extensions:
+//! Wire codecs for SV2 extensions 0x0001 ([`RequestExtensions`]), 0x0002
+//! (Worker-ID TLV, [`parse_worker_id_tlv`]) and 0x0003
+//! ([`SetPayoutDistribution`] plus the `distribution_id` TLV).
+//! 0x0001/0x0003 frames carry their own `extension_type`; the Worker-ID TLV
+//! rides on `SubmitSharesExtended`, whose frame keeps 0x0000.
 //!
-//! - **0x0001 Extensions Negotiation** — [`RequestExtensions`], the decoded
-//!   shape; the wire codec is `stratum-core`'s.
-//! - **0x0002 Worker-Specific Hashrate Tracking** — Worker-ID TLV
-//!   piggy-backed on `SubmitSharesExtended` (extension_type stays
-//!   0x0000). See [`parse_worker_id_tlv`],
-//!   [`resolve_share_worker_name_from_tlv`].
-//! - **0x0003 Non-Custodial Payouts** (push model) —
-//!   [`SetPayoutDistribution`] (JDS→JDC) + the `distribution_id` TLV
-//!   on `DeclareMiningJob` / `SetCustomMiningJob`.
-//!
-//! Frames for 0x0001 and 0x0003 messages set `extension_type` to the
-//! extension's identifier (NOT 0x0000), because both introduce new messages.
-//! The Worker-ID TLV rides on `SubmitSharesExtended`, whose frame keeps
-//! `extension_type = 0x0000`.
-//!
-//! Body fields are SV2 little-endian. **TLV headers are little-endian too**:
-//! SV2 Overview/Stratum V2 TLV Encoding Model types them as U16/U8, and U16
-//! is LE in SV2. The worked examples there and in ext 0x0002/Extended
-//! SubmitSharesExtended Message Format show `00 02` (big-endian); the
-//! data-type rule is treated as binding and the examples as the error.
-//! Worker-ID caps `user_identity` at 32 bytes
-//! (ext 0x0002/TLV Format for user_identity).
+//! **TLV headers are little-endian**: SV2 Overview/Stratum V2 TLV Encoding
+//! Model types them as U16/U8, and U16 is LE in SV2. The big-endian `00 02`
+//! examples there and in ext 0x0002/Extended SubmitSharesExtended Message
+//! Format are treated as the error.
 
 // ── Spec constants ─────────────────────────────────────────────────
 
-/// Extension identifier for **Worker-Specific Hashrate Tracking** (0x0002).
 pub const SV2_EXTENSION_TYPE_WORKER_ID: u16 = 0x0002;
 
-/// TLV field-type for `user_identity` inside the Worker-ID TLV (0x01).
 pub const SV2_FIELD_TYPE_USER_IDENTITY: u8 = 0x01;
 
-/// Maximum length of `user_identity` (ext 0x0002/TLV Format for user_identity)
-/// in bytes.
+/// ext 0x0002/TLV Format for user_identity.
 pub const SV2_USER_IDENTITY_MAX_BYTES: usize = 32;
 
-/// Extension identifier for **Non-Custodial Pool Payouts** (0x0003).
 pub const SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS: u16 = 0x0003;
 
 // ── Errors ─────────────────────────────────────────────────────────
 
-/// Parse-side errors for extension messages.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExtensionsParseError {
     #[error("buffer truncated: needed {needed} more bytes at offset {offset}")]
     Truncated { offset: usize, needed: usize },
 }
 
-// ── Minimal LE/BE codec helpers (private) ──────────────────────────
-//
-// In-file rather than `stratum_core::binary_sv2`, so the tests assert exact
-// spec byte sequences with no abstraction in between. Everything is LE,
-// body fields and TLV headers alike.
+// ── LE codec helpers ───────────────────────────────────────────────
 
 struct Reader<'a> {
     buf: &'a [u8],
@@ -148,10 +124,7 @@ fn write_seq0_64k_b0_64k(dst: &mut Vec<u8>, items: &[Vec<u8>]) {
 
 // ── 0x0001 Extensions Negotiation ──────────────────────────────────
 
-/// `RequestExtensions` — JDC/Mining-client → server, as the handlers take it.
-/// Frame: `extension_type = 0x0001`, `msg_type = 0x00`. The wire codec for
-/// this and its `.Success` / `.Error` replies is `stratum-core`'s; see
-/// [`crate::codec_common`].
+/// Decoded `RequestExtensions`; the wire codec is in [`crate::codec_common`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestExtensions {
     pub request_id: u16,
@@ -160,32 +133,22 @@ pub struct RequestExtensions {
 
 // ── 0x0003 Non-Custodial Payouts (push model) ──────────────────────
 
-/// TLV field-type for `distribution_id` on `DeclareMiningJob` /
-/// `SetCustomMiningJob` (ext 0x0003/distribution_id TLV Field).
+/// ext 0x0003/distribution_id TLV Field.
 pub const SV2_FIELD_TYPE_DISTRIBUTION_ID: u8 = 0x01;
 
-/// `SetPayoutDistribution` — JDS → JDC (ext 0x0003/SetPayoutDistribution).
-/// Frame: `extension_type = 0x0003`, `msg_type = 0x00`, channel bit 0.
-///
-/// MUST be the first message the JDS sends after `SetupConnection.Success` and
-/// `RequestExtensions.Success`; re-sent (with a higher `distribution_id`)
-/// whenever the pool updates the distribution. Amount fields inside
-/// `pool_payout` / `payouts` carry relative WEIGHTS, not satoshis — the JDC
-/// derives amounts per ext 0x0003/Payout Computation.
+/// JDS → JDC (ext 0x0003/SetPayoutDistribution). MUST be the first message
+/// after `RequestExtensions.Success`, re-sent with a higher id on every update.
+/// Amounts in `pool_payout` / `payouts` are non-zero WEIGHTS, not satoshis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetPayoutDistribution {
-    /// Strictly increasing, universal across all connections of this
-    /// pool (ext 0x0003/SetPayoutDistribution).
+    /// Strictly increasing across all connections of this pool.
     pub distribution_id: u64,
-    /// Consensus-serialized `TxOut`; amount field = `weight_P` (non-0).
     /// Locking script MUST be pool-controlled.
     pub pool_payout: Vec<u8>, // B0_64K
-    /// Consensus-serialized `TxOut`s; amount fields = weights (non-0).
     pub payouts: Vec<Vec<u8>>, // SEQ0_64K[B0_64K]
-    /// Per-`payouts[i]` dust limit in satoshis; same length as `payouts`.
+    /// Satoshis, one per `payouts` entry.
     pub dust_limits: Vec<u32>, // SEQ0_64K[U32]
-    /// Consensus-serialized `TxOut`s the pool appends (e.g. OP_RETURN);
-    /// amount fields MUST be 0.
+    /// Amount fields MUST be 0.
     pub additional_outputs: Vec<Vec<u8>>, // SEQ0_64K[B0_64K]
 }
 
@@ -230,26 +193,17 @@ impl SetPayoutDistribution {
     }
 }
 
-/// Error-code vocabulary for the push-model 0x0003 extension
-/// (ext 0x0003/Error Codes), emitted on `DeclareMiningJob.Error` /
+/// ext 0x0003/Error Codes, sent on `DeclareMiningJob.Error` /
 /// `SetCustomMiningJob.Error`.
 pub mod payout_distribution_error_codes {
-    /// ext 0x0003/Error Codes — the referenced `distribution_id` is not
-    /// accepted: too old (outside the grace window), unknown, or invalidated
-    /// by a settlement event (ext 0x0003/Implementation Notes).
+    /// The `distribution_id` is unknown, past its grace window, or invalidated.
     pub const STALE_PAYOUT_DISTRIBUTION: &str = "stale-payout-distribution";
-    /// ext 0x0003/Error Codes — the declared coinbase outputs violate
-    /// ext 0x0003/Payout Computation (recomputed vector mismatch, non-0-value
-    /// trailing output, missing/mis-typed `distribution_id` TLV where the
-    /// extension is negotiated).
+    /// The coinbase outputs violate ext 0x0003/Payout Computation.
     pub const INVALID_PAYOUT_DISTRIBUTION: &str = "invalid-payout-distribution";
 }
 
-/// Extract the ext 0x0003 `distribution_id` from parsed trailing TLVs
-/// (ext 0x0003/distribution_id TLV Field: Type `0x0003`/`0x01`, length 8,
-/// value U64-LE). Returns `None` when absent or malformed — the caller decides
-/// whether a missing TLV is an error (it is, when the extension was
-/// negotiated).
+/// The ext 0x0003 `distribution_id` TLV value, or `None` when absent or
+/// malformed; the caller decides whether that is an error.
 pub fn parse_distribution_id_tlv(tlvs: &[stratum_core::parsers_sv2::Tlv]) -> Option<u64> {
     tlvs.iter().find_map(|tlv| {
         (tlv.r#type.extension_type == SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS
@@ -259,9 +213,7 @@ pub fn parse_distribution_id_tlv(tlvs: &[stratum_core::parsers_sv2::Tlv]) -> Opt
     })
 }
 
-/// Encode the `distribution_id` TLV in wire form
-/// (ext 0x0003/distribution_id TLV Field) — used by tests standing in for a
-/// JDC.
+/// For tests standing in for a JDC.
 pub fn encode_distribution_id_tlv(distribution_id: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(13);
     buf.extend_from_slice(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS.to_le_bytes());
@@ -273,15 +225,8 @@ pub fn encode_distribution_id_tlv(distribution_id: u64) -> Vec<u8> {
 
 // ── 0x0002 Worker-ID TLV ───────────────────────────────────────────
 
-/// The `user_identity` of the first ext 0x0002 Worker-ID TLV among a
-/// frame's parsed TLVs (ext 0x0002/TLV Format for user_identity), or `None`
-/// when there is none.
-///
-/// TLVs of other extensions are skipped (SV2 Overview/Stratum V2 TLV
-/// Encoding Model: receivers MUST ignore unexpected TLVs). A Worker-ID TLV
-/// that is empty, longer than [`SV2_USER_IDENTITY_MAX_BYTES`] or not UTF-8
-/// also yields `None`: the share itself is structurally valid, so it falls
-/// back to the channel's worker rather than being rejected.
+/// The `user_identity` of the first Worker-ID TLV. A malformed one yields
+/// `None`, so the share falls back to the channel's worker instead of failing.
 pub fn parse_worker_id_tlv(tlvs: &[stratum_core::parsers_sv2::Tlv]) -> Option<&str> {
     let tlv = tlvs.iter().find(|tlv| {
         tlv.r#type.extension_type == SV2_EXTENSION_TYPE_WORKER_ID
@@ -293,17 +238,9 @@ pub fn parse_worker_id_tlv(tlvs: &[stratum_core::parsers_sv2::Tlv]) -> Option<&s
     std::str::from_utf8(&tlv.value).ok()
 }
 
-/// The worker name a `SubmitSharesExtended` share is attributed to by its
-/// ext 0x0002 Worker-ID TLV, or `None` to keep the channel's own worker.
-///
-/// - ext 0x0002 not negotiated: `None`; any TLV is ignored
-///   (ext 0x0002/Behavior Based on Negotiation).
-/// - TLV missing or malformed: `None`.
-/// - `"worker"` (no dot): that worker.
-/// - `"<prefix>.<worker>"`: the worker part, split at the first dot like
-///   every `address.worker` identity; a trailing dot (empty worker) is
-///   `None`. The prefix is not checked: it names the worker only, and the
-///   share stays booked to the address its channel was opened under.
+/// The worker a share's Worker-ID TLV names, or `None` to keep the channel's.
+/// The address prefix is ignored: the share stays booked to the channel's
+/// address, the TLV only renames the worker.
 pub fn resolve_share_worker_name_from_tlv(
     tlvs: &[stratum_core::parsers_sv2::Tlv],
     ext_0x0002_negotiated: bool,
@@ -334,7 +271,6 @@ mod tests {
         }
     }
 
-    /// `SetPayoutDistribution round-trips`
     #[test]
     fn set_payout_distribution_roundtrip() {
         let msg = sample_distribution();
@@ -342,8 +278,7 @@ mod tests {
         assert_eq!(SetPayoutDistribution::deserialize(&bytes).unwrap(), msg);
     }
 
-    /// `SetPayoutDistribution wire layout (ext 0x0003/SetPayoutDistribution
-    /// field order, all LE)`
+    /// Field order per ext 0x0003/SetPayoutDistribution, all LE.
     #[test]
     fn set_payout_distribution_wire_layout() {
         let msg = SetPayoutDistribution {
@@ -366,7 +301,6 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 
-    /// `truncated buffers refuse to parse`
     #[test]
     fn set_payout_distribution_truncated_refuses() {
         let bytes = sample_distribution().serialize();
@@ -378,7 +312,6 @@ mod tests {
         }
     }
 
-    /// `empty payouts + dust_limits are legal (pool-only distribution)`
     #[test]
     fn set_payout_distribution_pool_only_roundtrip() {
         let msg = SetPayoutDistribution {
@@ -392,7 +325,6 @@ mod tests {
         assert_eq!(SetPayoutDistribution::deserialize(&bytes).unwrap(), msg);
     }
 
-    /// `distribution_id TLV round-trips through the upstream Tlv codec`
     #[test]
     fn distribution_id_tlv_roundtrip_via_reference_codec() {
         use stratum_core::parsers_sv2::Tlv;
@@ -402,11 +334,9 @@ mod tests {
             parse_distribution_id_tlv(std::slice::from_ref(&parsed)),
             Some(0xDEADBEEF00C0FFEE)
         );
-        // And the upstream encoder produces the same bytes.
         assert_eq!(parsed.encode().unwrap(), wire);
     }
 
-    /// `wrong length or foreign TLVs yield None`
     #[test]
     fn distribution_id_tlv_rejects_malformed() {
         use stratum_core::parsers_sv2::Tlv;
@@ -419,7 +349,6 @@ mod tests {
         assert_eq!(parse_distribution_id_tlv(&[]), None);
     }
 
-    /// `finds the distribution_id among other negotiated TLVs`
     #[test]
     fn distribution_id_tlv_found_among_others() {
         use stratum_core::parsers_sv2::Tlv;
@@ -440,12 +369,9 @@ mod tests {
         )
     }
 
-    /// `wire layout: "Worker_001" decodes with a little-endian TLV header`
+    /// The TLV header is LE; see the module doc for the spec's BE example.
     #[test]
     fn worker_id_tlv_wire_layout_is_little_endian() {
-        // SV2 Overview/Stratum V2 TLV Encoding Model types the header as
-        // U16|U8 + U16, and U16 is LE in SV2 (the `00 02 …` example in
-        // ext 0x0002/Extended SubmitSharesExtended Message Format is wrong).
         let wire = hex::decode("0200010a00576f726b65725f303031").unwrap();
         let parsed = Tlv::decode(&wire).expect("reference decode");
         assert_eq!(
@@ -454,7 +380,6 @@ mod tests {
         );
     }
 
-    /// `round-trips arbitrary UTF-8`
     #[test]
     fn worker_id_tlv_roundtrips_utf8() {
         assert_eq!(
@@ -463,8 +388,6 @@ mod tests {
         );
     }
 
-    /// `rejects an empty or > 32 byte user_identity
-    /// (ext 0x0002/TLV Format for user_identity) and invalid UTF-8`
     #[test]
     fn worker_id_tlv_parser_rejects_malformed_values() {
         assert_eq!(parse_worker_id_tlv(&[worker_tlv("")]), None);
@@ -481,7 +404,6 @@ mod tests {
         assert_eq!(parse_worker_id_tlv(&[not_utf8]), None);
     }
 
-    /// `returns None when no 0x0002 TLV is present`
     #[test]
     fn worker_id_tlv_returns_none_when_absent() {
         assert_eq!(parse_worker_id_tlv(&[]), None);
@@ -491,7 +413,6 @@ mod tests {
         );
     }
 
-    /// `skips unknown leading TLVs and finds the 0x0002 one`
     #[test]
     fn worker_id_tlv_skips_unknown_leading_tlvs() {
         let unknown = Tlv::new(0x0099, 0x01, vec![0; 4]);
@@ -507,45 +428,37 @@ mod tests {
         resolve_share_worker_name_from_tlv(&[worker_tlv(user_identity)], negotiated)
     }
 
-    /// `keeps the channel worker when ext 0x0002 is not negotiated (TLV ignored)`
     #[test]
     fn resolve_returns_default_when_not_negotiated() {
         assert_eq!(resolve("hacker.evil", false), None);
     }
 
-    /// `keeps the channel worker when no TLV is present`
     #[test]
     fn resolve_returns_default_when_no_tlv() {
         assert_eq!(resolve_share_worker_name_from_tlv(&[], true), None);
     }
 
-    /// `accepts bare worker name (no address prefix)`
     #[test]
     fn resolve_accepts_bare_worker() {
         assert_eq!(resolve("rig42", true).as_deref(), Some("rig42"));
     }
 
-    /// `accepts "<address>.<worker>" form and returns just the worker`
     #[test]
     fn resolve_accepts_address_worker_form() {
         assert_eq!(resolve("addr1.rig42", true).as_deref(), Some("rig42"));
     }
 
-    /// The prefix before the dot is not compared with anything: a TLV naming
-    /// another address still only renames the worker. The share's address
-    /// is the channel's, which the TLV cannot reach.
+    /// A TLV naming another address only renames the worker.
     #[test]
     fn resolve_strips_any_address_prefix() {
         assert_eq!(resolve("addr2.victim", true).as_deref(), Some("victim"));
     }
 
-    /// `handles trailing-dot edge case ("addr.") → channel worker (empty worker)`
     #[test]
     fn resolve_handles_trailing_dot() {
         assert_eq!(resolve("addr1.", true), None);
     }
 
-    /// `preserves nested dots in worker name ("addr.a.b" → "a.b")`
     #[test]
     fn resolve_preserves_nested_dots() {
         assert_eq!(
@@ -554,7 +467,6 @@ mod tests {
         );
     }
 
-    /// `malformed TLV (oversized) → channel worker, share remains accountable`
     #[test]
     fn resolve_malformed_tlv_keeps_channel_worker() {
         assert_eq!(resolve(&"x".repeat(33), true), None);

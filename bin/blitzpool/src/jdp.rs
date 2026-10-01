@@ -1,21 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! JDP server wiring.
+//! JDP server wiring: one listener on `[sv2].jdp_port`, each socket handed to
+//! [`StratumV2JdpServer::accept_connection`] (no protocol detection).
 //!
-//! Binds one listener on `[sv2].jdp_port` and hands each socket to
-//! [`StratumV2JdpServer::accept_connection`]. Unlike the mining ports,
-//! JDP shares its port with nothing: JDCs speak JDP right after the Noise
-//! handshake.
-//!
-//! The hooks come from [`crate::jdp_hooks::build_jdp_hooks`] (in place of
-//! [`bp_stratum_v2::jdp_server::JdpServerHooks::no_op`]). The
-//! [`TemplateTxCache`]-backed tx provider runs only with
-//! `[sv2].jdp_orphan_submitblock = true`: when the pool resubmits blocks
-//! itself, it cuts `ProvideMissingTransactions` down to the txs the pool
-//! lacks; otherwise the declared tx bytes are not needed.
-//!
-//! JDP is off by default: without `[sv2].jdp_enabled = true` `spawn`
-//! returns an empty handle.
+//! The [`TemplateTxCache`]-backed tx provider runs only with
+//! `[sv2].jdp_orphan_submitblock = true`, since only then does the pool need
+//! the declared tx bytes. JDP is off unless `[sv2].jdp_enabled = true`.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -57,9 +47,7 @@ impl JdpHandles {
         }
     }
 
-    /// [`Self::disabled`] for the `--skip-tdp` startup path: the JDP hooks
-    /// need TDP (the allocate resolver reads the latest template's
-    /// `coinbase_tx_value_remaining`, block submit relates prev hashes).
+    /// [`Self::disabled`] for the `--skip-tdp` startup path; the JDP hooks need TDP.
     pub(crate) fn disabled_for_init() -> Self {
         Self::disabled()
     }
@@ -87,16 +75,13 @@ pub(crate) enum JdpSpawnError {
     },
     #[error(transparent)]
     Sv2(#[from] stratum_v2::StratumV2SpawnError),
-    /// `[sv2].jdp_validation_socket_path` names a socket the upstream engine
-    /// cannot be pointed at, or the node did not answer on it.
+    /// `[sv2].jdp_validation_socket_path` is unusable or the node did not answer.
     #[error("jdp validation socket unusable: {0}")]
     ValidationSocket(String),
 }
 
-/// Spawn the JDP server when `[sv2].jdp_enabled` is true. The bridge
-/// is shared with the SV2 mining servers via [`stratum_v2::build_bridge`]
-/// so `DeclareMiningJob`-issued tokens route to the correct mining
-/// channel on `SetCustomMiningJob`.
+/// Spawn the JDP server when `[sv2].jdp_enabled` is true. The bridge is shared
+/// with the mining servers so declared tokens resolve on `SetCustomMiningJob`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn(
     cfg: &AppConfig,
@@ -105,15 +90,11 @@ pub(crate) async fn spawn(
     bitcoin_rpc: BitcoinRpc,
     payout_resolver: Arc<ProductionPayoutResolver>,
     template_tx_cache: Option<Arc<TemplateTxCache>>,
-    // Books a JDC-found block against the distribution its coinbase was
-    // proven to pay.
+    // Books a JDC-found block against the distribution its coinbase paid.
     ledger_booker: Arc<crate::block_sink::TdpBlockSubmissionSink>,
-    // Allocator backing for the strictly-increasing ext 0x0003
-    // `distribution_id` (ext 0x0003/SetPayoutDistribution).
+    // Allocates the strictly-increasing `distribution_id` (ext 0x0003/SetPayoutDistribution).
     redis: redis::aio::ConnectionManager,
-    // ext 0x0003/Implementation Notes settlement fan-out, created by the
-    // caller because the block sinks are built before this server and must
-    // reach the SAME registry. The registry handle is attached to it here.
+    // Created by the caller so the block sinks reach the same registry.
     settle: crate::settlement::SettlementSignal,
 ) -> Result<JdpHandles, JdpSpawnError> {
     if !cfg.sv2.jdp_enabled {
@@ -123,10 +104,8 @@ pub(crate) async fn spawn(
     let port = cfg.sv2.jdp_port.ok_or(JdpSpawnError::PortMissing)?;
     let noise = stratum_v2::build_noise_config(cfg)?;
     let network = crate::boot::bitcoin_network(cfg.network);
-    // ext 0x0003 payout-distribution source: same resolver + engines the
-    // allocate path uses, so the published weight distribution and the
-    // pool's own coinbase always agree. The fee address anchors tailored
-    // distributions whose mode has no pool output of its own.
+    // Same resolver as the allocate path, so the published distribution and
+    // the pool's coinbase agree. The fee address anchors modes with no pool output.
     let fee_address = cfg
         .pplns
         .as_ref()
@@ -139,10 +118,8 @@ pub(crate) async fn spawn(
         fee_address,
     });
 
-    // SV2 JDP/Job Declarator Server: declared jobs go to bitcoin-core for a
-    // verdict when a validation socket is configured; unset means trusted.
-    // A configured but unusable socket stops boot rather than claiming
-    // validation that does not happen.
+    // SV2 JDP/Job Declarator Server: unset socket means trusted; an unusable
+    // one stops boot rather than claiming validation that does not happen.
     let job_validator = match cfg.sv2.jdp_validation_socket_path.clone() {
         Some(socket_path) => crate::jdp_hooks::ProductionJobValidator::connect(
             socket_path,

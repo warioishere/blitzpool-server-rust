@@ -1,38 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Bind the job a JDC asks to MINE to the job it DECLARED.
+//! Bind the job a JDC MINES (`SetCustomMiningJob`) to the job it DECLARED.
 //!
-//! The two arrive on different connections: `DeclareMiningJob` on JDP and
-//! `SetCustomMiningJob` on the Mining Protocol, the latter carrying its own
-//! `coinbase_tx_outputs` and `merkle_path`. Base SV2 ties them only by
-//! `mining_job_token`; nothing in either spec requires the fields to agree.
-//!
-//! ## Not about revenue
-//!
-//! Fees and block value are not checked: which transactions a JDC mines is
-//! its own call, which is the point of job declaration. The split is guarded
-//! separately ([`crate::jdp::payout_distribution`], ext 0x0003/Payout
-//! Computation), and settlement books from the block's own coinbase.
-//!
-//! ## What it does
-//!
-//! Makes the node validation apply to the job being mined. Every declaration
-//! goes to bitcoin-core before acceptance (SV2 JDP/Job Declarator Server),
-//! but `SetCustomMiningJob.merkle_path` would otherwise enter the
-//! [`crate::mining::jobs::ExtendedJob`] unexamined, so a mined transaction
-//! set could differ from the validated one and earn window share for blocks
-//! that cannot land.
-//!
-//! Limits: it is only as strong as the `job_validator` behind it (optional),
-//! and Coinbase-only jobs (SV2 JDP/Coinbase-only Mode) have no declaration to
-//! bind.
-//!
-//! Pure: projects a stored [`DeclaredJob`] to the fields `SetCustomMiningJob`
-//! repeats ([`DeclaredJobBinding`]) and compares them ([`check_custom_job`]).
-//!
-//! `nbits` and `min_ntime` are not covered: neither reaches [`DeclaredJob`]
-//! (`DeclareMiningJobResult` does not carry them). A mismatch there yields a
-//! block the network rejects, not a wrong payout.
+//! Base SV2 ties the two only by `mining_job_token`. Without this check a
+//! mined transaction set could differ from the one the node validated and
+//! earn window share for blocks that cannot land. Fees and block value are
+//! not checked: the split is guarded by [`crate::jdp::payout_distribution`].
+//! `nbits` and `min_ntime` never reach [`DeclaredJob`], so they are not bound.
+//! Only as strong as the optional `job_validator`; Coinbase-only jobs have no
+//! declaration to bind.
 
 use bitcoin::hashes::Hash;
 
@@ -40,36 +16,23 @@ use crate::jdp::declarations::DeclaredJob;
 use crate::jdp::dynamic_outputs::declared_coinbase_tx;
 
 /// A declared job projected down to the fields `SetCustomMiningJob` repeats.
-///
-/// A small owned value, so the mining handler does not carry the whole
-/// declared-job payload (raw transactions included) across connections.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclaredJobBinding {
-    /// Block-header version as declared.
     pub version: u32,
-    /// Coinbase transaction `nVersion`.
     pub coinbase_tx_version: u32,
-    /// The scriptSig bytes the declaration committed to, i.e. everything
-    /// before the extranonce slot.
+    /// Everything before the extranonce slot.
     pub coinbase_script_sig_prefix: Vec<u8>,
-    /// Coinbase input `nSequence`.
     pub coinbase_tx_input_n_sequence: u32,
-    /// CompactSize-prefixed consensus output vector, re-serialised from the
-    /// rebuilt coinbase so it compares byte-for-byte against the wire field.
+    /// CompactSize-prefixed, re-serialised so it compares byte-for-byte.
     pub coinbase_tx_outputs: Vec<u8>,
-    /// Coinbase `nLockTime`.
     pub coinbase_tx_locktime: u32,
-    /// Sibling hashes from the coinbase leaf up to the root, over the
-    /// declared transaction set.
+    /// Over the declared transaction set.
     pub merkle_path: Vec<[u8; 32]>,
-    /// Bytes the declaration reserved for the extranonce. The `PushSolution`
-    /// rebuild splices the channel's extranonce into this gap, so the widths
-    /// must agree or the coinbase contradicts its own scriptSig length.
+    /// The `PushSolution` rebuild splices the channel's extranonce into this
+    /// gap, so the widths must agree.
     pub extranonce_slot: usize,
 }
 
-/// Which field of the mined job disagrees with the declaration. The JDC
-/// composes both messages itself, so every variant is reachable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BindingViolation {
     Version,
@@ -78,19 +41,12 @@ pub enum BindingViolation {
     CoinbaseInputNSequence,
     CoinbaseOutputs,
     CoinbaseLocktime,
-    /// The mined job commits to a different transaction set than the one the
-    /// node validated.
     MerklePath,
-    /// The mining channel's extranonce does not fit the declared gap, so a
-    /// found block could not be reassembled.
     ExtranonceSlotWidth,
 }
 
-/// Project a stored declaration into the comparable fields.
-///
-/// `None` when the declared coinbase cannot be rebuilt (see
-/// [`declared_coinbase_tx`]) or a declared transaction is missing/unparseable
-/// — the caller must treat that as a rejection, never as "nothing to check".
+/// `None` when the coinbase cannot be rebuilt or a declared transaction is
+/// missing: the caller must reject, never read it as "nothing to check".
 pub fn binding_from_declared_job(job: &DeclaredJob) -> Option<DeclaredJobBinding> {
     let declared = declared_coinbase_tx(&job.coinbase_tx_prefix, &job.coinbase_tx_suffix)?;
     let tx = &declared.tx;
@@ -115,9 +71,7 @@ pub fn binding_from_declared_job(job: &DeclaredJob) -> Option<DeclaredJobBinding
     })
 }
 
-/// What a `SetCustomMiningJob` claims, in the shape this check needs.
-///
-/// A borrowed view, so the comparison is testable without a mining session.
+/// What a `SetCustomMiningJob` claims.
 #[derive(Clone, Copy, Debug)]
 pub struct MinedJobFields<'a> {
     pub version: u32,
@@ -127,28 +81,17 @@ pub struct MinedJobFields<'a> {
     pub coinbase_tx_outputs: &'a [u8],
     pub coinbase_tx_locktime: u32,
     pub merkle_path: &'a [[u8; 32]],
-    /// The mining channel's own extranonce width, which the pool will splice
-    /// into the declared gap when a block is pushed.
     pub full_extranonce_size: usize,
 }
 
-/// Compare a mined job against its declaration, every field for exact
-/// equality.
-///
-/// The scriptSig prefix is exact too, not a prefix match: one JDC's coinbase
-/// yields the same committed bytes in both messages, and a relaxed compare
-/// would admit an empty prefix, i.e. a scriptSig without the BIP-34 height
-/// push and blocks the network rejects.
+/// Every field must match exactly. The scriptSig prefix too: a prefix match
+/// would admit an empty one, i.e. no BIP-34 height push.
 pub fn check_custom_job(
     binding: &DeclaredJobBinding,
     mined: MinedJobFields<'_>,
 ) -> Result<(), BindingViolation> {
-    // Exact, BIP-323 general-purpose bits included. SV2 JDP/DeclareMiningJob
-    // and SV2 Mining/SetCustomMiningJob both let the BIP-323 bits be rolled
-    // at hashing time, but neither lets the two base versions differ from
-    // each other (SV2 TDP/SubmitSolution states the rolling rule against the
-    // template). Rolling is unaffected: the found header and share validation
-    // use the submitted version verbatim, never the declared one.
+    // BIP-323 bits included: rolling happens at hashing time, but the two
+    // base versions may not differ (SV2 Mining/SetCustomMiningJob).
     if binding.version != mined.version {
         return Err(BindingViolation::Version);
     }
@@ -170,13 +113,8 @@ pub fn check_custom_job(
     if binding.merkle_path != mined.merkle_path {
         return Err(BindingViolation::MerklePath);
     }
-    // `handle_push_solution` rebuilds a found block as
-    // `declared_prefix || channel extranonce || declared_suffix`, and the
-    // declared scriptSig length covers the DECLARED gap. A different channel
-    // width would break the length field and the merkle root at submit.
-    // This check exists only because the pool reassembles the block itself;
-    // if the solution can be handed to bitcoin-core's job-declaration IPC
-    // instead, it goes together with that reconstruction.
+    // The pool reassembles a found block into the DECLARED gap; another width
+    // breaks the scriptSig length and the merkle root.
     if binding.extranonce_slot != mined.full_extranonce_size {
         return Err(BindingViolation::ExtranonceSlotWidth);
     }
@@ -194,8 +132,7 @@ mod tests {
     const SCRIPT_SIG_PREFIX: [u8; 3] = [0x03, 0xC8, 0x00];
     const SLOT: usize = 8;
 
-    /// Build a declared coinbase split at the extranonce slot, the way SV2
-    /// carries it.
+    /// A declared coinbase split at the extranonce slot.
     fn coinbase_parts(script_sig_prefix: &[u8], outputs_blob: &[u8]) -> (Vec<u8>, Vec<u8>) {
         use bitcoin::consensus::Encodable;
 
@@ -205,8 +142,7 @@ mod tests {
         prefix.push(0x01);
         prefix.extend_from_slice(&[0u8; 32]);
         prefix.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        // The library encoder, not `push(len as u8)`: a wrong length would
-        // make "projects to None" tests pass for the wrong reason.
+        // A wrong length would make the "projects to None" tests pass falsely.
         bitcoin::VarInt(script_sig_len as u64)
             .consensus_encode(&mut prefix)
             .expect("Vec<u8> writer cannot fail");
@@ -277,8 +213,6 @@ mod tests {
         }
     }
 
-    /// The projection reads the fields off the rebuilt transaction, not off
-    /// assumed byte offsets — pin each one against what was declared.
     #[test]
     fn projection_reads_the_declared_coinbase() {
         let binding = binding_from_declared_job(&declared_job(2)).expect("must project");
@@ -288,12 +222,10 @@ mod tests {
         assert_eq!(binding.coinbase_tx_input_n_sequence, 0x1234_5678);
         assert_eq!(binding.coinbase_tx_outputs, vec![0x00]);
         assert_eq!(binding.coinbase_tx_locktime, 7);
-        // 3 leaves (coinbase + 2) ⇒ two levels ⇒ two siblings.
+        // 3 leaves ⇒ two siblings.
         assert_eq!(binding.merkle_path.len(), 2);
     }
 
-    /// The honest job passes. Every test below tampers with exactly one
-    /// field, so what each proves is that field.
     #[test]
     fn an_honest_job_matches_its_declaration() {
         let binding = binding_from_declared_job(&declared_job(2)).expect("must project");
@@ -359,23 +291,18 @@ mod tests {
         );
     }
 
-    /// The version compare is exact INCLUDING the BIP-323 general-purpose
-    /// bits. `every_bound_field_is_checked` flips bit 0, outside the mask, so
-    /// only this test fails if the compare is ever masked.
+    /// Pins that the version compare is never masked to the BIP-323 bits.
     #[test]
     fn a_bip323_only_difference_is_still_a_version_violation() {
         /// Bits 5–28 inclusive.
         const BIP323_MASK: u32 = 0x1fff_ffe0;
 
         let binding = binding_from_declared_job(&declared_job(2)).expect("must project");
-        // Positive control: the declared version passes.
         assert_eq!(check_custom_job(&binding, mined_from(&binding)), Ok(()));
 
-        // Lowest, a middle one, and the highest bit the mask covers.
         for bit in [5u32, 12, 28] {
             let mut m = mined_from(&binding);
             m.version = binding.version | (1 << bit);
-            // Precondition: the versions differ, and only inside the mask.
             assert_ne!(
                 m.version, binding.version,
                 "bit {bit} must change the value"
@@ -393,14 +320,10 @@ mod tests {
         }
     }
 
-    /// The scriptSig prefix carries the BIP-34 height push and the pool
-    /// builds its scriptSig from the MINED prefix, so any departure from the
-    /// declared bytes is refused: empty, truncated, different or extended.
     #[test]
     fn any_script_sig_prefix_other_than_the_declared_one_is_refused() {
         let binding = binding_from_declared_job(&declared_job(2)).expect("must project");
 
-        // Positive control: the declared bytes are accepted.
         assert_eq!(check_custom_job(&binding, mined_from(&binding)), Ok(()));
 
         for (label, prefix) in [
@@ -419,8 +342,6 @@ mod tests {
         }
     }
 
-    /// A coinbase that will not rebuild projects to nothing — fail-closed,
-    /// so the caller cannot read it as "nothing to check".
     #[test]
     fn an_unrebuildable_coinbase_projects_to_none() {
         let mut job = declared_job(2);
@@ -428,9 +349,7 @@ mod tests {
         assert!(binding_from_declared_job(&job).is_none());
     }
 
-    /// Same for a declared transaction that is not held: without it the
-    /// merkle branch cannot be computed, and a branch computed over a
-    /// SHORTER set would silently authorise a different block.
+    /// A branch over a SHORTER set would authorise a different block.
     #[test]
     fn a_missing_declared_transaction_projects_to_none() {
         let mut job = declared_job(2);
@@ -442,8 +361,6 @@ mod tests {
         assert!(binding_from_declared_job(&job).is_none());
     }
 
-    /// A declaration with no transactions but a real coinbase still
-    /// projects — an empty block is a legitimate declaration.
     #[test]
     fn an_empty_transaction_set_projects_with_an_empty_branch() {
         let binding = binding_from_declared_job(&declared_job(0)).expect("must project");

@@ -1,36 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pure helpers for the JDP `DeclareMiningJob` → `ProvideMissingTransactions`
-//! → `…Success` round-trip.
+//! Helpers for the `DeclareMiningJob` → `ProvideMissingTransactions` round-trip.
 //!
-//! ## What happens on `DeclareMiningJob`
-//!
-//! The JDS needs raw bytes for every declared wtxid to reconstruct the block
-//! on `PushSolution` (SV2 JDP/PushSolution). Wtxids in the current template
-//! are covered; the missing positions are requested from the JDC via
-//! `ProvideMissingTransactions` ([`partition_against_template`]).
-//!
-//! ## Round-trip state
-//!
-//! Until `ProvideMissingTransactions.Success` arrives, the JDS holds a
-//! [`PendingDeclaration`] (request id, requested positions, locally known
-//! raw txs); [`merge_provided_with_known`] then builds the complete
-//! `position → raw_tx` map.
-//!
-//! ## Byte order
-//!
-//! All wtxids here are in **wire byte order** (the natural SHA256d output);
-//! callers key their template-tx maps the same way.
+//! The JDS needs the raw bytes of every declared wtxid to rebuild the block on
+//! `PushSolution`; whatever the template lacks is requested from the JDC.
+//! All wtxids are in wire byte order.
 
 use std::collections::HashMap;
 
 // ── PartitionResult ─────────────────────────────────────────────────
 
-/// Outcome of [`partition_against_template`]. `known_raw_txs` keys
-/// are wtxid-list **positions** (the index into the JDC's declared
-/// `wtxid_list`), values are the raw transaction bytes pulled from
-/// the JDS's local template. `missing_positions` lists the positions
-/// the JDS needs from the JDC via `ProvideMissingTransactions`.
+/// Both keyed by position in the declared `wtxid_list`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PartitionResult {
     pub known_raw_txs: HashMap<u32, Vec<u8>>,
@@ -38,8 +18,6 @@ pub struct PartitionResult {
 }
 
 impl PartitionResult {
-    /// `true` when no transactions are missing, so the
-    /// `ProvideMissingTransactions` step is skipped.
     pub fn fully_covered(&self) -> bool {
         self.missing_positions.is_empty()
     }
@@ -47,9 +25,8 @@ impl PartitionResult {
 
 // ── partition_against_template ──────────────────────────────────────
 
-/// Partition `wtxid_list` against the JDS's local `template_txs`
-/// (`wtxid → raw_tx`, same byte order). Positions not in the template go
-/// into the `ProvideMissingTransactions` request.
+/// Split `wtxid_list` into positions the template covers and positions to
+/// request.
 pub fn partition_against_template(
     wtxid_list: &[[u8; 32]],
     template_txs: &HashMap<[u8; 32], Vec<u8>>,
@@ -73,40 +50,27 @@ pub fn partition_against_template(
 
 // ── PendingDeclaration ──────────────────────────────────────────────
 
-/// In-flight declaration state, held on the JDP session between
-/// `ProvideMissingTransactions` and its `.Success`. At most one per
-/// connection: a second `DeclareMiningJob` in the meantime REPLACES it, and
-/// the first `request_id` is never answered.
+/// A declaration waiting for `ProvideMissingTransactions.Success`. At most one
+/// per connection: a second `DeclareMiningJob` replaces it unanswered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingDeclaration {
-    /// `DeclareMiningJob.request_id`, echoed on the Success frame.
     pub request_id: u32,
-    /// Positions requested from the JDC (`unknown_tx_position_list` in
-    /// `ProvideMissingTransactions`).
     pub missing_positions: Vec<u32>,
-    /// Raw txs already held locally; [`merge_provided_with_known`] folds the
-    /// provided list in.
     pub known_raw_txs: HashMap<u32, Vec<u8>>,
 }
 
 // ── merge_provided_with_known ──────────────────────────────────────
 
-/// Error from [`merge_provided_with_known`].
-/// SV2 JDP/ProvideMissingTransactions.Success fixes `transaction_list` to the
-/// requested transactions "in the order they were requested". The count is
-/// enforced too, because a shorter list would shift every later position onto
-/// the wrong transaction. The handler answers a mismatch with `missing-txs`.
+/// The provided list must match the request in count and order
+/// (SV2 JDP/ProvideMissingTransactions.Success); a shorter list would shift
+/// every later position onto the wrong transaction.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MergeError {
     #[error("expected {expected} transactions, got {got}")]
     PositionCountMismatch { expected: usize, got: usize },
 }
 
-/// Fold a `ProvideMissingTransactions.Success` payload into the
-/// known-raw-txs map and return the complete `position → raw_tx` map.
-///
-/// The provided list must match `pending.missing_positions` in length and,
-/// index for index, in order.
+/// The complete `position → raw_tx` map.
 pub fn merge_provided_with_known(
     pending: PendingDeclaration,
     provided: Vec<Vec<u8>>,
@@ -159,7 +123,6 @@ mod tests {
     fn partition_template_unknown_wtxids_become_missing_positions() {
         let mut template = HashMap::new();
         template.insert(wtxid(0x01), vec![0xAA]);
-        // wtxid 0x02 NOT in template → missing.
         let list = vec![wtxid(0x01), wtxid(0x02), wtxid(0x03)];
         let result = partition_against_template(&list, &template);
         assert!(!result.fully_covered());
@@ -168,8 +131,6 @@ mod tests {
         assert_eq!(result.known_raw_txs.get(&0), Some(&vec![0xAA]));
     }
 
-    /// Positions are 0-indexed and preserve order — even when
-    /// known + missing interleave.
     #[test]
     fn partition_template_preserves_position_order() {
         let mut template = HashMap::new();
@@ -180,8 +141,6 @@ mod tests {
         assert_eq!(result.known_raw_txs.get(&1), Some(&vec![0xBB]));
     }
 
-    /// Duplicate wtxids in the JDC's list → both positions get the
-    /// same raw tx assigned.
     #[test]
     fn partition_template_handles_duplicate_wtxids() {
         let mut template = HashMap::new();
@@ -222,7 +181,7 @@ mod tests {
             missing_positions: vec![1, 2, 3],
             known_raw_txs: HashMap::new(),
         };
-        let provided = vec![vec![0xAA], vec![0xBB]]; // got 2, expected 3
+        let provided = vec![vec![0xAA], vec![0xBB]];
         let err = merge_provided_with_known(pending, provided).unwrap_err();
         assert_eq!(
             err,
@@ -233,7 +192,6 @@ mod tests {
         );
     }
 
-    /// Zero missing positions + zero provided → the known map unchanged.
     #[test]
     fn merge_provided_zero_positions_is_a_noop() {
         let pending = PendingDeclaration {

@@ -1,31 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SV2 JDP-side wire-codec — analogous to [`crate::server_codec`] but
-//! for the Job-Declaration sub-protocol.
+//! SV2 JDP wire codec: maps `AnyMessage::JobDeclaration(...)` to and from the
+//! owned shapes in [`crate::jdp::client`].
 //!
-//! Maps `stratum_core::parsers_sv2::AnyMessage::JobDeclaration(...)`
-//! variants ↔ the owned `Input` / `JdpOutboundFrame` shapes from
-//! [`crate::jdp::client`]. Reuses [`crate::codec_common::CodecError`]
-//! and the shared wire primitives next to it.
-//!
-//! ## Scope
-//!
-//! - **Inbound** (6 variants): SetupConnection (common), RequestExtensions
-//!   (ext 0x0001), AllocateMiningJobToken, DeclareMiningJob,
-//!   ProvideMissingTransactionsSuccess and PushSolution. Ext 0x0003 has
-//!   no inbound message — the payout distribution is server-push only.
-//! - **Outbound** (9 variants): SetupConnection Success/Error,
-//!   RequestExtensions Success/Error, AllocateMiningJobTokenSuccess,
-//!   DeclareMiningJob Success/Error, ProvideMissingTransactions, and
-//!   SetPayoutDistribution (ext 0x0003: `stratum-core::AnyMessage`
-//!   doesn't carry it, so [`encode_jdp_outbound`] hands it over as
-//!   [`JdpWireFrame::Ext0x0003`] bytes and the IO layer frames it by hand
-//!   with the 6-byte header).
-//!
-//! ## Notes
-//!
-//! - **DeclareMiningJob.excess_data** is dropped on decode — reserved
-//!   for future pool-side metadata.
+//! Ext 0x0003 has no inbound message. Its outbound `SetPayoutDistribution` is
+//! not in `stratum-core::AnyMessage`, so [`encode_jdp_outbound`] returns it as
+//! [`JdpWireFrame::Ext0x0003`] bytes for the IO layer to frame by hand.
+//! `DeclareMiningJob.excess_data` is dropped on decode.
 
 use stratum_core::job_declaration_sv2::{
     AllocateMiningJobToken as Sv2AllocateMiningJobToken,
@@ -67,11 +48,7 @@ pub enum InboundJdpFrame {
 
 // ── decode_jdp_inbound ──────────────────────────────────────────────
 
-/// ext 0x0003/Message Types: `SetPayoutDistribution` (JDS → JDC, channel_msg
-/// bit unset). The push model defines no inbound ext-0x0003 frames — the
-/// `distribution_id` reference arrives as an
-/// ext 0x0003/distribution_id TLV Field on the base-protocol
-/// `DeclareMiningJob` / `SetCustomMiningJob` frames.
+/// ext 0x0003/Message Types: `SetPayoutDistribution` (JDS → JDC, channel_msg bit unset).
 pub const EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION: u8 = 0x00;
 
 pub fn decode_jdp_inbound(msg: AnyMessage<'_>) -> Result<Option<InboundJdpFrame>, CodecError> {
@@ -137,8 +114,7 @@ fn decode_declare(m: Sv2DeclareMiningJob<'_>) -> Result<DeclareMiningJobInput, C
         wtxid_list.push(bytes_to_32(b)?);
     }
     Ok(DeclareMiningJobInput {
-        // ext 0x0003/distribution_id TLV Field — extracted by the IO layer
-        // from the frame's trailing TLVs, not part of the base-message decode.
+        // ext 0x0003/distribution_id TLV Field: filled in by the IO layer.
         distribution_id: None,
         request_id: m.request_id,
         mining_job_token: token_from_bytes(m.mining_job_token.as_bytes())?,
@@ -146,7 +122,6 @@ fn decode_declare(m: Sv2DeclareMiningJob<'_>) -> Result<DeclareMiningJobInput, C
         coinbase_tx_prefix: m.coinbase_tx_prefix.as_bytes().to_vec(),
         coinbase_tx_suffix: m.coinbase_tx_suffix.as_bytes().to_vec(),
         wtxid_list,
-        // excess_data is dropped (see module docs).
     })
 }
 
@@ -184,9 +159,7 @@ fn decode_push_solution(m: Sv2PushSolution<'_>) -> Result<PushSolutionInput, Cod
 pub enum JdpWireFrame {
     /// A base-protocol message; the IO layer wraps it in a `MessageFrame`.
     Message(AnyMessageOwned),
-    /// An ext 0x0003 message. `stratum-core` has no type for it, so the
-    /// codec hands over the serialised body and the IO layer frames it by
-    /// hand with `(extension_type = 0x0003, msg_type, len(payload))`.
+    /// An ext 0x0003 body; the IO layer frames it with `(0x0003, msg_type, len)`.
     Ext0x0003 { msg_type: u8, payload: Vec<u8> },
 }
 
@@ -253,8 +226,7 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<JdpWireFrame, Code
         } => AnyMessageOwned::JobDeclaration(JobDeclarationOwned::ProvideMissingTransactions(
             Sv2ProvideMissingTransactions {
                 request_id,
-                // The wire field is u16. Positions index a `Seq064K`
-                // wtxid list, so they always fit.
+                // Positions index a `Seq064K` list, so they fit in u16.
                 unknown_tx_position_list: unknown_tx_position_list
                     .into_iter()
                     .map(|x| x as u16)
@@ -263,8 +235,6 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<JdpWireFrame, Code
                     .map_err(CodecError::from_conv)?,
             },
         )),
-        // SetPayoutDistribution is ext 0x0003 — not in `AnyMessage`, so it
-        // leaves as serialised bytes for the IO layer to frame.
         JdpOutboundFrame::SetPayoutDistribution(msg) => {
             return Ok(JdpWireFrame::Ext0x0003 {
                 msg_type: EXT_0X0003_MSG_TYPE_SET_PAYOUT_DISTRIBUTION,
@@ -278,13 +248,11 @@ pub fn encode_jdp_outbound(frame: JdpOutboundFrame) -> Result<JdpWireFrame, Code
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stratum_core::common_messages_sv2::SetupConnection as Sv2SetupConnection;
-    use stratum_core::parsers_sv2::CommonMessagesOwned;
-    // Named only here: the production path reaches `Token` through
-    // `codec_common::token_from_bytes` without spelling the type.
     use crate::tokens::Token;
     use stratum_core::binary_sv2::{Seq064K, U256};
     use stratum_core::common_messages_sv2::Protocol;
+    use stratum_core::common_messages_sv2::SetupConnection as Sv2SetupConnection;
+    use stratum_core::parsers_sv2::CommonMessagesOwned;
 
     fn token(byte: u8) -> Token {
         Token([byte; 16])

@@ -1,45 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! The ext 0x0003 side of one JDP connection: which payout distribution the
-//! session is served, and when that is re-decided.
-//!
-//! The connection loop in the parent module handles the base protocol and
-//! calls into [`PayoutSession`] at four points; everything that exists only
-//! because of ext 0x0003 lives here.
+//! session is served, and when that is re-decided. The connection loop calls
+//! into [`PayoutSession`].
 
 use super::*;
 
-/// What a session is being served, and why. Three outcomes rather than a
-/// bool, because "served nothing" covers two states whose cures differ: a
-/// build that failed and may fail again, and a mode that is not known YET and
-/// resolves by itself once a mining session registers. Treating an unknown
-/// mode as known would publish a wrong distribution.
+/// What a session is being served. "Served nothing" is split in two because
+/// the cures differ: a failed build is retried throttled, an unknown mode
+/// resolves once a mining session registers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SessionDistribution {
-    /// A plan is on file, carrying the accounting it was BUILT for, so "is
-    /// this still the right plan?" stays answerable. `PoolWide` means the
-    /// pool-wide push is this miner's accounting (PPLNS); the tailored kinds
-    /// carry their owner address.
+    /// A plan is on file, tagged with the accounting it was built for.
     Served(DistributionAccounting),
-    /// The mode is not known YET. Nothing is published, and the caller retries
-    /// on the next inbound frame: the check is a map lookup, and the answer
-    /// normally arrives right after the miner opens its channel.
+    /// The mode is not known yet; nothing published, retried on every frame.
     AwaitingMode,
-    /// Nothing published because the build FAILED, or no distribution id was
-    /// available. Retried on the session's own frames, but throttled
-    /// ([`rebuild_due`]), because each retry runs the whole distribution build
-    /// and a JDC sends frames continuously.
+    /// The build failed or no distribution id was available; retried
+    /// throttled ([`rebuild_due`]).
     Denied,
 }
 
 impl SessionDistribution {
-    /// The accounting this session is being served, or `None` while it is
-    /// served nothing.
-    ///
-    /// A plan on file is REFERENCEABLE: `distribution_acceptance` answers
-    /// with it, and ext 0x0003/Grace Window keeps the immediately-previous one
-    /// answerable too. So a plan that stops being right has to be dropped, not
-    /// just superseded.
+    /// The accounting served, or `None`. A plan that stops being right must be
+    /// dropped, not superseded: ext 0x0003/Grace Window keeps the previous one
+    /// acceptable.
     fn accounting(&self) -> Option<&DistributionAccounting> {
         match self {
             Self::Served(accounting) => Some(accounting),
@@ -48,28 +32,14 @@ impl SessionDistribution {
     }
 }
 
-/// How long a session that was refused a distribution waits before the pool
-/// tries to build it one again, on its own frames.
-///
-/// Below the publisher's 60 s default, which this backs up, and long enough
-/// that a JDC's frame rate cannot turn it into a rebuild per frame.
+/// Retry interval for a `Denied` session: below the publisher's 60 s tick, and
+/// long enough that a JDC's frame rate cannot force a build per frame.
 const DENIED_REBUILD_INTERVAL_MS: u64 = 30_000;
 
-/// Whether an inbound frame should make the pool re-decide what this session
-/// is served, given the accounting its address is on right now.
-///
-/// An exhaustive `match`, so a state added later has to be classified:
-///
-/// - `AwaitingMode`: every frame. The mode lookup returns before anything is
-///   built.
-/// - `Denied`: throttled, because it runs the WHOLE distribution build. It
-///   must retry at all because the publisher skips a tick whose fingerprint
-///   is unchanged, so on a quiet window nothing else would wake the session.
-/// - `Served`: only when the mode MOVED. A settlement re-decides through slot
-///   invalidation (ext 0x0003/Implementation Notes), but
-///   `cache_sync::reconcile_gate_modes` flips a live address between Solo and
-///   Group-Solo on a group join or leave without a reconnect, and nothing
-///   else would move the session off the plan for its old mode.
+/// Whether an inbound frame should re-decide what this session is served.
+/// `Denied` must retry here: the publisher skips a tick whose fingerprint is
+/// unchanged. `Served` rebuilds only when the mode moved: a group join or
+/// leave flips a live address between Solo and Group-Solo without a reconnect.
 fn rebuild_due(
     served: &SessionDistribution,
     current_mode: Option<bp_common::StreamKind>,
@@ -81,36 +51,25 @@ fn rebuild_due(
         SessionDistribution::Denied => {
             now_ms.saturating_sub(last_rebuild_ms) >= DENIED_REBUILD_INTERVAL_MS
         }
-        // The one shared table, so a session is never served a plan the
-        // mining side or the declare path would then refuse.
+        // Shared table, so the mining side and declare path agree.
         SessionDistribution::Served(accounting) => {
             !crate::bridge::accounting_fits_mode(accounting, current_mode)
         }
     }
 }
 
-/// Makes "this session is still waiting for its mode" visible.
-///
-/// `AwaitingMode` is the NORMAL first answer for every JDC, which allocates
-/// several seconds before its mining channel opens, so entering it is not
-/// reported. STAYING there is: an address that never opens a mining session
-/// is served nothing forever, which otherwise looks like a healthy session
-/// that is not declaring.
-///
-/// The wait is timed and reported once, naming what an operator can act on:
-/// the pool learns Solo from PPLNS from the PORT a miner connects on. The
-/// recovery is reported too, with how long it took.
+/// Reports a session stuck in `AwaitingMode` once per episode, and its
+/// recovery. A short wait is normal: a JDC allocates before its mining
+/// channel opens.
 struct AwaitingModeWatch {
     /// When the current wait started. `None` = not waiting.
     since_ms: Option<u64>,
-    /// Whether THIS wait has already been reported. Reset with the wait, so a
-    /// session that flaps gets one line per episode, not one per frame.
+    /// Whether this wait has been reported; reset with the wait.
     warned: bool,
 }
 
 impl AwaitingModeWatch {
-    /// Comfortably past the ~8 s a healthy JDC needs, and under the
-    /// publisher's 60 s tick so the per-frame retry is what trips it.
+    /// Past the ~8 s a healthy JDC needs, under the publisher's 60 s tick.
     const WARN_AFTER_MS: u64 = 30_000;
 
     fn new() -> Self {
@@ -120,8 +79,7 @@ impl AwaitingModeWatch {
         }
     }
 
-    /// Feed EVERY `served` transition through here, including the ones that
-    /// resolve it.
+    /// Feed every `served` transition through here, resolving ones included.
     fn observe(
         &mut self,
         served: &SessionDistribution,
@@ -157,23 +115,15 @@ impl AwaitingModeWatch {
     }
 }
 
-/// Everything a session's payout plan is tracked with.
-///
-/// `served`, `last_rebuild_ms` and `awaiting` move TOGETHER on every rebuild
-/// (see [`republish_tailored`]): a missed stamp costs `Denied` its throttle,
-/// a missed [`AwaitingModeWatch::observe`] costs the stuck-session warning its
-/// state. `last_pool_wide_written` is the same plan seen from the wire side.
+/// A session's payout plan. `served`, `last_rebuild_ms` and `awaiting` move
+/// together on every rebuild, via [`republish_tailored`].
 struct SessionPlan {
-    /// What this session is being served, and why.
     served: SessionDistribution,
-    /// When the pool last TRIED to build this session a plan, whatever came
-    /// of it — [`rebuild_due`]'s throttle for the refused case.
+    /// When a build was last attempted; [`rebuild_due`]'s throttle.
     last_rebuild_ms: u64,
-    /// Makes a session stuck without a known payout mode visible.
     awaiting: AwaitingModeWatch,
-    /// The pool-wide distribution id last written to this client, so a session
-    /// arriving on that stream can be told whether it is behind. `None` while
-    /// it holds something else (nothing yet, or a tailored push).
+    /// The pool-wide distribution id last written to this client; `None` while
+    /// it holds nothing or a tailored push.
     last_pool_wide_written: Option<u64>,
 }
 
@@ -188,12 +138,8 @@ impl SessionPlan {
     }
 }
 
-/// Rebuild this session's plan and record it, applying all three
-/// post-conditions in one place.
-///
-/// It does NOT drop a plan the rebuild failed to replace. Only the
-/// mode-moved caller does that: for the other callers the old entry is
-/// either already settlement-invalidated or still the right one.
+/// Rebuild and record this session's plan. Does not drop a plan the rebuild
+/// failed to replace; only the mode-moved caller needs that.
 async fn republish_tailored(
     hooks: &JdpServerHooks,
     bridge: &Arc<RwLock<JdpDeclaredJobRegistry>>,
@@ -220,16 +166,8 @@ async fn republish_tailored(
         .observe(&plan.served, session_id_hex, miner, now);
 }
 
-/// Build and push a fresh tailored distribution for `miner` on this session.
-///
-/// Reached only through [`republish_tailored`], from three callers: an
-/// allocate; an ext 0x0003/Implementation Notes settlement, which invalidates
-/// a tailored slot like the pool-wide one while the publisher only republishes
-/// the latter; and the session's own frames, which retry an undecided or
-/// refused build and answer a mode that moved.
-///
-/// It rebuilds from the mode gate every time, so it needs no reason for the
-/// call.
+/// Build and push a fresh distribution for `miner` from the mode gate. Only
+/// reached through [`republish_tailored`].
 #[allow(clippy::too_many_arguments)]
 async fn rebuild_tailored_plan(
     hooks: &JdpServerHooks,
@@ -238,35 +176,17 @@ async fn rebuild_tailored_plan(
     session_id: u32,
     session_id_hex: &str,
     miner: &AddressId,
-    // What this session is served RIGHT NOW. Compared against the rebuild, so
-    // a plan that stops being right is dropped rather than superseded:
-    // ext 0x0003/Grace Window keeps the immediately-previous entry of a slot
-    // acceptable. The comparison lives here, not at a call site, because the
-    // allocate path also republishes and clients allocate before nearly every
-    // declare, so that is where a mode flip is usually observed.
+    // Current plan; a changed accounting drops it (ext 0x0003/Grace Window).
     serving: &SessionDistribution,
-    // The pool-wide distribution id this session was last WRITTEN, or `None`
-    // if it holds something else (nothing yet, or a tailored push:
-    // ext 0x0003/Payout Computation gives the client ONE current distribution).
-    // Updated in place so the catch-up below knows whether to push.
+    // Updated in place so the pool-wide catch-up knows whether to push.
     last_pool_wide_written: &mut Option<u64>,
 ) -> SessionDistribution {
     let (accounting, built) = match hooks.distribution_source.build_for_miner(miner).await {
         TailoredDistribution::Built { accounting, built } => (accounting, *built),
-        // This miner rides the pool-wide distribution (PPLNS). Three things
-        // have to happen together, or the session is stranded:
-        //
-        // 1. **Drop a tailored slot it may still hold.** `distribution_accep-
-        //    tance` under `JdpSession` scope PREFERS that slot, so one left
-        //    behind resolves every later pool-wide id as `Stale`.
-        // 2. **Lift the denial**, or the acceptance answers `Unknown`.
-        // 3. **Push the current distribution NOW**, unless the session already
-        //    holds it. A session that was awaiting its mode may hold an id past
-        //    the ext 0x0003/Grace Window, and a tailored one holds its own plan
-        //    (ext 0x0003/Payout Computation). Only `stale-chain-tip` is a
-        //    benign declare error; `stale-payout-distribution` ends the
-        //    session. The publisher skips a tick whose fingerprint is
-        //    unchanged, so waiting for it is not a recovery.
+        // Pool-wide (PPLNS). All three or the session is stranded: drop a
+        // leftover tailored slot (acceptance prefers it, so pool-wide ids
+        // resolve `Stale`), lift the denial, and push the current distribution
+        // now; `stale-payout-distribution` would end the session.
         TailoredDistribution::PoolWide => {
             let current = {
                 let mut guard = bridge.write().expect("bridge RwLock poisoned");
@@ -281,8 +201,7 @@ async fn rebuild_tailored_plan(
                 guard.current_pool_wide()
             };
             match current {
-                // Already holding it: a session on the pool-wide stream gets
-                // the publisher's pushes, so no re-send per frame.
+                // Already holding it; the publisher keeps it current.
                 Some(entry) if *last_pool_wide_written == Some(entry.distribution_id) => {}
                 Some(entry) => {
                     let wire = wire_from_entry(&entry);
@@ -301,22 +220,17 @@ async fn rebuild_tailored_plan(
                         );
                     }
                 }
-                // Nothing published yet at all. The session is allowed on the
-                // pool-wide stream, so the publisher's first push reaches it.
+                // The publisher's first push will reach it.
                 None => {
                     debug!("jdp {session_id_hex} on the pool-wide distribution, none published yet")
                 }
             }
             return SessionDistribution::Served(DistributionAccounting::PoolWide);
         }
-        // Not known YET. Publish nothing and keep pool-wide denied: either
-        // guess is a money error. The caller retries on the next inbound
-        // frame, by which time the miner has usually opened its channel.
+        // Unknown mode: publish nothing and keep pool-wide denied; either
+        // guess is a money error.
         TailoredDistribution::ModeUnknown => {
-            // Read first: this arm runs on EVERY inbound frame while the mode
-            // is undecided, and a write lock per frame would contend with the
-            // mining side for nothing. Racing writers are harmless, the insert
-            // is idempotent.
+            // Read lock first: this runs on every frame while undecided.
             let already_denied = bridge
                 .read()
                 .expect("bridge RwLock poisoned")
@@ -363,12 +277,8 @@ async fn rebuild_tailored_plan(
     let wire = wire_from_entry(&entry);
     {
         let mut guard = bridge.write().expect("bridge RwLock poisoned");
-        // Same lock as the publish, so there is no window in which the session
-        // has neither plan. Only when the accounting actually changed: a
-        // rebuild for the SAME accounting (an ext 0x0003/Implementation Notes
-        // settlement, a fresh allocate) legitimately supersedes, and
-        // ext 0x0003/Grace Window's grace entry is what a declaration already
-        // in flight resolves against.
+        // Drop under the publish lock, and only on a changed accounting: a
+        // same-accounting rebuild supersedes and keeps ext 0x0003/Grace Window.
         if serving.accounting().is_some_and(|was| *was != accounting) {
             let dropped = guard.clear_tailored(session_id);
             info!(
@@ -388,24 +298,21 @@ async fn rebuild_tailored_plan(
     {
         warn!("jdp {session_id_hex} tailored republish write: {err:?}");
     }
-    // ext 0x0003/Payout Computation makes the LATEST push the one the client
-    // uses, so a return to the pool-wide distribution needs a fresh push, even
-    // of an id it has already seen.
+    // The client uses the latest push (ext 0x0003/Payout Computation), so a
+    // return to pool-wide needs a fresh push.
     *last_pool_wide_written = None;
     debug!(distribution_id, "jdp {session_id_hex} tailored republished");
     SessionDistribution::Served(accounting)
 }
 
-/// A frame's ext 0x0003 context, read before the handler runs: the handler
-/// may change the negotiated set, and the mode lookup is async.
+/// A frame's ext 0x0003 context, read before the handler can change it.
 pub(super) struct FrameProbe {
     negotiated_before: bool,
     requests_extensions: bool,
     current_mode: Option<bp_common::StreamKind>,
 }
 
-/// Per-connection ext 0x0003 state: the plan this session is served and the
-/// miner it belongs to, learned from its first allocate.
+/// Per-connection ext 0x0003 state; the miner is learned from the first allocate.
 pub(super) struct PayoutSession {
     session_id: u32,
     session_id_hex: String,
@@ -413,8 +320,7 @@ pub(super) struct PayoutSession {
     identity: Option<AddressId>,
 }
 
-/// Whether this session negotiated ext 0x0003. The async entry points take
-/// this instead of the session state, which is not `Sync`.
+/// Whether this session negotiated ext 0x0003 (the session state is not `Sync`).
 pub(super) fn negotiated(state: &JdpSessionState) -> bool {
     state
         .negotiated_extensions
@@ -431,11 +337,9 @@ impl PayoutSession {
         }
     }
 
-    /// Extensions whose TLVs an inbound frame may carry, or `None` for an
-    /// ext 0x0003 frame, which only ever flows JDS to JDC and is dropped.
-    ///
-    /// A `DeclareMiningJob` is parsed with the 0x0003 TLV even when it was not
-    /// negotiated, so the declare path can see and refuse it.
+    /// Extensions whose TLVs an inbound frame may carry; `None` drops an
+    /// inbound ext 0x0003 frame. `DeclareMiningJob` always parses the 0x0003
+    /// TLV so the declare path can refuse it when not negotiated.
     pub(super) fn tlv_extensions(
         &self,
         state: &JdpSessionState,
@@ -474,8 +378,7 @@ impl PayoutSession {
         inbound: &InboundJdpFrame,
         hooks: &JdpServerHooks,
     ) -> FrameProbe {
-        // The mode of the miner this session's own plan belongs to. The
-        // declare path looks up the mode of its token's address separately.
+        // The plan owner's mode; the declare path looks up its token's own.
         let current_mode = match (&self.identity, negotiated_before) {
             (Some(miner), true) => hooks.distribution_source.current_mode(miner).await,
             _ => None,
@@ -487,10 +390,8 @@ impl PayoutSession {
         }
     }
 
-    /// A new pool-wide distribution was published. Pushes it to a session on
-    /// the pool-wide stream; a tailored session instead gets its own plan
-    /// rebuilt if the publish invalidated it. `Err` means the write failed and
-    /// the connection is done.
+    /// A pool-wide publish: push it, or rebuild an invalidated tailored plan.
+    /// `Err` means the write failed and the connection is done.
     pub(super) async fn on_publish(
         &mut self,
         negotiated: bool,
@@ -538,9 +439,8 @@ impl PayoutSession {
         Ok(())
     }
 
-    /// The frame just negotiated ext 0x0003: the current distribution goes out
-    /// in the same write as `RequestExtensions.Success`, so it is the first
-    /// message after it (ext 0x0003/SetPayoutDistribution).
+    /// On negotiation, the current distribution is the first message after
+    /// `RequestExtensions.Success` (ext 0x0003/SetPayoutDistribution).
     pub(super) fn append_first_push(
         &mut self,
         state: &JdpSessionState,
@@ -572,9 +472,8 @@ impl PayoutSession {
         }
     }
 
-    /// After a frame's answer is written: learn the miner from an allocate,
-    /// and re-decide the plan when it is undecided, refused, or built for a
-    /// mode the miner is no longer on.
+    /// After a frame: learn the miner from an allocate and re-decide the plan
+    /// when `rebuild_due`.
     pub(super) async fn after_frame(
         &mut self,
         negotiated: bool,
@@ -608,8 +507,7 @@ impl PayoutSession {
         }
         let was = self.plan.served.clone();
         self.republish(hooks, bridge, writer, &miner).await;
-        // Due while serving a plan means the mode moved. If no plan could be
-        // built for the new mode, the old one pays the wrong miners: drop it.
+        // Mode moved and no new plan: the old one pays the wrong miners.
         if was.accounting().is_some() && self.plan.served.accounting().is_none() {
             let dropped = bridge
                 .write()
@@ -660,11 +558,10 @@ mod tests {
     fn only_the_states_that_have_something_to_gain_rebuild_on_a_frame() {
         let miner = AddressId::new(ADDR.to_string()).unwrap();
         let solo = Some(bp_common::StreamKind::Solo);
-        // Undecided: every frame, the check returns before anything is built.
         assert!(rebuild_due(&SessionDistribution::AwaitingMode, solo, 0, 0));
         assert!(rebuild_due(&SessionDistribution::AwaitingMode, solo, 1, 0));
 
-        // Refused: not on the next frame, but not never either.
+        // Denied: only after the throttle.
         assert!(!rebuild_due(
             &SessionDistribution::Denied,
             solo,
@@ -684,8 +581,7 @@ mod tests {
             1_000
         ));
 
-        // Being served the plan its mode calls for: its own traffic decides
-        // nothing, however long it keeps sending.
+        // Served the right plan: never.
         for (served, mode) in [
             (
                 SessionDistribution::Served(DistributionAccounting::Solo(miner.clone())),
@@ -707,8 +603,7 @@ mod tests {
         }
     }
 
-    /// The mode moving under a served session is the ONE thing that re-opens
-    /// it, checked for every pair in both directions.
+    /// A served session rebuilds exactly when its mode moved, for every pair.
     #[test]
     fn a_served_session_rebuilds_exactly_when_its_mode_moved() {
         use bp_common::StreamKind as Sk;
@@ -735,9 +630,7 @@ mod tests {
                     "{served:?} was built for {built_for:?}, gate now says {now:?}"
                 );
             }
-            // …and "the gate has never heard of this address" is not a move.
-            // A miner behind a JDC that drops for a moment must not cost the
-            // session the plan it is correctly being served.
+            // An unknown mode (miner briefly gone) is not a move.
             assert!(
                 !rebuild_due(&served, None, u64::MAX, 0),
                 "{served:?} must survive an unknown mode"
@@ -745,9 +638,7 @@ mod tests {
         }
     }
 
-    /// Only a served session has a plan on file to drop. Dropping matters
-    /// because ext 0x0003/Grace Window keeps the immediately-previous entry
-    /// acceptable, so a merely superseded plan is still declarable.
+    /// Only a served session has a plan on file to drop.
     #[test]
     fn only_a_served_session_has_a_plan_to_drop() {
         let miner = AddressId::new(ADDR.to_string()).unwrap();
@@ -765,8 +656,7 @@ mod tests {
         assert_eq!(SessionDistribution::Denied.accounting(), None);
     }
 
-    /// A healthy JDC start must not warn: it allocates seconds before its
-    /// mining channel opens, so `AwaitingMode` on the first frames is normal.
+    /// A healthy JDC start (`AwaitingMode` for a few seconds) does not warn.
     #[test]
     fn a_short_wait_for_the_mode_is_not_reported() {
         let mut w = AwaitingModeWatch::new();
@@ -784,8 +674,7 @@ mod tests {
         assert_eq!(w.since_ms, None, "a resolved wait must reset");
     }
 
-    /// A wait that outlasts the threshold is reported exactly once, however
-    /// many frames arrive, and so is its recovery.
+    /// A stuck wait is reported once, its recovery too, and a new episode again.
     #[test]
     fn a_stuck_session_is_reported_once_and_its_recovery_too() {
         let mut w = AwaitingModeWatch::new();
@@ -806,8 +695,7 @@ mod tests {
         assert!(w.warned, "the threshold must trip it");
         assert_eq!(w.since_ms, Some(1_000), "the wait's start must not move");
 
-        // Recovery clears BOTH, so a second episode on the same connection is
-        // reported again instead of being swallowed by the first one's flag.
+        // Recovery clears both fields, so the next episode is reported again.
         w.observe(
             &SessionDistribution::Served(DistributionAccounting::PoolWide),
             "jdp-test",
@@ -829,9 +717,7 @@ mod tests {
         );
     }
 
-    /// `Denied` is not counted as a wait for the mode: it has its own warning
-    /// where the build fails, and "no miner has connected" would name the
-    /// wrong cure for a session whose mode is known.
+    /// `Denied` is not counted as awaiting the mode; it warns where the build fails.
     #[test]
     fn a_denied_session_is_not_counted_as_awaiting_its_mode() {
         let mut w = AwaitingModeWatch::new();

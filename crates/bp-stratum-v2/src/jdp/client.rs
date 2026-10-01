@@ -1,22 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pure handler-layer for the JDP-server per-connection state machine.
+//! Pure handler layer for the JDP-server per-connection state machine.
 //!
-//! Wraps [`crate::tokens`], [`crate::jdp::declarations`],
-//! [`crate::jdp::tx_validation`], [`crate::jdp::dynamic_outputs`] and the
-//! [`crate::extensions`] codecs into a connection-scoped state struct plus
-//! `handle_*` functions, in the style of [`crate::mining::client`]: each
-//! handler mutates `&mut JdpSessionState` and returns a
-//! [`JdpHandlerOutcome`] (outbound frames + [`JdpSessionEvent`]s). No I/O,
-//! no broadcasting, no DB writes.
-//!
-//! The IO layer (`jdp_server.rs`) resolves any async hooks (mempool
-//! validation, template-tx snapshot, dynamic outputs) before calling a
-//! handler, so the handlers stay pure and testable with synthetic inputs.
-//! Handlers never close the socket: they emit
-//! [`JdpSessionEvent::Disconnect`] and the IO layer writes the pending
-//! `SetupConnection.Error` before closing, per SV2
-//! Overview/SetupConnection.Error.
+//! Each `handle_*` mutates `&mut JdpSessionState` and returns a
+//! [`JdpHandlerOutcome`] (outbound frames + [`JdpSessionEvent`]s), like
+//! [`crate::mining::client`]. No I/O: the IO layer (`jdp_server.rs`) resolves
+//! async hooks before the call. Handlers never close the socket; they emit
+//! [`JdpSessionEvent::Disconnect`] so the IO layer can write the pending
+//! `SetupConnection.Error` first (SV2 Overview/SetupConnection.Error).
 
 use std::collections::{HashMap, HashSet};
 
@@ -38,19 +29,14 @@ use super::tx_validation::{merge_provided_with_known, PartitionResult, PendingDe
 
 // ── Constants ────────────────────────────────────────────────────────
 
-/// SV2 protocol code for the Job-Declaration sub-protocol — the
-/// `protocol` field of SV2 Overview/SetupConnection, not a JDP flag.
+/// `protocol` field of SV2 Overview/SetupConnection for Job Declaration.
 pub const PROTOCOL_JOB_DECLARATION: u8 = 1;
 
-/// `DECLARE_TX_DATA` flag (bit 0 of `SetupConnection.flags`). When
-/// set, the JDC sends a full `DeclareMiningJob` before any
-/// `SetCustomMiningJob` (Full-Template mode). When clear, the JDC
-/// sends `SetCustomMiningJob` directly (Coinbase-only mode — the
-/// JDS doesn't validate the full transaction set).
+/// `DECLARE_TX_DATA` (bit 0 of `SetupConnection.flags`): set = Full-Template
+/// mode (`DeclareMiningJob` first), clear = Coinbase-only mode.
 pub const FLAG_DECLARE_TX_DATA: u32 = 1 << 0;
 
-/// Set of JDP-side SV2 extensions this server supports. Currently 0x0003
-/// (Non-Custodial Pool Payouts).
+/// JDP-side SV2 extensions this server supports.
 pub const SUPPORTED_JDP_EXTENSIONS: &[u16] = &[SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS];
 
 fn is_jdp_extension_supported(ext: u16) -> bool {
@@ -59,63 +45,37 @@ fn is_jdp_extension_supported(ext: u16) -> bool {
 
 // ── Wire error codes ─────────────────────────────────────────────────
 
-/// `unsupported-feature-flags` — JDC sent `DeclareMiningJob` without
-/// negotiating `DECLARE_TX_DATA` (Full-Template mode).
-///
-/// Borrowed from `SetupConnection.Error`: SV2 JDP/DeclareMiningJob.Error
-/// enumerates no codes, and no job-declaration code says "flag never
-/// negotiated" more precisely. Pinned in `tests/wire_error_parity.rs`.
-/// ⚠️ Never answer this with `stale-chain-tip`: that invites a retry
-/// against a condition only a new connection can resolve.
+/// `DeclareMiningJob` without negotiated `DECLARE_TX_DATA`. Borrowed from
+/// `SetupConnection.Error` (pinned in `tests/wire_error_parity.rs`); never
+/// `stale-chain-tip`, which would invite a retry only a new connection fixes.
 pub const ERR_UNSUPPORTED_FEATURE_FLAGS: &str = "unsupported-feature-flags";
 
-/// `invalid-mining-job-token` — the token referenced was never issued, has
-/// expired, or was already SPENT by an earlier declaration
-/// (`DeclareMiningJob.Error`). The last is the common one: a token authorises
-/// one declaration.
+/// Token never issued, expired, or already spent (one token, one declaration).
 pub const ERR_INVALID_MINING_JOB_TOKEN: &str = "invalid-mining-job-token";
 
-/// `invalid-job-param-value-coinbase_tx_outputs` — the declared coinbase
-/// doesn't carry the pool's committed payout outputs verbatim (an output is
-/// missing, modified, or reduced — ext 0x0003/Payout Computation).
+/// Declared coinbase lacks the pool's committed payout outputs verbatim.
 pub const ERR_INVALID_JOB_PARAM_COINBASE: &str = "invalid-job-param-value-coinbase_tx_outputs";
 
-/// `stale-payout-distribution` — the referenced `distribution_id` is outside
-/// the acceptance window: superseded past the ext 0x0003/Grace Window,
-/// settlement-invalidated (ext 0x0003/Implementation Notes), or never
-/// published. The JDC SHOULD re-declare against the latest received
-/// distribution.
+/// `distribution_id` outside the ext 0x0003/Grace Window, settlement-invalidated,
+/// or never published; the JDC SHOULD re-declare against the latest.
 pub const ERR_STALE_PAYOUT_DISTRIBUTION: &str =
     crate::extensions::payout_distribution_error_codes::STALE_PAYOUT_DISTRIBUTION;
 
-/// `invalid-payout-distribution` — the declared coinbase violates
-/// ext 0x0003/Payout Computation against the referenced distribution
-/// (positional recompute mismatch), or the `distribution_id` TLV is
-/// missing/malformed while the extension is negotiated.
+/// Coinbase fails the ext 0x0003/Payout Computation recompute, or the
+/// `distribution_id` TLV is missing/malformed while negotiated.
 pub const ERR_INVALID_PAYOUT_DISTRIBUTION: &str =
     crate::extensions::payout_distribution_error_codes::INVALID_PAYOUT_DISTRIBUTION;
 
-/// `stale-chain-tip` — the chain tip advanced while this declaration was
-/// in flight (between the initial `DeclareMiningJob` and the completion of
-/// its `ProvideMissingTransactions` round-trip), so the declared job
-/// references a superseded template. A benign race, not a protocol
-/// violation — this exact string matters, because JDCs treat
-/// `stale-chain-tip` as retryable and any other declaration error as fatal.
+/// The tip moved while the declaration was in flight. The exact string matters:
+/// JDCs retry `stale-chain-tip` and treat every other declaration error as fatal.
 pub const ERR_STALE_CHAIN_TIP: &str = "stale-chain-tip";
 
-/// `missing-txs` — the declaration is complete (its
-/// `ProvideMissingTransactions.Success` has arrived) and the pool's node still
-/// cannot resolve every declared wtxid. The node only resolves a transaction
-/// by the wtxid it hashes to, so a supplied transaction that does not match
-/// its position stays missing — and a declaration the node never saw whole
-/// was never validated.
+/// After `ProvideMissingTransactions.Success` the node still cannot resolve
+/// every declared wtxid; an unseen declaration is never validated.
 pub const ERR_MISSING_TXS: &str = "missing-txs";
 
-/// How many declarations one connection may have waiting for their
-/// `ProvideMissingTransactions.Success` at once. A JDC declares per template,
-/// so a second one can be in flight before the first round-trip returns; the
-/// bound only stops a JDC that never answers from growing the session. Same
-/// size as the declared-job store (`MAX_DECLARED_JOBS`).
+/// Declarations one connection may have awaiting
+/// `ProvideMissingTransactions.Success`; bounds a JDC that never answers.
 pub const MAX_PENDING_DECLARATIONS: usize = 3;
 
 // ── Inputs (typed wrappers over deserialized SV2 frames) ────────────
@@ -124,14 +84,11 @@ pub const MAX_PENDING_DECLARATIONS: usize = 3;
 #[derive(Clone, Debug)]
 pub struct AllocateMiningJobTokenInput {
     pub request_id: u32,
-    /// JDC-supplied identifier. The handler tries
-    /// `normalize_btc_address` on it first; if that fails, the
-    /// caller's `fallback_miner_address` argument takes over.
+    /// Used as the miner address if it normalizes; otherwise the fallback is.
     pub user_identifier: String,
 }
 
-/// Inputs from a deserialized `DeclareMiningJob` frame: the fields the
-/// handler reads.
+/// Inputs from a deserialized `DeclareMiningJob` frame.
 #[derive(Clone, Debug)]
 pub struct DeclareMiningJobInput {
     pub request_id: u32,
@@ -140,57 +97,39 @@ pub struct DeclareMiningJobInput {
     pub coinbase_tx_prefix: Vec<u8>,
     pub coinbase_tx_suffix: Vec<u8>,
     pub wtxid_list: Vec<[u8; 32]>,
-    /// The ext 0x0003/distribution_id TLV Field, when
-    /// present and the extension is negotiated (the IO layer extracts it from
-    /// the frame's trailing TLVs).
+    /// The ext 0x0003/distribution_id TLV Field, when present and negotiated.
     pub distribution_id: Option<u64>,
 }
 
-/// Inputs from a deserialized `ProvideMissingTransactions.Success`
-/// frame. The transactions are positioned to match the previously
-/// requested `missing_positions` index-for-index.
+/// Inputs from a `ProvideMissingTransactions.Success` frame, index-aligned
+/// with the requested `missing_positions`.
 #[derive(Clone, Debug)]
 pub struct ProvideMissingTransactionsSuccessInput {
     pub request_id: u32,
     pub transaction_list: Vec<Vec<u8>>,
 }
 
-/// The block-header fields a `PushSolution` carries.
-///
-/// Named fields rather than loose arguments: four of the five are `u32`, and
-/// a swap at any call site on the way to block reassembly compiles, passes
-/// tests, and yields a header that hashes to nothing.
-///
-/// No `merkle_root`: it follows from the reassembled transaction set.
+/// The block-header fields a `PushSolution` carries. Named fields because four
+/// are `u32` and a swap compiles fine but hashes to nothing.
 #[derive(Clone, Copy, Debug)]
 pub struct SolutionHeader {
     /// Tip the solution was mined on.
     pub prev_hash: [u8; 32],
-    /// Block-header `version` field (BIP-320 version-rolled).
+    /// BIP-320 version-rolled header version.
     pub version: u32,
-    /// Block-header `ntime` field.
     pub ntime: u32,
-    /// Block-header `nonce` field.
     pub nonce: u32,
-    /// Block-header `nBits` field, as the JDC sent it. Never used as a
-    /// threshold — the pool checks work against its OWN target.
+    /// As the JDC sent it; never a threshold (the pool checks its OWN target).
     pub n_bits: u32,
 }
 
 /// Which declaration a pushed solution came from, and on which JDP session.
-///
-/// The block-found path needs both: the session id is what
-/// `blocks_entity."sessionId"` records, the token is what diagnostics name.
 #[derive(Clone, Copy, Debug)]
 pub struct DeclarationRef {
-    /// The `new_mining_job_token` the JDS issued in `DeclareMiningJobSuccess`.
+    /// The `new_mining_job_token` from `DeclareMiningJobSuccess`.
     pub new_token: Token,
-    /// The JDP connection the declaration was accepted on.
-    ///
-    /// This is what the durable block record stores, as `{:08x}` — the same
-    /// eight hex characters SV1 and SV2 put in that column, and the same id
-    /// `run_jdp_connection` logs as `jdp-{id:08x}`, so a found block can be
-    /// joined back to its connection.
+    /// Stored in `blocks_entity."sessionId"` as `{:08x}`, matching the
+    /// `jdp-{id:08x}` connection logs.
     pub jdp_session_id: u32,
 }
 
@@ -203,18 +142,9 @@ pub struct PushSolutionInput {
 
 // ── Pre-resolved hook arguments (caller-supplied) ───────────────────
 
-/// Payload the caller resolves between the wire frame arriving and
-/// invoking [`handle_allocate_token`]. The IO layer:
-///
-/// 1. Calls a `MinerLookup` hook with the connection's remote IP if
-///    the JDC's `user_identifier` doesn't parse as a BTC address.
-/// 2. Resolves the pool's payout addresses via a `PayoutResolver`
-///    hook — typically just the miner's address (single-output,
-///    SV2 JDP/AllocateMiningJobToken.Success fallback).
-/// 3. Encodes the designated payout script into the one-output
-///    consensus-serialised `Vec<TxOut>` blob via
-///    [`crate::jdp::dynamic_outputs::designated_output_blob`].
-/// 4. Passes the resolved `(miner_address, coinbase_outputs)` here.
+/// What the IO layer resolves before [`handle_allocate_token`]: the miner and
+/// the one-output blob from
+/// [`crate::jdp::dynamic_outputs::designated_output_blob`].
 #[derive(Clone, Debug)]
 pub struct AllocateTokenContext {
     pub miner_address: AddressId,
@@ -223,11 +153,7 @@ pub struct AllocateTokenContext {
 
 // ── OutboundFrame ───────────────────────────────────────────────────
 
-/// What the JDP handler decided to send. The IO layer translates
-/// these into `stratum_core::job_declaration_sv2` / `common_messages_sv2`
-/// types and serialises via `codec_sv2`. Kept as a separate enum so
-/// the handler stays pure on session-state types (no lifetimes
-/// leaking through).
+/// What the JDP handler decided to send; the IO layer encodes it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum JdpOutboundFrame {
     SetupConnectionSuccess {
@@ -252,9 +178,7 @@ pub enum JdpOutboundFrame {
         mining_job_token: Token,
         coinbase_outputs: Vec<u8>,
     },
-    /// ext 0x0003/SetPayoutDistribution push: the JDS-initiated distribution
-    /// frame. Emitted by the IO layer (connection-open, publisher tick,
-    /// tailored push) — never by an inbound handler.
+    /// ext 0x0003/SetPayoutDistribution push; emitted by the IO layer only.
     SetPayoutDistribution(crate::extensions::SetPayoutDistribution),
     DeclareMiningJobSuccess {
         request_id: u32,
@@ -274,87 +198,48 @@ pub enum JdpOutboundFrame {
 // ── SessionEvent ────────────────────────────────────────────────────
 
 /// What the handler decided about the session beyond the wire frames.
-/// The IO layer uses these to drive hooks (block submission, job
-/// declared notification, miner registration) without re-deriving
-/// state.
 #[derive(Clone, Debug)]
 pub enum JdpSessionEvent {
-    /// `SetupConnection` completed. Caller can register the JDP
-    /// connection in the live-connection registry. The negotiated
-    /// Full-Template flag is not carried: it lives on
-    /// [`JdpSessionState::full_template_mode`], which is what every
-    /// gate reads.
+    /// `SetupConnection` completed; the negotiated mode lives on
+    /// [`JdpSessionState::full_template_mode`].
     SetupComplete,
-    /// A token was allocated. The IO layer registers it in the
-    /// cross-connection bridge so the mining side can resolve the token
-    /// when its `SetCustomMiningJob` arrives without a declaration
-    /// (base-protocol Coinbase-only mode).
+    /// A token was allocated; the IO layer mirrors it into the bridge for
+    /// Coinbase-only `SetCustomMiningJob`.
     TokenAllocated {
         token: Token,
         miner_address: AddressId,
-        /// SV2 JDP/AllocateMiningJobToken.Success's designated pool payout
-        /// output, read back off the blob this allocate answered with
-        /// ([`crate::jdp::dynamic_outputs::designated_payout_script`]).
-        ///
-        /// `None` on an ext 0x0003 session, where ext 0x0003/Negotiation
-        /// requires the outputs to be empty and the published distribution
-        /// replaces the base convention entirely — a custom job is then judged
-        /// by the ext 0x0003/Output Verification recompute, never by this
-        /// script.
+        /// The designated payout output of SV2 JDP/AllocateMiningJobToken.Success.
+        /// `None` on an ext 0x0003 session: there the outputs are empty and a
+        /// custom job is judged by the ext 0x0003/Output Verification recompute.
         payout_script: Option<Vec<u8>>,
-        /// The token's own expiry, so the bridge entry cannot outlive the
-        /// token it mirrors. Carried on the event rather than looked up
-        /// later: the token store is the JDP session's, and a lookup that
-        /// missed would have to invent an expiry.
+        /// The token's own expiry, so the bridge entry cannot outlive it.
         expires_at_ms: u64,
     },
-    /// A `DeclareMiningJob` was accepted. Caller fans out to the
-    /// mining-protocol bridge to build a `SetCustomMiningJob` for
-    /// the matching JDC miner.
-    ///
-    /// Carries only the key. Everything else about the job — the miner
-    /// and the declared tip included — is read off the stored
-    /// [`DeclaredJob`] under `new_token`, so nothing here can disagree
-    /// with it.
+    /// A `DeclareMiningJob` was accepted. Only the key: the rest is read off
+    /// the stored [`DeclaredJob`], so nothing here can disagree with it.
     JobDeclared { new_token: Token },
-    /// A `PushSolution` has been resolved against a declared job. The IO
-    /// layer assembles the block (merkle root, header, consensus encoding)
-    /// and calls `submitblock`. The JDC submits the same block through its
-    /// own Template Provider; `submitblock` is idempotent, so that is safe.
+    /// A `PushSolution` resolved against a declared job; the IO layer builds
+    /// the block and calls `submitblock` (idempotent, the JDC submits too).
     BlockSubmissionCandidate {
         miner_address: AddressId,
-        /// Which declaration this solution belongs to — see
-        /// [`DeclarationRef`].
         declaration: DeclarationRef,
-        /// Reconstructed non-witness coinbase (prefix + extranonce +
-        /// suffix). IO layer parses this back into a
-        /// `bitcoin::Transaction` for merkle-root computation.
+        /// Non-witness coinbase: prefix + extranonce + suffix.
         coinbase_raw: Vec<u8>,
-        /// Raw transaction bytes for positions 1..=N of the block,
-        /// in `wtxid_list` order (NOT including the coinbase). May
-        /// include witness data; the IO layer strips for merkle-root
-        /// computation if needed.
+        /// Positions 1..=N in `wtxid_list` order, coinbase excluded; may carry
+        /// witness data.
         transactions: Vec<Vec<u8>>,
-        /// The header fields the JDC solved with, as one value — see
-        /// [`SolutionHeader`].
         header: SolutionHeader,
-        /// What the declaration behind this solution was backed by, carried
-        /// from the declare-time ext 0x0003/Output Verification proof. Decides
-        /// BOTH whether the block is booked and whether the
-        /// ext 0x0003/Implementation Notes settle fires — which are not the
-        /// same question, see [`CandidateBacking`].
+        /// From the declare-time ext 0x0003/Output Verification proof; decides
+        /// both booking and settlement, see [`CandidateBacking`].
         backing: CandidateBacking,
     },
-    /// The connection should be closed. Emitted on protocol /
-    /// version mismatch in `SetupConnection`. IO layer closes the
-    /// socket after dispatching any preceding outbound frame.
+    /// Close the connection after any preceding outbound frame is sent.
     Disconnect { reason: String },
 }
 
 // ── HandlerOutcome ──────────────────────────────────────────────────
 
-/// What a single handler call produced. Both fields can be empty
-/// (e.g. a silently-ignored frame) — that's a no-op outcome.
+/// What a single handler call produced; both fields may be empty.
 #[derive(Clone, Debug, Default)]
 pub struct JdpHandlerOutcome {
     pub outbound: Vec<JdpOutboundFrame>,
@@ -362,9 +247,7 @@ pub struct JdpHandlerOutcome {
 }
 
 impl JdpHandlerOutcome {
-    /// A `DeclareMiningJob.Error` and nothing else. The refusal paths share
-    /// this construction but stay separate, since some differ only in what
-    /// they log.
+    /// A `DeclareMiningJob.Error` and nothing else.
     pub(crate) fn declare_error(request_id: u32, error_code: &str, error_details: &[u8]) -> Self {
         Self::with_frame(JdpOutboundFrame::DeclareMiningJobError {
             request_id,
@@ -387,14 +270,8 @@ impl JdpHandlerOutcome {
 
 // ── JdpSessionState ─────────────────────────────────────────────────
 
-/// All per-connection mutable state for the JDP sub-protocol. Owned
-/// `&mut` by the JDP-server's per-connection task.
-///
-/// Constructor responsibility is split between this module and the IO
-/// layer: this module owns the connection-scoped pure state (token
-/// store + declared-jobs store + payout-outputs tracker + negotiation
-/// flags); the IO layer wires in the Noise session, the per-connection
-/// task channel, the hook adapters, and the disconnect handle.
+/// All pure per-connection state for the JDP sub-protocol, owned by the
+/// connection task; I/O handles live in the IO layer.
 pub struct JdpSessionState {
     pub session_id: u32,
 
@@ -404,20 +281,14 @@ pub struct JdpSessionState {
     pub used_version: u16,
     pub vendor: String,
 
-    /// Extensions the JDC has negotiated via ext 0x0001
-    /// (RequestExtensions). Populated in
-    /// [`handle_request_extensions`]. Empty until then — pre-setup
-    /// behaviour is base-spec only.
+    /// Extensions negotiated via ext 0x0001 in [`handle_request_extensions`].
     pub negotiated_extensions: HashSet<u16>,
 
-    /// Token bookkeeping (allocation rate-limit, expiry, lookup).
     pub tokens: TokenStore,
 
-    /// Per-connection declared-jobs store (FIFO `MAX_DECLARED_JOBS`).
+    /// FIFO, bounded by `MAX_DECLARED_JOBS`.
     pub declared_jobs: DeclaredJobStore,
 
-    /// In-flight `DeclareMiningJob`s waiting for their
-    /// `ProvideMissingTransactions.Success`, by `request_id`.
     pub pending_declarations: PendingDeclarations,
 }
 
@@ -460,19 +331,15 @@ impl PendingDeclarations {
     }
 }
 
-/// In-flight declaration state — wraps [`PendingDeclaration`] with
-/// the original `DeclareMiningJobInput` so `acceptDeclaration` can
-/// run after the missing-tx round-trip.
+/// An in-flight declaration: the original input kept for acceptance after the
+/// missing-tx round-trip.
 #[derive(Clone, Debug)]
 pub struct PendingState {
     pub input: DeclareMiningJobInput,
     pub pending: PendingDeclaration,
     pub miner_address: AddressId,
-    /// Pool chain-tip when the `DeclareMiningJob` arrived. Compared against
-    /// the tip when `ProvideMissingTransactions.Success` completes the
-    /// round-trip — drift means the declared job references a superseded
-    /// template and is rejected `stale-chain-tip` instead of accepted (and
-    /// stamped with a tip it was never built for).
+    /// Pool tip when `DeclareMiningJob` arrived; a different tip at completion
+    /// means `stale-chain-tip`.
     pub prev_hash_at_declare: Option<[u8; 32]>,
 }
 
@@ -491,9 +358,7 @@ impl JdpSessionState {
         }
     }
 
-    /// Test/IO-layer hook to inject a deterministic RNG into the
-    /// underlying [`TokenStore`]. Production paths use the default
-    /// `getrandom` source.
+    /// Inject a deterministic RNG into the [`TokenStore`] (tests).
     pub fn set_token_rng(&mut self, rng: Option<Box<crate::tokens::RngFn>>) {
         self.tokens.set_rng(rng);
     }
@@ -501,14 +366,8 @@ impl JdpSessionState {
 
 // ── Handler: SetupConnection ────────────────────────────────────────
 
-/// Handle a JDP `SetupConnection`.
-///
-/// - Protocol mismatch (`!= JOB_DECLARATION`) → `SetupConnectionError`
-///   with `unsupported-protocol` + [`JdpSessionEvent::Disconnect`].
-/// - Version range outside `[MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION]`
-///   → `SetupConnectionError` with `protocol-version-mismatch` + Disconnect.
-/// - Else → `SetupConnectionSuccess` echoing the negotiated
-///   `DECLARE_TX_DATA` flag (bit 0). Other flag bits are masked off.
+/// Handle a JDP `SetupConnection`: wrong protocol or version → error +
+/// Disconnect; else success echoing only the `DECLARE_TX_DATA` bit.
 pub fn handle_setup_connection(
     state: &mut JdpSessionState,
     input: &SetupConnectionInput,
@@ -555,24 +414,11 @@ pub fn handle_setup_connection(
 
 // ── Handler: RequestExtensions (ext 0x0001) ─────────────────────────
 
-/// Handle ext 0x0001 `RequestExtensions`.
+/// Handle ext 0x0001 `RequestExtensions`; dropped before setup, `Error` only
+/// when a non-empty request has nothing supported.
 ///
-/// - Pre-setup → silently dropped, so nothing bypasses the
-///   SetupConnection handshake.
-/// - Supported subset non-empty → `RequestExtensionsSuccess` with the
-///   intersection of requested + [`SUPPORTED_JDP_EXTENSIONS`].
-///   Negotiated entries added to `state.negotiated_extensions`.
-/// - Empty request → `Success` with empty list (always respond).
-///   Same shape as the mining-side handler.
-/// - Non-empty request, zero supported → `RequestExtensionsError`
-///   with the unsupported list.
-///
-/// `distribution_available` — whether the pool can actually publish a
-/// `SetPayoutDistribution` right now (ext 0x0003/SetPayoutDistribution makes
-/// it the FIRST message after this exchange). When it can't (no PPLNS engine,
-/// no template yet), 0x0003 is simply not offered: negotiating an extension
-/// whose mandatory first push can't happen would break the
-/// ext 0x0003/SetPayoutDistribution ordering contract.
+/// 0x0003 is offered only if `distribution_available`: ext
+/// 0x0003/SetPayoutDistribution must be the FIRST message after this exchange.
 pub fn handle_request_extensions(
     state: &mut JdpSessionState,
     input: &RequestExtensions,
@@ -611,22 +457,8 @@ pub fn handle_request_extensions(
 
 // ── Handler: AllocateMiningJobToken ─────────────────────────────────
 
-/// Handle `AllocateMiningJobToken`.
-///
-/// **Caller-resolved context**: the IO layer pre-resolves
-/// [`AllocateTokenContext`] before invoking by parsing the JDC's
-/// `user_identifier` as a BTC address. The caller also pre-encodes the pool's
-/// `coinbase_outputs` blob (consensus-serialised `Vec<TxOut>`) via
-/// [`crate::jdp::dynamic_outputs::designated_output_blob`].
-///
-/// - Pre-setup → silently dropped.
-/// - Rate-limited (enforced by [`TokenStore::allocate`]) → silently
-///   dropped. Silence here means the rate limit and nothing else.
-/// - Entropy failure or a saturated counter → dropped too, but logged at
-///   `error!`. Both are pool-side faults the JDC can neither act on nor see,
-///   and SV2 defines no answer for them, so the allocate goes unanswered.
-/// - Token allocation success → `AllocateMiningJobTokenSuccess` +
-///   [`JdpSessionEvent::TokenAllocated`].
+/// Handle `AllocateMiningJobToken`. Pre-setup, rate-limited and pool-side
+/// allocation failures go unanswered (SV2 defines no error); only the last is logged.
 pub fn handle_allocate_token(
     state: &mut JdpSessionState,
     input: &AllocateMiningJobTokenInput,
@@ -643,13 +475,9 @@ pub fn handle_allocate_token(
         context.coinbase_outputs,
     ) {
         Ok(entry) => entry,
-        // Silent by design: SV2 JDP/AllocateMiningJobToken asks for the limit
-        // and defines no wire answer for hitting it, so there is nothing to
-        // send and nothing an operator needs to see.
+        // SV2 JDP/AllocateMiningJobToken defines no wire answer for the limit.
         Err(TokenAllocError::RateLimited { .. }) => return JdpHandlerOutcome::default(),
-        // Entropy failure or a saturated counter: pool-side faults with no
-        // SV2 error, so the allocate goes unanswered. Logged loudly (as in
-        // `mint_for_declaration`) so it is not mistaken for the rate limit.
+        // Pool-side fault; logged so it is not mistaken for the rate limit.
         Err(err) => {
             tracing::error!(
                 %err,
@@ -665,8 +493,7 @@ pub fn handle_allocate_token(
     let outputs = alloc.coinbase_outputs.clone();
     let miner_address = alloc.miner_address.clone();
     let expires_at_ms = alloc.expires_at_ms;
-    // Derived from the very bytes this frame carries, so the script the
-    // mining side holds a custom job to is the script the JDC was sent.
+    // From the very bytes sent, so the mining side checks what the JDC got.
     let payout_script = super::dynamic_outputs::designated_payout_script(&outputs);
 
     JdpHandlerOutcome {
@@ -684,19 +511,14 @@ pub fn handle_allocate_token(
     }
 }
 
-/// Helper for the IO layer: try to parse `user_identifier` as a BTC
-/// address. Returns the normalised `AddressId` when valid (any
-/// network is accepted at this layer — Mainnet/Testnet/Regtest split
-/// is the resolver's job). On `None` the allocate is dropped silently.
+/// Parse `user_identifier` as a BTC address of any network; the network check
+/// is the resolver's job.
 pub fn parse_user_identifier_as_address(user_identifier: &str) -> Option<AddressId> {
     let trimmed = user_identifier.trim();
     if trimmed.is_empty() {
         return None;
     }
-    // Stratum `address.worker` convention, split at the first dot as in the
-    // mining channel-open parse. Only the address is carried downstream: a
-    // trailing `.worker` would fail `address_to_script` and leave the pool
-    // payout with an empty output set.
+    // `address.worker`: a trailing `.worker` would fail `address_to_script`.
     let (address_part, _worker) = bp_common::split_user_identity(trimmed);
     if address_part.is_empty() {
         return None;
@@ -709,45 +531,25 @@ pub fn parse_user_identifier_as_address(user_identifier: &str) -> Option<Address
 
 // ── Caller-resolved per-frame context ───────────────────────────────
 
-/// What the IO layer resolved off the pool's live state for THIS frame.
+/// The pool's live state as resolved for THIS declaration frame.
 ///
-/// Each value is read when a declaration frame arrives and can differ between
-/// the two legs of a `ProvideMissingTransactions` round-trip. Named fields
-/// keep `current_prev_hash` apart from
-/// [`PendingState::prev_hash_at_declare`]: same type, opposite meaning.
-///
-/// ⚠️ **Per-frame, never stored.** `ProvideMissingTransactions.Success` builds
-/// a fresh one: during the round-trip the distribution may have been
-/// superseded or settlement-invalidated, and the address's mode may have moved.
+/// ⚠️ Per-frame, never stored: `ProvideMissingTransactions.Success` resolves a
+/// fresh one, since distribution, mode and tip may move during the round-trip.
 #[derive(Clone, Debug)]
 pub struct DeclarationContext {
-    /// The chain tip the pool builds on right now. Compared against
-    /// [`PendingState::prev_hash_at_declare`] — the tip the declaration's
-    /// FIRST leg was accepted under — to catch a tip move mid-round-trip.
+    /// Tip now; compared with [`PendingState::prev_hash_at_declare`].
     pub current_prev_hash: Option<[u8; 32]>,
-    /// Whether the `distribution_id` the declaration references is inside the
-    /// ext 0x0003 acceptance window right now. `None` when the declaration
-    /// carries no reference at all; on a negotiated connection that is an
-    /// IO-layer contract breach and fails closed.
+    /// The referenced `distribution_id`'s acceptance now; `None` = no reference,
+    /// which fails closed on a negotiated connection.
     pub distribution: Option<DistributionAcceptance>,
-    /// The stream the declaring address's accounting maps to right now, or
-    /// `None` when the pool has no live mining session for it. Resolved from
-    /// the token's address, not from whichever address allocated last on the
-    /// connection.
+    /// The token address's stream now, `None` without a live mining session.
     pub current_mode: Option<bp_common::StreamKind>,
-    /// Frame arrival time — token expiry and the declaration's own stamp.
     pub now_ms: u64,
 }
 
-/// The two refusals a `DeclareMiningJob` earns from the SESSION alone.
-///
-/// Checked before the caller spends the token, so a misconfigured connection
-/// sees the real reason rather than a follow-up `invalid-mining-job-token`.
-///
-/// - a `distribution_id` TLV on a connection that never negotiated ext 0x0003
-///   → `invalid-payout-distribution`. The IO layer captures the TLV
-///   regardless of the negotiated set so this check can see it.
-/// - Coinbase-only mode (`!full_template_mode`) → `unsupported-feature-flags`.
+/// Refusals from the session alone, checked before the token is spent so the
+/// JDC sees the real reason: a `distribution_id` TLV without negotiated ext
+/// 0x0003, or Coinbase-only mode.
 pub fn declare_refused_by_session(
     state: &JdpSessionState,
     input: &DeclareMiningJobInput,
@@ -773,27 +575,10 @@ pub fn declare_refused_by_session(
     None
 }
 
-/// Handle `DeclareMiningJob`.
-///
-/// **Caller-resolved context.** The IO layer has already run
-/// [`declare_refused_by_session`], resolved the `mining_job_token` by
-/// SPENDING it ([`crate::tokens::TokenStore::take_active`]) and partitioned
-/// the declared wtxids against its template cache. The handler decides
-/// whether to round-trip via `ProvideMissingTransactions` or accept the
-/// declaration immediately.
-///
-/// The node round-trip sits between those steps and this handler, and only a
-/// valid unspent token may pay for it. The partition arrives by value because
-/// the caller needs it too.
-///
-/// `declaring_miner` is the address the spent token was issued to, never the
-/// connection's: a session may hold tokens for several addresses, and the
-/// allocate is what carries one.
-///
-/// - Partition is fully covered → accept declaration immediately
-///   (emits `DeclareMiningJobSuccess` + `JobDeclared` event).
-/// - Some wtxids missing → emit `ProvideMissingTransactions` and
-///   stash a [`PendingState`] for the follow-up Success frame.
+/// Handle `DeclareMiningJob` after the caller spent the token
+/// ([`crate::tokens::TokenStore::take_active`]) and partitioned the wtxids:
+/// accept now, or ask via `ProvideMissingTransactions` and stash a [`PendingState`].
+/// `declaring_miner` is the spent token's address, never the connection's.
 pub fn handle_declare_mining_job(
     state: &mut JdpSessionState,
     input: &DeclareMiningJobInput,
@@ -821,8 +606,6 @@ pub fn handle_declare_mining_job(
         miner_address,
         prev_hash_at_declare: ctx.current_prev_hash,
     });
-    // Past MAX_PENDING_DECLARATIONS unanswered round-trips the oldest is
-    // dropped and its `request_id` never answered; log it.
     if let Some(dropped) = evicted {
         tracing::warn!(
             dropped_request_id = dropped.pending.request_id,
@@ -831,27 +614,14 @@ pub fn handle_declare_mining_job(
              the oldest is dropped and its request_id will never be answered"
         );
     }
-    // Epoch staleness is observed in `accept_declaration` (the path that
-    // actually validates the payout set), reached here once the
-    // `ProvideMissingTransactions.Success` round-trip completes.
     outcome
 }
 
 // ── Handler: ProvideMissingTransactions.Success ─────────────────────
 
-/// Handle `ProvideMissingTransactions.Success`.
-///
-/// - No pending declaration under its `request_id` → silently dropped (a
-///   spurious Success indicates a JDC bug).
-/// - Position-count mismatch ([`merge_provided_with_known`] errors
-///   with `MergeError::PositionCountMismatch`) → `missing-txs`.
-/// - Successful merge → accept the declaration (same path as the
-///   fully-covered case in [`handle_declare_mining_job`]).
-///
-/// The [`DeclarationContext`] is RE-resolved by the IO layer at THIS point,
-/// never carried over from declare time — see the type's own warning for why.
-/// ext 0x0003/Grace Window + Implementation Notes are judged when the
-/// declaration is actually accepted, which is here.
+/// Handle `ProvideMissingTransactions.Success`: unknown `request_id` dropped,
+/// merge failure ([`merge_provided_with_known`]) → `missing-txs`, else accept
+/// under a freshly resolved [`DeclarationContext`].
 pub fn handle_provide_missing_transactions_success(
     state: &mut JdpSessionState,
     input: &ProvideMissingTransactionsSuccessInput,
@@ -860,9 +630,7 @@ pub fn handle_provide_missing_transactions_success(
     let Some(pending) = state.pending_declarations.take(input.request_id) else {
         return JdpHandlerOutcome::default();
     };
-    // If the chain advanced during the round-trip, the job references a
-    // superseded template: reject `stale-chain-tip`, which the JDC retries
-    // against its new template.
+    // Tip moved during the round-trip: the JDC retries `stale-chain-tip`.
     if pending.prev_hash_at_declare != ctx.current_prev_hash {
         return JdpHandlerOutcome::declare_error(
             input.request_id,
@@ -899,10 +667,8 @@ fn accept_declaration(
     miner_address: AddressId,
     ctx: DeclarationContext,
 ) -> JdpHandlerOutcome {
-    // A declaration is bound to the tip the pool is on: the mining side holds
-    // every `SetCustomMiningJob` built on it to that tip. Without one (the
-    // pool has not seen its first template yet) there is nothing to bind to,
-    // so it is refused with the one code a JD-client retries.
+    // A declaration binds to the pool's tip; before the first template there
+    // is none, so refuse with the one code a JD-client retries.
     let Some(prev_hash) = ctx.current_prev_hash else {
         tracing::warn!(
             request_id = input.request_id,
@@ -915,12 +681,8 @@ fn accept_declaration(
         );
     };
 
-    // The coinbase must rebuild on EVERY connection, not just 0x0003 ones:
-    // the mining-side binding (`crate::jdp::custom_job_binding`) projects from
-    // this reconstruction, so a declaration it cannot express (e.g. scriptSig
-    // bytes after the extranonce slot, see [`declared_coinbase_tx`]) would
-    // succeed here and then fail every `SetCustomMiningJob`. Refusing now
-    // tells the JDC while it can still change something.
+    // Must rebuild on EVERY connection: `crate::jdp::custom_job_binding`
+    // projects from it, so an unbuildable one would fail every custom job later.
     let Some(declared_coinbase) =
         declared_coinbase_tx(&input.coinbase_tx_prefix, &input.coinbase_tx_suffix)
     else {
@@ -935,26 +697,17 @@ fn accept_declaration(
         );
     };
 
-    // ext 0x0003/Validation (push model). With 0x0003 negotiated, every
-    // declared job MUST reference a published distribution via the
-    // ext 0x0003/distribution_id TLV Field, and the coinbase MUST match the
-    // ext 0x0003/Payout Computation recompute POSITIONALLY
-    // (ext 0x0003/Output Verification). Without it, this is a plain
-    // base-protocol declaration and the block below is skipped.
+    // ext 0x0003/Validation: a negotiated declaration MUST reference a published
+    // distribution and match its recompute positionally (ext 0x0003/Output Verification).
     let mut declared_booking: Option<PayoutBooking> = None;
-    // Which distribution this declaration was accepted against. Set on every
-    // accepted 0x0003 declaration, including the non-bookable ones — see
-    // `DeclaredJob::distribution_id` for why the two must not be conflated.
+    // Set even when not bookable; see `DeclaredJob::distribution_id`.
     let mut declared_distribution_id: Option<u64> = None;
     if state
         .negotiated_extensions
         .contains(&SV2_EXTENSION_TYPE_NON_CUSTODIAL_PAYOUTS)
     {
         if input.distribution_id.is_none() {
-            // ext 0x0003/distribution_id TLV Field: the TLV is mandatory on a
-            // negotiated connection — the allocate carried no outputs
-            // (ext 0x0003/Negotiation), so a declaration without a
-            // distribution reference pays nobody the pool knows.
+            // ext 0x0003/distribution_id TLV Field: mandatory once negotiated.
             tracing::warn!(
                 request_id = input.request_id,
                 "jdp: 0x0003 negotiated but DeclareMiningJob carries no distribution_id TLV — rejecting"
@@ -968,10 +721,7 @@ fn accept_declaration(
         let entry = match ctx.distribution {
             Some(DistributionAcceptance::Accepted(entry)) => entry,
             Some(DistributionAcceptance::Stale) | Some(DistributionAcceptance::Unknown) => {
-                // ext 0x0003/Grace Window + Error Codes: outside the
-                // acceptance window (superseded, settlement-invalidated, or
-                // never published) — the JDC re-declares against the latest
-                // received distribution.
+                // ext 0x0003/Grace Window: the JDC re-declares against the latest.
                 tracing::warn!(
                     request_id = input.request_id,
                     distribution_id = input.distribution_id,
@@ -984,8 +734,7 @@ fn accept_declaration(
                 );
             }
             None => {
-                // IO-layer contract breach: a negotiated declare must
-                // arrive with a resolved acceptance. Fail closed.
+                // IO-layer contract breach; fail closed.
                 tracing::warn!(
                     request_id = input.request_id,
                     "jdp: negotiated declare arrived without a resolved distribution acceptance — rejecting"
@@ -997,13 +746,9 @@ fn accept_declaration(
                 );
             }
         };
-        // The plan must belong to the accounting this address is on RIGHT
-        // NOW. This is the only place that is asked for a block found through
-        // `PushSolution`, which books from the declaration alone: a Solo plan
-        // left standing after its owner joined a group would otherwise pay
-        // the finder a block the group earned, and Group-Solo keeps no ledger
-        // to repair it. `accounting_fits_mode` is shared with the JDP loop's
-        // rebuild decision so both judge staleness identically.
+        // The plan must fit the address's accounting NOW: a `PushSolution` block
+        // books from the declaration alone, and a stale Solo plan would pay the
+        // finder a block the group earned (Group-Solo has no ledger to repair it).
         if !crate::bridge::accounting_fits_mode(&entry.accounting, ctx.current_mode) {
             tracing::warn!(
                 request_id = input.request_id,
@@ -1028,12 +773,8 @@ fn accept_declaration(
             &entry.built.additional_outputs,
         ) {
             Ok(_declared_revenue) => {
-                // The coinbase pays this distribution — record it as the
-                // declaration's reference regardless of bookability, so the
-                // mining side can judge the custom job against it.
                 declared_distribution_id = Some(entry.distribution_id);
-                // Vouch for booking only when the distribution's
-                // settlement snapshot actually landed.
+                // Book only when the settlement snapshot actually landed.
                 if entry.built.bookable {
                     declared_booking = Some(PayoutBooking {
                         distribution_id: entry.distribution_id,
@@ -1064,25 +805,13 @@ fn accept_declaration(
             }
         }
     }
-    // No base-protocol designated-output check here, deliberately
-    // (SV2 JDP/AllocateMiningJobToken.Success; the mining side applies it in
-    // Coinbase-only mode). A base-protocol custom job is Solo-only, where the
-    // designated output is the declaring miner's own address, so the check
-    // would protect nobody while adding a declare error that JD-clients treat
-    // as fatal. ⚠️ If a base-protocol job is ever served off Solo, this must
-    // change.
+    // No base-protocol designated-output check: such jobs are Solo-only, where
+    // that output is the declarer's own. ⚠️ Must change if served off Solo.
 
-    // Mint the `new_mining_job_token` through the shared TokenStore so it has
-    // the same shape as an allocated one, but outside `allocate`: the
-    // SV2 JDP/AllocateMiningJobToken rate limit applies to client allocates,
-    // and a declaration that follows an allocate within the limit window must
-    // still be answered. The token is held by `state.declared_jobs` and the
-    // bridge, never the token store. See `mint_for_declaration`.
+    // Minted outside `allocate`, so the allocate rate limit cannot block it.
     let new_token = match state.tokens.mint_for_declaration() {
         Ok(token) => token,
         Err(err) => {
-            // Entropy failure or a saturated counter: pool-side faults with
-            // no SV2 error, so log loudly.
             tracing::error!(
                 %err,
                 request_id = input.request_id,
@@ -1118,36 +847,15 @@ fn accept_declaration(
 
 // ── Handler: PushSolution ───────────────────────────────────────────
 
-/// Handle `PushSolution`.
-///
-/// Match the solution to a declared job via
-/// [`DeclaredJobStore::match_for_solution`] (prefers prev_hash match,
-/// falls back to most-recent). Reconstruct the coinbase from
-/// `prefix + extranonce + suffix`, build the transaction list in
-/// block order, derive the 80-byte block header, and emit a
-/// [`JdpSessionEvent::BlockSubmissionCandidate`] for the IO layer to
-/// hand to bitcoin-core's `submitblock` RPC.
-///
-/// The block is booked against the matched declaration's own
-/// [`DeclaredJob::miner_address`], so it cannot name a different miner than
-/// the job it belongs to.
-///
-/// - Coinbase-only mode → dropped; the NORMAL case, not a fault.
-/// - No matching declared job → dropped.
-/// - Missing raw-tx data for any wtxid position → dropped.
+/// Handle `PushSolution`: match a declared job
+/// ([`DeclaredJobStore::match_for_solution`]), rebuild the coinbase and emit a
+/// [`JdpSessionEvent::BlockSubmissionCandidate`] booked to that job's own miner.
 pub fn handle_push_solution(
     state: &mut JdpSessionState,
     input: &PushSolutionInput,
 ) -> JdpHandlerOutcome {
-    // The drops below are WARN-logged: a PushSolution is a found block, and a
-    // silent drop would make a lost pool-side booking undiagnosable (the block
-    // itself still propagates through the JDC's own node).
-    //
-    // Coinbase-only logs at INFO: JD-clients send `PushSolution` in that mode
-    // too, but per SV2 JDP/Coinbase-only Mode there is no declaration, so the
-    // pool holds no transaction list and cannot reassemble the block. The JDC's
-    // node propagates it and the mining side records it
-    // (`ExtendedJob::jdp_claims_the_block`).
+    // Drops are WARN-logged: this is a found block. Coinbase-only is normal
+    // (SV2 JDP/Coinbase-only Mode, no declaration) and the mining side records it.
     if !state.full_template_mode {
         tracing::info!(
             prev_hash = %input.header.prev_hash.as_hex(),
@@ -1170,23 +878,13 @@ pub fn handle_push_solution(
         }
     };
 
-    // Copy out what the outcome needs so the borrow into
-    // `state.declared_jobs` can end.
     let new_token = job.new_token;
     let miner_address = job.miner_address.clone();
-    // `match` over BOTH fields rather than `booking.is_some()`, which reads
-    // like "was a distribution involved?" but answers a different question.
+    // `match` over BOTH fields: `booking.is_some()` answers a different question.
     let backing = match (job.booking, job.distribution_id) {
         (Some(booking), _) => CandidateBacking::Bookable(booking),
-        // Validated against a published distribution whose settlement
-        // snapshot never landed (`bookable == false`). The coinbase still pays
-        // the published split on-chain, but this block gets no ledger entry
-        // and nothing parks the inputs; deliberately not built, since it needs
-        // a Redis outage and a block find in the same interval. The error log
-        // is the whole mitigation.
-        //
-        // The ext 0x0003/Implementation Notes settle must still fire. See
-        // `CandidateBacking`.
+        // Snapshot never landed: no ledger entry, but the ext 0x0003
+        // settle must still fire (see `CandidateBacking`).
         (None, Some(distribution_id)) => {
             tracing::error!(
                 prev_hash = %input.header.prev_hash.as_hex(),
@@ -1199,8 +897,7 @@ pub fn handle_push_solution(
             );
             CandidateBacking::UnbookableDistribution { distribution_id }
         }
-        // Base-protocol declaration: nothing published, nothing to book, and
-        // nothing to settle.
+        // Base-protocol: nothing to book or settle.
         (None, None) => CandidateBacking::BaseProtocol,
     };
     let coinbase_prefix = job.coinbase_tx_prefix.clone();
@@ -1221,7 +918,6 @@ pub fn handle_push_solution(
         }
     }
 
-    // Reconstruct coinbase = prefix + extranonce + suffix.
     let mut coinbase_raw =
         Vec::with_capacity(coinbase_prefix.len() + input.extranonce.len() + coinbase_suffix.len());
     coinbase_raw.extend_from_slice(&coinbase_prefix);
@@ -1252,7 +948,6 @@ mod tests {
 
     // ── Fixtures ───────────────────────────────────────────────────
 
-    /// Regtest bech32 address — same one used in mining/client tests.
     const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
     fn addr() -> AddressId {
@@ -1261,8 +956,7 @@ mod tests {
 
     fn fresh() -> JdpSessionState {
         let mut s = JdpSessionState::new(1);
-        // Deterministic RNG so tokens are byte-predictable. Counter
-        // increments per allocation; suffix bytes are zero-filled.
+        // Deterministic, byte-predictable tokens.
         s.set_token_rng(Some(Box::new(|buf: &mut [u8]| {
             for b in buf.iter_mut() {
                 *b = 0;
@@ -1305,18 +999,15 @@ mod tests {
             mining_job_token: token,
             version: 0x2000_0000,
             coinbase_tx_prefix: coinbase_prefix(),
-            // A real suffix: every declaration has to rebuild, so a blob that
-            // is not an output vector is refused on the base path too.
+            // Real suffix: every declaration must rebuild.
             coinbase_tx_suffix: coinbase_suffix(&one_output_blob()),
             wtxid_list: wtxids,
             distribution_id: None,
         }
     }
 
-    /// A realistic declared `coinbase_tx_prefix`: coinbase header, a BIP-34
-    /// height push, and a 12-byte extranonce slot the prefix stops at. The
-    /// declare-time validation rebuilds the transaction from this plus the
-    /// suffix, so it must be well-formed.
+    /// A well-formed `coinbase_tx_prefix`: header, BIP-34 height push, and a
+    /// 12-byte extranonce slot the prefix stops at.
     const EXTRANONCE_SLOT: usize = 12;
     fn coinbase_prefix() -> Vec<u8> {
         use bitcoin::consensus::Encodable;
@@ -1342,9 +1033,7 @@ mod tests {
         b
     }
 
-    /// Wrap a consensus `Vec<TxOut>` blob as a realistic coinbase suffix
-    /// (`nSequence(4) + outputs + nLockTime(4)`), paired with
-    /// [`coinbase_prefix`].
+    /// `nSequence + outputs + nLockTime`, paired with [`coinbase_prefix`].
     fn coinbase_suffix(outputs_consensus: &[u8]) -> Vec<u8> {
         let mut s = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
         s.extend_from_slice(outputs_consensus);
@@ -1352,17 +1041,13 @@ mod tests {
         s
     }
 
-    /// Open one allocated token on a setup-complete session, return
-    /// the new token.
+    /// Set up a session and allocate one token.
     fn complete_setup_and_allocate(s: &mut JdpSessionState) -> Token {
         let _ = handle_setup_connection(s, &good_setup());
         allocate_another(s, 1, 1_000)
     }
 
-    /// One more token on an already-set-up session. A JDC that declares
-    /// twice allocates twice — that is what a token IS — and
-    /// SV2 JDP/AllocateMiningJobToken rate-limits allocation to 1/s, so the
-    /// caller has to move `now_ms` on by at least that.
+    /// One more token; the 1/s allocate rate limit means `now_ms` must advance.
     fn allocate_another(s: &mut JdpSessionState, request_id: u32, now_ms: u64) -> Token {
         let out = handle_allocate_token(s, &good_alloc(request_id), alloc_ctx(), now_ms);
         match out.outbound.first() {
@@ -1392,9 +1077,7 @@ mod tests {
         );
     }
 
-    /// A minimal ext 0x0003/SetPayoutDistribution distribution: pool slot
-    /// (weight 1) + one miner payout slot (weight 9), no pruning, no
-    /// additional outputs.
+    /// Minimal distribution: pool weight 1 + one miner weight 9.
     fn distribution_entry(id: u64) -> crate::bridge::PayoutDistributionEntry {
         crate::bridge::PayoutDistributionEntry {
             distribution_id: id,
@@ -1423,9 +1106,7 @@ mod tests {
         Some(DistributionAcceptance::Accepted(std::sync::Arc::new(entry)))
     }
 
-    /// The IO-resolved [`DeclarationContext`] a test frame arrives with, at
-    /// the tip these tests build on. A call site names only what it actually
-    /// varies: `DeclarationContext { distribution: accepted(e), ..ctx(3_000) }`.
+    /// Default [`DeclarationContext`] at the tests' tip; override with `..ctx(t)`.
     fn ctx(now_ms: u64) -> DeclarationContext {
         DeclarationContext {
             current_prev_hash: Some([0xAB; 32]),
@@ -1435,12 +1116,8 @@ mod tests {
         }
     }
 
-    /// Stand-in for the three things the IO layer does ahead of the handler:
-    /// the session-shape gates, resolving the `mining_job_token` by SPENDING
-    /// it ([`TokenStore::take_active`]), and the wtxid partition.
-    ///
-    /// Calls the same functions the dispatch calls. Declaring twice on one
-    /// token panics in the `expect`, so a test cannot do it by accident.
+    /// The IO layer's pre-handler steps: session gates, spending the token
+    /// ([`TokenStore::take_active`]), partition. Panics on a reused token.
     fn declared(
         s: &mut JdpSessionState,
         input: &DeclareMiningJobInput,
@@ -1459,9 +1136,7 @@ mod tests {
         handle_declare_mining_job(s, input, &declaring.miner_address, partition, ctx)
     }
 
-    /// A coinbase suffix whose outputs are the ext 0x0003/Payout Computation
-    /// recompute for `entry` at revenue `t` — passes the
-    /// ext 0x0003/Output Verification positional validation by construction.
+    /// Suffix carrying the ext 0x0003/Payout Computation recompute for `entry` at `t`.
     fn matching_suffix(entry: &crate::bridge::PayoutDistributionEntry, t: u64) -> Vec<u8> {
         let outputs = compute_payout_vector(
             &entry.built.pool_payout,
@@ -1525,8 +1200,6 @@ mod tests {
             }
         ));
         assert!(s.setup_complete);
-        // The negotiated mode lives on the session state — that is what
-        // the Declare and PushSolution gates read.
         assert!(s.full_template_mode);
         assert!(matches!(out.events[0], JdpSessionEvent::SetupComplete));
     }
@@ -1628,10 +1301,7 @@ mod tests {
         }
     }
 
-    /// ext 0x0003/SetPayoutDistribution makes `SetPayoutDistribution` the
-    /// FIRST message after the extension exchange — when the pool cannot
-    /// publish one yet, 0x0003 is not offered and the request errors as
-    /// unsupported.
+    /// 0x0003 is not offered while no distribution can be published first.
     #[test]
     fn request_extensions_0x0003_not_offered_when_distribution_unavailable() {
         let mut s = fresh();
@@ -1706,8 +1376,7 @@ mod tests {
         assert!(out.outbound.is_empty(), "rate-limited alloc must drop");
     }
 
-    /// Two back-to-back allocates at connect are both answered: JD-clients
-    /// start that way and never re-request a dropped one.
+    /// Two allocates at connect are both answered; JD-clients never re-request.
     #[test]
     fn the_reference_clients_two_token_start_is_answered_in_full() {
         let mut s = fresh();
@@ -1724,8 +1393,7 @@ mod tests {
         }
     }
 
-    /// An entropy failure drops the allocate with no frame and no event, like
-    /// the rate limit; the two differ only in what they log.
+    /// An entropy failure drops the allocate with no frame and no event.
     #[test]
     fn an_entropy_failure_drops_the_allocate_without_a_frame() {
         let mut s = fresh();
@@ -1748,22 +1416,16 @@ mod tests {
 
     #[test]
     fn parse_user_identifier_rejects_garbage() {
-        // Spaces, control chars, oversize → InvalidAddress.
         let out = parse_user_identifier_as_address(&"x".repeat(200));
         assert!(out.is_none());
     }
 
     #[test]
     fn parse_user_identifier_strips_worker_suffix() {
-        // `address.worker` must yield only the address — the trailing
-        // `.worker` would otherwise reach `address_to_script` and collapse
-        // the JDP coinbase outputs to an empty set.
         let out = parse_user_identifier_as_address(&format!("{ADDR}.gitgab"));
         assert_eq!(out.map(|a| a.as_str().to_string()), Some(ADDR.to_string()));
-        // Worker name keeps further dots; only the first split matters.
         let out2 = parse_user_identifier_as_address(&format!("{ADDR}.rig.1"));
         assert_eq!(out2.map(|a| a.as_str().to_string()), Some(ADDR.to_string()));
-        // A leading dot (empty address) is rejected.
         assert!(parse_user_identifier_as_address(".worker").is_none());
     }
 
@@ -1775,8 +1437,7 @@ mod tests {
         let mut setup = good_setup();
         setup.flags = 0; // Coinbase-only mode
         handle_setup_connection(&mut s, &setup);
-        // Allocation is not mode-gated, so a Coinbase-only session can hold a
-        // token.
+        // Allocation is not mode-gated.
         let token = allocate_another(&mut s, 1, 1_000);
         let input = declare(1, token, vec![]);
         let out = declared(
@@ -1822,12 +1483,7 @@ mod tests {
         assert!(s.pending_declarations.is_empty());
     }
 
-    /// A declaration the pool cannot pin to a chain tip is not accepted: it
-    /// is answered `stale-chain-tip`, the one code a JD-client retries, and
-    /// the next template brings the tip. Without a tip the mining side would
-    /// have nothing to bind `SetCustomMiningJob.prev_hash` to.
-    ///
-    /// Both directions: the identical declaration with a tip is accepted.
+    /// No pool tip yet → retryable `stale-chain-tip`; with a tip, accepted.
     #[test]
     fn a_declaration_before_the_pool_knows_a_tip_is_refused_retryably() {
         let wtxid = [0x01; 32];
@@ -1864,20 +1520,12 @@ mod tests {
         assert_eq!(stored, 1);
     }
 
-    /// INTEROP: a declaration in the same second as an allocate must be
-    /// answered.
-    ///
-    /// The SV2 JDP/AllocateMiningJobToken rate limit applies to client
-    /// allocates only, not to minting the `new_mining_job_token`. An
-    /// unanswered declare makes the JDC switch pools
-    /// (SV2 JDP/Job Declarator Client), and JD-clients routinely allocate on
-    /// the same block change that produces a declaration.
+    /// INTEROP: the allocate rate limit never blocks a declaration; an
+    /// unanswered declare makes the JDC switch pools (SV2 JDP/Job Declarator Client).
     #[test]
     fn a_declaration_in_the_same_second_as_an_allocate_is_still_answered() {
         let mut s = fresh();
         let _ = handle_setup_connection(&mut s, &good_setup());
-        // Allocate at t=1000 — this is what stamps the
-        // SV2 JDP/AllocateMiningJobToken budget.
         let out = handle_allocate_token(&mut s, &good_alloc(1), alloc_ctx(), 1_000);
         let token = match out.outbound[0] {
             JdpOutboundFrame::AllocateMiningJobTokenSuccess {
@@ -1886,7 +1534,7 @@ mod tests {
             _ => panic!("expected AllocateMiningJobTokenSuccess"),
         };
 
-        // Declare 100 ms later — well inside the 1 s allocate limit.
+        // 100 ms later, inside the 1 s allocate limit.
         let wtxid = [0x01; 32];
         let mut tpl = HashMap::new();
         tpl.insert(wtxid, vec![0xCA; 16]);
@@ -1909,9 +1557,8 @@ mod tests {
         assert_eq!(s.declared_jobs.len(), 1);
     }
 
-    /// A declaration token is not kept in the token store: minting it is not
-    /// rate-limited, so storing it there would let the store grow unbounded.
-    /// `declared_jobs` (FIFO, `MAX_DECLARED_JOBS`) holds it instead.
+    /// Declaration tokens live in the capped `declared_jobs`, never the
+    /// unbounded-by-mint token store.
     #[test]
     fn a_declaration_mints_a_token_without_growing_the_token_store() {
         let mut s = fresh();
@@ -1944,8 +1591,7 @@ mod tests {
                 ),
                 "declaration {request_id} must be answered"
             );
-            // Checked per step, not as a net figure at the end: one allocate
-            // in, one out, the declaration token in neither direction.
+            // Per step, not net: one allocate in, one out.
             assert_eq!(
                 s.tokens.len(),
                 0,
@@ -1961,9 +1607,7 @@ mod tests {
         );
     }
 
-    /// The allocate map is bounded by rate × TTL only if expired entries are
-    /// swept; `take_active` touches just the token it was asked about, so
-    /// allocating sweeps the rest.
+    /// Allocating sweeps expired tokens, keeping the map bounded by rate × TTL.
     #[test]
     fn allocating_sweeps_the_tokens_that_outlived_their_ttl() {
         let mut s = fresh();
@@ -1972,7 +1616,6 @@ mod tests {
         let _ = handle_allocate_token(&mut s, &good_alloc(2), alloc_ctx(), 2_100);
         assert_eq!(s.tokens.len(), 2, "precondition: both are live");
 
-        // Past both TTLs — the third allocate must not find company.
         let past_ttl = 2_100 + crate::tokens::DEFAULT_TOKEN_TTL_MS + 1;
         let _ = handle_allocate_token(&mut s, &good_alloc(3), alloc_ctx(), past_ttl);
         assert_eq!(
@@ -1982,8 +1625,7 @@ mod tests {
         );
     }
 
-    /// The client's allocate stays rate-limited, and minting a declaration
-    /// token in between does not move that budget.
+    /// Minting a declaration token does not move the allocate budget.
     #[test]
     fn the_client_facing_allocate_limit_survives_a_declaration() {
         let mut s = fresh();
@@ -1998,19 +1640,15 @@ mod tests {
         let wtxid = [0x01; 32];
         let mut tpl = HashMap::new();
         tpl.insert(wtxid, vec![0xCA; 16]);
-        // The rest of the start burst, at the same instant.
         let _ = handle_allocate_token(&mut s, &good_alloc(4), alloc_ctx(), 1_000);
         let _ = declared(&mut s, &declare(3, token, vec![wtxid]), &tpl, ctx(1_100));
 
-        // The burst is spent and still inside the second: refused, as
-        // SV2 JDP/AllocateMiningJobToken asks.
         let out = handle_allocate_token(&mut s, &good_alloc(2), alloc_ctx(), 1_500);
         assert!(
             out.outbound.is_empty(),
             "an allocate past the burst inside 1 s must still be rate-limited"
         );
-        // And past the second it is served again — measured from the
-        // ALLOCATES at 1_000, not from the declaration at 1_100.
+        // Measured from the allocates at 1_000, not the declaration at 1_100.
         let out = handle_allocate_token(&mut s, &good_alloc(5), alloc_ctx(), 2_050);
         assert!(
             matches!(
@@ -2021,16 +1659,12 @@ mod tests {
         );
     }
 
-    /// ext 0x0003/distribution_id TLV Field: on a 0x0003-negotiated connection
-    /// every `DeclareMiningJob` MUST reference a published distribution — a
-    /// declaration without the `distribution_id` TLV pays nobody the pool
-    /// knows and is rejected `invalid-payout-distribution`.
+    /// ext 0x0003/distribution_id TLV Field: missing TLV once negotiated is rejected.
     #[test]
     fn declare_negotiated_without_distribution_tlv_rejected() {
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
         negotiate_0x0003(&mut s);
-        // `declare()` carries no distribution_id TLV.
         let input = declare(2, token, vec![]);
         let out = declared(&mut s, &input, &HashMap::new(), ctx(3_000));
         match &out.outbound[0] {
@@ -2046,10 +1680,7 @@ mod tests {
         );
     }
 
-    /// ext 0x0003/Grace Window + Error Codes: a `distribution_id` outside the
-    /// acceptance window is rejected `stale-payout-distribution`. `Unknown`
-    /// folds into the same wire code — a JDC can't distinguish "superseded"
-    /// from "never published", both mean "re-declare against the latest".
+    /// ext 0x0003/Grace Window: `Stale` and `Unknown` both → `stale-payout-distribution`.
     #[test]
     fn declare_with_stale_or_unknown_distribution_rejected() {
         let mut s = fresh();
@@ -2080,15 +1711,13 @@ mod tests {
                 }
                 f => panic!("expected stale DeclareMiningJobError, got {f:?}"),
             }
-            // A refusal spends the token too, so the next attempt allocates.
+            // A refusal spends the token too.
             token = allocate_another(&mut s, 3 + attempt as u32, 2_100 + attempt as u64 * 1_100);
         }
         assert_eq!(s.declared_jobs.len(), 0);
     }
 
-    /// A negotiated declare must arrive with a caller-resolved
-    /// acceptance; `None` is an IO-contract breach and fails closed
-    /// with the stale code.
+    /// An unresolved acceptance on a negotiated declare fails closed.
     #[test]
     fn declare_negotiated_with_unresolved_acceptance_fails_closed() {
         let mut s = fresh();
@@ -2106,17 +1735,8 @@ mod tests {
         assert_eq!(s.declared_jobs.len(), 0);
     }
 
-    /// A plan built for one payout mode must not bless a coinbase once the
-    /// address is on another. A Full-Template block is booked from its
-    /// declaration, so this is the only place that can be caught.
-    ///
-    /// All three answers:
-    /// - the mode it was built for → accepted, or the pool refuses its own
-    ///   correct plan on every declare,
-    /// - a DIFFERENT mode → refused,
-    /// - no mode at all → accepted. "The gate has never heard of this address"
-    ///   is the absence of an answer, not a changed one; treating it as a
-    ///   change would refuse every declare whose miner briefly dropped.
+    /// A plan is refused once the address is on a different mode; its own mode
+    /// or no known mode (miner briefly dropped) is accepted.
     #[test]
     fn a_declare_is_judged_against_the_mode_the_address_is_on_now() {
         use bp_common::StreamKind as Sk;
@@ -2162,8 +1782,6 @@ mod tests {
             );
             match (&out.outbound[0], accept) {
                 (JdpOutboundFrame::DeclareMiningJobSuccess { .. }, true) => {
-                    // Accepting is only half of it: the booking stamped here
-                    // is what a `PushSolution` books the block from.
                     assert_eq!(s.declared_jobs.len(), 1, "{mode:?}");
                 }
                 (JdpOutboundFrame::DeclareMiningJobError { error_code, .. }, false) => {
@@ -2179,11 +1797,8 @@ mod tests {
         }
     }
 
-    /// ext 0x0003/Output Verification recompute-and-compare: a declared
-    /// coinbase matching the referenced distribution positionally is accepted
-    /// and the job is stamped with a booking; one paying the right scripts and
-    /// the right sum in the WRONG positions is rejected
-    /// `invalid-payout-distribution` (the spec fixes the output order).
+    /// ext 0x0003/Output Verification: matching outputs are accepted and booked;
+    /// the same outputs in the wrong order are rejected.
     #[test]
     fn declare_validates_coinbase_against_distribution() {
         let mut s = fresh();
@@ -2225,9 +1840,7 @@ mod tests {
             "rejected declaration must not be stored"
         );
 
-        // Accept: the ext 0x0003/Payout Computation vector as recomputed
-        // validates by construction. A refused declaration spends its token
-        // just as an accepted one does, so the retry brings its own.
+        // Accept: the recomputed vector; the refusal spent the token.
         let token = allocate_another(&mut s, 2, 2_100);
         let mut good = declare(4, token, vec![]);
         good.distribution_id = Some(7);
@@ -2262,17 +1875,14 @@ mod tests {
         );
     }
 
-    /// A declare whose suffix is not a parseable output vector fails closed
-    /// on both connection kinds: an output set that cannot be verified is
-    /// never accepted, and on a base connection the mining-side binding
-    /// could not express it.
+    /// An unparseable output suffix fails closed on base and 0x0003 connections.
     #[test]
     fn declare_unrebuildable_coinbase_rejected_on_either_connection() {
         for negotiated in [false, true] {
             let mut s = fresh();
             let token = complete_setup_and_allocate(&mut s);
             let mut input = declare(3, token, vec![]);
-            // 8 opaque bytes: strips to an empty body, not a TxOut vector.
+            // Not a TxOut vector.
             input.coinbase_tx_suffix = vec![0xBB; 8];
             let distribution = if negotiated {
                 negotiate_0x0003(&mut s);
@@ -2300,8 +1910,7 @@ mod tests {
         }
     }
 
-    /// Positive control: a coinbase that DOES rebuild is accepted on a plain
-    /// base-protocol connection, with no distribution in sight.
+    /// Positive control: a rebuildable coinbase is accepted on a base connection.
     #[test]
     fn declare_rebuildable_coinbase_accepted_on_a_base_connection() {
         let mut s = fresh();
@@ -2323,9 +1932,7 @@ mod tests {
         assert_eq!(s.declared_jobs.len(), 1);
     }
 
-    /// ext 0x0003/Negotiation: a distribution reference from a client that
-    /// never negotiated ext 0x0003 MUST be rejected — the IO layer captures
-    /// the TLV unconditionally so this gate fires in production too.
+    /// ext 0x0003/Negotiation: a `distribution_id` TLV without negotiation is rejected.
     #[test]
     fn declare_with_tlv_but_no_negotiation_rejected() {
         let mut s = fresh();
@@ -2350,15 +1957,8 @@ mod tests {
         assert_eq!(s.declared_jobs.len(), 0, "nothing may be declared");
     }
 
-    /// `bookable = false` (settlement snapshot missing): the
-    /// declaration is still accepted, but no booking is stamped — a
-    /// found block is reported, not booked.
-    ///
-    /// It MUST still record which distribution it was accepted against: the
-    /// mining side inherits that reference for a Full-Template job
-    /// (ext 0x0003/distribution_id TLV Field sits on this message, not on
-    /// `SetCustomMiningJob`). Without it every later custom job would be
-    /// refused `custom-jobs-require-solo`, which JD-clients treat as fatal.
+    /// `bookable = false`: accepted without booking, but the `distribution_id`
+    /// is kept; the Full-Template `SetCustomMiningJob` inherits it.
     #[test]
     fn declare_unbookable_distribution_accepted_without_booking() {
         let mut s = fresh();
@@ -2396,9 +1996,7 @@ mod tests {
         );
     }
 
-    /// A coinbase that does not rebuild is refused whichever part is empty or
-    /// malformed, with a positive control so "everything is refused" cannot
-    /// pass for "these are refused".
+    /// A coinbase that does not rebuild is refused whichever part is broken.
     #[test]
     fn a_coinbase_that_will_not_rebuild_is_refused() {
         for (label, prefix, suffix) in [
@@ -2426,8 +2024,7 @@ mod tests {
             assert_eq!(s.declared_jobs.len(), 0, "{label} must not be stored");
         }
 
-        // Positive control: the honest coinbase from the same fixtures is
-        // accepted, so the refusals above are about the coinbase.
+        // Positive control.
         let mut s = fresh();
         let token = complete_setup_and_allocate(&mut s);
         let out = declared(
@@ -2466,8 +2063,7 @@ mod tests {
         assert_eq!(s.declared_jobs.len(), 0, "not accepted yet");
     }
 
-    /// Declare one job that needs a round-trip, on a fresh token allocated at
-    /// `now_ms`, and assert the round-trip went out.
+    /// Declare one job that needs a round-trip, on a fresh token.
     fn declare_pending(s: &mut JdpSessionState, request_id: u32, now_ms: u64) {
         let known = [0x01; 32];
         let missing = [0x02; 32];
@@ -2512,9 +2108,7 @@ mod tests {
         )
     }
 
-    /// A JDC may declare again before it has answered the first
-    /// `ProvideMissingTransactions`, so pending declarations are kept by
-    /// `request_id`. Both complete, in whichever order the JDC answers.
+    /// Two pending declarations both complete, in either order.
     #[test]
     fn two_declarations_in_flight_both_complete() {
         let mut s = fresh();
@@ -2530,9 +2124,7 @@ mod tests {
         assert_eq!(s.declared_jobs.len(), 2);
     }
 
-    /// Pending declarations are bounded: past [`MAX_PENDING_DECLARATIONS`]
-    /// the oldest is dropped, so a JDC that never answers cannot grow the
-    /// session. The ones still held complete normally.
+    /// Past [`MAX_PENDING_DECLARATIONS`] the oldest is dropped; the rest complete.
     #[test]
     fn past_the_bound_the_oldest_pending_declaration_is_dropped() {
         let mut s = fresh();
@@ -2579,9 +2171,7 @@ mod tests {
         assert!(s.pending_declarations.is_empty());
     }
 
-    /// Chain tip advances during the missing-transactions round-trip →
-    /// the declaration is rejected `stale-chain-tip` (retryable) instead
-    /// of being accepted and stamped with a tip it was never built for.
+    /// A tip move during the round-trip → `stale-chain-tip`.
     #[test]
     fn provide_missing_with_tip_drift_rejects_stale_chain_tip() {
         let mut s = fresh();
@@ -2624,11 +2214,8 @@ mod tests {
         );
     }
 
-    /// ext 0x0003/Grace Window + Implementation Notes are judged when the
-    /// declaration is ACCEPTED: a distribution superseded during the
-    /// missing-transactions round-trip rejects the declaration
-    /// `stale-payout-distribution` even though it was accepted at declare
-    /// time.
+    /// ext 0x0003/Grace Window is judged at acceptance: superseded mid-round-trip
+    /// → `stale-payout-distribution`.
     #[test]
     fn provide_missing_re_resolves_distribution_at_acceptance() {
         let mut s = fresh();
@@ -2675,9 +2262,7 @@ mod tests {
         assert_eq!(s.declared_jobs.len(), 0);
     }
 
-    /// The round-trip path runs the same ext 0x0003/Output Verification
-    /// validation as the immediate path: a still-accepted distribution plus
-    /// matching coinbase completes with a booking-stamped job.
+    /// The round-trip path validates like the immediate one and stamps the booking.
     #[test]
     fn provide_missing_accepts_negotiated_declaration_with_booking() {
         let mut s = fresh();
@@ -2728,8 +2313,6 @@ mod tests {
                 reference_reward_sats: 312_500_000,
             })
         );
-        // The mining side inherits this, not `booking` — the two are separate
-        // claims and only this one survives a non-bookable distribution.
         assert_eq!(declared.distribution_id, Some(7));
     }
 
@@ -2752,9 +2335,7 @@ mod tests {
         assert!(out.outbound.is_empty());
     }
 
-    /// A `ProvideMissingTransactions.Success` that does not carry one
-    /// transaction per requested position is answered `missing-txs`, so the
-    /// JDC is not left waiting on a declaration that cannot complete.
+    /// A Success with the wrong transaction count is answered `missing-txs`.
     #[test]
     fn provide_missing_length_mismatch_is_refused_missing_txs() {
         let mut s = fresh();
@@ -2763,7 +2344,7 @@ mod tests {
         let wtxid_b = [0x02; 32];
         let input = declare(6, token, vec![wtxid_a, wtxid_b]);
         let _ = declared(&mut s, &input, &HashMap::new(), ctx(3_000));
-        // Pending expects 2 missing (positions 0,1) but only 1 is provided.
+        // Two positions asked for, one provided.
         let bad_success = ProvideMissingTransactionsSuccessInput {
             request_id: 6,
             transaction_list: vec![vec![0xFE; 16]],
@@ -2824,9 +2405,7 @@ mod tests {
         assert!(out.events.is_empty());
     }
 
-    /// The block is booked against the DECLARATION's miner, and the
-    /// declaration alone decides who that is, even with the token store
-    /// emptied underneath it.
+    /// The block is booked to the declaration's miner, even with the token store emptied.
     #[test]
     fn a_pushed_solution_is_booked_against_its_declarations_miner() {
         let mut s = fresh();
@@ -2836,8 +2415,6 @@ mod tests {
         tpl.insert(wtxid_a, vec![0xCA; 8]);
         let _ = declared(&mut s, &declare(7, token, vec![wtxid_a]), &tpl, ctx(3_000));
 
-        // Drop every token the session holds — the declaration must still
-        // know whose it is.
         s.tokens = TokenStore::new();
 
         let solution = PushSolutionInput {
@@ -2868,9 +2445,7 @@ mod tests {
         }
     }
 
-    /// Happy-path: declare a job → push solution that matches its
-    /// prev_hash → emit BlockSubmissionCandidate with reconstructed
-    /// coinbase.
+    /// A matching solution yields a candidate with the reconstructed coinbase.
     #[test]
     fn push_solution_emits_block_submission_candidate() {
         let mut s = fresh();
@@ -2900,8 +2475,6 @@ mod tests {
                 header,
                 ..
             } => {
-                // The candidate is the declared prefix + the miner's extranonce
-                // + the declared suffix, spliced in that order.
                 let plen = coinbase_prefix().len();
                 let slen = coinbase_suffix(&one_output_blob()).len();
                 assert_eq!(coinbase_raw.len(), plen + extranonce.len() + slen);
@@ -2927,13 +2500,9 @@ mod tests {
         let wtxid_b = [0x02; 32];
         let mut tpl = HashMap::new();
         tpl.insert(wtxid_a, vec![0xCA; 8]);
-        // wtxid_b is in declared list but NOT in template → goes
-        // into pending. Without ProvideMissingTransactions.Success,
-        // raw_transactions[1] never gets populated.
+        // wtxid_b is not in the template, so the declaration stays pending.
         let input = declare(8, token, vec![wtxid_a, wtxid_b]);
         let _ = declared(&mut s, &input, &tpl, ctx(3_000));
-        // No declared_jobs entry yet (still pending) → push_solution
-        // can't find a matching job → drops. Pin that path.
         assert_eq!(s.declared_jobs.len(), 0);
         let solution = PushSolutionInput {
             extranonce: vec![0; 8],
