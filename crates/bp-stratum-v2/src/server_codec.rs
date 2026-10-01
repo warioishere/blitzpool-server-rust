@@ -497,11 +497,19 @@ mod tests {
                 assert_eq!(i.min_version, 2);
                 assert_eq!(i.max_version, 2);
                 assert_eq!(i.vendor, "test-vendor");
-                assert_eq!(i.firmware, "0.1");
-                assert_eq!(i.device_id, "dev-1");
             }
             _ => panic!("expected SetupConnection"),
         }
+    }
+
+    /// The firmware string is never stored, but a non-UTF-8 one still
+    /// refuses the setup.
+    #[test]
+    fn decode_setup_connection_refuses_non_utf8_firmware() {
+        let mut setup = build_setup_connection();
+        setup.firmware = (&[0xffu8, 0xfe][..]).try_into().unwrap();
+        let msg = AnyMessage::Common(CommonMessages::SetupConnection(setup));
+        assert!(decode_mining_inbound(msg).is_err());
     }
 
     // ── decode_request_extensions ──────────────────────────────────

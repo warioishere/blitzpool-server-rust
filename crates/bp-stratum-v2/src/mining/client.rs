@@ -428,7 +428,6 @@ pub struct MiningSessionState<C: Clock> {
 
     // Negotiated state from SetupConnection
     pub setup_complete: bool,
-    pub used_version: u16,
     // No `version_rolling` field: every job serves `VERSION_ROLLING_ALLOWED`.
     pub work_selection: bool,
     pub requires_standard_jobs: bool,
@@ -513,7 +512,6 @@ impl<C: Clock + Clone> MiningSessionState<C> {
             stream: StreamKind::Pplns,
             accounting_stream: StreamKind::Pplns,
             setup_complete: false,
-            used_version: 0,
             work_selection: false,
             requires_standard_jobs: false,
             is_tdp_client: false,
@@ -637,7 +635,6 @@ pub fn handle_setup_connection<C: Clock>(
     }
 
     state.setup_complete = true;
-    state.used_version = used_version;
     state.user_agent = vendor_user_agent(&input.vendor);
     state.requires_standard_jobs = (input.flags & FLAG_REQUIRES_STANDARD_JOBS) != 0;
     state.work_selection = (input.flags & FLAG_REQUIRES_WORK_SELECTION) != 0;
@@ -1046,12 +1043,7 @@ pub fn handle_submit_shares_standard<C: Clock>(
         }
         ShareValidation::Rejected(_) => {}
     }
-    let channel = state
-        .channels
-        .get_mut(&submission.channel_id)
-        .expect("channel existed above");
     finalize_submit(
-        channel,
         submission.channel_id,
         submission.sequence_number,
         validation,
@@ -1141,12 +1133,7 @@ pub fn handle_submit_shares_extended<C: Clock>(
         }
         ShareValidation::Rejected(_) => {}
     }
-    let channel = state
-        .channels
-        .get_mut(&submission.channel_id)
-        .expect("channel existed above");
     finalize_submit(
-        channel,
         submission.channel_id,
         submission.sequence_number,
         validation,
@@ -1177,24 +1164,20 @@ fn submit_error_with_event(
 }
 
 fn finalize_submit(
-    channel: &mut ChannelState,
     channel_id: u32,
     sequence_number: u32,
     validation: ShareValidation,
 ) -> HandlerOutcome {
     match validation {
-        ShareValidation::Accepted(accept) => {
-            channel.record_accepted_share(accept.effective_difficulty);
-            HandlerOutcome {
-                outbound: vec![OutboundFrame::SubmitSharesSuccess {
-                    channel_id,
-                    last_sequence_number: sequence_number,
-                    new_submits_accepted_count: 1,
-                    new_shares_sum: accept.effective_difficulty.as_f64() as u64,
-                }],
-                events: vec![SessionEvent::ShareAccepted { channel_id, accept }],
-            }
-        }
+        ShareValidation::Accepted(accept) => HandlerOutcome {
+            outbound: vec![OutboundFrame::SubmitSharesSuccess {
+                channel_id,
+                last_sequence_number: sequence_number,
+                new_submits_accepted_count: 1,
+                new_shares_sum: accept.effective_difficulty.as_f64() as u64,
+            }],
+            events: vec![SessionEvent::ShareAccepted { channel_id, accept }],
+        },
         ShareValidation::Rejected(reject) => {
             submit_error_with_event(channel_id, sequence_number, reject)
         }
@@ -1544,7 +1527,6 @@ pub fn apply_template_broadcast<C: Clock>(
             channel.clear_submission_cache();
             channel.latest_extended_prev_hash = Some(template.prev_hash);
             channel.latest_extended_n_bits = Some(template.n_bits);
-            channel.latest_extended_min_ntime = Some(template.header_timestamp);
         }
 
         let job_id = channel.next_job_id;
@@ -1799,7 +1781,6 @@ pub fn apply_template_broadcast<C: Clock>(
                         job.created_at = now_ms;
                         ch.latest_extended_prev_hash = Some(job.prev_hash);
                         ch.latest_extended_n_bits = Some(job.n_bits);
-                        ch.latest_extended_min_ntime = Some(job.min_ntime);
                         let (pv, nt, nb, ver) =
                             (job.prev_hash, job.min_ntime, job.n_bits, job.version);
                         let mp = job.merkle_path.clone();
@@ -1857,7 +1838,6 @@ pub fn apply_template_broadcast<C: Clock>(
                 channel.clear_submission_cache();
                 channel.latest_extended_prev_hash = Some(template.prev_hash);
                 channel.latest_extended_n_bits = Some(template.n_bits);
-                channel.latest_extended_min_ntime = Some(template.header_timestamp);
             }
             // Store the shared job under the group job_id on every member, so
             // per-member `SubmitSharesExtended` validation finds it.
@@ -2327,9 +2307,6 @@ pub(crate) mod tests {
             max_version: 2,
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "test-vendor".to_string(),
-            firmware: "0.1".to_string(),
-            hardware_version: "rev1".to_string(),
-            device_id: "dev-1".to_string(),
         }
     }
 
@@ -2900,9 +2877,6 @@ pub(crate) mod tests {
             }
         ));
         assert!(matches!(out.events[0], SessionEvent::ShareAccepted { .. }));
-        // Channel counter bumped.
-        let ch = s.channels.get(&channel_id).unwrap();
-        assert_eq!(ch.accepted_share_count, 1);
     }
 
     /// A share below the network target is accepted with `is_block_candidate = false`.

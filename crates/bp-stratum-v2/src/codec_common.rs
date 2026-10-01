@@ -163,23 +163,23 @@ pub struct SetupConnectionInput {
     pub max_version: u16,
     pub flags: u32,
     pub vendor: String,
-    pub firmware: String,
-    pub hardware_version: String,
-    pub device_id: String,
 }
 
+/// The unused string fields are still checked: a non-UTF-8 one refuses the
+/// connection setup.
 pub(crate) fn decode_setup_connection(
     m: SetupConnection<'_>,
 ) -> Result<SetupConnectionInput, CodecError> {
+    let vendor = utf8_from_bytes(m.vendor.as_bytes())?;
+    utf8_from_bytes(m.firmware.as_bytes())?;
+    utf8_from_bytes(m.hardware_version.as_bytes())?;
+    utf8_from_bytes(m.device_id.as_bytes())?;
     Ok(SetupConnectionInput {
         protocol: m.protocol as u8,
         min_version: m.min_version,
         max_version: m.max_version,
         flags: m.flags,
-        vendor: utf8_from_bytes(m.vendor.as_bytes())?,
-        firmware: utf8_from_bytes(m.firmware.as_bytes())?,
-        hardware_version: utf8_from_bytes(m.hardware_version.as_bytes())?,
-        device_id: utf8_from_bytes(m.device_id.as_bytes())?,
+        vendor,
     })
 }
 

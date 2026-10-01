@@ -274,8 +274,6 @@ pub struct JdpSessionState {
     // Negotiated state from SetupConnection.
     pub setup_complete: bool,
     pub full_template_mode: bool,
-    pub used_version: u16,
-    pub vendor: String,
 
     /// Extensions negotiated via ext 0x0001 in [`handle_request_extensions`].
     pub negotiated_extensions: HashSet<u16>,
@@ -345,8 +343,6 @@ impl JdpSessionState {
             session_id,
             setup_complete: false,
             full_template_mode: false,
-            used_version: 0,
-            vendor: String::new(),
             negotiated_extensions: HashSet::new(),
             tokens: TokenStore::new(),
             declared_jobs: DeclaredJobStore::new(),
@@ -396,12 +392,10 @@ pub fn handle_setup_connection(
     let full_template_mode = negotiated_flags != 0;
     state.setup_complete = true;
     state.full_template_mode = full_template_mode;
-    state.used_version = used_version;
-    state.vendor = input.vendor.clone();
 
     JdpHandlerOutcome {
         outbound: vec![JdpOutboundFrame::SetupConnectionSuccess {
-            used_version: state.used_version,
+            used_version,
             flags: negotiated_flags,
         }],
         events: vec![JdpSessionEvent::SetupComplete],
@@ -967,9 +961,6 @@ mod tests {
             max_version: 2,
             flags: FLAG_DECLARE_TX_DATA,
             vendor: "test-jdc".to_string(),
-            firmware: "0.1".to_string(),
-            hardware_version: "rev1".to_string(),
-            device_id: "dev-1".to_string(),
         }
     }
 

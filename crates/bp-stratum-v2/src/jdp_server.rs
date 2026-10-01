@@ -1061,9 +1061,6 @@ mod tests {
             max_version: 2,
             flags: crate::jdp::client::FLAG_DECLARE_TX_DATA,
             vendor: "v".to_string(),
-            firmware: "f".to_string(),
-            hardware_version: "h".to_string(),
-            device_id: "d".to_string(),
         }
     }
 

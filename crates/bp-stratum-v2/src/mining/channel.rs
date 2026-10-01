@@ -64,12 +64,6 @@ pub struct ChannelState {
     /// carries an absolute merkle root.
     pub latest_extended_prev_hash: Option<[u8; 32]>,
     pub latest_extended_n_bits: Option<u32>,
-    pub latest_extended_min_ntime: Option<u32>,
-
-    pub accepted_share_count: u64,
-    /// Sum of accepted-share difficulties. f64 because low-diff ports can
-    /// have sub-1 entries.
-    pub accepted_share_difficulty_sum: f64,
 
     /// Channel-local, monotonic job-id counter, bumped on each
     /// `NewMiningJob` / `NewExtendedMiningJob`.
@@ -83,11 +77,6 @@ pub struct ChannelState {
     /// on every `NewMiningJob`, so identical re-announced work stalls it. A
     /// block change (`SetNewPrevHash`) is always sent.
     pub last_sent_job_signature: Option<u64>,
-
-    /// One-shot diagnostic flag: the first share per channel logs its actual
-    /// extranonce length, to spot firmware that ignores the advertised
-    /// `extranonce_size`.
-    pub first_share_logged: bool,
 
     /// Target memo for the per-share accept check. Per-job difficulty
     /// changes only on a vardiff ratchet.
@@ -114,13 +103,9 @@ impl ChannelState {
             extended_jobs: HashMap::new(),
             latest_extended_prev_hash: None,
             latest_extended_n_bits: None,
-            latest_extended_min_ntime: None,
-            accepted_share_count: 0,
-            accepted_share_difficulty_sum: 0.0,
             next_job_id: 1,
             submission_cache: SubmissionCache::Standard(HashSet::new()),
             last_sent_job_signature: None,
-            first_share_logged: false,
             target_memo: TargetMemo::default(),
         }
     }
@@ -145,22 +130,11 @@ impl ChannelState {
             extended_jobs: HashMap::new(),
             latest_extended_prev_hash: None,
             latest_extended_n_bits: None,
-            latest_extended_min_ntime: None,
-            accepted_share_count: 0,
-            accepted_share_difficulty_sum: 0.0,
             next_job_id: 1,
             submission_cache: SubmissionCache::Extended(HashSet::new()),
             last_sent_job_signature: None,
-            first_share_logged: false,
             target_memo: TargetMemo::default(),
         }
-    }
-
-    /// Record an accepted share in the per-channel counters. The dedup-cache
-    /// write happens at the call site via `SubmissionCache::insert_*`.
-    pub fn record_accepted_share(&mut self, share_difficulty: Difficulty) {
-        self.accepted_share_count = self.accepted_share_count.saturating_add(1);
-        self.accepted_share_difficulty_sum += share_difficulty.as_f64();
     }
 
     /// Target for `job_difficulty`, memoized per channel (see
@@ -295,7 +269,6 @@ mod tests {
         assert!(ch.submission_cache.is_empty());
         assert!(matches!(ch.submission_cache, SubmissionCache::Standard(_)));
         assert_eq!(ch.full_extranonce_size(), 4);
-        assert!(!ch.first_share_logged);
     }
 
     /// Fresh Extended channel: extranonce_size > 0, Extended-cache.
@@ -331,24 +304,6 @@ mod tests {
             LifecycleConfig::DEFAULT,
         );
         assert_eq!(ch.declared_max_target, tgt);
-    }
-
-    // ── record_accepted_share ──────────────────────────────────────
-
-    /// Counters increment together; difficulty sum accumulates as f64.
-    #[test]
-    fn record_accepted_share_bumps_counters() {
-        let mut ch = ChannelState::new_standard(
-            1,
-            vec![0; 4],
-            Difficulty(1.0),
-            max_target(),
-            LifecycleConfig::DEFAULT,
-        );
-        ch.record_accepted_share(Difficulty(1024.0));
-        ch.record_accepted_share(Difficulty(2048.5));
-        assert_eq!(ch.accepted_share_count, 2);
-        assert!((ch.accepted_share_difficulty_sum - 3072.5).abs() < 1e-9);
     }
 
     // ── SubmissionCache ────────────────────────────────────────────
@@ -439,23 +394,6 @@ mod tests {
         );
         ch.clear_submission_cache();
         assert!(matches!(ch.submission_cache, SubmissionCache::Extended(_)));
-    }
-
-    // ── first_share_logged toggle ──────────────────────────────────
-
-    /// The diagnostic flag is mutable (callers flip it on first-share-log).
-    #[test]
-    fn diagnostic_flags_can_be_toggled() {
-        let mut ch = ChannelState::new_extended(
-            1,
-            vec![0; 4],
-            8,
-            Difficulty(1.0),
-            max_target(),
-            LifecycleConfig::DEFAULT,
-        );
-        ch.first_share_logged = true;
-        assert!(ch.first_share_logged);
     }
 
     // ── full_extranonce_size invariant ─────────────────────────────

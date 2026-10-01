@@ -2231,9 +2231,6 @@ mod tests {
             max_version: 2,
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "cgminer/4.11.1".to_string(),
-            firmware: "0.1".to_string(),
-            hardware_version: "r".to_string(),
-            device_id: "d".to_string(),
         });
         let _ = dispatch_inbound_frame(&mut s, setup, &fresh_extranonce(), &fresh_bridge(), 0);
         assert_eq!(s.user_agent.as_deref(), Some("cgminer/sv2"));
@@ -2285,9 +2282,6 @@ mod tests {
             max_version: 2,
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "test".to_string(),
-            firmware: "0.1".to_string(),
-            hardware_version: "rev1".to_string(),
-            device_id: "dev-1".to_string(),
         });
         let outcome = dispatch_inbound_frame(&mut s, inbound, &alloc, &bridge, 0);
         assert!(matches!(
@@ -2333,9 +2327,6 @@ mod tests {
             max_version: 2,
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "t".to_string(),
-            firmware: "0.1".to_string(),
-            hardware_version: "r".to_string(),
-            device_id: "d".to_string(),
         });
         let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
         let open = InboundMiningFrame::OpenStandardMiningChannel(
@@ -2376,9 +2367,6 @@ mod tests {
             max_version: 2,
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "t".to_string(),
-            firmware: "0.1".to_string(),
-            hardware_version: "r".to_string(),
-            device_id: "d".to_string(),
         });
         let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
         let open = |request_id, user_identity: String| {
@@ -2428,9 +2416,6 @@ mod tests {
             max_version: 2,
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "t".to_string(),
-            firmware: "0.1".to_string(),
-            hardware_version: "r".to_string(),
-            device_id: "d".to_string(),
         });
         let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
         for req in 1..=2u32 {
@@ -2481,9 +2466,6 @@ mod tests {
                 max_version: 2,
                 flags: FLAG_REQUIRES_VERSION_ROLLING,
                 vendor: "t".to_string(),
-                firmware: "0.1".to_string(),
-                hardware_version: "r".to_string(),
-                device_id: "d".to_string(),
             });
             let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
             let open = InboundMiningFrame::OpenStandardMiningChannel(
@@ -2527,9 +2509,6 @@ mod tests {
             max_version: 2,
             flags: FLAG_REQUIRES_VERSION_ROLLING,
             vendor: "t".to_string(),
-            firmware: "0.1".to_string(),
-            hardware_version: "r".to_string(),
-            device_id: "d".to_string(),
         });
         let _ = dispatch_inbound_frame(&mut s, setup, &alloc, &bridge, 0);
         // ext 0x0003/Negotiation: the TLV is honoured only when 0x0003 is
@@ -2797,9 +2776,6 @@ mod tests {
                 max_version: 2,
                 flags: FLAG_REQUIRES_VERSION_ROLLING,
                 vendor: "t".to_string(),
-                firmware: "0.1".to_string(),
-                hardware_version: "r".to_string(),
-                device_id: "d".to_string(),
             }),
             &alloc,
             &bridge,
