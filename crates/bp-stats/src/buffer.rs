@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Hot-path write buffers that a periodic flush drains in bulk.
-//! [`SwapBuffer`] is latest-wins and `drain` clears it; the delta buffers only
-//! snapshot on `drain` and subtract on `confirm`, so writes made during a flush
-//! survive it. Locking is the caller's job (each accumulator holds a `Mutex`).
+//! Hot-path write buffers that a periodic flush drains in bulk. The delta
+//! buffers only snapshot on `drain` and subtract on `confirm`, so writes made
+//! during a flush survive it. Locking is the caller's job (each accumulator
+//! holds a `Mutex`).
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -21,57 +21,6 @@ pub trait BufferRecord: Default + Clone {
     /// Subtract field-wise, clamping at zero so a residual never turns
     /// negative. Returns `true` when the bucket is empty and can be removed.
     fn sub_assign_clamped(&mut self, rhs: &Self) -> bool;
-}
-
-// ─── SwapBuffer ─────────────────────────────────────────────────────────────
-
-/// Latest-wins-by-key buffer. `drain` swaps in a fresh map, so writes made
-/// during the flush land in the new one.
-pub struct SwapBuffer<K, V> {
-    map: HashMap<K, V>,
-}
-
-impl<K, V> Default for SwapBuffer<K, V> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<K, V> SwapBuffer<K, V> {
-    pub fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-        }
-    }
-}
-
-impl<K, V> SwapBuffer<K, V>
-where
-    K: Eq + Hash,
-{
-    pub fn set(&mut self, key: K, value: V) {
-        self.map.insert(key, value);
-    }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-
-    pub fn drain(&mut self) -> HashMap<K, V> {
-        std::mem::take(&mut self.map)
-    }
-
-    /// Put a snapshot back after a failed flush. Existing entries win, since
-    /// they were written after the snapshot and are newer.
-    pub fn rebuffer(&mut self, snapshot: HashMap<K, V>) {
-        for (k, v) in snapshot {
-            self.map.entry(k).or_insert(v);
-        }
-    }
 }
 
 // ─── NumberDeltaBuffer ──────────────────────────────────────────────────────
@@ -141,11 +90,6 @@ where
                 }
             }
         }
-    }
-
-    /// Drop a key — used when an upstream account is deleted.
-    pub fn forget(&mut self, key: &K) {
-        self.map.remove(key);
     }
 }
 
@@ -298,30 +242,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ─── SwapBuffer ──────────────────────────────────────────────────────
-
-    #[test]
-    fn swap_buffer_drain_clears_and_returns_previous_contents() {
-        let mut buf: SwapBuffer<&'static str, u32> = SwapBuffer::new();
-        buf.set("a", 1);
-        buf.set("b", 2);
-        let snap = buf.drain();
-        assert_eq!(snap.len(), 2);
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn swap_buffer_rebuffer_prefers_existing() {
-        let mut buf: SwapBuffer<&'static str, u32> = SwapBuffer::new();
-        buf.set("a", 1);
-        let snap = buf.drain();
-        // Concurrent write during the (failed) flush.
-        buf.set("a", 99);
-        buf.rebuffer(snap);
-        // Existing wins.
-        assert_eq!(buf.map.get("a"), Some(&99));
-    }
 
     // ─── NumberDeltaBuffer ───────────────────────────────────────────────
 

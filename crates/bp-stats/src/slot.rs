@@ -36,15 +36,6 @@ impl TimeSlot {
         Self(self.0 + SLOT_DURATION_MS)
     }
 
-    /// `true` if `self` is fully in the past.
-    pub fn is_complete(self) -> bool {
-        self < Self::current()
-    }
-
-    pub fn is_current(self) -> bool {
-        self == Self::current()
-    }
-
     pub fn as_millis(self) -> i64 {
         self.0
     }
@@ -98,22 +89,12 @@ mod tests {
     }
 
     #[test]
-    fn is_complete_and_is_current() {
+    fn the_current_slot_ends_after_now() {
         let now = now_millis();
         let cur = TimeSlot::current();
         let prev = cur.previous();
-        let future = cur.next();
 
-        assert!(cur.is_current());
-        assert!(!cur.is_complete());
-
-        assert!(!prev.is_current());
-        assert!(prev.is_complete());
-
-        assert!(!future.is_current());
-        assert!(!future.is_complete());
-
-        // Sanity: now is bracketed by prev (start) and cur (end).
+        // Now is bracketed by prev (start) and cur (end).
         assert!(now >= prev.as_millis() && now < cur.as_millis());
     }
 

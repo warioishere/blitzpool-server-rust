@@ -77,28 +77,6 @@ impl ShareTotalsAccumulator {
     pub fn confirm_workers(&self, snapshot: &WorkerTotalsSnapshot) {
         self.worker.lock().confirm(snapshot);
     }
-
-    // ─── Maintenance ────────────────────────────────────────────────
-
-    /// Drop an address and all its workers, on account deletion.
-    pub fn forget_address(&self, address: &AddressId) {
-        let mut addr = self.address.lock();
-        addr.forget(address);
-        // Worker keys cannot be forgotten by prefix; dropping them here keeps
-        // stale buckets from lingering if the address never shares again.
-        drop(addr);
-        let mut workers = self.worker.lock();
-        let to_remove: Vec<WorkerKey> = workers
-            .drain()
-            .keys()
-            .filter(|k| &k.address == address)
-            .cloned()
-            .collect();
-        // drain() is a snapshot and does not clear the live map.
-        for key in to_remove {
-            workers.forget(&key);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -163,19 +141,5 @@ mod tests {
             acc.drain_workers().get(&worker_key("bc1qalice", "w1")),
             Some(&10.0)
         );
-    }
-
-    #[test]
-    fn forget_address_clears_address_and_workers() {
-        let acc = ShareTotalsAccumulator::new();
-        acc.add(a("bc1qalice"), "w1".into(), 100.0);
-        acc.add(a("bc1qalice"), "w2".into(), 50.0);
-        acc.add(a("bc1qbob"), "w1".into(), 25.0);
-        acc.forget_address(&a("bc1qalice"));
-        let addrs = acc.drain_addresses();
-        let workers = acc.drain_workers();
-        assert_eq!(addrs.get(&a("bc1qalice")), None);
-        assert_eq!(addrs.get(&a("bc1qbob")), Some(&25.0));
-        assert!(workers.keys().all(|k| k.address == a("bc1qbob")));
     }
 }
