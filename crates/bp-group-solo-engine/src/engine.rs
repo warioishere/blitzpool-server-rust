@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use bp_common::{AddressId, InvalidAddressError, Sats};
+use bp_common::{AddressId, Sats};
 use bp_cron_utils::SystemClock;
 use bp_db::{find_group, DbError, PplnsGroupRow};
 use bp_group_mgmt::group::{window_duration_ms, PayoutMode, RoundResetPreset};
@@ -75,8 +75,6 @@ pub enum EngineError {
     },
     #[error("on_block_found already in flight for group {group_id}")]
     BlockFoundInProgress { group_id: Uuid },
-    #[error("invalid address in snapshot: {0}")]
-    Address(#[from] InvalidAddressError),
 }
 
 impl EngineError {
@@ -88,8 +86,7 @@ impl EngineError {
             EngineError::Config(_)
             | EngineError::SnapshotMissing { .. }
             | EngineError::SnapshotMissingForPayouts { .. }
-            | EngineError::RevenueBelowSubsidy { .. }
-            | EngineError::Address(_) => true,
+            | EngineError::RevenueBelowSubsidy { .. } => true,
             // Infrastructure, and the per-group in-flight guard — all
             // of these clear on their own.
             EngineError::Redis(_)
@@ -802,19 +799,6 @@ impl GroupSoloEngine {
             .reset_scheduled(group_id)
             .await
             .map_err(EngineError::from)
-    }
-
-    /// Invalidate the distribution cache for one
-    /// (group, reward, finder) triple.
-    pub fn invalidate_distribution(
-        &self,
-        group_id: Uuid,
-        block_reward_sats: u64,
-        finder_address: &AddressId,
-    ) {
-        self.inner
-            .distribution_builder
-            .invalidate(group_id, block_reward_sats, finder_address);
     }
 
     /// Signal background tasks to exit. Best-effort. Flips the global cancel

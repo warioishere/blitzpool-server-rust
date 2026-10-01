@@ -197,12 +197,6 @@ impl DistributionBuilder {
         .map_err(Arc::new)
     }
 
-    /// Invalidate one reward. Window changes use `invalidate_all`; a
-    /// difficulty change needs neither, its trim runs inside `record_share`.
-    pub fn invalidate(&self, block_reward_sats: u64) {
-        self.cache.invalidate(&block_reward_sats);
-    }
-
     /// Drops the built distributions AND the inputs; stale inputs would
     /// just rebuild the same stale distribution.
     pub fn invalidate_all(&self) {

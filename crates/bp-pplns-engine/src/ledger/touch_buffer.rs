@@ -15,8 +15,6 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
-
 /// `address → latest share timestamp (ms)`, newest wins.
 #[derive(Debug, Default)]
 pub struct TouchBuffer {
@@ -85,7 +83,6 @@ impl TouchBuffer {
 // ── Background flush task ───────────────────────────────────────────
 
 /// Returns the rows updated; on error the snapshot is already rebuffered.
-/// Public so [`crate::engine::PplnsEngine::shutdown`] can do a final drain.
 pub async fn flush_once(pool: &PgPool, buffer: &TouchBuffer) -> Result<u64, DbError> {
     let snapshot = buffer.drain();
     if snapshot.is_empty() {

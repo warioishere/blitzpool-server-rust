@@ -45,7 +45,7 @@ pub struct PplnsEngineConfig {
     /// How often buffered `lastAcceptedShareAt` updates flush to Postgres.
     pub touch_flush_interval_secs: u32,
 
-    /// Only the daily cron; manual sweeps work regardless.
+    /// Switches the daily dust-sweep cron.
     pub dust_sweep_enabled: bool,
 
     /// Days without a share before a balance owner counts as gone.

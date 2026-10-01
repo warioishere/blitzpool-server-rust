@@ -132,16 +132,8 @@ where
         shared
     }
 
-    /// Drop any cached or in-flight entry for `key` and bump the generation,
-    /// so a compute already in flight does not install its superseded result.
-    pub fn invalidate(&self, key: &K) {
-        let mut state = self.state.lock().expect("inflight mutex poisoned");
-        state.slots.remove(key);
-        state.generation = state.generation.wrapping_add(1);
-    }
-
-    /// Drop all entries; like [`Self::invalidate`], in-flight computes will
-    /// not cache their results.
+    /// Drop all entries and bump the generation, so a compute already in
+    /// flight does not install its superseded result.
     pub fn clear(&self) {
         let mut state = self.state.lock().expect("inflight mutex poisoned");
         state.slots.clear();
@@ -280,9 +272,9 @@ mod tests {
         );
     }
 
-    /// A mid-compute invalidation: the leader's result is returned but not cached.
+    /// A mid-compute clear: the leader's result is returned but not cached.
     #[tokio::test]
-    async fn invalidate_during_inflight_is_not_resurrected() {
+    async fn clear_during_inflight_is_not_resurrected() {
         let cache: Arc<InflightResultCache<u64, u64, FakeError>> =
             Arc::new(InflightResultCache::new(Duration::from_secs(60)));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -301,9 +293,9 @@ mod tests {
             })
         };
 
-        // Land the invalidation while the leader is still computing.
+        // Land the clear while the leader is still computing.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        cache.invalidate(&1);
+        cache.clear();
 
         // The leader still returns its value to its own caller.
         assert_eq!(*leader.await.unwrap().expect("leader ok"), 11);
@@ -325,52 +317,12 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
-            "invalidation during in-flight compute must force a recompute"
-        );
-    }
-
-    /// `clear()` carries the same guarantee as `invalidate()`.
-    #[tokio::test]
-    async fn clear_during_inflight_is_not_resurrected() {
-        let cache: Arc<InflightResultCache<u64, u64, FakeError>> =
-            Arc::new(InflightResultCache::new(Duration::from_secs(60)));
-        let calls = Arc::new(AtomicUsize::new(0));
-
-        let leader = {
-            let cache = cache.clone();
-            let calls = calls.clone();
-            tokio::spawn(async move {
-                cache
-                    .get_or_compute(1, || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(80)).await;
-                        Ok(11u64)
-                    })
-                    .await
-            })
-        };
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        cache.clear();
-        let _ = leader.await.unwrap().expect("leader ok");
-
-        let calls_clone = calls.clone();
-        let _ = cache
-            .get_or_compute(1, || async move {
-                calls_clone.fetch_add(1, Ordering::SeqCst);
-                Ok(22u64)
-            })
-            .await
-            .expect("ok");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
             "clear during in-flight compute must force a recompute"
         );
     }
 
     #[tokio::test]
-    async fn invalidate_drops_cache() {
+    async fn clear_drops_cache() {
         let cache: InflightResultCache<u64, u64, FakeError> =
             InflightResultCache::new(Duration::from_secs(60));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -386,7 +338,7 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        cache.invalidate(&5);
+        cache.clear();
         let calls_clone = calls.clone();
         let _ = cache
             .get_or_compute(5, || async move {
@@ -397,7 +349,7 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
-            "after invalidate, next get_or_compute runs"
+            "after clear, next get_or_compute runs"
         );
     }
 

@@ -9,7 +9,6 @@ pub mod autoscale;
 pub mod config;
 pub mod distribution;
 pub mod engine;
-pub mod error;
 pub mod hooks;
 pub mod ledger;
 pub mod reader;

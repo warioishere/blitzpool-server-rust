@@ -17,7 +17,6 @@ const _: () = assert!(
 pub mod config;
 pub mod distribution;
 pub mod engine;
-pub mod error;
 pub mod history;
 pub mod hooks;
 pub mod reader;

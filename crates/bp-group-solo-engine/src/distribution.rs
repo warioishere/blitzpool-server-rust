@@ -150,16 +150,6 @@ impl DistributionBuilder {
             .await
     }
 
-    /// Invalidate the cache for one (group, reward, finder) triple.
-    pub fn invalidate(&self, group_id: Uuid, block_reward_sats: u64, finder_address: &AddressId) {
-        let key: CacheKey = (
-            group_id,
-            block_reward_sats,
-            finder_address.as_str().to_string(),
-        );
-        self.cache.invalidate(&key);
-    }
-
     pub fn invalidate_all(&self) {
         self.cache.clear();
     }

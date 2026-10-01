@@ -4,7 +4,7 @@
 //! Redis window read with a Postgres ledger read. Field names match the
 //! wire API the UI consumes.
 
-use bp_common::{AddressId, Sats};
+use bp_common::AddressId;
 use bp_db::find_pplns_balance;
 use chrono::Utc;
 
@@ -240,6 +240,3 @@ impl ReaderView<'_> {
         }
     }
 }
-
-// Silence "unused" if Sats import isn't needed elsewhere.
-fn _force_sats(_: Sats) {}

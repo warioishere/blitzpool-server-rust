@@ -39,7 +39,7 @@ use crate::ledger::{
     apply_distribution, pending_row, ApplyDistributionResult, AuditRow, BalanceWrite, LedgerError,
     PayoutRowType,
 };
-use crate::sweep::{spawn_daily_task, DustSweepRunner, SweepError, SystemClock};
+use crate::sweep::{spawn_daily_task, DustSweepRunner, SystemClock};
 use crate::window::{snapshot::StoredWeightSnapshot, NetworkDifficulty, WindowError, WindowStore};
 use bp_coinbase_snapshot::ActualCoinbase;
 use bp_share::{block_subsidy_sats, claim_sats};
@@ -57,8 +57,6 @@ pub enum EngineError {
     Db(#[from] DbError),
     #[error("ledger: {0}")]
     Ledger(#[from] LedgerError),
-    #[error("sweep: {0}")]
-    Sweep(#[from] SweepError),
     #[error("distribution: {0}")]
     Distribution(Arc<DistributionError>),
     #[error("snapshot missing for block {block_height} — pool restart or expired TTL?")]
@@ -106,7 +104,6 @@ impl EngineError {
             EngineError::Redis(_)
             | EngineError::Window(_)
             | EngineError::Db(_)
-            | EngineError::Sweep(_)
             | EngineError::Distribution(_)
             | EngineError::BlockFoundInProgress => false,
         }
@@ -552,13 +549,6 @@ impl PplnsEngine {
         Ok((audit_rows, balance_writes))
     }
 
-    /// Drop one cached distribution, forcing a recompute for that reward.
-    pub fn invalidate_distribution(&self, block_reward_sats: u64) {
-        self.inner
-            .distribution_builder
-            .invalidate(block_reward_sats);
-    }
-
     /// Signal the background tasks to exit; the touch buffer flushes once more.
     pub fn shutdown(&self) {
         // Err only when the tasks already exited.
@@ -597,9 +587,6 @@ mod tests {
             EngineError::from(e)
         }
         fn _accepts_ledger(e: LedgerError) -> EngineError {
-            EngineError::from(e)
-        }
-        fn _accepts_sweep(e: SweepError) -> EngineError {
             EngineError::from(e)
         }
     }
