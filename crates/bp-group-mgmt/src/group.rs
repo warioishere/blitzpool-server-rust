@@ -17,8 +17,7 @@ pub enum GroupNameError {
     ControlChar,
 }
 
-/// Validated group name: [`GroupName::new`] for input,
-/// [`GroupName::from_trusted`] for values read back from the DB.
+/// Validated group name, built by [`GroupName::new`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GroupName(String);
 
@@ -34,11 +33,6 @@ impl GroupName {
             return Err(GroupNameError::ControlChar);
         }
         Ok(Self(trimmed.to_string()))
-    }
-
-    /// Wrap a value already known to be valid (e.g. from a DB row).
-    pub fn from_trusted(name: impl Into<String>) -> Self {
-        Self(name.into())
     }
 
     pub fn as_str(&self) -> &str {

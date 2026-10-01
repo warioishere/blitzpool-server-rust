@@ -143,14 +143,6 @@ impl BlockpartyCache {
         guard.member = next_member;
         Ok(())
     }
-
-    pub async fn admin_len(&self) -> usize {
-        self.inner.read().await.admin.len()
-    }
-
-    pub async fn member_len(&self) -> usize {
-        self.inner.read().await.member.len()
-    }
 }
 
 /// Lets `GroupService` refuse a PPLNS join for an address already in a

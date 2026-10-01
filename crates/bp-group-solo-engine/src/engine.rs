@@ -110,7 +110,6 @@ struct Inner {
     distribution_builder: DistributionBuilder,
     reset_runner: GroupResetRunner<SystemClock>,
     config: GroupSoloEngineConfig,
-    cancel_tx: watch::Sender<bool>,
     /// Per-group reset crons, each with its own cancel channel so
     /// [`GroupSoloEngine::reschedule_group`] can re-arm one group alone.
     reset_tasks: StdMutex<HashMap<Uuid, ResetTask>>,
@@ -228,8 +227,6 @@ impl GroupSoloEngine {
         let clock = Arc::new(SystemClock);
         let reset_runner = GroupResetRunner::new(pool.clone(), round.clone(), clock.clone());
 
-        let (cancel_tx, _cancel_rx) = watch::channel(false);
-
         let mut reset_tasks: HashMap<Uuid, ResetTask> = HashMap::new();
         if background_tasks {
             for schedule in load_active_schedules(&pool).await? {
@@ -252,7 +249,6 @@ impl GroupSoloEngine {
                 distribution_builder,
                 reset_runner,
                 config,
-                cancel_tx,
                 reset_tasks: StdMutex::new(reset_tasks),
                 block_found_in_progress: TokioMutex::new(HashSet::new()),
                 mode_cache: StdMutex::new(HashMap::new()),
@@ -777,10 +773,8 @@ impl GroupSoloEngine {
             .map_err(EngineError::from)
     }
 
-    /// Signal background tasks to exit. Best-effort. Flips the global cancel
-    /// and signals each per-group reset cron's own cancel channel.
+    /// Signal each per-group reset cron to exit. Best-effort.
     pub fn shutdown(&self) {
-        let _ = self.inner.cancel_tx.send(true);
         if let Ok(tasks) = self.inner.reset_tasks.lock() {
             for task in tasks.values() {
                 let _ = task.cancel.send(true);
