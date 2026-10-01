@@ -97,7 +97,7 @@ pub(crate) async fn spawn(
     let mode_gate = Arc::new(BlitzpoolModeGate::new());
     let pplns = spawn_pplns(cfg, handles, read_only).await?;
     let group_solo = spawn_group_solo(cfg, handles, read_only).await?;
-    let stats = spawn_stats(cfg, handles).await?;
+    let stats = spawn_stats(handles).await?;
     let session_persistence = spawn_session_persistence(handles).await?;
 
     let (accepted_sink, rejected_sink) = if cfg.has_role(Role::Front) {
@@ -265,10 +265,7 @@ fn to_group_solo_engine_config(cfg: &AppConfig) -> Result<GroupSoloEngineConfig,
 
 // ─── ShareStats engine ───────────────────────────────────────────
 
-async fn spawn_stats(
-    _cfg: &AppConfig,
-    handles: &FoundationHandles,
-) -> Result<ShareStatsEngineHandle, EngineError> {
+async fn spawn_stats(handles: &FoundationHandles) -> Result<ShareStatsEngineHandle, EngineError> {
     let cfg = StatsSinkConfig {
         // Spreads the 60 s loops across the minute.
         startup_offset: crate::crons::offsets::STATS_SINK_FLUSH,

@@ -4,8 +4,6 @@
 
 use std::time::Duration;
 
-use crate::error::SinkError;
-
 /// Constructed once at `bin/blitzpool` startup, immutable thereafter.
 #[derive(Clone, Debug)]
 pub struct StatsSinkConfig {
@@ -32,47 +30,5 @@ impl Default for StatsSinkConfig {
             seed_on_spawn: true,
             startup_offset: Duration::ZERO,
         }
-    }
-}
-
-impl StatsSinkConfig {
-    pub fn validate(&self) -> Result<(), SinkError> {
-        if self.flush_interval.is_zero() {
-            return Err(SinkError::Config("flush_interval must be > 0".to_string()));
-        }
-        if self.client_stats_batch_size == 0 {
-            return Err(SinkError::Config(
-                "client_stats_batch_size must be > 0".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_validates() {
-        assert!(StatsSinkConfig::default().validate().is_ok());
-    }
-
-    #[test]
-    fn zero_flush_interval_rejected() {
-        let cfg = StatsSinkConfig {
-            flush_interval: Duration::ZERO,
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn zero_batch_size_rejected() {
-        let cfg = StatsSinkConfig {
-            client_stats_batch_size: 0,
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
     }
 }

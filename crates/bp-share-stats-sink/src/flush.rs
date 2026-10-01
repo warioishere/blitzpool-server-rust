@@ -131,11 +131,6 @@ async fn flush_pool_mode_hashrate(
             });
         }
     }
-    if rows.is_empty() {
-        accs.pool_mode_hashrate.confirm(&snapshot);
-        record_success(health, Flusher::PoolModeHashrate);
-        return;
-    }
     match bulk_upsert_pool_mode_hashrate(pool, &rows).await {
         Ok(_) => {
             accs.pool_mode_hashrate.confirm(&snapshot);
@@ -167,11 +162,6 @@ async fn flush_pool_rejected(
                 count: *count as f32,
             });
         }
-    }
-    if rows.is_empty() {
-        accs.pool_rejected.confirm(&snapshot);
-        record_success(health, Flusher::PoolRejected);
-        return;
     }
     match bulk_upsert_pool_rejected_statistics(pool, &rows).await {
         Ok(_) => {

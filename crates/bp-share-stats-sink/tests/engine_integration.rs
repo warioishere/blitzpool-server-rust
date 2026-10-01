@@ -181,7 +181,7 @@ async fn engine_reader_exposes_pending_residuals_before_flush() {
         seed_on_spawn: false,
         startup_offset: Duration::ZERO,
     };
-    let engine = ShareStatsEngine::new(cfg, pool).expect("new engine");
+    let engine = ShareStatsEngine::new(cfg, pool);
     let reader = engine.reader();
     let accs = engine.accumulators();
 
@@ -218,17 +218,4 @@ async fn engine_handle_shutdown_is_idempotent_against_dropped_handle() {
     }
     // Let the detached task run; tokio would log a panic there.
     tokio::time::sleep(Duration::from_millis(50)).await;
-}
-
-#[tokio::test]
-async fn engine_with_invalid_config_fails_validation() {
-    let Some(pool) = connect_or_skip().await else {
-        return;
-    };
-    let bad = StatsSinkConfig {
-        flush_interval: Duration::ZERO,
-        ..Default::default()
-    };
-    let result = ShareStatsEngine::spawn(bad, pool).await;
-    assert!(result.is_err(), "zero flush interval must reject");
 }

@@ -4,7 +4,6 @@
 //! [`ReaderView`] for the API surface, propagate shutdown.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bp_stats::{FlushHealthMonitor, TimeSlot};
 use sqlx::PgPool;
@@ -30,14 +29,13 @@ pub struct ShareStatsEngine {
 impl ShareStatsEngine {
     /// Builds the engine without starting the flush task, so hooks can be
     /// wired first.
-    pub fn new(config: StatsSinkConfig, pool: PgPool) -> Result<Self, SinkError> {
-        config.validate()?;
-        Ok(Self {
+    pub fn new(config: StatsSinkConfig, pool: PgPool) -> Self {
+        Self {
             config,
             pool,
             accumulators: Arc::new(Accumulators::default()),
             health: Arc::new(std::sync::Mutex::new(FlushHealthMonitor::default())),
-        })
+        }
     }
 
     /// Builds the engine, runs `seed_if_empty` when `config.seed_on_spawn`,
@@ -47,7 +45,7 @@ impl ShareStatsEngine {
         config: StatsSinkConfig,
         pool: PgPool,
     ) -> Result<ShareStatsEngineHandle, SinkError> {
-        let engine = Self::new(config, pool)?;
+        let engine = Self::new(config, pool);
         if engine.config.seed_on_spawn {
             if let Some(rows) = seed_if_empty(&engine.pool).await? {
                 debug!(rows, "stats_sink: seed_if_empty bootstrapped worker_shares");
@@ -160,8 +158,4 @@ async fn run_flush_loop(
 
     info!("stats_sink final drain");
     flush_once(&pool, &accs, &health, cfg.client_stats_batch_size).await;
-
-    // Brief wait for slot-aligned spot flush window to elapse if a
-    // tick was in-flight (defensive, kept short).
-    let _ = tokio::time::sleep(Duration::from_millis(10)).await;
 }

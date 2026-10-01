@@ -8,8 +8,6 @@ use thiserror::Error;
 pub enum SinkError {
     #[error("database error: {0}")]
     Db(#[from] bp_db::DbError),
-    #[error("invalid sink configuration: {0}")]
-    Config(String),
     #[error("worker_shares seed bootstrap failed: {0}")]
     Seed(String),
 }
