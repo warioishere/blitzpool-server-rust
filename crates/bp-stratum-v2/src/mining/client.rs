@@ -1415,6 +1415,53 @@ impl MiningJobInputs {
 /// from the group-template builder in `apply_template_broadcast`.
 type GroupTemplateParts = (ExtendedJob, Vec<u8>, Vec<u8>, Vec<[u8; 32]>);
 
+/// A new block: retire the channel's jobs, age out the expired ones, clear
+/// its dedup set and record the block context later extended jobs carry.
+fn retire_for_new_block(
+    channel: &mut ChannelState,
+    template: &bp_template_distribution::ActiveTemplate,
+    now_ms: u64,
+) {
+    channel.standard_jobs.retire(now_ms);
+    channel.standard_jobs.cleanup_expired(now_ms);
+    retire_extended_jobs(&mut channel.extended_jobs, now_ms);
+    cleanup_retired_extended_jobs(
+        &mut channel.extended_jobs,
+        now_ms,
+        channel.standard_jobs.lifecycle(),
+    );
+    channel.clear_submission_cache();
+    channel.latest_extended_prev_hash = Some(template.prev_hash);
+    channel.latest_extended_n_bits = Some(template.n_bits);
+}
+
+/// The pool-built extended job for `template`, as stored for share validation.
+fn extended_job(
+    template: &bp_template_distribution::ActiveTemplate,
+    mining_job: &MiningJob,
+    extranonce_prefix: Vec<u8>,
+    difficulty: Difficulty,
+    now_ms: u64,
+) -> ExtendedJob {
+    ExtendedJob {
+        coinbase_prefix: mining_job.coinbase_prefix().to_vec(),
+        coinbase_suffix: mining_job.coinbase_suffix().to_vec(),
+        payouts_fingerprint: *mining_job.payouts_fingerprint(),
+        merkle_path: template.merkle_path.clone(),
+        version: template.version,
+        prev_hash: template.prev_hash,
+        n_bits: template.n_bits,
+        min_ntime: template.header_timestamp,
+        extranonce_prefix,
+        difficulty,
+        coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
+        template_id: Some(template.template_id),
+        jdp_claims_the_block: false,
+        created_at: now_ms,
+        retired_at: None,
+    }
+}
+
 /// `(merkle_root, coinbase_stratum)` for a Standard channel: its 4-byte prefix
 /// plus 8 zero bytes (a Standard channel can't roll) spliced into the
 /// [`EXTRANONCE_SLOT_LEN`] slot. The coinbase is kept for the block-found path.
@@ -1515,17 +1562,7 @@ pub fn apply_template_broadcast<C: Clock>(
             continue;
         };
         if is_new_block {
-            channel.standard_jobs.retire(now_ms);
-            channel.standard_jobs.cleanup_expired(now_ms);
-            retire_extended_jobs(&mut channel.extended_jobs, now_ms);
-            cleanup_retired_extended_jobs(
-                &mut channel.extended_jobs,
-                now_ms,
-                channel.standard_jobs.lifecycle(),
-            );
-            channel.clear_submission_cache();
-            channel.latest_extended_prev_hash = Some(template.prev_hash);
-            channel.latest_extended_n_bits = Some(template.n_bits);
+            retire_for_new_block(channel, template, now_ms);
         }
 
         let job_id = channel.next_job_id;
@@ -1640,23 +1677,13 @@ pub fn apply_template_broadcast<C: Clock>(
                 }
                 channel.last_sent_job_signature = Some(sig);
 
-                let ext_job = ExtendedJob {
-                    coinbase_prefix: tx_prefix.clone(),
-                    coinbase_suffix: tx_suffix.clone(),
-                    payouts_fingerprint: *mining_job.payouts_fingerprint(),
-                    merkle_path: merkle_path.clone(),
-                    version: template.version,
-                    prev_hash: template.prev_hash,
-                    n_bits: template.n_bits,
-                    min_ntime: template.header_timestamp,
-                    extranonce_prefix: channel.extranonce_prefix.clone(),
-                    difficulty: channel.session_difficulty,
-                    coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
-                    template_id: Some(template.template_id),
-                    jdp_claims_the_block: false,
-                    created_at: now_ms,
-                    retired_at: None,
-                };
+                let ext_job = extended_job(
+                    template,
+                    &mining_job,
+                    channel.extranonce_prefix.clone(),
+                    channel.session_difficulty,
+                    now_ms,
+                );
                 channel.extended_jobs.insert(job_id, ext_job);
 
                 outcome.push_frame(OutboundFrame::NewExtendedMiningJob {
@@ -1704,26 +1731,12 @@ pub fn apply_template_broadcast<C: Clock>(
                 );
             })
             .ok()?;
-        let tx_prefix = mining_job.coinbase_prefix().to_vec();
-        let tx_suffix = mining_job.coinbase_suffix().to_vec();
-        let merkle_path = template.merkle_path.clone();
-        let tmpl = ExtendedJob {
-            coinbase_prefix: tx_prefix.clone(),
-            coinbase_suffix: tx_suffix.clone(),
-            payouts_fingerprint: *mining_job.payouts_fingerprint(),
-            merkle_path: merkle_path.clone(),
-            version: template.version,
-            prev_hash: template.prev_hash,
-            n_bits: template.n_bits,
-            min_ntime: template.header_timestamp,
-            extranonce_prefix: Vec::new(),
-            difficulty: Difficulty(0.0),
-            coinbase_tx_value_remaining: template.coinbase_tx_value_remaining,
-            template_id: Some(template.template_id),
-            jdp_claims_the_block: false,
-            created_at: now_ms,
-            retired_at: None,
-        };
+        let tmpl = extended_job(template, &mining_job, Vec::new(), Difficulty(0.0), now_ms);
+        let (tx_prefix, tx_suffix, merkle_path) = (
+            tmpl.coinbase_prefix.clone(),
+            tmpl.coinbase_suffix.clone(),
+            tmpl.merkle_path.clone(),
+        );
         Some((tmpl, tx_prefix, tx_suffix, merkle_path))
     };
 
@@ -1826,17 +1839,7 @@ pub fn apply_template_broadcast<C: Clock>(
                 continue;
             };
             if is_new_block {
-                channel.standard_jobs.retire(now_ms);
-                channel.standard_jobs.cleanup_expired(now_ms);
-                retire_extended_jobs(&mut channel.extended_jobs, now_ms);
-                cleanup_retired_extended_jobs(
-                    &mut channel.extended_jobs,
-                    now_ms,
-                    channel.standard_jobs.lifecycle(),
-                );
-                channel.clear_submission_cache();
-                channel.latest_extended_prev_hash = Some(template.prev_hash);
-                channel.latest_extended_n_bits = Some(template.n_bits);
+                retire_for_new_block(channel, template, now_ms);
             }
             // Store the shared job under the group job_id on every member, so
             // per-member `SubmitSharesExtended` validation finds it.
