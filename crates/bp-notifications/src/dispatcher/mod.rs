@@ -12,4 +12,5 @@ pub use device_gate::{
     DeviceAggregate, DeviceGateConfig, DeviceKey, DeviceLiveness, DeviceLivenessLookup,
     DeviceNotice, DeviceStatusGate, ReportedStateStore,
 };
+pub(crate) use orchestrator::{push_fcm, push_web, PUSH_TYPE_FCM, PUSH_TYPE_UNIFIED};
 pub use orchestrator::{DeviceStatusEvent, NotificationDispatcher};

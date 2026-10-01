@@ -20,6 +20,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::adapter::{FcmAdapter, PushKind, PushPayload, WebPushAdapter};
+use crate::dispatcher::{push_fcm, push_web, PUSH_TYPE_FCM, PUSH_TYPE_UNIFIED};
 
 const MEMPOOL_API: &str = "https://mempool.space/api/v1/mining/hashrate/3d";
 
@@ -192,54 +193,13 @@ async fn fan_out_change(
             .filter(|s| s.network_diff_notifications_enabled)
         {
             let kind = sub.subscription_type.as_str();
-            if kind.eq_ignore_ascii_case("fcm") {
-                let Some(adapter) = fcm else { continue };
-                match adapter
-                    .send(&sub.endpoint, address.as_str(), &payload)
-                    .await
-                {
-                    Ok(outcome) if outcome.invalid_token => {
-                        let _ = bp_db::delete_push_subscription_by_endpoint(
-                            pool,
-                            &address,
-                            &sub.endpoint,
-                        )
-                        .await;
-                    }
-                    Ok(_) => {
-                        let _ = bp_db::update_push_subscription_last_notification(
-                            pool,
-                            sub.id,
-                            Utc::now().timestamp_millis(),
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        warn!(target: "bp_notifications::cron::network_difficulty", error = %e, "FCM send");
-                    }
+            if kind.eq_ignore_ascii_case(PUSH_TYPE_FCM) {
+                if let Some(adapter) = fcm {
+                    push_fcm(adapter, pool, &address, &sub, &payload, "FCM send").await;
                 }
-            } else if kind.eq_ignore_ascii_case("unified_push") {
-                let Some(adapter) = web_push else { continue };
-                match adapter.send(&sub.endpoint, &payload).await {
-                    Ok(outcome) if outcome.invalid_endpoint => {
-                        let _ = bp_db::delete_push_subscription_by_endpoint(
-                            pool,
-                            &address,
-                            &sub.endpoint,
-                        )
-                        .await;
-                    }
-                    Ok(_) => {
-                        let _ = bp_db::update_push_subscription_last_notification(
-                            pool,
-                            sub.id,
-                            Utc::now().timestamp_millis(),
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        warn!(target: "bp_notifications::cron::network_difficulty", error = %e, "UnifiedPush send");
-                    }
+            } else if kind.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED) {
+                if let Some(adapter) = web_push {
+                    push_web(adapter, pool, &address, &sub, &payload, "UnifiedPush send").await;
                 }
             } else {
                 warn!(target: "bp_notifications::cron::network_difficulty", kind, "unknown subscription_type — skipped");

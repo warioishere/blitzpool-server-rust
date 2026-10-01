@@ -29,8 +29,8 @@ use super::device_gate::{DeviceAggregate, DeviceNotice, DevicePartial};
 // Canonical stored `subscriptionType` values (lowercase, as written by
 // the `/api/push/*` register endpoints). Comparisons below are
 // case-insensitive so a row stored in any casing still routes.
-const PUSH_TYPE_UNIFIED: &str = "unified_push";
-const PUSH_TYPE_FCM: &str = "fcm";
+pub(crate) const PUSH_TYPE_UNIFIED: &str = "unified_push";
+pub(crate) const PUSH_TYPE_FCM: &str = "fcm";
 
 /// Timezone device-status timestamps are rendered in.
 const DEVICE_TIMEZONE: chrono_tz::Tz = chrono_tz::Europe::Zurich;
@@ -881,23 +881,15 @@ async fn send_fcm_device_status(
         let payload = payload.clone();
         let address = event.address.clone();
         async move {
-            match adapter
-                .send(&sub.endpoint, address.as_str(), &payload)
-                .await
-            {
-                Ok(outcome) if outcome.invalid_token => {
-                    soft_delete_push(&pool, &address, &sub.endpoint).await;
-                }
-                Ok(_) => {
-                    bump_last_notification(&pool, sub.id).await;
-                }
-                Err(AdapterError::InvalidRecipient(_)) => {
-                    soft_delete_push(&pool, &address, &sub.endpoint).await;
-                }
-                Err(e) => {
-                    warn!(target: "bp_notifications::dispatcher", error = %e, "fcm device-status");
-                }
-            }
+            push_fcm(
+                &adapter,
+                &pool,
+                &address,
+                &sub,
+                &payload,
+                "fcm device-status",
+            )
+            .await;
         }
     });
     join_all(tasks).await;
@@ -945,20 +937,15 @@ async fn send_web_push_device_status(
         let payload = payload.clone();
         let address = event.address.clone();
         async move {
-            match adapter.send(&sub.endpoint, &payload).await {
-                Ok(outcome) if outcome.invalid_endpoint => {
-                    soft_delete_push(&pool, &address, &sub.endpoint).await;
-                }
-                Ok(_) => {
-                    bump_last_notification(&pool, sub.id).await;
-                }
-                Err(AdapterError::InvalidRecipient(_)) => {
-                    soft_delete_push(&pool, &address, &sub.endpoint).await;
-                }
-                Err(e) => {
-                    warn!(target: "bp_notifications::dispatcher", error = %e, "unified push device-status");
-                }
-            }
+            push_web(
+                &adapter,
+                &pool,
+                &address,
+                &sub,
+                &payload,
+                "unified push device-status",
+            )
+            .await;
         }
     });
     join_all(tasks).await;
@@ -979,40 +966,12 @@ async fn fan_push(
         async move {
             let kind = sub.subscription_type.as_str();
             if kind.eq_ignore_ascii_case(PUSH_TYPE_UNIFIED) {
-                let Some(adapter) = handles.web_push else {
-                    return;
-                };
-                match adapter.send(&sub.endpoint, &payload).await {
-                    Ok(outcome) if outcome.invalid_endpoint => {
-                        soft_delete_push(&pool, &address, &sub.endpoint).await;
-                    }
-                    Ok(_) => {
-                        bump_last_notification(&pool, sub.id).await;
-                    }
-                    Err(AdapterError::InvalidRecipient(_)) => {
-                        soft_delete_push(&pool, &address, &sub.endpoint).await;
-                    }
-                    Err(e) => {
-                        warn!(target: "bp_notifications::dispatcher", error = %e, "unified push");
-                    }
+                if let Some(adapter) = handles.web_push {
+                    push_web(&adapter, &pool, &address, &sub, &payload, "unified push").await;
                 }
             } else if kind.eq_ignore_ascii_case(PUSH_TYPE_FCM) {
-                let Some(adapter) = handles.fcm else {
-                    return;
-                };
-                match adapter.send(&sub.endpoint, address.as_str(), &payload).await {
-                    Ok(outcome) if outcome.invalid_token => {
-                        soft_delete_push(&pool, &address, &sub.endpoint).await;
-                    }
-                    Ok(_) => {
-                        bump_last_notification(&pool, sub.id).await;
-                    }
-                    Err(AdapterError::InvalidRecipient(_)) => {
-                        soft_delete_push(&pool, &address, &sub.endpoint).await;
-                    }
-                    Err(e) => {
-                        warn!(target: "bp_notifications::dispatcher", error = %e, "fcm push");
-                    }
+                if let Some(adapter) = handles.fcm {
+                    push_fcm(&adapter, &pool, &address, &sub, &payload, "fcm push").await;
                 }
             } else {
                 debug!(target: "bp_notifications::dispatcher", kind, "unknown push subscription_type — ignored");
@@ -1020,6 +979,43 @@ async fn fan_push(
         }
     });
     join_all(tasks).await;
+}
+
+/// One FCM delivery: an invalid token soft-deletes the subscription, a sent
+/// push stamps its last notification, any other error is logged as `what`.
+pub(crate) async fn push_fcm(
+    adapter: &FcmAdapter,
+    pool: &PgPool,
+    address: &AddressId,
+    sub: &PushSubscriptionRow,
+    payload: &PushPayload,
+    what: &'static str,
+) {
+    match adapter.send(&sub.endpoint, address.as_str(), payload).await {
+        Ok(outcome) if outcome.invalid_token => {
+            soft_delete_push(pool, address, &sub.endpoint).await
+        }
+        Ok(_) => bump_last_notification(pool, sub.id).await,
+        Err(e) => warn!(target: "bp_notifications::dispatcher", error = %e, "{what}"),
+    }
+}
+
+/// [`push_fcm`] for a UnifiedPush endpoint.
+pub(crate) async fn push_web(
+    adapter: &WebPushAdapter,
+    pool: &PgPool,
+    address: &AddressId,
+    sub: &PushSubscriptionRow,
+    payload: &PushPayload,
+    what: &'static str,
+) {
+    match adapter.send(&sub.endpoint, payload).await {
+        Ok(outcome) if outcome.invalid_endpoint => {
+            soft_delete_push(pool, address, &sub.endpoint).await
+        }
+        Ok(_) => bump_last_notification(pool, sub.id).await,
+        Err(e) => warn!(target: "bp_notifications::dispatcher", error = %e, "{what}"),
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
