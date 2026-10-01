@@ -5078,7 +5078,13 @@ pub(crate) mod tests {
 
     // ── handle_set_custom_mining_job ───────────────────────────────
 
-    use crate::bridge::RegisteredDeclaredJob;
+    /// A declared job plus the JDP session that registered it, as the
+    /// bridge receives them.
+    #[derive(Clone)]
+    pub(crate) struct RegisteredDeclaredJob {
+        pub(crate) declared_job: JdpDeclaredJob,
+        pub(crate) jdp_session_id: u32,
+    }
     use crate::jdp::declarations::DeclaredJob as JdpDeclaredJob;
     use crate::tokens::Token;
     use std::collections::HashMap as Map;
@@ -5325,7 +5331,7 @@ pub(crate) mod tests {
     fn job_ref_for(entry: &RegisteredDeclaredJob) -> crate::bridge::BridgeJobRef {
         let mut registry = crate::bridge::JdpDeclaredJobRegistry::new();
         let token = entry.declared_job.new_token;
-        registry.register(token, entry.clone());
+        registry.register(token, &entry.declared_job, entry.jdp_session_id);
         registry.job_ref(&token).expect("just registered")
     }
 

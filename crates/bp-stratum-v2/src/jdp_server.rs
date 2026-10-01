@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::{
     AllocatedTokenRef, AllocationKind, DistributionAcceptance, DistributionAccounting,
-    DistributionScope, JdpDeclaredJobRegistry, PayoutDistributionEntry, RegisteredDeclaredJob,
+    DistributionScope, JdpDeclaredJobRegistry, PayoutDistributionEntry,
 };
 use crate::codec_common::{write_message, write_raw_frame, WriteError};
 use crate::extensions::{
@@ -953,13 +953,7 @@ pub(crate) fn register_bridge_entries(
         match event {
             JdpSessionEvent::JobDeclared { new_token } => {
                 if let Some(declared_job) = state.declared_jobs.get(new_token) {
-                    reg.register(
-                        *new_token,
-                        RegisteredDeclaredJob {
-                            declared_job: declared_job.clone(),
-                            jdp_session_id,
-                        },
-                    );
+                    reg.register(*new_token, declared_job, jdp_session_id);
                 }
             }
             // Negotiation is asked explicitly, not inferred from

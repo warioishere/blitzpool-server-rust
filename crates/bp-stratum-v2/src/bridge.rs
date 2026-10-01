@@ -15,17 +15,6 @@ use crate::jdp::declarations::DeclaredJob;
 use crate::jdp::payout_distribution::WeightedOutput;
 use crate::tokens::Token;
 
-// ── Registered job entry ─────────────────────────────────────────────
-
-/// One bridge entry: the cross-connection copy of a declared job (the JDP
-/// session keeps its own for `PushSolution`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RegisteredDeclaredJob {
-    pub declared_job: DeclaredJob,
-    /// JDP session that registered the entry; evicted with it.
-    pub jdp_session_id: u32,
-}
-
 /// What the allocate gave the mining side to judge a Coinbase-only job by.
 /// An enum, not `Option<Vec<u8>>`: "no script by design" is not "broken allocate".
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,14 +154,6 @@ pub fn classify_backing<'a>(
         }),
         (None, None) => None,
     }
-}
-
-/// A registered entry plus its projection, built once at registration so no
-/// merkle rebuild happens per `SetCustomMiningJob` under the registry lock.
-#[derive(Debug)]
-struct StoredJob {
-    entry: RegisteredDeclaredJob,
-    binding: Option<DeclaredJobBinding>,
 }
 
 // ── Payout distributions (ext 0x0003 push model) ─────────────────────
@@ -329,7 +310,7 @@ impl DistributionSlot {
 #[derive(Debug, Default)]
 pub struct JdpDeclaredJobRegistry {
     /// Keyed by the token issued in `DeclareMiningJobSuccess`.
-    entries: HashMap<Token, StoredJob>,
+    entries: HashMap<Token, BridgeJobRef>,
     allocations: HashMap<Token, AllocatedTokenRef>,
     /// The PPLNS distribution every connection is pushed.
     pool_wide_distribution: DistributionSlot,
@@ -347,16 +328,20 @@ impl JdpDeclaredJobRegistry {
         Self::default()
     }
 
-    /// Register a declared job; returns the previous entry for the token.
-    pub fn register(
-        &mut self,
-        token: Token,
-        entry: RegisteredDeclaredJob,
-    ) -> Option<RegisteredDeclaredJob> {
-        let binding = binding_from_declared_job(&entry.declared_job);
-        self.entries
-            .insert(token, StoredJob { entry, binding })
-            .map(|s| s.entry)
+    /// Register a declared job as its projection, built once here so no
+    /// merkle rebuild happens per `SetCustomMiningJob` under the registry lock.
+    /// The JDP session keeps the full job for `PushSolution`.
+    pub fn register(&mut self, token: Token, job: &DeclaredJob, jdp_session_id: u32) {
+        let job_ref = BridgeJobRef {
+            // Off the declaration, so it cannot name a different miner than the job.
+            miner_address: job.miner_address.clone(),
+            declared_prev_hash: job.prev_hash,
+            binding: binding_from_declared_job(job),
+            // Not from `booking`, which also requires the settlement snapshot.
+            distribution_id: job.distribution_id,
+            jdp_session_id,
+        };
+        self.entries.insert(token, job_ref);
     }
 
     /// One declaration authorises exactly one `SetCustomMiningJob`. Removes
@@ -368,15 +353,7 @@ impl JdpDeclaredJobRegistry {
     /// Projection for the `SetCustomMiningJob` cross-checks; `None` for an
     /// unknown or evicted token.
     pub fn job_ref(&self, token: &Token) -> Option<BridgeJobRef> {
-        self.entries.get(token).map(|s| BridgeJobRef {
-            // Off the declaration, so it cannot name a different miner than the job.
-            miner_address: s.entry.declared_job.miner_address.clone(),
-            declared_prev_hash: s.entry.declared_job.prev_hash,
-            binding: s.binding.clone(),
-            // Not from `booking`, which also requires the settlement snapshot.
-            distribution_id: s.entry.declared_job.distribution_id,
-            jdp_session_id: s.entry.jdp_session_id,
-        })
+        self.entries.get(token).cloned()
     }
 
     // ── Base-protocol allocate tokens ───────────────────────────────
@@ -539,7 +516,7 @@ impl JdpDeclaredJobRegistry {
     pub fn evict_for_jdp_session(&mut self, jdp_session_id: u32) -> usize {
         let before = self.entries.len() + self.allocations.len();
         self.entries
-            .retain(|_, s| s.entry.jdp_session_id != jdp_session_id);
+            .retain(|_, j| j.jdp_session_id != jdp_session_id);
         self.allocations
             .retain(|_, a| a.jdp_session_id != jdp_session_id);
         self.tailored_distributions.remove(&jdp_session_id);
@@ -602,13 +579,6 @@ mod tests {
         }
     }
 
-    fn registration(token: Token, session_id: u32) -> RegisteredDeclaredJob {
-        RegisteredDeclaredJob {
-            declared_job: declared(token),
-            jdp_session_id: session_id,
-        }
-    }
-
     // ── the projection the mining side actually consumes ───────────
 
     /// Pins which declared bytes `job_ref()` projects into the binding.
@@ -616,7 +586,7 @@ mod tests {
     fn job_ref_carries_the_declaration_projected() {
         let mut reg = JdpDeclaredJobRegistry::new();
         let t = token(1);
-        reg.register(t, registration(t, 7));
+        reg.register(t, &declared(t), 7);
 
         let job_ref = reg.job_ref(&t).expect("registered token must resolve");
         assert_eq!(job_ref.miner_address, addr());
@@ -643,12 +613,12 @@ mod tests {
         let mut reg = JdpDeclaredJobRegistry::new();
 
         let declared_under_0x0003 = token(1);
-        let mut entry = registration(declared_under_0x0003, 7);
-        entry.declared_job.distribution_id = Some(9);
-        reg.register(declared_under_0x0003, entry);
+        let mut job = declared(declared_under_0x0003);
+        job.distribution_id = Some(9);
+        reg.register(declared_under_0x0003, &job, 7);
 
         let base_protocol = token(2);
-        reg.register(base_protocol, registration(base_protocol, 7));
+        reg.register(base_protocol, &declared(base_protocol), 7);
 
         assert_eq!(
             reg.job_ref(&declared_under_0x0003)
@@ -673,9 +643,9 @@ mod tests {
     fn declared_ref(distribution_id: Option<u64>, session: u32) -> BridgeJobRef {
         let mut reg = JdpDeclaredJobRegistry::new();
         let t = token(1);
-        let mut entry = registration(t, session);
-        entry.declared_job.distribution_id = distribution_id;
-        reg.register(t, entry);
+        let mut job = declared(t);
+        job.distribution_id = distribution_id;
+        reg.register(t, &job, session);
         reg.job_ref(&t).expect("registered")
     }
 
@@ -803,9 +773,9 @@ mod tests {
     fn job_ref_projects_none_for_an_unrebuildable_declaration() {
         let mut reg = JdpDeclaredJobRegistry::new();
         let t = token(2);
-        let mut entry = registration(t, 7);
-        entry.declared_job.coinbase_tx_prefix = vec![0xAA; 8];
-        reg.register(t, entry);
+        let mut job = declared(t);
+        job.coinbase_tx_prefix = vec![0xAA; 8];
+        reg.register(t, &job, 7);
 
         let job_ref = reg.job_ref(&t).expect("registered token must resolve");
         assert!(job_ref.binding.is_none());
@@ -817,7 +787,7 @@ mod tests {
     fn register_and_resolve_roundtrips() {
         let mut reg = JdpDeclaredJobRegistry::new();
         let t = token(1);
-        reg.register(t, registration(t, 42));
+        reg.register(t, &declared(t), 42);
         let got = reg.job_ref(&t).expect("must resolve");
         assert_eq!(got.jdp_session_id, 42);
         assert_eq!(got.miner_address.as_str(), ADDR);
@@ -833,11 +803,8 @@ mod tests {
     fn register_overwrites_existing_token() {
         let mut reg = JdpDeclaredJobRegistry::new();
         let t = token(1);
-        reg.register(t, registration(t, 42));
-        let prev = reg
-            .register(t, registration(t, 99))
-            .expect("must return previous");
-        assert_eq!(prev.jdp_session_id, 42);
+        reg.register(t, &declared(t), 42);
+        reg.register(t, &declared(t), 99);
         assert_eq!(reg.job_ref(&t).unwrap().jdp_session_id, 99);
         assert_eq!(reg.evict_for_jdp_session(99), 1, "exactly one entry held");
     }
@@ -847,9 +814,9 @@ mod tests {
     #[test]
     fn evict_for_jdp_session_removes_only_matching_session() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.register(token(1), registration(token(1), 42));
-        reg.register(token(2), registration(token(2), 42));
-        reg.register(token(3), registration(token(3), 99));
+        reg.register(token(1), &declared(token(1)), 42);
+        reg.register(token(2), &declared(token(2)), 42);
+        reg.register(token(3), &declared(token(3)), 99);
         let evicted = reg.evict_for_jdp_session(42);
         assert_eq!(evicted, 2);
         assert!(reg.job_ref(&token(3)).is_some());
@@ -860,7 +827,7 @@ mod tests {
     #[test]
     fn evict_for_unknown_session_returns_zero() {
         let mut reg = JdpDeclaredJobRegistry::new();
-        reg.register(token(1), registration(token(1), 42));
+        reg.register(token(1), &declared(token(1)), 42);
         assert_eq!(reg.evict_for_jdp_session(999), 0);
         assert!(reg.job_ref(&token(1)).is_some(), "untouched");
     }

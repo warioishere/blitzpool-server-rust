@@ -2688,13 +2688,10 @@ mod tests {
         let bridge = fresh_bridge();
         let token = Token([0x5Au8; 16]);
         let entry = bridge_entry_for(token, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 42);
-        bridge.write().unwrap().register(
-            token,
-            crate::bridge::RegisteredDeclaredJob {
-                declared_job: entry.declared_job.clone(),
-                jdp_session_id: 42,
-            },
-        );
+        bridge
+            .write()
+            .unwrap()
+            .register(token, &entry.declared_job, 42);
 
         // Rejected first: a tip the declaration was not accepted under.
         let mut stale = custom_job_matching(cid, &entry);
@@ -2899,24 +2896,16 @@ mod tests {
             let mut newer = tailored(6, 9_000);
             newer.jdp_session_id = Some(NEW_SESSION);
             guard.publish_tailored(NEW_SESSION, newer);
-            guard.register(
-                token,
-                crate::bridge::RegisteredDeclaredJob {
-                    declared_job: declared_job.clone(),
-                    jdp_session_id: OLD_SESSION,
-                },
-            );
+            guard.register(token, &declared_job, OLD_SESSION);
             // Same declaration under its own token, since a token authorises
             // exactly one custom job.
             guard.register(
                 SECOND_TOKEN,
-                crate::bridge::RegisteredDeclaredJob {
-                    declared_job: crate::jdp::declarations::DeclaredJob {
-                        new_token: SECOND_TOKEN,
-                        ..declared_job
-                    },
-                    jdp_session_id: OLD_SESSION,
+                &crate::jdp::declarations::DeclaredJob {
+                    new_token: SECOND_TOKEN,
+                    ..declared_job
                 },
+                OLD_SESSION,
             );
         }
 
