@@ -107,10 +107,6 @@ pub const MAX_EXTENDED_ROLLABLE: usize = 16;
 
 // ── Wire error codes (SV2 spec setup/open-channel error strings) ────
 
-/// `unsupported-protocol` — this sub-protocol value is not accepted
-/// (e.g. `protocol = 2`, TDP).
-pub const ERR_UNSUPPORTED_PROTOCOL: &str = "unsupported-protocol";
-
 /// `unknown-user` — the address parsed out of `user_identity` failed
 /// `bp_common::normalize_btc_address` validation.
 pub const ERR_UNKNOWN_USER: &str = "unknown-user";
@@ -805,7 +801,7 @@ pub fn handle_setup_connection<C: Clock>(
         }
         other => {
             return setup_rejected(
-                ERR_UNSUPPORTED_PROTOCOL,
+                crate::codec_common::ERR_UNSUPPORTED_PROTOCOL,
                 format!("protocol {other} is not served on this port"),
             );
         }
@@ -3066,7 +3062,7 @@ pub(crate) mod tests {
         let out = handle_setup_connection(&mut s, &input);
         match &out.outbound[0] {
             OutboundFrame::SetupConnectionError { error_code, .. } => {
-                assert_eq!(error_code, ERR_UNSUPPORTED_PROTOCOL);
+                assert_eq!(error_code, crate::codec_common::ERR_UNSUPPORTED_PROTOCOL);
             }
             _ => panic!("expected error"),
         }

@@ -45,14 +45,9 @@ const PAIRS: &[(&str, &str, &str)] = &[
         "SetupConnection.Error / protocol-version-mismatch (mining and JDP)",
     ),
     (
-        jdp_client::ERR_UNSUPPORTED_PROTOCOL,
+        bp_stratum_v2::codec_common::ERR_UNSUPPORTED_PROTOCOL,
         common::ERROR_CODE_SETUP_CONNECTION_UNSUPPORTED_PROTOCOL,
-        "JDP SetupConnection.Error / unsupported-protocol",
-    ),
-    (
-        mining_client::ERR_UNSUPPORTED_PROTOCOL,
-        common::ERROR_CODE_SETUP_CONNECTION_UNSUPPORTED_PROTOCOL,
-        "Mining SetupConnection.Error / unsupported-protocol",
+        "SetupConnection.Error / unsupported-protocol (mining and JDP)",
     ),
     // Cross-message ON PURPOSE, and the only row in this table that is.
     // The pool raises this on `DeclareMiningJob.Error`, but pairs it with a

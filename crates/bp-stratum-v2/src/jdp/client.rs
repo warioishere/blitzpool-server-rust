@@ -59,10 +59,6 @@ fn is_jdp_extension_supported(ext: u16) -> bool {
 
 // ── Wire error codes ─────────────────────────────────────────────────
 
-/// `unsupported-protocol` — `SetupConnection.protocol` was something
-/// other than JOB_DECLARATION (1).
-pub const ERR_UNSUPPORTED_PROTOCOL: &str = "unsupported-protocol";
-
 /// `unsupported-feature-flags` — JDC sent `DeclareMiningJob` without
 /// negotiating `DECLARE_TX_DATA` (Full-Template mode).
 ///
@@ -520,7 +516,7 @@ pub fn handle_setup_connection(
     if input.protocol != PROTOCOL_JOB_DECLARATION {
         let mut outcome = JdpHandlerOutcome::with_frame(JdpOutboundFrame::SetupConnectionError {
             flags: input.flags,
-            error_code: ERR_UNSUPPORTED_PROTOCOL.to_string(),
+            error_code: crate::codec_common::ERR_UNSUPPORTED_PROTOCOL.to_string(),
         });
         outcome.push_event(JdpSessionEvent::Disconnect {
             reason: format!("protocol mismatch: got {}", input.protocol),
@@ -1488,7 +1484,7 @@ mod tests {
         let out = handle_setup_connection(&mut s, &input);
         match &out.outbound[0] {
             JdpOutboundFrame::SetupConnectionError { error_code, .. } => {
-                assert_eq!(error_code, ERR_UNSUPPORTED_PROTOCOL);
+                assert_eq!(error_code, crate::codec_common::ERR_UNSUPPORTED_PROTOCOL);
             }
             _ => panic!("expected SetupConnectionError"),
         }

@@ -164,6 +164,11 @@ pub(crate) fn str0255(s: String) -> Result<stratum_core::binary_sv2::Str0255Owne
 /// same reason on either port.
 pub const ERR_PROTOCOL_VERSION_MISMATCH: &str = "protocol-version-mismatch";
 
+/// `unsupported-protocol` — `SetupConnection.protocol` is not the
+/// sub-protocol this port serves. Shared for the same reason as
+/// [`ERR_PROTOCOL_VERSION_MISMATCH`].
+pub const ERR_UNSUPPORTED_PROTOCOL: &str = "unsupported-protocol";
+
 /// Inputs from a deserialized `SetupConnection` frame, narrowed to what the
 /// handlers read. The mining and the JDP handler both take it.
 #[derive(Clone, Debug)]
