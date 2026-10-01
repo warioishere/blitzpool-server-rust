@@ -29,7 +29,8 @@ pub(crate) struct ProductionPayoutResolver {
     pplns: Option<PplnsEngine>,
     group_solo: GroupSoloEngine,
     solo_fee: SoloFeeConfig,
-    /// When `None`, the Blockparty arm and the pending-fee guard fall back to Solo.
+    /// When `None`, the Blockparty arm serves no job and the pending-fee guard
+    /// falls through to Solo.
     blockparty: Option<Arc<dyn BlockpartyApi>>,
 }
 
@@ -81,13 +82,17 @@ impl ProductionPayoutResolver {
                 )
             }
             MiningMode::Pplns => self.pplns_payouts(miner_address, reward_sats).await,
-            MiningMode::Blockparty => (
-                ResolvedPayouts::unsnapshotted(
-                    self.blockparty_payouts(miner_address, reward_sats, result.group_id.as_deref())
-                        .await,
-                ),
-                vouchable,
-            ),
+            MiningMode::Blockparty => {
+                let resolved = blockparty_payouts(
+                    self.blockparty.as_deref(),
+                    miner_address,
+                    reward_sats,
+                    result.group_id.as_deref(),
+                )
+                .await;
+                let bookable = vouchable && !resolved.is_none();
+                (resolved, bookable)
+            }
             MiningMode::GroupSolo => {
                 let Some(gid_str) = result.group_id.as_deref() else {
                     error!(
@@ -106,6 +111,57 @@ impl ProductionPayoutResolver {
                 self.group_solo_payouts(miner_address, reward_sats, group_id)
                     .await
             }
+        }
+    }
+}
+
+/// The members' split, or no job when it cannot be built: only the admin
+/// hashes, so a solo coinbase would pay the admin the whole block.
+async fn blockparty_payouts(
+    blockparty: Option<&dyn BlockpartyApi>,
+    miner_address: &str,
+    reward_sats: u64,
+    group_id_str: Option<&str>,
+) -> ResolvedPayouts {
+    let Some(svc) = blockparty else {
+        error!(
+            miner_address,
+            "Blockparty mode in gate but service handle not wired; serving NO JOB"
+        );
+        return ResolvedPayouts::none();
+    };
+    let Some(gid_str) = group_id_str else {
+        error!(
+            miner_address,
+            "Blockparty mode published WITHOUT a group_id; serving NO JOB"
+        );
+        return ResolvedPayouts::none();
+    };
+    let Ok(group_id) = Uuid::parse_str(gid_str) else {
+        error!(
+            miner_address,
+            gid_str, "Blockparty group_id failed to parse as UUID; serving NO JOB"
+        );
+        return ResolvedPayouts::none();
+    };
+    match svc.build_payouts(group_id, Sats(reward_sats as i64)).await {
+        Ok(Some(result)) => ResolvedPayouts::unsnapshotted(entries_to_payouts(&result.payouts)),
+        Ok(None) => {
+            warn!(
+                miner_address,
+                %group_id,
+                "Blockparty group not found; serving NO JOB"
+            );
+            ResolvedPayouts::none()
+        }
+        Err(err) => {
+            warn!(
+                %err,
+                miner_address,
+                %group_id,
+                "Blockparty distribution build failed; serving NO JOB until it succeeds"
+            );
+            ResolvedPayouts::none()
         }
     }
 }
@@ -302,55 +358,6 @@ impl ProductionPayoutResolver {
         let addr = AddressId::new(miner_address.to_string()).ok()?;
         let route = svc.pending_party_fee_route(&addr).await?;
         Some(pending_fee_route_payouts(route, reward_sats))
-    }
-
-    async fn blockparty_payouts(
-        &self,
-        miner_address: &str,
-        reward_sats: u64,
-        group_id_str: Option<&str>,
-    ) -> Vec<PayoutEntry> {
-        let Some(svc) = self.blockparty.as_ref() else {
-            warn!(
-                miner_address,
-                "Blockparty mode in gate but service handle not wired; falling back to solo"
-            );
-            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
-        };
-        let Some(gid_str) = group_id_str else {
-            warn!(
-                miner_address,
-                "Blockparty mode published WITHOUT a group_id; falling back to solo"
-            );
-            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
-        };
-        let Ok(group_id) = Uuid::parse_str(gid_str) else {
-            warn!(
-                miner_address,
-                gid_str, "Blockparty group_id failed to parse as UUID; falling back to solo"
-            );
-            return solo_payouts(miner_address, &self.solo_fee, reward_sats);
-        };
-        match svc.build_payouts(group_id, Sats(reward_sats as i64)).await {
-            Ok(Some(result)) => entries_to_payouts(&result.payouts),
-            Ok(None) => {
-                warn!(
-                    miner_address,
-                    %group_id,
-                    "Blockparty group not found; falling back to solo"
-                );
-                solo_payouts(miner_address, &self.solo_fee, reward_sats)
-            }
-            Err(err) => {
-                warn!(
-                    %err,
-                    miner_address,
-                    %group_id,
-                    "Blockparty distribution build failed; falling back to solo"
-                );
-                solo_payouts(miner_address, &self.solo_fee, reward_sats)
-            }
-        }
     }
 
     /// Returns the list and its bookable flag; see [`Self::resolve_internal`].
@@ -972,6 +979,72 @@ mod tests {
                 "reward {reward}"
             );
         }
+    }
+
+    const BP_ADMIN: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+    fn blockparty_service(pool: sqlx::PgPool) -> Arc<dyn BlockpartyApi> {
+        Arc::new(bp_blockparty_engine::BlockpartyService::new(
+            pool,
+            Arc::new(bp_blockparty_engine::NoopHooks::default()),
+            bp_group_mgmt_engine::AddressCache::new(),
+            bp_blockparty_engine::BlockpartyServiceConfig::default(),
+        ))
+    }
+
+    /// The admin is the only one hashing, so a solo coinbase here would pay
+    /// the whole block to the admin and nothing to the members.
+    async fn assert_no_job(svc: Option<&dyn BlockpartyApi>, group_id: Option<&str>, case: &str) {
+        let resolved = blockparty_payouts(svc, BP_ADMIN, TEST_REWARD, group_id).await;
+        assert!(
+            resolved.is_none(),
+            "{case}: must serve no job, got {:?}",
+            resolved.entries
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blockparty_without_a_buildable_split_serves_no_job() {
+        let gid = Uuid::new_v4().to_string();
+        assert_no_job(None, Some(&gid), "service not wired").await;
+
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(300))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/nope")
+            .expect("a lazily-connected pool parses its url");
+        let svc = blockparty_service(unreachable);
+        assert!(
+            svc.build_payouts(Uuid::parse_str(&gid).unwrap(), Sats(TEST_REWARD as i64))
+                .await
+                .is_err(),
+            "precondition: the split build must fail on this pool"
+        );
+        assert_no_job(Some(svc.as_ref()), Some(&gid), "database error").await;
+        assert_no_job(Some(svc.as_ref()), None, "no group id").await;
+        assert_no_job(Some(svc.as_ref()), Some("not-a-uuid"), "bad group id").await;
+    }
+
+    #[tokio::test]
+    async fn a_blockparty_whose_group_is_gone_serves_no_job() {
+        let Some(pool) = bp_test_support::connect_pg_or_skip().await else {
+            return;
+        };
+        let svc = blockparty_service(pool);
+        let gid = Uuid::new_v4();
+        assert!(
+            matches!(
+                svc.build_payouts(gid, Sats(TEST_REWARD as i64)).await,
+                Ok(None)
+            ),
+            "precondition: a fresh group id must resolve to no group"
+        );
+        assert_no_job(
+            Some(svc.as_ref()),
+            Some(&gid.to_string()),
+            "group not found",
+        )
+        .await;
     }
 
     #[test]
